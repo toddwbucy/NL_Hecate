@@ -14,7 +14,8 @@
 // NOTE: This file is structured to compile even if the autodiff attribute
 //       on dyn Trait is rejected. We catch errors at each level.
 
-use std::autodiff::autodiff;
+#[allow(unused_imports)]
+use std::autodiff::autodiff_reverse;
 
 // --- The trait (same as test_03) ---
 
@@ -42,7 +43,7 @@ impl MemoryRule for DeltaRule {
 //
 // Uncomment to test:
 //
-// #[autodiff(d_apply_dyn, Reverse, Duplicated, Active, Active, Active)]
+// #[autodiff_reverse(d_apply_dyn, Duplicated, Active, Active, Active)]
 // fn apply_dyn(rule: &dyn MemoryRule, state: f32, input: f32) -> f32 {
 //     rule.forward(state, input)
 // }
@@ -50,7 +51,7 @@ impl MemoryRule for DeltaRule {
 // --- Attempt 2: Box<dyn Trait> ---
 // Same issue but with heap allocation.
 //
-// #[autodiff(d_apply_boxed, Reverse, Duplicated, Active, Active, Active)]
+// #[autodiff_reverse(d_apply_boxed, Duplicated, Active, Active, Active)]
 // fn apply_boxed(rule: &Box<dyn MemoryRule>, state: f32, input: f32) -> f32 {
 //     rule.forward(state, input)
 // }
@@ -62,7 +63,7 @@ impl MemoryRule for DeltaRule {
 //     rule: &'a dyn MemoryRule,
 // }
 //
-// #[autodiff(d_apply_held, Reverse, Duplicated, Active, Active, Active)]
+// #[autodiff_reverse(d_apply_held, Duplicated, Active, Active, Active)]
 // fn apply_held(holder: &RuleHolder, state: f32, input: f32) -> f32 {
 //     holder.rule.forward(state, input)
 // }
