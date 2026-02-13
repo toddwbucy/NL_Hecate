@@ -11,7 +11,7 @@
 // EXPECTED: Gradients flow to individual struct fields correctly.
 //           Shadow struct accumulates per-field gradients.
 
-use std::autodiff::autodiff;
+use std::autodiff::autodiff_reverse;
 
 // --- Structs modeling NL parameters ---
 
@@ -24,7 +24,7 @@ struct ProjectionParams {
 
 /// Two-parameter linear model: out = w_k * x + w_v
 /// This models the simplest case of "project input through learned weights"
-#[autodiff(d_project, Reverse, Duplicated, Active, Active)]
+#[autodiff_reverse(d_project, Duplicated, Active, Active)]
 fn project(params: &ProjectionParams, x: f32) -> f32 {
     params.w_k * x + params.w_v
 }
@@ -37,7 +37,7 @@ struct MiniModel {
 }
 
 /// Forward pass through mini model: proj(x) + bias
-#[autodiff(d_mini_forward, Reverse, Duplicated, Active, Active)]
+#[autodiff_reverse(d_mini_forward, Duplicated, Active, Active)]
 fn mini_forward(model: &MiniModel, x: f32) -> f32 {
     let projected = model.proj.w_k * x + model.proj.w_v;
     projected + model.bias
@@ -45,7 +45,7 @@ fn mini_forward(model: &MiniModel, x: f32) -> f32 {
 
 /// Loss function wrapping projection: (project(x) - target)^2
 /// This tests gradient flow through a chain: loss -> project -> params
-#[autodiff(d_project_loss, Reverse, Duplicated, Active, Const, Active)]
+#[autodiff_reverse(d_project_loss, Duplicated, Active, Const, Active)]
 fn project_loss(params: &ProjectionParams, x: f32, target: f32) -> f32 {
     let out = params.w_k * x + params.w_v;
     let diff = out - target;
@@ -77,7 +77,7 @@ pub fn run() -> (usize, usize) {
     println!("\n=== Test 02: Struct Field Differentiation ===\n");
 
     let eps = 1e-4_f32;
-    let tol = 1e-3_f32;
+    let tol = 2e-3_f32;  // FD has ~1e-3 error at eps=1e-4; Enzyme is exact
     let mut pass = 0;
     let mut fail = 0;
 

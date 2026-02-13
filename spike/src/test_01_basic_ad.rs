@@ -9,22 +9,22 @@
 // EXPECTED: d_square(3.0) = 6.0  (derivative of x^2 is 2x)
 //           d_cubic(2.0) = 12.0  (derivative of x^3 is 3x^2)
 
-use std::autodiff::autodiff;
+use std::autodiff::autodiff_reverse;
 
 // --- Test functions ---
 
-#[autodiff(d_square, Reverse, Active, Active)]
+#[autodiff_reverse(d_square, Active, Active)]
 fn square(x: f32) -> f32 {
     x * x
 }
 
-#[autodiff(d_cubic, Reverse, Active, Active)]
+#[autodiff_reverse(d_cubic, Active, Active)]
 fn cubic(x: f32) -> f32 {
     x * x * x
 }
 
 // Multi-operation chain: tests that Enzyme handles intermediate values
-#[autodiff(d_chain, Reverse, Active, Active)]
+#[autodiff_reverse(d_chain, Active, Active)]
 fn chain(x: f32) -> f32 {
     let a = x * x;       // x^2
     let b = a + x;       // x^2 + x
@@ -62,7 +62,7 @@ pub fn run() -> (usize, usize) {
     println!("\n=== Test 01: Basic Scalar AD ===\n");
 
     let eps = 1e-4_f32;
-    let tol = 1e-3_f32;
+    let tol = 2e-3_f32;  // FD has ~1e-3 error at eps=1e-4; Enzyme is exact
     let mut pass = 0;
     let mut fail = 0;
 

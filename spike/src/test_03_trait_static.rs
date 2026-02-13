@@ -12,7 +12,7 @@
 // PATTERN: Generic function with trait bound -> monomorphized at call site ->
 //          Enzyme sees concrete code -> differentiation works (hypothesis).
 
-use std::autodiff::autodiff;
+use std::autodiff::autodiff_reverse;
 
 // --- The trait (models MemoryRule from the spec) ---
 
@@ -65,17 +65,17 @@ impl MemoryRule for GatedRule {
 // (Enzyme needs a concrete function). So we create concrete wrappers
 // that the compiler monomorphizes.
 
-#[autodiff(d_apply_delta, Reverse, Duplicated, Active, Active, Active)]
+#[autodiff_reverse(d_apply_delta, Duplicated, Active, Active, Active)]
 fn apply_delta(rule: &DeltaRule, state: f32, input: f32) -> f32 {
     rule.forward(state, input)
 }
 
-#[autodiff(d_apply_momentum, Reverse, Duplicated, Active, Active, Active)]
+#[autodiff_reverse(d_apply_momentum, Duplicated, Active, Active, Active)]
 fn apply_momentum(rule: &MomentumRule, state: f32, input: f32) -> f32 {
     rule.forward(state, input)
 }
 
-#[autodiff(d_apply_gated, Reverse, Duplicated, Active, Active, Active)]
+#[autodiff_reverse(d_apply_gated, Duplicated, Active, Active, Active)]
 fn apply_gated(rule: &GatedRule, state: f32, input: f32) -> f32 {
     rule.forward(state, input)
 }
@@ -90,7 +90,7 @@ fn apply_generic<R: MemoryRule>(rule: &R, state: f32, input: f32) -> f32 {
 
 // We can't directly annotate the generic, but we can annotate a
 // concrete instantiation via a wrapper:
-#[autodiff(d_generic_delta, Reverse, Duplicated, Active, Active, Active)]
+#[autodiff_reverse(d_generic_delta, Duplicated, Active, Active, Active)]
 fn generic_delta_wrapper(rule: &DeltaRule, state: f32, input: f32) -> f32 {
     apply_generic(rule, state, input)
 }
@@ -120,7 +120,7 @@ pub fn run() -> (usize, usize) {
     println!("\n=== Test 03: Static Trait Dispatch ===\n");
 
     let eps = 1e-4_f32;
-    let tol = 1e-3_f32;
+    let tol = 2e-3_f32;  // FD has ~1e-3 error at eps=1e-4; Enzyme is exact
     let mut pass = 0;
     let mut fail = 0;
 

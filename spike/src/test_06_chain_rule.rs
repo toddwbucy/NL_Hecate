@@ -15,7 +15,7 @@
 //
 // This test validates the manual composition approach.
 
-use std::autodiff::autodiff;
+use std::autodiff::autodiff_reverse;
 
 // ============================================================
 // The three-stage forward pass
@@ -65,13 +65,13 @@ fn full_forward(w: f32, x: f32, state: f32, lr: f32, target: f32) -> f32 {
 // ============================================================
 
 /// Loss function that Enzyme differentiates — gives us d_loss/d_output
-#[autodiff(d_loss_fn, Reverse, Active, Const, Active)]
+#[autodiff_reverse(d_loss_fn, Active, Const, Active)]
 fn loss_ad(output: f32, target: f32) -> f32 {
     loss_fn(output, target)
 }
 
 /// Projection that Enzyme differentiates — gives us d_projected/d_w
-#[autodiff(d_project, Reverse, Active, Active, Active)]
+#[autodiff_reverse(d_project, Active, Active, Active)]
 fn project_ad(w: f32, x: f32) -> f32 {
     project(w, x)
 }
@@ -165,7 +165,7 @@ pub fn run() -> (usize, usize) {
     println!("\n=== Test 06: Chain Rule Composition ===\n");
 
     let eps = 1e-4_f32;
-    let tol = 1e-3_f32;
+    let tol = 2e-3_f32;  // FD has ~1e-3 error at eps=1e-4; Enzyme is exact
     let mut pass = 0;
     let mut fail = 0;
 
@@ -193,7 +193,7 @@ pub fn run() -> (usize, usize) {
 
     if check_gradient("chain_rule: d_loss/d_w", d_w_manual, fd_w, tol) { pass += 1; } else { fail += 1; }
 
-    let (_loss, d_w_full, d_state_full, d_lr_full) = manual_chain_rule_full(w, x, state, lr, target);
+    let (_loss, _d_w_full, d_state_full, d_lr_full) = manual_chain_rule_full(w, x, state, lr, target);
     if check_gradient("chain_rule: d_loss/d_state", d_state_full, fd_state, tol) { pass += 1; } else { fail += 1; }
     if check_gradient("chain_rule: d_loss/d_lr", d_lr_full, fd_lr, tol) { pass += 1; } else { fail += 1; }
 
