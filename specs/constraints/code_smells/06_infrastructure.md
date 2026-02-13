@@ -1,4 +1,4 @@
-# Infrastructure Code Smells (CS-39 through CS-47)
+# Infrastructure Code Smells (CS-39 through CS-48)
 
 ```
 CONTRACT
@@ -12,7 +12,8 @@ CONTRACT
   Guarantees: Known pitfalls are documented and enforceable.
               Each smell has a specific test or enforcement mechanism.
   Position:   specs/constraints/code_smells/06_infrastructure.md
-  Source:     Track A experience; nl_code_smells CS-39 through CS-47
+  Source:     Track A experience; nl_code_smells CS-39 through CS-47;
+              committee review cycle (CS-48)
 ```
 
 ## CS-39: Learnable Decay Parameters Must Be Clamped [CRITICAL]
@@ -191,4 +192,27 @@ FIX:   Never modify shared state in place. Produce a NEW tensor:
        Rust's ownership model helps: &mut self means only YOU can modify it.
 SEVERITY: CRITICAL — non-reproducibility is a show-stopper
 TRACE: CS-46 (compile can't trace — related to mutation); state lifecycle spec
+```
+
+## CS-48: Shared Retention Parameters Across CMS Levels
+
+```
+SMELL: let retention_lambda = nn::Parameter::new(0.99);
+       // same lambda used for level 0, 1, 2, 3
+WHY:   CMS levels operate at different timescales (C=1, 8, 64, 512).
+       Level 0 (fast, every step) needs different retention than
+       level 3 (slow, every 512 steps). If they share a single lambda:
+       - Lambda optimized for level 0 → level 3 forgets too fast
+         (its memory decays 512x between updates)
+       - Lambda optimized for level 3 → level 0 retains too aggressively
+         (it never forgets, memory saturates)
+       This is RETENTION INTERFERENCE — levels fight over a shared parameter.
+       The optimizer sees conflicting gradient signals and oscillates.
+
+FIX:   Each CMS level gets its own retention parameters.
+       retention_lambdas: Vec<nn::Parameter> with len == k (number of levels).
+       The frequency scheduler ensures each level's lambda is optimized
+       independently by its own gradient stream.
+SEVERITY: Warning — silent performance degradation, not crash
+TRACE: Committee review cycle; frequency scheduler error buffer analysis
 ```

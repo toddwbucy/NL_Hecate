@@ -117,6 +117,33 @@ FUNCTION: advance_pulse(pulse: &mut Pulse, chunk_sizes: &[u64])
   -- Every component reads pulse.active_levels to decide whether to update
 ```
 
+## Error Buffer Health Invariant
+
+```
+-- When a level is frozen for C steps, its error buffer accumulates C gradients.
+-- If these gradients are correlated (same sign), the accumulated norm grows linearly.
+-- Applied all at once, this creates a "bomb" — one giant update at sync time.
+
+INVARIANT: Error Buffer Norm Ratio
+  At every sync point (when level i fires), monitor:
+
+  norm_ratio = ||error_buffers[level]|| / ||grad_fn(level)||
+    where the denominator is the CURRENT single-step gradient magnitude
+
+  IF norm_ratio > threshold (configurable, default 10.0):
+    LOG WARNING: "Error buffer for level {level} at {norm_ratio}x single-step norm"
+    OPTIONALLY: clip error_buffers[level] to threshold * ||grad_fn(level)||
+
+  WHY 10.0: For level 3 (C=512), accumulating 512 random gradients gives
+  expected norm_ratio ≈ sqrt(512) ≈ 22.6 (random walk).
+  If norm_ratio >> sqrt(C), gradients are correlated (systematic signal).
+  If norm_ratio < sqrt(C), some cancellation occurred (expected).
+  10.0 as default catches pathological accumulation while allowing normal behavior.
+
+  THIS IS A HEALTH CHECK, NOT A TRAINING SIGNAL.
+  It monitors for pathology — it does not steer the optimizer.
+```
+
 ## Axiom Compliance
 
 - **NL IS #2** (nested, multi-level, parallel): Frequency scheduler CREATES the multi-level structure

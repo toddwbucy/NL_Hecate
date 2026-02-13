@@ -42,7 +42,7 @@ CONTRACT
   -- MIRAS design space constraints
   -- "Don't force same attentional bias, don't restrict memory structure"
 
-06_infrastructure.md  CS-39 through CS-47
+06_infrastructure.md  CS-39 through CS-48
   -- Implementation-level constraints from Track A experience
   -- "Clamp decay, opt-in AD, DDP inflates, compile can't trace"
 ```
@@ -98,7 +98,7 @@ MIRAS (4 smells):
   CS-35  Don't assume GD is the only memory algorithm
   CS-36  Don't restrict retention to quadratic/linear only
 
-INFRASTRUCTURE (9 smells):
+INFRASTRUCTURE (10 smells):
   CS-39  Learnable decay parameters must be clamped [CRITICAL]
   CS-40  Differentiation is opt-in, not opt-out [CRITICAL]
   CS-41  GPU utilization != throughput
@@ -108,6 +108,7 @@ INFRASTRUCTURE (9 smells):
   CS-45  NL cannot fill high-end GPUs
   CS-46  Graph tracing cannot trace NL inner loops
   CS-47  In-place modification destroys reproducibility [CRITICAL]
+  CS-48  Shared retention parameters across CMS levels
 ```
 
 ## Enforcement Strategy
@@ -125,7 +126,7 @@ LEVEL 2: Structural (AST-checkable)
 
 LEVEL 3: Semantic (review-required)
   -- CS-02, CS-03, CS-05, CS-06, CS-07, CS-08, CS-09, CS-14 through CS-17,
-  -- CS-24 through CS-30, CS-33 through CS-36
+  -- CS-24 through CS-30, CS-33 through CS-36, CS-48
   -- Enforce: code review against smell descriptions
   -- Semi-automated: review checklist
 

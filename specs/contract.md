@@ -1,6 +1,6 @@
 # nl.Module Contract
 
-**Version**: 0.3.0
+**Version**: 0.4.0
 **Repository**: NL_Hecate
 **Language Target**: Rust + CUDA (core), Python + PyO3 (orchestration bindings)
 **Differentiation**: Enzyme (LLVM-level AD on Rust) + hand-written kernel pairs (CUDA)
@@ -309,6 +309,13 @@ struct Pulse {
   phase: Phase,              // Build | Test | Stream (replaces train/eval)
 }
 
+-- Note: there is no "train" or "eval" phase. The forward pass runs the
+-- SAME CODE in all phases. The ONLY difference: in Build phase, Enzyme's
+-- AD graph is live downstream of the forward pass (computing outer-loop
+-- gradients). In Test/Stream, Enzyme is inactive. The model itself never
+-- checks what phase it's in — the Conductor owns that decision.
+-- This is "same forward code, different computational context."
+
 RULE: Every STEP, WRITE, READ, and FORWARD function takes a &Pulse.
       Components use it to determine:
         - Whether they should update (frequency scheduling)
@@ -392,7 +399,7 @@ RULE: Every memory update rule specifies which parallelization
 
 ### 9. Code Smell Enforcement
 
-47 code smells (CS-01 through CS-47) define what code must NOT look like. Key categories:
+48 code smells (CS-01 through CS-48) define what code must NOT look like. Key categories:
 
 ```
 Ontological smells (CS-01, CS-10, CS-11, CS-13, CS-37, CS-38):
@@ -412,14 +419,16 @@ MIRAS smells (CS-33 through CS-36):
   - Don't assume GD is the only algorithm
   - Don't restrict retention to L2 only
 
-Infrastructure smells (CS-40 through CS-47):
-  - Autograd is opt-out not opt-in
+Infrastructure smells (CS-39 through CS-48):
+  - Learnable decay must be clamped
+  - Autograd is opt-in not opt-out
   - GPU utilization != throughput
   - Gradient checkpointing hurts NL
   - DDP inflates reported throughput
   - NL cannot fill high-end GPUs
   - torch.compile cannot trace NL inner loops
   - In-place modification destroys reproducibility
+  - Shared retention parameters across CMS levels
 ```
 
 ### 10. Committee Findings (v0.3.0)
@@ -436,13 +445,12 @@ FINDING 1: Differentiation Barrier Enforcement
   Updated:  Section 4 (Differentiation), differentiation/00_enzyme_integration.md,
             memory_update_rules/00_interface.md
 
-FINDING 2: Pulse Reconciliation Protocol
+FINDING 2: Pulse Reconciliation Protocol (DEFERRED TO PHASE 2)
   Problem:  The conductor assumed perfect lockstep synchronization across GPUs.
-            CMS asymmetric workloads cause pulse drift → deadlocks.
-  Fix:      PulseEnvelope with (pulse_id, rank, level, timestamp) on ALL messages.
-            Wait-for-pulse timeout (30s default) with defined failure state.
-            MAX_PULSE_SKEW bound (4 pulses) prevents memory exhaustion.
-            High-frequency levels may take local steps without global sync.
+            CMS asymmetric workloads COULD cause pulse drift → deadlocks.
+  Status:   Phase 1 uses synchronous barrier sync (allreduce). Pulse skew
+            cannot occur. Protocol deferred until asynchronous advancement
+            is introduced. See scheduling/00_conductor.md for full protocol.
   Updated:  scheduling/00_conductor.md, distribution/00_multi_gpu.md
 
 FINDING 3: Compile-Time Composition Safety
@@ -466,7 +474,65 @@ FINDING 4: Stream-State Coupling
             state_lifecycle/00_state_ownership.md
 ```
 
-### 11. What This Contract Does NOT Specify
+### 11. Toolchain Constraints (v0.4.0)
+
+```
+Enzyme pins the LLVM version. The LLVM version pins the Rust nightly.
+The Rust nightly constrains which language features and libraries are available.
+This is an ARCHITECTURAL constraint, not a build detail.
+
+CONSTRAINT CHAIN:
+  Enzyme requires LLVM version X
+  → Rust nightly Y targets LLVM X (not all nightlies do)
+  → Language features available in nightly Y constrain the trait system design
+  → CUDA toolkit Z must link with the same LLVM version
+  → PyO3 version must support nightly Y
+
+RULE: The Enzyme→LLVM→Rust compatibility matrix MUST be resolved in Phase 0
+      (the Enzyme spike), BEFORE any production code is written.
+      If the trait system design (marker traits, associated types, builder
+      pattern with generic bounds) requires features unavailable in the
+      Enzyme-compatible nightly, the trait system adapts, not the toolchain.
+
+RULE: Phase 0 produces a pinned toolchain document:
+      - Exact Rust nightly version
+      - Exact LLVM version (Enzyme requirement)
+      - Exact CUDA toolkit version
+      - List of Rust features AVAILABLE under this toolchain
+      - List of Rust features UNAVAILABLE (and workarounds if needed)
+      - Verified: trait system patterns compile under pinned toolchain
+
+See: infrastructure/track_zero/00_track_zero.md for Phase 0 spike definition.
+```
+
+### 12. Implementation Sequence (v0.4.0)
+
+```
+Defined by committee review cycle. Non-negotiable ordering.
+
+Phase 0: Enzyme Spike (2 weeks, time-boxed)
+  → Can Enzyme differentiate through our Rust trait patterns?
+  → Three outcomes: works / works with simplifications / doesn't work
+  → Deliverable: spike notebook + pinned toolchain (or go/no-go on Enzyme)
+
+Phase 1: Track Zero (2-4 weeks)
+  Zero-A: Pure SWA attention, no memory. Match PyTorch Transformer baseline.
+  Zero-B: Delta Rule + MAG + k=1. Match PyTorch reference implementation.
+  → Deliverable: working pipeline, regression anchors passing
+
+Phase 2: CMS Introduction (k=2)
+  → Error buffer health monitoring, retention interference analysis
+  → TRANSITION CRITERIA: k=2 must beat k=1 on at least one metric
+  → If k=2 doesn't beat k=1, debug CMS before adding more levels
+
+Phase 3: Full Design Space (k=4, multiple rules)
+  → Combinatorial validation at 100/1K/10K/100K step horizons
+  → Falsification: >20% degenerate combinations = orthogonality is wrong
+
+See: infrastructure/track_zero/00_track_zero.md for full specification.
+```
+
+### 13. What This Contract Does NOT Specify
 
 - **Hyperparameters**: Chunk sizes, frequency multipliers, learning rates — application-dependent
 - **Model architecture**: How many blocks, what composition per block — that's model design
@@ -528,6 +594,8 @@ specs/                              <- root node
     compilation/                    <- Self-modifying graph compilation
     serving/                        <- Serving non-stationary models
     context_stream/                 <- DataLoader replacement
+    precision/                      <- Numerical precision strategy (v0.4.0)
+    track_zero/                     <- First implementation milestone (v0.4.0)
   constraints/                      <- Enforcement rules
     code_smells/                    <- CS-01 through CS-47
     trait_system/                   <- Valid composition pairings

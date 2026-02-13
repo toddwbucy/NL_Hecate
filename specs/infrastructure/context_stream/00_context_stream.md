@@ -38,11 +38,26 @@ TRAIT: ContextStream
 STRUCT: TokenChunk
   tokens: Vec<u32>,            -- token IDs
   chunk_id: u64,               -- monotonic chunk counter
-  document_boundary: bool,     -- true if this chunk crosses a document boundary
+  boundary: Option<BoundaryEvent>,  -- typed boundary (replaces boolean)
 
   -- Note: the model processes ALL chunks identically.
-  -- document_boundary is metadata for the Conductor, not the model.
+  -- boundary is metadata for the Conductor, not the model.
   -- The Conductor may choose to reset ContextMemory at boundaries.
+
+ENUM: BoundaryEvent
+  DocumentEnd,       -- end of a document in the corpus
+  ChunkBoundary,     -- CMS chunk boundary (frequency-aligned)
+  SessionEnd,        -- end of an interactive session
+  FrequencySync,     -- CMS level synchronization point
+
+  -- WHY a typed enum instead of bool:
+  -- A boolean says "something happened" but not WHAT.
+  -- The Conductor needs to know what boundary to choose the right action:
+  --   DocumentEnd → optionally reset context memory
+  --   ChunkBoundary → normal CMS boundary handling
+  --   SessionEnd → flush all state, prepare for new context
+  --   FrequencySync → error buffer sync across levels
+  -- A bool collapses all four into "true" — losing information.
 ```
 
 ## Why Not DataLoader
@@ -109,7 +124,7 @@ The ContextStream trait is intentionally minimal. Implementations can wrap:
 
   4. Interactive: Live user input for inference/Stream phase
      -- Single-user, real-time token stream.
-     -- document_boundary = true at conversation breaks.
+     -- boundary = Some(SessionEnd) at conversation breaks.
 
 All of these produce the same TokenChunk interface.
 The model doesn't know or care which one is behind the stream.

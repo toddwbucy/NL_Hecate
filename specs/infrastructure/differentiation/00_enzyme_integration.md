@@ -238,6 +238,33 @@ TEST CLASS 2: Analytical Correctness
 -- The barrier test catches the silent corruption scenario:
 --   Enzyme traces a pointer mutation, produces a valid-looking number,
 --   but the gradient is mathematical garbage.
+
+TEST CLASS 3: Integration Gradient Test (Track Zero gate)
+  -- Compute d(loss)/d(W_K) through a COMPLETE small forward pass.
+  -- Single block, 64x64 matrices, 3 chunks of 8 tokens.
+  -- This catches chain-rule COMPOSITION bugs that kernel-level tests miss.
+
+  fn test_integration_gradient() {
+    let config = SmallConfig { d: 64, chunks: 3, chunk_size: 8 };
+    let model = build_single_block(config);
+
+    // (a) Enzyme: the production path (Rust + kernel pairs + chain rule)
+    let enzyme_grad = enzyme_reverse(model.forward(data), model.w_k);
+
+    // (b) Finite differences: numerical ground truth
+    let numerical_grad = finite_differences(
+      |w_k| model.forward_with(w_k, data), model.w_k, epsilon=1e-5
+    );
+
+    // Must match within tolerance
+    assert_close!(enzyme_grad, numerical_grad, rtol=1e-4, atol=1e-6,
+      "Integration gradient: Enzyme chain rule composition is broken");
+  }
+
+  -- WHY this matters: kernel-level tests verify each piece.
+  -- Integration tests verify the COMPOSITION via chain rule.
+  -- If Enzyme mis-chains two correct kernels, kernel tests pass
+  -- but integration tests fail. This is the Track Zero-A pass criterion.
 ```
 
 ## Mandatory Trait Bound: EnzymeOpaque
