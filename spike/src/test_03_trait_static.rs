@@ -176,6 +176,9 @@ pub fn run() -> (usize, usize) {
 
         let fd_state = (apply_momentum(&rule, state + eps, input) - apply_momentum(&rule, state - eps, input)) / (2.0 * eps);
         if check_gradient("momentum: d/d_state", d_state, fd_state, tol) { pass += 1; } else { fail += 1; }
+
+        let fd_input = (apply_momentum(&rule, state, input + eps) - apply_momentum(&rule, state, input - eps)) / (2.0 * eps);
+        if check_gradient("momentum: d/d_input", d_input, fd_input, tol) { pass += 1; } else { fail += 1; }
     }
 
     // --- Gated Rule (two learnable params) ---

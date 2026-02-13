@@ -88,10 +88,9 @@ extern "C" fn ffi_kernel_backward(
 /// If no:  Enzyme returns zero gradient, and we need manual composition.
 #[autodiff(d_ffi_wrapper, Reverse, Active, Active, Active, Active)]
 fn ffi_wrapper(state: f32, input: f32, lr: f32) -> f32 {
-    // Call through C ABI
-    unsafe {
-        ffi_kernel_forward(state, input, lr)
-    }
+    // Call through C ABI — no unsafe needed since ffi_kernel_forward
+    // is declared as extern "C" fn, not unsafe extern "C" fn
+    ffi_kernel_forward(state, input, lr)
 }
 
 // ============================================================

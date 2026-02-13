@@ -18,7 +18,7 @@ Layer 2: Rust   — All math, control flow, Enzyme AD. Trait system enforces val
 Layer 1: CUDA   — Kernel pairs (forward + backward). Opaque to Enzyme. Hardware-specific.
 ```
 
-**Kernel-Pair Pattern**: Every hot operation has three implementations: (1) Rust reference (portable, Enzyme-compatible), (2) CUDA forward kernel, (3) CUDA backward kernel with analytical gradients from papers. Enzyme chains through pairs via `#[custom_vjp]` — same pattern as FlashAttention/PyTorch autograd.
+**Kernel-Pair Pattern**: Every hot operation has three implementations: (1) Rust reference (portable, Enzyme-compatible), (2) CUDA forward kernel, (3) CUDA backward kernel with analytical gradients from papers. The spec envisions Enzyme chaining through pairs via `#[custom_vjp]` and `#[enzyme_opaque]`, but these annotations are **not yet exposed** in the Rust-Enzyme wrapper (they exist internally in Enzyme but are not surfaced). Currently the Rust integration only exposes `#[autodiff]` (expands to internal `#[rustc_autodiff]`) and `#[no_autodiff]`. The Phase 0 spike validates a workaround: manual chain-rule composition at kernel boundaries using FFI barriers as opaque regions, with Enzyme differentiating the Rust portions and hand-written backward kernels providing analytical gradients for the opaque CUDA portions. `#[custom_vjp]` and `#[enzyme_opaque]` remain planned future features — the architecture is designed for them but does not depend on them.
 
 **Toolchain dependency chain**: LLVM version → Rust nightly → CUDA toolkit (all interdependent via Enzyme).
 
@@ -60,9 +60,10 @@ Three ways to combine memory with attention: MAC (memory-attention-memory, seque
 
 ### Differentiation (Two mechanisms composing via chain rule)
 
-- **Enzyme AD**: Differentiates Rust code at LLVM IR level. Annotations: `#[autodiff]`, `#[enzyme_opaque]`, `#[custom_vjp]`, `#[no_autodiff]`
+- **Enzyme AD**: Differentiates Rust code at LLVM IR level. Currently supported annotations: `#[autodiff]` (reverse/forward mode, expands to `#[rustc_autodiff]`), `#[no_autodiff]`. Planned but not yet available in Rust wrapper: `#[custom_vjp]`, `#[enzyme_opaque]`.
 - **Hand-written backward kernels**: Analytical gradients from papers, opaque to Enzyme
-- **Critical**: Inner-loop operations are `#[custom_vjp]`, NOT `#[no_autodiff]` — outer-loop gradients flow THROUGH them
+- **Phase 0 strategy**: Since `#[custom_vjp]` is not yet available, the spike validates manual chain-rule composition — Enzyme differentiates Rust code on either side of a kernel boundary (FFI barrier), and hand-written backward kernels provide gradients for the opaque middle. The upstream gradient is passed as the seed to Enzyme's reverse-mode call, composing the full gradient in one shot.
+- **Critical**: Inner-loop operations must allow outer-loop gradients to flow THROUGH them (the spec's `#[custom_vjp]` intent) — currently achieved via manual composition rather than annotation
 
 ### Numerical Precision
 
@@ -81,7 +82,7 @@ Full index: `specs/constraints/code_smells/00_index.md`
 
 ## Implementation Roadmap (Track Zero)
 
-1. **Phase 0** (2 weeks): Enzyme spike — prove Enzyme differentiates through Rust trait dispatch + `#[custom_vjp]`
+1. **Phase 0** (2 weeks): Enzyme spike — prove Enzyme differentiates through Rust trait dispatch + manual chain-rule composition at kernel boundaries (see `spike/`)
 2. **Track Zero-A** (2-4 weeks): Pure SWA attention, no memory — validate full Rust→Enzyme→CUDA→Python pipeline
 3. **Track Zero-B**: Delta Rule + MAG — validate gradient flow through memory
 4. **Phase 2**: CMS k=2 — verify multi-level scheduling

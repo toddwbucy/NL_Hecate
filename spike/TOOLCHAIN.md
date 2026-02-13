@@ -43,8 +43,8 @@ cd rust-enzyme
 # Build stage 1 (expect 1-3 hours)
 ./x build --stage 1 library
 
-# Link as rustup toolchain
-rustup toolchain link enzyme build/host/stage1
+# Link as rustup toolchain (use your host triple, not "host")
+rustup toolchain link enzyme build/x86_64-unknown-linux-gnu/stage1
 ```
 
 ### Verification
