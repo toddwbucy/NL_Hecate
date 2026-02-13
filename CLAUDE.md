@@ -12,7 +12,7 @@ NL_Hecate is a specification-first implementation of the Nested Learning (NL) re
 
 ## Architecture: Three Layers
 
-```
+```text
 Layer 3: Python — PyO3 bindings, orchestration, configuration. No math.
 Layer 2: Rust   — All math, control flow, Enzyme AD. Trait system enforces valid compositions.
 Layer 1: CUDA   — Kernel pairs (forward + backward). Opaque to Enzyme. Hardware-specific.

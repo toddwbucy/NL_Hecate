@@ -182,7 +182,7 @@ pub fn run() -> (usize, usize) {
         assert!((val - expected).abs() < 1e-6);
 
         // Check if Enzyme differentiated through the FFI call
-        let enzyme_saw_through = d_state_e.abs() > 1e-10 || d_input_e.abs() > 1e-10;
+        let enzyme_saw_through = d_state_e.abs() > 1e-10 || d_input_e.abs() > 1e-10 || d_lr_e.abs() > 1e-10;
 
         if enzyme_saw_through {
             println!("  [INFO] Enzyme DID see through extern \"C\" (same compilation unit).");
@@ -202,6 +202,7 @@ pub fn run() -> (usize, usize) {
             // Verify hand-written backward matches finite diff
             if check_gradient("B: hand_backward d_state vs fd", hand_state, fd_state, tol) { pass += 1; } else { fail += 1; }
             if check_gradient("B: hand_backward d_input vs fd", hand_input, fd_input, tol) { pass += 1; } else { fail += 1; }
+            if check_gradient("B: hand_backward d_lr vs fd", hand_lr, fd_lr, tol) { pass += 1; } else { fail += 1; }
         }
     }
 
@@ -212,13 +213,14 @@ pub fn run() -> (usize, usize) {
         let expected = delta_kernel_forward(state, input, lr);
         assert!((val - expected).abs() < 1e-6);
 
-        let enzyme_saw_through = d_state_e.abs() > 1e-10 || d_input_e.abs() > 1e-10;
+        let enzyme_saw_through = d_state_e.abs() > 1e-10 || d_input_e.abs() > 1e-10 || d_lr_e.abs() > 1e-10;
 
         if enzyme_saw_through {
             println!("  [INFO] Enzyme DID see through black_box.");
             println!("  [INFO] black_box is NOT a reliable opaque barrier for Enzyme.");
             if check_gradient("C: d/d_state (enzyme vs fd)", d_state_e, fd_state, tol) { pass += 1; } else { fail += 1; }
             if check_gradient("C: d/d_input (enzyme vs fd)", d_input_e, fd_input, tol) { pass += 1; } else { fail += 1; }
+            if check_gradient("C: d/d_lr (enzyme vs fd)", d_lr_e, fd_lr, tol) { pass += 1; } else { fail += 1; }
         } else {
             println!("  [INFO] Enzyme did NOT see through black_box — gradients are zero.");
             println!("  [INFO] black_box IS a reliable opaque barrier.");
