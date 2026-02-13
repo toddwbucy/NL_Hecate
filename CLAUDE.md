@@ -116,7 +116,7 @@ Each core paper is decomposed into `{prefix}_equations`, `{prefix}_definitions`,
 
 ### Cross-Cutting Collections
 
-- `nl_code_smells` (47) — all code smell constraints
+- `nl_code_smells` (48) — all code smell constraints (CS-01 through CS-48)
 - `nl_reframings` (33) — PyTorch→NL concept mappings
 - `nl_optimizers` (14) — optimizer catalog
 - `nl_toolchain` (15) — Enzyme/Rust/CUDA toolchain notes

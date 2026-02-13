@@ -68,16 +68,19 @@ extern "C" fn ffi_kernel_forward(state: f32, input: f32, lr: f32) -> f32 {
 }
 
 // The hand-written backward for the FFI kernel.
+// Marked unsafe: caller is responsible for passing valid, non-null pointers.
 #[no_mangle]
-extern "C" fn ffi_kernel_backward(
+unsafe extern "C" fn ffi_kernel_backward(
     state: f32, input: f32, lr: f32, d_out: f32,
     d_state: *mut f32, d_input: *mut f32, d_lr: *mut f32,
 ) {
-    unsafe {
-        *d_state = d_out * (1.0 - lr);
-        *d_input = d_out * lr;
-        *d_lr = d_out * (input - state);
-    }
+    debug_assert!(!d_state.is_null(), "d_state must not be null");
+    debug_assert!(!d_input.is_null(), "d_input must not be null");
+    debug_assert!(!d_lr.is_null(), "d_lr must not be null");
+
+    *d_state = d_out * (1.0 - lr);
+    *d_input = d_out * lr;
+    *d_lr = d_out * (input - state);
 }
 
 /// Wrapper that Enzyme differentiates.
