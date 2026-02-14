@@ -192,6 +192,46 @@ pub fn cross_entropy_loss(logits: &[f32], targets: &[usize], seq_len: usize, voc
     }
 }
 
+/// Sigmoid: 1 / (1 + exp(-x)). Clamped to avoid overflow.
+#[inline]
+pub fn sigmoid_f32(x: f32) -> f32 {
+    if x >= 15.0 { return 1.0; }
+    if x <= -15.0 { return 0.0; }
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// Softplus: ln(1 + exp(x)). Numerically stable.
+#[inline]
+pub fn softplus_f32(x: f32) -> f32 {
+    if x >= 15.0 { return x; }
+    if x <= -15.0 { return 0.0; }
+    (1.0 + x.exp()).ln()
+}
+
+/// Outer product: out[d1, d2] = a[d1] * b[d2]. Row-major.
+/// `out` must be pre-allocated with d1*d2 elements (will be overwritten).
+pub fn outer_product_f32(a: &[f32], b: &[f32], out: &mut [f32]) {
+    let d1 = a.len();
+    let d2 = b.len();
+    debug_assert_eq!(out.len(), d1 * d2);
+    for i in 0..d1 {
+        for j in 0..d2 {
+            out[i * d2 + j] = a[i] * b[j];
+        }
+    }
+}
+
+/// Frobenius dot product: sum_ij A[i,j] * B[i,j].
+/// Both A and B are flat slices of the same length.
+pub fn frobenius_dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut sum = 0.0f32;
+    for i in 0..a.len() {
+        sum += a[i] * b[i];
+    }
+    sum
+}
+
 /// Simple xorshift64 PRNG for deterministic weight init. Not crypto-safe.
 pub struct SimpleRng {
     state: u64,
@@ -338,5 +378,44 @@ mod tests {
         for &v in &buf {
             assert!(v >= -0.1 && v <= 0.1, "Value {} out of range", v);
         }
+    }
+
+    #[test]
+    fn test_sigmoid() {
+        assert!((sigmoid_f32(0.0) - 0.5).abs() < 1e-6);
+        assert!((sigmoid_f32(100.0) - 1.0).abs() < 1e-6);
+        assert!((sigmoid_f32(-100.0) - 0.0).abs() < 1e-6);
+        // sigmoid(3.0) ≈ 0.9526
+        assert!((sigmoid_f32(3.0) - 0.9526).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_softplus() {
+        // softplus(0) = ln(2) ≈ 0.6931
+        assert!((softplus_f32(0.0) - 0.6931).abs() < 0.001);
+        // softplus(large) ≈ large
+        assert!((softplus_f32(20.0) - 20.0).abs() < 0.01);
+        // softplus(-large) ≈ 0
+        assert!(softplus_f32(-20.0) < 1e-6);
+        // softplus(-4.6) ≈ 0.01
+        assert!((softplus_f32(-4.6) - 0.01).abs() < 0.002);
+    }
+
+    #[test]
+    fn test_outer_product() {
+        let a = [1.0, 2.0, 3.0f32];
+        let b = [4.0, 5.0f32];
+        let mut out = [0.0f32; 6];
+        outer_product_f32(&a, &b, &mut out);
+        assert_eq!(out, [4.0, 5.0, 8.0, 10.0, 12.0, 15.0]);
+    }
+
+    #[test]
+    fn test_frobenius_dot() {
+        let a = [1.0, 2.0, 3.0, 4.0f32];
+        let b = [5.0, 6.0, 7.0, 8.0f32];
+        let dot = frobenius_dot_f32(&a, &b);
+        // 1*5 + 2*6 + 3*7 + 4*8 = 5+12+21+32 = 70
+        assert!((dot - 70.0).abs() < 1e-6);
     }
 }
