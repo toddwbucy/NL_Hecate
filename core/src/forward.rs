@@ -44,6 +44,10 @@ pub fn forward(
     let hd = cfg.head_dim;
     let ws = cfg.window_size;
 
+    assert_eq!(
+        d, nh * hd,
+        "forward: d_model must equal num_heads * head_dim: d_model={d}, num_heads={nh}, head_dim={hd}"
+    );
     assert!(
         input_ids.len() >= s,
         "forward: input_ids length {} < seq_len {}", input_ids.len(), s
@@ -53,14 +57,20 @@ pub fn forward(
         "forward: target_ids length {} < seq_len {}", target_ids.len(), s
     );
 
+    // Validate all input tokens are in-vocab (consistent with backward_full assert)
+    for t in 0..s {
+        assert!(
+            input_ids[t] < v,
+            "forward: input_ids[{t}]={} >= vocab_size {v}", input_ids[t]
+        );
+    }
+
     // Stage 1: Embedding lookup
     let mut embedded = vec![0.0f32; s * d];
     for t in 0..s {
         let tok = input_ids[t];
-        if tok < v {
-            let src = &params.w_embed[tok * d..(tok + 1) * d];
-            embedded[t * d..(t + 1) * d].copy_from_slice(src);
-        }
+        let src = &params.w_embed[tok * d..(tok + 1) * d];
+        embedded[t * d..(t + 1) * d].copy_from_slice(src);
     }
 
     // Stage 2: QKV projections — Q = X @ W_Q^T, etc.

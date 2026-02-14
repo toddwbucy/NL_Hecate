@@ -8,21 +8,15 @@ use crate::model::{SWAConfig, SWAParams};
 use crate::forward::ForwardCache;
 
 /// Gradients for all intermediate activations.
-pub struct BackwardGrads {
-    /// d_loss/d_logits: [seq_len, vocab_size]
-    pub d_logits: Vec<f32>,
-    /// d_loss/d_projected: [seq_len, d_model]
-    pub d_projected: Vec<f32>,
-    /// d_loss/d_attn_out: [seq_len, d_model]
-    pub d_attn_out: Vec<f32>,
-    /// d_loss/d_q: [seq_len, d_model]
-    pub d_q: Vec<f32>,
-    /// d_loss/d_k: [seq_len, d_model]
-    pub d_k: Vec<f32>,
-    /// d_loss/d_v: [seq_len, d_model]
-    pub d_v: Vec<f32>,
-    /// d_loss/d_embedded: [seq_len, d_model]
-    pub d_embedded: Vec<f32>,
+#[allow(dead_code)]
+pub(crate) struct BackwardGrads {
+    pub(crate) d_logits: Vec<f32>,
+    pub(crate) d_projected: Vec<f32>,
+    pub(crate) d_attn_out: Vec<f32>,
+    pub(crate) d_q: Vec<f32>,
+    pub(crate) d_k: Vec<f32>,
+    pub(crate) d_v: Vec<f32>,
+    pub(crate) d_embedded: Vec<f32>,
 }
 
 /// Internal backward pass returning parameter gradients AND d_embedded.
@@ -44,14 +38,20 @@ fn backward_internal(
 
     // ── Stage 6: Cross-entropy gradient ──────────────────────────────
     // d_loss/d_logits = softmax(logits) - one_hot(target) / seq_len
+    // Guard: target_ids may be shorter than seq_len; only count positions
+    // that are both in-bounds and have a valid vocab index.
     let mut d_logits = vec![0.0f32; s * v];
-    let count = target_ids.iter().filter(|&&t| t < v).count() as f32;
+    let count = (0..s)
+        .filter(|&t| target_ids.get(t).map_or(false, |&tok| tok < v))
+        .count() as f32;
     if count > 0.0 {
         for t in 0..s {
+            let target = match target_ids.get(t) {
+                Some(&tok) if tok < v => tok,
+                _ => continue,
+            };
             let base = t * v;
             let row = &cache.logits[base..base + v];
-            let target = target_ids[t];
-            if target >= v { continue; }
 
             // softmax of logits row
             let max_val = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -192,6 +192,8 @@ fn backward_internal(
 }
 
 /// Backward pass returning parameter gradients (without embedding gradient).
+/// Used by Phase 2 CUDA dispatch where some callers don't need embedding gradients.
+#[allow(dead_code)]
 pub fn backward(
     params: &SWAParams,
     cfg: &SWAConfig,
