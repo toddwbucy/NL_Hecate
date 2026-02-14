@@ -284,18 +284,269 @@ def run_timing(num_steps=500, lr=0.05):
     return rust_tps, pt_tps
 
 
+# ══════════════════════════════════════════════════════════════════
+#  MAG (Memory-Attention-Gate) baseline
+# ══════════════════════════════════════════════════════════════════
+
+MAG_SEQ_LEN = 8
+MAG_D_MODEL = 16
+MAG_NUM_HEADS = 2
+MAG_HEAD_DIM = 8
+MAG_WINDOW_SIZE = 8
+MAG_VOCAB_SIZE = 64
+
+
+def make_mag_config():
+    return nl_hecate.MAGConfig(
+        MAG_D_MODEL, MAG_NUM_HEADS, MAG_HEAD_DIM,
+        MAG_SEQ_LEN, MAG_WINDOW_SIZE, MAG_VOCAB_SIZE, True,
+    )
+
+
+MAG_TEXT = "the cat sat on the mat. " * 10
+MAG_BYTES = [b % MAG_VOCAB_SIZE for b in MAG_TEXT.encode("ascii")]
+
+
+def make_mag_chunks(data, seq_len):
+    chunks = []
+    for i in range(0, len(data) - seq_len, seq_len):
+        inp = data[i : i + seq_len]
+        tgt = data[i + 1 : i + seq_len + 1]
+        if len(tgt) == seq_len:
+            chunks.append((inp, tgt))
+    return chunks
+
+
+MAG_CHUNKS = make_mag_chunks(MAG_BYTES, MAG_SEQ_LEN)
+
+MAG_SWA_MASK = build_swa_mask(MAG_SEQ_LEN, MAG_WINDOW_SIZE)
+
+
+def load_mag_weights_from_rust(params):
+    """Extract MAG Rust weights and convert to PyTorch tensors."""
+    w = params.get_weights()
+    d = MAG_D_MODEL
+    v = MAG_VOCAB_SIZE
+    return {
+        # SWA weights
+        "w_embed": torch.tensor(w["w_embed"], dtype=torch.float32).reshape(v, d).requires_grad_(True),
+        "w_q": torch.tensor(w["w_q"], dtype=torch.float32).reshape(d, d).requires_grad_(True),
+        "w_k": torch.tensor(w["w_k"], dtype=torch.float32).reshape(d, d).requires_grad_(True),
+        "w_v": torch.tensor(w["w_v"], dtype=torch.float32).reshape(d, d).requires_grad_(True),
+        "w_o": torch.tensor(w["w_o"], dtype=torch.float32).reshape(d, d).requires_grad_(True),
+        "w_unembed": torch.tensor(w["w_unembed"], dtype=torch.float32).reshape(d, v).requires_grad_(True),
+        # Memory weights
+        "w_k_mem": torch.tensor(w["w_k_mem"], dtype=torch.float32).reshape(d, d).requires_grad_(True),
+        "w_v_mem": torch.tensor(w["w_v_mem"], dtype=torch.float32).reshape(d, d).requires_grad_(True),
+        "w_q_mem": torch.tensor(w["w_q_mem"], dtype=torch.float32).reshape(d, d).requires_grad_(True),
+        "w_alpha": torch.tensor(w["w_alpha"], dtype=torch.float32).requires_grad_(True),
+        "b_alpha": torch.tensor(w["b_alpha"], dtype=torch.float32).requires_grad_(True),
+        "w_theta": torch.tensor(w["w_theta"], dtype=torch.float32).requires_grad_(True),
+        "b_theta": torch.tensor(w["b_theta"], dtype=torch.float32).requires_grad_(True),
+    }
+
+
+def forward_pytorch_mag(weights, input_ids, target_ids):
+    """Full MAG forward: SWA attention + Delta Rule memory + sigmoid gating."""
+    s = MAG_SEQ_LEN
+    d = MAG_D_MODEL
+    nh = MAG_NUM_HEADS
+    hd = MAG_HEAD_DIM
+
+    inp = torch.tensor(input_ids, dtype=torch.long)
+    tgt = torch.tensor(target_ids, dtype=torch.long)
+
+    # Stage 1: Embedding
+    embedded = weights["w_embed"][inp]  # [s, d]
+
+    # Stage 2a: Attention branch — QKV projections
+    q = embedded @ weights["w_q"].T
+    k = embedded @ weights["w_k"].T
+    v = embedded @ weights["w_v"].T
+
+    # Stage 3a: Multi-head SWA attention
+    q_heads = q.reshape(s, nh, hd).permute(1, 0, 2)
+    k_heads = k.reshape(s, nh, hd).permute(1, 0, 2)
+    v_heads = v.reshape(s, nh, hd).permute(1, 0, 2)
+
+    scale = 1.0 / math.sqrt(hd)
+    scores = torch.bmm(q_heads, k_heads.transpose(1, 2)) * scale
+    scores = scores + MAG_SWA_MASK.unsqueeze(0)
+    attn_weights = torch.softmax(scores, dim=-1)
+    attn_out_heads = torch.bmm(attn_weights, v_heads)
+    attn_out = attn_out_heads.permute(1, 0, 2).reshape(s, d)
+
+    # Stage 2b+3b: Memory branch — Delta Rule (sequential)
+    M = torch.zeros(d, d)
+    y = torch.zeros(s, d)
+
+    for t in range(s):
+        x_t = embedded[t]  # [d]
+        k_t = x_t @ weights["w_k_mem"].T  # [d]
+        v_t = x_t @ weights["w_v_mem"].T
+        q_t = x_t @ weights["w_q_mem"].T
+
+        concat_kv = torch.cat([k_t, v_t])  # [2d]
+        alpha_t = torch.sigmoid(concat_kv @ weights["w_alpha"] + weights["b_alpha"])
+        theta_t = F.softplus(concat_kv @ weights["w_theta"] + weights["b_theta"])
+
+        prediction = M @ k_t
+        error = prediction - v_t
+        grad = torch.outer(error, k_t)
+        M = (1.0 - alpha_t) * M - theta_t * grad
+
+        y[t] = M @ q_t
+
+    # Stage 4: Gating
+    gate = torch.sigmoid(y)
+    gated_out = attn_out * gate
+
+    # Stage 5: Output projection
+    projected = gated_out @ weights["w_o"].T
+
+    # Stage 6: Unembed + cross-entropy loss
+    logits = projected @ weights["w_unembed"]
+    loss = F.cross_entropy(logits, tgt, reduction="mean")
+
+    return loss
+
+
+def sgd_step_mag_pytorch(weights, lr):
+    """Manual SGD for MAG weights."""
+    with torch.no_grad():
+        for w in weights.values():
+            if w.grad is not None:
+                w -= lr * w.grad
+                w.grad = None
+    for key in weights:
+        weights[key].requires_grad_(True)
+
+
+def run_comparison_mag(num_steps=100, lr=0.01):
+    """Train both MAG pipelines in lockstep, comparing per-step loss."""
+    print(f"\n{'='*60}")
+    print(f"  MAG COMPARISON: Rust vs PyTorch, {num_steps} steps, lr={lr}")
+    print(f"{'='*60}\n")
+
+    cfg = make_mag_config()
+    rust_params = nl_hecate.mag_init_params(cfg, seed=42)
+    pt_weights = load_mag_weights_from_rust(rust_params)
+
+    max_rel_err = 0.0
+    all_finite = True
+    first_rel_err = None
+
+    print(f"  {'step':>4s}  {'rust_loss':>10s}  {'pt_loss':>10s}  {'rel_err':>10s}")
+    print(f"  {'-'*4}  {'-'*10}  {'-'*10}  {'-'*10}")
+
+    for step in range(num_steps):
+        chunk_idx = step % len(MAG_CHUNKS)
+        inp, tgt = MAG_CHUNKS[chunk_idx]
+
+        # Rust forward + backward + SGD
+        rust_loss, rust_grads = nl_hecate.mag_compute_gradients(rust_params, cfg, inp, tgt)
+        nl_hecate.mag_sgd_step(rust_params, rust_grads, lr)
+
+        # PyTorch forward + backward + SGD
+        pt_loss_tensor = forward_pytorch_mag(pt_weights, inp, tgt)
+        pt_loss = pt_loss_tensor.item()
+        pt_loss_tensor.backward()
+        sgd_step_mag_pytorch(pt_weights, lr)
+
+        if not math.isfinite(rust_loss) or not math.isfinite(pt_loss):
+            all_finite = False
+
+        denom = max(abs(rust_loss), abs(pt_loss), 1e-12)
+        rel_err = abs(rust_loss - pt_loss) / denom
+
+        if step == 0:
+            first_rel_err = rel_err
+        max_rel_err = max(max_rel_err, rel_err)
+
+        if step < 5 or step % 10 == 0 or step == num_steps - 1:
+            print(f"  {step:4d}  {rust_loss:10.6f}  {pt_loss:10.6f}  {rel_err:10.2e}")
+
+    print("\n  Results:")
+    print(f"    Initial loss rel error (step 0): {first_rel_err:.2e}")
+    print(f"    Max relative error:              {max_rel_err:.2e}")
+    print(f"    All losses finite:               {all_finite}")
+
+    passed = True
+    if first_rel_err > 1e-5:
+        print(f"    FAIL: Initial loss rel error {first_rel_err:.2e} > 1e-5")
+        passed = False
+    if max_rel_err > 1e-3:
+        print(f"    FAIL: Max rel error {max_rel_err:.2e} > 1e-3")
+        passed = False
+    if not all_finite:
+        print("    FAIL: Non-finite losses detected")
+        passed = False
+
+    if passed:
+        print("\n    PASS: Rust and PyTorch MAG produce identical loss curves")
+    else:
+        print("\n    FAIL: MAG loss curves diverged beyond tolerance")
+
+    return passed, max_rel_err
+
+
+def run_timing_mag(num_steps=200, lr=0.01):
+    """Measure tok/s for MAG pipeline."""
+    print(f"\n{'='*60}")
+    print(f"  MAG TIMING: {num_steps} steps each, seq_len={MAG_SEQ_LEN}")
+    print(f"{'='*60}\n")
+
+    cfg = make_mag_config()
+    total_tokens = num_steps * MAG_SEQ_LEN
+
+    # Rust timing
+    rust_params = nl_hecate.mag_init_params(cfg, seed=42)
+    t0 = time.perf_counter()
+    for step in range(num_steps):
+        inp, tgt = MAG_CHUNKS[step % len(MAG_CHUNKS)]
+        _loss, grads = nl_hecate.mag_compute_gradients(rust_params, cfg, inp, tgt)
+        nl_hecate.mag_sgd_step(rust_params, grads, lr)
+    rust_elapsed = time.perf_counter() - t0
+    rust_tps = total_tokens / rust_elapsed
+
+    # PyTorch timing
+    pt_params = nl_hecate.mag_init_params(cfg, seed=42)
+    pt_weights = load_mag_weights_from_rust(pt_params)
+    t0 = time.perf_counter()
+    for step in range(num_steps):
+        inp, tgt = MAG_CHUNKS[step % len(MAG_CHUNKS)]
+        loss = forward_pytorch_mag(pt_weights, inp, tgt)
+        loss.backward()
+        sgd_step_mag_pytorch(pt_weights, lr)
+    pt_elapsed = time.perf_counter() - t0
+    pt_tps = total_tokens / pt_elapsed
+
+    print("  Rust MAG pipeline:")
+    print(f"    {rust_elapsed:.3f}s, {rust_tps:,.0f} tok/s")
+    print("  PyTorch MAG pipeline:")
+    print(f"    {pt_elapsed:.3f}s, {pt_tps:,.0f} tok/s")
+    print(f"  Ratio: Rust is {rust_tps / pt_tps:.1f}x {'faster' if rust_tps > pt_tps else 'slower'}")
+
+    return rust_tps, pt_tps
+
+
 # ── Main ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Phase 4: PyTorch regression baseline")
-    parser.add_argument("--compare", action="store_true", help="Run comparison only")
-    parser.add_argument("--timing", action="store_true", help="Run timing only")
+    parser.add_argument("--compare", action="store_true", help="Run SWA comparison only")
+    parser.add_argument("--timing", action="store_true", help="Run SWA timing only")
+    parser.add_argument("--compare-mag", action="store_true", help="Run MAG comparison only")
+    parser.add_argument("--timing-mag", action="store_true", help="Run MAG timing only")
     args = parser.parse_args()
 
-    if not args.compare and not args.timing:
-        # Default: run both
+    any_flag = args.compare or args.timing or args.compare_mag or args.timing_mag
+    if not any_flag:
+        # Default: run all
         args.compare = True
         args.timing = True
+        args.compare_mag = True
+        args.timing_mag = True
 
     exit_code = 0
     if args.compare:
@@ -304,5 +555,11 @@ if __name__ == "__main__":
             exit_code = 1
     if args.timing:
         run_timing(num_steps=500)
+    if args.compare_mag:
+        passed, _ = run_comparison_mag(num_steps=100)
+        if not passed:
+            exit_code = 1
+    if args.timing_mag:
+        run_timing_mag(num_steps=200)
 
     sys.exit(exit_code)
