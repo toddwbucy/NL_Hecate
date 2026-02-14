@@ -4,6 +4,9 @@
 // Grid=(num_heads, seq_len), Block=(head_dim).
 // One block per (head, query_position). Computes dQ, dK, dV.
 //
+// bf16 storage for Q/K/V/attn_weights, f32 for all gradients.
+// All arithmetic in float. Matches forward kernel precision pattern.
+//
 // Matches backward.rs Stage 3 exactly:
 //   1. d_attn_w[w] = sum_d d_attn_out[q,h,d] * V[k,h,d]
 //   2. d_V[k,h,d] += weights[w] * d_attn_out[q,h,d]     (atomicAdd)
@@ -14,18 +17,19 @@
 // This file is compiled by nvcc into machine code (opaque to Enzyme).
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <float.h>
 #include <math.h>
 
 __global__ void swa_backward_kernel(
-    const float* __restrict__ q,           // [seq_len, total_dim]
-    const float* __restrict__ k,           // [seq_len, total_dim]
-    const float* __restrict__ v,           // [seq_len, total_dim]
-    const float* __restrict__ attn_weights,// [num_heads, seq_len, window_size]
-    const float* __restrict__ d_attn_out,  // [seq_len, total_dim]
-    float* __restrict__ d_q,               // [seq_len, total_dim]
-    float* __restrict__ d_k,               // [seq_len, total_dim]
-    float* __restrict__ d_v,               // [seq_len, total_dim]
+    const __nv_bfloat16* __restrict__ q,           // [seq_len, total_dim]
+    const __nv_bfloat16* __restrict__ k,           // [seq_len, total_dim]
+    const __nv_bfloat16* __restrict__ v,           // [seq_len, total_dim]
+    const __nv_bfloat16* __restrict__ attn_weights,// [num_heads, seq_len, window_size]
+    const float* __restrict__ d_attn_out,          // [seq_len, total_dim]
+    float* __restrict__ d_q,                       // [seq_len, total_dim]
+    float* __restrict__ d_k,                       // [seq_len, total_dim]
+    float* __restrict__ d_v,                       // [seq_len, total_dim]
     int seq_len, int num_heads, int head_dim, int window_size)
 {
     int h = blockIdx.x;       // head index
@@ -56,11 +60,11 @@ __global__ void swa_backward_kernel(
         float partial = 0.0f;
         if (d < head_dim) {
             partial = d_attn_out[q_pos * total_dim + h_offset + d]
-                    * v[k_pos * total_dim + h_offset + d];
+                    * __bfloat162float(v[k_pos * total_dim + h_offset + d]);
         }
 
-        // Warp reduction
-        unsigned mask = 0xFFFFFFFF;
+        // Warp-level reduction (head_dim <= 32 fits in one warp)
+        unsigned mask = __activemask();
         for (int offset = 16; offset > 0; offset >>= 1) {
             partial += __shfl_down_sync(mask, partial, offset);
         }
@@ -83,7 +87,8 @@ __global__ void swa_backward_kernel(
         float dao_val = d_attn_out[q_pos * total_dim + h_offset + d];
         for (int w = 0; w < win_len; w++) {
             int k_pos = win_start + w;
-            float aw = attn_weights[aw_base + w];
+            // Load attn_weights: bf16 → f32
+            float aw = __bfloat162float(attn_weights[aw_base + w]);
             atomicAdd(&d_v[k_pos * total_dim + h_offset + d], aw * dao_val);
         }
     }
@@ -93,11 +98,11 @@ __global__ void swa_backward_kernel(
     if (d == 0) {
         float dot_pw = 0.0f;
         for (int w = 0; w < win_len; w++) {
-            dot_pw += attn_weights[aw_base + w] * s_d_attn_w[w];
+            dot_pw += __bfloat162float(attn_weights[aw_base + w]) * s_d_attn_w[w];
         }
 
         for (int w = 0; w < win_len; w++) {
-            s_d_scores[w] = attn_weights[aw_base + w] * (s_d_attn_w[w] - dot_pw);
+            s_d_scores[w] = __bfloat162float(attn_weights[aw_base + w]) * (s_d_attn_w[w] - dot_pw);
         }
         for (int w = win_len; w < window_size; w++) {
             s_d_scores[w] = 0.0f;
@@ -111,11 +116,11 @@ __global__ void swa_backward_kernel(
         for (int w = 0; w < win_len; w++) {
             int k_pos = win_start + w;
             float ds = s_d_scores[w] * scale;
-            // d_Q[q,h,d] += d_scores[w] * K[k,h,d] * scale
-            dq_acc += ds * k[k_pos * total_dim + h_offset + d];
-            // d_K[k,h,d] += d_scores[w] * Q[q,h,d] * scale (atomicAdd)
+            // d_Q[q,h,d] += d_scores[w] * K[k,h,d] * scale (load K: bf16 → f32)
+            dq_acc += ds * __bfloat162float(k[k_pos * total_dim + h_offset + d]);
+            // d_K[k,h,d] += d_scores[w] * Q[q,h,d] * scale (atomicAdd, load Q: bf16 → f32)
             atomicAdd(&d_k[k_pos * total_dim + h_offset + d],
-                      ds * q[q_pos * total_dim + h_offset + d]);
+                      ds * __bfloat162float(q[q_pos * total_dim + h_offset + d]));
         }
         // d_Q: only one block writes to each q_pos, so direct write is safe
         atomicAdd(&d_q[q_pos * total_dim + h_offset + d], dq_acc);
@@ -123,8 +128,8 @@ __global__ void swa_backward_kernel(
 }
 
 extern "C" void swa_backward_f32_cuda(
-    const float* q, const float* k, const float* v,
-    const float* attn_weights, const float* d_attn_out,
+    const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
+    const __nv_bfloat16* attn_weights, const float* d_attn_out,
     float* d_q, float* d_k, float* d_v,
     int seq_len, int num_heads, int head_dim, int window_size)
 {

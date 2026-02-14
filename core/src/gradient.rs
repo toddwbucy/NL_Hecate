@@ -74,9 +74,13 @@ pub(crate) fn check_weight_gradient(
     let weight_vec = get_weight(params);
     let n = weight_vec.len();
 
-    // f32 FD resolution limit: smallest detectable gradient ≈ loss * f32_eps / (2*eps).
-    // With loss~2.8 and eps=1e-2: ~2.8 * 1.2e-7 / 0.02 ≈ 1.7e-5.
     // Auto-pass any gradient pair where both are below this threshold.
+    // f32 path: FD resolution ~1.7e-5, threshold at 5e-4.
+    // CUDA bf16 path: bf16 quantization (~0.8% relative) corrupts FD for small
+    // gradients. Raise threshold to 5e-3 to avoid false failures on tiny values.
+    #[cfg(feature = "cuda")]
+    let abs_threshold = 5e-3;
+    #[cfg(not(feature = "cuda"))]
     let abs_threshold = 5e-4;
 
     let step = if n > num_samples { n / num_samples } else { 1 };
@@ -150,8 +154,12 @@ mod tests {
     /// 2*eps*grad >> loss * f32_eps ≈ 3e-7.
     const FD_EPS: f32 = 1e-2;
     /// Tolerance: accounts for both FD truncation and f32 rounding.
-    /// With eps=1e-2, expect ~2-5% error for well-resolved gradients.
-    const FD_TOL: f32 = 0.10; // 10% relative error
+    /// f32 path: ~2-5% error → 10% tolerance.
+    /// CUDA bf16 path: bf16 quantization adds ~1% per load/store → 20% tolerance.
+    #[cfg(not(feature = "cuda"))]
+    const FD_TOL: f32 = 0.10;
+    #[cfg(feature = "cuda")]
+    const FD_TOL: f32 = 0.20;
 
     #[test]
     fn test_gradient_w_unembed() {

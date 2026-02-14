@@ -4,9 +4,14 @@
 // Grid=(num_heads, seq_len), Block=(head_dim).
 // One block per (head, query_position). Threads parallelize over head_dim.
 //
+// bf16 storage, f32 compute: Q/K/V/out/attn_weights stored as __nv_bfloat16,
+// all arithmetic in float. This matches production transformer precision
+// (FlashAttention-style) while keeping gradient-checkable accuracy.
+//
 // This file is compiled by nvcc into machine code (opaque to Enzyme).
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <float.h>
 #include <math.h>
 
@@ -15,11 +20,11 @@
 #define MAX_WINDOW 64
 
 __global__ void swa_forward_kernel(
-    const float* __restrict__ q,      // [seq_len, total_dim]
-    const float* __restrict__ k,      // [seq_len, total_dim]
-    const float* __restrict__ v,      // [seq_len, total_dim]
-    float* __restrict__ out,          // [seq_len, total_dim]
-    float* __restrict__ attn_weights, // [num_heads, seq_len, window_size]
+    const __nv_bfloat16* __restrict__ q,      // [seq_len, total_dim]
+    const __nv_bfloat16* __restrict__ k,      // [seq_len, total_dim]
+    const __nv_bfloat16* __restrict__ v,      // [seq_len, total_dim]
+    __nv_bfloat16* __restrict__ out,          // [seq_len, total_dim]
+    __nv_bfloat16* __restrict__ attn_weights, // [num_heads, seq_len, window_size]
     int seq_len, int num_heads, int head_dim, int window_size)
 {
     int h = blockIdx.x;       // head index
@@ -34,17 +39,17 @@ __global__ void swa_forward_kernel(
     int win_len = q_pos - win_start + 1;
 
     // Shared memory layout:
-    //   q_row[head_dim]          — cached Q row for this position
-    //   scores[window_size]      — raw attention scores
-    //   weights[window_size]     — softmax weights
+    //   q_row[head_dim]          — cached Q row for this position (f32)
+    //   scores[window_size]      — raw attention scores (f32)
+    //   weights[window_size]     — softmax weights (f32)
     extern __shared__ float smem[];
     float* q_row  = smem;                        // [head_dim]
     float* scores = smem + head_dim;              // [window_size]
     float* weights = smem + head_dim + window_size; // [window_size]
 
-    // Load Q row into shared memory
+    // Load Q row into shared memory (bf16 → f32)
     if (d < head_dim) {
-        q_row[d] = q[q_pos * total_dim + h_offset + d];
+        q_row[d] = __bfloat162float(q[q_pos * total_dim + h_offset + d]);
     }
     __syncthreads();
 
@@ -57,12 +62,12 @@ __global__ void swa_forward_kernel(
         float partial = 0.0f;
         if (w < win_len && d < head_dim) {
             int k_pos = win_start + w;
-            partial = q_row[d] * k[k_pos * total_dim + h_offset + d];
+            // Load K element: bf16 → f32
+            partial = q_row[d] * __bfloat162float(k[k_pos * total_dim + h_offset + d]);
         }
 
         // Warp-level reduction (head_dim <= 32 fits in one warp)
-        // Use full warp mask
-        unsigned mask = 0xFFFFFFFF;
+        unsigned mask = __activemask();
         for (int offset = 16; offset > 0; offset >>= 1) {
             partial += __shfl_down_sync(mask, partial, offset);
         }
@@ -94,11 +99,11 @@ __global__ void swa_forward_kernel(
             sum_exp += e;
         }
 
-        // Normalize and write to global attn_weights
+        // Normalize and write to global attn_weights (f32 → bf16)
         int aw_base = (h * seq_len + q_pos) * window_size;
         for (int w = 0; w < window_size; w++) {
             weights[w] /= sum_exp;
-            attn_weights[aw_base + w] = weights[w];
+            attn_weights[aw_base + w] = __float2bfloat16(weights[w]);
         }
     }
     __syncthreads();
@@ -108,15 +113,17 @@ __global__ void swa_forward_kernel(
         float acc = 0.0f;
         for (int w = 0; w < win_len; w++) {
             int k_pos = win_start + w;
-            acc += weights[w] * v[k_pos * total_dim + h_offset + d];
+            // Load V element: bf16 → f32
+            acc += weights[w] * __bfloat162float(v[k_pos * total_dim + h_offset + d]);
         }
-        out[q_pos * total_dim + h_offset + d] = acc;
+        // Store output: f32 → bf16
+        out[q_pos * total_dim + h_offset + d] = __float2bfloat16(acc);
     }
 }
 
 extern "C" void swa_forward_f32_cuda(
-    const float* q, const float* k, const float* v,
-    float* out, float* attn_weights,
+    const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
+    __nv_bfloat16* out, __nv_bfloat16* attn_weights,
     int seq_len, int num_heads, int head_dim, int window_size)
 {
     dim3 grid(num_heads, seq_len);

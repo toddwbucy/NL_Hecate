@@ -1,9 +1,12 @@
 // CUDA SWA Kernel Tests — Phase 2 Track Zero-A
 //
 // Three test classes:
-//   1. Forward match: CUDA output vs Rust reference (per-element < 1e-5)
-//   2. Backward match: CUDA dQ/dK/dV vs Rust backward (per-element < 1e-4)
+//   1. Forward match: CUDA bf16 output vs Rust f32 reference (per-element < 1e-2)
+//   2. Backward match: CUDA bf16 dQ/dK/dV vs Rust f32 backward (per-element < 5e-2)
 //   3. Full pipeline FD check through CUDA path (all 6 weight matrices)
+//
+// Tolerances are wider than f32-vs-f32 because the CUDA path uses bf16 storage
+// (~7 mantissa bits, ~0.8% relative precision) for Q/K/V/out/attn_weights.
 //
 // All tests gated behind #[cfg(feature = "cuda")].
 
@@ -94,8 +97,8 @@ fn test_cuda_forward_matches_rust_test_config() {
     cuda_forward_via_dispatch(&q, &k, &v, &mut out_cuda, &mut aw_cuda,
                               seq_len, num_heads, head_dim, window_size);
 
-    check_close("forward_out", &out_rust, &out_cuda, 1e-5);
-    check_close("forward_aw", &aw_rust, &aw_cuda, 1e-5);
+    check_close("forward_out", &out_rust, &out_cuda, 1e-2);
+    check_close("forward_aw", &aw_rust, &aw_cuda, 1e-2);
 }
 
 #[test]
@@ -122,8 +125,8 @@ fn test_cuda_forward_matches_rust_small() {
     cuda_forward_via_dispatch(&q, &k, &v, &mut out_cuda, &mut aw_cuda,
                               seq_len, num_heads, head_dim, window_size);
 
-    check_close("small_forward_out", &out_rust, &out_cuda, 1e-5);
-    check_close("small_forward_aw", &aw_rust, &aw_cuda, 1e-5);
+    check_close("small_forward_out", &out_rust, &out_cuda, 1e-2);
+    check_close("small_forward_aw", &aw_rust, &aw_cuda, 1e-2);
 }
 
 #[test]
@@ -150,8 +153,8 @@ fn test_cuda_forward_single_position() {
     cuda_forward_via_dispatch(&q, &k, &v, &mut out_cuda, &mut aw_cuda,
                               seq_len, num_heads, head_dim, window_size);
 
-    check_close("single_pos_out", &out_rust, &out_cuda, 1e-5);
-    check_close("single_pos_aw", &aw_rust, &aw_cuda, 1e-5);
+    check_close("single_pos_out", &out_rust, &out_cuda, 1e-2);
+    check_close("single_pos_aw", &aw_rust, &aw_cuda, 1e-2);
 }
 
 // ── Test Class 2: Backward match ────────────────────────────────────
@@ -194,9 +197,9 @@ fn test_cuda_backward_matches_rust_test_config() {
                                &mut dq_cuda, &mut dk_cuda, &mut dv_cuda,
                                seq_len, num_heads, head_dim, window_size);
 
-    check_close("backward_dQ", &dq_rust, &dq_cuda, 1e-4);
-    check_close("backward_dK", &dk_rust, &dk_cuda, 1e-4);
-    check_close("backward_dV", &dv_rust, &dv_cuda, 1e-4);
+    check_close("backward_dQ", &dq_rust, &dq_cuda, 5e-2);
+    check_close("backward_dK", &dk_rust, &dk_cuda, 5e-2);
+    check_close("backward_dV", &dv_rust, &dv_cuda, 5e-2);
 }
 
 #[test]
@@ -233,9 +236,9 @@ fn test_cuda_backward_matches_rust_small() {
                                &mut dq_cuda, &mut dk_cuda, &mut dv_cuda,
                                seq_len, num_heads, head_dim, window_size);
 
-    check_close("small_backward_dQ", &dq_rust, &dq_cuda, 1e-4);
-    check_close("small_backward_dK", &dk_rust, &dk_cuda, 1e-4);
-    check_close("small_backward_dV", &dv_rust, &dv_cuda, 1e-4);
+    check_close("small_backward_dQ", &dq_rust, &dq_cuda, 5e-2);
+    check_close("small_backward_dK", &dk_rust, &dk_cuda, 5e-2);
+    check_close("small_backward_dV", &dv_rust, &dv_cuda, 5e-2);
 }
 
 // ── Test Class 3: Full pipeline FD check ────────────────────────────
@@ -295,7 +298,8 @@ fn check_weight_gradient_cuda(
     let grad_vec = get_grad(grads);
     let weight_vec = get_weight(params);
     let n = weight_vec.len();
-    let abs_threshold = 5e-4;
+    // bf16 quantization corrupts FD for small gradients — raise threshold
+    let abs_threshold = 5e-3;
 
     let step = if n > num_samples { n / num_samples } else { 1 };
     let mut checked = 0;
@@ -352,7 +356,8 @@ fn compute_gradients_cuda(
 }
 
 const FD_EPS: f32 = 1e-2;
-const FD_TOL: f32 = 0.10;
+// bf16 quantization adds ~1% error per load/store, compounding through the pipeline
+const FD_TOL: f32 = 0.20;
 
 #[test]
 fn test_cuda_pipeline_gradient_w_q() {
