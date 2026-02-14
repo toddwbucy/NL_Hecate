@@ -5,6 +5,7 @@
 
 use pyo3::prelude::*;
 use pyo3::exceptions::PyValueError;
+use pyo3::types::PyDict;
 
 use nl_hecate_core::model::{SWAConfig as RustConfig, SWAParams as RustParams};
 use nl_hecate_core::forward::{forward as rust_forward, ForwardCache as RustCache};
@@ -71,6 +72,19 @@ struct SWAParams {
 impl SWAParams {
     fn num_params(&self) -> usize {
         self.inner.num_params()
+    }
+
+    /// Return all weight matrices as a dict of flat lists.
+    /// Keys: "w_embed", "w_q", "w_k", "w_v", "w_o", "w_unembed".
+    fn get_weights<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
+        dict.set_item("w_embed", self.inner.w_embed.clone())?;
+        dict.set_item("w_q", self.inner.w_q.clone())?;
+        dict.set_item("w_k", self.inner.w_k.clone())?;
+        dict.set_item("w_v", self.inner.w_v.clone())?;
+        dict.set_item("w_o", self.inner.w_o.clone())?;
+        dict.set_item("w_unembed", self.inner.w_unembed.clone())?;
+        Ok(dict)
     }
 }
 
