@@ -5,7 +5,7 @@ pub mod swa;
 pub mod model;
 pub mod forward;
 pub mod backward;
-pub(crate) mod gradient;
+pub mod gradient;
 
 #[cfg(feature = "cuda")]
 pub(crate) mod cuda_ffi;

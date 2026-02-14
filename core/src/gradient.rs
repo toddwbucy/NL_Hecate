@@ -12,7 +12,7 @@ use crate::backward::backward_full;
 /// Compute gradients of loss with respect to all parameters.
 /// This is the main training API — used by Python bindings in Phase 3.
 #[allow(dead_code)]
-pub(crate) fn compute_gradients(
+pub fn compute_gradients(
     params: &SWAParams,
     cfg: &SWAConfig,
     input_ids: &[usize],
