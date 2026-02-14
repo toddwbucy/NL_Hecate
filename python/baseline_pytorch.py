@@ -60,6 +60,17 @@ CHUNKS = make_chunks(BYTES, SEQ_LEN)
 def load_weights_from_rust(params):
     """Extract Rust weights and convert to PyTorch tensors."""
     w = params.get_weights()
+    expected = {
+        "w_embed": VOCAB_SIZE * D_MODEL,
+        "w_q": D_MODEL * D_MODEL,
+        "w_k": D_MODEL * D_MODEL,
+        "w_v": D_MODEL * D_MODEL,
+        "w_o": D_MODEL * D_MODEL,
+        "w_unembed": D_MODEL * VOCAB_SIZE,
+    }
+    for name, size in expected.items():
+        if len(w[name]) != size:
+            raise ValueError(f"{name} length {len(w[name])} != {size}")
     return {
         "w_embed": torch.tensor(w["w_embed"], dtype=torch.float32).reshape(VOCAB_SIZE, D_MODEL).requires_grad_(True),
         "w_q": torch.tensor(w["w_q"], dtype=torch.float32).reshape(D_MODEL, D_MODEL).requires_grad_(True),
@@ -206,7 +217,7 @@ def run_comparison(num_steps=100, lr=0.05):
         if step < 5 or step % 10 == 0 or step == num_steps - 1:
             print(f"  {step:4d}  {rust_loss:10.6f}  {pt_loss:10.6f}  {rel_err:10.2e}")
 
-    print(f"\n  Results:")
+    print("\n  Results:")
     print(f"    Initial loss rel error (step 0): {first_rel_err:.2e}")
     print(f"    Max relative error:              {max_rel_err:.2e}")
     print(f"    All losses finite:               {all_finite}")
@@ -220,13 +231,13 @@ def run_comparison(num_steps=100, lr=0.05):
         print(f"    FAIL: Max rel error {max_rel_err:.2e} > 1e-4")
         passed = False
     if not all_finite:
-        print(f"    FAIL: Non-finite losses detected")
+        print("    FAIL: Non-finite losses detected")
         passed = False
 
     if passed:
-        print(f"\n    PASS: Rust and PyTorch produce identical loss curves")
+        print("\n    PASS: Rust and PyTorch produce identical loss curves")
     else:
-        print(f"\n    FAIL: Loss curves diverged beyond tolerance")
+        print("\n    FAIL: Loss curves diverged beyond tolerance")
 
     return passed, max_rel_err
 
@@ -264,9 +275,9 @@ def run_timing(num_steps=500, lr=0.05):
     pt_elapsed = time.perf_counter() - t0
     pt_tps = total_tokens / pt_elapsed
 
-    print(f"  Rust pipeline:")
+    print("  Rust pipeline:")
     print(f"    {rust_elapsed:.3f}s, {rust_tps:,.0f} tok/s")
-    print(f"  PyTorch pipeline:")
+    print("  PyTorch pipeline:")
     print(f"    {pt_elapsed:.3f}s, {pt_tps:,.0f} tok/s")
     print(f"  Ratio: Rust is {rust_tps / pt_tps:.1f}x {'faster' if rust_tps > pt_tps else 'slower'}")
 
