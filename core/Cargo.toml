@@ -1,0 +1,21 @@
+[package]
+name = "nl-hecate-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Track Zero-A: SWA Transformer pipeline
+# Pure Rust forward + backward with Enzyme AD for gradient computation.
+
+# Fat LTO is MANDATORY for Enzyme.
+# Enzyme operates at LLVM IR level and must see all function bodies
+# in a single compilation unit. Without fat LTO, cross-module calls
+# are opaque and Enzyme cannot differentiate through them.
+[profile.dev]
+lto = "fat"
+
+[profile.release]
+lto = "fat"
+opt-level = 2
+
+[dependencies]
