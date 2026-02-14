@@ -14,4 +14,5 @@ pub(crate) mod gradient;
 
 #[cfg(feature = "cuda")]
 pub(crate) mod cuda_ffi;
+pub mod conductor;
 pub mod dispatch;
