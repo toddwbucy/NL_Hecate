@@ -188,7 +188,8 @@ impl DevBuf {
 #[cfg(feature = "cuda")]
 impl Drop for DevBuf {
     fn drop(&mut self) {
-        unsafe { cudaFree(self.ptr as *mut std::ffi::c_void); }
+        let rc = unsafe { cudaFree(self.ptr as *mut std::ffi::c_void) };
+        debug_assert_eq!(rc, 0, "cudaFree failed with error code {rc}");
     }
 }
 
@@ -264,7 +265,8 @@ impl DevBuf16 {
 #[cfg(feature = "cuda")]
 impl Drop for DevBuf16 {
     fn drop(&mut self) {
-        unsafe { cudaFree(self.ptr as *mut std::ffi::c_void); }
+        let rc = unsafe { cudaFree(self.ptr as *mut std::ffi::c_void) };
+        debug_assert_eq!(rc, 0, "cudaFree failed with error code {rc}");
     }
 }
 

@@ -122,8 +122,8 @@ __global__ void swa_backward_kernel(
             atomicAdd(&d_k[k_pos * total_dim + h_offset + d],
                       ds * __bfloat162float(q[q_pos * total_dim + h_offset + d]));
         }
-        // d_Q: only one block writes to each q_pos, so direct write is safe
-        atomicAdd(&d_q[q_pos * total_dim + h_offset + d], dq_acc);
+        // d_Q: exactly one block per (h, q_pos), so direct store is safe (no contention)
+        d_q[q_pos * total_dim + h_offset + d] = dq_acc;
     }
 }
 

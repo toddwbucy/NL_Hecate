@@ -157,6 +157,75 @@ fn test_cuda_forward_single_position() {
     check_close("single_pos_aw", &aw_rust, &aw_cuda, 1e-2);
 }
 
+#[test]
+fn test_cuda_forward_head_dim_32_warp_boundary() {
+    // Edge case: head_dim=32 fills exactly one warp — exercises the warp
+    // reduction boundary where every thread participates.
+    let seq_len = 8;
+    let num_heads = 1;
+    let head_dim = 32;
+    let window_size = 4;
+    let total_dim = num_heads * head_dim;
+    let aw_len = num_heads * seq_len * window_size;
+
+    let q = rand_buf(seq_len * total_dim, 1100);
+    let k = rand_buf(seq_len * total_dim, 1200);
+    let v = rand_buf(seq_len * total_dim, 1300);
+
+    let mut out_rust = vec![0.0f32; seq_len * total_dim];
+    let mut aw_rust = vec![0.0f32; aw_len];
+    swa_forward(&q, &k, &v, &mut out_rust, &mut aw_rust,
+                seq_len, num_heads, head_dim, window_size);
+
+    let mut out_cuda = vec![0.0f32; seq_len * total_dim];
+    let mut aw_cuda = vec![0.0f32; aw_len];
+    cuda_forward_via_dispatch(&q, &k, &v, &mut out_cuda, &mut aw_cuda,
+                              seq_len, num_heads, head_dim, window_size);
+
+    check_close("hd32_forward_out", &out_rust, &out_cuda, 1e-2);
+    check_close("hd32_forward_aw", &aw_rust, &aw_cuda, 1e-2);
+}
+
+#[test]
+fn test_cuda_backward_head_dim_32_warp_boundary() {
+    // Edge case: head_dim=32 fills exactly one warp for backward too.
+    let seq_len = 8;
+    let num_heads = 1;
+    let head_dim = 32;
+    let window_size = 4;
+    let total_dim = num_heads * head_dim;
+    let aw_len = num_heads * seq_len * window_size;
+
+    let q = rand_buf(seq_len * total_dim, 1400);
+    let k = rand_buf(seq_len * total_dim, 1500);
+    let v = rand_buf(seq_len * total_dim, 1600);
+
+    let mut attn_out = vec![0.0f32; seq_len * total_dim];
+    let mut attn_weights = vec![0.0f32; aw_len];
+    swa_forward(&q, &k, &v, &mut attn_out, &mut attn_weights,
+                seq_len, num_heads, head_dim, window_size);
+
+    let d_attn_out = rand_buf(seq_len * total_dim, 1700);
+
+    let mut dq_rust = vec![0.0f32; seq_len * total_dim];
+    let mut dk_rust = vec![0.0f32; seq_len * total_dim];
+    let mut dv_rust = vec![0.0f32; seq_len * total_dim];
+    swa_backward_rust(&q, &k, &v, &attn_weights, &d_attn_out,
+                      &mut dq_rust, &mut dk_rust, &mut dv_rust,
+                      seq_len, num_heads, head_dim, window_size);
+
+    let mut dq_cuda = vec![0.0f32; seq_len * total_dim];
+    let mut dk_cuda = vec![0.0f32; seq_len * total_dim];
+    let mut dv_cuda = vec![0.0f32; seq_len * total_dim];
+    cuda_backward_via_dispatch(&q, &k, &v, &attn_weights, &d_attn_out,
+                               &mut dq_cuda, &mut dk_cuda, &mut dv_cuda,
+                               seq_len, num_heads, head_dim, window_size);
+
+    check_close("hd32_backward_dQ", &dq_rust, &dq_cuda, 5e-2);
+    check_close("hd32_backward_dK", &dk_rust, &dk_cuda, 5e-2);
+    check_close("hd32_backward_dV", &dv_rust, &dv_cuda, 5e-2);
+}
+
 // ── Test Class 2: Backward match ────────────────────────────────────
 
 #[test]
