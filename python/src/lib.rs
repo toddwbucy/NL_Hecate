@@ -189,6 +189,7 @@ struct MAGConfig {
 #[pymethods]
 impl MAGConfig {
     #[new]
+    #[pyo3(signature = (d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled, k=1, chunk_sizes=None))]
     fn new(
         d_model: usize,
         num_heads: usize,
@@ -197,11 +198,29 @@ impl MAGConfig {
         window_size: usize,
         vocab_size: usize,
         memory_enabled: bool,
+        k: usize,
+        chunk_sizes: Option<Vec<usize>>,
     ) -> PyResult<Self> {
         if d_model != num_heads * head_dim {
             return Err(PyValueError::new_err(format!(
                 "d_model ({d_model}) must equal num_heads ({num_heads}) * head_dim ({head_dim})"
             )));
+        }
+        if k < 1 {
+            return Err(PyValueError::new_err("k must be >= 1"));
+        }
+        let chunk_sizes = chunk_sizes.unwrap_or_else(|| vec![1; k]);
+        if chunk_sizes.len() != k {
+            return Err(PyValueError::new_err(format!(
+                "chunk_sizes length ({}) must equal k ({k})", chunk_sizes.len()
+            )));
+        }
+        for (i, &cs) in chunk_sizes.iter().enumerate() {
+            if cs < 1 {
+                return Err(PyValueError::new_err(format!(
+                    "chunk_sizes[{i}] must be >= 1, got {cs}"
+                )));
+            }
         }
         Ok(MAGConfig {
             inner: RustMAGConfig {
@@ -214,6 +233,8 @@ impl MAGConfig {
                     vocab_size,
                 },
                 memory_enabled,
+                k,
+                chunk_sizes,
             },
         })
     }
@@ -232,6 +253,8 @@ impl MAGConfig {
     fn vocab_size(&self) -> usize { self.inner.swa.vocab_size }
     #[getter]
     fn memory_enabled(&self) -> bool { self.inner.memory_enabled }
+    #[getter]
+    fn k(&self) -> usize { self.inner.k }
 }
 
 // ── MAGParams ──────────────────────────────────────────────────────
@@ -248,7 +271,7 @@ impl MAGParams {
     }
 
     /// Return all weight matrices as a dict of flat lists.
-    /// Keys: 6 SWA + 7 memory = 13 total.
+    /// Keys: 6 SWA + 7 memory (level 0) = 13 total.
     fn get_weights<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let dict = PyDict::new(py);
         // SWA weights
@@ -258,14 +281,14 @@ impl MAGParams {
         dict.set_item("w_v", self.inner.swa.w_v.clone())?;
         dict.set_item("w_o", self.inner.swa.w_o.clone())?;
         dict.set_item("w_unembed", self.inner.swa.w_unembed.clone())?;
-        // Memory weights
-        dict.set_item("w_k_mem", self.inner.w_k_mem.clone())?;
-        dict.set_item("w_v_mem", self.inner.w_v_mem.clone())?;
-        dict.set_item("w_q_mem", self.inner.w_q_mem.clone())?;
-        dict.set_item("w_alpha", self.inner.w_alpha.clone())?;
-        dict.set_item("b_alpha", self.inner.b_alpha.clone())?;
-        dict.set_item("w_theta", self.inner.w_theta.clone())?;
-        dict.set_item("b_theta", self.inner.b_theta.clone())?;
+        // Memory weights (level 0 for backward compat)
+        dict.set_item("w_k_mem", self.inner.levels[0].w_k_mem.clone())?;
+        dict.set_item("w_v_mem", self.inner.levels[0].w_v_mem.clone())?;
+        dict.set_item("w_q_mem", self.inner.levels[0].w_q_mem.clone())?;
+        dict.set_item("w_alpha", self.inner.levels[0].w_alpha.clone())?;
+        dict.set_item("b_alpha", self.inner.levels[0].b_alpha.clone())?;
+        dict.set_item("w_theta", self.inner.levels[0].w_theta.clone())?;
+        dict.set_item("b_theta", self.inner.levels[0].b_theta.clone())?;
         Ok(dict)
     }
 }
@@ -288,6 +311,7 @@ impl MAGForwardCache {
 // ── MAG free functions ─────────────────────────────────────────────
 
 #[pyfunction]
+#[pyo3(signature = (d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled, k=1, chunk_sizes=None))]
 fn mag_create_config(
     d_model: usize,
     num_heads: usize,
@@ -296,8 +320,10 @@ fn mag_create_config(
     window_size: usize,
     vocab_size: usize,
     memory_enabled: bool,
+    k: usize,
+    chunk_sizes: Option<Vec<usize>>,
 ) -> PyResult<MAGConfig> {
-    MAGConfig::new(d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled)
+    MAGConfig::new(d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled, k, chunk_sizes)
 }
 
 #[pyfunction]

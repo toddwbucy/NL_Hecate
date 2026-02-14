@@ -22,7 +22,7 @@ use crate::tensor::{
     matmul_f32, transpose_f32, sigmoid_f32, softplus_f32,
     outer_product_f32, frobenius_dot_f32,
 };
-use crate::model::{MAGParams, SWAParams};
+use crate::model::MemoryLevelParams;
 
 // ── Memory rule trait ────────────────────────────────────────────────
 
@@ -69,23 +69,27 @@ pub trait MemoryRule {
 
     /// Full sequence forward: project → gate → write → read for all tokens.
     /// Returns (output [seq_len, d], cache for backward).
+    ///
+    /// `initial_m`: Optional initial memory state [d*d]. If None, starts from zeros.
+    /// Used by CMS to seed active levels with persisted context memory.
     fn step(
         &self,
-        params: &MAGParams,
+        level_params: &MemoryLevelParams,
         embedded: &[f32],
         seq_len: usize,
         d: usize,
+        initial_m: Option<&[f32]>,
     ) -> (Vec<f32>, Self::Cache);
 
     /// Full sequence backward through the memory rule.
-    /// Returns (param gradients, d_embedded contribution).
+    /// Returns (level param gradients, d_embedded contribution).
     fn step_backward(
         &self,
-        params: &MAGParams,
+        level_params: &MemoryLevelParams,
         cache: &Self::Cache,
         d_y: &[f32],
         embedded: &[f32],
-    ) -> (MAGParams, Vec<f32>);
+    ) -> (MemoryLevelParams, Vec<f32>);
 }
 
 // ── Delta Rule implementation ────────────────────────────────────────
@@ -166,10 +170,11 @@ impl MemoryRule for DeltaRule {
     /// Returns (y, cache) where y is [seq_len, d] memory output.
     fn step(
         &self,
-        params: &MAGParams,
+        level_params: &MemoryLevelParams,
         embedded: &[f32],
         seq_len: usize,
         d: usize,
+        initial_m: Option<&[f32]>,
     ) -> (Vec<f32>, DeltaRuleCache) {
         debug_assert_eq!(embedded.len(), seq_len * d);
 
@@ -177,9 +182,9 @@ impl MemoryRule for DeltaRule {
         let mut w_k_mem_t = vec![0.0f32; d * d];
         let mut w_v_mem_t = vec![0.0f32; d * d];
         let mut w_q_mem_t = vec![0.0f32; d * d];
-        transpose_f32(&params.w_k_mem, &mut w_k_mem_t, d, d);
-        transpose_f32(&params.w_v_mem, &mut w_v_mem_t, d, d);
-        transpose_f32(&params.w_q_mem, &mut w_q_mem_t, d, d);
+        transpose_f32(&level_params.w_k_mem, &mut w_k_mem_t, d, d);
+        transpose_f32(&level_params.w_v_mem, &mut w_v_mem_t, d, d);
+        transpose_f32(&level_params.w_q_mem, &mut w_q_mem_t, d, d);
 
         let mut k_mem = vec![0.0f32; seq_len * d];
         let mut v_mem = vec![0.0f32; seq_len * d];
@@ -188,8 +193,12 @@ impl MemoryRule for DeltaRule {
         matmul_f32(embedded, &w_v_mem_t, &mut v_mem, seq_len, d, d);
         matmul_f32(embedded, &w_q_mem_t, &mut q_mem, seq_len, d, d);
 
-        // Allocate cache
-        let mut m_states = vec![0.0f32; (seq_len + 1) * d * d]; // M_0 = zeros
+        // Allocate cache — seed M_0 from initial_m if provided, else zeros
+        let mut m_states = vec![0.0f32; (seq_len + 1) * d * d];
+        if let Some(m0) = initial_m {
+            debug_assert_eq!(m0.len(), d * d);
+            m_states[..d * d].copy_from_slice(m0);
+        }
         let mut concat_kv = vec![0.0f32; seq_len * 2 * d];
         let mut alpha_pre = vec![0.0f32; seq_len];
         let mut alpha = vec![0.0f32; seq_len];
@@ -212,17 +221,17 @@ impl MemoryRule for DeltaRule {
             let concat_t = &concat_kv[c_base..c_base + 2 * d];
 
             // alpha_t = sigmoid(concat @ w_alpha + b_alpha)
-            let mut alpha_pre_t = params.b_alpha[0];
+            let mut alpha_pre_t = level_params.b_alpha[0];
             for i in 0..(2 * d) {
-                alpha_pre_t += concat_t[i] * params.w_alpha[i];
+                alpha_pre_t += concat_t[i] * level_params.w_alpha[i];
             }
             alpha_pre[t] = alpha_pre_t;
             alpha[t] = sigmoid_f32(alpha_pre_t);
 
             // theta_t = softplus(concat @ w_theta + b_theta)
-            let mut theta_pre_t = params.b_theta[0];
+            let mut theta_pre_t = level_params.b_theta[0];
             for i in 0..(2 * d) {
-                theta_pre_t += concat_t[i] * params.w_theta[i];
+                theta_pre_t += concat_t[i] * level_params.w_theta[i];
             }
             theta_pre[t] = theta_pre_t;
             theta[t] = softplus_f32(theta_pre_t);
@@ -268,38 +277,21 @@ impl MemoryRule for DeltaRule {
     /// `d_y`: [seq_len, d] — upstream gradient on memory output y.
     /// `embedded`: [seq_len, d] — input embeddings (for projection backward).
     ///
-    /// Returns gradient on MAGParams memory fields and d_embedded contribution.
+    /// Returns (MemoryLevelParams gradients, d_embedded contribution).
     fn step_backward(
         &self,
-        params: &MAGParams,
+        level_params: &MemoryLevelParams,
         cache: &DeltaRuleCache,
         d_y: &[f32],
         embedded: &[f32],
-    ) -> (MAGParams, Vec<f32>) {
+    ) -> (MemoryLevelParams, Vec<f32>) {
         let s = cache.seq_len;
         let d = cache.d;
         debug_assert_eq!(d_y.len(), s * d);
         debug_assert_eq!(embedded.len(), s * d);
 
-        // Initialize gradient accumulators — only memory fields are populated here;
-        // SWA fields are empty (they come from mag.rs).
-        let mut grads = MAGParams {
-            swa: SWAParams {
-                w_embed: vec![],
-                w_q: vec![],
-                w_k: vec![],
-                w_v: vec![],
-                w_o: vec![],
-                w_unembed: vec![],
-            },
-            w_k_mem: vec![0.0f32; d * d],
-            w_v_mem: vec![0.0f32; d * d],
-            w_q_mem: vec![0.0f32; d * d],
-            w_alpha: vec![0.0f32; 2 * d],
-            b_alpha: vec![0.0f32; 1],
-            w_theta: vec![0.0f32; 2 * d],
-            b_theta: vec![0.0f32; 1],
-        };
+        // Initialize gradient accumulators for memory level weights only.
+        let mut grads = MemoryLevelParams::zeros_like(d);
 
         // Gradient buffers for projected memory k/v/q
         let mut d_k_mem = vec![0.0f32; s * d];
@@ -417,12 +409,12 @@ impl MemoryRule for DeltaRule {
 
             // ── concat backward → d_k_mem, d_v_mem ──
             for i in 0..d {
-                d_k_mem[t * d + i] += d_alpha_pre * params.w_alpha[i]
-                                    + d_theta_pre * params.w_theta[i];
+                d_k_mem[t * d + i] += d_alpha_pre * level_params.w_alpha[i]
+                                    + d_theta_pre * level_params.w_theta[i];
             }
             for i in 0..d {
-                d_v_mem[t * d + i] += d_alpha_pre * params.w_alpha[d + i]
-                                    + d_theta_pre * params.w_theta[d + i];
+                d_v_mem[t * d + i] += d_alpha_pre * level_params.w_alpha[d + i]
+                                    + d_theta_pre * level_params.w_theta[d + i];
             }
 
             // Update d_m for next (earlier) token
@@ -444,12 +436,86 @@ impl MemoryRule for DeltaRule {
         transpose_f32(&d_q_mem, &mut d_q_mem_t, s, d);
         matmul_f32(&d_q_mem_t, embedded, &mut grads.w_q_mem, d, s, d);
 
-        crate::tensor::matmul_acc_f32(&d_k_mem, &params.w_k_mem, &mut d_embedded, s, d, d);
-        crate::tensor::matmul_acc_f32(&d_v_mem, &params.w_v_mem, &mut d_embedded, s, d, d);
-        crate::tensor::matmul_acc_f32(&d_q_mem, &params.w_q_mem, &mut d_embedded, s, d, d);
+        crate::tensor::matmul_acc_f32(&d_k_mem, &level_params.w_k_mem, &mut d_embedded, s, d, d);
+        crate::tensor::matmul_acc_f32(&d_v_mem, &level_params.w_v_mem, &mut d_embedded, s, d, d);
+        crate::tensor::matmul_acc_f32(&d_q_mem, &level_params.w_q_mem, &mut d_embedded, s, d, d);
 
         (grads, d_embedded)
     }
+}
+
+/// Forward pass for a frozen (read-only) level: uses persisted M without writing.
+///
+/// For each token: y_t = M @ q_t, where M is the frozen memory matrix.
+/// Returns (y [seq_len, d], projected q_mem [seq_len, d]).
+pub fn delta_rule_read_only(
+    level_params: &MemoryLevelParams,
+    embedded: &[f32],
+    frozen_m: &[f32],
+    seq_len: usize,
+    d: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    debug_assert_eq!(embedded.len(), seq_len * d);
+    debug_assert_eq!(frozen_m.len(), d * d);
+
+    // Project embedded → q_mem via W_Q_mem^T
+    let mut w_q_mem_t = vec![0.0f32; d * d];
+    transpose_f32(&level_params.w_q_mem, &mut w_q_mem_t, d, d);
+    let mut q_mem = vec![0.0f32; seq_len * d];
+    matmul_f32(embedded, &w_q_mem_t, &mut q_mem, seq_len, d, d);
+
+    // y_t = M @ q_t for each token
+    let mut y = vec![0.0f32; seq_len * d];
+    for t in 0..seq_len {
+        let q_t = &q_mem[t * d..(t + 1) * d];
+        matmul_f32(frozen_m, q_t, &mut y[t * d..(t + 1) * d], d, d, 1);
+    }
+
+    (y, q_mem)
+}
+
+/// Backward pass for a frozen (read-only) level.
+///
+/// Only d_embedded (through W_Q_mem) flows back — no memory weight gradients
+/// because the frozen level doesn't write. But we DO compute d_W_Q_mem gradients
+/// since the query projection parameters are still learnable.
+///
+/// Returns (MemoryLevelParams grads [only w_q_mem populated], d_embedded contribution).
+pub fn delta_rule_read_only_backward(
+    level_params: &MemoryLevelParams,
+    frozen_m: &[f32],
+    _q_mem: &[f32],
+    d_y: &[f32],
+    embedded: &[f32],
+    seq_len: usize,
+    d: usize,
+) -> (MemoryLevelParams, Vec<f32>) {
+    debug_assert_eq!(d_y.len(), seq_len * d);
+
+    let mut grads = MemoryLevelParams::zeros_like(d);
+
+    // y_t = M @ q_t → d_q_t = M^T @ d_y_t
+    let mut d_q_mem = vec![0.0f32; seq_len * d];
+    for t in 0..seq_len {
+        let d_y_t = &d_y[t * d..(t + 1) * d];
+        for i in 0..d {
+            let mut sum = 0.0f32;
+            for j in 0..d {
+                sum += frozen_m[j * d + i] * d_y_t[j];
+            }
+            d_q_mem[t * d + i] = sum;
+        }
+    }
+
+    // q_mem = embedded @ W_Q_mem^T → d_W_Q_mem, d_embedded
+    let mut d_q_mem_t = vec![0.0f32; d * seq_len];
+    transpose_f32(&d_q_mem, &mut d_q_mem_t, seq_len, d);
+    matmul_f32(&d_q_mem_t, embedded, &mut grads.w_q_mem, d, seq_len, d);
+
+    let mut d_embedded = vec![0.0f32; seq_len * d];
+    crate::tensor::matmul_acc_f32(&d_q_mem, &level_params.w_q_mem, &mut d_embedded, seq_len, d, d);
+
+    (grads, d_embedded)
 }
 
 #[cfg(test)]
@@ -477,7 +543,7 @@ mod tests {
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
         let rule = DeltaRule;
-        let (y, _cache) = rule.step(&params, &embedded, cfg.swa.seq_len, cfg.swa.d_model);
+        let (y, _cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for (i, &v) in y.iter().enumerate() {
             assert!(v.is_finite(), "y[{i}] is not finite: {v}");
         }
@@ -489,7 +555,7 @@ mod tests {
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
         let rule = DeltaRule;
-        let (_y, cache) = rule.step(&params, &embedded, cfg.swa.seq_len, cfg.swa.d_model);
+        let (_y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let d = cfg.swa.d_model;
         let s = cfg.swa.seq_len;
 
@@ -507,7 +573,7 @@ mod tests {
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
         let rule = DeltaRule;
-        let (_y, cache) = rule.step(&params, &embedded, cfg.swa.seq_len, cfg.swa.d_model);
+        let (_y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for t in 0..cfg.swa.seq_len {
             let a = cache.alpha[t];
             assert!(a > 0.0 && a < 1.0, "alpha[{t}]={a} not in (0,1)");
@@ -522,8 +588,8 @@ mod tests {
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
         let rule = DeltaRule;
-        let (y1, _) = rule.step(&params, &embedded, cfg.swa.seq_len, cfg.swa.d_model);
-        let (y2, _) = rule.step(&params, &embedded, cfg.swa.seq_len, cfg.swa.d_model);
+        let (y1, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
+        let (y2, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         assert_eq!(y1, y2, "Delta rule forward should be deterministic");
     }
 
@@ -533,7 +599,7 @@ mod tests {
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
         let rule = DeltaRule;
-        let (y, cache) = rule.step(&params, &embedded, cfg.swa.seq_len, cfg.swa.d_model);
+        let (y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
         assert_eq!(y.len(), s * d);
@@ -551,10 +617,10 @@ mod tests {
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
         let rule = DeltaRule;
-        let (_y, cache) = rule.step(&params, &embedded, s, d);
+        let (_y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
 
         let d_y = vec![1.0f32; s * d];
-        let (grads, d_emb) = rule.step_backward(&params, &cache, &d_y, &embedded);
+        let (grads, d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
 
         for (name, g) in [
             ("w_k_mem", &grads.w_k_mem), ("w_v_mem", &grads.w_v_mem),
@@ -579,10 +645,10 @@ mod tests {
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
         let rule = DeltaRule;
-        let (_y, cache) = rule.step(&params, &embedded, s, d);
+        let (_y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
 
         let d_y = vec![1.0f32; s * d];
-        let (grads, d_emb) = rule.step_backward(&params, &cache, &d_y, &embedded);
+        let (grads, d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
 
         for (name, g) in [
             ("w_k_mem", &grads.w_k_mem), ("w_v_mem", &grads.w_v_mem),
@@ -603,10 +669,10 @@ mod tests {
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
         let rule = DeltaRule;
-        let (_y, cache) = rule.step(&params, &embedded, s, d);
+        let (_y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
 
         let d_y = vec![1.0f32; s * d];
-        let (grads, d_emb) = rule.step_backward(&params, &cache, &d_y, &embedded);
+        let (grads, d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
 
         assert_eq!(grads.w_k_mem.len(), d * d);
         assert_eq!(grads.w_v_mem.len(), d * d);
@@ -656,5 +722,37 @@ mod tests {
         let rule = DeltaRule;
         assert_eq!(rule.level(), 0);
         assert_eq!(rule.supported_parallelization(), &["sequential"]);
+    }
+
+    // ── Read-only tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_read_only_zero_memory() {
+        let cfg = test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let d = cfg.swa.d_model;
+        let s = cfg.swa.seq_len;
+        let frozen_m = vec![0.0f32; d * d];
+        let (y, _q_mem) = delta_rule_read_only(&params.levels[0], &embedded, &frozen_m, s, d);
+        // Zero memory → zero output
+        assert!(y.iter().all(|&x| x.abs() < 1e-12));
+    }
+
+    #[test]
+    fn test_read_only_nonzero_memory() {
+        let cfg = test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let d = cfg.swa.d_model;
+        let s = cfg.swa.seq_len;
+        // Identity memory → y_t = q_t
+        let mut frozen_m = vec![0.0f32; d * d];
+        for i in 0..d { frozen_m[i * d + i] = 1.0; }
+        let (y, q_mem) = delta_rule_read_only(&params.levels[0], &embedded, &frozen_m, s, d);
+        // y should equal q_mem when M = I
+        for i in 0..(s * d) {
+            assert!((y[i] - q_mem[i]).abs() < 1e-6, "y[{i}]={} != q_mem[{i}]={}", y[i], q_mem[i]);
+        }
     }
 }
