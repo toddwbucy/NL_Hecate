@@ -172,10 +172,6 @@ def run_comparison(num_steps=100, lr=0.05):
 
     max_rel_err = 0.0
     all_finite = True
-    rust_decreasing = True
-    pt_decreasing = True
-    prev_rust_loss = None
-    prev_pt_loss = None
     first_rel_err = None
 
     print(f"  {'step':>4s}  {'rust_loss':>10s}  {'pt_loss':>10s}  {'rel_err':>10s}")
@@ -206,15 +202,6 @@ def run_comparison(num_steps=100, lr=0.05):
         if step == 0:
             first_rel_err = rel_err
         max_rel_err = max(max_rel_err, rel_err)
-
-        # Monotonicity check (first 10 steps can be noisy with cycling data)
-        if step > 10:
-            if prev_rust_loss is not None and rust_loss > prev_rust_loss * 1.1:
-                rust_decreasing = False
-            if prev_pt_loss is not None and pt_loss > prev_pt_loss * 1.1:
-                pt_decreasing = False
-        prev_rust_loss = rust_loss
-        prev_pt_loss = pt_loss
 
         if step < 5 or step % 10 == 0 or step == num_steps - 1:
             print(f"  {step:4d}  {rust_loss:10.6f}  {pt_loss:10.6f}  {rel_err:10.2e}")
