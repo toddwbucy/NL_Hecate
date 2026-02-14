@@ -91,6 +91,89 @@ pub fn swa_forward(
     }
 }
 
+/// SWA backward pass — Rust reference implementation.
+///
+/// Computes dQ, dK, dV from d_attn_out and cached attn_weights/Q/K/V.
+/// This is the exact logic from backward.rs Stage 3, extracted for dispatch.
+///
+/// All slices are [seq_len, num_heads * head_dim] row-major flat,
+/// except attn_weights which is [num_heads, seq_len, window_size].
+/// SWA backward — public for CUDA comparison tests.
+#[allow(dead_code)]
+pub fn swa_backward_rust(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    attn_weights: &[f32],
+    d_attn_out: &[f32],
+    d_q: &mut [f32],
+    d_k: &mut [f32],
+    d_v: &mut [f32],
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    window_size: usize,
+) {
+    let total_dim = num_heads * head_dim;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    for h in 0..num_heads {
+        let h_offset = h * head_dim;
+
+        for q_pos in 0..seq_len {
+            let win_start = if q_pos + 1 >= window_size { q_pos + 1 - window_size } else { 0 };
+            let win_len = q_pos - win_start + 1;
+
+            let aw_base = (h * seq_len + q_pos) * window_size;
+
+            // d_attn_w[w] = sum_d d_attn_out[q,h,d] * V[k,h,d]
+            let mut d_attn_w = vec![0.0f32; window_size];
+            for w in 0..win_len {
+                let k_pos = win_start + w;
+                let mut sum = 0.0f32;
+                for dd in 0..head_dim {
+                    sum += d_attn_out[q_pos * total_dim + h_offset + dd]
+                         * v[k_pos * total_dim + h_offset + dd];
+                }
+                d_attn_w[w] = sum;
+            }
+
+            // d_V[k,h,d] += attn_weights[w] * d_attn_out[q,h,d]
+            for w in 0..win_len {
+                let k_pos = win_start + w;
+                let aw = attn_weights[aw_base + w];
+                for dd in 0..head_dim {
+                    d_v[k_pos * total_dim + h_offset + dd] +=
+                        aw * d_attn_out[q_pos * total_dim + h_offset + dd];
+                }
+            }
+
+            // Softmax backward: d_scores[i] = P[i] * (d_attn_w[i] - sum_j(P[j] * d_attn_w[j]))
+            let mut dot_pw = 0.0f32;
+            for w in 0..win_len {
+                dot_pw += attn_weights[aw_base + w] * d_attn_w[w];
+            }
+            let mut d_scores = vec![0.0f32; window_size];
+            for w in 0..win_len {
+                d_scores[w] = attn_weights[aw_base + w] * (d_attn_w[w] - dot_pw);
+            }
+
+            // d_Q[q,h,d] += d_scores[w] * K[k,h,d] * scale
+            // d_K[k,h,d] += d_scores[w] * Q[q,h,d] * scale
+            for w in 0..win_len {
+                let k_pos = win_start + w;
+                let ds = d_scores[w] * scale;
+                for dd in 0..head_dim {
+                    d_q[q_pos * total_dim + h_offset + dd] +=
+                        ds * k[k_pos * total_dim + h_offset + dd];
+                    d_k[k_pos * total_dim + h_offset + dd] +=
+                        ds * q[q_pos * total_dim + h_offset + dd];
+                }
+            }
+        }
+    }
+}
+
 /// Naive reference SWA for testing: single head, no multi-head reshaping.
 /// q, k, v: [seq_len, dim]. Returns [seq_len, dim].
 pub fn swa_forward_single_head(

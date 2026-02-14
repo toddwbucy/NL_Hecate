@@ -4,7 +4,6 @@
 /// All intermediate buffers are allocated and returned for backward pass use.
 
 use crate::tensor::{matmul_f32, cross_entropy_loss};
-use crate::swa::swa_forward;
 use crate::model::{SWAConfig, SWAParams};
 
 /// All intermediate activations from a forward pass, needed for backward.
@@ -108,7 +107,7 @@ pub fn forward(
     // Stage 3: SWA Attention
     let mut attn_out = vec![0.0f32; s * d];
     let mut attn_weights = vec![0.0f32; nh * s * ws];
-    swa_forward(&q, &k, &vv, &mut attn_out, &mut attn_weights, s, nh, hd, ws);
+    crate::dispatch::swa_forward_dispatch(&q, &k, &vv, &mut attn_out, &mut attn_weights, s, nh, hd, ws);
 
     // Stage 4: Output projection — projected = attn_out @ W_O^T
     let mut w_o_t = vec![0.0f32; d * d];

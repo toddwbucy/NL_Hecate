@@ -98,68 +98,16 @@ fn backward_internal(
     matmul_f32(&d_projected_t, &cache.attn_out, &mut grads.w_o, d, s, d);
 
     // ── Stage 3: SWA Attention backward ──────────────────────────────
-    let total_dim = nh * hd;
     let mut d_q = vec![0.0f32; s * d];
     let mut d_k = vec![0.0f32; s * d];
     let mut d_v = vec![0.0f32; s * d];
 
-    let scale = 1.0 / (hd as f32).sqrt();
-
-    for h in 0..nh {
-        let h_offset = h * hd;
-
-        for q_pos in 0..s {
-            let win_start = if q_pos + 1 >= ws { q_pos + 1 - ws } else { 0 };
-            let win_len = q_pos - win_start + 1;
-
-            let aw_base = (h * s + q_pos) * ws;
-
-            // d_attn_w[w] = sum_d d_attn_out[q,h,d] * V[k,h,d]
-            let mut d_attn_w = vec![0.0f32; ws];
-            for w in 0..win_len {
-                let k_pos = win_start + w;
-                let mut sum = 0.0f32;
-                for dd in 0..hd {
-                    sum += d_attn_out[q_pos * total_dim + h_offset + dd]
-                         * cache.v[k_pos * total_dim + h_offset + dd];
-                }
-                d_attn_w[w] = sum;
-            }
-
-            // d_V[k,h,d] += attn_weights[w] * d_attn_out[q,h,d]
-            for w in 0..win_len {
-                let k_pos = win_start + w;
-                let aw = cache.attn_weights[aw_base + w];
-                for dd in 0..hd {
-                    d_v[k_pos * total_dim + h_offset + dd] +=
-                        aw * d_attn_out[q_pos * total_dim + h_offset + dd];
-                }
-            }
-
-            // Softmax backward: d_scores[i] = P[i] * (d_attn_w[i] - sum_j(P[j] * d_attn_w[j]))
-            let mut dot_pw = 0.0f32;
-            for w in 0..win_len {
-                dot_pw += cache.attn_weights[aw_base + w] * d_attn_w[w];
-            }
-            let mut d_scores = vec![0.0f32; ws];
-            for w in 0..win_len {
-                d_scores[w] = cache.attn_weights[aw_base + w] * (d_attn_w[w] - dot_pw);
-            }
-
-            // d_Q[q,h,d] += d_scores[w] * K[k,h,d] * scale
-            // d_K[k,h,d] += d_scores[w] * Q[q,h,d] * scale
-            for w in 0..win_len {
-                let k_pos = win_start + w;
-                let ds = d_scores[w] * scale;
-                for dd in 0..hd {
-                    d_q[q_pos * total_dim + h_offset + dd] +=
-                        ds * cache.k[k_pos * total_dim + h_offset + dd];
-                    d_k[k_pos * total_dim + h_offset + dd] +=
-                        ds * cache.q[q_pos * total_dim + h_offset + dd];
-                }
-            }
-        }
-    }
+    crate::dispatch::swa_backward_dispatch(
+        &cache.q, &cache.k, &cache.v,
+        &cache.attn_weights, &d_attn_out,
+        &mut d_q, &mut d_k, &mut d_v,
+        s, nh, hd, ws,
+    );
 
     // ── Stage 2: QKV projection backward ─────────────────────────────
     // Q = embedded[s,d] @ W_Q^T[d,d]
