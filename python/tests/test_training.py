@@ -23,7 +23,7 @@ def test_sgd_training_loop():
 
     lr = 0.01
     for _ in range(50):
-        loss, grads = nl_hecate.compute_gradients(params, cfg, input_ids, target_ids)
+        _loss, grads = nl_hecate.compute_gradients(params, cfg, input_ids, target_ids)
         nl_hecate.sgd_step(params, grads, lr)
 
     final_loss, _ = nl_hecate.forward(params, cfg, input_ids, target_ids)

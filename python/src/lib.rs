@@ -81,7 +81,13 @@ struct ForwardCache {
     inner: RustCache,
 }
 
-// Opaque — no exposed methods (CS-18: Python cannot inspect activations)
+#[pymethods]
+impl ForwardCache {
+    /// Return logits as flat list: [seq_len * vocab_size], row-major.
+    fn get_logits(&self) -> Vec<f32> {
+        self.inner.logits.clone()
+    }
+}
 
 // ── Free functions ───────────────────────────────────────────────────
 
@@ -104,10 +110,26 @@ fn init_params(cfg: &SWAConfig, seed: u64) -> SWAParams {
     }
 }
 
+fn validate_seq_lens(cfg: &SWAConfig, input_ids: &[usize], target_ids: &[usize]) -> PyResult<()> {
+    let expected = cfg.inner.seq_len;
+    if input_ids.len() != expected {
+        return Err(PyValueError::new_err(format!(
+            "input_ids length ({}) must equal seq_len ({expected})", input_ids.len()
+        )));
+    }
+    if target_ids.len() != expected {
+        return Err(PyValueError::new_err(format!(
+            "target_ids length ({}) must equal seq_len ({expected})", target_ids.len()
+        )));
+    }
+    Ok(())
+}
+
 #[pyfunction]
-fn forward(params: &SWAParams, cfg: &SWAConfig, input_ids: Vec<usize>, target_ids: Vec<usize>) -> (f32, ForwardCache) {
+fn forward(params: &SWAParams, cfg: &SWAConfig, input_ids: Vec<usize>, target_ids: Vec<usize>) -> PyResult<(f32, ForwardCache)> {
+    validate_seq_lens(cfg, &input_ids, &target_ids)?;
     let (loss, cache) = rust_forward(&params.inner, &cfg.inner, &input_ids, &target_ids);
-    (loss, ForwardCache { inner: cache })
+    Ok((loss, ForwardCache { inner: cache }))
 }
 
 #[pyfunction]
@@ -117,9 +139,10 @@ fn backward(
     cache: &ForwardCache,
     input_ids: Vec<usize>,
     target_ids: Vec<usize>,
-) -> SWAParams {
+) -> PyResult<SWAParams> {
+    validate_seq_lens(cfg, &input_ids, &target_ids)?;
     let grads = rust_backward_full(&params.inner, &cfg.inner, &cache.inner, &input_ids, &target_ids);
-    SWAParams { inner: grads }
+    Ok(SWAParams { inner: grads })
 }
 
 #[pyfunction]
@@ -128,9 +151,10 @@ fn compute_gradients(
     cfg: &SWAConfig,
     input_ids: Vec<usize>,
     target_ids: Vec<usize>,
-) -> (f32, SWAParams) {
+) -> PyResult<(f32, SWAParams)> {
+    validate_seq_lens(cfg, &input_ids, &target_ids)?;
     let (loss, grads) = rust_compute_gradients(&params.inner, &cfg.inner, &input_ids, &target_ids);
-    (loss, SWAParams { inner: grads })
+    Ok((loss, SWAParams { inner: grads }))
 }
 
 #[pyfunction]

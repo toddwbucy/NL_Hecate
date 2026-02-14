@@ -77,7 +77,7 @@ def test_backward_returns_grads():
     cfg = nl_hecate.SWAConfig(64, 4, 16, 24, 16, 256)
     params = nl_hecate.init_params(cfg, 42)
     input_ids, target_ids = _make_test_data(cfg)
-    loss, cache = nl_hecate.forward(params, cfg, input_ids, target_ids)
+    _loss, cache = nl_hecate.forward(params, cfg, input_ids, target_ids)
     grads = nl_hecate.backward(params, cfg, cache, input_ids, target_ids)
     assert isinstance(grads, nl_hecate.SWAParams)
     assert grads.num_params() == params.num_params()
@@ -88,6 +88,6 @@ def test_compute_gradients():
     params = nl_hecate.init_params(cfg, 42)
     input_ids, target_ids = _make_test_data(cfg)
     loss_cg, grads = nl_hecate.compute_gradients(params, cfg, input_ids, target_ids)
-    loss_fwd, _ = nl_hecate.forward(params, cfg, input_ids, target_ids)
+    loss_fwd, _cache = nl_hecate.forward(params, cfg, input_ids, target_ids)
     assert loss_cg == loss_fwd
     assert grads.num_params() == params.num_params()
