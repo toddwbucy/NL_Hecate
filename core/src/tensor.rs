@@ -51,20 +51,20 @@ pub fn truncate_to_bf16(buf: &mut [f32]) {
 
 // ── Free-function math ops on flat slices ────────────────────────────
 //
-// Kernel-pair registry (Phase 2 — CUDA):
-//   Each Rust reference impl below requires a CUDA forward + backward kernel.
-//   Status: all pending. Kernel symbols reserved for dispatch.rs.
-//
-//   | Rust reference     | CUDA forward              | CUDA backward              |
-//   |--------------------|---------------------------|----------------------------|
-//   | matmul_f32         | matmul_f32_cuda_fwd       | matmul_f32_cuda_bwd        |
-//   | matmul_acc_f32     | matmul_acc_f32_cuda_fwd   | matmul_acc_f32_cuda_bwd    |
-//   | transpose_f32      | transpose_f32_cuda_fwd    | transpose_f32_cuda_bwd     |
-//   | softmax_f32        | softmax_f32_cuda_fwd      | softmax_f32_cuda_bwd       |
-//
-//   Backward kernels must compute correct analytical gradients matching the
+// Kernel-pair registry (CUDA):
+//   Each Rust reference impl below may have a CUDA forward + backward kernel.
+//   Backward kernels compute correct analytical gradients matching the
 //   Rust signatures and row-major memory layout. See specs/infrastructure/
 //   00_enzyme_integration.md for the kernel-pair contract.
+//
+//   | Rust reference         | CUDA kernel pair            | Status       |
+//   |------------------------|-----------------------------|--------------|
+//   | swa::swa_forward       | swa_forward_f32_cuda        | ✓ Phase 2    |
+//   | swa::swa_backward_rust | swa_backward_f32_cuda       | ✓ Phase 2    |
+//   | matmul_f32             | matmul_f32_cuda_fwd/bwd     | pending      |
+//   | matmul_acc_f32         | matmul_acc_f32_cuda_fwd/bwd | pending      |
+//   | transpose_f32          | transpose_f32_cuda_fwd/bwd  | pending      |
+//   | softmax_f32            | softmax_f32_cuda_fwd/bwd    | pending      |
 
 /// Matrix multiply: C[M,N] = A[M,K] @ B[K,N].  Row-major.
 /// `out` must be pre-allocated with M*N elements (will be overwritten).
