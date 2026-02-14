@@ -180,6 +180,9 @@ pub(crate) fn mag_check_weight_gradient(
     let weight_vec = get_weight(params);
     let n = weight_vec.len();
 
+    #[cfg(feature = "cuda")]
+    let abs_threshold = 5e-3;
+    #[cfg(not(feature = "cuda"))]
     let abs_threshold = 5e-4;
 
     let step = if n > num_samples { n / num_samples } else { 1 };

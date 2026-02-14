@@ -9,7 +9,7 @@
 
 use crate::tensor::{matmul_f32, transpose_f32, cross_entropy_loss, sigmoid_f32};
 use crate::model::{MAGConfig, MAGParams};
-use crate::delta_rule::{delta_rule_forward, delta_rule_backward, DeltaRuleCache};
+use crate::delta_rule::{MemoryRule, DeltaRule, DeltaRuleCache};
 
 /// Cache for MAG forward pass — holds both branches' intermediates.
 pub struct MAGForwardCache {
@@ -79,8 +79,9 @@ pub fn mag_forward(
     let mut attn_weights = vec![0.0f32; nh * s * ws];
     crate::dispatch::swa_forward_dispatch(&q, &k, &vv, &mut attn_out, &mut attn_weights, s, nh, hd, ws);
 
-    // Stage 2b+3b: Memory branch — Delta Rule
-    let (y, delta_cache) = delta_rule_forward(params, &embedded, s, d);
+    // Stage 2b+3b: Memory branch — Delta Rule (via MemoryRule trait)
+    let memory = DeltaRule;
+    let (y, delta_cache) = memory.step(params, &embedded, s, d);
 
     // Stage 4: Gating — gate = sigmoid(y), gated_out = attn_out * gate
     let mut gate = vec![0.0f32; s * d];
@@ -195,8 +196,9 @@ pub fn mag_backward(
         d_y[i] = d_gate[i] * cache.gate[i] * (1.0 - cache.gate[i]);
     }
 
-    // ── Stage 3b: Delta Rule backward ────────────────────────────────
-    let (mem_grads, d_embedded_mem) = delta_rule_backward(
+    // ── Stage 3b: Delta Rule backward (via MemoryRule trait) ──────────
+    let memory = DeltaRule;
+    let (mem_grads, d_embedded_mem) = memory.step_backward(
         params, &cache.delta_cache, &d_y, &cache.embedded,
     );
 
