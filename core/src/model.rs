@@ -5,6 +5,17 @@
 
 use crate::tensor::SimpleRng;
 
+/// Which memory update rule to use for the inner loop.
+///
+/// MIRAS Algorithm knob: selects the optimizer for memory updates.
+/// - DeltaRule: GD without momentum (Titans Eq 34)
+/// - TitansLMM: GD + momentum accumulator S (Titans Eqs 12-15, 32-33)
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MemoryRuleKind {
+    DeltaRule,
+    TitansLMM,
+}
+
 /// Model configuration — immutable after construction.
 #[derive(Clone, Debug)]
 pub struct SWAConfig {
@@ -133,6 +144,8 @@ impl SWAParams {
 ///   b_alpha:  [1]    retention gate bias
 ///   w_theta:  [2*d]  learning rate gate weights
 ///   b_theta:  [1]    learning rate gate bias
+///   w_eta:    [2*d]  momentum gate weights (TitansLMM only; zero-init for DeltaRule)
+///   b_eta:    [1]    momentum gate bias (TitansLMM only)
 #[derive(Clone)]
 pub struct MemoryLevelParams {
     pub w_k_mem: Vec<f32>,
@@ -142,6 +155,8 @@ pub struct MemoryLevelParams {
     pub b_alpha: Vec<f32>,
     pub w_theta: Vec<f32>,
     pub b_theta: Vec<f32>,
+    pub w_eta: Vec<f32>,
+    pub b_eta: Vec<f32>,
 }
 
 impl MemoryLevelParams {
@@ -149,7 +164,8 @@ impl MemoryLevelParams {
     /// `b_alpha_init` and `b_theta_init` control gate bias initialization:
     ///   Level 0: b_alpha=3.0 (sigmoid≈0.95), b_theta=-4.6 (softplus≈0.01)
     ///   Level 1: b_alpha=4.0 (sigmoid≈0.98), b_theta=-5.6 (softplus≈0.004)
-    pub fn init(d: usize, rng: &mut SimpleRng, b_alpha_init: f32, b_theta_init: f32) -> Self {
+    /// `b_eta_init`: momentum gate bias (only used by TitansLMM; still allocated for uniform struct).
+    pub fn init(d: usize, rng: &mut SimpleRng, b_alpha_init: f32, b_theta_init: f32, b_eta_init: f32) -> Self {
         let proj_scale = (2.0 / (d + d) as f32).sqrt();
         let gate_scale = (1.0 / (2 * d) as f32).sqrt();
 
@@ -168,10 +184,14 @@ impl MemoryLevelParams {
         let mut w_theta = vec![0.0f32; 2 * d];
         rng.fill_uniform(&mut w_theta, gate_scale);
 
+        let mut w_eta = vec![0.0f32; 2 * d];
+        rng.fill_uniform(&mut w_eta, gate_scale);
+
         let b_alpha = vec![b_alpha_init];
         let b_theta = vec![b_theta_init];
+        let b_eta = vec![b_eta_init];
 
-        MemoryLevelParams { w_k_mem, w_v_mem, w_q_mem, w_alpha, b_alpha, w_theta, b_theta }
+        MemoryLevelParams { w_k_mem, w_v_mem, w_q_mem, w_alpha, b_alpha, w_theta, b_theta, w_eta, b_eta }
     }
 
     /// Create zero-initialized shadow for gradient accumulation.
@@ -184,6 +204,8 @@ impl MemoryLevelParams {
             b_alpha: vec![0.0f32; 1],
             w_theta: vec![0.0f32; 2 * d],
             b_theta: vec![0.0f32; 1],
+            w_eta: vec![0.0f32; 2 * d],
+            b_eta: vec![0.0f32; 1],
         }
     }
 
@@ -192,6 +214,7 @@ impl MemoryLevelParams {
         self.w_k_mem.len() + self.w_v_mem.len() + self.w_q_mem.len()
             + self.w_alpha.len() + self.b_alpha.len()
             + self.w_theta.len() + self.b_theta.len()
+            + self.w_eta.len() + self.b_eta.len()
     }
 
     /// Apply SGD: param -= lr * grad for all weight matrices.
@@ -208,6 +231,8 @@ impl MemoryLevelParams {
         step(&mut self.b_alpha, &grads.b_alpha, lr);
         step(&mut self.w_theta, &grads.w_theta, lr);
         step(&mut self.b_theta, &grads.b_theta, lr);
+        step(&mut self.w_eta, &grads.w_eta, lr);
+        step(&mut self.b_eta, &grads.b_eta, lr);
     }
 
     /// Element-wise accumulate: self += other.
@@ -224,13 +249,16 @@ impl MemoryLevelParams {
         acc(&mut self.b_alpha, &other.b_alpha);
         acc(&mut self.w_theta, &other.w_theta);
         acc(&mut self.b_theta, &other.b_theta);
+        acc(&mut self.w_eta, &other.w_eta);
+        acc(&mut self.b_eta, &other.b_eta);
     }
 
     /// Frobenius norm across all weight matrices.
     pub fn norm(&self) -> f32 {
         let mut sum = 0.0f32;
         for v in [&self.w_k_mem, &self.w_v_mem, &self.w_q_mem,
-                   &self.w_alpha, &self.b_alpha, &self.w_theta, &self.b_theta] {
+                   &self.w_alpha, &self.b_alpha, &self.w_theta, &self.b_theta,
+                   &self.w_eta, &self.b_eta] {
             for &x in v.iter() {
                 sum += x * x;
             }
@@ -247,6 +275,8 @@ impl MemoryLevelParams {
 pub struct MAGConfig {
     pub swa: SWAConfig,
     pub memory_enabled: bool,
+    /// Which memory update rule to use.
+    pub memory_rule: MemoryRuleKind,
     /// Number of CMS frequency levels (1 for Zero-B, 2 for Phase 2).
     pub k: usize,
     /// Chunk sizes per level: [1] for k=1, [1, 8] for k=2.
@@ -275,6 +305,18 @@ fn default_b_theta(level: usize) -> f32 {
     }
 }
 
+/// Default momentum gate bias per level index.
+/// Higher levels have more persistent momentum (higher eta → closer to 1).
+pub fn default_b_eta(level: usize) -> f32 {
+    match level {
+        0 => 1.5,    // sigmoid(1.5) ≈ 0.82 (moderate momentum)
+        1 => 2.0,    // sigmoid(2.0) ≈ 0.88
+        2 => 2.5,    // sigmoid(2.5) ≈ 0.92
+        3 => 3.0,    // sigmoid(3.0) ≈ 0.95 (very persistent)
+        _ => 2.0,
+    }
+}
+
 impl MAGConfig {
     /// Test configuration: tiny model for gradient checking (k=1).
     pub fn test_config() -> Self {
@@ -288,6 +330,7 @@ impl MAGConfig {
                 vocab_size: 16,
             },
             memory_enabled: true,
+            memory_rule: MemoryRuleKind::DeltaRule,
             k: 1,
             chunk_sizes: vec![1],
         }
@@ -305,6 +348,7 @@ impl MAGConfig {
                 vocab_size: 16,
             },
             memory_enabled: true,
+            memory_rule: MemoryRuleKind::DeltaRule,
             k: 2,
             chunk_sizes: vec![1, 8],
         }
@@ -322,6 +366,7 @@ impl MAGConfig {
                 vocab_size: 64,
             },
             memory_enabled: true,
+            memory_rule: MemoryRuleKind::DeltaRule,
             k: 1,
             chunk_sizes: vec![1],
         }
@@ -340,6 +385,7 @@ impl MAGConfig {
                 vocab_size: 64,
             },
             memory_enabled: true,
+            memory_rule: MemoryRuleKind::DeltaRule,
             k: 2,
             chunk_sizes: vec![1, 8],
         }
@@ -358,6 +404,7 @@ impl MAGConfig {
                 vocab_size: 16,
             },
             memory_enabled: true,
+            memory_rule: MemoryRuleKind::DeltaRule,
             k: 4,
             chunk_sizes: vec![1, 8, 64, 512],
         }
@@ -376,8 +423,45 @@ impl MAGConfig {
                 vocab_size: 64,
             },
             memory_enabled: true,
+            memory_rule: MemoryRuleKind::DeltaRule,
             k: 4,
             chunk_sizes: vec![1, 8, 64, 512],
+        }
+    }
+
+    /// Titans LMM test configuration: tiny model for gradient checking (k=1).
+    pub fn titans_test_config() -> Self {
+        MAGConfig {
+            swa: SWAConfig {
+                d_model: 8,
+                num_heads: 2,
+                head_dim: 4,
+                seq_len: 4,
+                window_size: 4,
+                vocab_size: 16,
+            },
+            memory_enabled: true,
+            memory_rule: MemoryRuleKind::TitansLMM,
+            k: 1,
+            chunk_sizes: vec![1],
+        }
+    }
+
+    /// Titans LMM test configuration for CMS k=2 testing.
+    pub fn titans_test_config_k2() -> Self {
+        MAGConfig {
+            swa: SWAConfig {
+                d_model: 8,
+                num_heads: 2,
+                head_dim: 4,
+                seq_len: 8,
+                window_size: 8,
+                vocab_size: 16,
+            },
+            memory_enabled: true,
+            memory_rule: MemoryRuleKind::TitansLMM,
+            k: 2,
+            chunk_sizes: vec![1, 8],
         }
     }
 }
@@ -408,6 +492,7 @@ impl MAGParams {
                 d, &mut rng,
                 default_b_alpha(level),
                 default_b_theta(level),
+                default_b_eta(level),
             ));
         }
 
@@ -672,5 +757,40 @@ mod tests {
         assert_ne!(p.levels[0].w_k_mem, p.levels[1].w_k_mem);
         assert_ne!(p.levels[1].w_k_mem, p.levels[2].w_k_mem);
         assert_ne!(p.levels[2].w_k_mem, p.levels[3].w_k_mem);
+    }
+
+    // ── Titans LMM tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_memory_level_params_with_eta() {
+        let cfg = MAGConfig::titans_test_config();
+        let p = MAGParams::init(&cfg, 42);
+        let d = cfg.swa.d_model;
+        assert_eq!(p.levels[0].w_eta.len(), 2 * d);
+        assert_eq!(p.levels[0].b_eta.len(), 1);
+        // eta params included in num_params
+        let expected = 3 * d * d + 2 * (2 * d) + 2 + (2 * d) + 1; // 3 proj + 2 gates + eta
+        assert_eq!(p.levels[0].num_params(), expected);
+    }
+
+    #[test]
+    fn test_mag_config_titans() {
+        let cfg = MAGConfig::titans_test_config();
+        assert_eq!(cfg.memory_rule, MemoryRuleKind::TitansLMM);
+        assert!(cfg.memory_enabled);
+        assert_eq!(cfg.k, 1);
+
+        let cfg2 = MAGConfig::titans_test_config_k2();
+        assert_eq!(cfg2.memory_rule, MemoryRuleKind::TitansLMM);
+        assert_eq!(cfg2.k, 2);
+    }
+
+    #[test]
+    fn test_titans_default_b_eta() {
+        assert!((default_b_eta(0) - 1.5).abs() < 1e-6);
+        assert!((default_b_eta(1) - 2.0).abs() < 1e-6);
+        assert!((default_b_eta(2) - 2.5).abs() < 1e-6);
+        assert!((default_b_eta(3) - 3.0).abs() < 1e-6);
+        assert!((default_b_eta(4) - 2.0).abs() < 1e-6); // fallback
     }
 }

@@ -8,9 +8,17 @@
 /// via element-wise multiply with sigmoid activation.
 
 use crate::tensor::{matmul_f32, transpose_f32, cross_entropy_loss, sigmoid_f32};
-use crate::model::{MAGConfig, MAGParams};
+use crate::model::{MAGConfig, MAGParams, MemoryRuleKind};
 use crate::delta_rule::{MemoryRule, DeltaRule, DeltaRuleCache, delta_rule_read_only, delta_rule_read_only_backward};
+use crate::titans_lmm::{TitansLMM, TitansLMMCache};
 use crate::conductor::{Pulse, ContextState, ErrorBuffer};
+
+/// Memory cache enum for static dispatch across memory rule variants.
+/// Preserves monomorphization (Enzyme requires no vtable indirection).
+pub enum MemoryCache {
+    Delta(DeltaRuleCache),
+    Titans(TitansLMMCache),
+}
 
 /// Cache for MAG forward pass — holds both branches' intermediates.
 pub struct MAGForwardCache {
@@ -23,7 +31,7 @@ pub struct MAGForwardCache {
     pub attn_out: Vec<f32>,
     pub attn_weights: Vec<f32>,
     // Memory branch
-    pub delta_cache: DeltaRuleCache,
+    pub memory_cache: MemoryCache,
     // Gating
     pub gate: Vec<f32>,        // sigmoid(y_t): [seq_len, d]
     pub gated_out: Vec<f32>,   // attn_out * gate: [seq_len, d]
@@ -80,9 +88,17 @@ pub fn mag_forward(
     let mut attn_weights = vec![0.0f32; nh * s * ws];
     crate::dispatch::swa_forward_dispatch(&q, &k, &vv, &mut attn_out, &mut attn_weights, s, nh, hd, ws);
 
-    // Stage 2b+3b: Memory branch — Delta Rule (via MemoryRule trait)
-    let memory = DeltaRule;
-    let (y, delta_cache) = memory.step(&params.levels[0], &embedded, s, d, None);
+    // Stage 2b+3b: Memory branch — dispatch based on memory rule
+    let (y, memory_cache) = match cfg.memory_rule {
+        MemoryRuleKind::DeltaRule => {
+            let (y, cache) = DeltaRule.step(&params.levels[0], &embedded, s, d, None);
+            (y, MemoryCache::Delta(cache))
+        }
+        MemoryRuleKind::TitansLMM => {
+            let (y, cache) = TitansLMM.step(&params.levels[0], &embedded, s, d, None);
+            (y, MemoryCache::Titans(cache))
+        }
+    };
 
     // Stage 4: Gating — gate = sigmoid(y), gated_out = attn_out * gate
     let mut gate = vec![0.0f32; s * d];
@@ -107,7 +123,7 @@ pub fn mag_forward(
 
     let cache = MAGForwardCache {
         embedded, q, k, v: vv, attn_out, attn_weights,
-        delta_cache, gate, gated_out, projected, logits,
+        memory_cache, gate, gated_out, projected, logits,
     };
 
     (loss, cache)
@@ -197,11 +213,15 @@ pub fn mag_backward(
         d_y[i] = d_gate[i] * cache.gate[i] * (1.0 - cache.gate[i]);
     }
 
-    // ── Stage 3b: Delta Rule backward (via MemoryRule trait) ──────────
-    let memory = DeltaRule;
-    let (mem_grads, d_embedded_mem) = memory.step_backward(
-        &params.levels[0], &cache.delta_cache, &d_y, &cache.embedded,
-    );
+    // ── Stage 3b: Memory backward — dispatch on cache variant ──────────
+    let (mem_grads, d_embedded_mem) = match &cache.memory_cache {
+        MemoryCache::Delta(delta_cache) => {
+            DeltaRule.step_backward(&params.levels[0], delta_cache, &d_y, &cache.embedded)
+        }
+        MemoryCache::Titans(titans_cache) => {
+            TitansLMM.step_backward(&params.levels[0], titans_cache, &d_y, &cache.embedded)
+        }
+    };
 
     // Accumulate memory parameter gradients into level 0
     grads.levels[0].accumulate(&mem_grads);
@@ -263,8 +283,8 @@ pub struct CMSForwardCache {
     pub v: Vec<f32>,
     pub attn_out: Vec<f32>,
     pub attn_weights: Vec<f32>,
-    /// Per-level delta cache. None if level was frozen (read-only).
-    pub delta_caches: Vec<Option<DeltaRuleCache>>,
+    /// Per-level memory cache. None if level was frozen (read-only).
+    pub memory_caches: Vec<Option<MemoryCache>>,
     /// Per-level q_mem for frozen levels (needed for backward).
     pub q_mem_per_level: Vec<Option<Vec<f32>>>,
     /// Per-level frozen M matrix (for frozen level backward). None if active.
@@ -335,26 +355,33 @@ pub fn cms_forward(
     let mut attn_weights = vec![0.0f32; nh * s * ws];
     crate::dispatch::swa_forward_dispatch(&q, &k, &vv, &mut attn_out, &mut attn_weights, s, nh, hd, ws);
 
-    // Stage 2b+3b: Memory branch — per-level DeltaRule
-    let mut delta_caches: Vec<Option<DeltaRuleCache>> = Vec::with_capacity(cfg.k);
+    // Stage 2b+3b: Memory branch — per-level dispatch
+    let mut memory_caches: Vec<Option<MemoryCache>> = Vec::with_capacity(cfg.k);
     let mut q_mem_per_level: Vec<Option<Vec<f32>>> = Vec::with_capacity(cfg.k);
     let mut frozen_memories: Vec<Option<Vec<f32>>> = Vec::with_capacity(cfg.k);
     let mut y_per_level: Vec<Vec<f32>> = Vec::with_capacity(cfg.k);
 
     for level in 0..cfg.k {
         if pulse.active_levels[level] {
-            // Active level: full DeltaRule write + read, seeded from persisted memory
-            let memory = DeltaRule;
+            // Active level: full memory write + read, seeded from persisted memory
             let initial_m = Some(context.memory[level].as_slice());
-            let (y_level, cache_level) = memory.step(&params.levels[level], &embedded, s, d, initial_m);
-
-            // Extract final M from m_states and persist in context
-            // m_states has (seq_len+1) entries; the last one is the final memory state
-            let m_final_start = s * d * d;
-            context.memory[level] = cache_level.m_states[m_final_start..m_final_start + d * d].to_vec();
+            let (y_level, mem_cache) = match cfg.memory_rule {
+                MemoryRuleKind::DeltaRule => {
+                    let (y, cache) = DeltaRule.step(&params.levels[level], &embedded, s, d, initial_m);
+                    let m_final_start = s * d * d;
+                    context.memory[level] = cache.m_states[m_final_start..m_final_start + d * d].to_vec();
+                    (y, MemoryCache::Delta(cache))
+                }
+                MemoryRuleKind::TitansLMM => {
+                    let (y, cache) = TitansLMM.step(&params.levels[level], &embedded, s, d, initial_m);
+                    let m_final_start = s * d * d;
+                    context.memory[level] = cache.m_states[m_final_start..m_final_start + d * d].to_vec();
+                    (y, MemoryCache::Titans(cache))
+                }
+            };
 
             y_per_level.push(y_level);
-            delta_caches.push(Some(cache_level));
+            memory_caches.push(Some(mem_cache));
             q_mem_per_level.push(None);
             frozen_memories.push(None);
         } else {
@@ -368,7 +395,7 @@ pub fn cms_forward(
                 d,
             );
             y_per_level.push(y_level);
-            delta_caches.push(None);
+            memory_caches.push(None);
             q_mem_per_level.push(Some(q_mem));
             frozen_memories.push(Some(frozen_m));
         }
@@ -405,7 +432,7 @@ pub fn cms_forward(
 
     let cache = CMSForwardCache {
         embedded, q, k, v: vv, attn_out, attn_weights,
-        delta_caches, q_mem_per_level, frozen_memories,
+        memory_caches, q_mem_per_level, frozen_memories,
         y_per_level, y_combined,
         gate, gated_out, projected, logits,
         pulse: pulse.clone(),
@@ -504,12 +531,16 @@ pub fn cms_backward(
 
     for level in 0..cfg.k {
         if cache.pulse.active_levels[level] {
-            // Active level: full DeltaRule backward
-            let memory = DeltaRule;
-            let delta_cache = cache.delta_caches[level].as_ref().unwrap();
-            let (mem_grads, d_embedded_mem) = memory.step_backward(
-                &params.levels[level], delta_cache, &d_y_combined, &cache.embedded,
-            );
+            // Active level: dispatch backward based on cache variant
+            let mem_cache = cache.memory_caches[level].as_ref().unwrap();
+            let (mem_grads, d_embedded_mem) = match mem_cache {
+                MemoryCache::Delta(delta_cache) => {
+                    DeltaRule.step_backward(&params.levels[level], delta_cache, &d_y_combined, &cache.embedded)
+                }
+                MemoryCache::Titans(titans_cache) => {
+                    TitansLMM.step_backward(&params.levels[level], titans_cache, &d_y_combined, &cache.embedded)
+                }
+            };
             grads.levels[level].accumulate(&mem_grads);
             for i in 0..(s * d) {
                 d_embedded_mem_total[i] += d_embedded_mem[i];

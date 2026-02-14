@@ -1,6 +1,6 @@
 //! CMS integration tests: multi-step training, error buffer health, falsification.
 
-use nl_hecate_core::model::{MAGConfig, MAGParams};
+use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind};
 use nl_hecate_core::mag::{cms_forward, cms_backward};
 use nl_hecate_core::conductor::{Conductor, Pulse, ContextState, ErrorBuffer};
 
@@ -199,11 +199,13 @@ fn test_k2_beats_k1() {
     // k=1 config (same base, single level)
     let cfg_k1 = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
+        memory_rule: MemoryRuleKind::DeltaRule,
         k: 1, chunk_sizes: vec![1],
     };
     // k=2 config
     let cfg_k2 = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
+        memory_rule: MemoryRuleKind::DeltaRule,
         k: 2, chunk_sizes: vec![1, 8],
     };
 
@@ -374,10 +376,12 @@ fn test_k4_vs_k2_multiscale() {
 
     let cfg_k2 = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
+        memory_rule: MemoryRuleKind::DeltaRule,
         k: 2, chunk_sizes: vec![1, 8],
     };
     let cfg_k4 = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
+        memory_rule: MemoryRuleKind::DeltaRule,
         k: 4, chunk_sizes: vec![1, 8, 64, 512],
     };
 
@@ -456,6 +460,7 @@ fn test_k4_diagnostics() {
             vocab_size: 64,
         },
         memory_enabled: true,
+        memory_rule: MemoryRuleKind::DeltaRule,
         k: 4,
         chunk_sizes: vec![1, 8, 64, 512],
     };
