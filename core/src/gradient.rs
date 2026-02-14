@@ -663,7 +663,11 @@ mod tests {
         // Verify memory evolved meaningfully
         let d = cfg.swa.d_model;
         let s = cfg.swa.seq_len;
-        let m_t = &cache.delta_cache.m_states[s * d * d..(s + 1) * d * d];
+        let m_states = match &cache.memory_cache {
+            crate::mag::MemoryCache::Delta(c) => &c.m_states,
+            crate::mag::MemoryCache::Titans(c) => &c.m_states,
+        };
+        let m_t = &m_states[s * d * d..(s + 1) * d * d];
         let mt_norm: f32 = m_t.iter().map(|x| x * x).sum::<f32>().sqrt();
         eprintln!("MAG final memory norm: {mt_norm:.4e}");
         assert!(mt_norm > 1e-6, "Memory should evolve during training, norm={mt_norm}");
@@ -1257,5 +1261,542 @@ mod tests {
         );
         eprintln!("CMS l3_b_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
         assert!(passed == checked, "l3_b_theta: {passed}/{checked} passed");
+    }
+
+    // ── Titans LMM gradient checks (k=1) ────────────────────────────
+
+    fn titans_grad_check_config() -> MAGConfig {
+        MAGConfig::titans_test_config()
+    }
+
+    fn titans_params_for_grad_check(cfg: &MAGConfig, seed: u64) -> MAGParams {
+        let mut params = MAGParams::init(cfg, seed);
+        for level in &mut params.levels {
+            level.b_alpha = vec![0.0f32];  // sigmoid(0)=0.5
+            level.b_theta = vec![0.0f32];  // softplus(0)=ln(2)≈0.69
+            level.b_eta = vec![0.0f32];    // sigmoid(0)=0.5
+        }
+        params
+    }
+
+    #[test]
+    fn test_titans_gradient_w_k_mem() {
+        let cfg = titans_grad_check_config();
+        let params = titans_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "titans_w_k_mem",
+            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("titans_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "titans_w_k_mem: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_titans_gradient_w_v_mem() {
+        let cfg = titans_grad_check_config();
+        let params = titans_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "titans_w_v_mem",
+            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("titans_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "titans_w_v_mem: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_titans_gradient_w_q_mem() {
+        let cfg = titans_grad_check_config();
+        let params = titans_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "titans_w_q_mem",
+            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("titans_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "titans_w_q_mem: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_titans_gradient_w_alpha() {
+        let cfg = titans_grad_check_config();
+        let params = titans_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "titans_w_alpha",
+            |p| &p.levels[0].w_alpha, |p, i, v| p.levels[0].w_alpha[i] = v, |g| &g.levels[0].w_alpha,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("titans_w_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "titans_w_alpha: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_titans_gradient_b_alpha() {
+        let cfg = titans_grad_check_config();
+        let params = titans_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "titans_b_alpha",
+            |p| &p.levels[0].b_alpha, |p, i, v| p.levels[0].b_alpha[i] = v, |g| &g.levels[0].b_alpha,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("titans_b_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "titans_b_alpha: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_titans_gradient_w_theta() {
+        let cfg = titans_grad_check_config();
+        let params = titans_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "titans_w_theta",
+            |p| &p.levels[0].w_theta, |p, i, v| p.levels[0].w_theta[i] = v, |g| &g.levels[0].w_theta,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("titans_w_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "titans_w_theta: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_titans_gradient_b_theta() {
+        let cfg = titans_grad_check_config();
+        let params = titans_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "titans_b_theta",
+            |p| &p.levels[0].b_theta, |p, i, v| p.levels[0].b_theta[i] = v, |g| &g.levels[0].b_theta,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("titans_b_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "titans_b_theta: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_titans_gradient_w_eta() {
+        let cfg = titans_grad_check_config();
+        let params = titans_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "titans_w_eta",
+            |p| &p.levels[0].w_eta, |p, i, v| p.levels[0].w_eta[i] = v, |g| &g.levels[0].w_eta,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("titans_w_eta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "titans_w_eta: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_titans_gradient_b_eta() {
+        let cfg = titans_grad_check_config();
+        let params = titans_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "titans_b_eta",
+            |p| &p.levels[0].b_eta, |p, i, v| p.levels[0].b_eta[i] = v, |g| &g.levels[0].b_eta,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("titans_b_eta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "titans_b_eta: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    // ── Titans CMS gradient checks (k=2, both levels active) ────────
+
+    fn titans_cms_grad_check_config() -> MAGConfig {
+        MAGConfig::titans_test_config_k2()
+    }
+
+    fn titans_cms_params_for_grad_check(cfg: &MAGConfig, seed: u64) -> MAGParams {
+        let mut params = MAGParams::init(cfg, seed);
+        for level in &mut params.levels {
+            level.b_alpha = vec![0.0f32];
+            level.b_theta = vec![0.0f32];
+            level.b_eta = vec![0.0f32];
+        }
+        params
+    }
+
+    fn titans_cms_make_test_data(cfg: &MAGConfig) -> (Vec<usize>, Vec<usize>) {
+        let input_ids: Vec<usize> = (0..cfg.swa.seq_len).map(|t| t % cfg.swa.vocab_size).collect();
+        let target_ids: Vec<usize> = (1..=cfg.swa.seq_len).map(|t| t % cfg.swa.vocab_size).collect();
+        (input_ids, target_ids)
+    }
+
+    // ── Titans CMS Level 0 FD checks ────────────────────────────────
+
+    #[test]
+    fn test_titans_cms_gradient_l0_w_k_mem() {
+        let cfg = titans_cms_grad_check_config();
+        let params = titans_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = titans_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "titans_l0_w_k_mem", &pulse,
+            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("titans CMS l0_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "titans l0_w_k_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_titans_cms_gradient_l0_w_v_mem() {
+        let cfg = titans_cms_grad_check_config();
+        let params = titans_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = titans_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "titans_l0_w_v_mem", &pulse,
+            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("titans CMS l0_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "titans l0_w_v_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_titans_cms_gradient_l0_w_q_mem() {
+        let cfg = titans_cms_grad_check_config();
+        let params = titans_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = titans_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "titans_l0_w_q_mem", &pulse,
+            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("titans CMS l0_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "titans l0_w_q_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_titans_cms_gradient_l0_w_alpha() {
+        let cfg = titans_cms_grad_check_config();
+        let params = titans_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = titans_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "titans_l0_w_alpha", &pulse,
+            |p| &p.levels[0].w_alpha, |p, i, v| p.levels[0].w_alpha[i] = v, |g| &g.levels[0].w_alpha,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("titans CMS l0_w_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "titans l0_w_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_titans_cms_gradient_l0_b_alpha() {
+        let cfg = titans_cms_grad_check_config();
+        let params = titans_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = titans_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "titans_l0_b_alpha", &pulse,
+            |p| &p.levels[0].b_alpha, |p, i, v| p.levels[0].b_alpha[i] = v, |g| &g.levels[0].b_alpha,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("titans CMS l0_b_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "titans l0_b_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_titans_cms_gradient_l0_w_theta() {
+        let cfg = titans_cms_grad_check_config();
+        let params = titans_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = titans_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "titans_l0_w_theta", &pulse,
+            |p| &p.levels[0].w_theta, |p, i, v| p.levels[0].w_theta[i] = v, |g| &g.levels[0].w_theta,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("titans CMS l0_w_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "titans l0_w_theta: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_titans_cms_gradient_l0_b_theta() {
+        let cfg = titans_cms_grad_check_config();
+        let params = titans_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = titans_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "titans_l0_b_theta", &pulse,
+            |p| &p.levels[0].b_theta, |p, i, v| p.levels[0].b_theta[i] = v, |g| &g.levels[0].b_theta,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("titans CMS l0_b_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "titans l0_b_theta: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_titans_cms_gradient_l0_w_eta() {
+        let cfg = titans_cms_grad_check_config();
+        let params = titans_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = titans_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "titans_l0_w_eta", &pulse,
+            |p| &p.levels[0].w_eta, |p, i, v| p.levels[0].w_eta[i] = v, |g| &g.levels[0].w_eta,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("titans CMS l0_w_eta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "titans l0_w_eta: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_titans_cms_gradient_l0_b_eta() {
+        let cfg = titans_cms_grad_check_config();
+        let params = titans_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = titans_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "titans_l0_b_eta", &pulse,
+            |p| &p.levels[0].b_eta, |p, i, v| p.levels[0].b_eta[i] = v, |g| &g.levels[0].b_eta,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("titans CMS l0_b_eta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "titans l0_b_eta: {passed}/{checked} passed");
+    }
+
+    // ── Titans CMS Level 1 FD checks ────────────────────────────────
+
+    #[test]
+    fn test_titans_cms_gradient_l1_w_k_mem() {
+        let cfg = titans_cms_grad_check_config();
+        let params = titans_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = titans_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "titans_l1_w_k_mem", &pulse,
+            |p| &p.levels[1].w_k_mem, |p, i, v| p.levels[1].w_k_mem[i] = v, |g| &g.levels[1].w_k_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("titans CMS l1_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "titans l1_w_k_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_titans_cms_gradient_l1_w_v_mem() {
+        let cfg = titans_cms_grad_check_config();
+        let params = titans_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = titans_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "titans_l1_w_v_mem", &pulse,
+            |p| &p.levels[1].w_v_mem, |p, i, v| p.levels[1].w_v_mem[i] = v, |g| &g.levels[1].w_v_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("titans CMS l1_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "titans l1_w_v_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_titans_cms_gradient_l1_w_q_mem() {
+        let cfg = titans_cms_grad_check_config();
+        let params = titans_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = titans_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "titans_l1_w_q_mem", &pulse,
+            |p| &p.levels[1].w_q_mem, |p, i, v| p.levels[1].w_q_mem[i] = v, |g| &g.levels[1].w_q_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("titans CMS l1_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "titans l1_w_q_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_titans_cms_gradient_l1_w_alpha() {
+        let cfg = titans_cms_grad_check_config();
+        let params = titans_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = titans_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "titans_l1_w_alpha", &pulse,
+            |p| &p.levels[1].w_alpha, |p, i, v| p.levels[1].w_alpha[i] = v, |g| &g.levels[1].w_alpha,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("titans CMS l1_w_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "titans l1_w_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_titans_cms_gradient_l1_b_alpha() {
+        let cfg = titans_cms_grad_check_config();
+        let params = titans_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = titans_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "titans_l1_b_alpha", &pulse,
+            |p| &p.levels[1].b_alpha, |p, i, v| p.levels[1].b_alpha[i] = v, |g| &g.levels[1].b_alpha,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("titans CMS l1_b_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "titans l1_b_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_titans_cms_gradient_l1_w_theta() {
+        let cfg = titans_cms_grad_check_config();
+        let params = titans_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = titans_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "titans_l1_w_theta", &pulse,
+            |p| &p.levels[1].w_theta, |p, i, v| p.levels[1].w_theta[i] = v, |g| &g.levels[1].w_theta,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("titans CMS l1_w_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "titans l1_w_theta: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_titans_cms_gradient_l1_b_theta() {
+        let cfg = titans_cms_grad_check_config();
+        let params = titans_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = titans_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "titans_l1_b_theta", &pulse,
+            |p| &p.levels[1].b_theta, |p, i, v| p.levels[1].b_theta[i] = v, |g| &g.levels[1].b_theta,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("titans CMS l1_b_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "titans l1_b_theta: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_titans_cms_gradient_l1_w_eta() {
+        let cfg = titans_cms_grad_check_config();
+        let params = titans_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = titans_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "titans_l1_w_eta", &pulse,
+            |p| &p.levels[1].w_eta, |p, i, v| p.levels[1].w_eta[i] = v, |g| &g.levels[1].w_eta,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("titans CMS l1_w_eta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "titans l1_w_eta: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_titans_cms_gradient_l1_b_eta() {
+        let cfg = titans_cms_grad_check_config();
+        let params = titans_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = titans_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "titans_l1_b_eta", &pulse,
+            |p| &p.levels[1].b_eta, |p, i, v| p.levels[1].b_eta[i] = v, |g| &g.levels[1].b_eta,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("titans CMS l1_b_eta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "titans l1_b_eta: {passed}/{checked} passed");
     }
 }

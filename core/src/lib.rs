@@ -6,6 +6,7 @@ pub mod model;
 pub mod forward;
 pub mod backward;
 pub mod delta_rule;
+pub mod titans_lmm;
 pub mod mag;
 #[cfg(feature = "internal")]
 pub mod gradient;
