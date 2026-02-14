@@ -44,6 +44,15 @@ pub fn forward(
     let hd = cfg.head_dim;
     let ws = cfg.window_size;
 
+    assert!(
+        input_ids.len() >= s,
+        "forward: input_ids length {} < seq_len {}", input_ids.len(), s
+    );
+    assert!(
+        target_ids.len() >= s,
+        "forward: target_ids length {} < seq_len {}", target_ids.len(), s
+    );
+
     // Stage 1: Embedding lookup
     let mut embedded = vec![0.0f32; s * d];
     for t in 0..s {

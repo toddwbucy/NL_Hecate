@@ -24,6 +24,12 @@ use crate::tensor::softmax_f32;
 ///   attn_weights: [num_heads, seq_len, window_size] — softmax weights (for backward)
 ///
 /// The scale factor is 1/sqrt(head_dim).
+///
+/// bf16 boundary notes (Phase 2 CUDA):
+///   Q/K/V inputs and attn_weights will be stored in bf16 for memory bandwidth.
+///   All accumulation (dot products, softmax, weighted sums) stays f32.
+///   This Rust reference uses f32 throughout for FD-checkable gradients.
+///   See `tensor::truncate_to_bf16` for the conversion helper.
 pub fn swa_forward(
     q: &[f32],
     k: &[f32],

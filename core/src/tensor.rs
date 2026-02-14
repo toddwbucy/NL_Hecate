@@ -25,7 +25,46 @@ impl Tensor {
     }
 }
 
+// ── bf16 conversion helpers ──────────────────────────────────────────
+//
+// Rust has no native bf16. These truncate f32 → bf16 → f32 by zeroing
+// the low 16 mantissa bits. Used at storage boundaries (Q/K/V/attn_weights)
+// in the CUDA path; the Rust reference path stays f32 for FD-checkable
+// gradients. Phase 2 CUDA kernels will store in actual bf16.
+
+/// Truncate f32 to bf16 precision (round to nearest even).
+#[inline]
+pub fn f32_to_bf16(x: f32) -> f32 {
+    let bits = x.to_bits();
+    // Round to nearest even: add 0x7FFF + bit 16 (the "round" bit)
+    let round = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+    f32::from_bits(round & 0xFFFF_0000)
+}
+
+/// Truncate a slice to bf16 precision in-place.
+#[allow(dead_code)]
+pub fn truncate_to_bf16(buf: &mut [f32]) {
+    for v in buf.iter_mut() {
+        *v = f32_to_bf16(*v);
+    }
+}
+
 // ── Free-function math ops on flat slices ────────────────────────────
+//
+// Kernel-pair registry (Phase 2 — CUDA):
+//   Each Rust reference impl below requires a CUDA forward + backward kernel.
+//   Status: all pending. Kernel symbols reserved for dispatch.rs.
+//
+//   | Rust reference     | CUDA forward              | CUDA backward              |
+//   |--------------------|---------------------------|----------------------------|
+//   | matmul_f32         | matmul_f32_cuda_fwd       | matmul_f32_cuda_bwd        |
+//   | matmul_acc_f32     | matmul_acc_f32_cuda_fwd   | matmul_acc_f32_cuda_bwd    |
+//   | transpose_f32      | transpose_f32_cuda_fwd    | transpose_f32_cuda_bwd     |
+//   | softmax_f32        | softmax_f32_cuda_fwd      | softmax_f32_cuda_bwd       |
+//
+//   Backward kernels must compute correct analytical gradients matching the
+//   Rust signatures and row-major memory layout. See specs/infrastructure/
+//   00_enzyme_integration.md for the kernel-pair contract.
 
 /// Matrix multiply: C[M,N] = A[M,K] @ B[K,N].  Row-major.
 /// `out` must be pre-allocated with M*N elements (will be overwritten).
@@ -273,6 +312,22 @@ mod tests {
         for _ in 0..100 {
             assert_eq!(rng1.next_u64(), rng2.next_u64());
         }
+    }
+
+    #[test]
+    fn test_bf16_truncation() {
+        // bf16 has 7-bit mantissa → ~2 decimal digits
+        let x = 1.234567f32;
+        let bf = f32_to_bf16(x);
+        assert!((bf - x).abs() < 0.01, "bf16({x}) = {bf}, expected within 0.01");
+        // bf16(0) = 0
+        assert_eq!(f32_to_bf16(0.0), 0.0);
+        // Negative values
+        let neg = f32_to_bf16(-3.14159);
+        assert!((neg - (-3.14159)).abs() < 0.03);
+        // Subnormals flush toward zero
+        let tiny = f32_to_bf16(1e-40);
+        assert!(tiny.abs() < 1e-37);
     }
 
     #[test]

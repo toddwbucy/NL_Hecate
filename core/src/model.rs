@@ -102,6 +102,8 @@ impl SWAParams {
     }
 
     /// Apply SGD: param -= lr * grad for all weight matrices.
+    /// Test-only: the forward pass is the sole public API (CS-18).
+    #[cfg(test)]
     pub fn sgd_step(&mut self, grads: &SWAParams, lr: f32) {
         fn step(param: &mut [f32], grad: &[f32], lr: f32) {
             for i in 0..param.len() {

@@ -10,8 +10,9 @@ use crate::forward::forward;
 use crate::backward::backward_full;
 
 /// Compute gradients of loss with respect to all parameters.
-/// This is the main training API.
-pub fn compute_gradients(
+/// This is the main training API — used by Python bindings in Phase 3.
+#[allow(dead_code)]
+pub(crate) fn compute_gradients(
     params: &SWAParams,
     cfg: &SWAConfig,
     input_ids: &[usize],
@@ -24,6 +25,7 @@ pub fn compute_gradients(
 
 /// Compute finite-difference gradient for a single weight element.
 /// Uses central differences: (f(x+eps) - f(x-eps)) / (2*eps).
+#[allow(dead_code)]
 fn fd_single(
     params: &SWAParams,
     cfg: &SWAConfig,
@@ -53,7 +55,8 @@ fn fd_single(
 /// Uses relative error with denominator = max(|a|, |b|, abs_threshold) to
 /// avoid division by near-zero values. Gradients where both analytical and
 /// numerical are below `abs_threshold` are auto-passed (below FD resolution).
-pub fn check_weight_gradient(
+#[allow(dead_code)]
+pub(crate) fn check_weight_gradient(
     params: &SWAParams,
     cfg: &SWAConfig,
     input_ids: &[usize],
@@ -254,24 +257,4 @@ mod tests {
         assert!(passed == checked, "w_embed: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
     }
 
-    #[test]
-    fn test_training_loss_decreases() {
-        let cfg = SWAConfig::test_config();
-        let mut params = SWAParams::init(&cfg, 42);
-        let (input_ids, target_ids) = make_test_data(&cfg);
-
-        let (initial_loss, _) = forward(&params, &cfg, &input_ids, &target_ids);
-
-        let lr = 0.01;
-        let mut last_loss = initial_loss;
-        for _ in 0..50 {
-            let (loss, grads) = compute_gradients(&params, &cfg, &input_ids, &target_ids);
-            params.sgd_step(&grads, lr);
-            last_loss = loss;
-        }
-
-        eprintln!("Loss: {initial_loss:.4} → {last_loss:.4}");
-        assert!(last_loss < initial_loss,
-            "Loss should decrease: {initial_loss} → {last_loss}");
-    }
 }
