@@ -159,7 +159,7 @@ def test_mag_forward_returns_loss():
     cfg = nl_hecate.MAGConfig(16, 2, 8, 8, 8, 64, True)
     params = nl_hecate.mag_init_params(cfg, 42)
     input_ids, target_ids = _make_mag_test_data(cfg)
-    loss, cache = nl_hecate.mag_forward(params, cfg, input_ids, target_ids)
+    loss, _cache = nl_hecate.mag_forward(params, cfg, input_ids, target_ids)
     assert isinstance(loss, float)
     assert math.isfinite(loss)
     assert loss > 0.0

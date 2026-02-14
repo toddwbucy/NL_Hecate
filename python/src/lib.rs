@@ -309,6 +309,7 @@ fn mag_init_params(cfg: &MAGConfig, seed: u64) -> MAGParams {
 
 fn validate_mag_seq_lens(cfg: &MAGConfig, input_ids: &[usize], target_ids: &[usize]) -> PyResult<()> {
     let expected = cfg.inner.swa.seq_len;
+    let vocab = cfg.inner.swa.vocab_size;
     if input_ids.len() != expected {
         return Err(PyValueError::new_err(format!(
             "input_ids length ({}) must equal seq_len ({expected})", input_ids.len()
@@ -318,6 +319,20 @@ fn validate_mag_seq_lens(cfg: &MAGConfig, input_ids: &[usize], target_ids: &[usi
         return Err(PyValueError::new_err(format!(
             "target_ids length ({}) must equal seq_len ({expected})", target_ids.len()
         )));
+    }
+    for (i, &tok) in input_ids.iter().enumerate() {
+        if tok >= vocab {
+            return Err(PyValueError::new_err(format!(
+                "input_ids[{i}]={tok} must be < vocab_size ({vocab})"
+            )));
+        }
+    }
+    for (i, &tok) in target_ids.iter().enumerate() {
+        if tok >= vocab {
+            return Err(PyValueError::new_err(format!(
+                "target_ids[{i}]={tok} must be < vocab_size ({vocab})"
+            )));
+        }
     }
     Ok(())
 }
