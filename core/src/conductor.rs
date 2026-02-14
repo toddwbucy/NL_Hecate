@@ -228,4 +228,59 @@ mod tests {
         let zero = MemoryLevelParams::zeros_like(d);
         assert!(buf.health_check(&zero).is_none());
     }
+
+    // ── k=4 Conductor tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_pulse_k4_all_levels() {
+        let mut c = Conductor::new(4, vec![1, 8, 64, 512]);
+        // Step 0: all levels fire
+        let p = c.pulse();
+        assert_eq!(p.active_levels, vec![true, true, true, true]);
+
+        // Step 1: only level 0
+        c.advance();
+        let p = c.pulse();
+        assert_eq!(p.active_levels, vec![true, false, false, false]);
+
+        // Step 8: levels 0 and 1
+        for _ in 1..8 { c.advance(); }
+        let p = c.pulse();
+        assert_eq!(p.active_levels, vec![true, true, false, false]);
+
+        // Step 64: levels 0, 1, and 2
+        for _ in 8..64 { c.advance(); }
+        let p = c.pulse();
+        assert_eq!(p.active_levels, vec![true, true, true, false]);
+
+        // Step 512: all 4 levels
+        for _ in 64..512 { c.advance(); }
+        let p = c.pulse();
+        assert_eq!(p.active_levels, vec![true, true, true, true]);
+    }
+
+    #[test]
+    fn test_pulse_k4_level3_frequency() {
+        let mut c = Conductor::new(4, vec![1, 8, 64, 512]);
+        let mut l3_active_steps = vec![];
+        for step in 0..1025 {
+            let p = c.pulse();
+            if p.active_levels[3] {
+                l3_active_steps.push(step);
+            }
+            c.advance();
+        }
+        assert_eq!(l3_active_steps, vec![0, 512, 1024]);
+    }
+
+    #[test]
+    fn test_context_state_k4() {
+        let d = 8;
+        let ctx = ContextState::new(4, d);
+        assert_eq!(ctx.memory.len(), 4);
+        for level in 0..4 {
+            assert_eq!(ctx.memory[level].len(), d * d);
+            assert!(ctx.memory[level].iter().all(|&v| v == 0.0));
+        }
+    }
 }

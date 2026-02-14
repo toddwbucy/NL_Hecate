@@ -967,4 +967,295 @@ mod tests {
         eprintln!("CMS l1_b_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
         assert!(passed == checked, "l1_b_theta: {passed}/{checked} passed");
     }
+
+    // ── k=4 FD gradient checks (Levels 2 and 3) ─────────────────────
+
+    fn cms_grad_check_config_k4() -> MAGConfig {
+        MAGConfig::test_config_k4()
+    }
+
+    fn cms_params_for_grad_check_k4(cfg: &MAGConfig, seed: u64) -> MAGParams {
+        let mut params = MAGParams::init(cfg, seed);
+        for level in &mut params.levels {
+            level.b_alpha = vec![0.0f32];
+            level.b_theta = vec![0.0f32];
+        }
+        params
+    }
+
+    fn cms_make_test_data_k4(cfg: &MAGConfig) -> (Vec<usize>, Vec<usize>) {
+        let input_ids: Vec<usize> = (0..cfg.swa.seq_len).map(|t| t % cfg.swa.vocab_size).collect();
+        let target_ids: Vec<usize> = (1..=cfg.swa.seq_len).map(|t| t % cfg.swa.vocab_size).collect();
+        (input_ids, target_ids)
+    }
+
+    // ── Level 2 FD checks ──────────────────────────────────────────
+
+    #[test]
+    fn test_cms_gradient_l2_w_k_mem() {
+        let cfg = cms_grad_check_config_k4();
+        let params = cms_params_for_grad_check_k4(&cfg, 42);
+        let (input_ids, target_ids) = cms_make_test_data_k4(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "l2_w_k_mem", &pulse,
+            |p| &p.levels[2].w_k_mem, |p, i, v| p.levels[2].w_k_mem[i] = v, |g| &g.levels[2].w_k_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("CMS l2_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "l2_w_k_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_cms_gradient_l2_w_v_mem() {
+        let cfg = cms_grad_check_config_k4();
+        let params = cms_params_for_grad_check_k4(&cfg, 42);
+        let (input_ids, target_ids) = cms_make_test_data_k4(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "l2_w_v_mem", &pulse,
+            |p| &p.levels[2].w_v_mem, |p, i, v| p.levels[2].w_v_mem[i] = v, |g| &g.levels[2].w_v_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("CMS l2_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "l2_w_v_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_cms_gradient_l2_w_q_mem() {
+        let cfg = cms_grad_check_config_k4();
+        let params = cms_params_for_grad_check_k4(&cfg, 42);
+        let (input_ids, target_ids) = cms_make_test_data_k4(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "l2_w_q_mem", &pulse,
+            |p| &p.levels[2].w_q_mem, |p, i, v| p.levels[2].w_q_mem[i] = v, |g| &g.levels[2].w_q_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("CMS l2_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "l2_w_q_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_cms_gradient_l2_w_alpha() {
+        let cfg = cms_grad_check_config_k4();
+        let params = cms_params_for_grad_check_k4(&cfg, 42);
+        let (input_ids, target_ids) = cms_make_test_data_k4(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "l2_w_alpha", &pulse,
+            |p| &p.levels[2].w_alpha, |p, i, v| p.levels[2].w_alpha[i] = v, |g| &g.levels[2].w_alpha,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("CMS l2_w_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "l2_w_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_cms_gradient_l2_b_alpha() {
+        let cfg = cms_grad_check_config_k4();
+        let params = cms_params_for_grad_check_k4(&cfg, 42);
+        let (input_ids, target_ids) = cms_make_test_data_k4(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "l2_b_alpha", &pulse,
+            |p| &p.levels[2].b_alpha, |p, i, v| p.levels[2].b_alpha[i] = v, |g| &g.levels[2].b_alpha,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("CMS l2_b_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "l2_b_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_cms_gradient_l2_w_theta() {
+        let cfg = cms_grad_check_config_k4();
+        let params = cms_params_for_grad_check_k4(&cfg, 42);
+        let (input_ids, target_ids) = cms_make_test_data_k4(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "l2_w_theta", &pulse,
+            |p| &p.levels[2].w_theta, |p, i, v| p.levels[2].w_theta[i] = v, |g| &g.levels[2].w_theta,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("CMS l2_w_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "l2_w_theta: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_cms_gradient_l2_b_theta() {
+        let cfg = cms_grad_check_config_k4();
+        let params = cms_params_for_grad_check_k4(&cfg, 42);
+        let (input_ids, target_ids) = cms_make_test_data_k4(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "l2_b_theta", &pulse,
+            |p| &p.levels[2].b_theta, |p, i, v| p.levels[2].b_theta[i] = v, |g| &g.levels[2].b_theta,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("CMS l2_b_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "l2_b_theta: {passed}/{checked} passed");
+    }
+
+    // ── Level 3 FD checks ──────────────────────────────────────────
+
+    #[test]
+    fn test_cms_gradient_l3_w_k_mem() {
+        let cfg = cms_grad_check_config_k4();
+        let params = cms_params_for_grad_check_k4(&cfg, 42);
+        let (input_ids, target_ids) = cms_make_test_data_k4(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "l3_w_k_mem", &pulse,
+            |p| &p.levels[3].w_k_mem, |p, i, v| p.levels[3].w_k_mem[i] = v, |g| &g.levels[3].w_k_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("CMS l3_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "l3_w_k_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_cms_gradient_l3_w_v_mem() {
+        let cfg = cms_grad_check_config_k4();
+        let params = cms_params_for_grad_check_k4(&cfg, 42);
+        let (input_ids, target_ids) = cms_make_test_data_k4(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "l3_w_v_mem", &pulse,
+            |p| &p.levels[3].w_v_mem, |p, i, v| p.levels[3].w_v_mem[i] = v, |g| &g.levels[3].w_v_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("CMS l3_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "l3_w_v_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_cms_gradient_l3_w_q_mem() {
+        let cfg = cms_grad_check_config_k4();
+        let params = cms_params_for_grad_check_k4(&cfg, 42);
+        let (input_ids, target_ids) = cms_make_test_data_k4(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "l3_w_q_mem", &pulse,
+            |p| &p.levels[3].w_q_mem, |p, i, v| p.levels[3].w_q_mem[i] = v, |g| &g.levels[3].w_q_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("CMS l3_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "l3_w_q_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_cms_gradient_l3_w_alpha() {
+        let cfg = cms_grad_check_config_k4();
+        let params = cms_params_for_grad_check_k4(&cfg, 42);
+        let (input_ids, target_ids) = cms_make_test_data_k4(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "l3_w_alpha", &pulse,
+            |p| &p.levels[3].w_alpha, |p, i, v| p.levels[3].w_alpha[i] = v, |g| &g.levels[3].w_alpha,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("CMS l3_w_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "l3_w_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_cms_gradient_l3_b_alpha() {
+        let cfg = cms_grad_check_config_k4();
+        let params = cms_params_for_grad_check_k4(&cfg, 42);
+        let (input_ids, target_ids) = cms_make_test_data_k4(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "l3_b_alpha", &pulse,
+            |p| &p.levels[3].b_alpha, |p, i, v| p.levels[3].b_alpha[i] = v, |g| &g.levels[3].b_alpha,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("CMS l3_b_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "l3_b_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_cms_gradient_l3_w_theta() {
+        let cfg = cms_grad_check_config_k4();
+        let params = cms_params_for_grad_check_k4(&cfg, 42);
+        let (input_ids, target_ids) = cms_make_test_data_k4(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "l3_w_theta", &pulse,
+            |p| &p.levels[3].w_theta, |p, i, v| p.levels[3].w_theta[i] = v, |g| &g.levels[3].w_theta,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("CMS l3_w_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "l3_w_theta: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_cms_gradient_l3_b_theta() {
+        let cfg = cms_grad_check_config_k4();
+        let params = cms_params_for_grad_check_k4(&cfg, 42);
+        let (input_ids, target_ids) = cms_make_test_data_k4(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "l3_b_theta", &pulse,
+            |p| &p.levels[3].b_theta, |p, i, v| p.levels[3].b_theta[i] = v, |g| &g.levels[3].b_theta,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("CMS l3_b_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "l3_b_theta: {passed}/{checked} passed");
+    }
 }

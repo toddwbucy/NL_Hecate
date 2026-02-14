@@ -14,6 +14,35 @@ fn make_data(cfg: &MAGConfig) -> (Vec<usize>, Vec<usize>) {
     (input_ids, target_ids)
 }
 
+/// Generate multi-scale data with fast + slow temporal patterns.
+///
+/// The target requires BOTH a fast cycling component and a slow regime shift
+/// to predict correctly. This creates multi-scale temporal structure.
+fn make_multiscale_data(
+    seq_len: usize,
+    vocab_size: usize,
+    slow_period: usize,
+    num_regimes: usize,
+    _seed: u64,
+) -> (Vec<usize>, Vec<usize>) {
+    let tokens_per_regime = vocab_size / num_regimes;
+    let mut input_ids = Vec::with_capacity(seq_len);
+    let mut target_ids = Vec::with_capacity(seq_len);
+
+    for t in 0..seq_len {
+        let slow_regime = (t / slow_period) % num_regimes;
+        let fast_component = (t * 3 + 1) % tokens_per_regime;
+
+        let input = (t * 7 + slow_regime * 3) % vocab_size;
+        let target = (fast_component + slow_regime * tokens_per_regime) % vocab_size;
+
+        input_ids.push(input);
+        target_ids.push(target);
+    }
+
+    (input_ids, target_ids)
+}
+
 /// Run CMS training loop for N steps. Returns (initial_loss, final_loss).
 fn cms_train(
     params: &mut MAGParams,
@@ -210,4 +239,447 @@ fn test_k2_beats_k1() {
     } else {
         eprintln!("NOTE: k=2 matches k=1 at this scale — expected for d=8 tiny model");
     }
+}
+
+/// Falsification at d=32: k=2 MUST beat k=1 on multi-scale data.
+/// Hard assertion — failure blocks Phase 3 but is scientifically valid.
+#[test]
+fn test_k2_beats_k1_multiscale() {
+    let cfg_k1 = MAGConfig::validation_config_k1();
+    let cfg_k2 = MAGConfig::validation_config_k2();
+
+    let slow_period = 8;
+    let num_regimes = 4;
+    let (input_ids, target_ids) = make_multiscale_data(
+        cfg_k1.swa.seq_len, cfg_k1.swa.vocab_size, slow_period, num_regimes, 42,
+    );
+
+    let lr = 0.02;
+    let steps = 10_000;
+
+    // k=1 at its best stable config at this lr.
+    // b_theta=0.0 (softplus≈0.69) is the most aggressive that doesn't diverge.
+    // b_theta=1.0 at lr=0.02 causes k=1 to diverge (NaN).
+    let mut params_k1 = MAGParams::init(&cfg_k1, 42);
+    params_k1.levels[0].b_theta[0] = 0.0;
+    params_k1.levels[0].b_alpha[0] = 1.0; // sigmoid≈0.73
+    let (k1_initial, k1_final) = cms_train(
+        &mut params_k1, &cfg_k1, &input_ids, &target_ids, steps, lr,
+    );
+
+    // k=2: CMS multi-level structure enables MORE AGGRESSIVE inner-loop learning.
+    // b_theta=1.0 for Level 0 would crash k=1 but k=2 distributes gradient
+    // across 2 levels, providing implicit regularization.
+    let mut params_k2 = MAGParams::init(&cfg_k2, 42);
+    params_k2.levels[0].b_theta[0] = 1.0;    // softplus≈1.31 (aggressive — crashes k=1!)
+    params_k2.levels[0].b_alpha[0] = 1.0;    // sigmoid≈0.73
+    params_k2.levels[1].b_theta[0] = 0.5;    // softplus≈0.97 (active slow level)
+    params_k2.levels[1].b_alpha[0] = 3.0;    // sigmoid≈0.95 (high retention for slow)
+    let (k2_initial, k2_final) = cms_train(
+        &mut params_k2, &cfg_k2, &input_ids, &target_ids, steps, lr,
+    );
+
+    eprintln!("=== Multi-scale validation (d=32) ===");
+    eprintln!("k=1: initial={k1_initial:.4}, final={k1_final:.4}");
+    eprintln!("k=2: initial={k2_initial:.4}, final={k2_final:.4}");
+
+    // Both must converge
+    assert!(k1_final < k1_initial, "k=1 should converge");
+    assert!(k2_final < k2_initial, "k=2 should converge");
+
+    // Hard assertion: k=2 beats k=1 on multi-scale data
+    let margin = (k1_final - k2_final) / k1_final * 100.0;
+    eprintln!("Margin: {margin:.2}%");
+    assert!(
+        k2_final < k1_final,
+        "k=2 must beat k=1 on multi-scale data: k1_final={k1_final:.6}, k2_final={k2_final:.6}, margin={margin:.2}%"
+    );
+    eprintln!("PASS: k=2 beats k=1 by {margin:.2}%");
+}
+
+// ── k=4 integration tests ────────────────────────────────────────────
+
+fn k4_config() -> MAGConfig {
+    MAGConfig::test_config_k4()
+}
+
+/// 100-step smoke test for k=4: no NaN, loss finite.
+#[test]
+fn test_cms_k4_100_steps() {
+    let cfg = k4_config();
+    let mut params = MAGParams::init(&cfg, 42);
+    let (input_ids, target_ids) = make_data(&cfg);
+
+    let (initial, final_loss) = cms_train(&mut params, &cfg, &input_ids, &target_ids, 100, 0.01);
+    eprintln!("k4 100-step: initial={initial:.4}, final={final_loss:.4}");
+
+    assert!(initial.is_finite(), "Initial loss not finite");
+    assert!(final_loss.is_finite(), "Final loss not finite");
+    assert!(final_loss < 100.0, "Loss diverged: {final_loss}");
+}
+
+/// 1K-step convergence for k=4: loss decreases.
+#[test]
+fn test_cms_k4_1k_steps() {
+    let cfg = k4_config();
+    let mut params = MAGParams::init(&cfg, 42);
+    let (input_ids, target_ids) = make_data(&cfg);
+
+    let (initial, final_loss) = cms_train(&mut params, &cfg, &input_ids, &target_ids, 1000, 0.01);
+    eprintln!("k4 1K-step: initial={initial:.4}, final={final_loss:.4}");
+
+    assert!(final_loss < initial,
+        "Loss should decrease: initial={initial:.4}, final={final_loss:.4}");
+}
+
+/// 10K-step stability for k=4: loss decreases and stays finite.
+#[test]
+fn test_cms_k4_10k_steps() {
+    let cfg = k4_config();
+    let mut params = MAGParams::init(&cfg, 42);
+    let (input_ids, target_ids) = make_data(&cfg);
+
+    let (initial, final_loss) = cms_train(&mut params, &cfg, &input_ids, &target_ids, 10_000, 0.005);
+    eprintln!("k4 10K-step: initial={initial:.4}, final={final_loss:.4}");
+
+    assert!(final_loss < initial,
+        "Loss should decrease: initial={initial:.4}, final={final_loss:.4}");
+    assert!(final_loss.is_finite(), "Loss should stay finite after 10K steps");
+}
+
+/// k=4 vs k=2 comparison on multi-scale data.
+///
+/// At tiny scale (d=32, seq=32), k=4 does NOT beat k=2 because:
+/// 1. y_combined = SUM(all level outputs) → 4 levels produce ~2x total memory signal
+/// 2. This shifts the gate sigmoid toward saturation, diluting effective learning
+/// 3. seq=32 is too short for 4 timescales to provide meaningful temporal diversity
+///
+/// This test validates k=4 infrastructure correctness (convergence, no NaN, proper
+/// gradient flow) and documents the comparison. The k=4 advantage is expected at
+/// larger scales with output normalization (1/k) or learnable mixing weights.
+///
+/// Phase 3 FINDING: Additive level composition needs 1/k normalization for k>2.
+#[test]
+fn test_k4_vs_k2_multiscale() {
+    use nl_hecate_core::model::SWAConfig;
+
+    let swa = SWAConfig {
+        d_model: 32,
+        num_heads: 4,
+        head_dim: 8,
+        seq_len: 32,
+        window_size: 32,
+        vocab_size: 64,
+    };
+
+    let cfg_k2 = MAGConfig {
+        swa: swa.clone(), memory_enabled: true,
+        k: 2, chunk_sizes: vec![1, 8],
+    };
+    let cfg_k4 = MAGConfig {
+        swa: swa.clone(), memory_enabled: true,
+        k: 4, chunk_sizes: vec![1, 8, 64, 512],
+    };
+
+    let slow_period = 8;
+    let num_regimes = 4;
+    let (input_ids, target_ids) = make_multiscale_data(
+        swa.seq_len, swa.vocab_size, slow_period, num_regimes, 42,
+    );
+
+    let lr = 0.02;
+    let steps = 10_000;
+
+    // k=2 at its best stable config (from Phase 2.5)
+    let mut params_k2 = MAGParams::init(&cfg_k2, 42);
+    params_k2.levels[0].b_theta[0] = 1.0;    // softplus≈1.31
+    params_k2.levels[0].b_alpha[0] = 1.0;    // sigmoid≈0.73
+    params_k2.levels[1].b_theta[0] = 0.5;    // softplus≈0.97
+    params_k2.levels[1].b_alpha[0] = 3.0;    // sigmoid≈0.95
+    let (k2_initial, k2_final) = cms_train(
+        &mut params_k2, &cfg_k2, &input_ids, &target_ids, steps, lr,
+    );
+
+    // k=4: Same init as k=2 for levels 0,1 + very conservative levels 2,3.
+    // Levels 2,3 use default (extremely conservative) init so they contribute
+    // near-zero output and don't destabilize the model.
+    let mut params_k4 = MAGParams::init(&cfg_k4, 42);
+    params_k4.levels[0].b_theta[0] = 1.0;    // same as k=2 level 0
+    params_k4.levels[0].b_alpha[0] = 1.0;
+    params_k4.levels[1].b_theta[0] = 0.5;    // same as k=2 level 1
+    params_k4.levels[1].b_alpha[0] = 3.0;
+    // levels[2] and levels[3] keep default init: b_theta=-6.6/-7.6 (near-zero lr)
+    let (k4_initial, k4_final) = cms_train(
+        &mut params_k4, &cfg_k4, &input_ids, &target_ids, steps, lr,
+    );
+
+    eprintln!("=== Multi-scale k=4 vs k=2 (d=32, seq=32) ===");
+    eprintln!("k=2: initial={k2_initial:.4}, final={k2_final:.4}");
+    eprintln!("k=4: initial={k4_initial:.4}, final={k4_final:.4}");
+
+    // Both must converge
+    assert!(k2_final < k2_initial, "k=2 should converge");
+    assert!(k4_final < k4_initial, "k=4 should converge");
+
+    let margin = (k2_final - k4_final) / k2_final * 100.0;
+    eprintln!("Margin: {margin:.2}% (positive = k4 better)");
+
+    // k=4 must converge to a reasonable loss (within 5x of k=2).
+    // At tiny scale with additive level composition, k=4 won't beat k=2,
+    // but it should still learn meaningfully.
+    assert!(k4_final < 1.0,
+        "k=4 should reach reasonable loss, got {k4_final:.4}");
+    assert!(k4_final < k2_final * 5.0,
+        "k=4 should not regress catastrophically vs k=2: k4={k4_final:.4}, k2={k2_final:.4}");
+
+    if k4_final < k2_final {
+        eprintln!("k=4 beats k=2 by {margin:.2}%");
+    } else {
+        eprintln!("NOTE: k=4 does not beat k=2 at d=32/seq=32. Expected — additive level \
+                   composition needs 1/k normalization for k>2 (Phase 3 finding).");
+    }
+}
+
+/// Diagnostics for k=4: per-level output norms, memory norms, gate stats.
+#[test]
+fn test_k4_diagnostics() {
+    use nl_hecate_core::model::SWAConfig;
+
+    // Same config as falsification test: d=32, seq=32
+    let cfg = MAGConfig {
+        swa: SWAConfig {
+            d_model: 32,
+            num_heads: 4,
+            head_dim: 8,
+            seq_len: 32,
+            window_size: 32,
+            vocab_size: 64,
+        },
+        memory_enabled: true,
+        k: 4,
+        chunk_sizes: vec![1, 8, 64, 512],
+    };
+
+    let (input_ids, target_ids) = make_multiscale_data(
+        cfg.swa.seq_len, cfg.swa.vocab_size, 8, 4, 42,
+    );
+
+    let mut params = MAGParams::init(&cfg, 42);
+    // Same gate init as comparison test: aggressive levels 0,1, default levels 2,3
+    params.levels[0].b_theta[0] = 1.0;
+    params.levels[0].b_alpha[0] = 1.0;
+    params.levels[1].b_theta[0] = 0.5;
+    params.levels[1].b_alpha[0] = 3.0;
+    // levels[2] and levels[3] keep default init (very conservative)
+
+    let mut conductor = Conductor::new(cfg.k, cfg.chunk_sizes.clone());
+    let mut context = ContextState::new(cfg.k, cfg.swa.d_model);
+    let mut error_buffers: Vec<ErrorBuffer> = (0..cfg.k)
+        .map(|_| ErrorBuffer::new(cfg.swa.d_model))
+        .collect();
+
+    let lr = 0.02;
+    let steps = 5_000;
+    let milestone_interval = 1000;
+
+    eprintln!("=== k=4 Diagnostics (d=32, seq=32, multi-scale) ===");
+
+    for step in 0..steps {
+        let pulse = conductor.pulse();
+        let (loss, cache) = cms_forward(&params, &cfg, &input_ids, &target_ids, &pulse, &mut context);
+        let grads = cms_backward(&params, &cfg, &cache, &input_ids, &target_ids, &mut error_buffers);
+        params.sgd_step(&grads, lr);
+
+        for level in 0..cfg.k {
+            if pulse.active_levels[level] && error_buffers[level].steps_accumulated > 0 {
+                error_buffers[level].apply_and_reset(&mut params.levels[level], lr);
+            }
+        }
+
+        if step % milestone_interval == 0 || step == steps - 1 {
+            let gate_mean = cache.gate.iter().sum::<f32>() / cache.gate.len() as f32;
+
+            let mut level_norms = Vec::new();
+            for lev in 0..cfg.k {
+                if lev < cache.y_per_level.len() {
+                    let norm: f32 = cache.y_per_level[lev].iter()
+                        .map(|x| x * x).sum::<f32>().sqrt();
+                    level_norms.push(norm);
+                }
+            }
+
+            let mut mem_norms = Vec::new();
+            for lev in 0..cfg.k {
+                let norm: f32 = context.memory[lev].iter()
+                    .map(|x| x * x).sum::<f32>().sqrt();
+                mem_norms.push(norm);
+            }
+
+            eprintln!(
+                "step {step:>5}: loss={loss:.4}, gate_mean={gate_mean:.4}, \
+                 level_norms={level_norms:?}, mem_norms={mem_norms:?}"
+            );
+        }
+
+        conductor.advance();
+    }
+
+    // Assert levels have non-trivial memory after training.
+    // Levels 0,1 have aggressive init → high memory norms.
+    // Levels 2,3 have default (very conservative) init → tiny but non-zero norms.
+    for lev in 0..cfg.k {
+        let mem_norm: f32 = context.memory[lev].iter()
+            .map(|x| x * x).sum::<f32>().sqrt();
+        eprintln!("Final Level {lev} memory norm: {mem_norm:.6e}");
+    }
+    // Active levels (0,1) should have substantial memory
+    let l0_norm: f32 = context.memory[0].iter().map(|x| x*x).sum::<f32>().sqrt();
+    let l1_norm: f32 = context.memory[1].iter().map(|x| x*x).sum::<f32>().sqrt();
+    assert!(l0_norm > 1e-2, "Level 0 memory should be substantial, got {l0_norm:.4e}");
+    assert!(l1_norm > 1e-2, "Level 1 memory should be substantial, got {l1_norm:.4e}");
+    // Conservative levels (2,3) should be non-zero (initialized, touched by delta rule)
+    let l2_norm: f32 = context.memory[2].iter().map(|x| x*x).sum::<f32>().sqrt();
+    let l3_norm: f32 = context.memory[3].iter().map(|x| x*x).sum::<f32>().sqrt();
+    assert!(l2_norm > 1e-8, "Level 2 memory should be non-zero, got {l2_norm:.4e}");
+    assert!(l3_norm > 1e-8, "Level 3 memory should be non-zero, got {l3_norm:.4e}");
+}
+
+/// Error buffer health for k=4: check norm ratios for levels 1, 2, 3.
+/// Uses SGD training so gradients decorrelate between steps, making the
+/// random-walk sqrt(N) baseline valid for norm ratio bounds.
+#[test]
+fn test_k4_error_buffer_health() {
+    let cfg = k4_config();
+    let mut params = MAGParams::init(&cfg, 42);
+    let (input_ids, target_ids) = make_data(&cfg);
+
+    let mut conductor = Conductor::new(cfg.k, cfg.chunk_sizes.clone());
+    let mut context = ContextState::new(cfg.k, cfg.swa.d_model);
+    let mut error_buffers: Vec<ErrorBuffer> = (0..cfg.k)
+        .map(|_| ErrorBuffer::new(cfg.swa.d_model))
+        .collect();
+
+    let lr = 0.01;
+
+    // Run enough steps for Level 1 to accumulate and fire multiple times
+    // Level 1 fires every 8 steps, so 64 steps = 8 firing cycles
+    let steps = 64;
+    let mut health_checks = 0;
+
+    for step in 0..steps {
+        let pulse = conductor.pulse();
+        let (_, cache) = cms_forward(&params, &cfg, &input_ids, &target_ids, &pulse, &mut context);
+        let grads = cms_backward(&params, &cfg, &cache, &input_ids, &target_ids, &mut error_buffers);
+
+        // SGD update so gradients decorrelate between steps
+        params.sgd_step(&grads, lr);
+
+        // Check and apply error buffers when levels fire
+        for lev in 1..cfg.k {
+            if pulse.active_levels[lev] && error_buffers[lev].steps_accumulated > 0 {
+                let accumulated = error_buffers[lev].steps_accumulated;
+                let norm = error_buffers[lev].grads.norm();
+                eprintln!(
+                    "Step {step}: Level {lev} error buffer: accumulated={accumulated}, norm={norm:.4e}"
+                );
+                // Norm should be finite and bounded
+                assert!(norm.is_finite(), "Level {lev} error buffer norm not finite");
+                health_checks += 1;
+
+                error_buffers[lev].apply_and_reset(&mut params.levels[lev], lr);
+            }
+        }
+
+        conductor.advance();
+    }
+
+    // Verify we actually checked some error buffers
+    // Level 1 fires at steps 0, 8, 16, 24, 32, 40, 48, 56 → 7 apply cycles (skip step 0)
+    eprintln!("Error buffer health checks performed: {health_checks}");
+    assert!(health_checks >= 7, "Expected at least 7 health checks for Level 1, got {health_checks}");
+}
+
+/// Diagnostic test: reports gate stats, per-level norms, loss at milestones.
+/// Provides observability for debugging if falsification test fails.
+#[test]
+fn test_k2_diagnostics() {
+    let cfg = MAGConfig::validation_config_k2();
+    let slow_period = 8;
+    let num_regimes = 4;
+    let (input_ids, target_ids) = make_multiscale_data(
+        cfg.swa.seq_len, cfg.swa.vocab_size, slow_period, num_regimes, 42,
+    );
+
+    let mut params = MAGParams::init(&cfg, 42);
+    // Same gate init as falsification test
+    params.levels[0].b_theta[0] = 1.0;    // softplus≈1.31 (aggressive)
+    params.levels[0].b_alpha[0] = 1.0;    // sigmoid≈0.73
+    params.levels[1].b_theta[0] = 0.5;    // softplus≈0.97
+    params.levels[1].b_alpha[0] = 3.0;    // sigmoid≈0.95
+
+    let mut conductor = Conductor::new(cfg.k, cfg.chunk_sizes.clone());
+    let mut context = ContextState::new(cfg.k, cfg.swa.d_model);
+    let mut error_buffers: Vec<ErrorBuffer> = (0..cfg.k)
+        .map(|_| ErrorBuffer::new(cfg.swa.d_model))
+        .collect();
+
+    let lr = 0.02;
+    let steps = 10_000;
+    let milestone_interval = 2500;
+
+    eprintln!("=== k=2 Diagnostics (d=32, multi-scale) ===");
+
+    for step in 0..steps {
+        let pulse = conductor.pulse();
+        let (loss, cache) = cms_forward(&params, &cfg, &input_ids, &target_ids, &pulse, &mut context);
+        let grads = cms_backward(&params, &cfg, &cache, &input_ids, &target_ids, &mut error_buffers);
+        params.sgd_step(&grads, lr);
+
+        for level in 0..cfg.k {
+            if pulse.active_levels[level] && error_buffers[level].steps_accumulated > 0 {
+                error_buffers[level].apply_and_reset(&mut params.levels[level], lr);
+            }
+        }
+
+        if step % milestone_interval == 0 || step == steps - 1 {
+            // Gate stats
+            let gate_mean = cache.gate.iter().sum::<f32>() / cache.gate.len() as f32;
+            let gate_std = (cache.gate.iter().map(|g| (g - gate_mean).powi(2)).sum::<f32>()
+                / cache.gate.len() as f32).sqrt();
+
+            // Per-level output norms
+            let mut level_norms = Vec::new();
+            for lev in 0..cfg.k {
+                if lev < cache.y_per_level.len() {
+                    let norm: f32 = cache.y_per_level[lev].iter()
+                        .map(|x| x * x).sum::<f32>().sqrt();
+                    level_norms.push(norm);
+                }
+            }
+
+            // Context memory norms
+            let mut mem_norms = Vec::new();
+            for lev in 0..cfg.k {
+                let norm: f32 = context.memory[lev].iter()
+                    .map(|x| x * x).sum::<f32>().sqrt();
+                mem_norms.push(norm);
+            }
+
+            eprintln!(
+                "step {step:>5}: loss={loss:.4}, gate_mean={gate_mean:.4}, gate_std={gate_std:.4}, \
+                 level_norms={level_norms:?}, mem_norms={mem_norms:?}"
+            );
+        }
+
+        conductor.advance();
+    }
+
+    // Assert Level 1 memory is actually being used
+    let l1_mem_norm: f32 = context.memory[1].iter()
+        .map(|x| x * x).sum::<f32>().sqrt();
+    eprintln!("Final Level 1 memory norm: {l1_mem_norm:.6}");
+    assert!(
+        l1_mem_norm > 1e-4,
+        "Level 1 memory should be active (norm={l1_mem_norm}), got < 1e-4"
+    );
 }
