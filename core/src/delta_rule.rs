@@ -69,12 +69,16 @@ pub trait MemoryRule {
 
     /// Full sequence forward: project → gate → write → read for all tokens.
     /// Returns (output [seq_len, d], cache for backward).
+    ///
+    /// `initial_m`: Optional initial memory state [d*d]. If None, starts from zeros.
+    /// Used by CMS to seed active levels with persisted context memory.
     fn step(
         &self,
         level_params: &MemoryLevelParams,
         embedded: &[f32],
         seq_len: usize,
         d: usize,
+        initial_m: Option<&[f32]>,
     ) -> (Vec<f32>, Self::Cache);
 
     /// Full sequence backward through the memory rule.
@@ -170,6 +174,7 @@ impl MemoryRule for DeltaRule {
         embedded: &[f32],
         seq_len: usize,
         d: usize,
+        initial_m: Option<&[f32]>,
     ) -> (Vec<f32>, DeltaRuleCache) {
         debug_assert_eq!(embedded.len(), seq_len * d);
 
@@ -188,8 +193,12 @@ impl MemoryRule for DeltaRule {
         matmul_f32(embedded, &w_v_mem_t, &mut v_mem, seq_len, d, d);
         matmul_f32(embedded, &w_q_mem_t, &mut q_mem, seq_len, d, d);
 
-        // Allocate cache
-        let mut m_states = vec![0.0f32; (seq_len + 1) * d * d]; // M_0 = zeros
+        // Allocate cache — seed M_0 from initial_m if provided, else zeros
+        let mut m_states = vec![0.0f32; (seq_len + 1) * d * d];
+        if let Some(m0) = initial_m {
+            debug_assert_eq!(m0.len(), d * d);
+            m_states[..d * d].copy_from_slice(m0);
+        }
         let mut concat_kv = vec![0.0f32; seq_len * 2 * d];
         let mut alpha_pre = vec![0.0f32; seq_len];
         let mut alpha = vec![0.0f32; seq_len];
@@ -534,7 +543,7 @@ mod tests {
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
         let rule = DeltaRule;
-        let (y, _cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model);
+        let (y, _cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for (i, &v) in y.iter().enumerate() {
             assert!(v.is_finite(), "y[{i}] is not finite: {v}");
         }
@@ -546,7 +555,7 @@ mod tests {
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
         let rule = DeltaRule;
-        let (_y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model);
+        let (_y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let d = cfg.swa.d_model;
         let s = cfg.swa.seq_len;
 
@@ -564,7 +573,7 @@ mod tests {
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
         let rule = DeltaRule;
-        let (_y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model);
+        let (_y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for t in 0..cfg.swa.seq_len {
             let a = cache.alpha[t];
             assert!(a > 0.0 && a < 1.0, "alpha[{t}]={a} not in (0,1)");
@@ -579,8 +588,8 @@ mod tests {
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
         let rule = DeltaRule;
-        let (y1, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model);
-        let (y2, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model);
+        let (y1, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
+        let (y2, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         assert_eq!(y1, y2, "Delta rule forward should be deterministic");
     }
 
@@ -590,7 +599,7 @@ mod tests {
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
         let rule = DeltaRule;
-        let (y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model);
+        let (y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
         assert_eq!(y.len(), s * d);
@@ -608,7 +617,7 @@ mod tests {
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
         let rule = DeltaRule;
-        let (_y, cache) = rule.step(&params.levels[0], &embedded, s, d);
+        let (_y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
 
         let d_y = vec![1.0f32; s * d];
         let (grads, d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
@@ -636,7 +645,7 @@ mod tests {
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
         let rule = DeltaRule;
-        let (_y, cache) = rule.step(&params.levels[0], &embedded, s, d);
+        let (_y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
 
         let d_y = vec![1.0f32; s * d];
         let (grads, d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
@@ -660,7 +669,7 @@ mod tests {
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
         let rule = DeltaRule;
-        let (_y, cache) = rule.step(&params.levels[0], &embedded, s, d);
+        let (_y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
 
         let d_y = vec![1.0f32; s * d];
         let (grads, d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);

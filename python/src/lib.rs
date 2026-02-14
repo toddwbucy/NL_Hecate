@@ -206,11 +206,21 @@ impl MAGConfig {
                 "d_model ({d_model}) must equal num_heads ({num_heads}) * head_dim ({head_dim})"
             )));
         }
+        if k < 1 {
+            return Err(PyValueError::new_err("k must be >= 1"));
+        }
         let chunk_sizes = chunk_sizes.unwrap_or_else(|| vec![1; k]);
         if chunk_sizes.len() != k {
             return Err(PyValueError::new_err(format!(
                 "chunk_sizes length ({}) must equal k ({k})", chunk_sizes.len()
             )));
+        }
+        for (i, &cs) in chunk_sizes.iter().enumerate() {
+            if cs < 1 {
+                return Err(PyValueError::new_err(format!(
+                    "chunk_sizes[{i}] must be >= 1, got {cs}"
+                )));
+            }
         }
         Ok(MAGConfig {
             inner: RustMAGConfig {

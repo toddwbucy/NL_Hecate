@@ -70,6 +70,7 @@ impl ContextState {
 pub struct ErrorBuffer {
     pub grads: MemoryLevelParams,
     pub steps_accumulated: usize,
+    d: usize,
 }
 
 impl ErrorBuffer {
@@ -77,6 +78,7 @@ impl ErrorBuffer {
         ErrorBuffer {
             grads: MemoryLevelParams::zeros_like(d),
             steps_accumulated: 0,
+            d,
         }
     }
 
@@ -90,8 +92,7 @@ impl ErrorBuffer {
     pub fn apply_and_reset(&mut self, params: &mut MemoryLevelParams, lr: f32) {
         if self.steps_accumulated > 0 {
             params.sgd_step(&self.grads, lr);
-            let d = self.grads.w_k_mem.len().isqrt();
-            self.grads = MemoryLevelParams::zeros_like(d);
+            self.grads = MemoryLevelParams::zeros_like(self.d);
             self.steps_accumulated = 0;
         }
     }

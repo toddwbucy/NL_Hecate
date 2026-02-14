@@ -82,7 +82,7 @@ pub fn mag_forward(
 
     // Stage 2b+3b: Memory branch — Delta Rule (via MemoryRule trait)
     let memory = DeltaRule;
-    let (y, delta_cache) = memory.step(&params.levels[0], &embedded, s, d);
+    let (y, delta_cache) = memory.step(&params.levels[0], &embedded, s, d, None);
 
     // Stage 4: Gating — gate = sigmoid(y), gated_out = attn_out * gate
     let mut gate = vec![0.0f32; s * d];
@@ -343,9 +343,10 @@ pub fn cms_forward(
 
     for level in 0..cfg.k {
         if pulse.active_levels[level] {
-            // Active level: full DeltaRule write + read
+            // Active level: full DeltaRule write + read, seeded from persisted memory
             let memory = DeltaRule;
-            let (y_level, cache_level) = memory.step(&params.levels[level], &embedded, s, d);
+            let initial_m = Some(context.memory[level].as_slice());
+            let (y_level, cache_level) = memory.step(&params.levels[level], &embedded, s, d, initial_m);
 
             // Extract final M from m_states and persist in context
             // m_states has (seq_len+1) entries; the last one is the final memory state
