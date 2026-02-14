@@ -258,7 +258,9 @@ pub struct MAGConfig {
 fn default_b_alpha(level: usize) -> f32 {
     match level {
         0 => 3.0,    // sigmoid(3.0) ≈ 0.95
-        1 => 4.0,    // sigmoid(4.0) ≈ 0.98 (higher retention for slow level)
+        1 => 4.0,    // sigmoid(4.0) ≈ 0.98
+        2 => 4.5,    // sigmoid(4.5) ≈ 0.989
+        3 => 5.0,    // sigmoid(5.0) ≈ 0.993
         _ => 3.0,
     }
 }
@@ -266,7 +268,9 @@ fn default_b_alpha(level: usize) -> f32 {
 fn default_b_theta(level: usize) -> f32 {
     match level {
         0 => -4.6,   // softplus(-4.6) ≈ 0.01
-        1 => -5.6,   // softplus(-5.6) ≈ 0.004 (smaller lr for slow level)
+        1 => -5.6,   // softplus(-5.6) ≈ 0.004
+        2 => -6.6,   // softplus(-6.6) ≈ 0.0014
+        3 => -7.6,   // softplus(-7.6) ≈ 0.0005
         _ => -4.6,
     }
 }
@@ -303,6 +307,77 @@ impl MAGConfig {
             memory_enabled: true,
             k: 2,
             chunk_sizes: vec![1, 8],
+        }
+    }
+
+    /// Validation config k=1: d=32 for multi-scale data experiments.
+    pub fn validation_config_k1() -> Self {
+        MAGConfig {
+            swa: SWAConfig {
+                d_model: 32,
+                num_heads: 4,
+                head_dim: 8,
+                seq_len: 32,
+                window_size: 32,
+                vocab_size: 64,
+            },
+            memory_enabled: true,
+            k: 1,
+            chunk_sizes: vec![1],
+        }
+    }
+
+    /// Validation config k=2: d=32 for multi-scale data experiments.
+    /// Level 0 fires every step, Level 1 fires every 8th step.
+    pub fn validation_config_k2() -> Self {
+        MAGConfig {
+            swa: SWAConfig {
+                d_model: 32,
+                num_heads: 4,
+                head_dim: 8,
+                seq_len: 32,
+                window_size: 32,
+                vocab_size: 64,
+            },
+            memory_enabled: true,
+            k: 2,
+            chunk_sizes: vec![1, 8],
+        }
+    }
+
+    /// Test configuration for CMS k=4 FD gradient checking.
+    /// Small d=8 for large gradients, seq_len=16 for fast FD tests.
+    pub fn test_config_k4() -> Self {
+        MAGConfig {
+            swa: SWAConfig {
+                d_model: 8,
+                num_heads: 2,
+                head_dim: 4,
+                seq_len: 16,
+                window_size: 16,
+                vocab_size: 16,
+            },
+            memory_enabled: true,
+            k: 4,
+            chunk_sizes: vec![1, 8, 64, 512],
+        }
+    }
+
+    /// Validation config k=4: d=32, seq=512 for full frequency hierarchy.
+    /// Level 0 fires every step, Level 1 every 8th, Level 2 every 64th, Level 3 every 512th.
+    pub fn validation_config_k4() -> Self {
+        MAGConfig {
+            swa: SWAConfig {
+                d_model: 32,
+                num_heads: 4,
+                head_dim: 8,
+                seq_len: 512,
+                window_size: 512,
+                vocab_size: 64,
+            },
+            memory_enabled: true,
+            k: 4,
+            chunk_sizes: vec![1, 8, 64, 512],
         }
     }
 }
@@ -537,5 +612,65 @@ mod tests {
         p.w_k_mem[1] = 4.0;
         // norm = sqrt(9+16) = 5.0
         assert!((p.norm() - 5.0).abs() < 1e-6);
+    }
+
+    // ── k=4 specific tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_mag_k4_config() {
+        let cfg = MAGConfig::test_config_k4();
+        assert_eq!(cfg.k, 4);
+        assert_eq!(cfg.chunk_sizes, vec![1, 8, 64, 512]);
+        assert_eq!(cfg.swa.d_model, cfg.swa.num_heads * cfg.swa.head_dim);
+
+        let val = MAGConfig::validation_config_k4();
+        assert_eq!(val.k, 4);
+        assert_eq!(val.swa.seq_len, 512);
+        assert_eq!(val.chunk_sizes, vec![1, 8, 64, 512]);
+    }
+
+    #[test]
+    fn test_mag_k4_param_shapes() {
+        let cfg = MAGConfig::test_config_k4();
+        let p = MAGParams::init(&cfg, 42);
+        let d = cfg.swa.d_model;
+        assert_eq!(p.levels.len(), 4);
+        for level in &p.levels {
+            assert_eq!(level.w_k_mem.len(), d * d);
+            assert_eq!(level.w_v_mem.len(), d * d);
+            assert_eq!(level.w_q_mem.len(), d * d);
+            assert_eq!(level.w_alpha.len(), 2 * d);
+            assert_eq!(level.b_alpha.len(), 1);
+            assert_eq!(level.w_theta.len(), 2 * d);
+            assert_eq!(level.b_theta.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_mag_k4_gate_bias_init() {
+        let cfg = MAGConfig::test_config_k4();
+        let p = MAGParams::init(&cfg, 42);
+        // Level 0: b_alpha=3.0, b_theta=-4.6
+        assert!((p.levels[0].b_alpha[0] - 3.0).abs() < 1e-6);
+        assert!((p.levels[0].b_theta[0] - (-4.6)).abs() < 1e-6);
+        // Level 1: b_alpha=4.0, b_theta=-5.6
+        assert!((p.levels[1].b_alpha[0] - 4.0).abs() < 1e-6);
+        assert!((p.levels[1].b_theta[0] - (-5.6)).abs() < 1e-6);
+        // Level 2: b_alpha=4.5, b_theta=-6.6
+        assert!((p.levels[2].b_alpha[0] - 4.5).abs() < 1e-6);
+        assert!((p.levels[2].b_theta[0] - (-6.6)).abs() < 1e-6);
+        // Level 3: b_alpha=5.0, b_theta=-7.6
+        assert!((p.levels[3].b_alpha[0] - 5.0).abs() < 1e-6);
+        assert!((p.levels[3].b_theta[0] - (-7.6)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_mag_k4_different_seeds() {
+        let cfg = MAGConfig::test_config_k4();
+        let p = MAGParams::init(&cfg, 42);
+        // All 4 levels should have different weights (different RNG seeds)
+        assert_ne!(p.levels[0].w_k_mem, p.levels[1].w_k_mem);
+        assert_ne!(p.levels[1].w_k_mem, p.levels[2].w_k_mem);
+        assert_ne!(p.levels[2].w_k_mem, p.levels[3].w_k_mem);
     }
 }
