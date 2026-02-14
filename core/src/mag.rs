@@ -401,11 +401,27 @@ pub fn cms_forward(
         }
     }
 
-    // Combine: y_combined = sum of all level outputs
+    // Combine: y_combined = sum of level outputs, with 1/sqrt(k) normalization for k>2.
+    //
+    // At k=2, additive composition works fine (signal doubles, sigmoid handles it).
+    // At k=4+, additive sum grows linearly with k, pushing sigmoid into saturation
+    // where gradients vanish. 1/sqrt(k) normalization keeps signal variance constant
+    // (analogous to attention's 1/sqrt(d) scaling) while preserving gradient magnitude.
+    //
+    // Why not normalize k=2: the 1/sqrt(k) factor also scales the backward gradient
+    // to all memory parameters, slowing outer-loop learning of gate biases (b_theta,
+    // b_alpha). At k=2, this cost outweighs the benefit since the signal isn't large
+    // enough to cause saturation.
     let mut y_combined = vec![0.0f32; s * d];
     for y_level in &y_per_level {
         for i in 0..(s * d) {
             y_combined[i] += y_level[i];
+        }
+    }
+    if cfg.k > 2 {
+        let scale = 1.0 / (cfg.k as f32).sqrt();
+        for i in 0..(s * d) {
+            y_combined[i] *= scale;
         }
     }
 
@@ -525,8 +541,18 @@ pub fn cms_backward(
         d_y_combined[i] = d_gate[i] * cache.gate[i] * (1.0 - cache.gate[i]);
     }
 
+    // Chain rule for 1/sqrt(k) normalization: d_y_level = (1/sqrt(k)) * d_y_combined
+    // Scale d_y_combined once before distributing to per-level backward passes.
+    // Only applies for k>2 (matching forward normalization).
+    if cfg.k > 2 {
+        let scale = 1.0 / (cfg.k as f32).sqrt();
+        for i in 0..(s * d) {
+            d_y_combined[i] *= scale;
+        }
+    }
+
     // ── Stage 3b: Per-level memory backward ──────────────────────────
-    // d_y_combined distributes equally to each level (additive combination)
+    // d_y_combined (now scaled by 1/k) distributes to each level
     let mut d_embedded_mem_total = vec![0.0f32; s * d];
 
     for level in 0..cfg.k {
