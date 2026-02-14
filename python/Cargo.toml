@@ -1,0 +1,17 @@
+[package]
+name = "nl-hecate-python"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "nl_hecate"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"] }
+nl-hecate-core = { path = "../core", features = ["internal"] }
+
+[profile.release]
+lto = "fat"
+opt-level = 2
