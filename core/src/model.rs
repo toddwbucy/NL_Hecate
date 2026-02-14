@@ -117,6 +117,130 @@ impl SWAParams {
     }
 }
 
+/// MAG (Memory-Attention-Gate) configuration.
+/// Wraps SWAConfig and adds a memory_enabled flag for backward compatibility.
+#[derive(Clone, Debug)]
+pub struct MAGConfig {
+    pub swa: SWAConfig,
+    pub memory_enabled: bool,
+}
+
+impl MAGConfig {
+    /// Test configuration: tiny model for gradient checking.
+    pub fn test_config() -> Self {
+        MAGConfig {
+            swa: SWAConfig {
+                d_model: 8,
+                num_heads: 2,
+                head_dim: 4,
+                seq_len: 4,
+                window_size: 4,
+                vocab_size: 16,
+            },
+            memory_enabled: true,
+        }
+    }
+}
+
+/// MAG parameters: attention branch (SWAParams) + memory branch weights.
+///
+/// Memory branch has 3 projection matrices (KVQ for memory) plus
+/// 2 scalar gates (alpha=retention, theta=learning rate).
+///
+/// Layout (row-major):
+///   w_k_mem:  [d, d] memory key projection
+///   w_v_mem:  [d, d] memory value projection
+///   w_q_mem:  [d, d] memory query projection
+///   w_alpha:  [2*d]  retention gate weights (input: concat(k,v))
+///   b_alpha:  [1]    retention gate bias (init ~3.0 → sigmoid≈0.95)
+///   w_theta:  [2*d]  learning rate gate weights
+///   b_theta:  [1]    learning rate gate bias (init ~-4.6 → softplus≈0.01)
+#[derive(Clone)]
+pub struct MAGParams {
+    pub swa: SWAParams,
+    pub w_k_mem: Vec<f32>,
+    pub w_v_mem: Vec<f32>,
+    pub w_q_mem: Vec<f32>,
+    pub w_alpha: Vec<f32>,
+    pub b_alpha: Vec<f32>,
+    pub w_theta: Vec<f32>,
+    pub b_theta: Vec<f32>,
+}
+
+impl MAGParams {
+    /// Initialize with Xavier scaling for projections and specific gate bias init.
+    pub fn init(cfg: &MAGConfig, seed: u64) -> Self {
+        let swa = SWAParams::init(&cfg.swa, seed);
+        let d = cfg.swa.d_model;
+        let proj_scale = (2.0 / (d + d) as f32).sqrt();
+        let gate_scale = (1.0 / (2 * d) as f32).sqrt();
+
+        // Use a different seed offset for memory weights to avoid correlation
+        let mut rng = SimpleRng::new(seed.wrapping_add(1000));
+
+        let mut w_k_mem = vec![0.0f32; d * d];
+        rng.fill_uniform(&mut w_k_mem, proj_scale);
+
+        let mut w_v_mem = vec![0.0f32; d * d];
+        rng.fill_uniform(&mut w_v_mem, proj_scale);
+
+        let mut w_q_mem = vec![0.0f32; d * d];
+        rng.fill_uniform(&mut w_q_mem, proj_scale);
+
+        let mut w_alpha = vec![0.0f32; 2 * d];
+        rng.fill_uniform(&mut w_alpha, gate_scale);
+
+        let mut w_theta = vec![0.0f32; 2 * d];
+        rng.fill_uniform(&mut w_theta, gate_scale);
+
+        // Gate bias init: conservative retention, small learning rate
+        let b_alpha = vec![3.0f32];   // sigmoid(3.0) ≈ 0.95
+        let b_theta = vec![-4.6f32];  // softplus(-4.6) ≈ 0.01
+
+        MAGParams { swa, w_k_mem, w_v_mem, w_q_mem, w_alpha, b_alpha, w_theta, b_theta }
+    }
+
+    /// Create zero-initialized shadow for gradient accumulation.
+    pub fn zeros_like(cfg: &MAGConfig) -> Self {
+        let d = cfg.swa.d_model;
+        MAGParams {
+            swa: SWAParams::zeros_like(&cfg.swa),
+            w_k_mem: vec![0.0f32; d * d],
+            w_v_mem: vec![0.0f32; d * d],
+            w_q_mem: vec![0.0f32; d * d],
+            w_alpha: vec![0.0f32; 2 * d],
+            b_alpha: vec![0.0f32; 1],
+            w_theta: vec![0.0f32; 2 * d],
+            b_theta: vec![0.0f32; 1],
+        }
+    }
+
+    /// Total number of parameters.
+    pub fn num_params(&self) -> usize {
+        self.swa.num_params()
+            + self.w_k_mem.len() + self.w_v_mem.len() + self.w_q_mem.len()
+            + self.w_alpha.len() + self.b_alpha.len()
+            + self.w_theta.len() + self.b_theta.len()
+    }
+
+    /// Apply SGD: param -= lr * grad for all weight matrices.
+    pub fn sgd_step(&mut self, grads: &MAGParams, lr: f32) {
+        fn step(param: &mut [f32], grad: &[f32], lr: f32) {
+            for i in 0..param.len() {
+                param[i] -= lr * grad[i];
+            }
+        }
+        self.swa.sgd_step(&grads.swa, lr);
+        step(&mut self.w_k_mem, &grads.w_k_mem, lr);
+        step(&mut self.w_v_mem, &grads.w_v_mem, lr);
+        step(&mut self.w_q_mem, &grads.w_q_mem, lr);
+        step(&mut self.w_alpha, &grads.w_alpha, lr);
+        step(&mut self.b_alpha, &grads.b_alpha, lr);
+        step(&mut self.w_theta, &grads.w_theta, lr);
+        step(&mut self.b_theta, &grads.b_theta, lr);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,5 +291,58 @@ mod tests {
         for &v in &p.w_q {
             assert!(v.abs() < 0.2, "Weight {} out of expected range", v);
         }
+    }
+
+    // ── MAG tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_mag_config() {
+        let cfg = MAGConfig::test_config();
+        assert!(cfg.memory_enabled);
+        assert_eq!(cfg.swa.d_model, cfg.swa.num_heads * cfg.swa.head_dim);
+    }
+
+    #[test]
+    fn test_mag_param_shapes() {
+        let cfg = MAGConfig::test_config();
+        let p = MAGParams::init(&cfg, 42);
+        let d = cfg.swa.d_model;
+        assert_eq!(p.w_k_mem.len(), d * d);
+        assert_eq!(p.w_v_mem.len(), d * d);
+        assert_eq!(p.w_q_mem.len(), d * d);
+        assert_eq!(p.w_alpha.len(), 2 * d);
+        assert_eq!(p.b_alpha.len(), 1);
+        assert_eq!(p.w_theta.len(), 2 * d);
+        assert_eq!(p.b_theta.len(), 1);
+    }
+
+    #[test]
+    fn test_mag_init_deterministic() {
+        let cfg = MAGConfig::test_config();
+        let p1 = MAGParams::init(&cfg, 42);
+        let p2 = MAGParams::init(&cfg, 42);
+        assert_eq!(p1.w_k_mem, p2.w_k_mem);
+        assert_eq!(p1.w_alpha, p2.w_alpha);
+        assert_eq!(p1.b_alpha, p2.b_alpha);
+    }
+
+    #[test]
+    fn test_mag_gate_bias_init() {
+        let cfg = MAGConfig::test_config();
+        let p = MAGParams::init(&cfg, 42);
+        // b_alpha=3.0 → sigmoid≈0.95 (high retention)
+        assert!((p.b_alpha[0] - 3.0).abs() < 1e-6);
+        // b_theta=-4.6 → softplus≈0.01 (small lr)
+        assert!((p.b_theta[0] - (-4.6)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_mag_zeros_like() {
+        let cfg = MAGConfig::test_config();
+        let z = MAGParams::zeros_like(&cfg);
+        assert!(z.w_k_mem.iter().all(|&x| x == 0.0));
+        assert!(z.w_alpha.iter().all(|&x| x == 0.0));
+        assert!(z.b_alpha.iter().all(|&x| x == 0.0));
+        assert!(z.swa.w_q.iter().all(|&x| x == 0.0));
     }
 }
