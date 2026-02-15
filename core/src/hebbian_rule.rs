@@ -180,8 +180,9 @@ impl MemoryRule for HebbianRule {
         let mut d_v_mem = vec![0.0f32; s * d];
         let mut d_q_mem = vec![0.0f32; s * d];
 
-        // d_M: accumulated gradient on memory state
+        // d_M: accumulated gradient on memory state (two buffers, swap to avoid allocation)
         let mut d_m = vec![0.0f32; d * d];
+        let mut d_m_prev = vec![0.0f32; d * d];
 
         // Reverse token loop
         for t in (0..s).rev() {
@@ -238,7 +239,6 @@ impl MemoryRule for HebbianRule {
 
             // d_M_prev = (1 - alpha_t) * d_M  (propagate to previous step)
             let retention = 1.0 - alpha_t;
-            let mut d_m_prev = vec![0.0f32; d * d];
             for i in 0..(d * d) {
                 d_m_prev[i] = retention * d_m[i];
             }
@@ -261,8 +261,8 @@ impl MemoryRule for HebbianRule {
                 d_v_mem[t * d + i] += d_alpha_pre * level_params.w_alpha[d + i];
             }
 
-            // Update d_m for next (earlier) token
-            d_m = d_m_prev;
+            // Swap buffers: d_m_prev becomes d_m for next (earlier) token
+            std::mem::swap(&mut d_m, &mut d_m_prev);
         }
 
         // ── Projection backward: k_mem = embedded @ W_K_mem^T ──
