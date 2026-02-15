@@ -286,6 +286,8 @@ pub struct MAGConfig {
 
 /// Default gate bias init values per level index.
 fn default_b_alpha(level: usize) -> f32 {
+    // Higher levels need higher retention (closer to 1.0) because they fire
+    // less frequently and must preserve information across longer intervals.
     match level {
         0 => 3.0,    // sigmoid(3.0) ≈ 0.95
         1 => 4.0,    // sigmoid(4.0) ≈ 0.98
@@ -296,6 +298,9 @@ fn default_b_alpha(level: usize) -> f32 {
 }
 
 fn default_b_theta(level: usize) -> f32 {
+    // Higher levels need smaller inner-loop lr because they accumulate M
+    // over more steps (64/512). Even with 1/sqrt(k) output normalization,
+    // aggressive inner-loop lr causes M to blow up for infrequently-firing levels.
     match level {
         0 => -4.6,   // softplus(-4.6) ≈ 0.01
         1 => -5.6,   // softplus(-5.6) ≈ 0.004
