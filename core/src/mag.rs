@@ -391,6 +391,17 @@ pub fn cms_forward(
     assert_eq!(pulse.active_levels.len(), cfg.k);
     assert_eq!(context.memory.len(), cfg.k);
 
+    // Validate context memory size for Trellis (needs 2*d_k*d, not default d*d).
+    if cfg.memory_rule == MemoryRuleKind::Trellis {
+        let expected = 2 * cfg.d_compress * d;
+        for level in 0..cfg.k {
+            assert_eq!(context.memory[level].len(), expected,
+                "Trellis context memory[{level}] has wrong size: got {}, expected {expected}. \
+                 Use ContextState::new_with_memory_size(k, d, 2 * d_compress * d).",
+                context.memory[level].len());
+        }
+    }
+
     // Stage 1: Embedding lookup
     let mut embedded = vec![0.0f32; s * d];
     for t in 0..s {

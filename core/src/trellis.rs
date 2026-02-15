@@ -127,6 +127,7 @@ impl MemoryRule for Trellis {
         initial_m: Option<Vec<f32>>,
     ) -> (Vec<f32>, TrellisCache) {
         let d_k = self.d_k;
+        assert!(d_k <= d, "Trellis requires d_compress <= d_model, got d_k={d_k}, d={d}");
         let sk_size = d_k * d;
         let sv_size = d * d_k;
         debug_assert_eq!(embedded.len(), seq_len * d);
@@ -244,18 +245,11 @@ impl MemoryRule for Trellis {
             }
             pred_k[t * d_k..(t + 1) * d_k].copy_from_slice(&pk);
 
-            // error_k = pred_k - k_t (note: k_t is d-dim but we only predict d_k components)
-            // Actually, pred_k is d_k-dim. We need k_t projected to d_k... but the plan says
-            // error_k = pred_k - k_t where both are d_k. This means k_t should be d_k-dim.
-            // Looking at the spec more carefully: S_K compresses d → d_k. The target for
-            // key compression is k_t which is d-dim. So pred_k = S_K @ x_t is d_k-dim.
-            // The error should be against some d_k-dim target... In the Trellis paper,
-            // the loss is ||S_K @ x - k||^2 where k is also compressed.
-            // For simplicity with d_k = d (our test config), this works directly.
-            // For d_k < d, we'd need a target projection. Since d_compress = d in our configs,
-            // we use k_t[:d_k] as the target.
+            // error_k = pred_k - k_t[:d_k]
+            // S_K compresses d → d_k. The target is the first d_k components of k_t.
+            // Since d_k <= d is enforced by the assert above, k_t[i] is always valid.
             for i in 0..d_k {
-                error_k[t * d_k + i] = pk[i] - k_t[i.min(d - 1)];
+                error_k[t * d_k + i] = pk[i] - k_t[i];
             }
 
             // grad_S_K = outer(error_k, x_t) + lambda_k * S_K_t
@@ -576,8 +570,8 @@ impl MemoryRule for Trellis {
                 }
             }
 
-            // d_k_mem from error_k: d_k_t[i] -= d_error_k[i] (for i < d_k)
-            for i in 0..d_k.min(d) {
+            // d_k_mem from error_k: d_k_t[i] -= d_error_k[i] (for i < d_k, and d_k <= d)
+            for i in 0..d_k {
                 d_k_mem[t * d + i] -= d_error_k[i];
             }
 

@@ -273,6 +273,11 @@ pub fn frobenius_dot_f32(a: &[f32], b: &[f32]) -> f32 {
 /// Normalized SiLU: silu(x) / ||silu(x)|| * sqrt(d).
 /// Smooth, bounded activation for Trellis two-pass compression.
 /// Returns (output, silu_values, silu_norm) for backward.
+///
+/// # Autodiff
+/// Must NOT be traversed by Enzyme — intermediates are cached in TrellisCache
+/// and consumed by the hand-written `normalized_silu_backward()`. Safe because
+/// Enzyme only differentiates functions explicitly marked with `#[autodiff_reverse]`.
 pub fn normalized_silu_f32(x: &[f32]) -> (Vec<f32>, Vec<f32>, f32) {
     let d = x.len();
     let mut silu_vals = vec![0.0f32; d];

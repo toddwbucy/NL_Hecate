@@ -18,7 +18,9 @@ fn make_multiscale_data(
     slow_period: usize,
     num_regimes: usize,
 ) -> (Vec<usize>, Vec<usize>) {
+    assert!(num_regimes > 0, "num_regimes must be > 0");
     let tokens_per_regime = vocab_size / num_regimes;
+    assert!(tokens_per_regime > 0, "vocab_size must be >= num_regimes");
     let mut input_ids = Vec::with_capacity(seq_len);
     let mut target_ids = Vec::with_capacity(seq_len);
 
@@ -43,6 +45,7 @@ fn cms_train(
     steps: usize,
     lr: f32,
 ) -> (f32, f32) {
+    assert!(steps > 0, "cms_train requires steps > 0");
     let mut conductor = Conductor::new(cfg.k, cfg.chunk_sizes.clone());
     let d = cfg.swa.d_model;
     let mem_size = 2 * cfg.d_compress * d;
