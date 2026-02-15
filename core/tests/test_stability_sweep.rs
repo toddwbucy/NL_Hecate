@@ -166,7 +166,7 @@ fn run_sweep_k1(cfg: &MAGConfig, steps: usize, lr: f32, seed: u64) -> SweepResul
             nan_step = Some(step);
         }
 
-        if step > 0 && step % 25_000 == 0 {
+        if step > 0 && step % 25_000 == 0 && step < steps {
             milestones.push((step, loss));
         }
 
