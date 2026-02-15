@@ -14,6 +14,8 @@ pub mod memora;
 pub mod lattice_osr;
 pub mod trellis;
 pub mod mag;
+pub mod mal;
+pub mod mac;
 #[cfg(feature = "internal")]
 pub mod gradient;
 #[cfg(not(feature = "internal"))]

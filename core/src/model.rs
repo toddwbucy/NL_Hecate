@@ -5,6 +5,19 @@
 
 use crate::tensor::SimpleRng;
 
+/// Which composition pattern to use (Titans Section 4).
+///
+/// Three ways memory connects to attention — orthogonal to memory rule choice.
+/// - MAG: Memory gates attention output via sigmoid (parallel branches)
+/// - MAL: Memory preprocesses input, attention processes memory output (simplest)
+/// - MAC: Memory provides context, attention processes assembled input (most expressive)
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CompositionKind {
+    MAG,
+    MAL,
+    MAC,
+}
+
 /// Which memory update rule to use for the inner loop.
 ///
 /// MIRAS Algorithm knob: selects the optimizer for memory updates.
@@ -281,6 +294,8 @@ impl MemoryLevelParams {
 pub struct MAGConfig {
     pub swa: SWAConfig,
     pub memory_enabled: bool,
+    /// Which composition pattern to use (MAG, MAL, MAC).
+    pub composition: CompositionKind,
     /// Which memory update rule to use.
     pub memory_rule: MemoryRuleKind,
     /// Number of CMS frequency levels (1 for Zero-B, 2 for Phase 2).
@@ -363,6 +378,7 @@ impl MAGConfig {
                 vocab_size: 16,
             },
             memory_enabled: true,
+            composition: CompositionKind::MAG,
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 1,
             chunk_sizes: vec![1],
@@ -382,6 +398,7 @@ impl MAGConfig {
                 vocab_size: 16,
             },
             memory_enabled: true,
+            composition: CompositionKind::MAG,
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 2,
             chunk_sizes: vec![1, 8],
@@ -401,6 +418,7 @@ impl MAGConfig {
                 vocab_size: 64,
             },
             memory_enabled: true,
+            composition: CompositionKind::MAG,
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 1,
             chunk_sizes: vec![1],
@@ -421,6 +439,7 @@ impl MAGConfig {
                 vocab_size: 64,
             },
             memory_enabled: true,
+            composition: CompositionKind::MAG,
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 2,
             chunk_sizes: vec![1, 8],
@@ -441,6 +460,7 @@ impl MAGConfig {
                 vocab_size: 16,
             },
             memory_enabled: true,
+            composition: CompositionKind::MAG,
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 4,
             chunk_sizes: vec![1, 8, 64, 512],
@@ -461,6 +481,7 @@ impl MAGConfig {
                 vocab_size: 64,
             },
             memory_enabled: true,
+            composition: CompositionKind::MAG,
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 4,
             chunk_sizes: vec![1, 8, 64, 512],
@@ -480,6 +501,7 @@ impl MAGConfig {
                 vocab_size: 16,
             },
             memory_enabled: true,
+            composition: CompositionKind::MAG,
             memory_rule: MemoryRuleKind::TitansLMM,
             k: 1,
             chunk_sizes: vec![1],
@@ -499,6 +521,7 @@ impl MAGConfig {
                 vocab_size: 16,
             },
             memory_enabled: true,
+            composition: CompositionKind::MAG,
             memory_rule: MemoryRuleKind::HebbianRule,
             k: 1,
             chunk_sizes: vec![1],
@@ -518,6 +541,7 @@ impl MAGConfig {
                 vocab_size: 16,
             },
             memory_enabled: true,
+            composition: CompositionKind::MAG,
             memory_rule: MemoryRuleKind::HebbianRule,
             k: 2,
             chunk_sizes: vec![1, 8],
@@ -537,6 +561,7 @@ impl MAGConfig {
                 vocab_size: 16,
             },
             memory_enabled: true,
+            composition: CompositionKind::MAG,
             memory_rule: MemoryRuleKind::TitansLMM,
             k: 2,
             chunk_sizes: vec![1, 8],
@@ -556,6 +581,7 @@ impl MAGConfig {
                 vocab_size: 16,
             },
             memory_enabled: true,
+            composition: CompositionKind::MAG,
             memory_rule: MemoryRuleKind::Moneta,
             k: 1,
             chunk_sizes: vec![1],
@@ -584,6 +610,7 @@ impl MAGConfig {
                 vocab_size: 16,
             },
             memory_enabled: true,
+            composition: CompositionKind::MAG,
             memory_rule: MemoryRuleKind::Moneta,
             k: 2,
             chunk_sizes: vec![1, 8],
@@ -612,6 +639,7 @@ impl MAGConfig {
                 vocab_size: 16,
             },
             memory_enabled: true,
+            composition: CompositionKind::MAG,
             memory_rule: MemoryRuleKind::YAAD,
             k: 1,
             chunk_sizes: vec![1],
@@ -640,6 +668,7 @@ impl MAGConfig {
                 vocab_size: 16,
             },
             memory_enabled: true,
+            composition: CompositionKind::MAG,
             memory_rule: MemoryRuleKind::YAAD,
             k: 2,
             chunk_sizes: vec![1, 8],
@@ -668,6 +697,7 @@ impl MAGConfig {
                 vocab_size: 16,
             },
             memory_enabled: true,
+            composition: CompositionKind::MAG,
             memory_rule: MemoryRuleKind::MEMORA,
             k: 1,
             chunk_sizes: vec![1],
@@ -696,6 +726,7 @@ impl MAGConfig {
                 vocab_size: 16,
             },
             memory_enabled: true,
+            composition: CompositionKind::MAG,
             memory_rule: MemoryRuleKind::MEMORA,
             k: 2,
             chunk_sizes: vec![1, 8],
@@ -724,6 +755,7 @@ impl MAGConfig {
                 vocab_size: 16,
             },
             memory_enabled: true,
+            composition: CompositionKind::MAG,
             memory_rule: MemoryRuleKind::LatticeOSR,
             k: 1,
             chunk_sizes: vec![1],
@@ -744,6 +776,7 @@ impl MAGConfig {
                 vocab_size: 16,
             },
             memory_enabled: true,
+            composition: CompositionKind::MAG,
             memory_rule: MemoryRuleKind::LatticeOSR,
             k: 2,
             chunk_sizes: vec![1, 8],
@@ -764,6 +797,7 @@ impl MAGConfig {
                 vocab_size: 16,
             },
             memory_enabled: true,
+            composition: CompositionKind::MAG,
             memory_rule: MemoryRuleKind::Trellis,
             k: 1,
             chunk_sizes: vec![1],
@@ -787,6 +821,7 @@ impl MAGConfig {
                 vocab_size: 16,
             },
             memory_enabled: true,
+            composition: CompositionKind::MAG,
             memory_rule: MemoryRuleKind::Trellis,
             k: 2,
             chunk_sizes: vec![1, 8],
@@ -795,6 +830,87 @@ impl MAGConfig {
             d_compress: 8,
             lambda_k: 0.01,
             lambda_v: 0.01,
+        }
+    }
+
+    /// MAL test configuration: d=8, k=1, DeltaRule.
+    pub fn mal_test_config() -> Self {
+        MAGConfig {
+            swa: SWAConfig {
+                d_model: 8,
+                num_heads: 2,
+                head_dim: 4,
+                seq_len: 4,
+                window_size: 4,
+                vocab_size: 16,
+            },
+            memory_enabled: true,
+            composition: CompositionKind::MAL,
+            memory_rule: MemoryRuleKind::DeltaRule,
+            k: 1,
+            chunk_sizes: vec![1],
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+        }
+    }
+
+    /// MAL test configuration for CMS k=2 testing.
+    pub fn mal_test_config_k2() -> Self {
+        MAGConfig {
+            swa: SWAConfig {
+                d_model: 8,
+                num_heads: 2,
+                head_dim: 4,
+                seq_len: 8,
+                window_size: 8,
+                vocab_size: 16,
+            },
+            memory_enabled: true,
+            composition: CompositionKind::MAL,
+            memory_rule: MemoryRuleKind::DeltaRule,
+            k: 2,
+            chunk_sizes: vec![1, 8],
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+        }
+    }
+
+    /// MAC test configuration: d=8, k=1, DeltaRule.
+    /// window_size=16 (2×seq_len) for full causal attention on assembled (2s, d).
+    pub fn mac_test_config() -> Self {
+        MAGConfig {
+            swa: SWAConfig {
+                d_model: 8,
+                num_heads: 2,
+                head_dim: 4,
+                seq_len: 4,
+                window_size: 8,   // 2 * seq_len for assembled input
+                vocab_size: 16,
+            },
+            memory_enabled: true,
+            composition: CompositionKind::MAC,
+            memory_rule: MemoryRuleKind::DeltaRule,
+            k: 1,
+            chunk_sizes: vec![1],
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+        }
+    }
+
+    /// MAC test configuration for CMS k=2 testing.
+    pub fn mac_test_config_k2() -> Self {
+        MAGConfig {
+            swa: SWAConfig {
+                d_model: 8,
+                num_heads: 2,
+                head_dim: 4,
+                seq_len: 8,
+                window_size: 16,  // 2 * seq_len for assembled input
+                vocab_size: 16,
+            },
+            memory_enabled: true,
+            composition: CompositionKind::MAC,
+            memory_rule: MemoryRuleKind::DeltaRule,
+            k: 2,
+            chunk_sizes: vec![1, 8],
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
         }
     }
 }

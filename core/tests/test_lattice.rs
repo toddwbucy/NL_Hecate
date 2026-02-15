@@ -1,6 +1,6 @@
 //! Lattice OSR integration tests: multi-step training, sphere preservation, CMS k=2, comparison vs Delta Rule.
 
-use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind};
+use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind, CompositionKind};
 use nl_hecate_core::mag::{cms_forward, cms_backward, mag_forward, mag_backward, MemoryCache};
 use nl_hecate_core::conductor::{Conductor, ContextState, ErrorBuffer};
 use nl_hecate_core::tensor::vec_norm_f32;
@@ -208,12 +208,14 @@ fn test_lattice_vs_delta() {
         memory_rule: MemoryRuleKind::DeltaRule,
         k: 1, chunk_sizes: vec![1],
         d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+        composition: CompositionKind::MAG,
     };
     let cfg_lattice = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
         memory_rule: MemoryRuleKind::LatticeOSR,
         k: 1, chunk_sizes: vec![1],
         d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 4, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+        composition: CompositionKind::MAG,
     };
 
     let input_ids: Vec<usize> = (0..swa.seq_len).map(|t| t % swa.vocab_size).collect();

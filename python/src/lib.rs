@@ -8,7 +8,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::types::PyDict;
 
 use nl_hecate_core::model::{SWAConfig as RustConfig, SWAParams as RustParams};
-use nl_hecate_core::model::{MAGConfig as RustMAGConfig, MAGParams as RustMAGParams, MemoryRuleKind};
+use nl_hecate_core::model::{MAGConfig as RustMAGConfig, MAGParams as RustMAGParams, MemoryRuleKind, CompositionKind};
 use nl_hecate_core::forward::{forward as rust_forward, ForwardCache as RustCache};
 use nl_hecate_core::backward::backward_full as rust_backward_full;
 use nl_hecate_core::gradient::compute_gradients as rust_compute_gradients;
@@ -191,7 +191,7 @@ impl MAGConfig {
     #[new]
     #[pyo3(signature = (
         d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled,
-        k=1, chunk_sizes=None, memory_rule="delta",
+        k=1, chunk_sizes=None, memory_rule="delta", composition="mag",
         d_hidden=None, lp_p=None, lq_q=None, lambda_local=None, lambda_2=None,
         delta=None, m_slots=None, d_compress=None, lambda_k=None, lambda_v=None,
     ))]
@@ -206,6 +206,7 @@ impl MAGConfig {
         k: usize,
         chunk_sizes: Option<Vec<usize>>,
         memory_rule: &str,
+        composition: &str,
         d_hidden: Option<usize>,
         lp_p: Option<f32>,
         lq_q: Option<f32>,
@@ -238,6 +239,14 @@ impl MAGConfig {
                 )));
             }
         }
+        let comp = match composition.to_lowercase().as_str() {
+            "mag" => CompositionKind::MAG,
+            "mal" => CompositionKind::MAL,
+            "mac" => CompositionKind::MAC,
+            _ => return Err(PyValueError::new_err(format!(
+                "Unknown composition '{composition}'. Expected: mag, mal, mac"
+            ))),
+        };
         let rule = match memory_rule.to_lowercase().as_str() {
             "delta" => MemoryRuleKind::DeltaRule,
             "titans" => MemoryRuleKind::TitansLMM,
@@ -262,6 +271,7 @@ impl MAGConfig {
                     vocab_size,
                 },
                 memory_enabled,
+                composition: comp,
                 memory_rule: rule,
                 k,
                 chunk_sizes,
@@ -293,6 +303,14 @@ impl MAGConfig {
     fn vocab_size(&self) -> usize { self.inner.swa.vocab_size }
     #[getter]
     fn memory_enabled(&self) -> bool { self.inner.memory_enabled }
+    #[getter]
+    fn composition(&self) -> &str {
+        match self.inner.composition {
+            CompositionKind::MAG => "mag",
+            CompositionKind::MAL => "mal",
+            CompositionKind::MAC => "mac",
+        }
+    }
     #[getter]
     fn memory_rule(&self) -> &str {
         match self.inner.memory_rule {
@@ -366,7 +384,7 @@ impl MAGForwardCache {
 #[pyfunction]
 #[pyo3(signature = (
     d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled,
-    k=1, chunk_sizes=None, memory_rule="delta",
+    k=1, chunk_sizes=None, memory_rule="delta", composition="mag",
     d_hidden=None, lp_p=None, lq_q=None, lambda_local=None, lambda_2=None,
     delta=None, m_slots=None, d_compress=None, lambda_k=None, lambda_v=None,
 ))]
@@ -381,6 +399,7 @@ fn mag_create_config(
     k: usize,
     chunk_sizes: Option<Vec<usize>>,
     memory_rule: &str,
+    composition: &str,
     d_hidden: Option<usize>,
     lp_p: Option<f32>,
     lq_q: Option<f32>,
@@ -394,7 +413,7 @@ fn mag_create_config(
 ) -> PyResult<MAGConfig> {
     MAGConfig::new(
         d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled,
-        k, chunk_sizes, memory_rule,
+        k, chunk_sizes, memory_rule, composition,
         d_hidden, lp_p, lq_q, lambda_local, lambda_2, delta, m_slots, d_compress, lambda_k, lambda_v,
     )
 }
