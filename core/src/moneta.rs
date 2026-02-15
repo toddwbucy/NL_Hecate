@@ -104,13 +104,13 @@ impl MemoryRule for Moneta {
     fn write(&self, _state: &mut MemoryState, _k: &[f32], _v: &[f32], _gates: &Gates) {
         // MONETA write is handled in step() — MLP update doesn't fit the matrix API.
         // mag.rs dispatch always uses step() directly; this should never be called.
-        debug_assert!(false, "MONETA does not support direct write — use step() instead");
+        unimplemented!("MONETA does not support direct write — use step() instead");
     }
 
     fn read(&self, _state: &MemoryState, _q: &[f32], _out: &mut [f32]) {
         // MONETA read is handled in step() — MLP forward doesn't fit M @ q API.
         // mag.rs dispatch always uses step() directly; this should never be called.
-        debug_assert!(false, "MONETA does not support direct read — use step() instead");
+        unimplemented!("MONETA does not support direct read — use step() instead");
     }
 
     fn step(
