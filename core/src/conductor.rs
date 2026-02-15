@@ -4,7 +4,9 @@
 //! which frequency levels are active. Level 0 fires every step, Level 1 every
 //! chunk_sizes[1] steps, etc.
 
+use serde::{Serialize, Deserialize};
 use crate::model::MemoryLevelParams;
+use crate::context_stream::{ContextStream, StreamCursor, TokenChunk, RestoreError};
 
 /// Timing pulse generated each step. Read-only after creation.
 #[derive(Clone, Debug)]
@@ -13,11 +15,28 @@ pub struct Pulse {
     pub active_levels: Vec<bool>,
 }
 
+/// Serializable snapshot of Conductor state (for checkpoint).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConductorState {
+    pub k: usize,
+    pub chunk_sizes: Vec<usize>,
+    pub step: usize,
+}
+
+/// Atomic checkpoint: Conductor state + stream cursor, pulse_id-verified.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Checkpoint {
+    pub conductor: ConductorState,
+    pub stream: StreamCursor,
+}
+
 /// Central timing system. Generates Pulse, manages step counter.
+/// Optionally owns a ContextStream for integrated data feeding.
 pub struct Conductor {
     pub k: usize,
     pub chunk_sizes: Vec<usize>,
     step: usize,
+    stream: Option<Box<dyn ContextStream>>,
 }
 
 impl Conductor {
@@ -27,7 +46,60 @@ impl Conductor {
         for (i, &cs) in chunk_sizes.iter().enumerate() {
             assert!(cs >= 1, "chunk_sizes[{i}] must be >= 1");
         }
-        Conductor { k, chunk_sizes, step: 0 }
+        Conductor { k, chunk_sizes, step: 0, stream: None }
+    }
+
+    /// Builder: attach a ContextStream for integrated data feeding.
+    pub fn with_stream(mut self, stream: Box<dyn ContextStream>) -> Self {
+        self.stream = Some(stream);
+        self
+    }
+
+    /// Whether a stream is attached.
+    pub fn has_stream(&self) -> bool {
+        self.stream.is_some()
+    }
+
+    /// Get next chunk from attached stream + generate pulse. Does NOT advance (CS-32).
+    /// Panics if no stream is attached.
+    pub fn next_chunk(&mut self, chunk_size: usize) -> Option<(TokenChunk, Pulse)> {
+        let pulse = self.pulse();
+        let step = self.step as u64;
+        let stream = self.stream.as_mut().expect("next_chunk requires an attached stream");
+        stream.set_pulse_id(step);
+        stream.next_chunk(chunk_size).map(|chunk| (chunk, pulse))
+    }
+
+    /// Capture atomic checkpoint (Conductor state + stream cursor).
+    /// Syncs pulse_id to current step before capture.
+    /// Panics if no stream is attached.
+    pub fn checkpoint(&mut self) -> Checkpoint {
+        let step = self.step as u64;
+        let stream = self.stream.as_mut().expect("checkpoint requires an attached stream");
+        stream.set_pulse_id(step);
+        let cursor = stream.cursor();
+        Checkpoint {
+            conductor: ConductorState {
+                k: self.k,
+                chunk_sizes: self.chunk_sizes.clone(),
+                step: self.step,
+            },
+            stream: cursor,
+        }
+    }
+
+    /// Restore from a checkpoint. Verifies pulse_id consistency.
+    pub fn restore(&mut self, checkpoint: &Checkpoint) -> Result<(), RestoreError> {
+        // Verify pulse_id matches between conductor state and stream cursor
+        if checkpoint.stream.pulse_id != checkpoint.conductor.step as u64 {
+            return Err(RestoreError::PulseMismatch {
+                stream_pulse: checkpoint.stream.pulse_id,
+                model_pulse: checkpoint.conductor.step as u64,
+            });
+        }
+        self.step = checkpoint.conductor.step;
+        let stream = self.stream.as_mut().expect("restore requires an attached stream");
+        stream.restore(&checkpoint.stream)
     }
 
     /// Generate pulse for current step.
