@@ -15,6 +15,7 @@ pub enum MemoryRuleKind {
     DeltaRule,
     TitansLMM,
     HebbianRule,
+    Moneta,
 }
 
 /// Model configuration — immutable after construction.
@@ -283,6 +284,16 @@ pub struct MAGConfig {
     /// Chunk sizes per level: [1] for k=1, [1, 8] for k=2.
     /// Level i fires every chunk_sizes[i] steps.
     pub chunk_sizes: Vec<usize>,
+    /// MLP hidden dimension for MONETA (default: 0, unused by matrix rules).
+    pub d_hidden: usize,
+    /// l_p norm exponent for MONETA attentional bias (default: 2.0).
+    pub lp_p: f32,
+    /// L_q retention exponent for MONETA (default: 2.0).
+    pub lq_q: f32,
+    /// Local retention strength for MONETA (default: 0.0 = disabled).
+    pub lambda_q: f32,
+    /// Global L2 retention strength for MONETA (default: 0.01).
+    pub lambda_2: f32,
 }
 
 /// Default gate bias init values per level index.
@@ -339,6 +350,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 1,
             chunk_sizes: vec![1],
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_q: 0.0, lambda_2: 0.0,
         }
     }
 
@@ -357,6 +369,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 2,
             chunk_sizes: vec![1, 8],
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_q: 0.0, lambda_2: 0.0,
         }
     }
 
@@ -375,6 +388,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 1,
             chunk_sizes: vec![1],
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_q: 0.0, lambda_2: 0.0,
         }
     }
 
@@ -394,6 +408,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 2,
             chunk_sizes: vec![1, 8],
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_q: 0.0, lambda_2: 0.0,
         }
     }
 
@@ -413,6 +428,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 4,
             chunk_sizes: vec![1, 8, 64, 512],
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_q: 0.0, lambda_2: 0.0,
         }
     }
 
@@ -432,6 +448,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 4,
             chunk_sizes: vec![1, 8, 64, 512],
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_q: 0.0, lambda_2: 0.0,
         }
     }
 
@@ -450,6 +467,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::TitansLMM,
             k: 1,
             chunk_sizes: vec![1],
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_q: 0.0, lambda_2: 0.0,
         }
     }
 
@@ -468,6 +486,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::HebbianRule,
             k: 1,
             chunk_sizes: vec![1],
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_q: 0.0, lambda_2: 0.0,
         }
     }
 
@@ -486,6 +505,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::HebbianRule,
             k: 2,
             chunk_sizes: vec![1, 8],
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_q: 0.0, lambda_2: 0.0,
         }
     }
 
@@ -504,6 +524,53 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::TitansLMM,
             k: 2,
             chunk_sizes: vec![1, 8],
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_q: 0.0, lambda_2: 0.0,
+        }
+    }
+
+    /// MONETA test configuration: d=8, d_hidden=4 (k=1).
+    pub fn moneta_test_config() -> Self {
+        MAGConfig {
+            swa: SWAConfig {
+                d_model: 8,
+                num_heads: 2,
+                head_dim: 4,
+                seq_len: 4,
+                window_size: 4,
+                vocab_size: 16,
+            },
+            memory_enabled: true,
+            memory_rule: MemoryRuleKind::Moneta,
+            k: 1,
+            chunk_sizes: vec![1],
+            d_hidden: 4,
+            lp_p: 2.0,
+            lq_q: 2.0,
+            lambda_q: 0.0,
+            lambda_2: 0.01,
+        }
+    }
+
+    /// MONETA test configuration for CMS k=2 testing.
+    pub fn moneta_test_config_k2() -> Self {
+        MAGConfig {
+            swa: SWAConfig {
+                d_model: 8,
+                num_heads: 2,
+                head_dim: 4,
+                seq_len: 8,
+                window_size: 8,
+                vocab_size: 16,
+            },
+            memory_enabled: true,
+            memory_rule: MemoryRuleKind::Moneta,
+            k: 2,
+            chunk_sizes: vec![1, 8],
+            d_hidden: 4,
+            lp_p: 2.0,
+            lq_q: 2.0,
+            lambda_q: 0.0,
+            lambda_2: 0.01,
         }
     }
 }
