@@ -16,6 +16,7 @@ use crate::moneta::{Moneta, MonetaCache, moneta_read_only, moneta_read_only_back
 use crate::yaad::{YAAD, YAADCache, yaad_read_only, yaad_read_only_backward};
 use crate::memora::{MEMORA, MEMORACache, memora_read_only, memora_read_only_backward};
 use crate::lattice_osr::{LatticeOSR, LatticeCache, lattice_read_only, lattice_read_only_backward};
+use crate::trellis::{Trellis, TrellisCache, trellis_read_only, trellis_read_only_backward};
 use crate::conductor::{Pulse, ContextState, ErrorBuffer};
 
 /// Memory cache enum for static dispatch across memory rule variants.
@@ -28,6 +29,7 @@ pub enum MemoryCache {
     YAAD(YAADCache),
     MEMORA(MEMORACache),
     Lattice(LatticeCache),
+    Trellis(TrellisCache),
 }
 
 /// Cache for MAG forward pass — holds both branches' intermediates.
@@ -131,6 +133,11 @@ pub fn mag_forward(
             let rule = LatticeOSR { m_slots: cfg.m_slots };
             let (y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
             (y, MemoryCache::Lattice(cache))
+        }
+        MemoryRuleKind::Trellis => {
+            let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
+            let (y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
+            (y, MemoryCache::Trellis(cache))
         }
     };
 
@@ -274,6 +281,10 @@ pub fn mag_backward(
             let rule = LatticeOSR { m_slots: cfg.m_slots };
             rule.step_backward(&params.levels[0], lattice_cache, &d_y, &cache.embedded)
         }
+        MemoryCache::Trellis(trellis_cache) => {
+            let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
+            rule.step_backward(&params.levels[0], trellis_cache, &d_y, &cache.embedded)
+        }
     };
 
     // Accumulate memory parameter gradients into level 0
@@ -379,6 +390,17 @@ pub fn cms_forward(
     assert!(target_ids.len() >= s);
     assert_eq!(pulse.active_levels.len(), cfg.k);
     assert_eq!(context.memory.len(), cfg.k);
+
+    // Validate context memory size for Trellis (needs 2*d_k*d, not default d*d).
+    if cfg.memory_rule == MemoryRuleKind::Trellis {
+        let expected = 2 * cfg.d_compress * d;
+        for level in 0..cfg.k {
+            assert_eq!(context.memory[level].len(), expected,
+                "Trellis context memory[{level}] has wrong size: got {}, expected {expected}. \
+                 Use ContextState::new_with_memory_size(k, d, 2 * d_compress * d).",
+                context.memory[level].len());
+        }
+    }
 
     // Stage 1: Embedding lookup
     let mut embedded = vec![0.0f32; s * d];
@@ -488,6 +510,20 @@ pub fn cms_forward(
                     context.memory[level] = s_final.to_vec();
                     (y, MemoryCache::Lattice(cache))
                 }
+                MemoryRuleKind::Trellis => {
+                    let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
+                    let (y, cache) = rule.step(&params.levels[level], &embedded, s, d, initial_m);
+                    let d_k = cfg.d_compress;
+                    let sk_size = d_k * d;
+                    let sv_size = d * d_k;
+                    let sk_final = &cache.sk_states[s * sk_size..(s + 1) * sk_size];
+                    let sv_final = &cache.sv_states[s * sv_size..(s + 1) * sv_size];
+                    let mut ctx_mem = Vec::with_capacity(sk_size + sv_size);
+                    ctx_mem.extend_from_slice(sk_final);
+                    ctx_mem.extend_from_slice(sv_final);
+                    context.memory[level] = ctx_mem;
+                    (y, MemoryCache::Trellis(cache))
+                }
             };
 
             y_per_level.push(y_level);
@@ -511,6 +547,9 @@ pub fn cms_forward(
                 ),
                 MemoryRuleKind::LatticeOSR => lattice_read_only(
                     &params.levels[level], &embedded, frozen_ref, s, d, cfg.m_slots,
+                ),
+                MemoryRuleKind::Trellis => trellis_read_only(
+                    &params.levels[level], &embedded, frozen_ref, s, d, cfg.d_compress,
                 ),
                 _ => delta_rule_read_only(
                     &params.levels[level], &embedded, frozen_ref, s, d,
@@ -707,6 +746,10 @@ pub fn cms_backward(
                     let rule = LatticeOSR { m_slots: cfg.m_slots };
                     rule.step_backward(&params.levels[level], lattice_cache, &d_y_combined, &cache.embedded)
                 }
+                MemoryCache::Trellis(trellis_cache) => {
+                    let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
+                    rule.step_backward(&params.levels[level], trellis_cache, &d_y_combined, &cache.embedded)
+                }
             };
             grads.levels[level].accumulate(&mem_grads);
             for i in 0..(s * d) {
@@ -728,6 +771,9 @@ pub fn cms_backward(
                 ),
                 MemoryRuleKind::LatticeOSR => lattice_read_only_backward(
                     &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.m_slots,
+                ),
+                MemoryRuleKind::Trellis => trellis_read_only_backward(
+                    &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.d_compress,
                 ),
                 _ => delta_rule_read_only_backward(
                     &params.levels[level],
