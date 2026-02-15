@@ -189,7 +189,12 @@ struct MAGConfig {
 #[pymethods]
 impl MAGConfig {
     #[new]
-    #[pyo3(signature = (d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled, k=1, chunk_sizes=None, memory_rule="delta"))]
+    #[pyo3(signature = (
+        d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled,
+        k=1, chunk_sizes=None, memory_rule="delta",
+        d_hidden=None, lp_p=None, lq_q=None, lambda_local=None, lambda_2=None,
+        delta=None, m_slots=None, d_compress=None, lambda_k=None, lambda_v=None,
+    ))]
     fn new(
         d_model: usize,
         num_heads: usize,
@@ -201,6 +206,16 @@ impl MAGConfig {
         k: usize,
         chunk_sizes: Option<Vec<usize>>,
         memory_rule: &str,
+        d_hidden: Option<usize>,
+        lp_p: Option<f32>,
+        lq_q: Option<f32>,
+        lambda_local: Option<f32>,
+        lambda_2: Option<f32>,
+        delta: Option<f32>,
+        m_slots: Option<usize>,
+        d_compress: Option<usize>,
+        lambda_k: Option<f32>,
+        lambda_v: Option<f32>,
     ) -> PyResult<Self> {
         if d_model != num_heads * head_dim {
             return Err(PyValueError::new_err(format!(
@@ -223,7 +238,7 @@ impl MAGConfig {
                 )));
             }
         }
-        let rule = match memory_rule {
+        let rule = match memory_rule.to_lowercase().as_str() {
             "delta" => MemoryRuleKind::DeltaRule,
             "titans" => MemoryRuleKind::TitansLMM,
             "hebbian" => MemoryRuleKind::HebbianRule,
@@ -250,16 +265,16 @@ impl MAGConfig {
                 memory_rule: rule,
                 k,
                 chunk_sizes,
-                d_hidden: 0,
-                lp_p: 2.0,
-                lq_q: 2.0,
-                lambda_local: 0.0,
-                lambda_2: 0.0,
-                delta: 1.0,
-                m_slots: 0,
-                d_compress: 0,
-                lambda_k: 0.0,
-                lambda_v: 0.0,
+                d_hidden: d_hidden.unwrap_or(0),
+                lp_p: lp_p.unwrap_or(2.0),
+                lq_q: lq_q.unwrap_or(2.0),
+                lambda_local: lambda_local.unwrap_or(0.0),
+                lambda_2: lambda_2.unwrap_or(0.0),
+                delta: delta.unwrap_or(1.0),
+                m_slots: m_slots.unwrap_or(0),
+                d_compress: d_compress.unwrap_or(0),
+                lambda_k: lambda_k.unwrap_or(0.0),
+                lambda_v: lambda_v.unwrap_or(0.0),
             },
         })
     }
@@ -278,6 +293,19 @@ impl MAGConfig {
     fn vocab_size(&self) -> usize { self.inner.swa.vocab_size }
     #[getter]
     fn memory_enabled(&self) -> bool { self.inner.memory_enabled }
+    #[getter]
+    fn memory_rule(&self) -> &str {
+        match self.inner.memory_rule {
+            MemoryRuleKind::DeltaRule => "delta",
+            MemoryRuleKind::TitansLMM => "titans",
+            MemoryRuleKind::HebbianRule => "hebbian",
+            MemoryRuleKind::Moneta => "moneta",
+            MemoryRuleKind::YAAD => "yaad",
+            MemoryRuleKind::MEMORA => "memora",
+            MemoryRuleKind::LatticeOSR => "lattice",
+            MemoryRuleKind::Trellis => "trellis",
+        }
+    }
     #[getter]
     fn k(&self) -> usize { self.inner.k }
 }
@@ -336,7 +364,12 @@ impl MAGForwardCache {
 // ── MAG free functions ─────────────────────────────────────────────
 
 #[pyfunction]
-#[pyo3(signature = (d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled, k=1, chunk_sizes=None, memory_rule="delta"))]
+#[pyo3(signature = (
+    d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled,
+    k=1, chunk_sizes=None, memory_rule="delta",
+    d_hidden=None, lp_p=None, lq_q=None, lambda_local=None, lambda_2=None,
+    delta=None, m_slots=None, d_compress=None, lambda_k=None, lambda_v=None,
+))]
 fn mag_create_config(
     d_model: usize,
     num_heads: usize,
@@ -348,8 +381,22 @@ fn mag_create_config(
     k: usize,
     chunk_sizes: Option<Vec<usize>>,
     memory_rule: &str,
+    d_hidden: Option<usize>,
+    lp_p: Option<f32>,
+    lq_q: Option<f32>,
+    lambda_local: Option<f32>,
+    lambda_2: Option<f32>,
+    delta: Option<f32>,
+    m_slots: Option<usize>,
+    d_compress: Option<usize>,
+    lambda_k: Option<f32>,
+    lambda_v: Option<f32>,
 ) -> PyResult<MAGConfig> {
-    MAGConfig::new(d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled, k, chunk_sizes, memory_rule)
+    MAGConfig::new(
+        d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled,
+        k, chunk_sizes, memory_rule,
+        d_hidden, lp_p, lq_q, lambda_local, lambda_2, delta, m_slots, d_compress, lambda_k, lambda_v,
+    )
 }
 
 #[pyfunction]
