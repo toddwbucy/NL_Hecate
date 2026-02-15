@@ -24,7 +24,7 @@ use crate::tensor::{
     outer_product_f32, frobenius_dot_f32,
 };
 use crate::model::MemoryLevelParams;
-use crate::delta_rule::{MemoryRule, MemoryState, Gates};
+use crate::delta_rule::{MemoryRule, MemoryState, Gates, MemoryError};
 
 // ── Titans LMM implementation ───────────────────────────────────────
 
@@ -78,7 +78,7 @@ impl MemoryRule for TitansLMM {
         MemoryState { m: vec![0.0f32; d * d], d }
     }
 
-    fn write(&self, state: &mut MemoryState, k: &[f32], v: &[f32], gates: &Gates) {
+    fn write(&self, state: &mut MemoryState, k: &[f32], v: &[f32], gates: &Gates) -> Result<(), MemoryError> {
         // Simplified write (no momentum tracking — use step() for full path)
         let d = state.d;
         let mut prediction = vec![0.0f32; d];
@@ -92,11 +92,13 @@ impl MemoryRule for TitansLMM {
                 state.m[i * d + j] = retention * state.m[i * d + j] - lr * err_i * k[j];
             }
         }
+        Ok(())
     }
 
-    fn read(&self, state: &MemoryState, q: &[f32], out: &mut [f32]) {
+    fn read(&self, state: &MemoryState, q: &[f32], out: &mut [f32]) -> Result<(), MemoryError> {
         let d = state.d;
         matmul_f32(&state.m, q, out, d, d, 1);
+        Ok(())
     }
 
     /// Full sequence forward with momentum accumulator S.
@@ -106,7 +108,7 @@ impl MemoryRule for TitansLMM {
         embedded: &[f32],
         seq_len: usize,
         d: usize,
-        initial_m: Option<&[f32]>,
+        initial_m: Option<Vec<f32>>,
     ) -> (Vec<f32>, TitansLMMCache) {
         debug_assert_eq!(embedded.len(), seq_len * d);
 
@@ -131,7 +133,7 @@ impl MemoryRule for TitansLMM {
         let mut s_states = vec![0.0f32; (seq_len + 1) * d * d];
         if let Some(m0) = initial_m {
             debug_assert_eq!(m0.len(), d * d);
-            m_states[..d * d].copy_from_slice(m0);
+            m_states[..d * d].copy_from_slice(&m0);
         }
         let mut concat_kv = vec![0.0f32; seq_len * 2 * d];
         let mut alpha_pre = vec![0.0f32; seq_len];

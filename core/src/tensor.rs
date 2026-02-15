@@ -221,6 +221,15 @@ pub fn softplus_f32(x: f32) -> f32 {
     (1.0 + x.exp()).ln()
 }
 
+/// Element-wise natural log with floor clamp to avoid log(0).
+/// Computes out[i] = ln(max(a[i], 1e-8)).
+pub fn log_f32(a: &[f32], out: &mut [f32]) {
+    debug_assert_eq!(a.len(), out.len());
+    for i in 0..a.len() {
+        out[i] = a[i].max(1e-8).ln();
+    }
+}
+
 /// Outer product: out[d1, d2] = a[d1] * b[d2]. Row-major.
 /// `out` must be pre-allocated with d1*d2 elements (will be overwritten).
 pub fn outer_product_f32(a: &[f32], b: &[f32], out: &mut [f32]) {
@@ -453,6 +462,29 @@ mod tests {
             let analytical = silu_prime_f32(x);
             assert!((analytical - numerical).abs() < 1e-3,
                 "silu_prime({x}): analytical={analytical}, numerical={numerical}");
+        }
+    }
+
+    #[test]
+    fn test_log_f32_basic() {
+        let a = [1.0f32, std::f32::consts::E, 10.0];
+        let mut out = [0.0f32; 3];
+        log_f32(&a, &mut out);
+        assert!((out[0] - 0.0).abs() < 1e-6, "ln(1) should be 0, got {}", out[0]);
+        assert!((out[1] - 1.0).abs() < 1e-5, "ln(e) should be 1, got {}", out[1]);
+        assert!((out[2] - 10.0f32.ln()).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_log_f32_clamps_near_zero() {
+        // Zero and negative values should be clamped to ln(1e-8) ≈ -18.42
+        let a = [0.0f32, -1.0, 1e-10];
+        let mut out = [0.0f32; 3];
+        log_f32(&a, &mut out);
+        let expected = 1e-8f32.ln();
+        for i in 0..3 {
+            assert!(out[i].is_finite(), "log_f32 output[{i}] should be finite");
+            assert!(out[i] <= expected + 1e-4, "log_f32 output[{i}]={} should be <= {expected}", out[i]);
         }
     }
 

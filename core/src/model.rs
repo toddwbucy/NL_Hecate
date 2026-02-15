@@ -17,6 +17,7 @@ pub enum MemoryRuleKind {
     HebbianRule,
     Moneta,
     YAAD,
+    MEMORA,
 }
 
 /// Model configuration — immutable after construction.
@@ -625,6 +626,54 @@ impl MAGConfig {
             lq_q: 2.0,
             lambda_local: 0.01,
             lambda_2: 0.01,
+            delta: 1.0,
+        }
+    }
+
+    /// MEMORA test configuration: d=8, d_hidden=4, KL retention (k=1).
+    pub fn memora_test_config() -> Self {
+        MAGConfig {
+            swa: SWAConfig {
+                d_model: 8,
+                num_heads: 2,
+                head_dim: 4,
+                seq_len: 4,
+                window_size: 4,
+                vocab_size: 16,
+            },
+            memory_enabled: true,
+            memory_rule: MemoryRuleKind::MEMORA,
+            k: 1,
+            chunk_sizes: vec![1],
+            d_hidden: 4,
+            lp_p: 2.0,
+            lq_q: 2.0,
+            lambda_local: 0.0,
+            lambda_2: 0.0,
+            delta: 1.0,
+        }
+    }
+
+    /// MEMORA test configuration for CMS k=2 testing.
+    pub fn memora_test_config_k2() -> Self {
+        MAGConfig {
+            swa: SWAConfig {
+                d_model: 8,
+                num_heads: 2,
+                head_dim: 4,
+                seq_len: 8,
+                window_size: 8,
+                vocab_size: 16,
+            },
+            memory_enabled: true,
+            memory_rule: MemoryRuleKind::MEMORA,
+            k: 2,
+            chunk_sizes: vec![1, 8],
+            d_hidden: 4,
+            lp_p: 2.0,
+            lq_q: 2.0,
+            lambda_local: 0.0,
+            lambda_2: 0.0,
             delta: 1.0,
         }
     }

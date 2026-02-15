@@ -1,16 +1,19 @@
-/// YAAD memory system — 2-layer MLP with Huber attentional bias and decoupled retention.
+/// MEMORA memory system — 2-layer MLP with KL divergence retention and softmax emergence.
 ///
-/// Second MLP-family MIRAS variant, sibling to MONETA. Same 2-layer MLP structure
-/// (y = W2 @ silu(W1 @ q)), same GD algorithm. Two targeted changes:
+/// Third and final MLP-family MIRAS variant, sibling to MONETA and YAAD. Same 2-layer MLP
+/// structure (y = W2 @ silu(W1 @ q)), but with a fundamentally different update mechanism:
 ///
-/// 1. Huber loss replaces l_p — gradient is `e` for |e| < delta, `delta * sign(e)` for |e| >= delta.
-///    Bounded gradient (never exceeds delta) protects memory from outlier tokens.
+/// 1. KL divergence retention replaces L2/Huber — the optimal solution is a closed-form
+///    softmax: W_new[row] = softmax(alpha * log(W_prev[row]) - theta * grad[row]).
 ///
-/// 2. Decoupled retention — local L2 (stay near chunk-boundary snapshot) + global L2 (keep small),
-///    replacing MONETA's global-only L2.
+/// 2. Probability simplex constraint — memory weight rows are distributions (sum to 1,
+///    all non-negative). Softmax in the update guarantees this invariant.
 ///
-/// MIRAS knobs: MLP structure, Huber attentional bias, decoupled retention, GD algorithm.
-/// Source: MIRAS (2504.13173) Eq 26, Table 2.
+/// 3. Softmax emergence — attention's softmax appears as a *mathematical consequence*
+///    of KL + L2 optimization (MIRAS Proposition 3.1), not a design choice.
+///
+/// MIRAS knobs: MLP structure, L2 attentional bias, KL retention, GD algorithm.
+/// Source: MIRAS (2504.13173) Proposition 3.1, Table 2.
 ///
 /// Forward (per token):
 ///   k_t = embedded_t @ W_K_mem^T
@@ -20,35 +23,32 @@
 ///   theta_t = softplus(concat(k_t, v_t) @ w_theta + b_theta)
 ///   pre_act = W1 @ k_t;  h = silu(pre_act)
 ///   prediction = W2 @ h;  error = prediction - v_t
-///   huber_grad = e if |e| < delta, delta * sign(e) otherwise
-///   grad_W2 = outer(huber_grad, h);  grad_W1 = outer(silu'(pre_act) * (W2^T @ huber_grad), k_t)
-///   ret_local = lambda_local * 2 * (W - W_boundary)
-///   ret_global = lambda_2 * 2 * W
-///   W1 = alpha_t * W1 - theta_t * (grad_W1 + ret_local_W1 + ret_global_W1)
-///   W2 = alpha_t * W2 - theta_t * (grad_W2 + ret_local_W2 + ret_global_W2)
-///   y_t = W2 @ silu(W1 @ q_t)
+///   grad_W2 = outer(error, h);  grad_W1 = outer(silu'(pre_act) * (W2^T @ error), k_t)
+///   For each row r of W1:
+///     z[i] = alpha_t * log(W1[r,i]) - theta_t * grad_W1[r,i]
+///     W1_next[r] = softmax(z)
+///   Similarly for W2.
+///   y_t = W2_t @ silu(W1_t @ q_t)     (observe-then-advance: read BEFORE update)
 ///
-/// Backward: reverse token loop with accumulated d_W1, d_W2.
+/// Backward: reverse token loop with accumulated d_W1, d_W2, using the softmax Jacobian
+/// to propagate through the KL-optimal update.
 
 use crate::tensor::{
-    matmul_f32, transpose_f32, sigmoid_f32, softplus_f32,
-    silu_f32, silu_prime_f32, frobenius_dot_f32,
+    matmul_f32, transpose_f32, softmax_f32, log_f32,
+    sigmoid_f32, softplus_f32, silu_f32, silu_prime_f32,
 };
 use crate::model::MemoryLevelParams;
 use crate::delta_rule::{MemoryRule, MemoryState, Gates, MemoryError};
 
-// ── YAAD implementation ─────────────────────────────────────────────
+// ── MEMORA implementation ─────────────────────────────────────────────
 
-/// YAAD: 2-layer MLP memory with Huber loss and decoupled retention.
-pub struct YAAD {
+/// MEMORA: 2-layer MLP memory with KL divergence retention.
+pub struct MEMORA {
     pub d_hidden: usize,
-    pub delta: f32,
-    pub lambda_local: f32,
-    pub lambda_2: f32,
 }
 
-/// All intermediate values from a YAAD forward pass, needed for backward.
-pub struct YAADCache {
+/// All intermediate values from a MEMORA forward pass, needed for backward.
+pub struct MEMORACache {
     pub seq_len: usize,
     pub d: usize,
     pub d_hidden: usize,
@@ -56,10 +56,6 @@ pub struct YAADCache {
     pub w1_states: Vec<f32>,
     /// W2 states for t=0..seq_len: [(seq_len+1) * d * d_hidden]
     pub w2_states: Vec<f32>,
-    /// Chunk-boundary snapshot of W1: [d_hidden * d]
-    pub w1_boundary: Vec<f32>,
-    /// Chunk-boundary snapshot of W2: [d * d_hidden]
-    pub w2_boundary: Vec<f32>,
     /// Per-token projected keys: [seq_len, d]
     pub k_mem: Vec<f32>,
     /// Per-token projected values: [seq_len, d]
@@ -86,34 +82,21 @@ pub struct YAADCache {
     pub error: Vec<f32>,
     /// Memory output y_t: [seq_len, d]
     pub y: Vec<f32>,
-    /// Huber delta threshold (cached for backward)
-    pub delta: f32,
-    /// Local retention strength (cached for backward)
-    pub lambda_local: f32,
-    /// Global L2 retention strength (cached for backward)
-    pub lambda_2: f32,
+    /// Cached log(W1_prev) per timestep: [seq_len * d_hidden * d]
+    pub log_w1_prev: Vec<f32>,
+    /// Cached log(W2_prev) per timestep: [seq_len * d * d_hidden]
+    pub log_w2_prev: Vec<f32>,
 }
 
-/// Compute Huber gradient: e if |e| < delta, delta * sign(e) otherwise.
-/// Bounded gradient magnitude — never exceeds delta.
-#[inline]
-fn huber_grad(e: f32, delta: f32) -> f32 {
-    if e.abs() < delta {
-        e
-    } else {
-        delta * e.signum()
-    }
-}
-
-impl MemoryRule for YAAD {
-    type Cache = YAADCache;
+impl MemoryRule for MEMORA {
+    type Cache = MEMORACache;
 
     fn level(&self) -> usize { 0 }
 
     fn supported_parallelization(&self) -> &'static [&'static str] { &["sequential"] }
 
     fn init(&self, d: usize) -> MemoryState {
-        // For API compatibility — actual YAAD state is W1+W2+boundaries, not a d×d matrix.
+        // For API compatibility — actual MEMORA state is W1+W2, not a d×d matrix.
         MemoryState { m: vec![0.0f32; d * d], d }
     }
 
@@ -132,11 +115,8 @@ impl MemoryRule for YAAD {
         seq_len: usize,
         d: usize,
         initial_m: Option<Vec<f32>>,
-    ) -> (Vec<f32>, YAADCache) {
+    ) -> (Vec<f32>, MEMORACache) {
         let dh = self.d_hidden;
-        let hub_delta = self.delta;
-        let l_local = self.lambda_local;
-        let l2 = self.lambda_2;
         debug_assert_eq!(embedded.len(), seq_len * d);
 
         // Project embedded → k_mem, v_mem, q_mem via W^T
@@ -154,29 +134,40 @@ impl MemoryRule for YAAD {
         matmul_f32(embedded, &w_v_mem_t, &mut v_mem, seq_len, d, d);
         matmul_f32(embedded, &w_q_mem_t, &mut q_mem, seq_len, d, d);
 
-        // Allocate W1, W2 states — seed from initial_m if provided
+        // Allocate W1, W2 states — reuse incoming allocation when possible
         let w1_size = dh * d;
         let w2_size = d * dh;
-        let mut w1_states = vec![0.0f32; (seq_len + 1) * w1_size];
-        let mut w2_states = vec![0.0f32; (seq_len + 1) * w2_size];
+        let total_w1 = (seq_len + 1) * w1_size;
+        let total_w2 = (seq_len + 1) * w2_size;
 
-        if let Some(m0) = initial_m {
+        let (mut w1_states, mut w2_states) = if let Some(mut m0) = initial_m {
             // CMS context memory format: W1_flat ++ W2_flat
+            // Take ownership and split, reusing the allocation.
             debug_assert_eq!(m0.len(), w1_size + w2_size);
-            w1_states[..w1_size].copy_from_slice(&m0[..w1_size]);
-            w2_states[..w2_size].copy_from_slice(&m0[w1_size..w1_size + w2_size]);
+            let mut w2_init = m0.split_off(w1_size);
+            m0.resize(total_w1, 0.0);
+            w2_init.resize(total_w2, 0.0);
+            (m0, w2_init)
         } else {
-            // Xavier-like init for W1 to break the zero saddle point.
-            let scale = (2.0 / (d + dh) as f32).sqrt() * 0.1;
-            for i in 0..w1_size {
-                let hash = ((i as u32).wrapping_mul(2654435761)) as f32 / u32::MAX as f32;
-                w1_states[i] = scale * (hash - 0.5);
+            // Simplex init: softmax(hash_noise) per row.
+            let mut w1 = vec![0.0f32; total_w1];
+            let mut w2 = vec![0.0f32; total_w2];
+            // W1: d_hidden rows of length d
+            let mut noise = vec![0.0f32; d.max(dh)];
+            for r in 0..dh {
+                for c in 0..d {
+                    let idx = r * d + c;
+                    let hash = ((idx as u32).wrapping_mul(2654435761)) as f32 / u32::MAX as f32;
+                    noise[c] = 0.1 * (hash - 0.5);
+                }
+                softmax_f32(&noise[..d], &mut w1[r * d..(r + 1) * d], 1, d);
             }
-        }
-
-        // Snapshot W1_0 and W2_0 as chunk boundary state
-        let w1_boundary = w1_states[..w1_size].to_vec();
-        let w2_boundary = w2_states[..w2_size].to_vec();
+            // W2: d rows of length d_hidden — uniform 1/d_hidden
+            for i in 0..w2_size {
+                w2[i] = 1.0 / dh as f32;
+            }
+            (w1, w2)
+        };
 
         let mut concat_kv = vec![0.0f32; seq_len * 2 * d];
         let mut alpha_pre = vec![0.0f32; seq_len];
@@ -188,6 +179,12 @@ impl MemoryRule for YAAD {
         let mut prediction_all = vec![0.0f32; seq_len * d];
         let mut error_all = vec![0.0f32; seq_len * d];
         let mut y = vec![0.0f32; seq_len * d];
+        let mut log_w1_prev = vec![0.0f32; seq_len * w1_size];
+        let mut log_w2_prev = vec![0.0f32; seq_len * w2_size];
+
+        // Temp buffers for per-row softmax update
+        let mut z_buf = vec![0.0f32; d.max(dh)];
+        let mut softmax_buf = vec![0.0f32; d.max(dh)];
 
         for t in 0..seq_len {
             let k_t = &k_mem[t * d..(t + 1) * d];
@@ -216,7 +213,7 @@ impl MemoryRule for YAAD {
             theta_pre[t] = theta_pre_t;
             theta[t] = softplus_f32(theta_pre_t);
 
-            // MLP forward: pre_act = W1 @ k_t, h = silu(pre_act)
+            // Observe-then-advance (CS-32): read from current state BEFORE update.
             let (w1_left, w1_right) = w1_states.split_at_mut((t + 1) * w1_size);
             let w1_t = &w1_left[t * w1_size..];
             let w1_next = &mut w1_right[..w1_size];
@@ -225,6 +222,16 @@ impl MemoryRule for YAAD {
             let w2_t = &w2_left[t * w2_size..];
             let w2_next = &mut w2_right[..w2_size];
 
+            // ── OBSERVE: y_t = W2_t @ silu(W1_t @ q_t) ──
+            let mut q_pre = vec![0.0f32; dh];
+            matmul_f32(w1_t, q_t, &mut q_pre, dh, d, 1);
+            let mut q_hidden = vec![0.0f32; dh];
+            for i in 0..dh {
+                q_hidden[i] = silu_f32(q_pre[i]);
+            }
+            matmul_f32(w2_t, &q_hidden, &mut y[t * d..(t + 1) * d], d, dh, 1);
+
+            // ── ADVANCE: compute error, gradient, then softmax update ──
             let pa_base = t * dh;
             matmul_f32(w1_t, k_t, &mut pre_act_all[pa_base..pa_base + dh], dh, d, 1);
             for i in 0..dh {
@@ -236,31 +243,26 @@ impl MemoryRule for YAAD {
             let pred_base = t * d;
             matmul_f32(w2_t, h_t, &mut prediction_all[pred_base..pred_base + d], d, dh, 1);
 
-            // error = prediction - v_t
+            // error = prediction - v_t (L2 attentional bias: grad = error)
             for i in 0..d {
                 error_all[pred_base + i] = prediction_all[pred_base + i] - v_t[i];
             }
+            let err = &error_all[pred_base..pred_base + d];
 
-            // Huber gradient on error
-            let mut hub_g = vec![0.0f32; d];
-            for i in 0..d {
-                hub_g[i] = huber_grad(error_all[pred_base + i], hub_delta);
-            }
-
-            // grad_W2 = outer(huber_grad, h) → [d, dh]
+            // grad_W2 = outer(error, h) → [d, dh]
             let mut grad_w2 = vec![0.0f32; w2_size];
             for i in 0..d {
                 for j in 0..dh {
-                    grad_w2[i * dh + j] = hub_g[i] * h_t[j];
+                    grad_w2[i * dh + j] = err[i] * h_t[j];
                 }
             }
 
-            // grad_h = W2^T @ huber_grad → [dh]
+            // grad_h = W2^T @ error → [dh]
             let mut grad_h = vec![0.0f32; dh];
             for i in 0..dh {
                 let mut sum = 0.0f32;
                 for j in 0..d {
-                    sum += w2_t[j * dh + i] * hub_g[j];
+                    sum += w2_t[j * dh + i] * err[j];
                 }
                 grad_h[i] = sum;
             }
@@ -279,47 +281,49 @@ impl MemoryRule for YAAD {
                 }
             }
 
-            // Decoupled retention:
-            //   local:  lambda_local * 2 * (W - W_boundary)
-            //   global: lambda_2 * 2 * W
-            let l_local_2 = l_local * 2.0;
-            let l2_2 = l2 * 2.0;
-
-            // Update: W1 = alpha_t * W1 - theta_t * (grad_W1 + ret_local_W1 + ret_global_W1)
-            //         W2 = alpha_t * W2 - theta_t * (grad_W2 + ret_local_W2 + ret_global_W2)
             let alpha_t = alpha[t];
             let theta_t = theta[t];
-            for i in 0..w1_size {
-                let ret_local = l_local_2 * (w1_t[i] - w1_boundary[i]);
-                let ret_global = l2_2 * w1_t[i];
-                w1_next[i] = alpha_t * w1_t[i] - theta_t * (grad_w1[i] + ret_local + ret_global);
-            }
-            for i in 0..w2_size {
-                let ret_local = l_local_2 * (w2_t[i] - w2_boundary[i]);
-                let ret_global = l2_2 * w2_t[i];
-                w2_next[i] = alpha_t * w2_t[i] - theta_t * (grad_w2[i] + ret_local + ret_global);
+
+            // Cache log(W1_t) and log(W2_t) for backward pass
+            let lw1_base = t * w1_size;
+            log_f32(w1_t, &mut log_w1_prev[lw1_base..lw1_base + w1_size]);
+            let lw2_base = t * w2_size;
+            log_f32(w2_t, &mut log_w2_prev[lw2_base..lw2_base + w2_size]);
+
+            // KL-optimal softmax update for W1: d_hidden rows of length d
+            //   z[i] = alpha_t * log(w1_t[i]) - theta_t * grad_w1[i]
+            //   w1_next[row] = softmax(z)
+            for r in 0..dh {
+                let row_base = r * d;
+                for c in 0..d {
+                    z_buf[c] = alpha_t * log_w1_prev[lw1_base + row_base + c]
+                             - theta_t * grad_w1[row_base + c];
+                }
+                softmax_f32(&z_buf[..d], &mut softmax_buf[..d], 1, d);
+                w1_next[row_base..row_base + d].copy_from_slice(&softmax_buf[..d]);
             }
 
-            // Read: y_t = W2_next @ silu(W1_next @ q_t)
-            let mut q_pre = vec![0.0f32; dh];
-            matmul_f32(w1_next, q_t, &mut q_pre, dh, d, 1);
-            let mut q_hidden = vec![0.0f32; dh];
-            for i in 0..dh {
-                q_hidden[i] = silu_f32(q_pre[i]);
+            // KL-optimal softmax update for W2: d rows of length dh
+            for r in 0..d {
+                let row_base = r * dh;
+                for c in 0..dh {
+                    z_buf[c] = alpha_t * log_w2_prev[lw2_base + row_base + c]
+                             - theta_t * grad_w2[row_base + c];
+                }
+                softmax_f32(&z_buf[..dh], &mut softmax_buf[..dh], 1, dh);
+                w2_next[row_base..row_base + dh].copy_from_slice(&softmax_buf[..dh]);
             }
-            matmul_f32(w2_next, &q_hidden, &mut y[t * d..(t + 1) * d], d, dh, 1);
         }
 
-        let cache = YAADCache {
+        let cache = MEMORACache {
             seq_len, d, d_hidden: dh,
             w1_states, w2_states,
-            w1_boundary, w2_boundary,
             k_mem, v_mem, q_mem, concat_kv,
             alpha_pre, alpha, theta_pre, theta,
             pre_act: pre_act_all, hidden: hidden_all,
             prediction: prediction_all, error: error_all,
             y: y.clone(),
-            delta: hub_delta, lambda_local: l_local, lambda_2: l2,
+            log_w1_prev, log_w2_prev,
         };
 
         (y, cache)
@@ -328,18 +332,13 @@ impl MemoryRule for YAAD {
     fn step_backward(
         &self,
         level_params: &MemoryLevelParams,
-        cache: &YAADCache,
+        cache: &MEMORACache,
         d_y: &[f32],
         embedded: &[f32],
     ) -> (MemoryLevelParams, Vec<f32>) {
         let s = cache.seq_len;
         let d = cache.d;
         let dh = cache.d_hidden;
-        let hub_delta = cache.delta;
-        let l_local = cache.lambda_local;
-        let l2 = cache.lambda_2;
-        let l_local_2 = l_local * 2.0;
-        let l2_2 = l2 * 2.0;
         let w1_size = dh * d;
         let w2_size = d * dh;
         debug_assert_eq!(d_y.len(), s * d);
@@ -369,31 +368,39 @@ impl MemoryRule for YAAD {
             let w2_t = &cache.w2_states[t * w2_size..(t + 1) * w2_size];
             let w1_next = &cache.w1_states[(t + 1) * w1_size..(t + 2) * w1_size];
             let w2_next = &cache.w2_states[(t + 1) * w2_size..(t + 2) * w2_size];
+            let lw1_base = t * w1_size;
+            let lw2_base = t * w2_size;
 
-            // ── y_t = W2_next @ silu(W1_next @ q_t) backward ──
+            // ── y_t = W2_t @ silu(W1_t @ q_t) backward (observe-then-advance) ──
+            // Read uses pre-update weights W_t, so read gradient flows to W_t directly
+            // (bypasses softmax Jacobian — NOT added to d_w1/d_w2 which track d_W_{t+1})
             let d_y_t = &d_y[t * d..(t + 1) * d];
 
-            // Forward cache for read: q_pre = W1_next @ q_t, q_hidden = silu(q_pre)
+            // Recompute read forward with pre-update weights: q_pre = W1_t @ q_t
             let mut q_pre = vec![0.0f32; dh];
-            matmul_f32(w1_next, q_t, &mut q_pre, dh, d, 1);
+            matmul_f32(w1_t, q_t, &mut q_pre, dh, d, 1);
             let mut q_hidden = vec![0.0f32; dh];
             for i in 0..dh {
                 q_hidden[i] = silu_f32(q_pre[i]);
             }
 
-            // d_W2_next += outer(d_y_t, q_hidden)
+            // Read gradient → separate buffers (will be added to d_w_prev after softmax backward)
+            let mut d_w2_read = vec![0.0f32; w2_size];
+            let mut d_w1_read = vec![0.0f32; w1_size];
+
+            // d_W2_t_read = outer(d_y_t, q_hidden)
             for i in 0..d {
                 for j in 0..dh {
-                    d_w2[i * dh + j] += d_y_t[i] * q_hidden[j];
+                    d_w2_read[i * dh + j] = d_y_t[i] * q_hidden[j];
                 }
             }
 
-            // d_q_hidden = W2_next^T @ d_y_t
+            // d_q_hidden = W2_t^T @ d_y_t
             let mut d_q_hidden = vec![0.0f32; dh];
             for i in 0..dh {
                 let mut sum = 0.0f32;
                 for j in 0..d {
-                    sum += w2_next[j * dh + i] * d_y_t[j];
+                    sum += w2_t[j * dh + i] * d_y_t[j];
                 }
                 d_q_hidden[i] = sum;
             }
@@ -404,49 +411,42 @@ impl MemoryRule for YAAD {
                 d_q_pre[i] = d_q_hidden[i] * silu_prime_f32(q_pre[i]);
             }
 
-            // d_W1_next += outer(d_q_pre, q_t)
+            // d_W1_t_read = outer(d_q_pre, q_t)
             for i in 0..dh {
                 for j in 0..d {
-                    d_w1[i * d + j] += d_q_pre[i] * q_t[j];
+                    d_w1_read[i * d + j] = d_q_pre[i] * q_t[j];
                 }
             }
 
-            // d_q_t = W1_next^T @ d_q_pre
+            // d_q_t = W1_t^T @ d_q_pre
             for j in 0..d {
                 let mut sum = 0.0f32;
                 for i in 0..dh {
-                    sum += w1_next[i * d + j] * d_q_pre[i];
+                    sum += w1_t[i * d + j] * d_q_pre[i];
                 }
                 d_q_mem[t * d + j] = sum;
             }
 
-            // ── W_next = alpha * W_t - theta * (grad_W + ret_local + ret_global) backward ──
-            // d_alpha from W1: sum_i(d_W1_next_i * W1_t_i)
-            // d_alpha from W2: sum_i(d_W2_next_i * W2_t_i)
-            let d_alpha_w1 = frobenius_dot_f32(&d_w1, w1_t);
-            let d_alpha_w2 = frobenius_dot_f32(&d_w2, w2_t);
-            let d_alpha_scalar = d_alpha_w1 + d_alpha_w2;
+            // ── Backward through softmax update ──
+            // W1_next = softmax(z), where z[i] = alpha * log(w1_t[i]) - theta * grad_w1[i]
+            // Softmax backward per row: d_z[i] = s[i] * (d_s[i] - dot(s, d_s))
+            // Then chain rule through z to get d_alpha, d_theta, d_w1_t, d_grad
 
-            // Recompute huber_grad and MLP gradients for this token
+            // Recompute MLP gradients for this token (needed for d_theta and d_grad)
             let pred_base = t * d;
-            let mut hub_g = vec![0.0f32; d];
-            for i in 0..d {
-                hub_g[i] = huber_grad(cache.error[pred_base + i], hub_delta);
-            }
+            let err = &cache.error[pred_base..pred_base + d];
 
-            // Recompute grad_W2 = outer(hub_g, h_t)
             let mut grad_w2 = vec![0.0f32; w2_size];
             for i in 0..d {
                 for j in 0..dh {
-                    grad_w2[i * dh + j] = hub_g[i] * h_t[j];
+                    grad_w2[i * dh + j] = err[i] * h_t[j];
                 }
             }
-            // Recompute grad_h, grad_pre, grad_W1
             let mut grad_h = vec![0.0f32; dh];
             for i in 0..dh {
                 let mut sum = 0.0f32;
                 for j in 0..d {
-                    sum += w2_t[j * dh + i] * hub_g[j];
+                    sum += w2_t[j * dh + i] * err[j];
                 }
                 grad_h[i] = sum;
             }
@@ -461,59 +461,67 @@ impl MemoryRule for YAAD {
                 }
             }
 
-            // d_theta_scalar: d_W_next_i * -(grad_W_i + ret_local_i + ret_global_i)
+            // ── W1 softmax backward (d_hidden rows of length d) ──
+            let mut d_alpha_scalar = 0.0f32;
             let mut d_theta_scalar = 0.0f32;
-            for i in 0..w1_size {
-                let ret_local = l_local_2 * (w1_t[i] - cache.w1_boundary[i]);
-                let ret_global = l2_2 * w1_t[i];
-                d_theta_scalar -= d_w1[i] * (grad_w1[i] + ret_local + ret_global);
-            }
-            for i in 0..w2_size {
-                let ret_local = l_local_2 * (w2_t[i] - cache.w2_boundary[i]);
-                let ret_global = l2_2 * w2_t[i];
-                d_theta_scalar -= d_w2[i] * (grad_w2[i] + ret_local + ret_global);
-            }
-
-            // ── Backprop d_W_next through the update to get d_W_t and d_grad ──
-            // d_grad_W1 = -theta * d_W1_next, d_grad_W2 = -theta * d_W2_next
-            let mut d_grad_w1 = vec![0.0f32; w1_size];
-            let mut d_grad_w2 = vec![0.0f32; w2_size];
-            for i in 0..w1_size {
-                d_grad_w1[i] = -theta_t * d_w1[i];
-            }
-            for i in 0..w2_size {
-                d_grad_w2[i] = -theta_t * d_w2[i];
-            }
-
-            // d_W1_t from update eq:
-            //   W1_next = alpha_t * W1_t - theta_t * (grad_W1 + l_local_2*(W1_t - W1_b) + l2_2*W1_t)
-            //   dW_next/dW_t = alpha_t - theta_t * (l_local_2 + l2_2) [for the retention terms]
-            //   Plus contributions from grad_W terms that depend on W_t
-            let coeff = alpha_t - theta_t * (l_local_2 + l2_2);
             let mut d_w1_prev = vec![0.0f32; w1_size];
-            let mut d_w2_prev = vec![0.0f32; w2_size];
-            for i in 0..w1_size {
-                d_w1_prev[i] = coeff * d_w1[i];
+            let mut d_grad_w1 = vec![0.0f32; w1_size];
+
+            for r in 0..dh {
+                let row_base = r * d;
+                let s_row = &w1_next[row_base..row_base + d]; // softmax output = W1_next row
+                let d_s_row = &d_w1[row_base..row_base + d];  // incoming gradient
+
+                // dot(s, d_s)
+                let dot_s_ds: f32 = (0..d).map(|i| s_row[i] * d_s_row[i]).sum();
+
+                for i in 0..d {
+                    let d_z_i = s_row[i] * (d_s_row[i] - dot_s_ds);
+
+                    // z[i] = alpha * log(w1_t[i]) - theta * grad_w1[i]
+                    d_alpha_scalar += d_z_i * cache.log_w1_prev[lw1_base + row_base + i];
+                    d_theta_scalar -= d_z_i * grad_w1[row_base + i];
+                    d_w1_prev[row_base + i] += d_z_i * alpha_t / w1_t[row_base + i].max(1e-8);
+                    d_grad_w1[row_base + i] = d_z_i * (-theta_t);
+                }
             }
-            for i in 0..w2_size {
-                d_w2_prev[i] = coeff * d_w2[i];
+
+            // ── W2 softmax backward (d rows of length dh) ──
+            let mut d_w2_prev = vec![0.0f32; w2_size];
+            let mut d_grad_w2 = vec![0.0f32; w2_size];
+
+            for r in 0..d {
+                let row_base = r * dh;
+                let s_row = &w2_next[row_base..row_base + dh];
+                let d_s_row = &d_w2[row_base..row_base + dh];
+
+                let dot_s_ds: f32 = (0..dh).map(|i| s_row[i] * d_s_row[i]).sum();
+
+                for i in 0..dh {
+                    let d_z_i = s_row[i] * (d_s_row[i] - dot_s_ds);
+
+                    d_alpha_scalar += d_z_i * cache.log_w2_prev[lw2_base + row_base + i];
+                    d_theta_scalar -= d_z_i * grad_w2[row_base + i];
+                    d_w2_prev[row_base + i] += d_z_i * alpha_t / w2_t[row_base + i].max(1e-8);
+                    d_grad_w2[row_base + i] = d_z_i * (-theta_t);
+                }
             }
 
             // ── Backprop through MLP gradient computation ──
-            // grad_W2 = outer(hub_g, h) → d_hub_g from d_grad_W2, d_h from d_grad_W2
-            let mut d_hub_g = vec![0.0f32; d];
+            // grad_W2 = outer(error, h) → d_error from d_grad_W2, d_h from d_grad_W2
+            let mut d_err = vec![0.0f32; d];
             for i in 0..d {
                 let mut sum = 0.0f32;
                 for j in 0..dh {
                     sum += d_grad_w2[i * dh + j] * h_t[j];
                 }
-                d_hub_g[i] = sum;
+                d_err[i] = sum;
             }
             let mut d_h_from_gw2 = vec![0.0f32; dh];
             for j in 0..dh {
                 let mut sum = 0.0f32;
                 for i in 0..d {
-                    sum += d_grad_w2[i * dh + j] * hub_g[i];
+                    sum += d_grad_w2[i * dh + j] * err[i];
                 }
                 d_h_from_gw2[j] = sum;
             }
@@ -542,29 +550,19 @@ impl MemoryRule for YAAD {
                 d_grad_h[i] = d_grad_pre[i] * silu_prime_f32(cache.pre_act[pa_base + i]);
             }
 
-            // grad_h = W2^T @ hub_g backward
+            // grad_h = W2^T @ error backward
             for j in 0..d {
                 let mut sum = 0.0f32;
                 for i in 0..dh {
                     sum += w2_t[j * dh + i] * d_grad_h[i];
                 }
-                d_hub_g[j] += sum;
+                d_err[j] += sum;
             }
-            // d_W2_t from grad_h: d_W2_t[j, i] += hub_g[j] * d_grad_h[i]
+            // d_W2_t from grad_h: d_W2_t[j, i] += error[j] * d_grad_h[i]
             for j in 0..d {
                 for i in 0..dh {
-                    d_w2_prev[j * dh + i] += hub_g[j] * d_grad_h[i];
+                    d_w2_prev[j * dh + i] += err[j] * d_grad_h[i];
                 }
-            }
-
-            // ── Huber gradient backward: hub_g(e) ──
-            // For |e| < delta: hub_g = e, so d_hub_g/de = 1.0
-            // For |e| >= delta: hub_g = delta * sign(e), so d_hub_g/de = 0.0
-            let mut d_err = vec![0.0f32; d];
-            for i in 0..d {
-                let e = cache.error[pred_base + i];
-                let huber_second = if e.abs() < hub_delta { 1.0 } else { 0.0 };
-                d_err[i] = d_hub_g[i] * huber_second;
             }
 
             // error = prediction - v_t backward
@@ -637,6 +635,10 @@ impl MemoryRule for YAAD {
                                     + d_theta_pre * level_params.w_theta[d + i];
             }
 
+            // Add read gradients to d_w_prev (read used W_t, not W_{t+1})
+            for i in 0..w1_size { d_w1_prev[i] += d_w1_read[i]; }
+            for i in 0..w2_size { d_w2_prev[i] += d_w2_read[i]; }
+
             // Swap: d_w1_prev becomes d_w1 for next (earlier) token
             d_w1 = d_w1_prev;
             d_w2 = d_w2_prev;
@@ -667,9 +669,9 @@ impl MemoryRule for YAAD {
 
 // ── Read-only functions (for frozen CMS levels) ─────────────────────
 
-/// Forward pass for a frozen YAAD level: y_t = W2 @ silu(W1 @ q_t).
+/// Forward pass for a frozen MEMORA level: y_t = W2 @ silu(W1 @ q_t).
 /// Same as MONETA read-only — MLP structure is identical when frozen.
-pub fn yaad_read_only(
+pub fn memora_read_only(
     level_params: &MemoryLevelParams,
     embedded: &[f32],
     frozen_m: &[f32],
@@ -677,13 +679,12 @@ pub fn yaad_read_only(
     d: usize,
     d_hidden: usize,
 ) -> (Vec<f32>, Vec<f32>) {
-    // Frozen MLP forward is identical to MONETA — same y = W2 @ silu(W1 @ q)
     crate::moneta::moneta_read_only(level_params, embedded, frozen_m, seq_len, d, d_hidden)
 }
 
-/// Backward pass for a frozen YAAD level.
+/// Backward pass for a frozen MEMORA level.
 /// Same as MONETA read-only backward — only q_mem projection flows back.
-pub fn yaad_read_only_backward(
+pub fn memora_read_only_backward(
     level_params: &MemoryLevelParams,
     frozen_m: &[f32],
     q_mem: &[f32],
@@ -706,7 +707,7 @@ mod tests {
     use crate::delta_rule::MemoryRule;
 
     fn test_config() -> MAGConfig {
-        MAGConfig::yaad_test_config()
+        MAGConfig::memora_test_config()
     }
 
     fn make_embedded(cfg: &MAGConfig, seed: u64) -> Vec<f32> {
@@ -718,21 +719,16 @@ mod tests {
         embedded
     }
 
-    fn make_yaad(cfg: &MAGConfig) -> YAAD {
-        YAAD {
-            d_hidden: cfg.d_hidden,
-            delta: cfg.delta,
-            lambda_local: cfg.lambda_local,
-            lambda_2: cfg.lambda_2,
-        }
+    fn make_memora(cfg: &MAGConfig) -> MEMORA {
+        MEMORA { d_hidden: cfg.d_hidden }
     }
 
     #[test]
-    fn test_yaad_forward_finite() {
+    fn test_memora_forward_finite() {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = make_yaad(&cfg);
+        let rule = make_memora(&cfg);
         let (y, _cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for (i, &v) in y.iter().enumerate() {
             assert!(v.is_finite(), "y[{i}] is not finite: {v}");
@@ -740,22 +736,22 @@ mod tests {
     }
 
     #[test]
-    fn test_yaad_forward_deterministic() {
+    fn test_memora_forward_deterministic() {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = make_yaad(&cfg);
+        let rule = make_memora(&cfg);
         let (y1, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let (y2, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
-        assert_eq!(y1, y2, "YAAD forward should be deterministic");
+        assert_eq!(y1, y2, "MEMORA forward should be deterministic");
     }
 
     #[test]
-    fn test_yaad_forward_output_shape() {
+    fn test_memora_forward_output_shape() {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = make_yaad(&cfg);
+        let rule = make_memora(&cfg);
         let (y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
@@ -766,18 +762,18 @@ mod tests {
         assert_eq!(cache.q_mem.len(), s * d);
         assert_eq!(cache.w1_states.len(), (s + 1) * dh * d);
         assert_eq!(cache.w2_states.len(), (s + 1) * d * dh);
-        assert_eq!(cache.w1_boundary.len(), dh * d);
-        assert_eq!(cache.w2_boundary.len(), d * dh);
         assert_eq!(cache.pre_act.len(), s * dh);
         assert_eq!(cache.hidden.len(), s * dh);
+        assert_eq!(cache.log_w1_prev.len(), s * dh * d);
+        assert_eq!(cache.log_w2_prev.len(), s * d * dh);
     }
 
     #[test]
-    fn test_yaad_forward_mlp_evolves() {
+    fn test_memora_forward_mlp_evolves() {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = make_yaad(&cfg);
+        let rule = make_memora(&cfg);
         let (_y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let dh = cfg.d_hidden;
         let d = cfg.swa.d_model;
@@ -785,16 +781,16 @@ mod tests {
 
         let w1_0_norm: f32 = cache.w1_states[0..dh * d].iter().map(|x| x * x).sum::<f32>().sqrt();
         let w1_t_norm: f32 = cache.w1_states[s * dh * d..(s + 1) * dh * d].iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!(w1_0_norm > 1e-6, "W1_0 should be initialized (Xavier), norm={w1_0_norm}");
+        assert!(w1_0_norm > 1e-6, "W1_0 should be initialized (simplex), norm={w1_0_norm}");
         assert!((w1_t_norm - w1_0_norm).abs() > 1e-8, "W1_T should have evolved from init");
     }
 
     #[test]
-    fn test_yaad_forward_gate_range() {
+    fn test_memora_forward_gate_range() {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = make_yaad(&cfg);
+        let rule = make_memora(&cfg);
         let (_y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for t in 0..cfg.swa.seq_len {
             let a = cache.alpha[t];
@@ -805,42 +801,53 @@ mod tests {
     }
 
     #[test]
-    fn test_yaad_boundary_snapshot() {
+    fn test_memora_simplex_preserved() {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = make_yaad(&cfg);
+        let rule = make_memora(&cfg);
         let (_y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let dh = cfg.d_hidden;
         let d = cfg.swa.d_model;
+        let s = cfg.swa.seq_len;
+        let w1_size = dh * d;
+        let w2_size = d * dh;
 
-        // Boundary should match W1_0
-        assert_eq!(&cache.w1_boundary, &cache.w1_states[0..dh * d]);
-        assert_eq!(&cache.w2_boundary, &cache.w2_states[0..d * dh]);
+        // Check all W1 states (including initial and all post-update states)
+        for t in 0..=s {
+            // W1: dh rows of length d
+            for r in 0..dh {
+                let row_start = t * w1_size + r * d;
+                let row = &cache.w1_states[row_start..row_start + d];
+                let sum: f32 = row.iter().sum();
+                assert!((sum - 1.0).abs() < 1e-5,
+                    "W1 row {r} at t={t}: sum={sum}, expected ~1.0");
+                for (c, &v) in row.iter().enumerate() {
+                    assert!(v >= 0.0, "W1[{r},{c}] at t={t} is negative: {v}");
+                }
+            }
+            // W2: d rows of length dh
+            for r in 0..d {
+                let row_start = t * w2_size + r * dh;
+                let row = &cache.w2_states[row_start..row_start + dh];
+                let sum: f32 = row.iter().sum();
+                assert!((sum - 1.0).abs() < 1e-5,
+                    "W2 row {r} at t={t}: sum={sum}, expected ~1.0");
+                for (c, &v) in row.iter().enumerate() {
+                    assert!(v >= 0.0, "W2[{r},{c}] at t={t} is negative: {v}");
+                }
+            }
+        }
     }
 
     #[test]
-    fn test_yaad_huber_gradient_bounded() {
-        // Verify huber_grad clips large errors at delta
-        let delta = 1.0f32;
-        // Small error: gradient = error
-        assert!((huber_grad(0.5, delta) - 0.5).abs() < 1e-8);
-        assert!((huber_grad(-0.3, delta) - (-0.3)).abs() < 1e-8);
-        // Large error: gradient = delta * sign(e)
-        assert!((huber_grad(5.0, delta) - 1.0).abs() < 1e-8);
-        assert!((huber_grad(-10.0, delta) - (-1.0)).abs() < 1e-8);
-        // At boundary
-        assert!((huber_grad(0.99, delta) - 0.99).abs() < 1e-8);
-    }
-
-    #[test]
-    fn test_yaad_backward_finite() {
+    fn test_memora_backward_finite() {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
-        let rule = make_yaad(&cfg);
+        let rule = make_memora(&cfg);
         let (_y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
 
         let d_y = vec![1.0f32; s * d];
@@ -862,13 +869,13 @@ mod tests {
     }
 
     #[test]
-    fn test_yaad_backward_nonzero() {
+    fn test_memora_backward_nonzero() {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
-        let rule = make_yaad(&cfg);
+        let rule = make_memora(&cfg);
         let (_y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
 
         let d_y = vec![1.0f32; s * d];
@@ -886,13 +893,13 @@ mod tests {
     }
 
     #[test]
-    fn test_yaad_backward_shapes() {
+    fn test_memora_backward_shapes() {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
-        let rule = make_yaad(&cfg);
+        let rule = make_memora(&cfg);
         let (_y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
 
         let d_y = vec![1.0f32; s * d];
@@ -911,8 +918,8 @@ mod tests {
     // ── Trait API tests ──────────────────────────────────────────────
 
     #[test]
-    fn test_yaad_init() {
-        let rule = YAAD { d_hidden: 4, delta: 1.0, lambda_local: 0.01, lambda_2: 0.01 };
+    fn test_memora_init() {
+        let rule = MEMORA { d_hidden: 4 };
         let state = rule.init(8);
         assert_eq!(state.m.len(), 64);
         assert_eq!(state.d, 8);
@@ -920,8 +927,8 @@ mod tests {
     }
 
     #[test]
-    fn test_yaad_level_and_parallelization() {
-        let rule = YAAD { d_hidden: 4, delta: 1.0, lambda_local: 0.01, lambda_2: 0.01 };
+    fn test_memora_level_and_parallelization() {
+        let rule = MEMORA { d_hidden: 4 };
         assert_eq!(rule.level(), 0);
         assert_eq!(rule.supported_parallelization(), &["sequential"]);
     }
@@ -929,7 +936,7 @@ mod tests {
     // ── Read-only tests ──────────────────────────────────────────────
 
     #[test]
-    fn test_yaad_read_only_zero_memory() {
+    fn test_memora_read_only_zero_memory() {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
@@ -937,12 +944,12 @@ mod tests {
         let s = cfg.swa.seq_len;
         let dh = cfg.d_hidden;
         let frozen_m = vec![0.0f32; dh * d + d * dh];
-        let (y, _q_mem) = yaad_read_only(&params.levels[0], &embedded, &frozen_m, s, d, dh);
+        let (y, _q_mem) = memora_read_only(&params.levels[0], &embedded, &frozen_m, s, d, dh);
         assert!(y.iter().all(|&x| x.abs() < 1e-12));
     }
 
     #[test]
-    fn test_yaad_read_only_nonzero() {
+    fn test_memora_read_only_nonzero() {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
@@ -952,13 +959,13 @@ mod tests {
         let mut rng = SimpleRng::new(77);
         let mut frozen_m = vec![0.0f32; dh * d + d * dh];
         rng.fill_uniform(&mut frozen_m, 0.1);
-        let (y, _q_mem) = yaad_read_only(&params.levels[0], &embedded, &frozen_m, s, d, dh);
+        let (y, _q_mem) = memora_read_only(&params.levels[0], &embedded, &frozen_m, s, d, dh);
         let y_norm: f32 = y.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!(y_norm > 1e-6, "Non-zero W1/W2 should produce non-zero output");
     }
 
     #[test]
-    fn test_yaad_read_only_backward_finite() {
+    fn test_memora_read_only_backward_finite() {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
@@ -968,9 +975,9 @@ mod tests {
         let mut rng = SimpleRng::new(77);
         let mut frozen_m = vec![0.0f32; dh * d + d * dh];
         rng.fill_uniform(&mut frozen_m, 0.1);
-        let (_, q_mem) = yaad_read_only(&params.levels[0], &embedded, &frozen_m, s, d, dh);
+        let (_, q_mem) = memora_read_only(&params.levels[0], &embedded, &frozen_m, s, d, dh);
         let d_y = vec![1.0f32; s * d];
-        let (grads, d_emb) = yaad_read_only_backward(
+        let (grads, d_emb) = memora_read_only_backward(
             &params.levels[0], &frozen_m, &q_mem, &d_y, &embedded, s, d, dh,
         );
         for &v in grads.w_q_mem.iter() {
@@ -984,21 +991,74 @@ mod tests {
     // ── Initial memory seeding test ──────────────────────────────────
 
     #[test]
-    fn test_yaad_initial_m_seeding() {
+    fn test_memora_initial_m_seeding() {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
         let d = cfg.swa.d_model;
         let s = cfg.swa.seq_len;
         let dh = cfg.d_hidden;
-        let rule = make_yaad(&cfg);
+        let rule = make_memora(&cfg);
 
         let (y1, _) = rule.step(&params.levels[0], &embedded, s, d, None);
         let mut rng = SimpleRng::new(77);
         let mut m0 = vec![0.0f32; dh * d + d * dh];
         rng.fill_uniform(&mut m0, 0.1);
+        // Make m0 valid simplex rows (positive entries summing to ~1)
+        // W1 part: dh rows of d
+        for r in 0..dh {
+            let row = &mut m0[r * d..(r + 1) * d];
+            for v in row.iter_mut() { *v = v.abs() + 0.01; }
+            let sum: f32 = row.iter().sum();
+            for v in row.iter_mut() { *v /= sum; }
+        }
+        // W2 part: d rows of dh
+        let w1_size = dh * d;
+        for r in 0..d {
+            let start = w1_size + r * dh;
+            let row = &mut m0[start..start + dh];
+            for v in row.iter_mut() { *v = v.abs() + 0.01; }
+            let sum: f32 = row.iter().sum();
+            for v in row.iter_mut() { *v /= sum; }
+        }
         let (y2, _) = rule.step(&params.levels[0], &embedded, s, d, Some(m0));
 
         assert_ne!(y1, y2, "Initial memory seeding should change output");
+    }
+
+    // ── Softmax update stays on simplex after multiple steps ────────
+
+    #[test]
+    fn test_memora_softmax_update_stays_on_simplex() {
+        // Run MEMORA for 8 steps and verify W1/W2 rows remain valid distributions
+        let mut cfg = MAGConfig::memora_test_config();
+        cfg.swa.seq_len = 8;
+        cfg.swa.window_size = 8;
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let rule = make_memora(&cfg);
+        let (_y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
+        let d = cfg.swa.d_model;
+        let dh = cfg.d_hidden;
+        let s = cfg.swa.seq_len;
+        let w1_size = dh * d;
+        let w2_size = d * dh;
+
+        // Check final W1 and W2 states
+        let w1_final = &cache.w1_states[s * w1_size..(s + 1) * w1_size];
+        for r in 0..dh {
+            let row = &w1_final[r * d..(r + 1) * d];
+            let sum: f32 = row.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-5,
+                "W1 final row {r}: sum={sum}, expected ~1.0");
+        }
+
+        let w2_final = &cache.w2_states[s * w2_size..(s + 1) * w2_size];
+        for r in 0..d {
+            let row = &w2_final[r * dh..(r + 1) * dh];
+            let sum: f32 = row.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-5,
+                "W2 final row {r}: sum={sum}, expected ~1.0");
+        }
     }
 }
