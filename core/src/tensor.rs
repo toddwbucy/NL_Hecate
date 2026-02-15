@@ -270,6 +270,27 @@ pub fn frobenius_dot_f32(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
+/// Normalized SiLU: silu(x) / ||silu(x)|| * sqrt(d).
+/// Smooth, bounded activation for Trellis two-pass compression.
+/// Returns (output, silu_values, silu_norm) for backward.
+pub fn normalized_silu_f32(x: &[f32]) -> (Vec<f32>, Vec<f32>, f32) {
+    let d = x.len();
+    let mut silu_vals = vec![0.0f32; d];
+    for i in 0..d {
+        silu_vals[i] = silu_f32(x[i]);
+    }
+    let norm = vec_norm_f32(&silu_vals);
+    let scale = (d as f32).sqrt();
+    let mut out = vec![0.0f32; d];
+    if norm > 1e-8 {
+        let inv = scale / norm;
+        for i in 0..d {
+            out[i] = silu_vals[i] * inv;
+        }
+    }
+    (out, silu_vals, norm)
+}
+
 /// Simple xorshift64 PRNG for deterministic weight init. Not crypto-safe.
 pub struct SimpleRng {
     state: u64,
@@ -536,6 +557,34 @@ mod tests {
         assert!((a[0] - 1.0).abs() < 1e-6);
         assert!(a[1].abs() < 1e-6);
         assert!(a[2].abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_normalized_silu_basic() {
+        let x = [1.0f32, 2.0, -1.0, 0.5];
+        let (out, silu_vals, norm) = normalized_silu_f32(&x);
+        assert_eq!(out.len(), 4);
+        assert_eq!(silu_vals.len(), 4);
+        assert!(norm > 0.0, "norm should be positive for non-zero input");
+        // Output should have norm = sqrt(d) = 2.0
+        let out_norm = vec_norm_f32(&out);
+        assert!((out_norm - 2.0).abs() < 1e-5,
+            "||normalized_silu|| should be sqrt(4)=2.0, got {out_norm}");
+        // Verify silu values
+        for i in 0..4 {
+            assert!((silu_vals[i] - silu_f32(x[i])).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_normalized_silu_zero_input() {
+        let x = [0.0f32; 4];
+        let (out, _silu_vals, norm) = normalized_silu_f32(&x);
+        // silu(0) = 0, so norm = 0, output should be zero (degenerate)
+        assert!(norm < 1e-8, "norm of silu(zeros) should be ~0");
+        for &v in &out {
+            assert!(v.abs() < 1e-8, "output should be zero for zero input, got {v}");
+        }
     }
 
     #[test]

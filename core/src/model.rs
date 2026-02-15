@@ -19,6 +19,7 @@ pub enum MemoryRuleKind {
     YAAD,
     MEMORA,
     LatticeOSR,
+    Trellis,
 }
 
 /// Model configuration — immutable after construction.
@@ -303,6 +304,12 @@ pub struct MAGConfig {
     pub delta: f32,
     /// Number of memory slots for Lattice OSR (default: 0, unused by other rules).
     pub m_slots: usize,
+    /// Key compression dimension for Trellis (default: 0, unused by other rules).
+    pub d_compress: usize,
+    /// Key state L2 decay rate for Trellis (default: 0.0).
+    pub lambda_k: f32,
+    /// Value state L2 decay rate for Trellis (default: 0.0).
+    pub lambda_v: f32,
 }
 
 /// Default gate bias init values per level index.
@@ -359,7 +366,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 1,
             chunk_sizes: vec![1],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
         }
     }
 
@@ -378,7 +385,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 2,
             chunk_sizes: vec![1, 8],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
         }
     }
 
@@ -397,7 +404,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 1,
             chunk_sizes: vec![1],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
         }
     }
 
@@ -417,7 +424,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 2,
             chunk_sizes: vec![1, 8],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
         }
     }
 
@@ -437,7 +444,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 4,
             chunk_sizes: vec![1, 8, 64, 512],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
         }
     }
 
@@ -457,7 +464,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 4,
             chunk_sizes: vec![1, 8, 64, 512],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
         }
     }
 
@@ -476,7 +483,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::TitansLMM,
             k: 1,
             chunk_sizes: vec![1],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
         }
     }
 
@@ -495,7 +502,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::HebbianRule,
             k: 1,
             chunk_sizes: vec![1],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
         }
     }
 
@@ -514,7 +521,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::HebbianRule,
             k: 2,
             chunk_sizes: vec![1, 8],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
         }
     }
 
@@ -533,7 +540,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::TitansLMM,
             k: 2,
             chunk_sizes: vec![1, 8],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
         }
     }
 
@@ -559,6 +566,9 @@ impl MAGConfig {
             lambda_2: 0.01,
             delta: 1.0,
             m_slots: 0,
+            d_compress: 0,
+            lambda_k: 0.0,
+            lambda_v: 0.0,
         }
     }
 
@@ -584,6 +594,9 @@ impl MAGConfig {
             lambda_2: 0.01,
             delta: 1.0,
             m_slots: 0,
+            d_compress: 0,
+            lambda_k: 0.0,
+            lambda_v: 0.0,
         }
     }
 
@@ -609,6 +622,9 @@ impl MAGConfig {
             lambda_2: 0.01,
             delta: 1.0,
             m_slots: 0,
+            d_compress: 0,
+            lambda_k: 0.0,
+            lambda_v: 0.0,
         }
     }
 
@@ -634,6 +650,9 @@ impl MAGConfig {
             lambda_2: 0.01,
             delta: 1.0,
             m_slots: 0,
+            d_compress: 0,
+            lambda_k: 0.0,
+            lambda_v: 0.0,
         }
     }
 
@@ -659,6 +678,9 @@ impl MAGConfig {
             lambda_2: 0.0,
             delta: 1.0,
             m_slots: 0,
+            d_compress: 0,
+            lambda_k: 0.0,
+            lambda_v: 0.0,
         }
     }
 
@@ -684,6 +706,9 @@ impl MAGConfig {
             lambda_2: 0.0,
             delta: 1.0,
             m_slots: 0,
+            d_compress: 0,
+            lambda_k: 0.0,
+            lambda_v: 0.0,
         }
     }
 
@@ -703,7 +728,7 @@ impl MAGConfig {
             k: 1,
             chunk_sizes: vec![1],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
-            m_slots: 4,
+            m_slots: 4, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
         }
     }
 
@@ -723,7 +748,53 @@ impl MAGConfig {
             k: 2,
             chunk_sizes: vec![1, 8],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
-            m_slots: 4,
+            m_slots: 4, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+        }
+    }
+
+    /// Trellis test configuration: d=8, d_compress=8, lambda_k/v=0.01 (k=1).
+    pub fn trellis_test_config() -> Self {
+        MAGConfig {
+            swa: SWAConfig {
+                d_model: 8,
+                num_heads: 2,
+                head_dim: 4,
+                seq_len: 4,
+                window_size: 4,
+                vocab_size: 16,
+            },
+            memory_enabled: true,
+            memory_rule: MemoryRuleKind::Trellis,
+            k: 1,
+            chunk_sizes: vec![1],
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
+            m_slots: 0,
+            d_compress: 8,
+            lambda_k: 0.01,
+            lambda_v: 0.01,
+        }
+    }
+
+    /// Trellis test configuration for CMS k=2 testing.
+    pub fn trellis_test_config_k2() -> Self {
+        MAGConfig {
+            swa: SWAConfig {
+                d_model: 8,
+                num_heads: 2,
+                head_dim: 4,
+                seq_len: 8,
+                window_size: 8,
+                vocab_size: 16,
+            },
+            memory_enabled: true,
+            memory_rule: MemoryRuleKind::Trellis,
+            k: 2,
+            chunk_sizes: vec![1, 8],
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
+            m_slots: 0,
+            d_compress: 8,
+            lambda_k: 0.01,
+            lambda_v: 0.01,
         }
     }
 }

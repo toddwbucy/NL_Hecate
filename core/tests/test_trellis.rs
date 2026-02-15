@@ -1,9 +1,9 @@
-//! Lattice OSR integration tests: multi-step training, sphere preservation, CMS k=2, comparison vs Delta Rule.
+//! Trellis two-pass KV compression integration tests: multi-step training,
+//! two-pass state evolution, CMS k=2, comparison vs Delta Rule.
 
 use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind};
 use nl_hecate_core::mag::{cms_forward, cms_backward, mag_forward, mag_backward, MemoryCache};
 use nl_hecate_core::conductor::{Conductor, ContextState, ErrorBuffer};
-use nl_hecate_core::tensor::vec_norm_f32;
 
 fn make_data(cfg: &MAGConfig) -> (Vec<usize>, Vec<usize>) {
     let input_ids: Vec<usize> = (0..cfg.swa.seq_len).map(|t| t % cfg.swa.vocab_size).collect();
@@ -45,7 +45,7 @@ fn cms_train(
 ) -> (f32, f32) {
     let mut conductor = Conductor::new(cfg.k, cfg.chunk_sizes.clone());
     let d = cfg.swa.d_model;
-    let mem_size = cfg.m_slots * d;
+    let mem_size = 2 * cfg.d_compress * d;
     let mut context = ContextState::new_with_memory_size(cfg.k, d, mem_size);
     let mut error_buffers: Vec<ErrorBuffer> = (0..cfg.k)
         .map(|_| ErrorBuffer::new(d))
@@ -77,12 +77,12 @@ fn cms_train(
     (initial_loss.unwrap(), final_loss)
 }
 
-// ── Lattice OSR k=1 tests ──────────────────────────────────────────
+// ── Trellis k=1 tests ──────────────────────────────────────────
 
 /// 100-step smoke test: no NaN, no divergence, loss finite.
 #[test]
-fn test_lattice_k1_smoke() {
-    let cfg = MAGConfig::lattice_test_config();
+fn test_trellis_k1_smoke() {
+    let cfg = MAGConfig::trellis_test_config();
     let mut params = MAGParams::init(&cfg, 42);
     let (input_ids, target_ids) = make_data(&cfg);
 
@@ -103,15 +103,15 @@ fn test_lattice_k1_smoke() {
         loss
     };
     let initial = prev_loss.unwrap();
-    eprintln!("Lattice k=1 smoke: initial={initial:.4}, final={final_loss:.4}");
+    eprintln!("Trellis k=1 smoke: initial={initial:.4}, final={final_loss:.4}");
     assert!(final_loss.is_finite(), "Final loss not finite");
     assert!(final_loss < 100.0, "Loss diverged: {final_loss}");
 }
 
 /// 1K-step convergence: loss decreases.
 #[test]
-fn test_lattice_k1_convergence() {
-    let cfg = MAGConfig::lattice_test_config();
+fn test_trellis_k1_convergence() {
+    let cfg = MAGConfig::trellis_test_config();
     let mut params = MAGParams::init(&cfg, 42);
     let (input_ids, target_ids) = make_data(&cfg);
 
@@ -130,61 +130,59 @@ fn test_lattice_k1_convergence() {
         loss
     };
     let initial = initial_loss.unwrap();
-    eprintln!("Lattice k=1 convergence: initial={initial:.4}, final={final_loss:.4}");
+    eprintln!("Trellis k=1 convergence: initial={initial:.4}, final={final_loss:.4}");
     assert!(final_loss < initial,
         "Loss should decrease: initial={initial:.4}, final={final_loss:.4}");
 }
 
-/// Verify all memory slots remain unit vectors after training.
-/// This is the core invariant of Lattice OSR — sphere preservation via renormalization.
+/// Verify both S_K and S_V state matrices evolve during forward pass.
+/// This is the core property of two-pass compression — both passes must be active.
 #[test]
-fn test_lattice_sphere_preserved() {
-    let cfg = MAGConfig::lattice_test_config();
-    let mut params = MAGParams::init(&cfg, 42);
+fn test_trellis_two_pass_states_evolve() {
+    let cfg = MAGConfig::trellis_test_config();
+    let params = MAGParams::init(&cfg, 42);
     let (input_ids, target_ids) = make_data(&cfg);
 
-    // Train for 50 steps
-    for _ in 0..50 {
-        let (_, cache) = mag_forward(&params, &cfg, &input_ids, &target_ids);
-        let grads = mag_backward(&params, &cfg, &cache, &input_ids, &target_ids);
-        params.sgd_step(&grads, 0.01);
-    }
-
-    // Run one more forward to get cache with slot states
     let (_, cache) = mag_forward(&params, &cfg, &input_ids, &target_ids);
     match &cache.memory_cache {
-        MemoryCache::Lattice(lc) => {
-            let d = lc.d;
-            let m = lc.m;
-            let s = lc.seq_len;
+        MemoryCache::Trellis(tc) => {
+            let d = tc.d;
+            let d_k = tc.d_k;
+            let s = tc.seq_len;
 
-            // Check every slot at every timestep (including initial and final)
-            for t in 0..=s {
-                for i in 0..m {
-                    let offset = t * m * d + i * d;
-                    let slot = &lc.s_states[offset..offset + d];
-                    let norm = vec_norm_f32(slot);
-                    assert!((norm - 1.0).abs() < 1e-4,
-                        "Slot {i} at t={t}: ||s|| = {norm}, expected ~1.0");
-                }
-            }
-            eprintln!("Sphere preserved: all {} slots × {} timesteps are unit vectors", m, s + 1);
+            // Check S_K evolved: compare initial (t=0) vs final (t=s)
+            let sk_initial = &tc.sk_states[0..d_k * d];
+            let sk_final = &tc.sk_states[s * d_k * d..(s + 1) * d_k * d];
+            let sk_diff: f32 = sk_initial.iter().zip(sk_final.iter())
+                .map(|(a, b)| (a - b).powi(2)).sum::<f32>().sqrt();
+            assert!(sk_diff > 1e-6,
+                "S_K should evolve: ||S_K_0 - S_K_final|| = {sk_diff:.4e}");
+
+            // Check S_V evolved: compare initial (t=0) vs final (t=s)
+            let sv_initial = &tc.sv_states[0..d * d_k];
+            let sv_final = &tc.sv_states[s * d * d_k..(s + 1) * d * d_k];
+            let sv_diff: f32 = sv_initial.iter().zip(sv_final.iter())
+                .map(|(a, b)| (a - b).powi(2)).sum::<f32>().sqrt();
+            assert!(sv_diff > 1e-6,
+                "S_V should evolve: ||S_V_0 - S_V_final|| = {sv_diff:.4e}");
+
+            eprintln!("Two-pass states evolve: ||dS_K||={sk_diff:.4e}, ||dS_V||={sv_diff:.4e}");
         }
-        _ => panic!("Expected LatticeCache"),
+        _ => panic!("Expected TrellisCache"),
     }
 }
 
-/// CMS k=2 with Lattice OSR on multi-scale data.
+/// CMS k=2 with Trellis on multi-scale data.
 #[test]
-fn test_lattice_k2_multiscale() {
-    let cfg = MAGConfig::lattice_test_config_k2();
+fn test_trellis_k2_multiscale() {
+    let cfg = MAGConfig::trellis_test_config_k2();
     let mut params = MAGParams::init(&cfg, 42);
     let (input_ids, target_ids) = make_multiscale_data(
         cfg.swa.seq_len, cfg.swa.vocab_size, 4, 4,
     );
 
     let (initial, final_loss) = cms_train(&mut params, &cfg, &input_ids, &target_ids, 5_000, 0.01);
-    eprintln!("Lattice k=2 multiscale: initial={initial:.4}, final={final_loss:.4}");
+    eprintln!("Trellis k=2 multiscale: initial={initial:.4}, final={final_loss:.4}");
 
     assert!(initial.is_finite(), "Initial loss not finite");
     assert!(final_loss.is_finite(), "Final loss not finite");
@@ -192,10 +190,10 @@ fn test_lattice_k2_multiscale() {
         "Loss should decrease: initial={initial:.4}, final={final_loss:.4}");
 }
 
-/// Compare Lattice OSR vs Delta Rule on same data.
-/// Lattice should converge — within tolerance of Delta Rule.
+/// Compare Trellis vs Delta Rule on same data.
+/// Trellis should converge — within tolerance of Delta Rule.
 #[test]
-fn test_lattice_vs_delta() {
+fn test_trellis_vs_delta() {
     use nl_hecate_core::model::SWAConfig;
 
     let swa = SWAConfig {
@@ -207,13 +205,15 @@ fn test_lattice_vs_delta() {
         swa: swa.clone(), memory_enabled: true,
         memory_rule: MemoryRuleKind::DeltaRule,
         k: 1, chunk_sizes: vec![1],
-        d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+        d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
+        d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
     };
-    let cfg_lattice = MAGConfig {
+    let cfg_trellis = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
-        memory_rule: MemoryRuleKind::LatticeOSR,
+        memory_rule: MemoryRuleKind::Trellis,
         k: 1, chunk_sizes: vec![1],
-        d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 4, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+        d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
+        d_compress: 8, lambda_k: 0.01, lambda_v: 0.01,
     };
 
     let input_ids: Vec<usize> = (0..swa.seq_len).map(|t| t % swa.vocab_size).collect();
@@ -232,32 +232,32 @@ fn test_lattice_vs_delta() {
     }
     let delta_final = mag_forward(&params_delta, &cfg_delta, &input_ids, &target_ids).0;
 
-    // Train Lattice OSR
-    let mut params_lattice = MAGParams::init(&cfg_lattice, 42);
-    let mut lattice_initial = None;
+    // Train Trellis
+    let mut params_trellis = MAGParams::init(&cfg_trellis, 42);
+    let mut trellis_initial = None;
     for _ in 0..steps {
-        let (loss, cache) = mag_forward(&params_lattice, &cfg_lattice, &input_ids, &target_ids);
-        if lattice_initial.is_none() { lattice_initial = Some(loss); }
-        let grads = mag_backward(&params_lattice, &cfg_lattice, &cache, &input_ids, &target_ids);
-        params_lattice.sgd_step(&grads, lr);
+        let (loss, cache) = mag_forward(&params_trellis, &cfg_trellis, &input_ids, &target_ids);
+        if trellis_initial.is_none() { trellis_initial = Some(loss); }
+        let grads = mag_backward(&params_trellis, &cfg_trellis, &cache, &input_ids, &target_ids);
+        params_trellis.sgd_step(&grads, lr);
     }
-    let lattice_final = mag_forward(&params_lattice, &cfg_lattice, &input_ids, &target_ids).0;
+    let trellis_final = mag_forward(&params_trellis, &cfg_trellis, &input_ids, &target_ids).0;
 
     eprintln!("Delta: initial={:.4}, final={delta_final:.4}", delta_initial.unwrap());
-    eprintln!("Lattice: initial={:.4}, final={lattice_final:.4}", lattice_initial.unwrap());
+    eprintln!("Trellis: initial={:.4}, final={trellis_final:.4}", trellis_initial.unwrap());
 
     // Both should converge
     assert!(delta_final < delta_initial.unwrap(), "Delta should converge");
-    assert!(lattice_final < lattice_initial.unwrap(), "Lattice should converge");
+    assert!(trellis_final < trellis_initial.unwrap(), "Trellis should converge");
 
-    // Lattice uses m<<d slots (4 slots in d=8), so less capacity — within 5x of Delta
-    assert!(lattice_final < delta_final * 5.0,
-        "Lattice should not catastrophically regress: lattice={lattice_final:.6}, delta={delta_final:.6}");
+    // Trellis has two d_k×d matrices at d_k=d=8, so similar capacity — within 5x of Delta
+    assert!(trellis_final < delta_final * 5.0,
+        "Trellis should not catastrophically regress: trellis={trellis_final:.6}, delta={delta_final:.6}");
 
-    if lattice_final > delta_final {
-        let ratio = lattice_final / delta_final;
-        eprintln!("NOTE: Delta beats Lattice by {ratio:.2}x — expected (m<d means less capacity)");
+    if trellis_final > delta_final {
+        let ratio = trellis_final / delta_final;
+        eprintln!("NOTE: Delta beats Trellis by {ratio:.2}x — two-pass overhead at tiny scale");
     } else {
-        eprintln!("Lattice matches/beats Delta at d=8 — impressive for m=4 slots");
+        eprintln!("Trellis matches/beats Delta at d=8 — compression advantage even at small scale");
     }
 }

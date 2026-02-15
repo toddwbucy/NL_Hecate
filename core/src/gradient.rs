@@ -27,6 +27,11 @@ fn make_context_state(cfg: &MAGConfig) -> ContextState {
             let mem_size = cfg.m_slots * d;
             ContextState::new_with_memory_size(cfg.k, d, mem_size)
         }
+        MemoryRuleKind::Trellis => {
+            let d = cfg.swa.d_model;
+            let mem_size = 2 * cfg.d_compress * d;
+            ContextState::new_with_memory_size(cfg.k, d, mem_size)
+        }
         _ => ContextState::new(cfg.k, cfg.swa.d_model),
     }
 }
@@ -715,6 +720,11 @@ mod tests {
                 let m = c.m;
                 let s_t = &c.s_states[s * m * d..(s + 1) * m * d];
                 s_t.iter().map(|x| x * x).sum::<f32>().sqrt()
+            }
+            crate::mag::MemoryCache::Trellis(c) => {
+                let sk_size = c.d_k * d;
+                let sk_t = &c.sk_states[s * sk_size..(s + 1) * sk_size];
+                sk_t.iter().map(|x| x * x).sum::<f32>().sqrt()
             }
         };
         eprintln!("MAG final memory norm: {memory_evolved:.4e}");
@@ -3741,5 +3751,430 @@ mod tests {
         );
         eprintln!("lattice CMS l1_b_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
         assert!(passed == checked, "lattice l1_b_alpha: {passed}/{checked} passed");
+    }
+
+    // ── Trellis gradient checks (k=1, MAG) ──────────────────────────────
+
+    fn trellis_grad_check_config() -> MAGConfig {
+        MAGConfig::trellis_test_config()
+    }
+
+    fn trellis_params_for_grad_check(cfg: &MAGConfig, seed: u64) -> MAGParams {
+        let mut params = MAGParams::init(cfg, seed);
+        for level in &mut params.levels {
+            level.b_alpha = vec![0.0f32];  // sigmoid(0)=0.5
+            level.b_theta = vec![0.0f32];  // softplus(0)≈0.69
+        }
+        params
+    }
+
+    #[test]
+    fn test_trellis_gradient_w_k_mem() {
+        let cfg = trellis_grad_check_config();
+        let params = trellis_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "trellis_w_k_mem",
+            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("trellis_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "trellis_w_k_mem: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_trellis_gradient_w_v_mem() {
+        let cfg = trellis_grad_check_config();
+        let params = trellis_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "trellis_w_v_mem",
+            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("trellis_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "trellis_w_v_mem: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_trellis_gradient_w_q_mem() {
+        let cfg = trellis_grad_check_config();
+        let params = trellis_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "trellis_w_q_mem",
+            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("trellis_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "trellis_w_q_mem: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_trellis_gradient_w_alpha() {
+        let cfg = trellis_grad_check_config();
+        let params = trellis_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "trellis_w_alpha",
+            |p| &p.levels[0].w_alpha, |p, i, v| p.levels[0].w_alpha[i] = v, |g| &g.levels[0].w_alpha,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("trellis_w_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "trellis_w_alpha: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_trellis_gradient_b_alpha() {
+        let cfg = trellis_grad_check_config();
+        let params = trellis_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "trellis_b_alpha",
+            |p| &p.levels[0].b_alpha, |p, i, v| p.levels[0].b_alpha[i] = v, |g| &g.levels[0].b_alpha,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("trellis_b_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "trellis_b_alpha: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_trellis_gradient_w_theta() {
+        let cfg = trellis_grad_check_config();
+        let params = trellis_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "trellis_w_theta",
+            |p| &p.levels[0].w_theta, |p, i, v| p.levels[0].w_theta[i] = v, |g| &g.levels[0].w_theta,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("trellis_w_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "trellis_w_theta: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_trellis_gradient_b_theta() {
+        let cfg = trellis_grad_check_config();
+        let params = trellis_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "trellis_b_theta",
+            |p| &p.levels[0].b_theta, |p, i, v| p.levels[0].b_theta[i] = v, |g| &g.levels[0].b_theta,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("trellis_b_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "trellis_b_theta: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    // ── Trellis CMS gradient checks (k=2, both levels active) ────────────
+
+    fn trellis_cms_grad_check_config() -> MAGConfig {
+        MAGConfig::trellis_test_config_k2()
+    }
+
+    fn trellis_cms_params_for_grad_check(cfg: &MAGConfig, seed: u64) -> MAGParams {
+        let mut params = MAGParams::init(cfg, seed);
+        for level in &mut params.levels {
+            level.b_alpha = vec![0.0f32];
+            level.b_theta = vec![0.0f32];
+        }
+        params
+    }
+
+    fn trellis_cms_make_test_data(cfg: &MAGConfig) -> (Vec<usize>, Vec<usize>) {
+        let input_ids: Vec<usize> = (0..cfg.swa.seq_len).map(|t| t % cfg.swa.vocab_size).collect();
+        let target_ids: Vec<usize> = (1..=cfg.swa.seq_len).map(|t| t % cfg.swa.vocab_size).collect();
+        (input_ids, target_ids)
+    }
+
+    // ── Trellis CMS Level 0 FD checks ──────────────────────────────────
+
+    #[test]
+    fn test_trellis_cms_gradient_l0_w_k_mem() {
+        let cfg = trellis_cms_grad_check_config();
+        let params = trellis_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = trellis_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "trellis_l0_w_k_mem", &pulse,
+            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("trellis CMS l0_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "trellis l0_w_k_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_trellis_cms_gradient_l0_w_v_mem() {
+        let cfg = trellis_cms_grad_check_config();
+        let params = trellis_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = trellis_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "trellis_l0_w_v_mem", &pulse,
+            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("trellis CMS l0_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "trellis l0_w_v_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_trellis_cms_gradient_l0_w_q_mem() {
+        let cfg = trellis_cms_grad_check_config();
+        let params = trellis_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = trellis_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "trellis_l0_w_q_mem", &pulse,
+            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("trellis CMS l0_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "trellis l0_w_q_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_trellis_cms_gradient_l0_w_alpha() {
+        let cfg = trellis_cms_grad_check_config();
+        let params = trellis_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = trellis_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "trellis_l0_w_alpha", &pulse,
+            |p| &p.levels[0].w_alpha, |p, i, v| p.levels[0].w_alpha[i] = v, |g| &g.levels[0].w_alpha,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("trellis CMS l0_w_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "trellis l0_w_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_trellis_cms_gradient_l0_b_alpha() {
+        let cfg = trellis_cms_grad_check_config();
+        let params = trellis_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = trellis_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "trellis_l0_b_alpha", &pulse,
+            |p| &p.levels[0].b_alpha, |p, i, v| p.levels[0].b_alpha[i] = v, |g| &g.levels[0].b_alpha,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("trellis CMS l0_b_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "trellis l0_b_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_trellis_cms_gradient_l0_w_theta() {
+        let cfg = trellis_cms_grad_check_config();
+        let params = trellis_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = trellis_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "trellis_l0_w_theta", &pulse,
+            |p| &p.levels[0].w_theta, |p, i, v| p.levels[0].w_theta[i] = v, |g| &g.levels[0].w_theta,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("trellis CMS l0_w_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "trellis l0_w_theta: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_trellis_cms_gradient_l0_b_theta() {
+        let cfg = trellis_cms_grad_check_config();
+        let params = trellis_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = trellis_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "trellis_l0_b_theta", &pulse,
+            |p| &p.levels[0].b_theta, |p, i, v| p.levels[0].b_theta[i] = v, |g| &g.levels[0].b_theta,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("trellis CMS l0_b_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "trellis l0_b_theta: {passed}/{checked} passed");
+    }
+
+    // ── Trellis CMS Level 1 FD checks ──────────────────────────────────
+
+    #[test]
+    fn test_trellis_cms_gradient_l1_w_k_mem() {
+        let cfg = trellis_cms_grad_check_config();
+        let params = trellis_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = trellis_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "trellis_l1_w_k_mem", &pulse,
+            |p| &p.levels[1].w_k_mem, |p, i, v| p.levels[1].w_k_mem[i] = v, |g| &g.levels[1].w_k_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("trellis CMS l1_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "trellis l1_w_k_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_trellis_cms_gradient_l1_w_v_mem() {
+        let cfg = trellis_cms_grad_check_config();
+        let params = trellis_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = trellis_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "trellis_l1_w_v_mem", &pulse,
+            |p| &p.levels[1].w_v_mem, |p, i, v| p.levels[1].w_v_mem[i] = v, |g| &g.levels[1].w_v_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("trellis CMS l1_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "trellis l1_w_v_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_trellis_cms_gradient_l1_w_q_mem() {
+        let cfg = trellis_cms_grad_check_config();
+        let params = trellis_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = trellis_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "trellis_l1_w_q_mem", &pulse,
+            |p| &p.levels[1].w_q_mem, |p, i, v| p.levels[1].w_q_mem[i] = v, |g| &g.levels[1].w_q_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("trellis CMS l1_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "trellis l1_w_q_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_trellis_cms_gradient_l1_w_alpha() {
+        let cfg = trellis_cms_grad_check_config();
+        let params = trellis_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = trellis_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "trellis_l1_w_alpha", &pulse,
+            |p| &p.levels[1].w_alpha, |p, i, v| p.levels[1].w_alpha[i] = v, |g| &g.levels[1].w_alpha,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("trellis CMS l1_w_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "trellis l1_w_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_trellis_cms_gradient_l1_b_alpha() {
+        let cfg = trellis_cms_grad_check_config();
+        let params = trellis_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = trellis_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "trellis_l1_b_alpha", &pulse,
+            |p| &p.levels[1].b_alpha, |p, i, v| p.levels[1].b_alpha[i] = v, |g| &g.levels[1].b_alpha,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("trellis CMS l1_b_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "trellis l1_b_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_trellis_cms_gradient_l1_w_theta() {
+        let cfg = trellis_cms_grad_check_config();
+        let params = trellis_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = trellis_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "trellis_l1_w_theta", &pulse,
+            |p| &p.levels[1].w_theta, |p, i, v| p.levels[1].w_theta[i] = v, |g| &g.levels[1].w_theta,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("trellis CMS l1_w_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "trellis l1_w_theta: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_trellis_cms_gradient_l1_b_theta() {
+        let cfg = trellis_cms_grad_check_config();
+        let params = trellis_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = trellis_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "trellis_l1_b_theta", &pulse,
+            |p| &p.levels[1].b_theta, |p, i, v| p.levels[1].b_theta[i] = v, |g| &g.levels[1].b_theta,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("trellis CMS l1_b_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "trellis l1_b_theta: {passed}/{checked} passed");
     }
 }
