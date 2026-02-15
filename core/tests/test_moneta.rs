@@ -197,13 +197,13 @@ fn test_moneta_vs_delta() {
         swa: swa.clone(), memory_enabled: true,
         memory_rule: MemoryRuleKind::DeltaRule,
         k: 1, chunk_sizes: vec![1],
-        d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_q: 0.0, lambda_2: 0.0,
+        d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
     };
     let cfg_moneta = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
         memory_rule: MemoryRuleKind::Moneta,
         k: 1, chunk_sizes: vec![1],
-        d_hidden: 4, lp_p: 2.0, lq_q: 2.0, lambda_q: 0.0, lambda_2: 0.01,
+        d_hidden: 4, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.01, delta: 1.0,
     };
 
     let input_ids: Vec<usize> = (0..swa.seq_len).map(|t| t % swa.vocab_size).collect();

@@ -13,6 +13,7 @@ use crate::delta_rule::{MemoryRule, DeltaRule, DeltaRuleCache, delta_rule_read_o
 use crate::titans_lmm::{TitansLMM, TitansLMMCache};
 use crate::hebbian_rule::{HebbianRule, HebbianCache};
 use crate::moneta::{Moneta, MonetaCache, moneta_read_only, moneta_read_only_backward};
+use crate::yaad::{YAAD, YAADCache, yaad_read_only, yaad_read_only_backward};
 use crate::conductor::{Pulse, ContextState, ErrorBuffer};
 
 /// Memory cache enum for static dispatch across memory rule variants.
@@ -22,6 +23,7 @@ pub enum MemoryCache {
     Titans(TitansLMMCache),
     Hebbian(HebbianCache),
     Moneta(MonetaCache),
+    YAAD(YAADCache),
 }
 
 /// Cache for MAG forward pass — holds both branches' intermediates.
@@ -110,6 +112,11 @@ pub fn mag_forward(
             let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2 };
             let (y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
             (y, MemoryCache::Moneta(cache))
+        }
+        MemoryRuleKind::YAAD => {
+            let rule = YAAD { d_hidden: cfg.d_hidden, delta: cfg.delta, lambda_local: cfg.lambda_local, lambda_2: cfg.lambda_2 };
+            let (y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
+            (y, MemoryCache::YAAD(cache))
         }
     };
 
@@ -240,6 +247,10 @@ pub fn mag_backward(
         MemoryCache::Moneta(moneta_cache) => {
             let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2 };
             rule.step_backward(&params.levels[0], moneta_cache, &d_y, &cache.embedded)
+        }
+        MemoryCache::YAAD(yaad_cache) => {
+            let rule = YAAD { d_hidden: cfg.d_hidden, delta: cfg.delta, lambda_local: cfg.lambda_local, lambda_2: cfg.lambda_2 };
+            rule.step_backward(&params.levels[0], yaad_cache, &d_y, &cache.embedded)
         }
     };
 
@@ -407,7 +418,6 @@ pub fn cms_forward(
                 MemoryRuleKind::Moneta => {
                     let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2 };
                     let (y, cache) = rule.step(&params.levels[level], &embedded, s, d, initial_m);
-                    // CMS context: W1_flat ++ W2_flat
                     let dh = cfg.d_hidden;
                     let w1_size = dh * d;
                     let w2_size = d * dh;
@@ -418,6 +428,20 @@ pub fn cms_forward(
                     ctx_mem.extend_from_slice(w2_final);
                     context.memory[level] = ctx_mem;
                     (y, MemoryCache::Moneta(cache))
+                }
+                MemoryRuleKind::YAAD => {
+                    let rule = YAAD { d_hidden: cfg.d_hidden, delta: cfg.delta, lambda_local: cfg.lambda_local, lambda_2: cfg.lambda_2 };
+                    let (y, cache) = rule.step(&params.levels[level], &embedded, s, d, initial_m);
+                    let dh = cfg.d_hidden;
+                    let w1_size = dh * d;
+                    let w2_size = d * dh;
+                    let w1_final = &cache.w1_states[s * w1_size..(s + 1) * w1_size];
+                    let w2_final = &cache.w2_states[s * w2_size..(s + 1) * w2_size];
+                    let mut ctx_mem = Vec::with_capacity(w1_size + w2_size);
+                    ctx_mem.extend_from_slice(w1_final);
+                    ctx_mem.extend_from_slice(w2_final);
+                    context.memory[level] = ctx_mem;
+                    (y, MemoryCache::YAAD(cache))
                 }
             };
 
@@ -432,6 +456,9 @@ pub fn cms_forward(
             let frozen_ref = &context.memory[level];
             let (y_level, q_mem) = match cfg.memory_rule {
                 MemoryRuleKind::Moneta => moneta_read_only(
+                    &params.levels[level], &embedded, frozen_ref, s, d, cfg.d_hidden,
+                ),
+                MemoryRuleKind::YAAD => yaad_read_only(
                     &params.levels[level], &embedded, frozen_ref, s, d, cfg.d_hidden,
                 ),
                 _ => delta_rule_read_only(
@@ -617,6 +644,10 @@ pub fn cms_backward(
                     let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2 };
                     rule.step_backward(&params.levels[level], moneta_cache, &d_y_combined, &cache.embedded)
                 }
+                MemoryCache::YAAD(yaad_cache) => {
+                    let rule = YAAD { d_hidden: cfg.d_hidden, delta: cfg.delta, lambda_local: cfg.lambda_local, lambda_2: cfg.lambda_2 };
+                    rule.step_backward(&params.levels[level], yaad_cache, &d_y_combined, &cache.embedded)
+                }
             };
             grads.levels[level].accumulate(&mem_grads);
             for i in 0..(s * d) {
@@ -628,6 +659,9 @@ pub fn cms_backward(
             let frozen_m = cache.frozen_memories[level].as_ref().unwrap();
             let (mem_grads, d_embedded_mem) = match cfg.memory_rule {
                 MemoryRuleKind::Moneta => moneta_read_only_backward(
+                    &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.d_hidden,
+                ),
+                MemoryRuleKind::YAAD => yaad_read_only_backward(
                     &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.d_hidden,
                 ),
                 _ => delta_rule_read_only_backward(
