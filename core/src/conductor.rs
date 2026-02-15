@@ -108,9 +108,10 @@ impl Conductor {
                 model_pulse: checkpoint.conductor.step as u64,
             });
         }
-        self.step = checkpoint.conductor.step;
         let stream = self.stream.as_mut().expect("restore requires an attached stream");
-        stream.restore(&checkpoint.stream)
+        stream.restore(&checkpoint.stream)?;
+        self.step = checkpoint.conductor.step;
+        Ok(())
     }
 
     /// Generate pulse for current step.
