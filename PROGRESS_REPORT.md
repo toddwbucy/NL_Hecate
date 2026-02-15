@@ -1,49 +1,16 @@
 # NL_Hecate Progress Report
 
 **Project**: NL_Hecate — Nested Learning implementation in Rust + Enzyme AD + CUDA
-**Report Date**: 2026-02-14
-**Started**: 2026-02-13 11:48 (initial commit)
-**Last Updated**: 2026-02-14 (end of day)
+**Status**: Phase 3 in progress
 
 ---
 
 ## Executive Summary
 
-In approximately **36 hours of wall-clock time** (Feb 13 11:48 AM → Feb 14 evening), the NL_Hecate project went from initial commit to **193 passing tests** across Rust, CUDA, Python, and Enzyme AD — covering the full pipeline from spec validation through 4-level continuous memory systems with two MIRAS memory rules and proven CMS stabilization.
+NL_Hecate implements the Nested Learning research program (Mirrokni/Behrouz, Google Research) in Rust with Enzyme AD and CUDA kernels. The project has validated the full pipeline from Enzyme differentiation through 4-level continuous memory systems with two MIRAS memory rules, and has produced a concrete empirical result: **CMS nesting provides implicit regularization that extends the stable operating range of inner-loop learning rates**.
 
 **Total test count**: 166 Rust lib + 17 CMS integration + 5 Enzyme vec + 5 Titans = **193 Rust tests** + 27 Python = **220 total**
 **PRs merged**: 12
-
----
-
-## Timeline
-
-### Day 1 — Feb 13 (Thu)
-
-| Time | Milestone | PR | Tests |
-|---|---|---|---|
-| 11:48 | Initial commit (specs v0.4.0, 48 files) | — | — |
-| 14:52 | V2 pseudocode specs + review fixes | — | — |
-| 15:49 | CLAUDE.md project guidance | — | — |
-| 16:03-16:42 | **Phase 0: Enzyme Spike** | #1, #2 | 57/57 |
-| 17:18 | Spike outcome: OUTCOME 1 (GO) | — | — |
-| 18:33-19:27 | **Track Zero-A Phase 1**: Rust core | #3 | 36/36 |
-| 19:50-22:43 | **Track Zero-A Phase 2**: CUDA kernels | #4 | 47/47 |
-| 23:05-23:52 | **Track Zero-A Phase 3**: PyO3 bindings | #5 | 56/56 |
-
-### Day 2 — Feb 14 (Fri)
-
-| Time | Milestone | PR | Tests |
-|---|---|---|---|
-| 00:18-00:50 | **Track Zero-A Phase 4**: PyTorch baseline | #6 | 67/67 |
-| 01:54-02:31 | **Track Zero-B Phase 1**: Delta Rule + MAG | #7 | 76 (71R+5E) |
-| 02:52-03:09 | **Track Zero-B Phase 2**: PyO3 + PyTorch MAG | #8 | 98 (71R+27Py) |
-| 09:55-10:38 | **Phase 2: CMS k=2** | #9 | 140 (113R+27Py) |
-| 10:46-11:23 | **Phase 2.5: k=2 Validation** | (session) | 142 (115R+27Py) |
-| ~12:00-14:00 | **Phase 3: CMS k=4** | #10 | 169 (142R+27Py) |
-| ~14:00-16:00 | **Titans LMM**: 2nd MIRAS variant | #11 | 174 (147R+27Py) |
-| ~18:00-24:00 | **Phase 3.5: Output normalization** | #12 | 192 (165R+27Py) |
-| evening | **Stability boundary test** | (pending) | 193 (166R+27Py) |
 
 ---
 
@@ -148,7 +115,7 @@ Output normalization scales backward gradients to ALL memory parameters, making 
 
 ---
 
-## Architecture Delivered
+## Architecture
 
 ```text
 core/src/                        (~6,800 lines)
@@ -184,35 +151,35 @@ python/                          (~455 lines)
 
 ## Test Breakdown
 
-| Suite | Count | What it covers |
+| Suite | Count | Coverage |
 |---|---|---|
-| Rust lib (core/src) | 166 | Unit tests: tensor ops, SWA, Delta Rule, Titans LMM, MAG, conductor, FD gradient checks |
-| CMS integration (core/tests/test_cms.rs) | 17 | Multi-step training: k=2/k=4 smoke/convergence/10K, stability boundary, normalization, diagnostics |
+| Rust lib (core/src) | 166 | Tensor ops, SWA, Delta Rule, Titans LMM, MAG, conductor, FD gradient checks |
+| CMS integration (core/tests/test_cms.rs) | 17 | k=2/k=4 smoke/convergence/10K, stability boundary, normalization, diagnostics |
 | Enzyme vec (core/tests/test_enzyme_vec.rs) | 5 | Enzyme AD with Vec<f32>, struct fields, slice params |
 | Titans (core/tests/test_titans.rs) | 5 | Titans LMM: smoke, convergence, momentum, k=2, vs Delta |
 | Python (python/tests/) | 27 | PyO3 bindings, PyTorch baseline comparison |
 | **Total** | **220** | |
 
-Note: CUDA tests (test_cuda_swa.rs) are feature-gated and run separately with `--features cuda`.
+CUDA tests (test_cuda_swa.rs) are feature-gated and run separately with `--features cuda`.
 
 ---
 
 ## PR History
 
-| PR | Title | Date Merged |
-|---|---|---|
-| #1 | Phase 0: Enzyme spike test suite | 2026-02-13 |
-| #2 | Phase 0 spike complete: 57/57 pass, OUTCOME 1 GO | 2026-02-13 |
-| #3 | Track Zero-A Phase 1: Rust core with SWA forward/backward | 2026-02-14 |
-| #4 | Track Zero-A Phase 2: CUDA SWA kernel pair | 2026-02-14 |
-| #5 | Track Zero-A Phase 3: PyO3 Python bindings | 2026-02-14 |
-| #6 | Track Zero-A Phase 4: PyTorch regression baseline | 2026-02-14 |
-| #7 | Track Zero-B Phase 1: Delta Rule + MAG composition | 2026-02-14 |
-| #8 | Track Zero-B Phase 2: PyO3 bindings + PyTorch MAG baseline | 2026-02-14 |
-| #9 | Phase 2: CMS k=2 — multi-level memory scheduling | 2026-02-14 |
-| #10 | Phase 3: CMS k=4 — full frequency hierarchy | 2026-02-14 |
-| #11 | Titans LMM: GD+momentum memory rule | 2026-02-14 |
-| #12 | Phase 3.5: CMS output normalization (1/sqrt(k) for k>2) | 2026-02-14 |
+| PR | Title |
+|---|---|
+| #1 | Phase 0: Enzyme spike test suite |
+| #2 | Phase 0 spike complete: 57/57 pass, OUTCOME 1 GO |
+| #3 | Track Zero-A Phase 1: Rust core with SWA forward/backward |
+| #4 | Track Zero-A Phase 2: CUDA SWA kernel pair |
+| #5 | Track Zero-A Phase 3: PyO3 Python bindings |
+| #6 | Track Zero-A Phase 4: PyTorch regression baseline |
+| #7 | Track Zero-B Phase 1: Delta Rule + MAG composition |
+| #8 | Track Zero-B Phase 2: PyO3 bindings + PyTorch MAG baseline |
+| #9 | Phase 2: CMS k=2 — multi-level memory scheduling |
+| #10 | Phase 3: CMS k=4 — full frequency hierarchy |
+| #11 | Titans LMM: GD+momentum memory rule |
+| #12 | Phase 3.5: CMS output normalization (1/sqrt(k) for k>2) |
 
 ---
 
