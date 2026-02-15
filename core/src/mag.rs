@@ -552,7 +552,7 @@ pub fn cms_backward(
     }
 
     // ── Stage 3b: Per-level memory backward ──────────────────────────
-    // d_y_combined (now scaled by 1/k) distributes to each level
+    // d_y_combined (now scaled by 1/sqrt(k) for k>2) distributes to each level
     let mut d_embedded_mem_total = vec![0.0f32; s * d];
 
     for level in 0..cfg.k {

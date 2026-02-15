@@ -269,9 +269,9 @@ fn test_k2_beats_k1_multiscale() {
         &mut params_k1, &cfg_k1, &input_ids, &target_ids, steps, lr,
     );
 
-    // k=2 with 1/sqrt(k) normalization: the combined gate signal is scaled by 1/sqrt(2)≈0.71,
-    // a softer normalization than 1/k. b_theta=1.0 for Level 0 crashes k=1 but k=2
-    // distributes gradient across 2 levels, providing implicit regularization.
+    // k=2 (no normalization; only k>2 is scaled): the combined gate signal is the raw sum.
+    // b_theta=1.0 for Level 0 crashes k=1 but k=2 distributes gradient across 2 levels,
+    // providing implicit regularization.
     let mut params_k2 = MAGParams::init(&cfg_k2, 42);
     params_k2.levels[0].b_theta[0] = 1.0;    // softplus≈1.31 (aggressive — crashes k=1!)
     params_k2.levels[0].b_alpha[0] = 1.0;    // sigmoid≈0.73
@@ -358,9 +358,9 @@ fn test_cms_k4_10k_steps() {
 ///
 /// This test validates k=4 infrastructure correctness (convergence, no NaN, proper
 /// gradient flow) and documents the comparison. The k=4 advantage is expected at
-/// larger scales with output normalization (1/k) or learnable mixing weights.
+/// larger scales with output normalization (1/sqrt(k)) or learnable mixing weights.
 ///
-/// Phase 3 FINDING: Additive level composition needs 1/k normalization for k>2.
+/// Phase 3 FINDING: Additive level composition needs 1/sqrt(k) normalization for k>2.
 #[test]
 fn test_k4_vs_k2_multiscale() {
     use nl_hecate_core::model::SWAConfig;
@@ -442,7 +442,7 @@ fn test_k4_vs_k2_multiscale() {
         eprintln!("k=4 beats k=2 by {margin:.2}%");
     } else {
         eprintln!("NOTE: k=4 does not beat k=2 at d=32/seq=32. Expected — additive level \
-                   composition needs 1/k normalization for k>2 (Phase 3 finding).");
+                   composition needs 1/sqrt(k) normalization for k>2 (Phase 3 finding).");
     }
 }
 
@@ -691,10 +691,10 @@ fn test_k2_diagnostics() {
     );
 }
 
-// ── 1/k normalization tests ───────────────────────────────────────────
+// ── 1/sqrt(k) normalization tests ─────────────────────────────────────
 
 /// Verify y_combined magnitude at k=4 is similar to k=1 output magnitude.
-/// This is the key invariant: 1/k normalization keeps signal scale constant.
+/// This is the key invariant: 1/sqrt(k) normalization keeps signal scale constant.
 #[test]
 fn test_k4_normalization_magnitude() {
     use nl_hecate_core::mag::mag_forward;
@@ -736,7 +736,7 @@ fn test_k4_normalization_magnitude() {
     // k=1 mag_forward doesn't store y_combined in cache, but we have gate = sigmoid(y).
     // The relevant invariant is that cache_k4.y_combined has similar scale to any single level.
 
-    // k=4 y_combined RMS (after 1/k normalization)
+    // k=4 y_combined RMS (after 1/sqrt(k) normalization)
     let k4_rms = (cache_k4.y_combined.iter().map(|x| x * x).sum::<f32>() / n).sqrt();
 
     // k=4 single level RMS (unnormalized)
@@ -746,7 +746,7 @@ fn test_k4_normalization_magnitude() {
     eprintln!("k=4 level 0 RMS (single level): {k4_level0_rms:.6}");
 
     // The normalized y_combined should be within 2x of a single level's magnitude
-    // (since levels have similar init, 1/k * k*level ≈ level)
+    // (since levels have similar init, 1/sqrt(k) * sqrt(k)*level ≈ level)
     assert!(
         k4_rms < k4_level0_rms * 2.0,
         "Normalized k=4 y_combined ({k4_rms:.6}) should be within 2x of single level ({k4_level0_rms:.6})"
@@ -759,9 +759,10 @@ fn test_k4_normalization_magnitude() {
         "k=4 gate should not be saturated, got mean={gate_mean:.4}");
 }
 
-/// With 1/k normalization, k=4 should be stable with UNIFORM gate biases.
+/// With 1/sqrt(k) normalization, k=4 should be stable with UNIFORM gate biases.
 /// Pre-normalization, uniform b_theta=-4.6 for all 4 levels would sum 4x the
-/// signal, pushing sigmoid into saturation.
+/// signal, pushing sigmoid into saturation. With 1/sqrt(4)=0.5 scaling, the
+/// combined signal grows as sqrt(4)=2x instead of 4x.
 #[test]
 fn test_k4_uniform_init_stable() {
     use nl_hecate_core::model::SWAConfig;
