@@ -243,6 +243,22 @@ pub fn outer_product_f32(a: &[f32], b: &[f32], out: &mut [f32]) {
     }
 }
 
+/// L2 norm of a vector: sqrt(sum(a[i]^2)).
+pub fn vec_norm_f32(a: &[f32]) -> f32 {
+    a.iter().map(|x| x * x).sum::<f32>().sqrt()
+}
+
+/// Normalize vector in-place to unit length. No-op if norm < eps.
+pub fn vec_normalize_f32(a: &mut [f32]) {
+    let norm = vec_norm_f32(a);
+    if norm > 1e-8 {
+        let inv = 1.0 / norm;
+        for x in a.iter_mut() {
+            *x *= inv;
+        }
+    }
+}
+
 /// Frobenius dot product: sum_ij A[i,j] * B[i,j].
 /// Both A and B are flat slices of the same length.
 pub fn frobenius_dot_f32(a: &[f32], b: &[f32]) -> f32 {
@@ -486,6 +502,40 @@ mod tests {
             assert!(out[i].is_finite(), "log_f32 output[{i}] should be finite");
             assert!(out[i] <= expected + 1e-4, "log_f32 output[{i}]={} should be <= {expected}", out[i]);
         }
+    }
+
+    #[test]
+    fn test_vec_norm_basic() {
+        let a = [3.0f32, 4.0];
+        assert!((vec_norm_f32(&a) - 5.0).abs() < 1e-6);
+        assert!((vec_norm_f32(&[0.0f32; 4]) - 0.0).abs() < 1e-8);
+        assert!((vec_norm_f32(&[1.0f32]) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_vec_normalize_basic() {
+        let mut a = [3.0f32, 4.0];
+        vec_normalize_f32(&mut a);
+        assert!((a[0] - 0.6).abs() < 1e-6, "a[0]={}", a[0]);
+        assert!((a[1] - 0.8).abs() < 1e-6, "a[1]={}", a[1]);
+        let norm = vec_norm_f32(&a);
+        assert!((norm - 1.0).abs() < 1e-6, "norm after normalize: {norm}");
+    }
+
+    #[test]
+    fn test_vec_normalize_zero() {
+        let mut a = [0.0f32; 4];
+        vec_normalize_f32(&mut a);
+        assert!(a.iter().all(|&x| x == 0.0), "Zero vec should stay zero");
+    }
+
+    #[test]
+    fn test_vec_normalize_already_unit() {
+        let mut a = [1.0f32, 0.0, 0.0];
+        vec_normalize_f32(&mut a);
+        assert!((a[0] - 1.0).abs() < 1e-6);
+        assert!(a[1].abs() < 1e-6);
+        assert!(a[2].abs() < 1e-6);
     }
 
     #[test]
