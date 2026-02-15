@@ -3,7 +3,7 @@
 /// First MIRAS variant to use MLP memory instead of d×d matrix.
 /// y = W2 @ silu(W1 @ q) — nonlinear associative memory with higher capacity.
 ///
-/// MIRAS knobs: MLP structure, l_p attentional bias, L_q+L2 retention, GD algorithm.
+/// MIRAS knobs: MLP structure, l_p attentional bias, L2 retention (L_q planned), GD algorithm.
 /// Source: MIRAS (2504.13173) Eqs 24-25, Table 2.
 ///
 /// Forward (per token):
@@ -103,11 +103,14 @@ impl MemoryRule for Moneta {
 
     fn write(&self, _state: &mut MemoryState, _k: &[f32], _v: &[f32], _gates: &Gates) {
         // MONETA write is handled in step() — MLP update doesn't fit the matrix API.
-        // This is only called by the trait test harness, not by mag.rs dispatch.
+        // mag.rs dispatch always uses step() directly; this should never be called.
+        debug_assert!(false, "MONETA does not support direct write — use step() instead");
     }
 
     fn read(&self, _state: &MemoryState, _q: &[f32], _out: &mut [f32]) {
         // MONETA read is handled in step() — MLP forward doesn't fit M @ q API.
+        // mag.rs dispatch always uses step() directly; this should never be called.
+        debug_assert!(false, "MONETA does not support direct read — use step() instead");
     }
 
     fn step(

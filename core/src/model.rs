@@ -289,8 +289,10 @@ pub struct MAGConfig {
     /// l_p norm exponent for MONETA attentional bias (default: 2.0).
     pub lp_p: f32,
     /// L_q retention exponent for MONETA (default: 2.0).
+    /// TODO: L_q local retention not yet implemented — reserved for future MIRAS variants.
     pub lq_q: f32,
     /// Local retention strength for MONETA (default: 0.0 = disabled).
+    /// TODO: L_q local retention not yet implemented — reserved for future MIRAS variants.
     pub lambda_q: f32,
     /// Global L2 retention strength for MONETA (default: 0.01).
     pub lambda_2: f32,

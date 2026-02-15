@@ -426,20 +426,22 @@ pub fn cms_forward(
             q_mem_per_level.push(None);
             frozen_memories.push(None);
         } else {
-            // Frozen level: read-only from persisted M (rule-aware dispatch)
-            let frozen_m = context.memory[level].clone();
+            // Frozen level: read-only from persisted M (rule-aware dispatch).
+            // Borrow context memory for the forward call, then clone for cache storage
+            // (backward needs owned copy since context may be mutated between calls).
+            let frozen_ref = &context.memory[level];
             let (y_level, q_mem) = match cfg.memory_rule {
                 MemoryRuleKind::Moneta => moneta_read_only(
-                    &params.levels[level], &embedded, &frozen_m, s, d, cfg.d_hidden,
+                    &params.levels[level], &embedded, frozen_ref, s, d, cfg.d_hidden,
                 ),
                 _ => delta_rule_read_only(
-                    &params.levels[level], &embedded, &frozen_m, s, d,
+                    &params.levels[level], &embedded, frozen_ref, s, d,
                 ),
             };
             y_per_level.push(y_level);
             memory_caches.push(None);
             q_mem_per_level.push(Some(q_mem));
-            frozen_memories.push(Some(frozen_m));
+            frozen_memories.push(Some(frozen_ref.clone()));
         }
     }
 
