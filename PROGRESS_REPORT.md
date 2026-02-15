@@ -150,7 +150,7 @@ Output normalization scales backward gradients to ALL memory parameters, making 
 
 ## Architecture Delivered
 
-```
+```text
 core/src/                        (~6,800 lines)
   tensor.rs       — SIMD-friendly primitives, RNG, sigmoid, softplus, outer product
   swa.rs          — Sliding Window Attention forward/backward
@@ -226,7 +226,7 @@ Phase 3 requires multiple memory rules and a combinatorial sweep. Current status
 
 **Parallelization**: 1/5 implemented (Chunkwise GD, implicit). Associative Scan and TNT Hierarchical are lower priority.
 
-**Combinatorial Sweep**: Not started. Requires automated harness to test valid MIRAS pairings across 100/1K/10K step horizons. Falsification criterion: >20% degenerate dynamics invalidates the orthogonality framing.
+**Combinatorial Sweep**: Not started. Requires an automated harness to test valid MIRAS pairings across 100/1K/10K step horizons. Falsification criterion: >20% degenerate dynamics invalidates the orthogonality framing.
 
 ---
 
