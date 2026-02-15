@@ -14,6 +14,7 @@ use crate::tensor::SimpleRng;
 pub enum MemoryRuleKind {
     DeltaRule,
     TitansLMM,
+    HebbianRule,
 }
 
 /// Model configuration — immutable after construction.
@@ -449,6 +450,42 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::TitansLMM,
             k: 1,
             chunk_sizes: vec![1],
+        }
+    }
+
+    /// Hebbian Rule test configuration: tiny model for gradient checking (k=1).
+    pub fn hebbian_test_config() -> Self {
+        MAGConfig {
+            swa: SWAConfig {
+                d_model: 8,
+                num_heads: 2,
+                head_dim: 4,
+                seq_len: 4,
+                window_size: 4,
+                vocab_size: 16,
+            },
+            memory_enabled: true,
+            memory_rule: MemoryRuleKind::HebbianRule,
+            k: 1,
+            chunk_sizes: vec![1],
+        }
+    }
+
+    /// Hebbian Rule test configuration for CMS k=2 testing.
+    pub fn hebbian_test_config_k2() -> Self {
+        MAGConfig {
+            swa: SWAConfig {
+                d_model: 8,
+                num_heads: 2,
+                head_dim: 4,
+                seq_len: 8,
+                window_size: 8,
+                vocab_size: 16,
+            },
+            memory_enabled: true,
+            memory_rule: MemoryRuleKind::HebbianRule,
+            k: 2,
+            chunk_sizes: vec![1, 8],
         }
     }
 

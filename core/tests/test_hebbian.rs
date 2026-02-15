@@ -1,4 +1,4 @@
-//! Titans LMM integration tests: multi-step training, momentum validation, comparison vs Delta Rule.
+//! Hebbian Rule integration tests: multi-step training, comparison vs Delta Rule.
 
 use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind};
 use nl_hecate_core::mag::{cms_forward, cms_backward, mag_forward, mag_backward, MemoryCache};
@@ -74,12 +74,12 @@ fn cms_train(
     (initial_loss.unwrap(), final_loss)
 }
 
-// ── Titans k=1 tests ─────────────────────────────────────────────────
+// ── Hebbian k=1 tests ────────────────────────────────────────────────
 
 /// 100-step smoke test: no NaN, no divergence, loss finite.
 #[test]
-fn test_titans_k1_smoke() {
-    let cfg = MAGConfig::titans_test_config();
+fn test_hebbian_k1_smoke() {
+    let cfg = MAGConfig::hebbian_test_config();
     let mut params = MAGParams::init(&cfg, 42);
     let (input_ids, target_ids) = make_data(&cfg);
 
@@ -100,15 +100,15 @@ fn test_titans_k1_smoke() {
         loss
     };
     let initial = prev_loss.unwrap();
-    eprintln!("Titans k=1 smoke: initial={initial:.4}, final={final_loss:.4}");
+    eprintln!("Hebbian k=1 smoke: initial={initial:.4}, final={final_loss:.4}");
     assert!(final_loss.is_finite(), "Final loss not finite");
     assert!(final_loss < 100.0, "Loss diverged: {final_loss}");
 }
 
 /// 1K-step convergence: loss decreases.
 #[test]
-fn test_titans_k1_convergence() {
-    let cfg = MAGConfig::titans_test_config();
+fn test_hebbian_k1_convergence() {
+    let cfg = MAGConfig::hebbian_test_config();
     let mut params = MAGParams::init(&cfg, 42);
     let (input_ids, target_ids) = make_data(&cfg);
 
@@ -127,44 +127,57 @@ fn test_titans_k1_convergence() {
         loss
     };
     let initial = initial_loss.unwrap();
-    eprintln!("Titans k=1 convergence: initial={initial:.4}, final={final_loss:.4}");
+    eprintln!("Hebbian k=1 convergence: initial={initial:.4}, final={final_loss:.4}");
     assert!(final_loss < initial,
         "Loss should decrease: initial={initial:.4}, final={final_loss:.4}");
 }
 
-/// Verify momentum state S is non-trivial after forward pass.
+/// Verify memory M is non-trivial after forward pass.
 #[test]
-fn test_titans_momentum_nonzero() {
-    let cfg = MAGConfig::titans_test_config();
+fn test_hebbian_memory_nonzero() {
+    let cfg = MAGConfig::hebbian_test_config();
     let params = MAGParams::init(&cfg, 42);
     let (input_ids, target_ids) = make_data(&cfg);
 
     let (_, cache) = mag_forward(&params, &cfg, &input_ids, &target_ids);
 
-    // Extract the TitansLMMCache from MemoryCache
     match &cache.memory_cache {
-        MemoryCache::Titans(tc) => {
-            let d = tc.d;
-            let seq = tc.seq_len;
-            // Check final S state (at index seq_len * d * d)
-            let s_final = &tc.s_states[seq * d * d..(seq + 1) * d * d];
-            let s_norm: f32 = s_final.iter().map(|x| x * x).sum::<f32>().sqrt();
-            eprintln!("Final S norm: {s_norm:.6e}");
-            assert!(s_norm > 1e-6, "Momentum S should be non-trivial, got {s_norm:.4e}");
+        MemoryCache::Hebbian(hc) => {
+            let d = hc.d;
+            let seq = hc.seq_len;
+            let m_final = &hc.m_states[seq * d * d..(seq + 1) * d * d];
+            let m_norm: f32 = m_final.iter().map(|x| x * x).sum::<f32>().sqrt();
+            eprintln!("Final M norm: {m_norm:.6e}");
+            assert!(m_norm > 1e-6, "Memory M should be non-trivial, got {m_norm:.4e}");
         }
-        MemoryCache::Delta(_) => {
-            panic!("Expected TitansLMMCache, got DeltaRuleCache");
-        }
-        MemoryCache::Hebbian(_) => {
-            panic!("Expected TitansLMMCache, got HebbianCache");
+        _ => {
+            panic!("Expected HebbianCache");
         }
     }
 }
 
-/// Compare Titans vs Delta Rule on same data.
-/// Titans should match or beat Delta Rule (soft criterion — same scale, same lr).
+/// CMS k=2 with Hebbian on multi-scale data.
 #[test]
-fn test_titans_vs_delta() {
+fn test_hebbian_k2_multiscale() {
+    let cfg = MAGConfig::hebbian_test_config_k2();
+    let mut params = MAGParams::init(&cfg, 42);
+    let (input_ids, target_ids) = make_multiscale_data(
+        cfg.swa.seq_len, cfg.swa.vocab_size, 4, 4,
+    );
+
+    let (initial, final_loss) = cms_train(&mut params, &cfg, &input_ids, &target_ids, 5_000, 0.01);
+    eprintln!("Hebbian k=2 multiscale: initial={initial:.4}, final={final_loss:.4}");
+
+    assert!(initial.is_finite(), "Initial loss not finite");
+    assert!(final_loss.is_finite(), "Final loss not finite");
+    assert!(final_loss < initial,
+        "Loss should decrease: initial={initial:.4}, final={final_loss:.4}");
+}
+
+/// Compare Hebbian vs Delta Rule on same data.
+/// Hebbian should converge but is expected to be less precise (no error correction).
+#[test]
+fn test_hebbian_vs_delta() {
     use nl_hecate_core::model::SWAConfig;
 
     let swa = SWAConfig {
@@ -177,9 +190,9 @@ fn test_titans_vs_delta() {
         memory_rule: MemoryRuleKind::DeltaRule,
         k: 1, chunk_sizes: vec![1],
     };
-    let cfg_titans = MAGConfig {
+    let cfg_hebbian = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
-        memory_rule: MemoryRuleKind::TitansLMM,
+        memory_rule: MemoryRuleKind::HebbianRule,
         k: 1, chunk_sizes: vec![1],
     };
 
@@ -199,51 +212,33 @@ fn test_titans_vs_delta() {
     }
     let delta_final = mag_forward(&params_delta, &cfg_delta, &input_ids, &target_ids).0;
 
-    // Train Titans LMM
-    let mut params_titans = MAGParams::init(&cfg_titans, 42);
-    let mut titans_initial = None;
+    // Train Hebbian
+    let mut params_hebbian = MAGParams::init(&cfg_hebbian, 42);
+    let mut hebbian_initial = None;
     for _ in 0..steps {
-        let (loss, cache) = mag_forward(&params_titans, &cfg_titans, &input_ids, &target_ids);
-        if titans_initial.is_none() { titans_initial = Some(loss); }
-        let grads = mag_backward(&params_titans, &cfg_titans, &cache, &input_ids, &target_ids);
-        params_titans.sgd_step(&grads, lr);
+        let (loss, cache) = mag_forward(&params_hebbian, &cfg_hebbian, &input_ids, &target_ids);
+        if hebbian_initial.is_none() { hebbian_initial = Some(loss); }
+        let grads = mag_backward(&params_hebbian, &cfg_hebbian, &cache, &input_ids, &target_ids);
+        params_hebbian.sgd_step(&grads, lr);
     }
-    let titans_final = mag_forward(&params_titans, &cfg_titans, &input_ids, &target_ids).0;
+    let hebbian_final = mag_forward(&params_hebbian, &cfg_hebbian, &input_ids, &target_ids).0;
 
     eprintln!("Delta: initial={:.4}, final={delta_final:.4}", delta_initial.unwrap());
-    eprintln!("Titans: initial={:.4}, final={titans_final:.4}", titans_initial.unwrap());
+    eprintln!("Hebbian: initial={:.4}, final={hebbian_final:.4}", hebbian_initial.unwrap());
 
     // Both should converge
     assert!(delta_final < delta_initial.unwrap(), "Delta should converge");
-    assert!(titans_final < titans_initial.unwrap(), "Titans should converge");
+    assert!(hebbian_final < hebbian_initial.unwrap(), "Hebbian should converge");
 
-    // Soft criterion: Titans should match or beat Delta (within 10% margin)
-    let margin = 0.10;
-    assert!(titans_final < delta_final * (1.0 + margin),
-        "Titans should not regress vs Delta: titans={titans_final:.6}, delta={delta_final:.6}");
+    // Hebbian is expected to be less precise, but should still be in same ballpark
+    // (within 5x of Delta — generous margin for no error correction)
+    assert!(hebbian_final < delta_final * 5.0,
+        "Hebbian should not catastrophically regress: hebbian={hebbian_final:.6}, delta={delta_final:.6}");
 
-    if titans_final < delta_final {
-        let improvement = (delta_final - titans_final) / delta_final * 100.0;
-        eprintln!("Titans beats Delta by {improvement:.2}%");
+    if hebbian_final > delta_final {
+        let ratio = hebbian_final / delta_final;
+        eprintln!("NOTE: Delta beats Hebbian by {ratio:.2}x — expected (error correction helps)");
     } else {
-        eprintln!("NOTE: Titans matches Delta at d=8 scale — expected for tiny model");
+        eprintln!("Hebbian matches/beats Delta at d=8 scale — surprising but possible");
     }
-}
-
-/// CMS k=2 with Titans on multi-scale data.
-#[test]
-fn test_titans_k2_multiscale() {
-    let cfg = MAGConfig::titans_test_config_k2();
-    let mut params = MAGParams::init(&cfg, 42);
-    let (input_ids, target_ids) = make_multiscale_data(
-        cfg.swa.seq_len, cfg.swa.vocab_size, 4, 4,
-    );
-
-    let (initial, final_loss) = cms_train(&mut params, &cfg, &input_ids, &target_ids, 5_000, 0.01);
-    eprintln!("Titans k=2 multiscale: initial={initial:.4}, final={final_loss:.4}");
-
-    assert!(initial.is_finite(), "Initial loss not finite");
-    assert!(final_loss.is_finite(), "Final loss not finite");
-    assert!(final_loss < initial,
-        "Loss should decrease: initial={initial:.4}, final={final_loss:.4}");
 }

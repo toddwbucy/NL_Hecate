@@ -11,6 +11,7 @@ use crate::tensor::{matmul_f32, transpose_f32, cross_entropy_loss, sigmoid_f32};
 use crate::model::{MAGConfig, MAGParams, MemoryRuleKind};
 use crate::delta_rule::{MemoryRule, DeltaRule, DeltaRuleCache, delta_rule_read_only, delta_rule_read_only_backward};
 use crate::titans_lmm::{TitansLMM, TitansLMMCache};
+use crate::hebbian_rule::{HebbianRule, HebbianCache};
 use crate::conductor::{Pulse, ContextState, ErrorBuffer};
 
 /// Memory cache enum for static dispatch across memory rule variants.
@@ -18,6 +19,7 @@ use crate::conductor::{Pulse, ContextState, ErrorBuffer};
 pub enum MemoryCache {
     Delta(DeltaRuleCache),
     Titans(TitansLMMCache),
+    Hebbian(HebbianCache),
 }
 
 /// Cache for MAG forward pass — holds both branches' intermediates.
@@ -97,6 +99,10 @@ pub fn mag_forward(
         MemoryRuleKind::TitansLMM => {
             let (y, cache) = TitansLMM.step(&params.levels[0], &embedded, s, d, None);
             (y, MemoryCache::Titans(cache))
+        }
+        MemoryRuleKind::HebbianRule => {
+            let (y, cache) = HebbianRule.step(&params.levels[0], &embedded, s, d, None);
+            (y, MemoryCache::Hebbian(cache))
         }
     };
 
@@ -220,6 +226,9 @@ pub fn mag_backward(
         }
         MemoryCache::Titans(titans_cache) => {
             TitansLMM.step_backward(&params.levels[0], titans_cache, &d_y, &cache.embedded)
+        }
+        MemoryCache::Hebbian(hebbian_cache) => {
+            HebbianRule.step_backward(&params.levels[0], hebbian_cache, &d_y, &cache.embedded)
         }
     };
 
@@ -377,6 +386,12 @@ pub fn cms_forward(
                     let m_final_start = s * d * d;
                     context.memory[level] = cache.m_states[m_final_start..m_final_start + d * d].to_vec();
                     (y, MemoryCache::Titans(cache))
+                }
+                MemoryRuleKind::HebbianRule => {
+                    let (y, cache) = HebbianRule.step(&params.levels[level], &embedded, s, d, initial_m);
+                    let m_final_start = s * d * d;
+                    context.memory[level] = cache.m_states[m_final_start..m_final_start + d * d].to_vec();
+                    (y, MemoryCache::Hebbian(cache))
                 }
             };
 
@@ -565,6 +580,9 @@ pub fn cms_backward(
                 }
                 MemoryCache::Titans(titans_cache) => {
                     TitansLMM.step_backward(&params.levels[level], titans_cache, &d_y_combined, &cache.embedded)
+                }
+                MemoryCache::Hebbian(hebbian_cache) => {
+                    HebbianRule.step_backward(&params.levels[level], hebbian_cache, &d_y_combined, &cache.embedded)
                 }
             };
             grads.levels[level].accumulate(&mem_grads);
