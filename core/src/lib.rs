@@ -10,6 +10,7 @@ pub mod titans_lmm;
 pub mod hebbian_rule;
 pub mod moneta;
 pub mod yaad;
+pub mod memora;
 pub mod mag;
 #[cfg(feature = "internal")]
 pub mod gradient;

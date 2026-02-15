@@ -164,6 +164,9 @@ fn test_titans_momentum_nonzero() {
         MemoryCache::YAAD(_) => {
             panic!("Expected TitansLMMCache, got YAADCache");
         }
+        MemoryCache::MEMORA(_) => {
+            panic!("Expected TitansLMMCache, got MEMORACache");
+        }
     }
 }
 
