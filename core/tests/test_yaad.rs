@@ -168,6 +168,7 @@ fn test_yaad_mlp_nonzero() {
             eprintln!("Boundary W1 norm: {b1_norm:.6e}, W2 norm: {b2_norm:.6e}");
             // W1 boundary should be non-zero (Xavier init), W2 boundary is zero (init)
             assert!(b1_norm > 1e-6, "W1 boundary should be non-trivial (Xavier init)");
+            assert!(b2_norm < 1e-12, "W2 boundary should be zero (init)");
             assert_eq!(yc.w1_boundary.len(), w1_size, "W1 boundary wrong size");
             assert_eq!(yc.w2_boundary.len(), w2_size, "W2 boundary wrong size");
         }
@@ -252,7 +253,7 @@ fn test_yaad_vs_delta() {
     assert!(yaad_final < yaad_initial.unwrap(), "YAAD should converge");
 
     // YAAD should be in same ballpark as Delta (MLP memory is different, not necessarily better at d=8)
-    assert!(yaad_final < delta_final * 10.0,
+    assert!(yaad_final < delta_final * 5.0,
         "YAAD should not catastrophically regress: yaad={yaad_final:.6}, delta={delta_final:.6}");
 
     let ratio = if yaad_final > delta_final {

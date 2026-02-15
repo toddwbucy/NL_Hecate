@@ -357,7 +357,6 @@ impl MemoryRule for YAAD {
         // Reverse token loop
         for t in (0..s).rev() {
             let k_t = &cache.k_mem[t * d..(t + 1) * d];
-            let _v_t = &cache.v_mem[t * d..(t + 1) * d];
             let q_t = &cache.q_mem[t * d..(t + 1) * d];
             let c_base = t * 2 * d;
             let concat_t = &cache.concat_kv[c_base..c_base + 2 * d];
