@@ -15,6 +15,7 @@ use crate::hebbian_rule::{HebbianRule, HebbianCache};
 use crate::moneta::{Moneta, MonetaCache, moneta_read_only, moneta_read_only_backward};
 use crate::yaad::{YAAD, YAADCache, yaad_read_only, yaad_read_only_backward};
 use crate::memora::{MEMORA, MEMORACache, memora_read_only, memora_read_only_backward};
+use crate::lattice_osr::{LatticeOSR, LatticeCache, lattice_read_only, lattice_read_only_backward};
 use crate::conductor::{Pulse, ContextState, ErrorBuffer};
 
 /// Memory cache enum for static dispatch across memory rule variants.
@@ -26,6 +27,7 @@ pub enum MemoryCache {
     Moneta(MonetaCache),
     YAAD(YAADCache),
     MEMORA(MEMORACache),
+    Lattice(LatticeCache),
 }
 
 /// Cache for MAG forward pass — holds both branches' intermediates.
@@ -124,6 +126,11 @@ pub fn mag_forward(
             let rule = MEMORA { d_hidden: cfg.d_hidden };
             let (y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
             (y, MemoryCache::MEMORA(cache))
+        }
+        MemoryRuleKind::LatticeOSR => {
+            let rule = LatticeOSR { m_slots: cfg.m_slots };
+            let (y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
+            (y, MemoryCache::Lattice(cache))
         }
     };
 
@@ -262,6 +269,10 @@ pub fn mag_backward(
         MemoryCache::MEMORA(memora_cache) => {
             let rule = MEMORA { d_hidden: cfg.d_hidden };
             rule.step_backward(&params.levels[0], memora_cache, &d_y, &cache.embedded)
+        }
+        MemoryCache::Lattice(lattice_cache) => {
+            let rule = LatticeOSR { m_slots: cfg.m_slots };
+            rule.step_backward(&params.levels[0], lattice_cache, &d_y, &cache.embedded)
         }
     };
 
@@ -469,6 +480,14 @@ pub fn cms_forward(
                     context.memory[level] = ctx_mem;
                     (y, MemoryCache::MEMORA(cache))
                 }
+                MemoryRuleKind::LatticeOSR => {
+                    let rule = LatticeOSR { m_slots: cfg.m_slots };
+                    let (y, cache) = rule.step(&params.levels[level], &embedded, s, d, initial_m);
+                    let m = cfg.m_slots;
+                    let s_final = &cache.s_states[s * m * d..(s + 1) * m * d];
+                    context.memory[level] = s_final.to_vec();
+                    (y, MemoryCache::Lattice(cache))
+                }
             };
 
             y_per_level.push(y_level);
@@ -489,6 +508,9 @@ pub fn cms_forward(
                 ),
                 MemoryRuleKind::MEMORA => memora_read_only(
                     &params.levels[level], &embedded, frozen_ref, s, d, cfg.d_hidden,
+                ),
+                MemoryRuleKind::LatticeOSR => lattice_read_only(
+                    &params.levels[level], &embedded, frozen_ref, s, d, cfg.m_slots,
                 ),
                 _ => delta_rule_read_only(
                     &params.levels[level], &embedded, frozen_ref, s, d,
@@ -681,6 +703,10 @@ pub fn cms_backward(
                     let rule = MEMORA { d_hidden: cfg.d_hidden };
                     rule.step_backward(&params.levels[level], memora_cache, &d_y_combined, &cache.embedded)
                 }
+                MemoryCache::Lattice(lattice_cache) => {
+                    let rule = LatticeOSR { m_slots: cfg.m_slots };
+                    rule.step_backward(&params.levels[level], lattice_cache, &d_y_combined, &cache.embedded)
+                }
             };
             grads.levels[level].accumulate(&mem_grads);
             for i in 0..(s * d) {
@@ -699,6 +725,9 @@ pub fn cms_backward(
                 ),
                 MemoryRuleKind::MEMORA => memora_read_only_backward(
                     &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.d_hidden,
+                ),
+                MemoryRuleKind::LatticeOSR => lattice_read_only_backward(
+                    &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.m_slots,
                 ),
                 _ => delta_rule_read_only_backward(
                     &params.levels[level],

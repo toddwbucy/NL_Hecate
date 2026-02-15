@@ -201,14 +201,14 @@ fn test_k2_beats_k1() {
         swa: swa.clone(), memory_enabled: true,
         memory_rule: MemoryRuleKind::DeltaRule,
         k: 1, chunk_sizes: vec![1],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
     };
     // k=2 config
     let cfg_k2 = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
         memory_rule: MemoryRuleKind::DeltaRule,
         k: 2, chunk_sizes: vec![1, 8],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
     };
 
     let input_ids: Vec<usize> = (0..swa.seq_len).map(|t| t % swa.vocab_size).collect();
@@ -380,13 +380,13 @@ fn test_k4_vs_k2_multiscale() {
         swa: swa.clone(), memory_enabled: true,
         memory_rule: MemoryRuleKind::DeltaRule,
         k: 2, chunk_sizes: vec![1, 8],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
     };
     let cfg_k4 = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
         memory_rule: MemoryRuleKind::DeltaRule,
         k: 4, chunk_sizes: vec![1, 8, 64, 512],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
     };
 
     let slow_period = 8;
@@ -469,7 +469,7 @@ fn test_k4_diagnostics() {
         memory_rule: MemoryRuleKind::DeltaRule,
         k: 4,
         chunk_sizes: vec![1, 8, 64, 512],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
     };
 
     let (input_ids, target_ids) = make_multiscale_data(
@@ -730,13 +730,13 @@ fn test_cms_stability_boundary() {
         swa: swa.clone(), memory_enabled: true,
         memory_rule: MemoryRuleKind::DeltaRule,
         k: 1, chunk_sizes: vec![1],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
     };
     let cfg_k2 = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
         memory_rule: MemoryRuleKind::DeltaRule,
         k: 2, chunk_sizes: vec![1, 8],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
     };
 
     let slow_period = 8;
@@ -916,7 +916,7 @@ fn test_k4_normalization_magnitude() {
         swa: swa.clone(), memory_enabled: true,
         memory_rule: MemoryRuleKind::DeltaRule,
         k: 4, chunk_sizes: vec![1, 8, 64, 512],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
     };
     let params_k4 = MAGParams::init(&cfg_k4, 42);
     let mut context = ContextState::new(cfg_k4.k, cfg_k4.swa.d_model);
@@ -975,7 +975,7 @@ fn test_k4_uniform_init_stable() {
         swa: swa.clone(), memory_enabled: true,
         memory_rule: MemoryRuleKind::DeltaRule,
         k: 4, chunk_sizes: vec![1, 8, 64, 512],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
     };
 
     let (input_ids, target_ids) = make_multiscale_data(
@@ -1020,7 +1020,7 @@ fn test_k4_normalized_stable() {
         swa: swa.clone(), memory_enabled: true,
         memory_rule: MemoryRuleKind::DeltaRule,
         k: 4, chunk_sizes: vec![1, 8, 64, 512],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
     };
 
     let (input_ids, target_ids) = make_multiscale_data(

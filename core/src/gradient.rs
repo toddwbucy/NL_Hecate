@@ -22,6 +22,11 @@ fn make_context_state(cfg: &MAGConfig) -> ContextState {
             let mem_size = dh * d + d * dh;
             ContextState::new_with_memory_size(cfg.k, d, mem_size)
         }
+        MemoryRuleKind::LatticeOSR => {
+            let d = cfg.swa.d_model;
+            let mem_size = cfg.m_slots * d;
+            ContextState::new_with_memory_size(cfg.k, d, mem_size)
+        }
         _ => ContextState::new(cfg.k, cfg.swa.d_model),
     }
 }
@@ -705,6 +710,11 @@ mod tests {
                 let w1_size = c.d_hidden * d;
                 let w1_t = &c.w1_states[s * w1_size..(s + 1) * w1_size];
                 w1_t.iter().map(|x| x * x).sum::<f32>().sqrt()
+            }
+            crate::mag::MemoryCache::Lattice(c) => {
+                let m = c.m;
+                let s_t = &c.s_states[s * m * d..(s + 1) * m * d];
+                s_t.iter().map(|x| x * x).sum::<f32>().sqrt()
             }
         };
         eprintln!("MAG final memory norm: {memory_evolved:.4e}");
@@ -3418,5 +3428,318 @@ mod tests {
         );
         eprintln!("memora CMS l1_b_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
         assert!(passed == checked, "memora l1_b_theta: {passed}/{checked} passed");
+    }
+
+    // ── Lattice OSR gradient checks (k=1, MAG) ──────────────────────────
+
+    fn lattice_grad_check_config() -> MAGConfig {
+        MAGConfig::lattice_test_config()
+    }
+
+    fn lattice_params_for_grad_check(cfg: &MAGConfig, seed: u64) -> MAGParams {
+        let mut params = MAGParams::init(cfg, seed);
+        for level in &mut params.levels {
+            level.b_alpha = vec![0.0f32];  // sigmoid(0)=0.5
+        }
+        params
+    }
+
+    #[test]
+    fn test_lattice_gradient_w_k_mem() {
+        let cfg = lattice_grad_check_config();
+        let params = lattice_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "lattice_w_k_mem",
+            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("lattice_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "lattice_w_k_mem: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_lattice_gradient_w_v_mem() {
+        let cfg = lattice_grad_check_config();
+        let params = lattice_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "lattice_w_v_mem",
+            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("lattice_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "lattice_w_v_mem: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_lattice_gradient_w_q_mem() {
+        let cfg = lattice_grad_check_config();
+        let params = lattice_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "lattice_w_q_mem",
+            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("lattice_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "lattice_w_q_mem: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_lattice_gradient_w_alpha() {
+        let cfg = lattice_grad_check_config();
+        let params = lattice_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "lattice_w_alpha",
+            |p| &p.levels[0].w_alpha, |p, i, v| p.levels[0].w_alpha[i] = v, |g| &g.levels[0].w_alpha,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("lattice_w_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "lattice_w_alpha: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_lattice_gradient_b_alpha() {
+        let cfg = lattice_grad_check_config();
+        let params = lattice_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "lattice_b_alpha",
+            |p| &p.levels[0].b_alpha, |p, i, v| p.levels[0].b_alpha[i] = v, |g| &g.levels[0].b_alpha,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("lattice_b_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "lattice_b_alpha: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    // ── Lattice OSR CMS gradient checks (k=2, both levels active) ────────
+
+    fn lattice_cms_grad_check_config() -> MAGConfig {
+        MAGConfig::lattice_test_config_k2()
+    }
+
+    fn lattice_cms_params_for_grad_check(cfg: &MAGConfig, seed: u64) -> MAGParams {
+        let mut params = MAGParams::init(cfg, seed);
+        for level in &mut params.levels {
+            level.b_alpha = vec![0.0f32];
+        }
+        params
+    }
+
+    fn lattice_cms_make_test_data(cfg: &MAGConfig) -> (Vec<usize>, Vec<usize>) {
+        let input_ids: Vec<usize> = (0..cfg.swa.seq_len).map(|t| t % cfg.swa.vocab_size).collect();
+        let target_ids: Vec<usize> = (1..=cfg.swa.seq_len).map(|t| t % cfg.swa.vocab_size).collect();
+        (input_ids, target_ids)
+    }
+
+    // ── Lattice CMS Level 0 FD checks ──────────────────────────────────
+
+    #[test]
+    fn test_lattice_cms_gradient_l0_w_k_mem() {
+        let cfg = lattice_cms_grad_check_config();
+        let params = lattice_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = lattice_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "lattice_l0_w_k_mem", &pulse,
+            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("lattice CMS l0_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "lattice l0_w_k_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_lattice_cms_gradient_l0_w_v_mem() {
+        let cfg = lattice_cms_grad_check_config();
+        let params = lattice_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = lattice_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "lattice_l0_w_v_mem", &pulse,
+            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("lattice CMS l0_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "lattice l0_w_v_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_lattice_cms_gradient_l0_w_q_mem() {
+        let cfg = lattice_cms_grad_check_config();
+        let params = lattice_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = lattice_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "lattice_l0_w_q_mem", &pulse,
+            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("lattice CMS l0_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "lattice l0_w_q_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_lattice_cms_gradient_l0_w_alpha() {
+        let cfg = lattice_cms_grad_check_config();
+        let params = lattice_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = lattice_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "lattice_l0_w_alpha", &pulse,
+            |p| &p.levels[0].w_alpha, |p, i, v| p.levels[0].w_alpha[i] = v, |g| &g.levels[0].w_alpha,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("lattice CMS l0_w_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "lattice l0_w_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_lattice_cms_gradient_l0_b_alpha() {
+        let cfg = lattice_cms_grad_check_config();
+        let params = lattice_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = lattice_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "lattice_l0_b_alpha", &pulse,
+            |p| &p.levels[0].b_alpha, |p, i, v| p.levels[0].b_alpha[i] = v, |g| &g.levels[0].b_alpha,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("lattice CMS l0_b_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "lattice l0_b_alpha: {passed}/{checked} passed");
+    }
+
+    // ── Lattice CMS Level 1 FD checks ──────────────────────────────────
+
+    #[test]
+    fn test_lattice_cms_gradient_l1_w_k_mem() {
+        let cfg = lattice_cms_grad_check_config();
+        let params = lattice_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = lattice_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "lattice_l1_w_k_mem", &pulse,
+            |p| &p.levels[1].w_k_mem, |p, i, v| p.levels[1].w_k_mem[i] = v, |g| &g.levels[1].w_k_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("lattice CMS l1_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "lattice l1_w_k_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_lattice_cms_gradient_l1_w_v_mem() {
+        let cfg = lattice_cms_grad_check_config();
+        let params = lattice_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = lattice_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "lattice_l1_w_v_mem", &pulse,
+            |p| &p.levels[1].w_v_mem, |p, i, v| p.levels[1].w_v_mem[i] = v, |g| &g.levels[1].w_v_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("lattice CMS l1_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "lattice l1_w_v_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_lattice_cms_gradient_l1_w_q_mem() {
+        let cfg = lattice_cms_grad_check_config();
+        let params = lattice_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = lattice_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "lattice_l1_w_q_mem", &pulse,
+            |p| &p.levels[1].w_q_mem, |p, i, v| p.levels[1].w_q_mem[i] = v, |g| &g.levels[1].w_q_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("lattice CMS l1_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "lattice l1_w_q_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_lattice_cms_gradient_l1_w_alpha() {
+        let cfg = lattice_cms_grad_check_config();
+        let params = lattice_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = lattice_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "lattice_l1_w_alpha", &pulse,
+            |p| &p.levels[1].w_alpha, |p, i, v| p.levels[1].w_alpha[i] = v, |g| &g.levels[1].w_alpha,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("lattice CMS l1_w_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "lattice l1_w_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_lattice_cms_gradient_l1_b_alpha() {
+        let cfg = lattice_cms_grad_check_config();
+        let params = lattice_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = lattice_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "lattice_l1_b_alpha", &pulse,
+            |p| &p.levels[1].b_alpha, |p, i, v| p.levels[1].b_alpha[i] = v, |g| &g.levels[1].b_alpha,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("lattice CMS l1_b_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "lattice l1_b_alpha: {passed}/{checked} passed");
     }
 }

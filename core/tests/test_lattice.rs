@@ -1,8 +1,9 @@
-//! MONETA integration tests: 2-layer MLP memory with l_p bias and L2 retention.
+//! Lattice OSR integration tests: multi-step training, sphere preservation, CMS k=2, comparison vs Delta Rule.
 
 use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind};
 use nl_hecate_core::mag::{cms_forward, cms_backward, mag_forward, mag_backward, MemoryCache};
 use nl_hecate_core::conductor::{Conductor, ContextState, ErrorBuffer};
+use nl_hecate_core::tensor::vec_norm_f32;
 
 fn make_data(cfg: &MAGConfig) -> (Vec<usize>, Vec<usize>) {
     let input_ids: Vec<usize> = (0..cfg.swa.seq_len).map(|t| t % cfg.swa.vocab_size).collect();
@@ -10,6 +11,7 @@ fn make_data(cfg: &MAGConfig) -> (Vec<usize>, Vec<usize>) {
     (input_ids, target_ids)
 }
 
+/// Generate multi-scale data with fast + slow temporal patterns.
 fn make_multiscale_data(
     seq_len: usize,
     vocab_size: usize,
@@ -32,15 +34,7 @@ fn make_multiscale_data(
     (input_ids, target_ids)
 }
 
-/// Create ContextState with correct memory size for MONETA (W1+W2 instead of d*d).
-fn make_context_state(cfg: &MAGConfig) -> ContextState {
-    let dh = cfg.d_hidden;
-    let d = cfg.swa.d_model;
-    let mem_size = dh * d + d * dh;
-    ContextState::new_with_memory_size(cfg.k, d, mem_size)
-}
-
-/// CMS training loop for MONETA. Uses correct memory size for ContextState.
+/// Run CMS training loop for N steps. Returns (initial_loss, final_loss).
 fn cms_train(
     params: &mut MAGParams,
     cfg: &MAGConfig,
@@ -50,9 +44,11 @@ fn cms_train(
     lr: f32,
 ) -> (f32, f32) {
     let mut conductor = Conductor::new(cfg.k, cfg.chunk_sizes.clone());
-    let mut context = make_context_state(cfg);
+    let d = cfg.swa.d_model;
+    let mem_size = cfg.m_slots * d;
+    let mut context = ContextState::new_with_memory_size(cfg.k, d, mem_size);
     let mut error_buffers: Vec<ErrorBuffer> = (0..cfg.k)
-        .map(|_| ErrorBuffer::new(cfg.swa.d_model))
+        .map(|_| ErrorBuffer::new(d))
         .collect();
 
     let mut initial_loss = None;
@@ -81,12 +77,12 @@ fn cms_train(
     (initial_loss.unwrap(), final_loss)
 }
 
-// ── MONETA k=1 tests ─────────────────────────────────────────────────
+// ── Lattice OSR k=1 tests ──────────────────────────────────────────
 
 /// 100-step smoke test: no NaN, no divergence, loss finite.
 #[test]
-fn test_moneta_k1_smoke() {
-    let cfg = MAGConfig::moneta_test_config();
+fn test_lattice_k1_smoke() {
+    let cfg = MAGConfig::lattice_test_config();
     let mut params = MAGParams::init(&cfg, 42);
     let (input_ids, target_ids) = make_data(&cfg);
 
@@ -102,17 +98,20 @@ fn test_moneta_k1_smoke() {
         params.sgd_step(&grads, 0.01);
     }
 
-    let final_loss = mag_forward(&params, &cfg, &input_ids, &target_ids).0;
+    let final_loss = {
+        let (loss, _) = mag_forward(&params, &cfg, &input_ids, &target_ids);
+        loss
+    };
     let initial = prev_loss.unwrap();
-    eprintln!("MONETA k=1 smoke: initial={initial:.4}, final={final_loss:.4}");
+    eprintln!("Lattice k=1 smoke: initial={initial:.4}, final={final_loss:.4}");
     assert!(final_loss.is_finite(), "Final loss not finite");
     assert!(final_loss < 100.0, "Loss diverged: {final_loss}");
 }
 
 /// 1K-step convergence: loss decreases.
 #[test]
-fn test_moneta_k1_convergence() {
-    let cfg = MAGConfig::moneta_test_config();
+fn test_lattice_k1_convergence() {
+    let cfg = MAGConfig::lattice_test_config();
     let mut params = MAGParams::init(&cfg, 42);
     let (input_ids, target_ids) = make_data(&cfg);
 
@@ -126,55 +125,66 @@ fn test_moneta_k1_convergence() {
         params.sgd_step(&grads, 0.01);
     }
 
-    let final_loss = mag_forward(&params, &cfg, &input_ids, &target_ids).0;
+    let final_loss = {
+        let (loss, _) = mag_forward(&params, &cfg, &input_ids, &target_ids);
+        loss
+    };
     let initial = initial_loss.unwrap();
-    eprintln!("MONETA k=1 convergence: initial={initial:.4}, final={final_loss:.4}");
+    eprintln!("Lattice k=1 convergence: initial={initial:.4}, final={final_loss:.4}");
     assert!(final_loss < initial,
         "Loss should decrease: initial={initial:.4}, final={final_loss:.4}");
 }
 
-/// Verify MLP W1/W2 are non-trivial after forward pass.
+/// Verify all memory slots remain unit vectors after training.
+/// This is the core invariant of Lattice OSR — sphere preservation via renormalization.
 #[test]
-fn test_moneta_mlp_nonzero() {
-    let cfg = MAGConfig::moneta_test_config();
-    let params = MAGParams::init(&cfg, 42);
+fn test_lattice_sphere_preserved() {
+    let cfg = MAGConfig::lattice_test_config();
+    let mut params = MAGParams::init(&cfg, 42);
     let (input_ids, target_ids) = make_data(&cfg);
 
+    // Train for 50 steps
+    for _ in 0..50 {
+        let (_, cache) = mag_forward(&params, &cfg, &input_ids, &target_ids);
+        let grads = mag_backward(&params, &cfg, &cache, &input_ids, &target_ids);
+        params.sgd_step(&grads, 0.01);
+    }
+
+    // Run one more forward to get cache with slot states
     let (_, cache) = mag_forward(&params, &cfg, &input_ids, &target_ids);
-
     match &cache.memory_cache {
-        MemoryCache::Moneta(mc) => {
-            let d = mc.d;
-            let dh = mc.d_hidden;
-            let s = mc.seq_len;
-            let w1_size = dh * d;
-            let w2_size = d * dh;
+        MemoryCache::Lattice(lc) => {
+            let d = lc.d;
+            let m = lc.m;
+            let s = lc.seq_len;
 
-            let w1_final = &mc.w1_states[s * w1_size..(s + 1) * w1_size];
-            let w1_norm: f32 = w1_final.iter().map(|x| x * x).sum::<f32>().sqrt();
-            eprintln!("Final W1 norm: {w1_norm:.6e}");
-            assert!(w1_norm > 1e-6, "MLP W1 should be non-trivial, got {w1_norm:.4e}");
-
-            let w2_final = &mc.w2_states[s * w2_size..(s + 1) * w2_size];
-            let w2_norm: f32 = w2_final.iter().map(|x| x * x).sum::<f32>().sqrt();
-            eprintln!("Final W2 norm: {w2_norm:.6e}");
-            assert!(w2_norm > 1e-6, "MLP W2 should be non-trivial, got {w2_norm:.4e}");
+            // Check every slot at every timestep (including initial and final)
+            for t in 0..=s {
+                for i in 0..m {
+                    let offset = t * m * d + i * d;
+                    let slot = &lc.s_states[offset..offset + d];
+                    let norm = vec_norm_f32(slot);
+                    assert!((norm - 1.0).abs() < 1e-4,
+                        "Slot {i} at t={t}: ||s|| = {norm}, expected ~1.0");
+                }
+            }
+            eprintln!("Sphere preserved: all {} slots × {} timesteps are unit vectors", m, s + 1);
         }
-        _ => panic!("Expected MonetaCache"),
+        _ => panic!("Expected LatticeCache"),
     }
 }
 
-/// CMS k=2 with MONETA on multi-scale data.
+/// CMS k=2 with Lattice OSR on multi-scale data.
 #[test]
-fn test_moneta_k2_multiscale() {
-    let cfg = MAGConfig::moneta_test_config_k2();
+fn test_lattice_k2_multiscale() {
+    let cfg = MAGConfig::lattice_test_config_k2();
     let mut params = MAGParams::init(&cfg, 42);
     let (input_ids, target_ids) = make_multiscale_data(
         cfg.swa.seq_len, cfg.swa.vocab_size, 4, 4,
     );
 
     let (initial, final_loss) = cms_train(&mut params, &cfg, &input_ids, &target_ids, 5_000, 0.01);
-    eprintln!("MONETA k=2 multiscale: initial={initial:.4}, final={final_loss:.4}");
+    eprintln!("Lattice k=2 multiscale: initial={initial:.4}, final={final_loss:.4}");
 
     assert!(initial.is_finite(), "Initial loss not finite");
     assert!(final_loss.is_finite(), "Final loss not finite");
@@ -182,10 +192,10 @@ fn test_moneta_k2_multiscale() {
         "Loss should decrease: initial={initial:.4}, final={final_loss:.4}");
 }
 
-/// Compare MONETA vs Delta Rule on same data.
-/// MONETA should converge — MLP memory has higher capacity per parameter.
+/// Compare Lattice OSR vs Delta Rule on same data.
+/// Lattice should converge — within tolerance of Delta Rule.
 #[test]
-fn test_moneta_vs_delta() {
+fn test_lattice_vs_delta() {
     use nl_hecate_core::model::SWAConfig;
 
     let swa = SWAConfig {
@@ -199,11 +209,11 @@ fn test_moneta_vs_delta() {
         k: 1, chunk_sizes: vec![1],
         d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
     };
-    let cfg_moneta = MAGConfig {
+    let cfg_lattice = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
-        memory_rule: MemoryRuleKind::Moneta,
+        memory_rule: MemoryRuleKind::LatticeOSR,
         k: 1, chunk_sizes: vec![1],
-        d_hidden: 4, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.01, delta: 1.0, m_slots: 0,
+        d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 4,
     };
 
     let input_ids: Vec<usize> = (0..swa.seq_len).map(|t| t % swa.vocab_size).collect();
@@ -222,32 +232,32 @@ fn test_moneta_vs_delta() {
     }
     let delta_final = mag_forward(&params_delta, &cfg_delta, &input_ids, &target_ids).0;
 
-    // Train MONETA
-    let mut params_moneta = MAGParams::init(&cfg_moneta, 42);
-    let mut moneta_initial = None;
+    // Train Lattice OSR
+    let mut params_lattice = MAGParams::init(&cfg_lattice, 42);
+    let mut lattice_initial = None;
     for _ in 0..steps {
-        let (loss, cache) = mag_forward(&params_moneta, &cfg_moneta, &input_ids, &target_ids);
-        if moneta_initial.is_none() { moneta_initial = Some(loss); }
-        let grads = mag_backward(&params_moneta, &cfg_moneta, &cache, &input_ids, &target_ids);
-        params_moneta.sgd_step(&grads, lr);
+        let (loss, cache) = mag_forward(&params_lattice, &cfg_lattice, &input_ids, &target_ids);
+        if lattice_initial.is_none() { lattice_initial = Some(loss); }
+        let grads = mag_backward(&params_lattice, &cfg_lattice, &cache, &input_ids, &target_ids);
+        params_lattice.sgd_step(&grads, lr);
     }
-    let moneta_final = mag_forward(&params_moneta, &cfg_moneta, &input_ids, &target_ids).0;
+    let lattice_final = mag_forward(&params_lattice, &cfg_lattice, &input_ids, &target_ids).0;
 
     eprintln!("Delta: initial={:.4}, final={delta_final:.4}", delta_initial.unwrap());
-    eprintln!("MONETA: initial={:.4}, final={moneta_final:.4}", moneta_initial.unwrap());
+    eprintln!("Lattice: initial={:.4}, final={lattice_final:.4}", lattice_initial.unwrap());
 
     // Both should converge
     assert!(delta_final < delta_initial.unwrap(), "Delta should converge");
-    assert!(moneta_final < moneta_initial.unwrap(), "MONETA should converge");
+    assert!(lattice_final < lattice_initial.unwrap(), "Lattice should converge");
 
-    // MONETA should be in same ballpark as Delta (MLP memory is different, not necessarily better at d=8)
-    assert!(moneta_final < delta_final * 10.0,
-        "MONETA should not catastrophically regress: moneta={moneta_final:.6}, delta={delta_final:.6}");
+    // Lattice uses m<<d slots (4 slots in d=8), so less capacity — within 5x of Delta
+    assert!(lattice_final < delta_final * 5.0,
+        "Lattice should not catastrophically regress: lattice={lattice_final:.6}, delta={delta_final:.6}");
 
-    let ratio = if moneta_final > delta_final {
-        moneta_final / delta_final
+    if lattice_final > delta_final {
+        let ratio = lattice_final / delta_final;
+        eprintln!("NOTE: Delta beats Lattice by {ratio:.2}x — expected (m<d means less capacity)");
     } else {
-        delta_final / moneta_final
-    };
-    eprintln!("Performance ratio: {ratio:.2}x (closer to 1.0 = more similar)");
+        eprintln!("Lattice matches/beats Delta at d=8 — impressive for m=4 slots");
+    }
 }

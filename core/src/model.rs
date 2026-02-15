@@ -18,6 +18,7 @@ pub enum MemoryRuleKind {
     Moneta,
     YAAD,
     MEMORA,
+    LatticeOSR,
 }
 
 /// Model configuration — immutable after construction.
@@ -300,6 +301,8 @@ pub struct MAGConfig {
     /// Huber loss threshold for YAAD (default: 1.0).
     /// Errors below delta get L2 gradient; above get bounded L1 gradient.
     pub delta: f32,
+    /// Number of memory slots for Lattice OSR (default: 0, unused by other rules).
+    pub m_slots: usize,
 }
 
 /// Default gate bias init values per level index.
@@ -356,7 +359,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 1,
             chunk_sizes: vec![1],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
         }
     }
 
@@ -375,7 +378,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 2,
             chunk_sizes: vec![1, 8],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
         }
     }
 
@@ -394,7 +397,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 1,
             chunk_sizes: vec![1],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
         }
     }
 
@@ -414,7 +417,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 2,
             chunk_sizes: vec![1, 8],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
         }
     }
 
@@ -434,7 +437,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 4,
             chunk_sizes: vec![1, 8, 64, 512],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
         }
     }
 
@@ -454,7 +457,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 4,
             chunk_sizes: vec![1, 8, 64, 512],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
         }
     }
 
@@ -473,7 +476,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::TitansLMM,
             k: 1,
             chunk_sizes: vec![1],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
         }
     }
 
@@ -492,7 +495,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::HebbianRule,
             k: 1,
             chunk_sizes: vec![1],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
         }
     }
 
@@ -511,7 +514,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::HebbianRule,
             k: 2,
             chunk_sizes: vec![1, 8],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
         }
     }
 
@@ -530,7 +533,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::TitansLMM,
             k: 2,
             chunk_sizes: vec![1, 8],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0,
         }
     }
 
@@ -555,6 +558,7 @@ impl MAGConfig {
             lambda_local: 0.0,
             lambda_2: 0.01,
             delta: 1.0,
+            m_slots: 0,
         }
     }
 
@@ -579,6 +583,7 @@ impl MAGConfig {
             lambda_local: 0.0,
             lambda_2: 0.01,
             delta: 1.0,
+            m_slots: 0,
         }
     }
 
@@ -603,6 +608,7 @@ impl MAGConfig {
             lambda_local: 0.01,
             lambda_2: 0.01,
             delta: 1.0,
+            m_slots: 0,
         }
     }
 
@@ -627,6 +633,7 @@ impl MAGConfig {
             lambda_local: 0.01,
             lambda_2: 0.01,
             delta: 1.0,
+            m_slots: 0,
         }
     }
 
@@ -651,6 +658,7 @@ impl MAGConfig {
             lambda_local: 0.0,
             lambda_2: 0.0,
             delta: 1.0,
+            m_slots: 0,
         }
     }
 
@@ -675,6 +683,47 @@ impl MAGConfig {
             lambda_local: 0.0,
             lambda_2: 0.0,
             delta: 1.0,
+            m_slots: 0,
+        }
+    }
+
+    /// Lattice OSR test configuration: d=8, m_slots=4 (k=1).
+    pub fn lattice_test_config() -> Self {
+        MAGConfig {
+            swa: SWAConfig {
+                d_model: 8,
+                num_heads: 2,
+                head_dim: 4,
+                seq_len: 4,
+                window_size: 4,
+                vocab_size: 16,
+            },
+            memory_enabled: true,
+            memory_rule: MemoryRuleKind::LatticeOSR,
+            k: 1,
+            chunk_sizes: vec![1],
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
+            m_slots: 4,
+        }
+    }
+
+    /// Lattice OSR test configuration for CMS k=2 testing.
+    pub fn lattice_test_config_k2() -> Self {
+        MAGConfig {
+            swa: SWAConfig {
+                d_model: 8,
+                num_heads: 2,
+                head_dim: 4,
+                seq_len: 8,
+                window_size: 8,
+                vocab_size: 16,
+            },
+            memory_enabled: true,
+            memory_rule: MemoryRuleKind::LatticeOSR,
+            k: 2,
+            chunk_sizes: vec![1, 8],
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
+            m_slots: 4,
         }
     }
 }
