@@ -53,6 +53,12 @@ pub struct StreamCursor {
 pub enum RestoreError {
     PulseMismatch { stream_pulse: u64, model_pulse: u64 },
     PositionOutOfBounds { position: u64, data_len: u64 },
+    ConfigMismatch {
+        expected_k: usize,
+        expected_chunk_sizes: Vec<usize>,
+        found_k: usize,
+        found_chunk_sizes: Vec<usize>,
+    },
 }
 
 impl std::fmt::Display for RestoreError {
@@ -63,6 +69,9 @@ impl std::fmt::Display for RestoreError {
             }
             RestoreError::PositionOutOfBounds { position, data_len } => {
                 write!(f, "position {position} out of bounds (data_len={data_len})")
+            }
+            RestoreError::ConfigMismatch { expected_k, found_k, .. } => {
+                write!(f, "config mismatch: expected k={expected_k}, found k={found_k}")
             }
         }
     }

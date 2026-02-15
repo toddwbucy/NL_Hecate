@@ -88,8 +88,19 @@ impl Conductor {
         }
     }
 
-    /// Restore from a checkpoint. Verifies pulse_id consistency.
+    /// Restore from a checkpoint. Verifies config and pulse_id consistency.
     pub fn restore(&mut self, checkpoint: &Checkpoint) -> Result<(), RestoreError> {
+        // Verify CMS configuration matches
+        if checkpoint.conductor.k != self.k
+            || checkpoint.conductor.chunk_sizes != self.chunk_sizes
+        {
+            return Err(RestoreError::ConfigMismatch {
+                expected_k: self.k,
+                expected_chunk_sizes: self.chunk_sizes.clone(),
+                found_k: checkpoint.conductor.k,
+                found_chunk_sizes: checkpoint.conductor.chunk_sizes.clone(),
+            });
+        }
         // Verify pulse_id matches between conductor state and stream cursor
         if checkpoint.stream.pulse_id != checkpoint.conductor.step as u64 {
             return Err(RestoreError::PulseMismatch {

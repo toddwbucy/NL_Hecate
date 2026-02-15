@@ -256,7 +256,35 @@ fn test_pulse_mismatch_rejected() {
     }
 }
 
-// ── Test 10: CMS k=2 training driven by ContextStream ──────────────────
+// ── Test 10: Config mismatch rejected ───────────────────────────────────
+
+#[test]
+fn test_config_mismatch_rejected() {
+    let corpus = make_corpus(100);
+    // Create checkpoint from k=2 conductor
+    let mut conductor_k2 = Conductor::new(2, vec![1, 8])
+        .with_stream(Box::new(VecStream::new(corpus.clone())));
+    for _ in 0..5 {
+        conductor_k2.next_chunk(8);
+        conductor_k2.advance();
+    }
+    let checkpoint = conductor_k2.checkpoint();
+
+    // Try restoring into k=1 conductor → ConfigMismatch
+    let mut conductor_k1 = Conductor::new(1, vec![1])
+        .with_stream(Box::new(VecStream::new(corpus)));
+    let result = conductor_k1.restore(&checkpoint);
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        RestoreError::ConfigMismatch { expected_k, found_k, .. } => {
+            assert_eq!(expected_k, 1);
+            assert_eq!(found_k, 2);
+        }
+        other => panic!("Expected ConfigMismatch, got {:?}", other),
+    }
+}
+
+// ── Test 11: CMS k=2 training driven by ContextStream ──────────────────
 
 #[test]
 fn test_cms_training_via_stream() {
