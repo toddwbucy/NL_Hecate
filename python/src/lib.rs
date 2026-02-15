@@ -8,7 +8,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::types::PyDict;
 
 use nl_hecate_core::model::{SWAConfig as RustConfig, SWAParams as RustParams};
-use nl_hecate_core::model::{MAGConfig as RustMAGConfig, MAGParams as RustMAGParams};
+use nl_hecate_core::model::{MAGConfig as RustMAGConfig, MAGParams as RustMAGParams, MemoryRuleKind};
 use nl_hecate_core::forward::{forward as rust_forward, ForwardCache as RustCache};
 use nl_hecate_core::backward::backward_full as rust_backward_full;
 use nl_hecate_core::gradient::compute_gradients as rust_compute_gradients;
@@ -189,7 +189,7 @@ struct MAGConfig {
 #[pymethods]
 impl MAGConfig {
     #[new]
-    #[pyo3(signature = (d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled, k=1, chunk_sizes=None))]
+    #[pyo3(signature = (d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled, k=1, chunk_sizes=None, memory_rule="delta"))]
     fn new(
         d_model: usize,
         num_heads: usize,
@@ -200,6 +200,7 @@ impl MAGConfig {
         memory_enabled: bool,
         k: usize,
         chunk_sizes: Option<Vec<usize>>,
+        memory_rule: &str,
     ) -> PyResult<Self> {
         if d_model != num_heads * head_dim {
             return Err(PyValueError::new_err(format!(
@@ -222,6 +223,19 @@ impl MAGConfig {
                 )));
             }
         }
+        let rule = match memory_rule {
+            "delta" => MemoryRuleKind::DeltaRule,
+            "titans" => MemoryRuleKind::TitansLMM,
+            "hebbian" => MemoryRuleKind::HebbianRule,
+            "moneta" => MemoryRuleKind::Moneta,
+            "yaad" => MemoryRuleKind::YAAD,
+            "memora" => MemoryRuleKind::MEMORA,
+            "lattice" => MemoryRuleKind::LatticeOSR,
+            "trellis" => MemoryRuleKind::Trellis,
+            _ => return Err(PyValueError::new_err(format!(
+                "Unknown memory_rule '{memory_rule}'. Expected: delta, titans, hebbian, moneta, yaad, memora, lattice, trellis"
+            ))),
+        };
         Ok(MAGConfig {
             inner: RustMAGConfig {
                 swa: RustConfig {
@@ -233,8 +247,19 @@ impl MAGConfig {
                     vocab_size,
                 },
                 memory_enabled,
+                memory_rule: rule,
                 k,
                 chunk_sizes,
+                d_hidden: 0,
+                lp_p: 2.0,
+                lq_q: 2.0,
+                lambda_local: 0.0,
+                lambda_2: 0.0,
+                delta: 1.0,
+                m_slots: 0,
+                d_compress: 0,
+                lambda_k: 0.0,
+                lambda_v: 0.0,
             },
         })
     }
@@ -311,7 +336,7 @@ impl MAGForwardCache {
 // ── MAG free functions ─────────────────────────────────────────────
 
 #[pyfunction]
-#[pyo3(signature = (d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled, k=1, chunk_sizes=None))]
+#[pyo3(signature = (d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled, k=1, chunk_sizes=None, memory_rule="delta"))]
 fn mag_create_config(
     d_model: usize,
     num_heads: usize,
@@ -322,8 +347,9 @@ fn mag_create_config(
     memory_enabled: bool,
     k: usize,
     chunk_sizes: Option<Vec<usize>>,
+    memory_rule: &str,
 ) -> PyResult<MAGConfig> {
-    MAGConfig::new(d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled, k, chunk_sizes)
+    MAGConfig::new(d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled, k, chunk_sizes, memory_rule)
 }
 
 #[pyfunction]
