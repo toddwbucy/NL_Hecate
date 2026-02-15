@@ -28,7 +28,7 @@
 ///     z[i] = alpha_t * log(W1[r,i]) - theta_t * grad_W1[r,i]
 ///     W1_next[r] = softmax(z)
 ///   Similarly for W2.
-///   y_t = W2_next @ silu(W1_next @ q_t)
+///   y_t = W2_t @ silu(W1_t @ q_t)     (observe-then-advance: read BEFORE update)
 ///
 /// Backward: reverse token loop with accumulated d_W1, d_W2, using the softmax Jacobian
 /// to propagate through the KL-optimal update.
@@ -38,7 +38,7 @@ use crate::tensor::{
     sigmoid_f32, softplus_f32, silu_f32, silu_prime_f32,
 };
 use crate::model::MemoryLevelParams;
-use crate::delta_rule::{MemoryRule, MemoryState, Gates};
+use crate::delta_rule::{MemoryRule, MemoryState, Gates, MemoryError};
 
 // ── MEMORA implementation ─────────────────────────────────────────────
 
@@ -100,12 +100,12 @@ impl MemoryRule for MEMORA {
         MemoryState { m: vec![0.0f32; d * d], d }
     }
 
-    fn write(&self, _state: &mut MemoryState, _k: &[f32], _v: &[f32], _gates: &Gates) {
-        unimplemented!("MEMORA does not support direct write — use step() instead");
+    fn write(&self, _state: &mut MemoryState, _k: &[f32], _v: &[f32], _gates: &Gates) -> Result<(), MemoryError> {
+        Err(MemoryError::UnsupportedOperation)
     }
 
-    fn read(&self, _state: &MemoryState, _q: &[f32], _out: &mut [f32]) {
-        unimplemented!("MEMORA does not support direct read — use step() instead");
+    fn read(&self, _state: &MemoryState, _q: &[f32], _out: &mut [f32]) -> Result<(), MemoryError> {
+        Err(MemoryError::UnsupportedOperation)
     }
 
     fn step(
@@ -114,7 +114,7 @@ impl MemoryRule for MEMORA {
         embedded: &[f32],
         seq_len: usize,
         d: usize,
-        initial_m: Option<&[f32]>,
+        initial_m: Option<Vec<f32>>,
     ) -> (Vec<f32>, MEMORACache) {
         let dh = self.d_hidden;
         debug_assert_eq!(embedded.len(), seq_len * d);
@@ -134,19 +134,24 @@ impl MemoryRule for MEMORA {
         matmul_f32(embedded, &w_v_mem_t, &mut v_mem, seq_len, d, d);
         matmul_f32(embedded, &w_q_mem_t, &mut q_mem, seq_len, d, d);
 
-        // Allocate W1, W2 states
+        // Allocate W1, W2 states — reuse incoming allocation when possible
         let w1_size = dh * d;
         let w2_size = d * dh;
-        let mut w1_states = vec![0.0f32; (seq_len + 1) * w1_size];
-        let mut w2_states = vec![0.0f32; (seq_len + 1) * w2_size];
+        let total_w1 = (seq_len + 1) * w1_size;
+        let total_w2 = (seq_len + 1) * w2_size;
 
-        if let Some(m0) = initial_m {
+        let (mut w1_states, mut w2_states) = if let Some(mut m0) = initial_m {
             // CMS context memory format: W1_flat ++ W2_flat
+            // Take ownership and split, reusing the allocation.
             debug_assert_eq!(m0.len(), w1_size + w2_size);
-            w1_states[..w1_size].copy_from_slice(&m0[..w1_size]);
-            w2_states[..w2_size].copy_from_slice(&m0[w1_size..w1_size + w2_size]);
+            let mut w2_init = m0.split_off(w1_size);
+            m0.resize(total_w1, 0.0);
+            w2_init.resize(total_w2, 0.0);
+            (m0, w2_init)
         } else {
             // Simplex init: softmax(hash_noise) per row.
+            let mut w1 = vec![0.0f32; total_w1];
+            let mut w2 = vec![0.0f32; total_w2];
             // W1: d_hidden rows of length d
             let mut noise = vec![0.0f32; d.max(dh)];
             for r in 0..dh {
@@ -155,13 +160,14 @@ impl MemoryRule for MEMORA {
                     let hash = ((idx as u32).wrapping_mul(2654435761)) as f32 / u32::MAX as f32;
                     noise[c] = 0.1 * (hash - 0.5);
                 }
-                softmax_f32(&noise[..d], &mut w1_states[r * d..(r + 1) * d], 1, d);
+                softmax_f32(&noise[..d], &mut w1[r * d..(r + 1) * d], 1, d);
             }
             // W2: d rows of length d_hidden — uniform 1/d_hidden
             for i in 0..w2_size {
-                w2_states[i] = 1.0 / dh as f32;
+                w2[i] = 1.0 / dh as f32;
             }
-        }
+            (w1, w2)
+        };
 
         let mut concat_kv = vec![0.0f32; seq_len * 2 * d];
         let mut alpha_pre = vec![0.0f32; seq_len];
@@ -207,7 +213,7 @@ impl MemoryRule for MEMORA {
             theta_pre[t] = theta_pre_t;
             theta[t] = softplus_f32(theta_pre_t);
 
-            // MLP forward: pre_act = W1 @ k_t, h = silu(pre_act)
+            // Observe-then-advance (CS-32): read from current state BEFORE update.
             let (w1_left, w1_right) = w1_states.split_at_mut((t + 1) * w1_size);
             let w1_t = &w1_left[t * w1_size..];
             let w1_next = &mut w1_right[..w1_size];
@@ -216,6 +222,16 @@ impl MemoryRule for MEMORA {
             let w2_t = &w2_left[t * w2_size..];
             let w2_next = &mut w2_right[..w2_size];
 
+            // ── OBSERVE: y_t = W2_t @ silu(W1_t @ q_t) ──
+            let mut q_pre = vec![0.0f32; dh];
+            matmul_f32(w1_t, q_t, &mut q_pre, dh, d, 1);
+            let mut q_hidden = vec![0.0f32; dh];
+            for i in 0..dh {
+                q_hidden[i] = silu_f32(q_pre[i]);
+            }
+            matmul_f32(w2_t, &q_hidden, &mut y[t * d..(t + 1) * d], d, dh, 1);
+
+            // ── ADVANCE: compute error, gradient, then softmax update ──
             let pa_base = t * dh;
             matmul_f32(w1_t, k_t, &mut pre_act_all[pa_base..pa_base + dh], dh, d, 1);
             for i in 0..dh {
@@ -297,15 +313,6 @@ impl MemoryRule for MEMORA {
                 softmax_f32(&z_buf[..dh], &mut softmax_buf[..dh], 1, dh);
                 w2_next[row_base..row_base + dh].copy_from_slice(&softmax_buf[..dh]);
             }
-
-            // Read: y_t = W2_next @ silu(W1_next @ q_t)
-            let mut q_pre = vec![0.0f32; dh];
-            matmul_f32(w1_next, q_t, &mut q_pre, dh, d, 1);
-            let mut q_hidden = vec![0.0f32; dh];
-            for i in 0..dh {
-                q_hidden[i] = silu_f32(q_pre[i]);
-            }
-            matmul_f32(w2_next, &q_hidden, &mut y[t * d..(t + 1) * d], d, dh, 1);
         }
 
         let cache = MEMORACache {
@@ -364,30 +371,36 @@ impl MemoryRule for MEMORA {
             let lw1_base = t * w1_size;
             let lw2_base = t * w2_size;
 
-            // ── y_t = W2_next @ silu(W1_next @ q_t) backward ──
+            // ── y_t = W2_t @ silu(W1_t @ q_t) backward (observe-then-advance) ──
+            // Read uses pre-update weights W_t, so read gradient flows to W_t directly
+            // (bypasses softmax Jacobian — NOT added to d_w1/d_w2 which track d_W_{t+1})
             let d_y_t = &d_y[t * d..(t + 1) * d];
 
-            // Recompute read forward: q_pre = W1_next @ q_t, q_hidden = silu(q_pre)
+            // Recompute read forward with pre-update weights: q_pre = W1_t @ q_t
             let mut q_pre = vec![0.0f32; dh];
-            matmul_f32(w1_next, q_t, &mut q_pre, dh, d, 1);
+            matmul_f32(w1_t, q_t, &mut q_pre, dh, d, 1);
             let mut q_hidden = vec![0.0f32; dh];
             for i in 0..dh {
                 q_hidden[i] = silu_f32(q_pre[i]);
             }
 
-            // d_W2_next += outer(d_y_t, q_hidden)
+            // Read gradient → separate buffers (will be added to d_w_prev after softmax backward)
+            let mut d_w2_read = vec![0.0f32; w2_size];
+            let mut d_w1_read = vec![0.0f32; w1_size];
+
+            // d_W2_t_read = outer(d_y_t, q_hidden)
             for i in 0..d {
                 for j in 0..dh {
-                    d_w2[i * dh + j] += d_y_t[i] * q_hidden[j];
+                    d_w2_read[i * dh + j] = d_y_t[i] * q_hidden[j];
                 }
             }
 
-            // d_q_hidden = W2_next^T @ d_y_t
+            // d_q_hidden = W2_t^T @ d_y_t
             let mut d_q_hidden = vec![0.0f32; dh];
             for i in 0..dh {
                 let mut sum = 0.0f32;
                 for j in 0..d {
-                    sum += w2_next[j * dh + i] * d_y_t[j];
+                    sum += w2_t[j * dh + i] * d_y_t[j];
                 }
                 d_q_hidden[i] = sum;
             }
@@ -398,18 +411,18 @@ impl MemoryRule for MEMORA {
                 d_q_pre[i] = d_q_hidden[i] * silu_prime_f32(q_pre[i]);
             }
 
-            // d_W1_next += outer(d_q_pre, q_t)
+            // d_W1_t_read = outer(d_q_pre, q_t)
             for i in 0..dh {
                 for j in 0..d {
-                    d_w1[i * d + j] += d_q_pre[i] * q_t[j];
+                    d_w1_read[i * d + j] = d_q_pre[i] * q_t[j];
                 }
             }
 
-            // d_q_t = W1_next^T @ d_q_pre
+            // d_q_t = W1_t^T @ d_q_pre
             for j in 0..d {
                 let mut sum = 0.0f32;
                 for i in 0..dh {
-                    sum += w1_next[i * d + j] * d_q_pre[i];
+                    sum += w1_t[i * d + j] * d_q_pre[i];
                 }
                 d_q_mem[t * d + j] = sum;
             }
@@ -621,6 +634,10 @@ impl MemoryRule for MEMORA {
                 d_v_mem[t * d + i] += d_alpha_pre * level_params.w_alpha[d + i]
                                     + d_theta_pre * level_params.w_theta[d + i];
             }
+
+            // Add read gradients to d_w_prev (read used W_t, not W_{t+1})
+            for i in 0..w1_size { d_w1_prev[i] += d_w1_read[i]; }
+            for i in 0..w2_size { d_w2_prev[i] += d_w2_read[i]; }
 
             // Swap: d_w1_prev becomes d_w1 for next (earlier) token
             d_w1 = d_w1_prev;
@@ -1004,7 +1021,7 @@ mod tests {
             let sum: f32 = row.iter().sum();
             for v in row.iter_mut() { *v /= sum; }
         }
-        let (y2, _) = rule.step(&params.levels[0], &embedded, s, d, Some(&m0));
+        let (y2, _) = rule.step(&params.levels[0], &embedded, s, d, Some(m0));
 
         assert_ne!(y1, y2, "Initial memory seeding should change output");
     }

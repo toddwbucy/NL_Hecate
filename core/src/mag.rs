@@ -405,8 +405,9 @@ pub fn cms_forward(
 
     for level in 0..cfg.k {
         if pulse.active_levels[level] {
-            // Active level: full memory write + read, seeded from persisted memory
-            let initial_m = Some(context.memory[level].as_slice());
+            // Active level: full memory write + read, seeded from persisted memory.
+            // Take ownership — context.memory[level] will be replaced after step().
+            let initial_m = Some(std::mem::take(&mut context.memory[level]));
             let (y_level, mem_cache) = match cfg.memory_rule {
                 MemoryRuleKind::DeltaRule => {
                     let (y, cache) = DeltaRule.step(&params.levels[level], &embedded, s, d, initial_m);

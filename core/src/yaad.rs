@@ -35,7 +35,7 @@ use crate::tensor::{
     silu_f32, silu_prime_f32, frobenius_dot_f32,
 };
 use crate::model::MemoryLevelParams;
-use crate::delta_rule::{MemoryRule, MemoryState, Gates};
+use crate::delta_rule::{MemoryRule, MemoryState, Gates, MemoryError};
 
 // ── YAAD implementation ─────────────────────────────────────────────
 
@@ -117,12 +117,12 @@ impl MemoryRule for YAAD {
         MemoryState { m: vec![0.0f32; d * d], d }
     }
 
-    fn write(&self, _state: &mut MemoryState, _k: &[f32], _v: &[f32], _gates: &Gates) {
-        unimplemented!("YAAD does not support direct write — use step() instead");
+    fn write(&self, _state: &mut MemoryState, _k: &[f32], _v: &[f32], _gates: &Gates) -> Result<(), MemoryError> {
+        Err(MemoryError::UnsupportedOperation)
     }
 
-    fn read(&self, _state: &MemoryState, _q: &[f32], _out: &mut [f32]) {
-        unimplemented!("YAAD does not support direct read — use step() instead");
+    fn read(&self, _state: &MemoryState, _q: &[f32], _out: &mut [f32]) -> Result<(), MemoryError> {
+        Err(MemoryError::UnsupportedOperation)
     }
 
     fn step(
@@ -131,7 +131,7 @@ impl MemoryRule for YAAD {
         embedded: &[f32],
         seq_len: usize,
         d: usize,
-        initial_m: Option<&[f32]>,
+        initial_m: Option<Vec<f32>>,
     ) -> (Vec<f32>, YAADCache) {
         let dh = self.d_hidden;
         let hub_delta = self.delta;
@@ -997,7 +997,7 @@ mod tests {
         let mut rng = SimpleRng::new(77);
         let mut m0 = vec![0.0f32; dh * d + d * dh];
         rng.fill_uniform(&mut m0, 0.1);
-        let (y2, _) = rule.step(&params.levels[0], &embedded, s, d, Some(&m0));
+        let (y2, _) = rule.step(&params.levels[0], &embedded, s, d, Some(m0));
 
         assert_ne!(y1, y2, "Initial memory seeding should change output");
     }

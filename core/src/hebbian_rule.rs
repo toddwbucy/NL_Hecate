@@ -21,7 +21,7 @@ use crate::tensor::{
     frobenius_dot_f32,
 };
 use crate::model::MemoryLevelParams;
-use crate::delta_rule::{MemoryRule, MemoryState, Gates};
+use crate::delta_rule::{MemoryRule, MemoryState, Gates, MemoryError};
 
 // ── Hebbian Rule implementation ─────────────────────────────────────
 
@@ -61,7 +61,7 @@ impl MemoryRule for HebbianRule {
         MemoryState { m: vec![0.0f32; d * d], d }
     }
 
-    fn write(&self, state: &mut MemoryState, k: &[f32], v: &[f32], gates: &Gates) {
+    fn write(&self, state: &mut MemoryState, k: &[f32], v: &[f32], gates: &Gates) -> Result<(), MemoryError> {
         let d = state.d;
         // M = (1-alpha) * M + outer(v, k)  — pure associative, no error
         let retention = 1.0 - gates.alpha;
@@ -70,11 +70,13 @@ impl MemoryRule for HebbianRule {
                 state.m[i * d + j] = retention * state.m[i * d + j] + v[i] * k[j];
             }
         }
+        Ok(())
     }
 
-    fn read(&self, state: &MemoryState, q: &[f32], out: &mut [f32]) {
+    fn read(&self, state: &MemoryState, q: &[f32], out: &mut [f32]) -> Result<(), MemoryError> {
         let d = state.d;
         matmul_f32(&state.m, q, out, d, d, 1);
+        Ok(())
     }
 
     /// Full sequence forward with cache for backward.
@@ -84,7 +86,7 @@ impl MemoryRule for HebbianRule {
         embedded: &[f32],
         seq_len: usize,
         d: usize,
-        initial_m: Option<&[f32]>,
+        initial_m: Option<Vec<f32>>,
     ) -> (Vec<f32>, HebbianCache) {
         debug_assert_eq!(embedded.len(), seq_len * d);
 
@@ -107,7 +109,7 @@ impl MemoryRule for HebbianRule {
         let mut m_states = vec![0.0f32; (seq_len + 1) * d * d];
         if let Some(m0) = initial_m {
             debug_assert_eq!(m0.len(), d * d);
-            m_states[..d * d].copy_from_slice(m0);
+            m_states[..d * d].copy_from_slice(&m0);
         }
         let mut concat_kv = vec![0.0f32; seq_len * 2 * d];
         let mut alpha_pre = vec![0.0f32; seq_len];
@@ -471,12 +473,12 @@ mod tests {
 
         // Write: M = (1-0)*0 + outer(v, k) = outer(v, k)
         // = [[0,0,0,0],[1,0,0,0],[0,0,0,0],[0,0,0,0]]
-        rule.write(&mut state, &k, &v, &gates);
+        rule.write(&mut state, &k, &v, &gates).unwrap();
 
         // Read: M @ q should give v when q = k
         let q = [1.0f32, 0.0, 0.0, 0.0];
         let mut out = [0.0f32; 4];
-        rule.read(&state, &q, &mut out);
+        rule.read(&state, &q, &mut out).unwrap();
         assert!((out[1] - 1.0).abs() < 1e-6, "read should return stored value");
     }
 

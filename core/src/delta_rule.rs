@@ -41,6 +41,26 @@ pub struct Gates {
     pub theta: f32,
 }
 
+/// Error type for memory operations that may not be supported by all rules.
+///
+/// MLP-family rules (MONETA, YAAD, MEMORA) fuse write+read into `step()` because
+/// their 2-layer MLP structure doesn't fit the per-token matrix API (M @ q).
+/// Instead of panicking at runtime, these rules return `Err(UnsupportedOperation)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryError {
+    /// The memory rule does not support this operation — use `step()` instead.
+    UnsupportedOperation,
+}
+
+impl std::fmt::Display for MemoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MemoryError::UnsupportedOperation =>
+                write!(f, "this memory rule does not support direct write/read — use step() instead"),
+        }
+    }
+}
+
 /// The core abstraction from the MIRAS framework (spec 00_interface.md).
 ///
 /// Every named memory variant (Delta Rule, Titans LMM, MONETA, etc.)
@@ -61,24 +81,31 @@ pub trait MemoryRule {
 
     /// Per-token WRITE: mutate memory state given projected k, v and gates.
     /// Does NOT produce output — use `read` after write.
-    fn write(&self, state: &mut MemoryState, k: &[f32], v: &[f32], gates: &Gates);
+    ///
+    /// Returns `Err(MemoryError::UnsupportedOperation)` for MLP-family rules
+    /// (MONETA, YAAD, MEMORA) where write is fused into `step()`.
+    fn write(&self, state: &mut MemoryState, k: &[f32], v: &[f32], gates: &Gates) -> Result<(), MemoryError>;
 
     /// Per-token READ: query memory with q, write result to `out`.
     /// Pure function — does NOT mutate state.
-    fn read(&self, state: &MemoryState, q: &[f32], out: &mut [f32]);
+    ///
+    /// Returns `Err(MemoryError::UnsupportedOperation)` for MLP-family rules
+    /// (MONETA, YAAD, MEMORA) where read is fused into `step()`.
+    fn read(&self, state: &MemoryState, q: &[f32], out: &mut [f32]) -> Result<(), MemoryError>;
 
     /// Full sequence forward: project → gate → write → read for all tokens.
     /// Returns (output [seq_len, d], cache for backward).
     ///
-    /// `initial_m`: Optional initial memory state [d*d]. If None, starts from zeros.
+    /// `initial_m`: Optional initial memory state. If None, starts from zeros.
     /// Used by CMS to seed active levels with persisted context memory.
+    /// Ownership is transferred so the callee can reuse the allocation.
     fn step(
         &self,
         level_params: &MemoryLevelParams,
         embedded: &[f32],
         seq_len: usize,
         d: usize,
-        initial_m: Option<&[f32]>,
+        initial_m: Option<Vec<f32>>,
     ) -> (Vec<f32>, Self::Cache);
 
     /// Full sequence backward through the memory rule.
@@ -141,7 +168,7 @@ impl MemoryRule for DeltaRule {
         MemoryState { m: vec![0.0f32; d * d], d }
     }
 
-    fn write(&self, state: &mut MemoryState, k: &[f32], v: &[f32], gates: &Gates) {
+    fn write(&self, state: &mut MemoryState, k: &[f32], v: &[f32], gates: &Gates) -> Result<(), MemoryError> {
         let d = state.d;
         // prediction = M @ k
         let mut prediction = vec![0.0f32; d];
@@ -157,11 +184,13 @@ impl MemoryRule for DeltaRule {
                 state.m[i * d + j] = retention * state.m[i * d + j] - lr * err_i * k[j];
             }
         }
+        Ok(())
     }
 
-    fn read(&self, state: &MemoryState, q: &[f32], out: &mut [f32]) {
+    fn read(&self, state: &MemoryState, q: &[f32], out: &mut [f32]) -> Result<(), MemoryError> {
         let d = state.d;
         matmul_f32(&state.m, q, out, d, d, 1);
+        Ok(())
     }
 
     /// Full sequence forward with cache for backward.
@@ -174,7 +203,7 @@ impl MemoryRule for DeltaRule {
         embedded: &[f32],
         seq_len: usize,
         d: usize,
-        initial_m: Option<&[f32]>,
+        initial_m: Option<Vec<f32>>,
     ) -> (Vec<f32>, DeltaRuleCache) {
         debug_assert_eq!(embedded.len(), seq_len * d);
 
@@ -197,7 +226,7 @@ impl MemoryRule for DeltaRule {
         let mut m_states = vec![0.0f32; (seq_len + 1) * d * d];
         if let Some(m0) = initial_m {
             debug_assert_eq!(m0.len(), d * d);
-            m_states[..d * d].copy_from_slice(m0);
+            m_states[..d * d].copy_from_slice(&m0);
         }
         let mut concat_kv = vec![0.0f32; seq_len * 2 * d];
         let mut alpha_pre = vec![0.0f32; seq_len];
@@ -706,12 +735,12 @@ mod tests {
         // Write: M = 0 - 1.0 * outer(0*k - v, k) = outer(v, k)
         // prediction = M@k = 0, error = 0-v = -v, grad = outer(-v, k)
         // M_new = (1-0)*M - 1.0*outer(-v,k) = outer(v, k)
-        rule.write(&mut state, &k, &v, &gates);
+        rule.write(&mut state, &k, &v, &gates).unwrap();
 
         // Read: M @ q should give v[0]*q for q aligned with k
         let q = [1.0f32, 0.0, 0.0, 0.0];
         let mut out = [0.0f32; 4];
-        rule.read(&state, &q, &mut out);
+        rule.read(&state, &q, &mut out).unwrap();
         // M = outer(v, k) = [[0,0,0,0],[1,0,0,0],[0,0,0,0],[0,0,0,0]]
         // M @ q = [0, 1, 0, 0]
         assert!((out[1] - 1.0).abs() < 1e-6, "read should return stored value");
