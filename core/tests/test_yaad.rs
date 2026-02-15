@@ -1,4 +1,4 @@
-//! Hebbian Rule integration tests: multi-step training, comparison vs Delta Rule.
+//! YAAD integration tests: 2-layer MLP memory with Huber loss and decoupled retention.
 
 use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind};
 use nl_hecate_core::mag::{cms_forward, cms_backward, mag_forward, mag_backward, MemoryCache};
@@ -10,7 +10,6 @@ fn make_data(cfg: &MAGConfig) -> (Vec<usize>, Vec<usize>) {
     (input_ids, target_ids)
 }
 
-/// Generate multi-scale data with fast + slow temporal patterns.
 fn make_multiscale_data(
     seq_len: usize,
     vocab_size: usize,
@@ -33,7 +32,15 @@ fn make_multiscale_data(
     (input_ids, target_ids)
 }
 
-/// Run CMS training loop for N steps. Returns (initial_loss, final_loss).
+/// Create ContextState with correct memory size for YAAD (W1+W2 instead of d*d).
+fn make_context_state(cfg: &MAGConfig) -> ContextState {
+    let dh = cfg.d_hidden;
+    let d = cfg.swa.d_model;
+    let mem_size = dh * d + d * dh;
+    ContextState::new_with_memory_size(cfg.k, d, mem_size)
+}
+
+/// CMS training loop for YAAD. Uses correct memory size for ContextState.
 fn cms_train(
     params: &mut MAGParams,
     cfg: &MAGConfig,
@@ -43,7 +50,7 @@ fn cms_train(
     lr: f32,
 ) -> (f32, f32) {
     let mut conductor = Conductor::new(cfg.k, cfg.chunk_sizes.clone());
-    let mut context = ContextState::new(cfg.k, cfg.swa.d_model);
+    let mut context = make_context_state(cfg);
     let mut error_buffers: Vec<ErrorBuffer> = (0..cfg.k)
         .map(|_| ErrorBuffer::new(cfg.swa.d_model))
         .collect();
@@ -74,12 +81,12 @@ fn cms_train(
     (initial_loss.unwrap(), final_loss)
 }
 
-// ── Hebbian k=1 tests ────────────────────────────────────────────────
+// ── YAAD k=1 tests ─────────────────────────────────────────────────
 
 /// 100-step smoke test: no NaN, no divergence, loss finite.
 #[test]
-fn test_hebbian_k1_smoke() {
-    let cfg = MAGConfig::hebbian_test_config();
+fn test_yaad_k1_smoke() {
+    let cfg = MAGConfig::yaad_test_config();
     let mut params = MAGParams::init(&cfg, 42);
     let (input_ids, target_ids) = make_data(&cfg);
 
@@ -95,20 +102,17 @@ fn test_hebbian_k1_smoke() {
         params.sgd_step(&grads, 0.01);
     }
 
-    let final_loss = {
-        let (loss, _) = mag_forward(&params, &cfg, &input_ids, &target_ids);
-        loss
-    };
+    let final_loss = mag_forward(&params, &cfg, &input_ids, &target_ids).0;
     let initial = prev_loss.unwrap();
-    eprintln!("Hebbian k=1 smoke: initial={initial:.4}, final={final_loss:.4}");
+    eprintln!("YAAD k=1 smoke: initial={initial:.4}, final={final_loss:.4}");
     assert!(final_loss.is_finite(), "Final loss not finite");
     assert!(final_loss < 100.0, "Loss diverged: {final_loss}");
 }
 
 /// 1K-step convergence: loss decreases.
 #[test]
-fn test_hebbian_k1_convergence() {
-    let cfg = MAGConfig::hebbian_test_config();
+fn test_yaad_k1_convergence() {
+    let cfg = MAGConfig::yaad_test_config();
     let mut params = MAGParams::init(&cfg, 42);
     let (input_ids, target_ids) = make_data(&cfg);
 
@@ -122,51 +126,67 @@ fn test_hebbian_k1_convergence() {
         params.sgd_step(&grads, 0.01);
     }
 
-    let final_loss = {
-        let (loss, _) = mag_forward(&params, &cfg, &input_ids, &target_ids);
-        loss
-    };
+    let final_loss = mag_forward(&params, &cfg, &input_ids, &target_ids).0;
     let initial = initial_loss.unwrap();
-    eprintln!("Hebbian k=1 convergence: initial={initial:.4}, final={final_loss:.4}");
+    eprintln!("YAAD k=1 convergence: initial={initial:.4}, final={final_loss:.4}");
     assert!(final_loss < initial,
         "Loss should decrease: initial={initial:.4}, final={final_loss:.4}");
 }
 
-/// Verify memory M is non-trivial after forward pass.
+/// Verify MLP W1/W2 are non-trivial after forward pass, and boundary snapshots exist.
 #[test]
-fn test_hebbian_memory_nonzero() {
-    let cfg = MAGConfig::hebbian_test_config();
+fn test_yaad_mlp_nonzero() {
+    let cfg = MAGConfig::yaad_test_config();
     let params = MAGParams::init(&cfg, 42);
     let (input_ids, target_ids) = make_data(&cfg);
 
     let (_, cache) = mag_forward(&params, &cfg, &input_ids, &target_ids);
 
     match &cache.memory_cache {
-        MemoryCache::Hebbian(hc) => {
-            let d = hc.d;
-            let seq = hc.seq_len;
-            let m_final = &hc.m_states[seq * d * d..(seq + 1) * d * d];
-            let m_norm: f32 = m_final.iter().map(|x| x * x).sum::<f32>().sqrt();
-            eprintln!("Final M norm: {m_norm:.6e}");
-            assert!(m_norm > 1e-6, "Memory M should be non-trivial, got {m_norm:.4e}");
+        MemoryCache::YAAD(yc) => {
+            let d = yc.d;
+            let dh = yc.d_hidden;
+            let s = yc.seq_len;
+            let w1_size = dh * d;
+            let w2_size = d * dh;
+
+            // Check final W1
+            let w1_final = &yc.w1_states[s * w1_size..(s + 1) * w1_size];
+            let w1_norm: f32 = w1_final.iter().map(|x| x * x).sum::<f32>().sqrt();
+            eprintln!("Final W1 norm: {w1_norm:.6e}");
+            assert!(w1_norm > 1e-6, "MLP W1 should be non-trivial, got {w1_norm:.4e}");
+
+            // Check final W2
+            let w2_final = &yc.w2_states[s * w2_size..(s + 1) * w2_size];
+            let w2_norm: f32 = w2_final.iter().map(|x| x * x).sum::<f32>().sqrt();
+            eprintln!("Final W2 norm: {w2_norm:.6e}");
+            assert!(w2_norm > 1e-6, "MLP W2 should be non-trivial, got {w2_norm:.4e}");
+
+            // Check boundary snapshots are populated
+            let b1_norm: f32 = yc.w1_boundary.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let b2_norm: f32 = yc.w2_boundary.iter().map(|x| x * x).sum::<f32>().sqrt();
+            eprintln!("Boundary W1 norm: {b1_norm:.6e}, W2 norm: {b2_norm:.6e}");
+            // W1 boundary should be non-zero (Xavier init), W2 boundary is zero (init)
+            assert!(b1_norm > 1e-6, "W1 boundary should be non-trivial (Xavier init)");
+            assert!(b2_norm < 1e-12, "W2 boundary should be zero (init)");
+            assert_eq!(yc.w1_boundary.len(), w1_size, "W1 boundary wrong size");
+            assert_eq!(yc.w2_boundary.len(), w2_size, "W2 boundary wrong size");
         }
-        _ => {
-            panic!("Expected HebbianCache");
-        }
+        _ => panic!("Expected YAADCache"),
     }
 }
 
-/// CMS k=2 with Hebbian on multi-scale data.
+/// CMS k=2 with YAAD on multi-scale data.
 #[test]
-fn test_hebbian_k2_multiscale() {
-    let cfg = MAGConfig::hebbian_test_config_k2();
+fn test_yaad_k2_multiscale() {
+    let cfg = MAGConfig::yaad_test_config_k2();
     let mut params = MAGParams::init(&cfg, 42);
     let (input_ids, target_ids) = make_multiscale_data(
         cfg.swa.seq_len, cfg.swa.vocab_size, 4, 4,
     );
 
     let (initial, final_loss) = cms_train(&mut params, &cfg, &input_ids, &target_ids, 5_000, 0.01);
-    eprintln!("Hebbian k=2 multiscale: initial={initial:.4}, final={final_loss:.4}");
+    eprintln!("YAAD k=2 multiscale: initial={initial:.4}, final={final_loss:.4}");
 
     assert!(initial.is_finite(), "Initial loss not finite");
     assert!(final_loss.is_finite(), "Final loss not finite");
@@ -174,10 +194,10 @@ fn test_hebbian_k2_multiscale() {
         "Loss should decrease: initial={initial:.4}, final={final_loss:.4}");
 }
 
-/// Compare Hebbian vs Delta Rule on same data.
-/// Hebbian should converge but is expected to be less precise (no error correction).
+/// Compare YAAD vs Delta Rule on same data.
+/// YAAD should converge — Huber loss + decoupled retention is a valid configuration.
 #[test]
-fn test_hebbian_vs_delta() {
+fn test_yaad_vs_delta() {
     use nl_hecate_core::model::SWAConfig;
 
     let swa = SWAConfig {
@@ -189,13 +209,13 @@ fn test_hebbian_vs_delta() {
         swa: swa.clone(), memory_enabled: true,
         memory_rule: MemoryRuleKind::DeltaRule,
         k: 1, chunk_sizes: vec![1],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
+        d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
     };
-    let cfg_hebbian = MAGConfig {
+    let cfg_yaad = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
-        memory_rule: MemoryRuleKind::HebbianRule,
+        memory_rule: MemoryRuleKind::YAAD,
         k: 1, chunk_sizes: vec![1],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
+        d_hidden: 4, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.01, lambda_2: 0.01, delta: 1.0,
     };
 
     let input_ids: Vec<usize> = (0..swa.seq_len).map(|t| t % swa.vocab_size).collect();
@@ -214,33 +234,32 @@ fn test_hebbian_vs_delta() {
     }
     let delta_final = mag_forward(&params_delta, &cfg_delta, &input_ids, &target_ids).0;
 
-    // Train Hebbian
-    let mut params_hebbian = MAGParams::init(&cfg_hebbian, 42);
-    let mut hebbian_initial = None;
+    // Train YAAD
+    let mut params_yaad = MAGParams::init(&cfg_yaad, 42);
+    let mut yaad_initial = None;
     for _ in 0..steps {
-        let (loss, cache) = mag_forward(&params_hebbian, &cfg_hebbian, &input_ids, &target_ids);
-        if hebbian_initial.is_none() { hebbian_initial = Some(loss); }
-        let grads = mag_backward(&params_hebbian, &cfg_hebbian, &cache, &input_ids, &target_ids);
-        params_hebbian.sgd_step(&grads, lr);
+        let (loss, cache) = mag_forward(&params_yaad, &cfg_yaad, &input_ids, &target_ids);
+        if yaad_initial.is_none() { yaad_initial = Some(loss); }
+        let grads = mag_backward(&params_yaad, &cfg_yaad, &cache, &input_ids, &target_ids);
+        params_yaad.sgd_step(&grads, lr);
     }
-    let hebbian_final = mag_forward(&params_hebbian, &cfg_hebbian, &input_ids, &target_ids).0;
+    let yaad_final = mag_forward(&params_yaad, &cfg_yaad, &input_ids, &target_ids).0;
 
     eprintln!("Delta: initial={:.4}, final={delta_final:.4}", delta_initial.unwrap());
-    eprintln!("Hebbian: initial={:.4}, final={hebbian_final:.4}", hebbian_initial.unwrap());
+    eprintln!("YAAD: initial={:.4}, final={yaad_final:.4}", yaad_initial.unwrap());
 
     // Both should converge
     assert!(delta_final < delta_initial.unwrap(), "Delta should converge");
-    assert!(hebbian_final < hebbian_initial.unwrap(), "Hebbian should converge");
+    assert!(yaad_final < yaad_initial.unwrap(), "YAAD should converge");
 
-    // Hebbian is expected to be less precise, but should still be in same ballpark
-    // (within 5x of Delta — generous margin for no error correction)
-    assert!(hebbian_final < delta_final * 5.0,
-        "Hebbian should not catastrophically regress: hebbian={hebbian_final:.6}, delta={delta_final:.6}");
+    // YAAD should be in same ballpark as Delta (MLP memory is different, not necessarily better at d=8)
+    assert!(yaad_final < delta_final * 5.0,
+        "YAAD should not catastrophically regress: yaad={yaad_final:.6}, delta={delta_final:.6}");
 
-    if hebbian_final > delta_final {
-        let ratio = hebbian_final / delta_final;
-        eprintln!("NOTE: Delta beats Hebbian by {ratio:.2}x — expected (error correction helps)");
+    let ratio = if yaad_final > delta_final {
+        yaad_final / delta_final
     } else {
-        eprintln!("Hebbian matches/beats Delta at d=8 scale — surprising but possible");
-    }
+        delta_final / yaad_final
+    };
+    eprintln!("Performance ratio: {ratio:.2}x (closer to 1.0 = more similar)");
 }

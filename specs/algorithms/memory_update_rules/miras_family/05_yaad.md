@@ -43,7 +43,9 @@ STATE: YAADState
 OUTER_PARAMS: YAADParams
   W_K, W_V, W_Q: (same as MONETA)
   gate_params: GateParams
-  delta: f32                     -- Huber threshold
+
+CONFIG: YAADConfig (hyperparameters, not learned)
+  delta: f32                     -- Huber threshold (default: 1.0)
   lambda_local: f32              -- local retention strength (stay close to boundary)
   lambda_global: f32             -- global retention strength (keep small)
 ```
@@ -57,7 +59,8 @@ ALGORITHM: yaad_init_chunk(state: &mut YAADState)
   state.W2_boundary = state.W2.clone()
 
 ALGORITHM: yaad_step(state: &mut YAADState, x_t: &Tensor,
-                     outer: &YAADParams, pulse: &Pulse) -> Tensor
+                     outer: &YAADParams, config: &YAADConfig,
+                     pulse: &Pulse) -> Tensor
   k_t = x_t @ outer.W_K^T
   v_t = x_t @ outer.W_V^T
   q_t = x_t @ outer.W_Q^T
@@ -78,9 +81,9 @@ ALGORITHM: yaad_step(state: &mut YAADState, x_t: &Tensor,
   -- Gradient:
   --   e                if |e| < delta    (same as L2)
   --   delta * sign(e)  if |e| >= delta   (same as L1, bounded)
-  huber_grad = WHERE(abs(error) < outer.delta,
+  huber_grad = WHERE(abs(error) < config.delta,
                      error,
-                     outer.delta * sign(error))
+                     config.delta * sign(error))
 
   -- Backprop through MLP (analytical)
   grad_W2 = outer_product(huber_grad, h)
@@ -95,10 +98,10 @@ ALGORITHM: yaad_step(state: &mut YAADState, x_t: &Tensor,
   -- Global: keep overall magnitude bounded
   --   L_global = lambda_global * ||W||^2
   --   grad_global = lambda_global * 2 * W
-  ret_local_W1 = outer.lambda_local * 2 * (state.W1 - state.W1_boundary)
-  ret_global_W1 = outer.lambda_global * 2 * state.W1
-  ret_local_W2 = outer.lambda_local * 2 * (state.W2 - state.W2_boundary)
-  ret_global_W2 = outer.lambda_global * 2 * state.W2
+  ret_local_W1 = config.lambda_local * 2 * (state.W1 - state.W1_boundary)
+  ret_global_W1 = config.lambda_global * 2 * state.W1
+  ret_local_W2 = config.lambda_local * 2 * (state.W2 - state.W2_boundary)
+  ret_global_W2 = config.lambda_global * 2 * state.W2
 
   -- Update
   state.W1 = state.W1 - gates.theta * (grad_W1 + ret_local_W1 + ret_global_W1)

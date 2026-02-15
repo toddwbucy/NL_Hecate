@@ -16,7 +16,7 @@ use crate::conductor::{Pulse, ContextState, ErrorBuffer};
 /// MONETA uses W1+W2 (d_hidden*d + d*d_hidden), other rules use d*d.
 fn make_context_state(cfg: &MAGConfig) -> ContextState {
     match cfg.memory_rule {
-        MemoryRuleKind::Moneta => {
+        MemoryRuleKind::Moneta | MemoryRuleKind::YAAD => {
             let dh = cfg.d_hidden;
             let d = cfg.swa.d_model;
             let mem_size = dh * d + d * dh;
@@ -692,6 +692,11 @@ mod tests {
                 m_t.iter().map(|x| x * x).sum::<f32>().sqrt()
             }
             crate::mag::MemoryCache::Moneta(c) => {
+                let w1_size = c.d_hidden * d;
+                let w1_t = &c.w1_states[s * w1_size..(s + 1) * w1_size];
+                w1_t.iter().map(|x| x * x).sum::<f32>().sqrt()
+            }
+            crate::mag::MemoryCache::YAAD(c) => {
                 let w1_size = c.d_hidden * d;
                 let w1_t = &c.w1_states[s * w1_size..(s + 1) * w1_size];
                 w1_t.iter().map(|x| x * x).sum::<f32>().sqrt()
@@ -2562,5 +2567,428 @@ mod tests {
         );
         eprintln!("moneta CMS l1_b_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
         assert!(passed == checked, "moneta l1_b_theta: {passed}/{checked} passed");
+    }
+
+    // ── YAAD gradient checks (k=1, MAG) ──────────────────────────────
+
+    fn yaad_grad_check_config() -> MAGConfig {
+        MAGConfig::yaad_test_config()
+    }
+
+    fn yaad_params_for_grad_check(cfg: &MAGConfig, seed: u64) -> MAGParams {
+        let mut params = MAGParams::init(cfg, seed);
+        for level in &mut params.levels {
+            level.b_alpha = vec![0.0f32];  // sigmoid(0)=0.5
+        }
+        params
+    }
+
+    #[test]
+    fn test_yaad_gradient_w_k_mem() {
+        let cfg = yaad_grad_check_config();
+        let params = yaad_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "yaad_w_k_mem",
+            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("yaad_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "yaad_w_k_mem: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_yaad_gradient_w_v_mem() {
+        let cfg = yaad_grad_check_config();
+        let params = yaad_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "yaad_w_v_mem",
+            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("yaad_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "yaad_w_v_mem: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_yaad_gradient_w_q_mem() {
+        let cfg = yaad_grad_check_config();
+        let params = yaad_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "yaad_w_q_mem",
+            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("yaad_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "yaad_w_q_mem: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_yaad_gradient_w_alpha() {
+        let cfg = yaad_grad_check_config();
+        let params = yaad_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "yaad_w_alpha",
+            |p| &p.levels[0].w_alpha, |p, i, v| p.levels[0].w_alpha[i] = v, |g| &g.levels[0].w_alpha,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("yaad_w_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "yaad_w_alpha: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_yaad_gradient_b_alpha() {
+        let cfg = yaad_grad_check_config();
+        let params = yaad_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "yaad_b_alpha",
+            |p| &p.levels[0].b_alpha, |p, i, v| p.levels[0].b_alpha[i] = v, |g| &g.levels[0].b_alpha,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("yaad_b_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "yaad_b_alpha: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_yaad_gradient_w_theta() {
+        let cfg = yaad_grad_check_config();
+        let params = yaad_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "yaad_w_theta",
+            |p| &p.levels[0].w_theta, |p, i, v| p.levels[0].w_theta[i] = v, |g| &g.levels[0].w_theta,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("yaad_w_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "yaad_w_theta: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_yaad_gradient_b_theta() {
+        let cfg = yaad_grad_check_config();
+        let params = yaad_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "yaad_b_theta",
+            |p| &p.levels[0].b_theta, |p, i, v| p.levels[0].b_theta[i] = v, |g| &g.levels[0].b_theta,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("yaad_b_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "yaad_b_theta: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    // ── YAAD CMS gradient checks (k=2, both levels active) ────────────
+
+    fn yaad_cms_grad_check_config() -> MAGConfig {
+        MAGConfig::yaad_test_config_k2()
+    }
+
+    fn yaad_cms_params_for_grad_check(cfg: &MAGConfig, seed: u64) -> MAGParams {
+        let mut params = MAGParams::init(cfg, seed);
+        for level in &mut params.levels {
+            level.b_alpha = vec![0.0f32];
+        }
+        params
+    }
+
+    fn yaad_cms_make_test_data(cfg: &MAGConfig) -> (Vec<usize>, Vec<usize>) {
+        let input_ids: Vec<usize> = (0..cfg.swa.seq_len).map(|t| t % cfg.swa.vocab_size).collect();
+        let target_ids: Vec<usize> = (1..=cfg.swa.seq_len).map(|t| t % cfg.swa.vocab_size).collect();
+        (input_ids, target_ids)
+    }
+
+    // ── YAAD CMS Level 0 FD checks ──────────────────────────────────
+
+    #[test]
+    fn test_yaad_cms_gradient_l0_w_k_mem() {
+        let cfg = yaad_cms_grad_check_config();
+        let params = yaad_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = yaad_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "yaad_l0_w_k_mem", &pulse,
+            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("yaad CMS l0_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "yaad l0_w_k_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_yaad_cms_gradient_l0_w_v_mem() {
+        let cfg = yaad_cms_grad_check_config();
+        let params = yaad_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = yaad_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "yaad_l0_w_v_mem", &pulse,
+            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("yaad CMS l0_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "yaad l0_w_v_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_yaad_cms_gradient_l0_w_q_mem() {
+        let cfg = yaad_cms_grad_check_config();
+        let params = yaad_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = yaad_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "yaad_l0_w_q_mem", &pulse,
+            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("yaad CMS l0_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "yaad l0_w_q_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_yaad_cms_gradient_l0_w_alpha() {
+        let cfg = yaad_cms_grad_check_config();
+        let params = yaad_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = yaad_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "yaad_l0_w_alpha", &pulse,
+            |p| &p.levels[0].w_alpha, |p, i, v| p.levels[0].w_alpha[i] = v, |g| &g.levels[0].w_alpha,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("yaad CMS l0_w_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "yaad l0_w_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_yaad_cms_gradient_l0_b_alpha() {
+        let cfg = yaad_cms_grad_check_config();
+        let params = yaad_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = yaad_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "yaad_l0_b_alpha", &pulse,
+            |p| &p.levels[0].b_alpha, |p, i, v| p.levels[0].b_alpha[i] = v, |g| &g.levels[0].b_alpha,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("yaad CMS l0_b_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "yaad l0_b_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_yaad_cms_gradient_l0_w_theta() {
+        let cfg = yaad_cms_grad_check_config();
+        let params = yaad_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = yaad_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "yaad_l0_w_theta", &pulse,
+            |p| &p.levels[0].w_theta, |p, i, v| p.levels[0].w_theta[i] = v, |g| &g.levels[0].w_theta,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("yaad CMS l0_w_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "yaad l0_w_theta: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_yaad_cms_gradient_l0_b_theta() {
+        let cfg = yaad_cms_grad_check_config();
+        let params = yaad_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = yaad_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "yaad_l0_b_theta", &pulse,
+            |p| &p.levels[0].b_theta, |p, i, v| p.levels[0].b_theta[i] = v, |g| &g.levels[0].b_theta,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("yaad CMS l0_b_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "yaad l0_b_theta: {passed}/{checked} passed");
+    }
+
+    // ── YAAD CMS Level 1 FD checks ──────────────────────────────────
+
+    #[test]
+    fn test_yaad_cms_gradient_l1_w_k_mem() {
+        let cfg = yaad_cms_grad_check_config();
+        let params = yaad_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = yaad_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "yaad_l1_w_k_mem", &pulse,
+            |p| &p.levels[1].w_k_mem, |p, i, v| p.levels[1].w_k_mem[i] = v, |g| &g.levels[1].w_k_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("yaad CMS l1_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "yaad l1_w_k_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_yaad_cms_gradient_l1_w_v_mem() {
+        let cfg = yaad_cms_grad_check_config();
+        let params = yaad_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = yaad_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "yaad_l1_w_v_mem", &pulse,
+            |p| &p.levels[1].w_v_mem, |p, i, v| p.levels[1].w_v_mem[i] = v, |g| &g.levels[1].w_v_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("yaad CMS l1_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "yaad l1_w_v_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_yaad_cms_gradient_l1_w_q_mem() {
+        let cfg = yaad_cms_grad_check_config();
+        let params = yaad_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = yaad_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "yaad_l1_w_q_mem", &pulse,
+            |p| &p.levels[1].w_q_mem, |p, i, v| p.levels[1].w_q_mem[i] = v, |g| &g.levels[1].w_q_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("yaad CMS l1_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "yaad l1_w_q_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_yaad_cms_gradient_l1_w_alpha() {
+        let cfg = yaad_cms_grad_check_config();
+        let params = yaad_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = yaad_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "yaad_l1_w_alpha", &pulse,
+            |p| &p.levels[1].w_alpha, |p, i, v| p.levels[1].w_alpha[i] = v, |g| &g.levels[1].w_alpha,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("yaad CMS l1_w_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "yaad l1_w_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_yaad_cms_gradient_l1_b_alpha() {
+        let cfg = yaad_cms_grad_check_config();
+        let params = yaad_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = yaad_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "yaad_l1_b_alpha", &pulse,
+            |p| &p.levels[1].b_alpha, |p, i, v| p.levels[1].b_alpha[i] = v, |g| &g.levels[1].b_alpha,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("yaad CMS l1_b_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "yaad l1_b_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_yaad_cms_gradient_l1_w_theta() {
+        let cfg = yaad_cms_grad_check_config();
+        let params = yaad_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = yaad_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "yaad_l1_w_theta", &pulse,
+            |p| &p.levels[1].w_theta, |p, i, v| p.levels[1].w_theta[i] = v, |g| &g.levels[1].w_theta,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("yaad CMS l1_w_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "yaad l1_w_theta: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_yaad_cms_gradient_l1_b_theta() {
+        let cfg = yaad_cms_grad_check_config();
+        let params = yaad_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = yaad_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "yaad_l1_b_theta", &pulse,
+            |p| &p.levels[1].b_theta, |p, i, v| p.levels[1].b_theta[i] = v, |g| &g.levels[1].b_theta,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("yaad CMS l1_b_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "yaad l1_b_theta: {passed}/{checked} passed");
     }
 }

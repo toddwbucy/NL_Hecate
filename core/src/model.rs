@@ -16,6 +16,7 @@ pub enum MemoryRuleKind {
     TitansLMM,
     HebbianRule,
     Moneta,
+    YAAD,
 }
 
 /// Model configuration — immutable after construction.
@@ -289,13 +290,15 @@ pub struct MAGConfig {
     /// l_p norm exponent for MONETA attentional bias (default: 2.0).
     pub lp_p: f32,
     /// L_q retention exponent for MONETA (default: 2.0).
-    /// TODO: L_q local retention not yet implemented — reserved for future MIRAS variants.
     pub lq_q: f32,
-    /// Local retention strength for MONETA (default: 0.0 = disabled).
-    /// TODO: L_q local retention not yet implemented — reserved for future MIRAS variants.
-    pub lambda_q: f32,
-    /// Global L2 retention strength for MONETA (default: 0.01).
+    /// Local retention strength: L2 penalty toward chunk-boundary snapshot.
+    /// Used by YAAD (default: 0.01). MONETA sets to 0.0 (disabled).
+    pub lambda_local: f32,
+    /// Global L2 retention strength for MONETA/YAAD (default: 0.01).
     pub lambda_2: f32,
+    /// Huber loss threshold for YAAD (default: 1.0).
+    /// Errors below delta get L2 gradient; above get bounded L1 gradient.
+    pub delta: f32,
 }
 
 /// Default gate bias init values per level index.
@@ -352,7 +355,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 1,
             chunk_sizes: vec![1],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_q: 0.0, lambda_2: 0.0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
         }
     }
 
@@ -371,7 +374,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 2,
             chunk_sizes: vec![1, 8],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_q: 0.0, lambda_2: 0.0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
         }
     }
 
@@ -390,7 +393,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 1,
             chunk_sizes: vec![1],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_q: 0.0, lambda_2: 0.0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
         }
     }
 
@@ -410,7 +413,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 2,
             chunk_sizes: vec![1, 8],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_q: 0.0, lambda_2: 0.0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
         }
     }
 
@@ -430,7 +433,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 4,
             chunk_sizes: vec![1, 8, 64, 512],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_q: 0.0, lambda_2: 0.0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
         }
     }
 
@@ -450,7 +453,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 4,
             chunk_sizes: vec![1, 8, 64, 512],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_q: 0.0, lambda_2: 0.0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
         }
     }
 
@@ -469,7 +472,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::TitansLMM,
             k: 1,
             chunk_sizes: vec![1],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_q: 0.0, lambda_2: 0.0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
         }
     }
 
@@ -488,7 +491,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::HebbianRule,
             k: 1,
             chunk_sizes: vec![1],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_q: 0.0, lambda_2: 0.0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
         }
     }
 
@@ -507,7 +510,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::HebbianRule,
             k: 2,
             chunk_sizes: vec![1, 8],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_q: 0.0, lambda_2: 0.0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
         }
     }
 
@@ -526,7 +529,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::TitansLMM,
             k: 2,
             chunk_sizes: vec![1, 8],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_q: 0.0, lambda_2: 0.0,
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
         }
     }
 
@@ -548,8 +551,9 @@ impl MAGConfig {
             d_hidden: 4,
             lp_p: 2.0,
             lq_q: 2.0,
-            lambda_q: 0.0,
+            lambda_local: 0.0,
             lambda_2: 0.01,
+            delta: 1.0,
         }
     }
 
@@ -571,8 +575,57 @@ impl MAGConfig {
             d_hidden: 4,
             lp_p: 2.0,
             lq_q: 2.0,
-            lambda_q: 0.0,
+            lambda_local: 0.0,
             lambda_2: 0.01,
+            delta: 1.0,
+        }
+    }
+
+    /// YAAD test configuration: d=8, d_hidden=4, Huber delta=1.0 (k=1).
+    pub fn yaad_test_config() -> Self {
+        MAGConfig {
+            swa: SWAConfig {
+                d_model: 8,
+                num_heads: 2,
+                head_dim: 4,
+                seq_len: 4,
+                window_size: 4,
+                vocab_size: 16,
+            },
+            memory_enabled: true,
+            memory_rule: MemoryRuleKind::YAAD,
+            k: 1,
+            chunk_sizes: vec![1],
+            d_hidden: 4,
+            lp_p: 2.0,
+            lq_q: 2.0,
+            lambda_local: 0.01,
+            lambda_2: 0.01,
+            delta: 1.0,
+        }
+    }
+
+    /// YAAD test configuration for CMS k=2 testing.
+    pub fn yaad_test_config_k2() -> Self {
+        MAGConfig {
+            swa: SWAConfig {
+                d_model: 8,
+                num_heads: 2,
+                head_dim: 4,
+                seq_len: 8,
+                window_size: 8,
+                vocab_size: 16,
+            },
+            memory_enabled: true,
+            memory_rule: MemoryRuleKind::YAAD,
+            k: 2,
+            chunk_sizes: vec![1, 8],
+            d_hidden: 4,
+            lp_p: 2.0,
+            lq_q: 2.0,
+            lambda_local: 0.01,
+            lambda_2: 0.01,
+            delta: 1.0,
         }
     }
 }
