@@ -64,6 +64,12 @@ impl ContextState {
         let memory = (0..k).map(|_| vec![0.0f32; d * d]).collect();
         ContextState { memory, d }
     }
+
+    /// Create with custom memory size per level (for MLP-based rules like MONETA).
+    pub fn new_with_memory_size(k: usize, d: usize, mem_size: usize) -> Self {
+        let memory = (0..k).map(|_| vec![0.0f32; mem_size]).collect();
+        ContextState { memory, d }
+    }
 }
 
 /// Accumulated outer-loop gradients for a frozen level.

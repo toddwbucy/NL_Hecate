@@ -200,6 +200,19 @@ pub fn sigmoid_f32(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
+/// SiLU (Sigmoid Linear Unit): x * sigmoid(x). Smooth ReLU variant.
+#[inline]
+pub fn silu_f32(x: f32) -> f32 {
+    x * sigmoid_f32(x)
+}
+
+/// SiLU derivative: sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x)).
+#[inline]
+pub fn silu_prime_f32(x: f32) -> f32 {
+    let s = sigmoid_f32(x);
+    s + x * s * (1.0 - s)
+}
+
 /// Softplus: ln(1 + exp(x)). Numerically stable.
 #[inline]
 pub fn softplus_f32(x: f32) -> f32 {
@@ -417,5 +430,41 @@ mod tests {
         let dot = frobenius_dot_f32(&a, &b);
         // 1*5 + 2*6 + 3*7 + 4*8 = 5+12+21+32 = 70
         assert!((dot - 70.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_silu() {
+        // silu(0) = 0 * 0.5 = 0
+        assert!((silu_f32(0.0) - 0.0).abs() < 1e-6);
+        // silu(large) ≈ large (sigmoid → 1)
+        assert!((silu_f32(10.0) - 10.0).abs() < 0.01);
+        // silu(-large) ≈ 0 (sigmoid → 0)
+        assert!(silu_f32(-10.0).abs() < 0.01);
+        // silu(1.0) = 1.0 * sigmoid(1.0) ≈ 0.7311
+        assert!((silu_f32(1.0) - 0.7311).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_silu_prime() {
+        // Numerical derivative check: silu'(x) ≈ (silu(x+eps) - silu(x-eps)) / (2*eps)
+        for &x in &[-2.0f32, -1.0, 0.0, 0.5, 1.0, 3.0] {
+            let eps = 1e-4;
+            let numerical = (silu_f32(x + eps) - silu_f32(x - eps)) / (2.0 * eps);
+            let analytical = silu_prime_f32(x);
+            assert!((analytical - numerical).abs() < 1e-3,
+                "silu_prime({x}): analytical={analytical}, numerical={numerical}");
+        }
+    }
+
+    #[test]
+    fn test_silu_monotonic_for_positive() {
+        // SiLU is monotonically increasing for x > 0
+        let mut prev = silu_f32(0.01);
+        for i in 1..100 {
+            let x = i as f32 * 0.1;
+            let y = silu_f32(x);
+            assert!(y >= prev, "SiLU not monotonic at x={x}: {y} < {prev}");
+            prev = y;
+        }
     }
 }

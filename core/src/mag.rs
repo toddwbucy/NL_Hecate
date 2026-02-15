@@ -12,6 +12,7 @@ use crate::model::{MAGConfig, MAGParams, MemoryRuleKind};
 use crate::delta_rule::{MemoryRule, DeltaRule, DeltaRuleCache, delta_rule_read_only, delta_rule_read_only_backward};
 use crate::titans_lmm::{TitansLMM, TitansLMMCache};
 use crate::hebbian_rule::{HebbianRule, HebbianCache};
+use crate::moneta::{Moneta, MonetaCache, moneta_read_only, moneta_read_only_backward};
 use crate::conductor::{Pulse, ContextState, ErrorBuffer};
 
 /// Memory cache enum for static dispatch across memory rule variants.
@@ -20,6 +21,7 @@ pub enum MemoryCache {
     Delta(DeltaRuleCache),
     Titans(TitansLMMCache),
     Hebbian(HebbianCache),
+    Moneta(MonetaCache),
 }
 
 /// Cache for MAG forward pass — holds both branches' intermediates.
@@ -103,6 +105,11 @@ pub fn mag_forward(
         MemoryRuleKind::HebbianRule => {
             let (y, cache) = HebbianRule.step(&params.levels[0], &embedded, s, d, None);
             (y, MemoryCache::Hebbian(cache))
+        }
+        MemoryRuleKind::Moneta => {
+            let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2 };
+            let (y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
+            (y, MemoryCache::Moneta(cache))
         }
     };
 
@@ -229,6 +236,10 @@ pub fn mag_backward(
         }
         MemoryCache::Hebbian(hebbian_cache) => {
             HebbianRule.step_backward(&params.levels[0], hebbian_cache, &d_y, &cache.embedded)
+        }
+        MemoryCache::Moneta(moneta_cache) => {
+            let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2 };
+            rule.step_backward(&params.levels[0], moneta_cache, &d_y, &cache.embedded)
         }
     };
 
@@ -393,6 +404,21 @@ pub fn cms_forward(
                     context.memory[level] = cache.m_states[m_final_start..m_final_start + d * d].to_vec();
                     (y, MemoryCache::Hebbian(cache))
                 }
+                MemoryRuleKind::Moneta => {
+                    let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2 };
+                    let (y, cache) = rule.step(&params.levels[level], &embedded, s, d, initial_m);
+                    // CMS context: W1_flat ++ W2_flat
+                    let dh = cfg.d_hidden;
+                    let w1_size = dh * d;
+                    let w2_size = d * dh;
+                    let w1_final = &cache.w1_states[s * w1_size..(s + 1) * w1_size];
+                    let w2_final = &cache.w2_states[s * w2_size..(s + 1) * w2_size];
+                    let mut ctx_mem = Vec::with_capacity(w1_size + w2_size);
+                    ctx_mem.extend_from_slice(w1_final);
+                    ctx_mem.extend_from_slice(w2_final);
+                    context.memory[level] = ctx_mem;
+                    (y, MemoryCache::Moneta(cache))
+                }
             };
 
             y_per_level.push(y_level);
@@ -400,19 +426,22 @@ pub fn cms_forward(
             q_mem_per_level.push(None);
             frozen_memories.push(None);
         } else {
-            // Frozen level: read-only from persisted M
-            let frozen_m = context.memory[level].clone();
-            let (y_level, q_mem) = delta_rule_read_only(
-                &params.levels[level],
-                &embedded,
-                &frozen_m,
-                s,
-                d,
-            );
+            // Frozen level: read-only from persisted M (rule-aware dispatch).
+            // Borrow context memory for the forward call, then clone for cache storage
+            // (backward needs owned copy since context may be mutated between calls).
+            let frozen_ref = &context.memory[level];
+            let (y_level, q_mem) = match cfg.memory_rule {
+                MemoryRuleKind::Moneta => moneta_read_only(
+                    &params.levels[level], &embedded, frozen_ref, s, d, cfg.d_hidden,
+                ),
+                _ => delta_rule_read_only(
+                    &params.levels[level], &embedded, frozen_ref, s, d,
+                ),
+            };
             y_per_level.push(y_level);
             memory_caches.push(None);
             q_mem_per_level.push(Some(q_mem));
-            frozen_memories.push(Some(frozen_m));
+            frozen_memories.push(Some(frozen_ref.clone()));
         }
     }
 
@@ -584,24 +613,33 @@ pub fn cms_backward(
                 MemoryCache::Hebbian(hebbian_cache) => {
                     HebbianRule.step_backward(&params.levels[level], hebbian_cache, &d_y_combined, &cache.embedded)
                 }
+                MemoryCache::Moneta(moneta_cache) => {
+                    let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2 };
+                    rule.step_backward(&params.levels[level], moneta_cache, &d_y_combined, &cache.embedded)
+                }
             };
             grads.levels[level].accumulate(&mem_grads);
             for i in 0..(s * d) {
                 d_embedded_mem_total[i] += d_embedded_mem[i];
             }
         } else {
-            // Frozen level: read-only backward, accumulate in error buffer
+            // Frozen level: read-only backward (rule-aware dispatch)
             let q_mem = cache.q_mem_per_level[level].as_ref().unwrap();
             let frozen_m = cache.frozen_memories[level].as_ref().unwrap();
-            let (mem_grads, d_embedded_mem) = delta_rule_read_only_backward(
-                &params.levels[level],
-                frozen_m,
-                q_mem,
-                &d_y_combined,
-                &cache.embedded,
-                s,
-                d,
-            );
+            let (mem_grads, d_embedded_mem) = match cfg.memory_rule {
+                MemoryRuleKind::Moneta => moneta_read_only_backward(
+                    &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.d_hidden,
+                ),
+                _ => delta_rule_read_only_backward(
+                    &params.levels[level],
+                    frozen_m,
+                    q_mem,
+                    &d_y_combined,
+                    &cache.embedded,
+                    s,
+                    d,
+                ),
+            };
             // Frozen level grads go to error buffer, not direct grads
             error_buffers[level].accumulate(&mem_grads);
             for i in 0..(s * d) {

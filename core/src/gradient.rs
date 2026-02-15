@@ -6,11 +6,25 @@
 /// - `finite_diff_gradient`: central finite differences for verification
 /// - Gradient checking utilities
 
-use crate::model::{SWAConfig, SWAParams, MAGConfig, MAGParams};
+use crate::model::{SWAConfig, SWAParams, MAGConfig, MAGParams, MemoryRuleKind};
 use crate::forward::forward;
 use crate::backward::backward_full;
 use crate::mag::{mag_forward, mag_backward, cms_forward, cms_backward};
 use crate::conductor::{Pulse, ContextState, ErrorBuffer};
+
+/// Create a ContextState with the correct memory size per level for the given config.
+/// MONETA uses W1+W2 (d_hidden*d + d*d_hidden), other rules use d*d.
+fn make_context_state(cfg: &MAGConfig) -> ContextState {
+    match cfg.memory_rule {
+        MemoryRuleKind::Moneta => {
+            let dh = cfg.d_hidden;
+            let d = cfg.swa.d_model;
+            let mem_size = dh * d + d * dh;
+            ContextState::new_with_memory_size(cfg.k, d, mem_size)
+        }
+        _ => ContextState::new(cfg.k, cfg.swa.d_model),
+    }
+}
 
 /// Compute gradients of loss with respect to all SWA parameters.
 /// This is the main training API — used by Python bindings in Phase 3.
@@ -261,12 +275,12 @@ fn cms_fd_single(
 
     let mut p_plus = params.clone();
     set_weight(&mut p_plus, idx, orig + eps);
-    let mut ctx_plus = ContextState::new(cfg.k, cfg.swa.d_model);
+    let mut ctx_plus = make_context_state(cfg);
     let (loss_plus, _) = cms_forward(&p_plus, cfg, input_ids, target_ids, pulse, &mut ctx_plus);
 
     let mut p_minus = params.clone();
     set_weight(&mut p_minus, idx, orig - eps);
-    let mut ctx_minus = ContextState::new(cfg.k, cfg.swa.d_model);
+    let mut ctx_minus = make_context_state(cfg);
     let (loss_minus, _) = cms_forward(&p_minus, cfg, input_ids, target_ids, pulse, &mut ctx_minus);
 
     (loss_plus - loss_minus) / (2.0 * eps)
@@ -663,15 +677,28 @@ mod tests {
         // Verify memory evolved meaningfully
         let d = cfg.swa.d_model;
         let s = cfg.swa.seq_len;
-        let m_states = match &cache.memory_cache {
-            crate::mag::MemoryCache::Delta(c) => &c.m_states,
-            crate::mag::MemoryCache::Titans(c) => &c.m_states,
-            crate::mag::MemoryCache::Hebbian(c) => &c.m_states,
+        // Verify memory evolved — MONETA uses W1/W2 instead of d×d matrix
+        let memory_evolved = match &cache.memory_cache {
+            crate::mag::MemoryCache::Delta(c) => {
+                let m_t = &c.m_states[s * d * d..(s + 1) * d * d];
+                m_t.iter().map(|x| x * x).sum::<f32>().sqrt()
+            }
+            crate::mag::MemoryCache::Titans(c) => {
+                let m_t = &c.m_states[s * d * d..(s + 1) * d * d];
+                m_t.iter().map(|x| x * x).sum::<f32>().sqrt()
+            }
+            crate::mag::MemoryCache::Hebbian(c) => {
+                let m_t = &c.m_states[s * d * d..(s + 1) * d * d];
+                m_t.iter().map(|x| x * x).sum::<f32>().sqrt()
+            }
+            crate::mag::MemoryCache::Moneta(c) => {
+                let w1_size = c.d_hidden * d;
+                let w1_t = &c.w1_states[s * w1_size..(s + 1) * w1_size];
+                w1_t.iter().map(|x| x * x).sum::<f32>().sqrt()
+            }
         };
-        let m_t = &m_states[s * d * d..(s + 1) * d * d];
-        let mt_norm: f32 = m_t.iter().map(|x| x * x).sum::<f32>().sqrt();
-        eprintln!("MAG final memory norm: {mt_norm:.4e}");
-        assert!(mt_norm > 1e-6, "Memory should evolve during training, norm={mt_norm}");
+        eprintln!("MAG final memory norm: {memory_evolved:.4e}");
+        assert!(memory_evolved > 1e-6, "Memory should evolve during training, norm={memory_evolved}");
     }
 
     // ── CMS gradient checks (k=2, both levels active) ──────────────
@@ -2112,5 +2139,428 @@ mod tests {
         );
         eprintln!("hebbian CMS l1_b_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
         assert!(passed == checked, "hebbian l1_b_alpha: {passed}/{checked} passed");
+    }
+
+    // ── MONETA gradient checks (k=1, MAG) ────────────────────────────
+
+    fn moneta_grad_check_config() -> MAGConfig {
+        MAGConfig::moneta_test_config()
+    }
+
+    fn moneta_params_for_grad_check(cfg: &MAGConfig, seed: u64) -> MAGParams {
+        let mut params = MAGParams::init(cfg, seed);
+        for level in &mut params.levels {
+            level.b_alpha = vec![0.0f32];  // sigmoid(0)=0.5
+        }
+        params
+    }
+
+    #[test]
+    fn test_moneta_gradient_w_k_mem() {
+        let cfg = moneta_grad_check_config();
+        let params = moneta_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "moneta_w_k_mem",
+            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("moneta_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "moneta_w_k_mem: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_moneta_gradient_w_v_mem() {
+        let cfg = moneta_grad_check_config();
+        let params = moneta_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "moneta_w_v_mem",
+            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("moneta_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "moneta_w_v_mem: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_moneta_gradient_w_q_mem() {
+        let cfg = moneta_grad_check_config();
+        let params = moneta_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "moneta_w_q_mem",
+            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("moneta_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "moneta_w_q_mem: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_moneta_gradient_w_alpha() {
+        let cfg = moneta_grad_check_config();
+        let params = moneta_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "moneta_w_alpha",
+            |p| &p.levels[0].w_alpha, |p, i, v| p.levels[0].w_alpha[i] = v, |g| &g.levels[0].w_alpha,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("moneta_w_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "moneta_w_alpha: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_moneta_gradient_b_alpha() {
+        let cfg = moneta_grad_check_config();
+        let params = moneta_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "moneta_b_alpha",
+            |p| &p.levels[0].b_alpha, |p, i, v| p.levels[0].b_alpha[i] = v, |g| &g.levels[0].b_alpha,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("moneta_b_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "moneta_b_alpha: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_moneta_gradient_w_theta() {
+        let cfg = moneta_grad_check_config();
+        let params = moneta_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "moneta_w_theta",
+            |p| &p.levels[0].w_theta, |p, i, v| p.levels[0].w_theta[i] = v, |g| &g.levels[0].w_theta,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("moneta_w_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "moneta_w_theta: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_moneta_gradient_b_theta() {
+        let cfg = moneta_grad_check_config();
+        let params = moneta_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mag_make_test_data(&cfg);
+        let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+
+        let (checked, passed, max_err) = mag_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads,
+            "moneta_b_theta",
+            |p| &p.levels[0].b_theta, |p, i, v| p.levels[0].b_theta[i] = v, |g| &g.levels[0].b_theta,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("moneta_b_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "moneta_b_theta: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    // ── MONETA CMS gradient checks (k=2, both levels active) ─────────
+
+    fn moneta_cms_grad_check_config() -> MAGConfig {
+        MAGConfig::moneta_test_config_k2()
+    }
+
+    fn moneta_cms_params_for_grad_check(cfg: &MAGConfig, seed: u64) -> MAGParams {
+        let mut params = MAGParams::init(cfg, seed);
+        for level in &mut params.levels {
+            level.b_alpha = vec![0.0f32];
+        }
+        params
+    }
+
+    fn moneta_cms_make_test_data(cfg: &MAGConfig) -> (Vec<usize>, Vec<usize>) {
+        let input_ids: Vec<usize> = (0..cfg.swa.seq_len).map(|t| t % cfg.swa.vocab_size).collect();
+        let target_ids: Vec<usize> = (1..=cfg.swa.seq_len).map(|t| t % cfg.swa.vocab_size).collect();
+        (input_ids, target_ids)
+    }
+
+    // ── MONETA CMS Level 0 FD checks ─────────────────────────────────
+
+    #[test]
+    fn test_moneta_cms_gradient_l0_w_k_mem() {
+        let cfg = moneta_cms_grad_check_config();
+        let params = moneta_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = moneta_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "moneta_l0_w_k_mem", &pulse,
+            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("moneta CMS l0_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "moneta l0_w_k_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_moneta_cms_gradient_l0_w_v_mem() {
+        let cfg = moneta_cms_grad_check_config();
+        let params = moneta_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = moneta_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "moneta_l0_w_v_mem", &pulse,
+            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("moneta CMS l0_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "moneta l0_w_v_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_moneta_cms_gradient_l0_w_q_mem() {
+        let cfg = moneta_cms_grad_check_config();
+        let params = moneta_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = moneta_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "moneta_l0_w_q_mem", &pulse,
+            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("moneta CMS l0_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "moneta l0_w_q_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_moneta_cms_gradient_l0_w_alpha() {
+        let cfg = moneta_cms_grad_check_config();
+        let params = moneta_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = moneta_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "moneta_l0_w_alpha", &pulse,
+            |p| &p.levels[0].w_alpha, |p, i, v| p.levels[0].w_alpha[i] = v, |g| &g.levels[0].w_alpha,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("moneta CMS l0_w_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "moneta l0_w_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_moneta_cms_gradient_l0_b_alpha() {
+        let cfg = moneta_cms_grad_check_config();
+        let params = moneta_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = moneta_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "moneta_l0_b_alpha", &pulse,
+            |p| &p.levels[0].b_alpha, |p, i, v| p.levels[0].b_alpha[i] = v, |g| &g.levels[0].b_alpha,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("moneta CMS l0_b_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "moneta l0_b_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_moneta_cms_gradient_l0_w_theta() {
+        let cfg = moneta_cms_grad_check_config();
+        let params = moneta_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = moneta_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "moneta_l0_w_theta", &pulse,
+            |p| &p.levels[0].w_theta, |p, i, v| p.levels[0].w_theta[i] = v, |g| &g.levels[0].w_theta,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("moneta CMS l0_w_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "moneta l0_w_theta: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_moneta_cms_gradient_l0_b_theta() {
+        let cfg = moneta_cms_grad_check_config();
+        let params = moneta_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = moneta_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "moneta_l0_b_theta", &pulse,
+            |p| &p.levels[0].b_theta, |p, i, v| p.levels[0].b_theta[i] = v, |g| &g.levels[0].b_theta,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("moneta CMS l0_b_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "moneta l0_b_theta: {passed}/{checked} passed");
+    }
+
+    // ── MONETA CMS Level 1 FD checks ─────────────────────────────────
+
+    #[test]
+    fn test_moneta_cms_gradient_l1_w_k_mem() {
+        let cfg = moneta_cms_grad_check_config();
+        let params = moneta_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = moneta_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "moneta_l1_w_k_mem", &pulse,
+            |p| &p.levels[1].w_k_mem, |p, i, v| p.levels[1].w_k_mem[i] = v, |g| &g.levels[1].w_k_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("moneta CMS l1_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "moneta l1_w_k_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_moneta_cms_gradient_l1_w_v_mem() {
+        let cfg = moneta_cms_grad_check_config();
+        let params = moneta_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = moneta_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "moneta_l1_w_v_mem", &pulse,
+            |p| &p.levels[1].w_v_mem, |p, i, v| p.levels[1].w_v_mem[i] = v, |g| &g.levels[1].w_v_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("moneta CMS l1_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "moneta l1_w_v_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_moneta_cms_gradient_l1_w_q_mem() {
+        let cfg = moneta_cms_grad_check_config();
+        let params = moneta_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = moneta_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "moneta_l1_w_q_mem", &pulse,
+            |p| &p.levels[1].w_q_mem, |p, i, v| p.levels[1].w_q_mem[i] = v, |g| &g.levels[1].w_q_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("moneta CMS l1_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "moneta l1_w_q_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_moneta_cms_gradient_l1_w_alpha() {
+        let cfg = moneta_cms_grad_check_config();
+        let params = moneta_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = moneta_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "moneta_l1_w_alpha", &pulse,
+            |p| &p.levels[1].w_alpha, |p, i, v| p.levels[1].w_alpha[i] = v, |g| &g.levels[1].w_alpha,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("moneta CMS l1_w_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "moneta l1_w_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_moneta_cms_gradient_l1_b_alpha() {
+        let cfg = moneta_cms_grad_check_config();
+        let params = moneta_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = moneta_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "moneta_l1_b_alpha", &pulse,
+            |p| &p.levels[1].b_alpha, |p, i, v| p.levels[1].b_alpha[i] = v, |g| &g.levels[1].b_alpha,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("moneta CMS l1_b_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "moneta l1_b_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_moneta_cms_gradient_l1_w_theta() {
+        let cfg = moneta_cms_grad_check_config();
+        let params = moneta_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = moneta_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "moneta_l1_w_theta", &pulse,
+            |p| &p.levels[1].w_theta, |p, i, v| p.levels[1].w_theta[i] = v, |g| &g.levels[1].w_theta,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("moneta CMS l1_w_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "moneta l1_w_theta: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_moneta_cms_gradient_l1_b_theta() {
+        let cfg = moneta_cms_grad_check_config();
+        let params = moneta_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = moneta_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "moneta_l1_b_theta", &pulse,
+            |p| &p.levels[1].b_theta, |p, i, v| p.levels[1].b_theta[i] = v, |g| &g.levels[1].b_theta,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("moneta CMS l1_b_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "moneta l1_b_theta: {passed}/{checked} passed");
     }
 }
