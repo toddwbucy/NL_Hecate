@@ -10,6 +10,8 @@ use crate::model::{SWAConfig, SWAParams, MAGConfig, MAGParams, MemoryRuleKind};
 use crate::forward::forward;
 use crate::backward::backward_full;
 use crate::mag::{mag_forward, mag_backward, cms_forward, cms_backward};
+use crate::mal::{mal_forward, mal_backward, cms_mal_forward, cms_mal_backward};
+use crate::mac::{mac_forward, mac_backward, cms_mac_forward, cms_mac_backward};
 use crate::conductor::{Pulse, ContextState, ErrorBuffer};
 
 /// Create a ContextState with the correct memory size per level for the given config.
@@ -357,6 +359,360 @@ pub(crate) fn cms_check_weight_gradient(
         }
     }
 
+    (checked, passed, max_rel_err)
+}
+
+// ── MAL gradient infrastructure ─────────────────────────────────────
+
+/// Compute gradients of loss with respect to all MAL parameters.
+#[allow(dead_code)]
+pub fn mal_compute_gradients(
+    params: &MAGParams,
+    cfg: &MAGConfig,
+    input_ids: &[usize],
+    target_ids: &[usize],
+) -> (f32, MAGParams) {
+    let (loss, cache) = mal_forward(params, cfg, input_ids, target_ids);
+    let grads = mal_backward(params, cfg, &cache, input_ids, target_ids);
+    (loss, grads)
+}
+
+/// Finite-difference gradient for a single weight element using MAL forward.
+#[allow(dead_code)]
+fn mal_fd_single(
+    params: &MAGParams,
+    cfg: &MAGConfig,
+    input_ids: &[usize],
+    target_ids: &[usize],
+    get_weight: impl Fn(&MAGParams) -> &Vec<f32>,
+    set_weight: impl Fn(&mut MAGParams, usize, f32),
+    idx: usize,
+    eps: f32,
+) -> f32 {
+    let orig = get_weight(params)[idx];
+
+    let mut p_plus = params.clone();
+    set_weight(&mut p_plus, idx, orig + eps);
+    let (loss_plus, _) = mal_forward(&p_plus, cfg, input_ids, target_ids);
+
+    let mut p_minus = params.clone();
+    set_weight(&mut p_minus, idx, orig - eps);
+    let (loss_minus, _) = mal_forward(&p_minus, cfg, input_ids, target_ids);
+
+    (loss_plus - loss_minus) / (2.0 * eps)
+}
+
+/// Check gradient for a specific weight matrix (MAL).
+#[allow(dead_code)]
+pub(crate) fn mal_check_weight_gradient(
+    params: &MAGParams,
+    cfg: &MAGConfig,
+    input_ids: &[usize],
+    target_ids: &[usize],
+    grads: &MAGParams,
+    name: &str,
+    get_weight: impl Fn(&MAGParams) -> &Vec<f32>,
+    set_weight: impl Fn(&mut MAGParams, usize, f32),
+    get_grad: impl Fn(&MAGParams) -> &Vec<f32>,
+    num_samples: usize,
+    eps: f32,
+    tol: f32,
+) -> (usize, usize, f32) {
+    let grad_vec = get_grad(grads);
+    let weight_vec = get_weight(params);
+    let n = weight_vec.len();
+    let abs_threshold = 5e-4;
+    let step = if n > num_samples { n / num_samples } else { 1 };
+    let mut checked = 0;
+    let mut passed = 0;
+    let mut max_rel_err = 0.0f32;
+
+    for idx in (0..n).step_by(step).take(num_samples) {
+        let analytical = grad_vec[idx];
+        let numerical = mal_fd_single(
+            params, cfg, input_ids, target_ids,
+            &get_weight, &set_weight, idx, eps,
+        );
+        let abs_diff = (analytical - numerical).abs();
+        let denom = analytical.abs().max(numerical.abs());
+        checked += 1;
+        if denom < abs_threshold { passed += 1; continue; }
+        let rel_err = abs_diff / denom;
+        if rel_err > max_rel_err { max_rel_err = rel_err; }
+        if rel_err < tol {
+            passed += 1;
+        } else {
+            eprintln!("  FAIL {name}[{idx}]: analytical={analytical:.6e}, numerical={numerical:.6e}, rel_err={rel_err:.4e}");
+        }
+    }
+    (checked, passed, max_rel_err)
+}
+
+/// Compute CMS MAL gradients.
+#[allow(dead_code)]
+pub fn cms_mal_compute_gradients(
+    params: &MAGParams,
+    cfg: &MAGConfig,
+    input_ids: &[usize],
+    target_ids: &[usize],
+    pulse: &Pulse,
+    context: &mut ContextState,
+    error_buffers: &mut [ErrorBuffer],
+) -> (f32, MAGParams) {
+    let (loss, cache) = cms_mal_forward(params, cfg, input_ids, target_ids, pulse, context);
+    let grads = cms_mal_backward(params, cfg, &cache, input_ids, target_ids, error_buffers);
+    (loss, grads)
+}
+
+/// Finite-difference gradient for a single weight element using CMS MAL forward.
+#[allow(dead_code)]
+fn cms_mal_fd_single(
+    params: &MAGParams,
+    cfg: &MAGConfig,
+    input_ids: &[usize],
+    target_ids: &[usize],
+    pulse: &Pulse,
+    get_weight: impl Fn(&MAGParams) -> &Vec<f32>,
+    set_weight: impl Fn(&mut MAGParams, usize, f32),
+    idx: usize,
+    eps: f32,
+) -> f32 {
+    let orig = get_weight(params)[idx];
+
+    let mut p_plus = params.clone();
+    set_weight(&mut p_plus, idx, orig + eps);
+    let mut ctx_plus = make_context_state(cfg);
+    let (loss_plus, _) = cms_mal_forward(&p_plus, cfg, input_ids, target_ids, pulse, &mut ctx_plus);
+
+    let mut p_minus = params.clone();
+    set_weight(&mut p_minus, idx, orig - eps);
+    let mut ctx_minus = make_context_state(cfg);
+    let (loss_minus, _) = cms_mal_forward(&p_minus, cfg, input_ids, target_ids, pulse, &mut ctx_minus);
+
+    (loss_plus - loss_minus) / (2.0 * eps)
+}
+
+/// Check gradient for a specific weight matrix (CMS MAL).
+#[allow(dead_code)]
+pub(crate) fn cms_mal_check_weight_gradient(
+    params: &MAGParams,
+    cfg: &MAGConfig,
+    input_ids: &[usize],
+    target_ids: &[usize],
+    grads: &MAGParams,
+    name: &str,
+    pulse: &Pulse,
+    get_weight: impl Fn(&MAGParams) -> &Vec<f32>,
+    set_weight: impl Fn(&mut MAGParams, usize, f32),
+    get_grad: impl Fn(&MAGParams) -> &Vec<f32>,
+    num_samples: usize,
+    eps: f32,
+    tol: f32,
+) -> (usize, usize, f32) {
+    let grad_vec = get_grad(grads);
+    let weight_vec = get_weight(params);
+    let n = weight_vec.len();
+    let abs_threshold = 5e-4;
+    let step = if n > num_samples { n / num_samples } else { 1 };
+    let mut checked = 0;
+    let mut passed = 0;
+    let mut max_rel_err = 0.0f32;
+
+    for idx in (0..n).step_by(step).take(num_samples) {
+        let analytical = grad_vec[idx];
+        let numerical = cms_mal_fd_single(
+            params, cfg, input_ids, target_ids, pulse,
+            &get_weight, &set_weight, idx, eps,
+        );
+        let abs_diff = (analytical - numerical).abs();
+        let denom = analytical.abs().max(numerical.abs());
+        checked += 1;
+        if denom < abs_threshold { passed += 1; continue; }
+        let rel_err = abs_diff / denom;
+        if rel_err > max_rel_err { max_rel_err = rel_err; }
+        if rel_err < tol {
+            passed += 1;
+        } else {
+            eprintln!("  FAIL {name}[{idx}]: analytical={analytical:.6e}, numerical={numerical:.6e}, rel_err={rel_err:.4e}");
+        }
+    }
+    (checked, passed, max_rel_err)
+}
+
+// ── MAC gradient infrastructure ─────────────────────────────────────
+
+/// Compute gradients of loss with respect to all MAC parameters.
+#[allow(dead_code)]
+pub fn mac_compute_gradients(
+    params: &MAGParams,
+    cfg: &MAGConfig,
+    input_ids: &[usize],
+    target_ids: &[usize],
+) -> (f32, MAGParams) {
+    let (loss, cache) = mac_forward(params, cfg, input_ids, target_ids);
+    let grads = mac_backward(params, cfg, &cache, input_ids, target_ids);
+    (loss, grads)
+}
+
+/// Finite-difference gradient for a single weight element using MAC forward.
+#[allow(dead_code)]
+fn mac_fd_single(
+    params: &MAGParams,
+    cfg: &MAGConfig,
+    input_ids: &[usize],
+    target_ids: &[usize],
+    get_weight: impl Fn(&MAGParams) -> &Vec<f32>,
+    set_weight: impl Fn(&mut MAGParams, usize, f32),
+    idx: usize,
+    eps: f32,
+) -> f32 {
+    let orig = get_weight(params)[idx];
+
+    let mut p_plus = params.clone();
+    set_weight(&mut p_plus, idx, orig + eps);
+    let (loss_plus, _) = mac_forward(&p_plus, cfg, input_ids, target_ids);
+
+    let mut p_minus = params.clone();
+    set_weight(&mut p_minus, idx, orig - eps);
+    let (loss_minus, _) = mac_forward(&p_minus, cfg, input_ids, target_ids);
+
+    (loss_plus - loss_minus) / (2.0 * eps)
+}
+
+/// Check gradient for a specific weight matrix (MAC).
+#[allow(dead_code)]
+pub(crate) fn mac_check_weight_gradient(
+    params: &MAGParams,
+    cfg: &MAGConfig,
+    input_ids: &[usize],
+    target_ids: &[usize],
+    grads: &MAGParams,
+    name: &str,
+    get_weight: impl Fn(&MAGParams) -> &Vec<f32>,
+    set_weight: impl Fn(&mut MAGParams, usize, f32),
+    get_grad: impl Fn(&MAGParams) -> &Vec<f32>,
+    num_samples: usize,
+    eps: f32,
+    tol: f32,
+) -> (usize, usize, f32) {
+    let grad_vec = get_grad(grads);
+    let weight_vec = get_weight(params);
+    let n = weight_vec.len();
+    let abs_threshold = 5e-4;
+    let step = if n > num_samples { n / num_samples } else { 1 };
+    let mut checked = 0;
+    let mut passed = 0;
+    let mut max_rel_err = 0.0f32;
+
+    for idx in (0..n).step_by(step).take(num_samples) {
+        let analytical = grad_vec[idx];
+        let numerical = mac_fd_single(
+            params, cfg, input_ids, target_ids,
+            &get_weight, &set_weight, idx, eps,
+        );
+        let abs_diff = (analytical - numerical).abs();
+        let denom = analytical.abs().max(numerical.abs());
+        checked += 1;
+        if denom < abs_threshold { passed += 1; continue; }
+        let rel_err = abs_diff / denom;
+        if rel_err > max_rel_err { max_rel_err = rel_err; }
+        if rel_err < tol {
+            passed += 1;
+        } else {
+            eprintln!("  FAIL {name}[{idx}]: analytical={analytical:.6e}, numerical={numerical:.6e}, rel_err={rel_err:.4e}");
+        }
+    }
+    (checked, passed, max_rel_err)
+}
+
+/// Compute CMS MAC gradients.
+#[allow(dead_code)]
+pub fn cms_mac_compute_gradients(
+    params: &MAGParams,
+    cfg: &MAGConfig,
+    input_ids: &[usize],
+    target_ids: &[usize],
+    pulse: &Pulse,
+    context: &mut ContextState,
+    error_buffers: &mut [ErrorBuffer],
+) -> (f32, MAGParams) {
+    let (loss, cache) = cms_mac_forward(params, cfg, input_ids, target_ids, pulse, context);
+    let grads = cms_mac_backward(params, cfg, &cache, input_ids, target_ids, error_buffers);
+    (loss, grads)
+}
+
+/// Finite-difference gradient for a single weight element using CMS MAC forward.
+#[allow(dead_code)]
+fn cms_mac_fd_single(
+    params: &MAGParams,
+    cfg: &MAGConfig,
+    input_ids: &[usize],
+    target_ids: &[usize],
+    pulse: &Pulse,
+    get_weight: impl Fn(&MAGParams) -> &Vec<f32>,
+    set_weight: impl Fn(&mut MAGParams, usize, f32),
+    idx: usize,
+    eps: f32,
+) -> f32 {
+    let orig = get_weight(params)[idx];
+
+    let mut p_plus = params.clone();
+    set_weight(&mut p_plus, idx, orig + eps);
+    let mut ctx_plus = make_context_state(cfg);
+    let (loss_plus, _) = cms_mac_forward(&p_plus, cfg, input_ids, target_ids, pulse, &mut ctx_plus);
+
+    let mut p_minus = params.clone();
+    set_weight(&mut p_minus, idx, orig - eps);
+    let mut ctx_minus = make_context_state(cfg);
+    let (loss_minus, _) = cms_mac_forward(&p_minus, cfg, input_ids, target_ids, pulse, &mut ctx_minus);
+
+    (loss_plus - loss_minus) / (2.0 * eps)
+}
+
+/// Check gradient for a specific weight matrix (CMS MAC).
+#[allow(dead_code)]
+pub(crate) fn cms_mac_check_weight_gradient(
+    params: &MAGParams,
+    cfg: &MAGConfig,
+    input_ids: &[usize],
+    target_ids: &[usize],
+    grads: &MAGParams,
+    name: &str,
+    pulse: &Pulse,
+    get_weight: impl Fn(&MAGParams) -> &Vec<f32>,
+    set_weight: impl Fn(&mut MAGParams, usize, f32),
+    get_grad: impl Fn(&MAGParams) -> &Vec<f32>,
+    num_samples: usize,
+    eps: f32,
+    tol: f32,
+) -> (usize, usize, f32) {
+    let grad_vec = get_grad(grads);
+    let weight_vec = get_weight(params);
+    let n = weight_vec.len();
+    let abs_threshold = 5e-4;
+    let step = if n > num_samples { n / num_samples } else { 1 };
+    let mut checked = 0;
+    let mut passed = 0;
+    let mut max_rel_err = 0.0f32;
+
+    for idx in (0..n).step_by(step).take(num_samples) {
+        let analytical = grad_vec[idx];
+        let numerical = cms_mac_fd_single(
+            params, cfg, input_ids, target_ids, pulse,
+            &get_weight, &set_weight, idx, eps,
+        );
+        let abs_diff = (analytical - numerical).abs();
+        let denom = analytical.abs().max(numerical.abs());
+        checked += 1;
+        if denom < abs_threshold { passed += 1; continue; }
+        let rel_err = abs_diff / denom;
+        if rel_err > max_rel_err { max_rel_err = rel_err; }
+        if rel_err < tol {
+            passed += 1;
+        } else {
+            eprintln!("  FAIL {name}[{idx}]: analytical={analytical:.6e}, numerical={numerical:.6e}, rel_err={rel_err:.4e}");
+        }
+    }
     (checked, passed, max_rel_err)
 }
 
@@ -4176,5 +4532,815 @@ mod tests {
         );
         eprintln!("trellis CMS l1_b_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
         assert!(passed == checked, "trellis l1_b_theta: {passed}/{checked} passed");
+    }
+
+    // ── MAL gradient checks (DeltaRule, k=1) ────────────────────────
+
+    fn mal_grad_check_config() -> MAGConfig {
+        MAGConfig::mal_test_config()
+    }
+
+    fn mal_make_test_data(cfg: &MAGConfig) -> (Vec<usize>, Vec<usize>) {
+        let input_ids: Vec<usize> = (0..cfg.swa.seq_len).collect();
+        let target_ids: Vec<usize> = (1..=cfg.swa.seq_len)
+            .map(|t| t % cfg.swa.vocab_size)
+            .collect();
+        (input_ids, target_ids)
+    }
+
+    fn mal_params_for_grad_check(cfg: &MAGConfig, seed: u64) -> MAGParams {
+        let mut params = MAGParams::init(cfg, seed);
+        for level in &mut params.levels {
+            level.b_alpha = vec![0.0f32];
+            level.b_theta = vec![0.0f32];
+        }
+        params
+    }
+
+    #[test]
+    fn test_mal_gradient_w_k_mem() {
+        let cfg = mal_grad_check_config();
+        let params = mal_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mal_make_test_data(&cfg);
+        let (_loss, grads) = mal_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+        let (checked, passed, max_err) = mal_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mal_w_k_mem",
+            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAL w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAL w_k_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mal_gradient_w_v_mem() {
+        let cfg = mal_grad_check_config();
+        let params = mal_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mal_make_test_data(&cfg);
+        let (_loss, grads) = mal_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+        let (checked, passed, max_err) = mal_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mal_w_v_mem",
+            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAL w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAL w_v_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mal_gradient_w_q_mem() {
+        let cfg = mal_grad_check_config();
+        let params = mal_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mal_make_test_data(&cfg);
+        let (_loss, grads) = mal_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+        let (checked, passed, max_err) = mal_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mal_w_q_mem",
+            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAL w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAL w_q_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mal_gradient_w_alpha() {
+        let cfg = mal_grad_check_config();
+        let params = mal_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mal_make_test_data(&cfg);
+        let (_loss, grads) = mal_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+        let (checked, passed, max_err) = mal_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mal_w_alpha",
+            |p| &p.levels[0].w_alpha, |p, i, v| p.levels[0].w_alpha[i] = v, |g| &g.levels[0].w_alpha,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAL w_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAL w_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mal_gradient_b_alpha() {
+        let cfg = mal_grad_check_config();
+        let params = mal_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mal_make_test_data(&cfg);
+        let (_loss, grads) = mal_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+        let (checked, passed, max_err) = mal_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mal_b_alpha",
+            |p| &p.levels[0].b_alpha, |p, i, v| p.levels[0].b_alpha[i] = v, |g| &g.levels[0].b_alpha,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAL b_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAL b_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mal_gradient_w_theta() {
+        let cfg = mal_grad_check_config();
+        let params = mal_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mal_make_test_data(&cfg);
+        let (_loss, grads) = mal_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+        let (checked, passed, max_err) = mal_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mal_w_theta",
+            |p| &p.levels[0].w_theta, |p, i, v| p.levels[0].w_theta[i] = v, |g| &g.levels[0].w_theta,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAL w_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAL w_theta: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mal_gradient_b_theta() {
+        let cfg = mal_grad_check_config();
+        let params = mal_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mal_make_test_data(&cfg);
+        let (_loss, grads) = mal_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+        let (checked, passed, max_err) = mal_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mal_b_theta",
+            |p| &p.levels[0].b_theta, |p, i, v| p.levels[0].b_theta[i] = v, |g| &g.levels[0].b_theta,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAL b_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAL b_theta: {passed}/{checked} passed");
+    }
+
+    // ── MAL CMS gradient checks (DeltaRule, k=2) ────────────────────
+
+    fn mal_cms_grad_check_config_k2() -> MAGConfig {
+        MAGConfig::mal_test_config_k2()
+    }
+
+    fn mal_cms_params_for_grad_check(cfg: &MAGConfig, seed: u64) -> MAGParams {
+        let mut params = MAGParams::init(cfg, seed);
+        for level in &mut params.levels {
+            level.b_alpha = vec![0.0f32];
+            level.b_theta = vec![0.0f32];
+        }
+        params
+    }
+
+    fn mal_cms_make_test_data(cfg: &MAGConfig) -> (Vec<usize>, Vec<usize>) {
+        let input_ids: Vec<usize> = (0..cfg.swa.seq_len).collect();
+        let target_ids: Vec<usize> = (1..=cfg.swa.seq_len)
+            .map(|t| t % cfg.swa.vocab_size)
+            .collect();
+        (input_ids, target_ids)
+    }
+
+    #[test]
+    fn test_mal_cms_gradient_l0_w_k_mem() {
+        let cfg = mal_cms_grad_check_config_k2();
+        let params = mal_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mal_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_mal_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+        let (checked, passed, max_err) = cms_mal_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mal_l0_w_k_mem", &pulse,
+            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAL CMS l0_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAL l0_w_k_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mal_cms_gradient_l0_w_v_mem() {
+        let cfg = mal_cms_grad_check_config_k2();
+        let params = mal_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mal_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_mal_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+        let (checked, passed, max_err) = cms_mal_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mal_l0_w_v_mem", &pulse,
+            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAL CMS l0_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAL l0_w_v_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mal_cms_gradient_l0_w_q_mem() {
+        let cfg = mal_cms_grad_check_config_k2();
+        let params = mal_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mal_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_mal_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+        let (checked, passed, max_err) = cms_mal_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mal_l0_w_q_mem", &pulse,
+            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAL CMS l0_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAL l0_w_q_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mal_cms_gradient_l0_w_alpha() {
+        let cfg = mal_cms_grad_check_config_k2();
+        let params = mal_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mal_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_mal_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+        let (checked, passed, max_err) = cms_mal_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mal_l0_w_alpha", &pulse,
+            |p| &p.levels[0].w_alpha, |p, i, v| p.levels[0].w_alpha[i] = v, |g| &g.levels[0].w_alpha,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAL CMS l0_w_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAL l0_w_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mal_cms_gradient_l0_b_alpha() {
+        let cfg = mal_cms_grad_check_config_k2();
+        let params = mal_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mal_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_mal_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+        let (checked, passed, max_err) = cms_mal_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mal_l0_b_alpha", &pulse,
+            |p| &p.levels[0].b_alpha, |p, i, v| p.levels[0].b_alpha[i] = v, |g| &g.levels[0].b_alpha,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAL CMS l0_b_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAL l0_b_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mal_cms_gradient_l0_w_theta() {
+        let cfg = mal_cms_grad_check_config_k2();
+        let params = mal_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mal_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_mal_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+        let (checked, passed, max_err) = cms_mal_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mal_l0_w_theta", &pulse,
+            |p| &p.levels[0].w_theta, |p, i, v| p.levels[0].w_theta[i] = v, |g| &g.levels[0].w_theta,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAL CMS l0_w_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAL l0_w_theta: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mal_cms_gradient_l0_b_theta() {
+        let cfg = mal_cms_grad_check_config_k2();
+        let params = mal_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mal_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_mal_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+        let (checked, passed, max_err) = cms_mal_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mal_l0_b_theta", &pulse,
+            |p| &p.levels[0].b_theta, |p, i, v| p.levels[0].b_theta[i] = v, |g| &g.levels[0].b_theta,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAL CMS l0_b_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAL l0_b_theta: {passed}/{checked} passed");
+    }
+
+    // ── MAL CMS Level 1 ──
+
+    #[test]
+    fn test_mal_cms_gradient_l1_w_k_mem() {
+        let cfg = mal_cms_grad_check_config_k2();
+        let params = mal_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mal_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_mal_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+        let (checked, passed, max_err) = cms_mal_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mal_l1_w_k_mem", &pulse,
+            |p| &p.levels[1].w_k_mem, |p, i, v| p.levels[1].w_k_mem[i] = v, |g| &g.levels[1].w_k_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAL CMS l1_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAL l1_w_k_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mal_cms_gradient_l1_w_v_mem() {
+        let cfg = mal_cms_grad_check_config_k2();
+        let params = mal_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mal_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_mal_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+        let (checked, passed, max_err) = cms_mal_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mal_l1_w_v_mem", &pulse,
+            |p| &p.levels[1].w_v_mem, |p, i, v| p.levels[1].w_v_mem[i] = v, |g| &g.levels[1].w_v_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAL CMS l1_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAL l1_w_v_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mal_cms_gradient_l1_w_q_mem() {
+        let cfg = mal_cms_grad_check_config_k2();
+        let params = mal_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mal_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_mal_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+        let (checked, passed, max_err) = cms_mal_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mal_l1_w_q_mem", &pulse,
+            |p| &p.levels[1].w_q_mem, |p, i, v| p.levels[1].w_q_mem[i] = v, |g| &g.levels[1].w_q_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAL CMS l1_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAL l1_w_q_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mal_cms_gradient_l1_w_alpha() {
+        let cfg = mal_cms_grad_check_config_k2();
+        let params = mal_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mal_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_mal_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+        let (checked, passed, max_err) = cms_mal_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mal_l1_w_alpha", &pulse,
+            |p| &p.levels[1].w_alpha, |p, i, v| p.levels[1].w_alpha[i] = v, |g| &g.levels[1].w_alpha,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAL CMS l1_w_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAL l1_w_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mal_cms_gradient_l1_b_alpha() {
+        let cfg = mal_cms_grad_check_config_k2();
+        let params = mal_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mal_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_mal_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+        let (checked, passed, max_err) = cms_mal_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mal_l1_b_alpha", &pulse,
+            |p| &p.levels[1].b_alpha, |p, i, v| p.levels[1].b_alpha[i] = v, |g| &g.levels[1].b_alpha,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAL CMS l1_b_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAL l1_b_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mal_cms_gradient_l1_w_theta() {
+        let cfg = mal_cms_grad_check_config_k2();
+        let params = mal_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mal_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_mal_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+        let (checked, passed, max_err) = cms_mal_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mal_l1_w_theta", &pulse,
+            |p| &p.levels[1].w_theta, |p, i, v| p.levels[1].w_theta[i] = v, |g| &g.levels[1].w_theta,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAL CMS l1_w_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAL l1_w_theta: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mal_cms_gradient_l1_b_theta() {
+        let cfg = mal_cms_grad_check_config_k2();
+        let params = mal_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mal_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_mal_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+        let (checked, passed, max_err) = cms_mal_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mal_l1_b_theta", &pulse,
+            |p| &p.levels[1].b_theta, |p, i, v| p.levels[1].b_theta[i] = v, |g| &g.levels[1].b_theta,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAL CMS l1_b_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAL l1_b_theta: {passed}/{checked} passed");
+    }
+
+    // ── MAC gradient checks (DeltaRule, k=1) ────────────────────────
+
+    fn mac_grad_check_config() -> MAGConfig {
+        MAGConfig::mac_test_config()
+    }
+
+    fn mac_make_test_data(cfg: &MAGConfig) -> (Vec<usize>, Vec<usize>) {
+        let input_ids: Vec<usize> = (0..cfg.swa.seq_len).collect();
+        let target_ids: Vec<usize> = (1..=cfg.swa.seq_len)
+            .map(|t| t % cfg.swa.vocab_size)
+            .collect();
+        (input_ids, target_ids)
+    }
+
+    fn mac_params_for_grad_check(cfg: &MAGConfig, seed: u64) -> MAGParams {
+        let mut params = MAGParams::init(cfg, seed);
+        for level in &mut params.levels {
+            level.b_alpha = vec![0.0f32];
+            level.b_theta = vec![0.0f32];
+        }
+        params
+    }
+
+    #[test]
+    fn test_mac_gradient_w_k_mem() {
+        let cfg = mac_grad_check_config();
+        let params = mac_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mac_make_test_data(&cfg);
+        let (_loss, grads) = mac_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+        let (checked, passed, max_err) = mac_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mac_w_k_mem",
+            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAC w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAC w_k_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mac_gradient_w_v_mem() {
+        let cfg = mac_grad_check_config();
+        let params = mac_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mac_make_test_data(&cfg);
+        let (_loss, grads) = mac_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+        let (checked, passed, max_err) = mac_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mac_w_v_mem",
+            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAC w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAC w_v_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mac_gradient_w_q_mem() {
+        let cfg = mac_grad_check_config();
+        let params = mac_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mac_make_test_data(&cfg);
+        let (_loss, grads) = mac_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+        let (checked, passed, max_err) = mac_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mac_w_q_mem",
+            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAC w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAC w_q_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mac_gradient_w_alpha() {
+        let cfg = mac_grad_check_config();
+        let params = mac_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mac_make_test_data(&cfg);
+        let (_loss, grads) = mac_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+        let (checked, passed, max_err) = mac_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mac_w_alpha",
+            |p| &p.levels[0].w_alpha, |p, i, v| p.levels[0].w_alpha[i] = v, |g| &g.levels[0].w_alpha,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAC w_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAC w_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mac_gradient_b_alpha() {
+        let cfg = mac_grad_check_config();
+        let params = mac_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mac_make_test_data(&cfg);
+        let (_loss, grads) = mac_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+        let (checked, passed, max_err) = mac_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mac_b_alpha",
+            |p| &p.levels[0].b_alpha, |p, i, v| p.levels[0].b_alpha[i] = v, |g| &g.levels[0].b_alpha,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAC b_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAC b_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mac_gradient_w_theta() {
+        let cfg = mac_grad_check_config();
+        let params = mac_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mac_make_test_data(&cfg);
+        let (_loss, grads) = mac_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+        let (checked, passed, max_err) = mac_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mac_w_theta",
+            |p| &p.levels[0].w_theta, |p, i, v| p.levels[0].w_theta[i] = v, |g| &g.levels[0].w_theta,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAC w_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAC w_theta: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mac_gradient_b_theta() {
+        let cfg = mac_grad_check_config();
+        let params = mac_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mac_make_test_data(&cfg);
+        let (_loss, grads) = mac_compute_gradients(&params, &cfg, &input_ids, &target_ids);
+        let (checked, passed, max_err) = mac_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mac_b_theta",
+            |p| &p.levels[0].b_theta, |p, i, v| p.levels[0].b_theta[i] = v, |g| &g.levels[0].b_theta,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAC b_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAC b_theta: {passed}/{checked} passed");
+    }
+
+    // ── MAC CMS gradient checks (DeltaRule, k=2) ────────────────────
+
+    fn mac_cms_grad_check_config_k2() -> MAGConfig {
+        MAGConfig::mac_test_config_k2()
+    }
+
+    fn mac_cms_params_for_grad_check(cfg: &MAGConfig, seed: u64) -> MAGParams {
+        let mut params = MAGParams::init(cfg, seed);
+        for level in &mut params.levels {
+            level.b_alpha = vec![0.0f32];
+            level.b_theta = vec![0.0f32];
+        }
+        params
+    }
+
+    fn mac_cms_make_test_data(cfg: &MAGConfig) -> (Vec<usize>, Vec<usize>) {
+        let input_ids: Vec<usize> = (0..cfg.swa.seq_len).collect();
+        let target_ids: Vec<usize> = (1..=cfg.swa.seq_len)
+            .map(|t| t % cfg.swa.vocab_size)
+            .collect();
+        (input_ids, target_ids)
+    }
+
+    #[test]
+    fn test_mac_cms_gradient_l0_w_k_mem() {
+        let cfg = mac_cms_grad_check_config_k2();
+        let params = mac_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mac_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_mac_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+        let (checked, passed, max_err) = cms_mac_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mac_l0_w_k_mem", &pulse,
+            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAC CMS l0_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAC l0_w_k_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mac_cms_gradient_l0_w_v_mem() {
+        let cfg = mac_cms_grad_check_config_k2();
+        let params = mac_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mac_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_mac_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+        let (checked, passed, max_err) = cms_mac_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mac_l0_w_v_mem", &pulse,
+            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAC CMS l0_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAC l0_w_v_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mac_cms_gradient_l0_w_q_mem() {
+        let cfg = mac_cms_grad_check_config_k2();
+        let params = mac_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mac_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_mac_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+        let (checked, passed, max_err) = cms_mac_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mac_l0_w_q_mem", &pulse,
+            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAC CMS l0_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAC l0_w_q_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mac_cms_gradient_l0_w_alpha() {
+        let cfg = mac_cms_grad_check_config_k2();
+        let params = mac_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mac_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_mac_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+        let (checked, passed, max_err) = cms_mac_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mac_l0_w_alpha", &pulse,
+            |p| &p.levels[0].w_alpha, |p, i, v| p.levels[0].w_alpha[i] = v, |g| &g.levels[0].w_alpha,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAC CMS l0_w_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAC l0_w_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mac_cms_gradient_l0_b_alpha() {
+        let cfg = mac_cms_grad_check_config_k2();
+        let params = mac_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mac_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_mac_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+        let (checked, passed, max_err) = cms_mac_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mac_l0_b_alpha", &pulse,
+            |p| &p.levels[0].b_alpha, |p, i, v| p.levels[0].b_alpha[i] = v, |g| &g.levels[0].b_alpha,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAC CMS l0_b_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAC l0_b_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mac_cms_gradient_l0_w_theta() {
+        let cfg = mac_cms_grad_check_config_k2();
+        let params = mac_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mac_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_mac_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+        let (checked, passed, max_err) = cms_mac_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mac_l0_w_theta", &pulse,
+            |p| &p.levels[0].w_theta, |p, i, v| p.levels[0].w_theta[i] = v, |g| &g.levels[0].w_theta,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAC CMS l0_w_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAC l0_w_theta: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mac_cms_gradient_l0_b_theta() {
+        let cfg = mac_cms_grad_check_config_k2();
+        let params = mac_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mac_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_mac_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+        let (checked, passed, max_err) = cms_mac_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mac_l0_b_theta", &pulse,
+            |p| &p.levels[0].b_theta, |p, i, v| p.levels[0].b_theta[i] = v, |g| &g.levels[0].b_theta,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAC CMS l0_b_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAC l0_b_theta: {passed}/{checked} passed");
+    }
+
+    // ── MAC CMS Level 1 ──
+
+    #[test]
+    fn test_mac_cms_gradient_l1_w_k_mem() {
+        let cfg = mac_cms_grad_check_config_k2();
+        let params = mac_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mac_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_mac_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+        let (checked, passed, max_err) = cms_mac_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mac_l1_w_k_mem", &pulse,
+            |p| &p.levels[1].w_k_mem, |p, i, v| p.levels[1].w_k_mem[i] = v, |g| &g.levels[1].w_k_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAC CMS l1_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAC l1_w_k_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mac_cms_gradient_l1_w_v_mem() {
+        let cfg = mac_cms_grad_check_config_k2();
+        let params = mac_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mac_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_mac_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+        let (checked, passed, max_err) = cms_mac_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mac_l1_w_v_mem", &pulse,
+            |p| &p.levels[1].w_v_mem, |p, i, v| p.levels[1].w_v_mem[i] = v, |g| &g.levels[1].w_v_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAC CMS l1_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAC l1_w_v_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mac_cms_gradient_l1_w_q_mem() {
+        let cfg = mac_cms_grad_check_config_k2();
+        let params = mac_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mac_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_mac_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+        let (checked, passed, max_err) = cms_mac_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mac_l1_w_q_mem", &pulse,
+            |p| &p.levels[1].w_q_mem, |p, i, v| p.levels[1].w_q_mem[i] = v, |g| &g.levels[1].w_q_mem,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAC CMS l1_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAC l1_w_q_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mac_cms_gradient_l1_w_alpha() {
+        let cfg = mac_cms_grad_check_config_k2();
+        let params = mac_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mac_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_mac_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+        let (checked, passed, max_err) = cms_mac_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mac_l1_w_alpha", &pulse,
+            |p| &p.levels[1].w_alpha, |p, i, v| p.levels[1].w_alpha[i] = v, |g| &g.levels[1].w_alpha,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAC CMS l1_w_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAC l1_w_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mac_cms_gradient_l1_b_alpha() {
+        let cfg = mac_cms_grad_check_config_k2();
+        let params = mac_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mac_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_mac_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+        let (checked, passed, max_err) = cms_mac_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mac_l1_b_alpha", &pulse,
+            |p| &p.levels[1].b_alpha, |p, i, v| p.levels[1].b_alpha[i] = v, |g| &g.levels[1].b_alpha,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAC CMS l1_b_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAC l1_b_alpha: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mac_cms_gradient_l1_w_theta() {
+        let cfg = mac_cms_grad_check_config_k2();
+        let params = mac_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mac_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_mac_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+        let (checked, passed, max_err) = cms_mac_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mac_l1_w_theta", &pulse,
+            |p| &p.levels[1].w_theta, |p, i, v| p.levels[1].w_theta[i] = v, |g| &g.levels[1].w_theta,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAC CMS l1_w_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAC l1_w_theta: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_mac_cms_gradient_l1_b_theta() {
+        let cfg = mac_cms_grad_check_config_k2();
+        let params = mac_cms_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = mac_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_mac_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+        let (checked, passed, max_err) = cms_mac_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "mac_l1_b_theta", &pulse,
+            |p| &p.levels[1].b_theta, |p, i, v| p.levels[1].b_theta[i] = v, |g| &g.levels[1].b_theta,
+            1, FD_EPS, FD_TOL,
+        );
+        eprintln!("MAC CMS l1_b_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "MAC l1_b_theta: {passed}/{checked} passed");
     }
 }
