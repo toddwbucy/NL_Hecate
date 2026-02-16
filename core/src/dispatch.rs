@@ -60,10 +60,10 @@ pub fn detect_gpu() -> Option<GpuInfo> {
     #[repr(C)]
     struct CudaDeviceProp {
         name: [u8; 256],
-        // We only need name and compute capability.
-        // cudaDeviceProp is a large struct (~900 bytes); we allocate the full
-        // size and read only the fields we need.
-        _padding: [u8; 1024],
+        // cudaDeviceProp grows across CUDA toolkit versions (900+ bytes as of 12.x).
+        // Over-allocate to 4096 bytes for forward-compatibility. We only read the
+        // `name` field; compute capability comes from cudaDeviceGetAttribute below.
+        _padding: [u8; 4096],
     }
 
     extern "C" {
@@ -79,7 +79,7 @@ pub fn detect_gpu() -> Option<GpuInfo> {
 
     let mut prop = CudaDeviceProp {
         name: [0u8; 256],
-        _padding: [0u8; 1024],
+        _padding: [0u8; 4096],
     };
     let rc = unsafe { cudaGetDeviceProperties(&mut prop, 0) };
     if rc != 0 {
@@ -102,9 +102,10 @@ pub fn detect_gpu() -> Option<GpuInfo> {
     // cudaDevAttrComputeCapabilityMinor = 76
     let mut major = 0i32;
     let mut minor = 0i32;
-    unsafe {
-        cudaDeviceGetAttribute(&mut major, 75, 0);
-        cudaDeviceGetAttribute(&mut minor, 76, 0);
+    let rc_major = unsafe { cudaDeviceGetAttribute(&mut major, 75, 0) };
+    let rc_minor = unsafe { cudaDeviceGetAttribute(&mut minor, 76, 0) };
+    if rc_major != 0 || rc_minor != 0 {
+        return None;
     }
 
     Some(GpuInfo {

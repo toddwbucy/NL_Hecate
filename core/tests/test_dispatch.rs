@@ -5,6 +5,7 @@
 //   - CUDA-only: detect_gpu(), force_rust_reference() with actual dispatch
 
 use nl_hecate_core::dispatch::{Backend, GpuInfo, select_backend, force_rust_reference, is_rust_forced, detect_gpu};
+use serial_test::serial;
 
 // ══════════════════════════════════════════════════════════════════════
 // Backend enum tests (always run)
@@ -96,6 +97,7 @@ fn test_select_backend_sm80() {
 // ══════════════════════════════════════════════════════════════════════
 
 #[test]
+#[serial]
 fn test_force_rust_reference_flag() {
     // Reset to default
     force_rust_reference(false);
@@ -140,7 +142,10 @@ mod cuda_tests {
                    "Expected CudaNative for detected GPU {:?}", gpu);
     }
 
+    use serial_test::serial;
+
     #[test]
+    #[serial]
     fn test_force_rust_overrides_cuda_dispatch() {
         // Run a small Delta forward through CUDA, then force Rust and verify
         // both paths produce the same result.

@@ -21,7 +21,7 @@
 | `cuda` | x86_64 + sm_86/89/90 | No | Yes | No | GPU-accelerated kernels |
 | `enzyme` | x86_64 | Yes | No | No | AD-enabled gradient tests |
 | `edge` | x86_64, wasm32 | No | No | Yes | Micro model deployment |
-| `cuda,enzyme` | x86_64 + sm_86/89/90 | Yes | No | No | Full pipeline (Enzyme + CUDA) |
+| `cuda,enzyme` | x86_64 + sm_86/89/90 | Yes | Yes | No | Full pipeline (Enzyme + CUDA) |
 | `cuda,distributed` | x86_64 + sm_86/89/90 | No | Yes | No | Multi-GPU training |
 | `cuda,serving` | x86_64 + sm_86/89/90 | No | Yes | No | Production inference |
 | `cuda,distributed,serving` | x86_64 + sm_86/89/90 | No | Yes | No | Full production |
