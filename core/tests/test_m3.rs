@@ -217,6 +217,7 @@ fn test_m3_vs_sgd_k1_eta0() {
         frequencies: vec![1],
         use_newton_schulz: false,
         ns_iterations: 5,
+        ns_dim: None,
     };
     let mut state = M3State::new(&cfg, 3);
     let grad = vec![0.5, -0.3, 0.8];
@@ -337,6 +338,7 @@ fn test_m3_no_levels_active() {
         frequencies: vec![2, 4], // neither fires at step 1
         use_newton_schulz: false,
         ns_iterations: 5,
+        ns_dim: None,
     };
     let mut state = M3State::new(&cfg, 2);
     state.step = 1; // step 1: 1%2!=0, 1%4!=0

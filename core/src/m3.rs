@@ -28,6 +28,9 @@ pub struct M3Config {
     pub use_newton_schulz: bool,
     /// Number of Newton-Schulz iterations (default 5).
     pub ns_iterations: usize,
+    /// Explicit square dimension for NS. Required when use_newton_schulz is true.
+    /// NS only applies when ns_dim * ns_dim == total_params. None = skip NS.
+    pub ns_dim: Option<usize>,
 }
 
 impl M3Config {
@@ -41,6 +44,7 @@ impl M3Config {
             frequencies: vec![1],
             use_newton_schulz: false,
             ns_iterations: 5,
+            ns_dim: None,
         }
     }
 
@@ -54,6 +58,7 @@ impl M3Config {
             frequencies: vec![1, 8],
             use_newton_schulz: false,
             ns_iterations: 5,
+            ns_dim: None,
         }
     }
 
@@ -67,6 +72,7 @@ impl M3Config {
             frequencies: vec![1, 8, 64, 512],
             use_newton_schulz: false,
             ns_iterations: 5,
+            ns_dim: None,
         }
     }
 
@@ -176,13 +182,14 @@ pub fn m3_step(state: &mut M3State, cfg: &M3Config, grad: &[f32]) -> Vec<f32> {
     }
 
     // Step 3: optional Newton-Schulz orthogonalization
-    if cfg.use_newton_schulz && n > 0 {
-        // Find the largest square dimension that fits
-        let d = (n as f64).sqrt() as usize;
-        if d > 0 && d * d == n {
+    // Only apply when ns_dim is explicitly set and matches total_params.
+    // This prevents silently orthogonalizing unrelated flattened tensors.
+    if cfg.use_newton_schulz {
+        if let Some(d) = cfg.ns_dim {
+            assert_eq!(d * d, n,
+                "ns_dim={d} does not match total_params={n} (expected {d}x{d}={})", d * d);
             combined = newton_schulz_5(&combined, d, cfg.ns_iterations);
         }
-        // Non-square param blocks: skip NS (embedding matrices, biases)
     }
 
     // Advance step counter
@@ -311,6 +318,10 @@ pub fn flatten_mag_params(params: &MAGParams) -> Vec<f32> {
 ///
 /// Uses `template` to determine the sizes of each field.
 pub fn unflatten_to_mag_grads(flat: &[f32], template: &MAGParams) -> MAGParams {
+    let expected = template.num_params();
+    assert_eq!(flat.len(), expected,
+        "unflatten: flat len {} != template num_params {}", flat.len(), expected);
+
     let mut offset = 0usize;
 
     fn take(flat: &[f32], offset: &mut usize, len: usize) -> Vec<f32> {
