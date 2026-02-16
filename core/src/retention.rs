@@ -202,6 +202,7 @@ pub fn kl_apply_retention_inplace(
 #[inline]
 pub fn elastic_net_apply(w: &mut [f32], retain: f32, lambda_1: f32, theta: f32) {
     let threshold = lambda_1 * theta;
+    debug_assert!(threshold >= 0.0, "elastic_net threshold must be non-negative");
     for x in w.iter_mut() {
         *x *= retain;
         let abs_x = x.abs();
@@ -374,6 +375,31 @@ mod tests {
         let result = kl_apply_retention(&w, &grad, 0.9, 0.1, 1, 4);
         for &v in &result {
             assert!(v > 0.0, "KL retention should produce positive values");
+        }
+    }
+
+    // ── KL apply retention inplace ─────────────────────────────────
+
+    #[test]
+    fn test_kl_apply_retention_inplace_matches_allocating() {
+        let w = vec![0.25f32; 12]; // 3 rows x 4 cols
+        let grad = vec![0.1, -0.1, 0.2, -0.2, 0.0, 0.0, 0.1, -0.1, -0.3, 0.3, 0.0, 0.0];
+        let (rows, cols) = (3, 4);
+
+        // Allocating version
+        let expected = kl_apply_retention(&w, &grad, 0.9, 0.05, rows, cols);
+
+        // Inplace version
+        let mut out = vec![0.0f32; rows * cols];
+        let mut log_buf = vec![0.0f32; rows * cols];
+        let mut z_buf = vec![0.0f32; cols];
+        kl_apply_retention_inplace(&w, &grad, 0.9, 0.05, rows, cols, &mut out, &mut log_buf, &mut z_buf);
+
+        for i in 0..rows * cols {
+            assert!(
+                (out[i] - expected[i]).abs() < 1e-7,
+                "mismatch at [{i}]: inplace={} expected={}", out[i], expected[i]
+            );
         }
     }
 
