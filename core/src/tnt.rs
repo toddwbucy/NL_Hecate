@@ -79,8 +79,7 @@ fn memory_state_size(cfg: &MAGConfig) -> usize {
 
 /// Compute shard summary: average of local outputs as (k, v) pair.
 fn compute_shard_summary(local_y: &[f32], shard_len: usize, d: usize) -> (Vec<f32>, Vec<f32>) {
-    // Summary key = mean of first half of outputs
-    // Summary value = mean of second half of outputs
+    // Summary key/value = mean of local outputs (shared summary).
     // This is a simple heuristic; the paper uses attention-based summaries.
     let mut k_summary = vec![0.0f32; d];
     let mut v_summary = vec![0.0f32; d];
@@ -190,10 +189,15 @@ pub fn tnt_forward(
         // Global update uses a simple outer-product with retention
         // Only update first d×d elements for matrix-based rules
         if state_size == d * d {
+            // Matrix rules: outer-product global update with retention
             update_global_memory(&mut global_m, &k_summary, &v_summary, d, 0.95);
+        } else if let Some(last_cache) = local_caches.last() {
+            // Non-matrix rules (MLP/Lattice/Trellis): carry forward last local
+            // boundary state so global memory evolves across shards.
+            if let Some(last_chunk) = last_cache.chunks.last() {
+                global_m = last_chunk.boundary_after.state.clone();
+            }
         }
-        // For non-matrix rules, the global memory still carries forward from local caches
-        // (this is a simplification — the full TNT paper uses rule-specific global updates)
 
         global_states.push(global_m.clone());
 
@@ -213,7 +217,53 @@ pub fn tnt_forward(
     (y, cache)
 }
 
-/// TNT backward pass: reverse through shards, accumulating gradients.
+/// Backward through global memory update.
+/// Forward: global_m_new[i,j] = alpha * global_m_old[i,j] + v_summary[i] * k_summary[j]
+/// Returns (d_global_m_old, d_k_summary, d_v_summary).
+fn update_global_memory_backward(
+    d_global_m_new: &[f32],
+    k_summary: &[f32],
+    v_summary: &[f32],
+    d: usize,
+    alpha: f32,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let mut d_global_m_old = vec![0.0f32; d * d];
+    let mut d_k_summary = vec![0.0f32; d];
+    let mut d_v_summary = vec![0.0f32; d];
+
+    for i in 0..d {
+        for j in 0..d {
+            let dg = d_global_m_new[i * d + j];
+            d_global_m_old[i * d + j] = alpha * dg;
+            d_v_summary[i] += dg * k_summary[j];
+            d_k_summary[j] += dg * v_summary[i];
+        }
+    }
+
+    (d_global_m_old, d_k_summary, d_v_summary)
+}
+
+/// Backward through shard summary (mean pooling).
+/// Distributes d_k_summary and d_v_summary back to local outputs.
+fn shard_summary_backward(
+    d_k_summary: &[f32],
+    d_v_summary: &[f32],
+    shard_len: usize,
+    d: usize,
+) -> Vec<f32> {
+    let mut d_local_y = vec![0.0f32; shard_len * d];
+    if shard_len == 0 { return d_local_y; }
+    let inv = 1.0 / shard_len as f32;
+    for t in 0..shard_len {
+        for j in 0..d {
+            d_local_y[t * d + j] = (d_k_summary[j] + d_v_summary[j]) * inv;
+        }
+    }
+    d_local_y
+}
+
+/// TNT backward pass: reverse through shards, propagating gradients through
+/// both local chunkwise passes and global memory updates.
 pub fn tnt_backward(
     level_params: &MemoryLevelParams,
     cache: &TNTForwardCache,
@@ -225,31 +275,81 @@ pub fn tnt_backward(
     let s = cache.seq_len;
     let d = cache.d;
     let cl = tnt_cfg.local_chunk_size;
+    let state_size = memory_state_size(cfg);
 
     let mut total_grads = MemoryLevelParams::zeros_like(d);
     let mut d_embedded = vec![0.0f32; s * d];
 
-    for (shard_idx, shard) in cache.shards.iter().enumerate() {
+    // Gradient for global memory, propagated backward through shards
+    let mut d_global_m = vec![0.0f32; state_size];
+
+    // Reverse shard order to propagate d_global_m backward
+    for shard_idx in (0..cache.shards.len()).rev() {
+        let shard = &cache.shards[shard_idx];
         let shard_start = cache.shard_boundaries[shard_idx];
         let shard_len = cache.shard_lens[shard_idx];
         let shard_embedded = &embedded[shard_start * d..(shard_start + shard_len) * d];
 
-        for (local_idx, local_cache) in shard.local_caches.iter().enumerate() {
-            let local_start = local_idx * cl;
-            let local_end = (local_start + cl).min(shard_len);
-            let local_len = local_end - local_start;
+        // Backward through global update at this shard boundary
+        // (gradient flows from later shards via d_global_m)
+        if state_size == d * d {
+            let (d_gm_old, d_k_sum, d_v_sum) = update_global_memory_backward(
+                &d_global_m, &shard.k_summary, &shard.v_summary, d, 0.95,
+            );
+            d_global_m = d_gm_old;
 
-            let abs_start = shard_start + local_start;
-            let d_y_local = &d_y[abs_start * d..(abs_start + local_len) * d];
-            let local_embedded = &shard_embedded[local_start * d..local_end * d];
-
-            let (local_grads, local_d_emb) = chunkwise_gd_backward(
-                level_params, local_cache, d_y_local, local_embedded, cfg,
+            // Backward through shard summary → additional d_y for this shard
+            let d_shard_y_from_global = shard_summary_backward(
+                &d_k_sum, &d_v_sum, shard_len, d,
             );
 
-            total_grads.accumulate(&local_grads);
-            d_embedded[abs_start * d..(abs_start + local_len) * d]
-                .copy_from_slice(&local_d_emb);
+            // Combine upstream d_y with gradient from global path
+            let mut d_y_combined = vec![0.0f32; shard_len * d];
+            for t in 0..shard_len {
+                for j in 0..d {
+                    let idx = t * d + j;
+                    d_y_combined[idx] = d_y[(shard_start + t) * d + j]
+                        + d_shard_y_from_global[idx];
+                }
+            }
+
+            // Backward through local chunks with combined gradient
+            for (local_idx, local_cache) in shard.local_caches.iter().enumerate() {
+                let local_start = local_idx * cl;
+                let local_end = (local_start + cl).min(shard_len);
+                let local_len = local_end - local_start;
+
+                let d_y_local = &d_y_combined[local_start * d..local_end * d];
+                let local_embedded = &shard_embedded[local_start * d..local_end * d];
+
+                let (local_grads, local_d_emb) = chunkwise_gd_backward(
+                    level_params, local_cache, d_y_local, local_embedded, cfg,
+                );
+
+                total_grads.accumulate(&local_grads);
+                let abs_start = shard_start + local_start;
+                d_embedded[abs_start * d..(abs_start + local_len) * d]
+                    .copy_from_slice(&local_d_emb);
+            }
+        } else {
+            // Non-matrix rules: simpler path (global = last local boundary state)
+            for (local_idx, local_cache) in shard.local_caches.iter().enumerate() {
+                let local_start = local_idx * cl;
+                let local_end = (local_start + cl).min(shard_len);
+                let local_len = local_end - local_start;
+
+                let abs_start = shard_start + local_start;
+                let d_y_local = &d_y[abs_start * d..(abs_start + local_len) * d];
+                let local_embedded = &shard_embedded[local_start * d..local_end * d];
+
+                let (local_grads, local_d_emb) = chunkwise_gd_backward(
+                    level_params, local_cache, d_y_local, local_embedded, cfg,
+                );
+
+                total_grads.accumulate(&local_grads);
+                d_embedded[abs_start * d..(abs_start + local_len) * d]
+                    .copy_from_slice(&local_d_emb);
+            }
         }
     }
 

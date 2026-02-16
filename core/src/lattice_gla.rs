@@ -1,14 +1,19 @@
 /// Lattice GLA — specialized parallelization for Lattice OSR and Trellis.
 ///
-/// Linearizes the orthogonal/two-pass update within chunks by freezing the
-/// normalization at chunk boundaries. The unit sphere constraint naturally
-/// bounds drift, so C=4 matches C=1 quality closely (empirical finding).
+/// Wraps chunkwise GD with boundary renormalization to preserve geometric
+/// constraints (unit sphere for Lattice, bounded S_K/S_V for Trellis).
 ///
-/// For Lattice OSR: freeze slot vectors at boundary, approximate orthogonal
-/// projection as linear within chunk, renormalize only at boundaries.
+/// **Design note on Lattice OSR**: LatticeOSR::step() normalizes slots to
+/// the unit sphere at every token internally. The boundary renormalization
+/// here is therefore a safety net ensuring drift doesn't accumulate across
+/// chunk boundaries, not a replacement for per-token normalization. This
+/// means Lattice GLA is closer to exact than a true linearized approximation.
 ///
-/// For Trellis: freeze S_K/S_V at boundary, approximate the two-pass update
-/// as linear within chunk, renormalize at boundaries.
+/// **Design note on Trellis**: Trellis::step() does NOT normalize S_K/S_V
+/// per-token — it applies OGD updates without explicit renormalization.
+/// Boundary renormalization here is the primary geometric constraint
+/// enforcement, making it a true GLA approximation where larger chunks
+/// trade quality for parallelism.
 
 use crate::model::{MAGConfig, MemoryLevelParams};
 use crate::chunkwise_gd::{chunkwise_gd_forward, chunkwise_gd_backward, ChunkwiseGDCache};
@@ -76,6 +81,7 @@ pub fn lattice_gla_forward(
     cfg: &MAGConfig,
     initial_m: Option<Vec<f32>>,
 ) -> (Vec<f32>, LatticeGLACache) {
+    assert!(chunk_size >= 1, "chunk_size must be >= 1");
     let m_slots = cfg.m_slots;
     let num_chunks = (seq_len + chunk_size - 1) / chunk_size;
 
@@ -169,6 +175,7 @@ pub fn trellis_gla_forward(
     cfg: &MAGConfig,
     initial_m: Option<Vec<f32>>,
 ) -> (Vec<f32>, LatticeGLACache) {
+    assert!(chunk_size >= 1, "chunk_size must be >= 1");
     let d_k = cfg.d_compress;
     let num_chunks = (seq_len + chunk_size - 1) / chunk_size;
 

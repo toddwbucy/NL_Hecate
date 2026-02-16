@@ -81,6 +81,10 @@ pub fn atlas_omega(k: &[f32], v: &[f32], params: &AtlasOmegaParams, d: usize) ->
 ///
 /// Panics with a clear message. Atlas Omega rule must first be implemented
 /// as a MIRAS variant before this parallelization strategy can be used.
+///
+/// Note: `#[no_autodiff]` is not needed here — `-> !` (never type) means this
+/// function can never appear in a differentiable call graph, and `AtlasOmega`
+/// is not in `MemoryRuleKind`, so `strategy_supported()` prevents runtime selection.
 pub fn atlas_parallel_forward(
     _level_params: &crate::model::MemoryLevelParams,
     _embedded: &[f32],
