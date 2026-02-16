@@ -1,7 +1,7 @@
 # NL_Hecate Progress Report
 
 **Project**: NL_Hecate — Nested Learning implementation in Rust + Enzyme AD + CUDA
-**Status**: Stages 0-2 COMPLETE. Stage 3 IN PROGRESS (S3-M1 Pluggable Retention complete).
+**Status**: Stages 0-2 COMPLETE. Stage 3 IN PROGRESS (4/5 milestones complete — S3-M1 through S3-M4 delivered).
 
 ---
 
@@ -11,9 +11,9 @@ NL_Hecate implements the Nested Learning research program (Mirrokni/Behrouz, Goo
 
 An integration spike (17 tests) validates the thesis end-to-end: the full VecStream -> Conductor -> cms_forward -> cms_backward -> apply pipeline learns a repeating token pattern, achieving 100% prediction accuracy across 3 representative configs. The serving path (Session::process_chunk) produces identical behavior to the raw loop.
 
-**Total test count**: 894 Rust + 27 Python = **921 total**
-**PRs merged**: 30
-**Codebase**: ~25.3K lines Rust source + ~9.9K lines Rust tests + ~1.3K lines CUDA + ~1.2K lines Python
+**Total test count**: 918 Rust + 27 Python = **945 total**
+**PRs merged**: 35
+**Codebase**: ~27K lines Rust source + ~10.5K lines Rust tests + ~1.3K lines CUDA + ~1.2K lines Python
 
 ---
 
@@ -41,7 +41,7 @@ An integration spike (17 tests) validates the thesis end-to-end: the full VecStr
 
 All 22 milestones delivered. This is the mathematical heart of the system — everything that PyTorch's autograd + optimizer + DataLoader + model.train()/model_eval() does, reimplemented as a single self-modifying forward pass.
 
-**Memory Rules (8/8)**:
+**Memory Rules (9/9)**:
 - Delta Rule (GD, matrix structure, L2 bias)
 - Titans LMM (GD+momentum, eta gate, momentum accumulator S)
 - Hebbian Rule (direct correlation, no gradient descent)
@@ -50,6 +50,7 @@ All 22 milestones delivered. This is the mathematical heart of the system — ev
 - MEMORA (KL-softmax bias, emergence-based retention)
 - Lattice OSR (orthogonal state recurrence, slot-based compression)
 - Trellis (two-pass KV compression, separate key/value decay)
+- Atlas Omega (state-independent learned omega, batch-parallelizable)
 
 **Composition Patterns (3/3)**:
 - MAG: Memory gates attention output via sigmoid (parallel branches)
@@ -66,7 +67,7 @@ All 22 milestones delivered. This is the mathematical heart of the system — ev
 - Associative Scan (parallel prefix)
 - TNT Hierarchical (chunk+inter-chunk)
 - Lattice GLA (gated linear attention)
-- Atlas Parallel (memory-optimized)
+- Atlas Parallel (batch omega precomputation + sequential recurrence)
 
 **Infrastructure**:
 - ContextStream: replaces DataLoader (no epochs, monotonic cursor, checkpoint-serializable)
@@ -100,7 +101,7 @@ All 22 milestones delivered. This is the mathematical heart of the system — ev
 - ~34k tok/s on x86_64 for d=64 (exceeds 18k target)
 - `#![feature(autodiff)]` gated behind `enzyme` feature for portability
 
-### Stage 3: Extensions (IN PROGRESS — 1/5 milestones)
+### Stage 3: Extensions (IN PROGRESS — 4/5 milestones)
 
 **S3-M1: Pluggable Retention** (PR #31)
 - Extracted retention mechanisms from inline code in all 8 memory rules into `core/src/retention.rs`
@@ -109,7 +110,31 @@ All 22 milestones delivered. This is the mathematical heart of the system — ev
 - `RetentionKind` field added to `MAGConfig` (24 constructors, all test files updated)
 - Cross-rule retention swapping enabled (e.g. DeltaRule+ElasticNet) — CS-36 compliance
 - PyO3 `retention` kwarg for Python-side configuration
-- 22 dedicated retention tests + 17 inline unit tests, 847 base tests passing (0 failures)
+- 22 dedicated retention tests + 17 inline unit tests
+
+**S3-M2: M3 Multi-Scale Optimizer** (PR #32)
+- CMS applied to the optimizer: k momentum accumulators at k frequency levels
+- `M3Config` + `M3State` + `m3_step()` core function with per-level EMA + error accumulation
+- Newton-Schulz orthogonalization (opt-in, 5-iteration convergence to orthogonal matrix)
+- Flatten/unflatten helpers for MAGParams ↔ flat Vec<f32>
+- `apply_weight_gradients_m3()` on MAGParams, integrated with distributed_step
+- 20 tests (unit, error buffering, integration, edge cases)
+
+**S3-M3: CMS Deployment Variants** (PR #32)
+- Configuration schema + validation for 5 CMS deployment patterns
+- `CMSVariant` enum (Basic, Nested, Sequential, Independent, Hybrid)
+- `BlockConfig` + `MultiBlockConfig` with per-variant constructors and validation
+- Nested requires M3 config, Sequential validates non-decreasing k, Hybrid requires mix
+- 15 tests (construction, validation, helpers)
+
+**S3-M4: Atlas Omega Rule** (PR #35)
+- 9th MIRAS variant: state-independent learned omega function `omega(k,v) = W_omega @ silu(concat(k_mem, v_mem))`
+- `core/src/atlas_omega.rs` (~700 lines): full forward + backward with d_M/d_S recurrences + d_W_omega gradient through silu chain rule
+- `atlas_parallel.rs` rewritten: batch omega precomputation + sequential M/S recurrence
+- Full dispatch wiring: MAG, MAL, MAC, chunkwise_gd, TNT (carry-forward path, not outer-product)
+- `w_omega` field on MemoryLevelParams, Xavier init for Atlas
+- Integration sweep expanded to 9 rules × 3 compositions × 3 k-values (72 combos)
+- 12 unit tests + chunkwise macro tests + TNT macro tests
 
 ### Integration Spike: End-to-End Validation
 
@@ -170,7 +195,10 @@ core/src/                          (~25,300 lines, 32 modules)
   memora.rs        — MEMORA (KL-softmax, emergence)
   lattice_osr.rs   — Lattice OSR (orthogonal state recurrence)
   trellis.rs       — Trellis (two-pass KV compression)
+  atlas_omega.rs   — Atlas Omega (state-independent omega, learned W_omega)
   retention.rs     — Pluggable retention (L2/KL/ElasticNet/Sphere) + in-place variants
+  m3.rs            — M3 multi-scale optimizer (CMS on optimizer itself)
+  cms_variants.rs  — CMS deployment variant schemas (Basic/Nested/Sequential/Independent/Hybrid)
   mag.rs           — MAG composition + CMS forward/backward
   mal.rs           — MAL composition
   mac.rs           — MAC composition
@@ -238,6 +266,10 @@ python/                            (~1,200 lines)
 | #29 | Multi-arch CUDA dispatch + build matrix (S2-M1 Phase 5) | S2 |
 | #30 | Update progress report and integration spike tests | S2 |
 | #31 | Pluggable retention trait — MIRAS Knob #3 (S3-M1) | S3 |
+| #32 | M3 multi-scale optimizer + CMS deployment variants (S3-M2/M3) | S3 |
+| #33 | (closed — agent-generated, rejected) | — |
+| #34 | (closed — agent-generated, rejected) | — |
+| #35 | Atlas Omega memory rule — 9th MIRAS variant (S3-M4) | S3 |
 
 ---
 
@@ -245,18 +277,18 @@ python/                            (~1,200 lines)
 
 | Metric | Value |
 |---|---|
-| Total tests | 921 (894 Rust + 27 Python) |
-| Rust tests (verified) | 847 base + 47 feature-gated = 894 passed, 0 failed, 2 ignored |
+| Total tests | 945 (918 Rust + 27 Python) |
+| Rust tests (verified) | 662 lib + 256 external = 918 passed, 0 failed |
 | Python tests | 27 |
-| PRs merged | 31 |
+| PRs merged | 35 (33 active + 2 closed) |
 | Spec files | 48 |
-| Lines of Rust (core/src) | ~25,300 |
-| Lines of Rust (core/tests) | ~9,900 |
+| Lines of Rust (core/src) | ~27,000 |
+| Lines of Rust (core/tests) | ~10,500 |
 | Lines of CUDA (kernels) | ~1,250 |
 | Lines of Python (bindings+tests) | ~1,200 |
-| Memory rules | 8/8 |
+| Memory rules | 9/9 |
 | Composition patterns | 3/3 |
-| Parallelization strategies | 5/5 |
+| Parallelization strategies | 6/6 |
 | CMS levels validated | k=1, k=2, k=4 |
 | MIRAS knobs exercised | All 4 (Structure, Bias, Retention, Algorithm) |
 | Edge throughput (d=64) | ~34k tok/s |
@@ -264,14 +296,12 @@ python/                            (~1,200 lines)
 
 ---
 
-## What's Next: Stage 3 (Extensions) — 1/5 complete
+## What's Next: Stage 3 (Extensions) — 4/5 complete
 
-S3-M1 (Pluggable Retention) is complete. Retention is now a first-class composable knob — any rule can use any retention mechanism, unlocking the full 4-knob MIRAS design space.
-
-Remaining Stage 3 milestones are independent:
+Four of five Stage 3 milestones are delivered. The system now has 9 memory rules, pluggable retention, a multi-scale optimizer (M3), CMS deployment variant schemas, and the Atlas Omega rule with full parallelization support.
 
 - ~~**S3-M1: Pluggable Retention**~~ — COMPLETE (PR #31)
-- **S3-M2: M3 Multi-Scale Optimizer** — Apply CMS to the optimizer itself (k momentum accumulators)
-- **S3-M3: CMS Deployment Variants** — Nested, sequential, independent, hybrid CMS patterns
-- **S3-M4: Atlas Omega Rule** — 9th MIRAS variant, enables Atlas Parallel strategy
+- ~~**S3-M2: M3 Multi-Scale Optimizer**~~ — COMPLETE (PR #32)
+- ~~**S3-M3: CMS Deployment Variants**~~ — COMPLETE (PR #32)
+- ~~**S3-M4: Atlas Omega Rule**~~ — COMPLETE (PR #35)
 - **S3-M5: Dynamic Frequency Scheduling** — Data-dependent level activation (learned frequency gates)
