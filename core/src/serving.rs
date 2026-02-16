@@ -168,7 +168,7 @@ impl Session {
     }
 
     /// Atomic checkpoint: conductor state + context memory + stream cursor + session metadata.
-    /// Requires stream to be attached (Stream mode).
+    /// Requires stream to be attached (Stream mode). Panics if called on a Test-mode session.
     pub fn checkpoint(&mut self) -> SessionCheckpoint {
         let inner = self.conductor.checkpoint();
         SessionCheckpoint {
