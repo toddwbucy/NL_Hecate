@@ -56,7 +56,7 @@ impl Default for RetentionConfig {
 pub fn default_retention(rule: crate::model::MemoryRuleKind) -> RetentionKind {
     use crate::model::MemoryRuleKind::*;
     match rule {
-        DeltaRule | TitansLMM | HebbianRule | Moneta | YAAD | Trellis => RetentionKind::L2WeightDecay,
+        DeltaRule | TitansLMM | HebbianRule | Moneta | YAAD | Trellis | AtlasOmega => RetentionKind::L2WeightDecay,
         MEMORA => RetentionKind::KLDivergence,
         LatticeOSR => RetentionKind::SphereNormalization,
     }

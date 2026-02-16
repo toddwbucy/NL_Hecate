@@ -130,7 +130,8 @@ fn context_memory_size(cfg: &MAGConfig) -> usize {
     match cfg.memory_rule {
         MemoryRuleKind::DeltaRule
         | MemoryRuleKind::TitansLMM
-        | MemoryRuleKind::HebbianRule => d * d,
+        | MemoryRuleKind::HebbianRule
+        | MemoryRuleKind::AtlasOmega => d * d,
         MemoryRuleKind::Moneta
         | MemoryRuleKind::YAAD
         | MemoryRuleKind::MEMORA => {
@@ -597,11 +598,12 @@ fn test_spike_multi_config_diagnostic() {
 //
 // MAC requires window_size >= 2*seq_len. k=4 gets more steps (Level 3 fires at 512).
 
-/// All 8 memory rules.
+/// All 9 memory rules.
 const ALL_RULES: &[MemoryRuleKind] = &[
     MemoryRuleKind::DeltaRule,
     MemoryRuleKind::TitansLMM,
     MemoryRuleKind::HebbianRule,
+    MemoryRuleKind::AtlasOmega,
     MemoryRuleKind::Moneta,
     MemoryRuleKind::YAAD,
     MemoryRuleKind::MEMORA,
@@ -644,7 +646,8 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
         match rule {
             MemoryRuleKind::DeltaRule
             | MemoryRuleKind::TitansLMM
-            | MemoryRuleKind::HebbianRule => {
+            | MemoryRuleKind::HebbianRule
+            | MemoryRuleKind::AtlasOmega => {
                 (0, 2.0, 2.0, 0.0, 0.0, 1.0, 0, 0, 0.0, 0.0)
             }
             MemoryRuleKind::Moneta => {
@@ -701,7 +704,8 @@ fn rule_family(rule: &MemoryRuleKind) -> &'static str {
     match rule {
         MemoryRuleKind::DeltaRule
         | MemoryRuleKind::TitansLMM
-        | MemoryRuleKind::HebbianRule => "matrix",
+        | MemoryRuleKind::HebbianRule
+        | MemoryRuleKind::AtlasOmega => "matrix",
         MemoryRuleKind::Moneta
         | MemoryRuleKind::YAAD
         | MemoryRuleKind::MEMORA => "mlp",

@@ -22,6 +22,7 @@ pub mod chunkwise_gd;
 pub mod associative_scan;
 pub mod tnt;
 pub mod lattice_gla;
+pub mod atlas_omega;
 pub mod atlas_parallel;
 #[cfg(feature = "internal")]
 pub mod gradient;

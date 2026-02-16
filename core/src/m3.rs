@@ -289,7 +289,7 @@ fn matmul_t_a(a: &[f32], b: &[f32], d: usize) -> Vec<f32> {
 /// Flatten all MAGParams weight vectors into a single contiguous Vec<f32>.
 ///
 /// Order: SWA (embed, q, k, v, o, unembed) then each level
-/// (k_mem, v_mem, q_mem, alpha, b_alpha, theta, b_theta, eta, b_eta).
+/// (k_mem, v_mem, q_mem, alpha, b_alpha, theta, b_theta, eta, b_eta, w_omega).
 pub fn flatten_mag_params(params: &MAGParams) -> Vec<f32> {
     let mut flat = Vec::with_capacity(params.num_params());
 
@@ -312,6 +312,7 @@ pub fn flatten_mag_params(params: &MAGParams) -> Vec<f32> {
         flat.extend_from_slice(&level.b_theta);
         flat.extend_from_slice(&level.w_eta);
         flat.extend_from_slice(&level.b_eta);
+        flat.extend_from_slice(&level.w_omega);
     }
 
     flat
@@ -354,6 +355,7 @@ pub fn unflatten_to_mag_grads(flat: &[f32], template: &MAGParams) -> MAGParams {
             b_theta: take(flat, &mut offset, tl.b_theta.len()),
             w_eta: take(flat, &mut offset, tl.w_eta.len()),
             b_eta: take(flat, &mut offset, tl.b_eta.len()),
+            w_omega: take(flat, &mut offset, tl.w_omega.len()),
         });
     }
 

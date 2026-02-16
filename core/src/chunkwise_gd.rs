@@ -99,13 +99,19 @@ fn extract_final_state(cache: &MemoryCache, seq_len: usize, d: usize, cfg: &MAGC
             state.extend_from_slice(&c.sv_states[seq_len * sv_size..(seq_len + 1) * sv_size]);
             state
         }
+        MemoryCache::Atlas(c) => {
+            c.m_states[seq_len * d * d..(seq_len + 1) * d * d].to_vec()
+        }
     }
 }
 
-/// Extract the final momentum state from a Titans cache (for boundary propagation).
+/// Extract the final momentum state from a Titans/Atlas cache (for boundary propagation).
 fn extract_final_momentum(cache: &MemoryCache, seq_len: usize, d: usize) -> Option<Vec<f32>> {
     match cache {
         MemoryCache::Titans(c) => {
+            Some(c.s_states[seq_len * d * d..(seq_len + 1) * d * d].to_vec())
+        }
+        MemoryCache::Atlas(c) => {
             Some(c.s_states[seq_len * d * d..(seq_len + 1) * d * d].to_vec())
         }
         _ => None,
@@ -159,6 +165,11 @@ fn run_chunk(
             let (y, cache) = rule.step(level_params, embedded_chunk, chunk_len, d, initial_m);
             (y, MemoryCache::Trellis(cache))
         }
+        MemoryRuleKind::AtlasOmega => {
+            use crate::atlas_omega::AtlasOmega;
+            let (y, cache) = AtlasOmega.step(level_params, embedded_chunk, chunk_len, d, initial_m);
+            (y, MemoryCache::Atlas(cache))
+        }
     }
 }
 
@@ -193,6 +204,10 @@ fn run_chunk_backward(
         MemoryCache::Trellis(c) => {
             let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
             rule.step_backward(level_params, c, d_y_chunk, embedded_chunk)
+        }
+        MemoryCache::Atlas(c) => {
+            use crate::atlas_omega::AtlasOmega;
+            AtlasOmega.step_backward(level_params, c, d_y_chunk, embedded_chunk)
         }
     }
 }
@@ -712,6 +727,8 @@ mod tests {
     chunkwise_rule_tests!(memora_chunkwise, memora_test_config);
     chunkwise_rule_tests!(lattice_chunkwise, lattice_test_config);
     chunkwise_rule_tests!(trellis_chunkwise, trellis_test_config);
+    // Atlas: has momentum S like Titans, needs relaxed tolerances for chunk boundaries.
+    chunkwise_rule_tests!(atlas_chunkwise, atlas_test_config, 1e-4, 2.0, 3.0);
 
     // ═══════════════════════════════════════════════════════════════════
     // General tests

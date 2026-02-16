@@ -64,7 +64,7 @@ fn memory_state_size(cfg: &MAGConfig) -> usize {
     let d = cfg.swa.d_model;
     match cfg.memory_rule {
         MemoryRuleKind::DeltaRule | MemoryRuleKind::TitansLMM
-        | MemoryRuleKind::HebbianRule => d * d,
+        | MemoryRuleKind::HebbianRule | MemoryRuleKind::AtlasOmega => d * d,
         MemoryRuleKind::Moneta | MemoryRuleKind::YAAD | MemoryRuleKind::MEMORA => {
             let dh = cfg.d_hidden;
             dh * d + d * dh // W1 + W2
@@ -186,14 +186,22 @@ pub fn tnt_forward(
         // Compute shard summary and update global memory
         let (k_summary, v_summary) = compute_shard_summary(&shard_y, shard_len, d);
 
-        // Global update uses a simple outer-product with retention
-        // Only update first d×d elements for matrix-based rules
-        if state_size == d * d {
-            // Matrix rules: outer-product global update with retention
+        // Global update: outer-product for state-dependent matrix rules (Delta/Titans/Hebbian).
+        // AtlasOmega uses a learned omega function for M updates, so it carries forward
+        // the last local boundary state instead of using the outer-product update.
+        let use_outer_product_update = matches!(
+            cfg.memory_rule,
+            MemoryRuleKind::DeltaRule | MemoryRuleKind::TitansLMM | MemoryRuleKind::HebbianRule
+        );
+        if use_outer_product_update {
             update_global_memory(&mut global_m, &k_summary, &v_summary, d, 0.95);
         } else if let Some(last_cache) = local_caches.last() {
-            // Non-matrix rules (MLP/Lattice/Trellis): carry forward last local
+            // Rules not in the outer-product set: carry forward last local
             // boundary state so global memory evolves across shards.
+            // This includes MLP rules (Moneta/YAAD/MEMORA), compression rules
+            // (Lattice/Trellis), and AtlasOmega — which has a d×d matrix M but
+            // updates it via a learned omega function (state-independent), not
+            // the Hebbian-style outer-product used by Delta/Titans/Hebbian.
             if let Some(last_chunk) = last_cache.chunks.last() {
                 global_m = last_chunk.boundary_after.state.clone();
             }
@@ -292,7 +300,11 @@ pub fn tnt_backward(
 
         // Backward through global update at this shard boundary
         // (gradient flows from later shards via d_global_m)
-        if state_size == d * d {
+        let use_outer_product_update = matches!(
+            cfg.memory_rule,
+            MemoryRuleKind::DeltaRule | MemoryRuleKind::TitansLMM | MemoryRuleKind::HebbianRule
+        );
+        if use_outer_product_update {
             let (d_gm_old, d_k_sum, d_v_sum) = update_global_memory_backward(
                 &d_global_m, &shard.k_summary, &shard.v_summary, d, 0.95,
             );
@@ -494,6 +506,7 @@ mod tests {
     tnt_rule_tests!(memora_tnt, memora_test_config);
     tnt_rule_tests!(lattice_tnt, lattice_test_config);
     tnt_rule_tests!(trellis_tnt, trellis_test_config);
+    tnt_rule_tests!(atlas_tnt, atlas_test_config);
 
     // ─── General tests ──────────────────────────────────────
 

@@ -36,6 +36,7 @@ pub enum MemoryRuleKind {
     MEMORA,
     LatticeOSR,
     Trellis,
+    AtlasOmega,
 }
 
 /// Model configuration — immutable after construction.
@@ -168,6 +169,7 @@ impl SWAParams {
 ///   b_theta:  [1]    learning rate gate bias
 ///   w_eta:    [2*d]  momentum gate weights (TitansLMM only; zero-init for DeltaRule)
 ///   b_eta:    [1]    momentum gate bias (TitansLMM only)
+///   w_omega:  [d, 2*d] Atlas Omega projection (AtlasOmega only; zero-init for others)
 #[derive(Clone)]
 pub struct MemoryLevelParams {
     pub w_k_mem: Vec<f32>,
@@ -179,6 +181,9 @@ pub struct MemoryLevelParams {
     pub b_theta: Vec<f32>,
     pub w_eta: Vec<f32>,
     pub b_eta: Vec<f32>,
+    /// Atlas Omega projection: [d, 2*d]. omega(k,v) = W_omega @ silu(concat(k_mem, v_mem)).
+    /// Zero-initialized for non-Atlas rules (adds d*2*d params per level).
+    pub w_omega: Vec<f32>,
 }
 
 impl MemoryLevelParams {
@@ -213,7 +218,19 @@ impl MemoryLevelParams {
         let b_theta = vec![b_theta_init];
         let b_eta = vec![b_eta_init];
 
-        MemoryLevelParams { w_k_mem, w_v_mem, w_q_mem, w_alpha, b_alpha, w_theta, b_theta, w_eta, b_eta }
+        // Atlas Omega projection: zero-initialized by default.
+        // atlas_init() below provides Xavier-initialized w_omega.
+        let w_omega = vec![0.0f32; d * 2 * d];
+
+        MemoryLevelParams { w_k_mem, w_v_mem, w_q_mem, w_alpha, b_alpha, w_theta, b_theta, w_eta, b_eta, w_omega }
+    }
+
+    /// Initialize with Xavier-initialized w_omega for Atlas Omega rule.
+    pub fn atlas_init(d: usize, rng: &mut SimpleRng, b_alpha_init: f32, b_theta_init: f32, b_eta_init: f32) -> Self {
+        let mut params = Self::init(d, rng, b_alpha_init, b_theta_init, b_eta_init);
+        let omega_scale = (1.0 / (2 * d) as f32).sqrt();
+        rng.fill_uniform(&mut params.w_omega, omega_scale);
+        params
     }
 
     /// Create zero-initialized shadow for gradient accumulation.
@@ -228,6 +245,7 @@ impl MemoryLevelParams {
             b_theta: vec![0.0f32; 1],
             w_eta: vec![0.0f32; 2 * d],
             b_eta: vec![0.0f32; 1],
+            w_omega: vec![0.0f32; d * 2 * d],
         }
     }
 
@@ -237,6 +255,7 @@ impl MemoryLevelParams {
             + self.w_alpha.len() + self.b_alpha.len()
             + self.w_theta.len() + self.b_theta.len()
             + self.w_eta.len() + self.b_eta.len()
+            + self.w_omega.len()
     }
 
     /// Outer-loop weight update: param -= lr * grad for all projection weights.
@@ -255,6 +274,7 @@ impl MemoryLevelParams {
         step(&mut self.b_theta, &grads.b_theta, lr);
         step(&mut self.w_eta, &grads.w_eta, lr);
         step(&mut self.b_eta, &grads.b_eta, lr);
+        step(&mut self.w_omega, &grads.w_omega, lr);
     }
 
     /// Element-wise accumulate: self += other.
@@ -273,6 +293,7 @@ impl MemoryLevelParams {
         acc(&mut self.b_theta, &other.b_theta);
         acc(&mut self.w_eta, &other.w_eta);
         acc(&mut self.b_eta, &other.b_eta);
+        acc(&mut self.w_omega, &other.w_omega);
     }
 
     /// Frobenius norm across all weight matrices.
@@ -280,7 +301,7 @@ impl MemoryLevelParams {
         let mut sum = 0.0f32;
         for v in [&self.w_k_mem, &self.w_v_mem, &self.w_q_mem,
                    &self.w_alpha, &self.b_alpha, &self.w_theta, &self.b_theta,
-                   &self.w_eta, &self.b_eta] {
+                   &self.w_eta, &self.b_eta, &self.w_omega] {
             for &x in v.iter() {
                 sum += x * x;
             }
@@ -903,6 +924,52 @@ impl MAGConfig {
         }
     }
 
+    /// Atlas Omega test configuration: d=8, k=1.
+    pub fn atlas_test_config() -> Self {
+        MAGConfig {
+            swa: SWAConfig {
+                d_model: 8,
+                num_heads: 2,
+                head_dim: 4,
+                seq_len: 4,
+                window_size: 4,
+                vocab_size: 16,
+            },
+            memory_enabled: true,
+            composition: CompositionKind::MAG,
+            memory_rule: MemoryRuleKind::AtlasOmega,
+            k: 1,
+            chunk_sizes: vec![1],
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            parallel: None,
+            retention: default_retention(MemoryRuleKind::AtlasOmega),
+            m3: None,
+        }
+    }
+
+    /// Atlas Omega test configuration for CMS k=2 testing.
+    pub fn atlas_test_config_k2() -> Self {
+        MAGConfig {
+            swa: SWAConfig {
+                d_model: 8,
+                num_heads: 2,
+                head_dim: 4,
+                seq_len: 8,
+                window_size: 8,
+                vocab_size: 16,
+            },
+            memory_enabled: true,
+            composition: CompositionKind::MAG,
+            memory_rule: MemoryRuleKind::AtlasOmega,
+            k: 2,
+            chunk_sizes: vec![1, 8],
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            parallel: None,
+            retention: default_retention(MemoryRuleKind::AtlasOmega),
+            m3: None,
+        }
+    }
+
     /// MAL test configuration: d=8, k=1, DeltaRule.
     pub fn mal_test_config() -> Self {
         MAGConfig {
@@ -1019,12 +1086,22 @@ impl MAGParams {
         for level in 0..cfg.k {
             // Different seed offset per level to avoid correlation
             let mut rng = SimpleRng::new(seed.wrapping_add(1000 + level as u64 * 500));
-            levels.push(MemoryLevelParams::init(
-                d, &mut rng,
-                default_b_alpha(level),
-                default_b_theta(level),
-                default_b_eta(level),
-            ));
+            let level_params = if cfg.memory_rule == MemoryRuleKind::AtlasOmega {
+                MemoryLevelParams::atlas_init(
+                    d, &mut rng,
+                    default_b_alpha(level),
+                    default_b_theta(level),
+                    default_b_eta(level),
+                )
+            } else {
+                MemoryLevelParams::init(
+                    d, &mut rng,
+                    default_b_alpha(level),
+                    default_b_theta(level),
+                    default_b_eta(level),
+                )
+            };
+            levels.push(level_params);
         }
 
         MAGParams { swa, levels }
@@ -1314,7 +1391,8 @@ mod tests {
         assert_eq!(p.levels[0].w_eta.len(), 2 * d);
         assert_eq!(p.levels[0].b_eta.len(), 1);
         // eta params included in num_params
-        let expected = 3 * d * d + 2 * (2 * d) + 2 + (2 * d) + 1; // 3 proj + 2 gates + eta
+        // 3 proj (d*d each) + alpha gate (2*d + 1) + theta gate (2*d + 1) + eta gate (2*d + 1) + w_omega (d * 2*d)
+        let expected = 3 * d * d + 3 * (2 * d + 1) + d * 2 * d;
         assert_eq!(p.levels[0].num_params(), expected);
     }
 

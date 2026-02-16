@@ -56,7 +56,8 @@ fn context_memory_size(cfg: &MAGConfig) -> usize {
     match cfg.memory_rule {
         MemoryRuleKind::DeltaRule
         | MemoryRuleKind::TitansLMM
-        | MemoryRuleKind::HebbianRule => d * d,
+        | MemoryRuleKind::HebbianRule
+        | MemoryRuleKind::AtlasOmega => d * d,
         MemoryRuleKind::Moneta
         | MemoryRuleKind::YAAD
         | MemoryRuleKind::MEMORA => cfg.d_hidden * d + d * cfg.d_hidden,
@@ -75,6 +76,7 @@ fn test_default_retention_all_rules() {
     assert_eq!(default_retention(MemoryRuleKind::Moneta), RetentionKind::L2WeightDecay);
     assert_eq!(default_retention(MemoryRuleKind::YAAD), RetentionKind::L2WeightDecay);
     assert_eq!(default_retention(MemoryRuleKind::Trellis), RetentionKind::L2WeightDecay);
+    assert_eq!(default_retention(MemoryRuleKind::AtlasOmega), RetentionKind::L2WeightDecay);
     assert_eq!(default_retention(MemoryRuleKind::MEMORA), RetentionKind::KLDivergence);
     assert_eq!(default_retention(MemoryRuleKind::LatticeOSR), RetentionKind::SphereNormalization);
 }
