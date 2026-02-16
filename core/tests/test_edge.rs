@@ -105,8 +105,9 @@ fn test_profile2_training_reduces_loss() {
     model.apply_gradients(&grads, 0.001);
 
     // Fresh context for fair comparison (inner-loop memory resets)
+    let mag_cfg = cfg.to_mag_config();
     model.context = nl_hecate_core::conductor::ContextState::new(cfg.k, cfg.d_model);
-    model.conductor = nl_hecate_core::conductor::Conductor::new(cfg.k, vec![1]);
+    model.conductor = nl_hecate_core::conductor::Conductor::new(cfg.k, mag_cfg.chunk_sizes);
 
     let (loss_after, _) = model.forward_backward(&input, &target);
     assert!(

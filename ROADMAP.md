@@ -186,6 +186,7 @@ Deploy micro models (d <= 128) on CPU with zero external dependencies. The inner
 - 11 integration tests + 9 unit tests (profiles, size, throughput, memory, cross-compile)
 
 **Benchmark results** (x86_64, release):
+
 | Dimension | Throughput (tok/s) | Forward latency | Deployment size |
 |-----------|-------------------|-----------------|-----------------|
 | d=64      | ~34,000           | ~471 µs         | ~230 KB         |
