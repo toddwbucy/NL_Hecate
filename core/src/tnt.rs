@@ -196,8 +196,12 @@ pub fn tnt_forward(
         if use_outer_product_update {
             update_global_memory(&mut global_m, &k_summary, &v_summary, d, 0.95);
         } else if let Some(last_cache) = local_caches.last() {
-            // Non-matrix rules (MLP/Lattice/Trellis): carry forward last local
+            // Rules not in the outer-product set: carry forward last local
             // boundary state so global memory evolves across shards.
+            // This includes MLP rules (Moneta/YAAD/MEMORA), compression rules
+            // (Lattice/Trellis), and AtlasOmega — which has a d×d matrix M but
+            // updates it via a learned omega function (state-independent), not
+            // the Hebbian-style outer-product used by Delta/Titans/Hebbian.
             if let Some(last_chunk) = last_cache.chunks.last() {
                 global_m = last_chunk.boundary_after.state.clone();
             }
