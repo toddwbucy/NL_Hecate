@@ -1,17 +1,19 @@
 # NL_Hecate Progress Report
 
 **Project**: NL_Hecate — Nested Learning implementation in Rust + Enzyme AD + CUDA
-**Status**: Stage 2 (Production Infrastructure) in progress — S2-M1 through S2-M3 complete
+**Status**: Stages 0-2 COMPLETE. Integration spike validates end-to-end learning. Ready for Stage 3.
 
 ---
 
 ## Executive Summary
 
-NL_Hecate implements the Nested Learning research program (Mirrokni/Behrouz, Google Research) in Rust with Enzyme AD and CUDA kernels. In roughly 48 hours of implementation across Stages 1-2, the project built the essential forward/backward/optimize pipeline — 8 memory rules, 3 composition patterns, 5 parallelization strategies, CUDA kernel pairs, multi-GPU sync, and serving — that replaces PyTorch's training/inference stack with a unified self-modifying forward pass.
+NL_Hecate implements the Nested Learning research program (Mirrokni/Behrouz, Google Research) in Rust with Enzyme AD and CUDA kernels. The project built the essential forward/backward/optimize pipeline — 8 memory rules, 3 composition patterns, 5 parallelization strategies, CUDA kernel pairs, multi-GPU sync, serving, and edge deployment — that replaces PyTorch's training/inference stack with a unified self-modifying forward pass.
 
-**Total test count**: 796 Rust + 27 Python = **823 total** (796 = 778 existing + 18 serving)
-**PRs merged**: 25 (plus S2-M2 and S2-M3 pending)
-**Codebase**: ~24K lines Rust source + ~8K lines Rust tests + ~1.2K lines CUDA + ~1.2K lines Python
+An integration spike (17 tests) validates the thesis end-to-end: the full VecStream -> Conductor -> cms_forward -> cms_backward -> apply pipeline learns a repeating token pattern, achieving 100% prediction accuracy across 3 representative configs. The serving path (Session::process_chunk) produces identical behavior to the raw loop.
+
+**Total test count**: 858 Rust + 27 Python = **885 total**
+**PRs merged**: 29
+**Codebase**: ~24.9K lines Rust source + ~9.5K lines Rust tests + ~1.3K lines CUDA + ~1.2K lines Python
 
 ---
 
@@ -71,12 +73,13 @@ All 22 milestones delivered. This is the mathematical heart of the system — ev
 - 100K stability sweep across all rule/composition/k combinations
 - PyO3 bindings for all rules + compositions
 
-### Stage 2: Production Infrastructure (IN PROGRESS — S2-M1 through S2-M3 complete)
+### Stage 2: Production Infrastructure (COMPLETE — S2-M1 through S2-M4)
 
-**S2-M1: CUDA Kernel Pairs** (PR #25)
+**S2-M1: CUDA Kernel Pairs + Compilation** (PRs #25, #29)
 - Forward + backward kernels for SWA, Delta Rule, Titans LMM, Hebbian
 - Composition dispatch kernels for MAG/MAL/MAC
-- Warp reduction via __shfl_down_sync, atomicAdd scatter
+- Multi-architecture fat binary (sm_86/89/90 SASS + PTX fallback)
+- Backend enum + detect_gpu() + force_rust_reference() override
 - Forward tolerance: 1e-5, backward: 1e-4 per-element vs Rust reference
 
 **S2-M2: CMS-Aware Multi-GPU Gradient Sync** (PR #26)
@@ -84,13 +87,26 @@ All 22 milestones delivered. This is the mathematical heart of the system — ev
 - MockProcessGroup for testing without real multi-GPU hardware
 - AllReduce averaging + ErrorBuffer integration for frozen levels
 
-**S2-M3: Serving Non-Stationary Models** (this PR)
+**S2-M3: Serving Non-Stationary Models** (PR #27)
 - Session struct: per-user isolated ContextState + Conductor
 - Two modes: Test (bounded) and Stream (unbounded via ContextStream) — no mode flag (CS-10)
 - process_chunk calls cms_forward directly — same path as build (CS-18)
 - LatencyTracker: average/worst/p99 for SLA validation
 - Checkpoint/restore with pulse_id verification
-- 18 tests proving: latency stability, memory evolution, session isolation, params read-only
+
+**S2-M4: Edge Deployment** (PR #28)
+- Zero-dependency micro models (d <= 128) on CPU
+- Three profiles: inner-loop only, full NL, WASM (wasm32-unknown-unknown validated)
+- ~34k tok/s on x86_64 for d=64 (exceeds 18k target)
+- `#![feature(autodiff)]` gated behind `enzyme` feature for portability
+
+### Integration Spike: End-to-End Validation
+
+**17 tests** validating that the full pipeline actually learns a predictable pattern.
+
+**Stage 1 tests (12)**: VecStream -> Conductor -> cms_forward -> cms_backward -> apply loop for 500 steps. Three configs (DeltaRule+MAG, TitansLMM+MAL, HebbianRule+MAG) all converge from random-chance loss (2.77) to near-zero, achieving 100% prediction accuracy on a repeating [0..8] token pattern.
+
+**Stage 2 tests (5)**: Serving Session path produces identical behavior to raw loop. Checkpoint/restore yields identical loss trajectory. CUDA dispatch stub validates feature gating.
 
 ---
 
@@ -115,7 +131,11 @@ The serving module proves the central NL thesis: there is no train/eval distinct
 
 For MONETA/YAAD/MEMORA (MLP-based memory structure), the outer-loop SGD barely affects loss. The MLP inner loop is expressive enough to fit without outer-loop weight changes. This suggests MLP memory rules may be more suitable for pure serving (no outer-loop needed) than matrix rules.
 
-### 4. Additive Level Composition Scaling
+### 4. Learning Rate Scales as 1/sqrt(d)
+
+The integration spike revealed that outer-loop learning rate must scale with model dimension. At d=8, lr=0.01 (used by d=64 unit tests) produces negligible weight changes — SWA gradient norm of 0.024, memory gradients ~1e-7. Scaling to lr=0.5 achieved convergence from 2.77 to 0.0007 in 500 steps. The relationship is approximately lr proportional to 1/sqrt(d).
+
+### 5. Additive Level Composition Scaling
 
 y_combined = SUM(level outputs) grows linearly with k. At k=4, the summed signal pushes sigmoid into saturation. Fixed with 1/sqrt(k) normalization (variance-preserving, applied only for k>2).
 
@@ -124,7 +144,7 @@ y_combined = SUM(level outputs) grows linearly with k. At k=4, the summed signal
 ## Architecture
 
 ```text
-core/src/                          (~24,400 lines, 30 modules)
+core/src/                          (~24,900 lines, 31 modules)
   tensor.rs        — SIMD-friendly primitives, RNG, sigmoid, softplus
   swa.rs           — Sliding Window Attention forward/backward
   model.rs         — SWAConfig/Params, MAGConfig/Params, MemoryLevelParams
@@ -153,6 +173,7 @@ core/src/                          (~24,400 lines, 30 modules)
   atlas_parallel.rs — Atlas memory-optimized parallel
   serving.rs       — Session/LatencyTracker/Checkpoint (feature: serving)
   distributed.rs   — CMS-aware multi-GPU sync (feature: distributed)
+  edge.rs          — Edge deployment profiles (feature: edge)
   cuda_ffi.rs      — CUDA FFI bindings (feature: cuda)
 
 core/kernels/                      (~1,250 lines, 8 kernel files)
@@ -161,7 +182,7 @@ core/kernels/                      (~1,250 lines, 8 kernel files)
   titans_forward.cu / titans_backward.cu
   hebbian_forward.cu / hebbian_backward.cu
 
-core/tests/                        (~8,350 lines, 23 test files)
+core/tests/                        (~9,500 lines, 28 test files)
 
 python/                            (~1,200 lines)
   nl_hecate/       — PyO3 bindings (all rules + compositions)
@@ -201,6 +222,8 @@ python/                            (~1,200 lines)
 | #25 | CUDA kernel pairs (S2-M1) | S2 |
 | #26 | CMS-aware multi-GPU gradient sync (S2-M2) | S2 |
 | #27 | Serving non-stationary models (S2-M3) | S2 |
+| #28 | Edge deployment for zero-dependency micro models (S2-M4) | S2 |
+| #29 | Multi-arch CUDA dispatch + build matrix (S2-M1 Phase 5) | S2 |
 
 ---
 
@@ -208,14 +231,13 @@ python/                            (~1,200 lines)
 
 | Metric | Value |
 |---|---|
-| Total tests | 823 (796 Rust + 27 Python) |
-| Rust lib tests | 611 |
-| Rust integration tests | 185 |
+| Total tests | 885 (858 Rust + 27 Python) |
+| Rust tests (verified) | 858 passed, 0 failed, 2 ignored |
 | Python tests | 27 |
-| PRs merged/pending | 27 |
+| PRs merged | 29 |
 | Spec files | 48 |
-| Lines of Rust (core/src) | ~24,400 |
-| Lines of Rust (core/tests) | ~8,350 |
+| Lines of Rust (core/src) | ~24,900 |
+| Lines of Rust (core/tests) | ~9,500 |
 | Lines of CUDA (kernels) | ~1,250 |
 | Lines of Python (bindings+tests) | ~1,200 |
 | Memory rules | 8/8 |
@@ -223,15 +245,19 @@ python/                            (~1,200 lines)
 | Parallelization strategies | 5/5 |
 | CMS levels validated | k=1, k=2, k=4 |
 | MIRAS knobs exercised | All 4 (Structure, Bias, Retention, Algorithm) |
+| Edge throughput (d=64) | ~34k tok/s |
+| Integration spike | 17/17 pass, Outcome 1 (GO) |
 
 ---
 
-## What's Next: S2-M4 (Edge Deployment)
+## What's Next: Stage 3 (Extensions)
 
-Deploy micro models (d <= 128) on CPU with zero external dependencies. The inner loop enables on-device adaptation without retraining.
+Stage 2 is complete. The integration spike confirms the foundation is solid — all 3 tested configs learn a repeating pattern end-to-end, serving path matches raw loop exactly, and checkpoint/restore is deterministic.
 
-- Profile 1: Inner-loop only (no Enzyme on target, pre-computed outer-loop weights)
-- Profile 2: Full NL (Enzyme on target for fine-tuning)
-- Profile 3: WASM (browser deployment)
-- Target matrix: x86, aarch64, armv7, riscv64, wasm32
-- Benchmark: 18k tok/s target on single CPU thread (d=64-128)
+Stage 3 extends the algorithm design space. All milestones are independent:
+
+- **S3-M1: Pluggable Retention Trait** — Extract retention into composable trait, add elastic net + f-divergence
+- **S3-M2: M3 Multi-Scale Optimizer** — Apply CMS to the optimizer itself (k momentum accumulators)
+- **S3-M3: CMS Deployment Variants** — Nested, sequential, independent, hybrid CMS patterns
+- **S3-M4: Atlas Omega Rule** — 9th MIRAS variant, enables Atlas Parallel strategy
+- **S3-M5: Dynamic Frequency Scheduling** — Data-dependent level activation (learned frequency gates)
