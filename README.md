@@ -35,7 +35,7 @@ This is a **specification-first** implementation: every component traces to a pa
 
 ## Key Concepts
 
-### MIRAS Framework (4 Independent Knobs)
+### [Miras](https://arxiv.org/abs/2504.13173) Framework (4 Independent Knobs)
 
 Every memory update rule is specified by four orthogonal choices:
 
@@ -48,7 +48,7 @@ Every memory update rule is specified by four orthogonal choices:
 
 Eight named variants implement specific knob combinations: **Titans LMM**, **Delta Rule**, **Hebbian**, **MONETA**, **YAAD**, **MEMORA**, **Lattice OSR**, **Trellis**.
 
-### Composition Patterns
+### [Titans](https://arxiv.org/abs/2501.00663) Composition Patterns
 
 | Pattern | Description |
 |---------|-------------|
@@ -73,7 +73,7 @@ Eight named variants implement specific knob combinations: **Titans LMM**, **Del
 | Stage | Description | Tests | Status |
 |-------|-------------|-------|--------|
 | **Stage 0** | Foundation — Enzyme spike, SWA pipeline, Delta Rule + MAG | 202 | Complete |
-| **Stage 1** | Algorithm Core — all 8 MIRAS rules, 3 compositions, CMS k=1/2/4, 5 parallelization strategies, ContextStream, 100K stability sweep, PyO3 bindings | 805 | Complete |
+| **Stage 1** | Algorithm Core — all 8 Miras rules, 3 compositions, CMS k=1/2/4, 5 parallelization strategies, ContextStream, 100K stability sweep, PyO3 bindings | 805 | Complete |
 | **Stage 2** | Production Infra — CUDA kernel pairs, multi-GPU sync, serving, edge deployment, architecture dispatch | ~131 | Complete |
 | **Stage 3** | Extensions — pluggable retention, M3 optimizer, CMS variants | — | Not started |
 
@@ -158,7 +158,7 @@ All components trace to equations in these papers:
 | Paper | ArXiv | What NL_Hecate uses from it |
 |-------|-------|-----------------------------|
 | **Titans**: Learning to Memorize at Test Time | [2501.00663](https://arxiv.org/abs/2501.00663) | Delta Rule, Titans LMM, Hebbian, MAG/MAL/MAC |
-| **MIRAS**: It's All Connected | [2504.13173](https://arxiv.org/abs/2504.13173) | 4-knob framework, MONETA, YAAD, MEMORA |
+| **Miras**: It's All Connected | [2504.13173](https://arxiv.org/abs/2504.13173) | 4-knob framework, MONETA, YAAD, MEMORA |
 | **HOPE / Nested Learning** | [2512.24695](https://arxiv.org/abs/2512.24695) | Self-modifying forward pass, CMS frequency scheduling |
 | **Lattice**: Learning to Efficiently Compress Memory | [2504.05646](https://arxiv.org/abs/2504.05646) | Lattice OSR, orthogonal state recurrence |
 | **ATLAS**: Learning to Optimally Memorize | [2505.23735](https://arxiv.org/abs/2505.23735) | Atlas Omega rule (stub, Stage 3) |
