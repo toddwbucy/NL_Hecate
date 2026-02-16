@@ -23,6 +23,8 @@ cuda = ["cc"]
 distributed = []
 serving = []
 internal = []
+edge = []
+enzyme = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -30,6 +32,11 @@ serde = { version = "1", features = ["derive"] }
 [dev-dependencies]
 serde_json = "1"
 paste = "1"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "edge_bench"
+harness = false
 
 [build-dependencies]
 cc = { version = "1.0", features = ["parallel"], optional = true }
