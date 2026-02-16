@@ -98,6 +98,9 @@ impl M3Config {
                 return Err(format!("frequencies[{i}] must be >= 1"));
             }
         }
+        if self.use_newton_schulz && self.ns_dim.is_none() {
+            return Err("ns_dim must be set when use_newton_schulz is true".into());
+        }
         Ok(())
     }
 }
