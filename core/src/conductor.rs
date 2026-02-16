@@ -9,7 +9,7 @@ use crate::model::MemoryLevelParams;
 use crate::context_stream::{ContextStream, StreamCursor, TokenChunk, RestoreError};
 
 /// Timing pulse generated each step. Read-only after creation.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Pulse {
     pub global_step: usize,
     pub active_levels: Vec<bool>,

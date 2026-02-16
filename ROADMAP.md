@@ -123,17 +123,23 @@ Formalize the two-domain compilation boundary that already exists in practice:
 
 ---
 
-### S2-M2: Multi-GPU Distribution
+### S2-M2: Multi-GPU Distribution ✅
 
 **Spec**: `specs/infrastructure/distribution/00_multi_gpu.md`
 
 NL cannot use DDP — CMS means different levels fire at different frequencies, so naive allreduce wastes bandwidth on frozen-level gradients.
 
 **Deliverables**:
-- [ ] CMS-aware gradient synchronization (only active levels allreduce)
-- [ ] State isolation: OuterLoopParam synced across ranks, InnerLoopState rank-local
-- [ ] Conductor synchronization across ranks (Pulse reconciliation)
-- [ ] Throughput reporting (per-GPU, average vs worst-case)
+- [x] CMS-aware gradient synchronization (only active levels allreduce)
+- [x] State isolation: OuterLoopParam synced across ranks, InnerLoopState rank-local
+- [x] Conductor synchronization across ranks (deterministic Pulse from same step counter)
+- [x] Throughput reporting (per-GPU, average vs worst-case) — CS-43/CS-44 compliant
+
+**Implementation**: `core/src/distributed.rs` behind `#[cfg(feature = "distributed")]`
+- ProcessGroup trait + MockProcessGroup (18 tests, all passing)
+- sync_gradients: 6 SWA allreduces always + 9 per active level, ~1.14 level-allreduces/step for k=4
+- ThroughputTracker with worst-case tracking
+- distributed_step: full forward→backward→sync→apply→advance composition
 
 **Dependencies**: S2-M1 (kernel pairs needed for GPU-resident compute)
 **Estimated scope**: Medium
