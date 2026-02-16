@@ -202,6 +202,7 @@ fn test_mac_vs_mag() {
         composition: CompositionKind::MAG,
         parallel: None,
         retention: RetentionKind::L2WeightDecay,
+            m3: None,
     };
     let cfg_mac = MAGConfig {
         swa: swa_mac, memory_enabled: true,
@@ -211,6 +212,7 @@ fn test_mac_vs_mag() {
         composition: CompositionKind::MAC,
         parallel: None,
         retention: RetentionKind::L2WeightDecay,
+            m3: None,
     };
 
     let seq_len = 8;
