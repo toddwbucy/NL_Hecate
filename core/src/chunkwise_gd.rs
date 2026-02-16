@@ -727,6 +727,8 @@ mod tests {
     chunkwise_rule_tests!(memora_chunkwise, memora_test_config);
     chunkwise_rule_tests!(lattice_chunkwise, lattice_test_config);
     chunkwise_rule_tests!(trellis_chunkwise, trellis_test_config);
+    // Atlas: has momentum S like Titans, needs relaxed tolerances for chunk boundaries.
+    chunkwise_rule_tests!(atlas_chunkwise, atlas_test_config, 1e-4, 2.0, 3.0);
 
     // ═══════════════════════════════════════════════════════════════════
     // General tests

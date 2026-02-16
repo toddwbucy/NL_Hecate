@@ -502,6 +502,7 @@ mod tests {
     tnt_rule_tests!(memora_tnt, memora_test_config);
     tnt_rule_tests!(lattice_tnt, lattice_test_config);
     tnt_rule_tests!(trellis_tnt, trellis_test_config);
+    tnt_rule_tests!(atlas_tnt, atlas_test_config);
 
     // ─── General tests ──────────────────────────────────────
 
