@@ -1,14 +1,13 @@
 /// Feature-gated dispatch: Rust reference vs CUDA kernels.
 ///
-/// Without `--features cuda` → Rust reference path (swa.rs).
+/// Without `--features cuda` → Rust reference path.
 /// With `--features cuda` → CUDA kernels via FFI (cuda_ffi.rs).
 ///
 /// Both paths produce comparable results (verified by tests).
 /// Dispatch is compile-time only — no runtime GPU detection overhead.
 ///
-/// The CUDA path uses bf16 storage for Q/K/V/out/attn_weights with f32
-/// compute. The dispatch layer converts between the f32 Rust world and
-/// the bf16 CUDA world transparently.
+/// SWA: bf16 storage, f32 compute (FlashAttention-style).
+/// Memory rules (Delta, Titans, Hebbian): all fp32 (M must be fp32 per spec).
 
 /// SWA forward dispatch.
 ///
@@ -360,4 +359,936 @@ fn cuda_backward(
     d_dq.copy_to_host(dq_host);
     d_dk.copy_to_host(dk_host);
     d_dv.copy_to_host(dv_host);
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Memory rule CUDA dispatch — all fp32 (no bf16 conversion needed)
+// ══════════════════════════════════════════════════════════════════════
+
+// ── Delta Rule dispatch ─────────────────────────────────────────────
+
+/// Delta Rule forward inner loop dispatch.
+///
+/// Takes pre-computed projections and gates (from Rust), runs the sequential
+/// M recurrence in either Rust or CUDA depending on feature gate.
+///
+/// Returns (m_states, y) where m_states is [(seq_len+1)*d*d] and y is [seq_len*d].
+pub fn delta_forward_dispatch(
+    k_mem: &[f32],
+    v_mem: &[f32],
+    q_mem: &[f32],
+    alpha: &[f32],
+    theta: &[f32],
+    m_initial: &[f32],
+    m_states: &mut [f32],
+    y: &mut [f32],
+    seq_len: usize,
+    d: usize,
+) {
+    #[cfg(feature = "cuda")]
+    {
+        cuda_delta_forward(k_mem, v_mem, q_mem, alpha, theta, m_initial,
+                           m_states, y, seq_len, d);
+        return;
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        rust_delta_forward(k_mem, v_mem, q_mem, alpha, theta, m_initial,
+                           m_states, y, seq_len, d);
+    }
+}
+
+/// Delta Rule backward inner loop dispatch.
+///
+/// Returns gradients on k_mem, v_mem, q_mem, alpha, theta, m_initial.
+pub fn delta_backward_dispatch(
+    k_mem: &[f32],
+    v_mem: &[f32],
+    q_mem: &[f32],
+    alpha: &[f32],
+    theta: &[f32],
+    m_states: &[f32],
+    d_y: &[f32],
+    d_k_mem: &mut [f32],
+    d_v_mem: &mut [f32],
+    d_q_mem: &mut [f32],
+    d_alpha: &mut [f32],
+    d_theta: &mut [f32],
+    d_m_initial: &mut [f32],
+    seq_len: usize,
+    d: usize,
+) {
+    #[cfg(feature = "cuda")]
+    {
+        cuda_delta_backward(k_mem, v_mem, q_mem, alpha, theta, m_states, d_y,
+                            d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta, d_m_initial,
+                            seq_len, d);
+        return;
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        rust_delta_backward(k_mem, v_mem, q_mem, alpha, theta, m_states, d_y,
+                            d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta, d_m_initial,
+                            seq_len, d);
+    }
+}
+
+// ── Titans LMM dispatch ─────────────────────────────────────────────
+
+/// Titans LMM forward inner loop dispatch.
+pub fn titans_forward_dispatch(
+    k_mem: &[f32],
+    v_mem: &[f32],
+    q_mem: &[f32],
+    alpha: &[f32],
+    theta: &[f32],
+    eta: &[f32],
+    m_initial: &[f32],
+    s_initial: &[f32],
+    m_states: &mut [f32],
+    s_states: &mut [f32],
+    y: &mut [f32],
+    seq_len: usize,
+    d: usize,
+) {
+    #[cfg(feature = "cuda")]
+    {
+        cuda_titans_forward(k_mem, v_mem, q_mem, alpha, theta, eta,
+                            m_initial, s_initial, m_states, s_states, y,
+                            seq_len, d);
+        return;
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        rust_titans_forward(k_mem, v_mem, q_mem, alpha, theta, eta,
+                            m_initial, s_initial, m_states, s_states, y,
+                            seq_len, d);
+    }
+}
+
+/// Titans LMM backward inner loop dispatch.
+pub fn titans_backward_dispatch(
+    k_mem: &[f32],
+    v_mem: &[f32],
+    q_mem: &[f32],
+    alpha: &[f32],
+    theta: &[f32],
+    eta: &[f32],
+    m_states: &[f32],
+    s_states: &[f32],
+    d_y: &[f32],
+    d_k_mem: &mut [f32],
+    d_v_mem: &mut [f32],
+    d_q_mem: &mut [f32],
+    d_alpha: &mut [f32],
+    d_theta: &mut [f32],
+    d_eta: &mut [f32],
+    d_m_initial: &mut [f32],
+    d_s_initial: &mut [f32],
+    seq_len: usize,
+    d: usize,
+) {
+    #[cfg(feature = "cuda")]
+    {
+        cuda_titans_backward(k_mem, v_mem, q_mem, alpha, theta, eta,
+                             m_states, s_states, d_y,
+                             d_k_mem, d_v_mem, d_q_mem,
+                             d_alpha, d_theta, d_eta,
+                             d_m_initial, d_s_initial,
+                             seq_len, d);
+        return;
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        rust_titans_backward(k_mem, v_mem, q_mem, alpha, theta, eta,
+                             m_states, s_states, d_y,
+                             d_k_mem, d_v_mem, d_q_mem,
+                             d_alpha, d_theta, d_eta,
+                             d_m_initial, d_s_initial,
+                             seq_len, d);
+    }
+}
+
+// ── Hebbian Rule dispatch ───────────────────────────────────────────
+
+/// Hebbian Rule forward inner loop dispatch.
+pub fn hebbian_forward_dispatch(
+    k_mem: &[f32],
+    v_mem: &[f32],
+    q_mem: &[f32],
+    alpha: &[f32],
+    m_initial: &[f32],
+    m_states: &mut [f32],
+    y: &mut [f32],
+    seq_len: usize,
+    d: usize,
+) {
+    #[cfg(feature = "cuda")]
+    {
+        cuda_hebbian_forward(k_mem, v_mem, q_mem, alpha, m_initial,
+                             m_states, y, seq_len, d);
+        return;
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        rust_hebbian_forward(k_mem, v_mem, q_mem, alpha, m_initial,
+                             m_states, y, seq_len, d);
+    }
+}
+
+/// Hebbian Rule backward inner loop dispatch.
+pub fn hebbian_backward_dispatch(
+    k_mem: &[f32],
+    v_mem: &[f32],
+    q_mem: &[f32],
+    alpha: &[f32],
+    m_states: &[f32],
+    d_y: &[f32],
+    d_k_mem: &mut [f32],
+    d_v_mem: &mut [f32],
+    d_q_mem: &mut [f32],
+    d_alpha: &mut [f32],
+    d_m_initial: &mut [f32],
+    seq_len: usize,
+    d: usize,
+) {
+    #[cfg(feature = "cuda")]
+    {
+        cuda_hebbian_backward(k_mem, v_mem, q_mem, alpha, m_states, d_y,
+                              d_k_mem, d_v_mem, d_q_mem, d_alpha, d_m_initial,
+                              seq_len, d);
+        return;
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        rust_hebbian_backward(k_mem, v_mem, q_mem, alpha, m_states, d_y,
+                              d_k_mem, d_v_mem, d_q_mem, d_alpha, d_m_initial,
+                              seq_len, d);
+    }
+}
+
+// ── Rust reference inner loops ──────────────────────────────────────
+// Used when not compiled with --features cuda
+
+/// Rust reference Delta Rule forward inner loop.
+#[cfg(not(feature = "cuda"))]
+fn rust_delta_forward(
+    k_mem: &[f32], v_mem: &[f32], q_mem: &[f32],
+    alpha: &[f32], theta: &[f32], m_initial: &[f32],
+    m_states: &mut [f32], y: &mut [f32],
+    seq_len: usize, d: usize,
+) {
+    let dd = d * d;
+    m_states[..dd].copy_from_slice(m_initial);
+    for t in 0..seq_len {
+        let k_t = &k_mem[t * d..(t + 1) * d];
+        let v_t = &v_mem[t * d..(t + 1) * d];
+        let q_t = &q_mem[t * d..(t + 1) * d];
+        let alpha_t = alpha[t];
+        let theta_t = theta[t];
+        let m_t = t * dd;
+        let m_next = (t + 1) * dd;
+
+        // prediction = M_t @ k_t
+        let mut prediction = vec![0.0f32; d];
+        for i in 0..d {
+            let mut sum = 0.0f32;
+            for j in 0..d { sum += m_states[m_t + i * d + j] * k_t[j]; }
+            prediction[i] = sum;
+        }
+
+        // error = prediction - v; M update
+        let retention = 1.0 - alpha_t;
+        for i in 0..d {
+            let err_i = prediction[i] - v_t[i];
+            for j in 0..d {
+                m_states[m_next + i * d + j] =
+                    retention * m_states[m_t + i * d + j] - theta_t * err_i * k_t[j];
+            }
+        }
+
+        // y = M_{t+1} @ q
+        for i in 0..d {
+            let mut sum = 0.0f32;
+            for j in 0..d { sum += m_states[m_next + i * d + j] * q_t[j]; }
+            y[t * d + i] = sum;
+        }
+    }
+}
+
+/// Rust reference Delta Rule backward inner loop.
+#[cfg(not(feature = "cuda"))]
+fn rust_delta_backward(
+    k_mem: &[f32], v_mem: &[f32], q_mem: &[f32],
+    alpha: &[f32], theta: &[f32], m_states: &[f32], d_y: &[f32],
+    d_k_mem: &mut [f32], d_v_mem: &mut [f32], d_q_mem: &mut [f32],
+    d_alpha: &mut [f32], d_theta: &mut [f32], d_m_initial: &mut [f32],
+    seq_len: usize, d: usize,
+) {
+    let dd = d * d;
+    let mut d_m = vec![0.0f32; dd];
+
+    for t in (0..seq_len).rev() {
+        let k_t = &k_mem[t * d..(t + 1) * d];
+        let v_t = &v_mem[t * d..(t + 1) * d];
+        let q_t = &q_mem[t * d..(t + 1) * d];
+        let d_y_t = &d_y[t * d..(t + 1) * d];
+        let m_t = &m_states[t * dd..(t + 1) * dd];
+        let m_next = &m_states[(t + 1) * dd..(t + 2) * dd];
+        let alpha_t = alpha[t];
+        let theta_t = theta[t];
+
+        // d_M += outer(d_y_t, q_t)
+        for i in 0..d {
+            for j in 0..d { d_m[i * d + j] += d_y_t[i] * q_t[j]; }
+        }
+
+        // d_q_t = M_{t+1}^T @ d_y_t
+        for j in 0..d {
+            let mut sum = 0.0f32;
+            for i in 0..d { sum += m_next[i * d + j] * d_y_t[i]; }
+            d_q_mem[t * d + j] = sum;
+        }
+
+        // Recompute prediction and error
+        let mut prediction = vec![0.0f32; d];
+        for i in 0..d {
+            let mut sum = 0.0f32;
+            for j in 0..d { sum += m_t[i * d + j] * k_t[j]; }
+            prediction[i] = sum;
+        }
+        let mut error = vec![0.0f32; d];
+        for i in 0..d { error[i] = prediction[i] - v_t[i]; }
+
+        // d_alpha, d_theta (reductions)
+        let mut d_alpha_sum = 0.0f32;
+        let mut d_theta_sum = 0.0f32;
+        for i in 0..d {
+            for j in 0..d {
+                d_alpha_sum += m_t[i * d + j] * d_m[i * d + j];
+                d_theta_sum += error[i] * k_t[j] * d_m[i * d + j];
+            }
+        }
+        d_alpha[t] = -d_alpha_sum;
+        d_theta[t] = -d_theta_sum;
+
+        // d_error, d_k contributions
+        let mut d_err = vec![0.0f32; d];
+        for i in 0..d {
+            let mut sum = 0.0f32;
+            for j in 0..d { sum += (-theta_t * d_m[i * d + j]) * k_t[j]; }
+            d_err[i] = sum;
+        }
+
+        for j in 0..d {
+            let mut sum = 0.0f32;
+            for i in 0..d { sum += (-theta_t * d_m[i * d + j]) * error[i]; }
+            d_k_mem[t * d + j] = sum;
+        }
+
+        // prediction = M @ k backward → d_k, d_M
+        for j in 0..d {
+            let mut sum = 0.0f32;
+            for i in 0..d { sum += m_t[i * d + j] * d_err[i]; }
+            d_k_mem[t * d + j] += sum;
+        }
+
+        // d_v = -d_error
+        for i in 0..d { d_v_mem[t * d + i] = -d_err[i]; }
+
+        // Propagate d_M backward
+        let retention = 1.0 - alpha_t;
+        let mut d_m_prev = vec![0.0f32; dd];
+        for i in 0..d {
+            for j in 0..d {
+                d_m_prev[i * d + j] = retention * d_m[i * d + j] + d_err[i] * k_t[j];
+            }
+        }
+        d_m = d_m_prev;
+    }
+
+    d_m_initial.copy_from_slice(&d_m);
+}
+
+/// Rust reference Titans forward inner loop.
+#[cfg(not(feature = "cuda"))]
+fn rust_titans_forward(
+    k_mem: &[f32], v_mem: &[f32], q_mem: &[f32],
+    alpha: &[f32], theta: &[f32], eta: &[f32],
+    m_initial: &[f32], s_initial: &[f32],
+    m_states: &mut [f32], s_states: &mut [f32], y: &mut [f32],
+    seq_len: usize, d: usize,
+) {
+    let dd = d * d;
+    m_states[..dd].copy_from_slice(m_initial);
+    s_states[..dd].copy_from_slice(s_initial);
+
+    for t in 0..seq_len {
+        let k_t = &k_mem[t * d..(t + 1) * d];
+        let v_t = &v_mem[t * d..(t + 1) * d];
+        let q_t = &q_mem[t * d..(t + 1) * d];
+        let alpha_t = alpha[t];
+        let theta_t = theta[t];
+        let eta_t = eta[t];
+        let m_t = t * dd;
+        let m_next = (t + 1) * dd;
+        let s_t = t * dd;
+        let s_next = (t + 1) * dd;
+
+        // prediction = M_t @ k_t; error = prediction - v_t
+        let mut prediction = vec![0.0f32; d];
+        for i in 0..d {
+            let mut sum = 0.0f32;
+            for j in 0..d { sum += m_states[m_t + i * d + j] * k_t[j]; }
+            prediction[i] = sum;
+        }
+
+        // S_{t+1} = eta_t * S_t - theta_t * outer(error, k)
+        for i in 0..d {
+            let err_i = prediction[i] - v_t[i];
+            for j in 0..d {
+                s_states[s_next + i * d + j] =
+                    eta_t * s_states[s_t + i * d + j] - theta_t * err_i * k_t[j];
+            }
+        }
+
+        // M_{t+1} = (1-alpha_t) * M_t + S_{t+1}
+        let retention = 1.0 - alpha_t;
+        for i in 0..dd {
+            m_states[m_next + i] = retention * m_states[m_t + i] + s_states[s_next + i];
+        }
+
+        // y = M_{t+1} @ q
+        for i in 0..d {
+            let mut sum = 0.0f32;
+            for j in 0..d { sum += m_states[m_next + i * d + j] * q_t[j]; }
+            y[t * d + i] = sum;
+        }
+    }
+}
+
+/// Rust reference Titans backward inner loop.
+#[cfg(not(feature = "cuda"))]
+#[allow(clippy::too_many_arguments)]
+fn rust_titans_backward(
+    k_mem: &[f32], v_mem: &[f32], q_mem: &[f32],
+    alpha: &[f32], theta: &[f32], eta: &[f32],
+    m_states: &[f32], s_states: &[f32], d_y: &[f32],
+    d_k_mem: &mut [f32], d_v_mem: &mut [f32], d_q_mem: &mut [f32],
+    d_alpha: &mut [f32], d_theta: &mut [f32], d_eta: &mut [f32],
+    d_m_initial: &mut [f32], d_s_initial: &mut [f32],
+    seq_len: usize, d: usize,
+) {
+    let dd = d * d;
+    let mut d_m = vec![0.0f32; dd];
+    let mut d_s = vec![0.0f32; dd];
+
+    for t in (0..seq_len).rev() {
+        let k_t = &k_mem[t * d..(t + 1) * d];
+        let v_t = &v_mem[t * d..(t + 1) * d];
+        let q_t = &q_mem[t * d..(t + 1) * d];
+        let d_y_t = &d_y[t * d..(t + 1) * d];
+        let m_t_off = t * dd;
+        let m_next_off = (t + 1) * dd;
+        let s_t_off = t * dd;
+        let alpha_t = alpha[t];
+        let theta_t = theta[t];
+        let eta_t = eta[t];
+
+        // d_M += outer(d_y_t, q_t)
+        for i in 0..d {
+            for j in 0..d { d_m[i * d + j] += d_y_t[i] * q_t[j]; }
+        }
+
+        // d_q_t = M_{t+1}^T @ d_y_t
+        for j in 0..d {
+            let mut sum = 0.0f32;
+            for i in 0..d { sum += m_states[m_next_off + i * d + j] * d_y_t[i]; }
+            d_q_mem[t * d + j] = sum;
+        }
+
+        // M_{t+1} = (1-alpha) * M_t + S_{t+1} backward
+        for i in 0..dd { d_s[i] += d_m[i]; }
+
+        let mut d_alpha_sum = 0.0f32;
+        for i in 0..dd { d_alpha_sum += m_states[m_t_off + i] * d_m[i]; }
+        d_alpha[t] = -d_alpha_sum;
+
+        let retention = 1.0 - alpha_t;
+        let mut d_m_prev = vec![0.0f32; dd];
+        for i in 0..dd { d_m_prev[i] = retention * d_m[i]; }
+
+        // S_{t+1} = eta * S_t - theta * grad backward
+        let mut d_eta_sum = 0.0f32;
+        for i in 0..dd { d_eta_sum += s_states[s_t_off + i] * d_s[i]; }
+        d_eta[t] = d_eta_sum;
+
+        // Recompute prediction/error
+        let mut prediction = vec![0.0f32; d];
+        for i in 0..d {
+            let mut sum = 0.0f32;
+            for j in 0..d { sum += m_states[m_t_off + i * d + j] * k_t[j]; }
+            prediction[i] = sum;
+        }
+        let mut error = vec![0.0f32; d];
+        for i in 0..d { error[i] = prediction[i] - v_t[i]; }
+
+        let mut d_theta_sum = 0.0f32;
+        for i in 0..d {
+            for j in 0..d { d_theta_sum += error[i] * k_t[j] * d_s[i * d + j]; }
+        }
+        d_theta[t] = -d_theta_sum;
+
+        // d_grad = -theta * d_S; d_error, d_k
+        let mut d_err = vec![0.0f32; d];
+        for i in 0..d {
+            let mut sum = 0.0f32;
+            for j in 0..d { sum += (-theta_t * d_s[i * d + j]) * k_t[j]; }
+            d_err[i] = sum;
+        }
+
+        for j in 0..d {
+            let mut sum = 0.0f32;
+            for i in 0..d { sum += (-theta_t * d_s[i * d + j]) * error[i]; }
+            d_k_mem[t * d + j] = sum;
+        }
+
+        for j in 0..d {
+            let mut sum = 0.0f32;
+            for i in 0..d { sum += m_states[m_t_off + i * d + j] * d_err[i]; }
+            d_k_mem[t * d + j] += sum;
+        }
+
+        for i in 0..d { d_v_mem[t * d + i] = -d_err[i]; }
+
+        // d_S_prev = eta * d_S
+        let mut d_s_prev = vec![0.0f32; dd];
+        for i in 0..dd { d_s_prev[i] = eta_t * d_s[i]; }
+
+        // Propagate d_M backward: add prediction chain
+        for i in 0..d {
+            for j in 0..d {
+                d_m_prev[i * d + j] += d_err[i] * k_t[j];
+            }
+        }
+
+        d_m = d_m_prev;
+        d_s = d_s_prev;
+    }
+
+    d_m_initial.copy_from_slice(&d_m);
+    d_s_initial.copy_from_slice(&d_s);
+}
+
+/// Rust reference Hebbian forward inner loop.
+#[cfg(not(feature = "cuda"))]
+fn rust_hebbian_forward(
+    k_mem: &[f32], v_mem: &[f32], q_mem: &[f32],
+    alpha: &[f32], m_initial: &[f32],
+    m_states: &mut [f32], y: &mut [f32],
+    seq_len: usize, d: usize,
+) {
+    let dd = d * d;
+    m_states[..dd].copy_from_slice(m_initial);
+
+    for t in 0..seq_len {
+        let k_t = &k_mem[t * d..(t + 1) * d];
+        let v_t = &v_mem[t * d..(t + 1) * d];
+        let q_t = &q_mem[t * d..(t + 1) * d];
+        let alpha_t = alpha[t];
+        let m_t = t * dd;
+        let m_next = (t + 1) * dd;
+
+        // M_{t+1} = (1-alpha) * M_t + outer(v, k)
+        let retention = 1.0 - alpha_t;
+        for i in 0..d {
+            for j in 0..d {
+                m_states[m_next + i * d + j] =
+                    retention * m_states[m_t + i * d + j] + v_t[i] * k_t[j];
+            }
+        }
+
+        // y = M_{t+1} @ q
+        for i in 0..d {
+            let mut sum = 0.0f32;
+            for j in 0..d { sum += m_states[m_next + i * d + j] * q_t[j]; }
+            y[t * d + i] = sum;
+        }
+    }
+}
+
+/// Rust reference Hebbian backward inner loop.
+#[cfg(not(feature = "cuda"))]
+fn rust_hebbian_backward(
+    k_mem: &[f32], v_mem: &[f32], q_mem: &[f32],
+    alpha: &[f32], m_states: &[f32], d_y: &[f32],
+    d_k_mem: &mut [f32], d_v_mem: &mut [f32], d_q_mem: &mut [f32],
+    d_alpha: &mut [f32], d_m_initial: &mut [f32],
+    seq_len: usize, d: usize,
+) {
+    let dd = d * d;
+    let mut d_m = vec![0.0f32; dd];
+
+    for t in (0..seq_len).rev() {
+        let k_t = &k_mem[t * d..(t + 1) * d];
+        let v_t = &v_mem[t * d..(t + 1) * d];
+        let q_t = &q_mem[t * d..(t + 1) * d];
+        let d_y_t = &d_y[t * d..(t + 1) * d];
+        let m_t_off = t * dd;
+        let m_next_off = (t + 1) * dd;
+        let alpha_t = alpha[t];
+
+        // d_M += outer(d_y_t, q_t)
+        for i in 0..d {
+            for j in 0..d { d_m[i * d + j] += d_y_t[i] * q_t[j]; }
+        }
+
+        // d_q_t = M_{t+1}^T @ d_y_t
+        for j in 0..d {
+            let mut sum = 0.0f32;
+            for i in 0..d { sum += m_states[m_next_off + i * d + j] * d_y_t[i]; }
+            d_q_mem[t * d + j] = sum;
+        }
+
+        // d_alpha = -frobenius_dot(d_M, M_t)
+        let mut d_alpha_sum = 0.0f32;
+        for i in 0..dd { d_alpha_sum += m_states[m_t_off + i] * d_m[i]; }
+        d_alpha[t] = -d_alpha_sum;
+
+        // d_v from outer product: d_v[i] = sum_j d_M[i,j] * k_t[j]
+        for i in 0..d {
+            let mut sum = 0.0f32;
+            for j in 0..d { sum += d_m[i * d + j] * k_t[j]; }
+            d_v_mem[t * d + i] = sum;
+        }
+
+        // d_k from outer product: d_k[j] = sum_i d_M[i,j] * v_t[i]
+        for j in 0..d {
+            let mut sum = 0.0f32;
+            for i in 0..d { sum += d_m[i * d + j] * v_t[i]; }
+            d_k_mem[t * d + j] = sum;
+        }
+
+        // d_M_prev = (1-alpha) * d_M
+        let retention = 1.0 - alpha_t;
+        for i in 0..dd { d_m[i] = retention * d_m[i]; }
+    }
+
+    d_m_initial.copy_from_slice(&d_m);
+}
+
+// ── CUDA memory rule dispatch helpers ────────────────────────────────
+
+#[cfg(feature = "cuda")]
+fn cuda_delta_forward(
+    k_mem: &[f32], v_mem: &[f32], q_mem: &[f32],
+    alpha: &[f32], theta: &[f32], m_initial: &[f32],
+    m_states: &mut [f32], y: &mut [f32],
+    seq_len: usize, d: usize,
+) {
+    let dd = d * d;
+    let dev_km = DevBuf::new(seq_len * d);
+    let dev_vm = DevBuf::new(seq_len * d);
+    let dev_qm = DevBuf::new(seq_len * d);
+    let dev_alpha = DevBuf::new(seq_len);
+    let dev_theta = DevBuf::new(seq_len);
+    let dev_minit = DevBuf::new(dd);
+    let dev_mstates = DevBuf::new((seq_len + 1) * dd);
+    let dev_y = DevBuf::new(seq_len * d);
+
+    dev_km.copy_from_host(k_mem);
+    dev_vm.copy_from_host(v_mem);
+    dev_qm.copy_from_host(q_mem);
+    dev_alpha.copy_from_host(alpha);
+    dev_theta.copy_from_host(theta);
+    dev_minit.copy_from_host(m_initial);
+    dev_mstates.zero();
+    dev_y.zero();
+
+    unsafe {
+        crate::cuda_ffi::delta_forward_f32_cuda(
+            dev_km.ptr, dev_vm.ptr, dev_qm.ptr,
+            dev_alpha.ptr, dev_theta.ptr, dev_minit.ptr,
+            dev_mstates.ptr, dev_y.ptr,
+            seq_len as i32, d as i32,
+        );
+        let rc = cudaDeviceSynchronize();
+        assert_eq!(rc, 0, "cudaDeviceSynchronize failed after delta forward (error {rc})");
+    }
+
+    dev_mstates.copy_to_host(m_states);
+    dev_y.copy_to_host(y);
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_delta_backward(
+    k_mem: &[f32], v_mem: &[f32], q_mem: &[f32],
+    alpha: &[f32], theta: &[f32], m_states: &[f32], d_y: &[f32],
+    d_k_mem: &mut [f32], d_v_mem: &mut [f32], d_q_mem: &mut [f32],
+    d_alpha: &mut [f32], d_theta: &mut [f32], d_m_initial: &mut [f32],
+    seq_len: usize, d: usize,
+) {
+    let dd = d * d;
+    let dev_km = DevBuf::new(seq_len * d);
+    let dev_vm = DevBuf::new(seq_len * d);
+    let dev_qm = DevBuf::new(seq_len * d);
+    let dev_alpha = DevBuf::new(seq_len);
+    let dev_theta = DevBuf::new(seq_len);
+    let dev_mstates = DevBuf::new((seq_len + 1) * dd);
+    let dev_dy = DevBuf::new(seq_len * d);
+    let dev_dkm = DevBuf::new(seq_len * d);
+    let dev_dvm = DevBuf::new(seq_len * d);
+    let dev_dqm = DevBuf::new(seq_len * d);
+    let dev_dalpha = DevBuf::new(seq_len);
+    let dev_dtheta = DevBuf::new(seq_len);
+    let dev_dm_init = DevBuf::new(dd);
+
+    dev_km.copy_from_host(k_mem);
+    dev_vm.copy_from_host(v_mem);
+    dev_qm.copy_from_host(q_mem);
+    dev_alpha.copy_from_host(alpha);
+    dev_theta.copy_from_host(theta);
+    dev_mstates.copy_from_host(m_states);
+    dev_dy.copy_from_host(d_y);
+    dev_dkm.zero();
+    dev_dvm.zero();
+    dev_dqm.zero();
+    dev_dalpha.zero();
+    dev_dtheta.zero();
+    dev_dm_init.zero();
+
+    unsafe {
+        crate::cuda_ffi::delta_backward_f32_cuda(
+            dev_km.ptr, dev_vm.ptr, dev_qm.ptr,
+            dev_alpha.ptr, dev_theta.ptr, dev_mstates.ptr,
+            dev_dy.ptr as *const f32,
+            dev_dkm.ptr, dev_dvm.ptr, dev_dqm.ptr,
+            dev_dalpha.ptr, dev_dtheta.ptr, dev_dm_init.ptr,
+            seq_len as i32, d as i32,
+        );
+        let rc = cudaDeviceSynchronize();
+        assert_eq!(rc, 0, "cudaDeviceSynchronize failed after delta backward (error {rc})");
+    }
+
+    dev_dkm.copy_to_host(d_k_mem);
+    dev_dvm.copy_to_host(d_v_mem);
+    dev_dqm.copy_to_host(d_q_mem);
+    dev_dalpha.copy_to_host(d_alpha);
+    dev_dtheta.copy_to_host(d_theta);
+    dev_dm_init.copy_to_host(d_m_initial);
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_titans_forward(
+    k_mem: &[f32], v_mem: &[f32], q_mem: &[f32],
+    alpha: &[f32], theta: &[f32], eta: &[f32],
+    m_initial: &[f32], s_initial: &[f32],
+    m_states: &mut [f32], s_states: &mut [f32], y: &mut [f32],
+    seq_len: usize, d: usize,
+) {
+    let dd = d * d;
+    let dev_km = DevBuf::new(seq_len * d);
+    let dev_vm = DevBuf::new(seq_len * d);
+    let dev_qm = DevBuf::new(seq_len * d);
+    let dev_alpha = DevBuf::new(seq_len);
+    let dev_theta = DevBuf::new(seq_len);
+    let dev_eta = DevBuf::new(seq_len);
+    let dev_minit = DevBuf::new(dd);
+    let dev_sinit = DevBuf::new(dd);
+    let dev_mstates = DevBuf::new((seq_len + 1) * dd);
+    let dev_sstates = DevBuf::new((seq_len + 1) * dd);
+    let dev_y = DevBuf::new(seq_len * d);
+
+    dev_km.copy_from_host(k_mem);
+    dev_vm.copy_from_host(v_mem);
+    dev_qm.copy_from_host(q_mem);
+    dev_alpha.copy_from_host(alpha);
+    dev_theta.copy_from_host(theta);
+    dev_eta.copy_from_host(eta);
+    dev_minit.copy_from_host(m_initial);
+    dev_sinit.copy_from_host(s_initial);
+    dev_mstates.zero();
+    dev_sstates.zero();
+    dev_y.zero();
+
+    unsafe {
+        crate::cuda_ffi::titans_forward_f32_cuda(
+            dev_km.ptr, dev_vm.ptr, dev_qm.ptr,
+            dev_alpha.ptr, dev_theta.ptr, dev_eta.ptr,
+            dev_minit.ptr, dev_sinit.ptr,
+            dev_mstates.ptr, dev_sstates.ptr, dev_y.ptr,
+            seq_len as i32, d as i32,
+        );
+        let rc = cudaDeviceSynchronize();
+        assert_eq!(rc, 0, "cudaDeviceSynchronize failed after titans forward (error {rc})");
+    }
+
+    dev_mstates.copy_to_host(m_states);
+    dev_sstates.copy_to_host(s_states);
+    dev_y.copy_to_host(y);
+}
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn cuda_titans_backward(
+    k_mem: &[f32], v_mem: &[f32], q_mem: &[f32],
+    alpha: &[f32], theta: &[f32], eta: &[f32],
+    m_states: &[f32], s_states: &[f32], d_y: &[f32],
+    d_k_mem: &mut [f32], d_v_mem: &mut [f32], d_q_mem: &mut [f32],
+    d_alpha: &mut [f32], d_theta: &mut [f32], d_eta: &mut [f32],
+    d_m_initial: &mut [f32], d_s_initial: &mut [f32],
+    seq_len: usize, d: usize,
+) {
+    let dd = d * d;
+    let dev_km = DevBuf::new(seq_len * d);
+    let dev_vm = DevBuf::new(seq_len * d);
+    let dev_qm = DevBuf::new(seq_len * d);
+    let dev_alpha = DevBuf::new(seq_len);
+    let dev_theta = DevBuf::new(seq_len);
+    let dev_eta = DevBuf::new(seq_len);
+    let dev_mstates = DevBuf::new((seq_len + 1) * dd);
+    let dev_sstates = DevBuf::new((seq_len + 1) * dd);
+    let dev_dy = DevBuf::new(seq_len * d);
+    let dev_dkm = DevBuf::new(seq_len * d);
+    let dev_dvm = DevBuf::new(seq_len * d);
+    let dev_dqm = DevBuf::new(seq_len * d);
+    let dev_dalpha = DevBuf::new(seq_len);
+    let dev_dtheta = DevBuf::new(seq_len);
+    let dev_deta = DevBuf::new(seq_len);
+    let dev_dm_init = DevBuf::new(dd);
+    let dev_ds_init = DevBuf::new(dd);
+
+    dev_km.copy_from_host(k_mem);
+    dev_vm.copy_from_host(v_mem);
+    dev_qm.copy_from_host(q_mem);
+    dev_alpha.copy_from_host(alpha);
+    dev_theta.copy_from_host(theta);
+    dev_eta.copy_from_host(eta);
+    dev_mstates.copy_from_host(m_states);
+    dev_sstates.copy_from_host(s_states);
+    dev_dy.copy_from_host(d_y);
+    dev_dkm.zero();
+    dev_dvm.zero();
+    dev_dqm.zero();
+    dev_dalpha.zero();
+    dev_dtheta.zero();
+    dev_deta.zero();
+    dev_dm_init.zero();
+    dev_ds_init.zero();
+
+    unsafe {
+        crate::cuda_ffi::titans_backward_f32_cuda(
+            dev_km.ptr, dev_vm.ptr, dev_qm.ptr,
+            dev_alpha.ptr, dev_theta.ptr, dev_eta.ptr,
+            dev_mstates.ptr, dev_sstates.ptr,
+            dev_dy.ptr as *const f32,
+            dev_dkm.ptr, dev_dvm.ptr, dev_dqm.ptr,
+            dev_dalpha.ptr, dev_dtheta.ptr, dev_deta.ptr,
+            dev_dm_init.ptr, dev_ds_init.ptr,
+            seq_len as i32, d as i32,
+        );
+        let rc = cudaDeviceSynchronize();
+        assert_eq!(rc, 0, "cudaDeviceSynchronize failed after titans backward (error {rc})");
+    }
+
+    dev_dkm.copy_to_host(d_k_mem);
+    dev_dvm.copy_to_host(d_v_mem);
+    dev_dqm.copy_to_host(d_q_mem);
+    dev_dalpha.copy_to_host(d_alpha);
+    dev_dtheta.copy_to_host(d_theta);
+    dev_deta.copy_to_host(d_eta);
+    dev_dm_init.copy_to_host(d_m_initial);
+    dev_ds_init.copy_to_host(d_s_initial);
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_hebbian_forward(
+    k_mem: &[f32], v_mem: &[f32], q_mem: &[f32],
+    alpha: &[f32], m_initial: &[f32],
+    m_states: &mut [f32], y: &mut [f32],
+    seq_len: usize, d: usize,
+) {
+    let dd = d * d;
+    let dev_km = DevBuf::new(seq_len * d);
+    let dev_vm = DevBuf::new(seq_len * d);
+    let dev_qm = DevBuf::new(seq_len * d);
+    let dev_alpha = DevBuf::new(seq_len);
+    let dev_minit = DevBuf::new(dd);
+    let dev_mstates = DevBuf::new((seq_len + 1) * dd);
+    let dev_y = DevBuf::new(seq_len * d);
+
+    dev_km.copy_from_host(k_mem);
+    dev_vm.copy_from_host(v_mem);
+    dev_qm.copy_from_host(q_mem);
+    dev_alpha.copy_from_host(alpha);
+    dev_minit.copy_from_host(m_initial);
+    dev_mstates.zero();
+    dev_y.zero();
+
+    unsafe {
+        crate::cuda_ffi::hebbian_forward_f32_cuda(
+            dev_km.ptr, dev_vm.ptr, dev_qm.ptr,
+            dev_alpha.ptr, dev_minit.ptr,
+            dev_mstates.ptr, dev_y.ptr,
+            seq_len as i32, d as i32,
+        );
+        let rc = cudaDeviceSynchronize();
+        assert_eq!(rc, 0, "cudaDeviceSynchronize failed after hebbian forward (error {rc})");
+    }
+
+    dev_mstates.copy_to_host(m_states);
+    dev_y.copy_to_host(y);
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_hebbian_backward(
+    k_mem: &[f32], v_mem: &[f32], q_mem: &[f32],
+    alpha: &[f32], m_states: &[f32], d_y: &[f32],
+    d_k_mem: &mut [f32], d_v_mem: &mut [f32], d_q_mem: &mut [f32],
+    d_alpha: &mut [f32], d_m_initial: &mut [f32],
+    seq_len: usize, d: usize,
+) {
+    let dd = d * d;
+    let dev_km = DevBuf::new(seq_len * d);
+    let dev_vm = DevBuf::new(seq_len * d);
+    let dev_qm = DevBuf::new(seq_len * d);
+    let dev_alpha = DevBuf::new(seq_len);
+    let dev_mstates = DevBuf::new((seq_len + 1) * dd);
+    let dev_dy = DevBuf::new(seq_len * d);
+    let dev_dkm = DevBuf::new(seq_len * d);
+    let dev_dvm = DevBuf::new(seq_len * d);
+    let dev_dqm = DevBuf::new(seq_len * d);
+    let dev_dalpha = DevBuf::new(seq_len);
+    let dev_dm_init = DevBuf::new(dd);
+
+    dev_km.copy_from_host(k_mem);
+    dev_vm.copy_from_host(v_mem);
+    dev_qm.copy_from_host(q_mem);
+    dev_alpha.copy_from_host(alpha);
+    dev_mstates.copy_from_host(m_states);
+    dev_dy.copy_from_host(d_y);
+    dev_dkm.zero();
+    dev_dvm.zero();
+    dev_dqm.zero();
+    dev_dalpha.zero();
+    dev_dm_init.zero();
+
+    unsafe {
+        crate::cuda_ffi::hebbian_backward_f32_cuda(
+            dev_km.ptr, dev_vm.ptr, dev_qm.ptr,
+            dev_alpha.ptr, dev_mstates.ptr,
+            dev_dy.ptr as *const f32,
+            dev_dkm.ptr, dev_dvm.ptr, dev_dqm.ptr,
+            dev_dalpha.ptr, dev_dm_init.ptr,
+            seq_len as i32, d as i32,
+        );
+        let rc = cudaDeviceSynchronize();
+        assert_eq!(rc, 0, "cudaDeviceSynchronize failed after hebbian backward (error {rc})");
+    }
+
+    dev_dkm.copy_to_host(d_k_mem);
+    dev_dvm.copy_to_host(d_v_mem);
+    dev_dqm.copy_to_host(d_q_mem);
+    dev_dalpha.copy_to_host(d_alpha);
+    dev_dm_init.copy_to_host(d_m_initial);
 }

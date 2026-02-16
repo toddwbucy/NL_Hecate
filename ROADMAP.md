@@ -89,11 +89,11 @@ All algorithms from the NL paper suite, validated with FD gradient checks and co
 
 ---
 
-## Stage 2: Production Infrastructure (NOT STARTED)
+## Stage 2: Production Infrastructure (IN PROGRESS)
 
 Move from validated algorithms to deployable system. Each milestone maps to a spec file.
 
-### S2-M1: Compilation Strategy
+### S2-M1: Compilation Strategy (PHASE 1-3 COMPLETE, PHASE 4 COMPLETE)
 
 **Spec**: `specs/infrastructure/compilation/00_compilation.md`
 
@@ -103,15 +103,23 @@ Formalize the two-domain compilation boundary that already exists in practice:
 - No whole-model graph tracing (torch.compile cannot trace NL's inner loop)
 - Architecture-specific `.cubin` + portable `.ptx` fallback
 
-**What exists today**: The kernel-pair pattern works (SWA has Rust reference + CUDA forward/backward). This milestone is about documenting the compilation contract, adding kernel dispatch for all 8 memory rules (currently only SWA has CUDA kernels), and building the `.cubin`/`.ptx` packaging.
+**What was delivered**: CUDA kernel pairs for all 3 matrix-based memory rules (DeltaRule, TitansLMM, HebbianRule). Each has forward + backward kernels with analytical gradients from the papers. All fp32. Single-block design (Grid=1, Block=min(d², 1024)) with shared memory for M recurrence. Projections and gates remain in Rust (Enzyme-differentiable); only the sequential inner loop is CUDA.
 
-**Deliverables**:
-- [ ] CUDA kernel pairs for memory rule hot paths (at minimum: Delta Rule, Titans)
+| Phase | Kernels | Tests | Status |
+|-------|---------|-------|--------|
+| Phase 1: DeltaRule | `delta_forward.cu`, `delta_backward.cu` | 11 | COMPLETE |
+| Phase 2: TitansLMM | `titans_forward.cu`, `titans_backward.cu` | 6 | COMPLETE |
+| Phase 3: HebbianRule | `hebbian_forward.cu`, `hebbian_backward.cu` | 7 | COMPLETE |
+| Phase 4: Integration | Composition-level CUDA parity tests | 5 | COMPLETE |
+
+**Remaining deliverables**:
+- [x] CUDA kernel pairs for memory rule hot paths (Delta Rule, Titans LMM, Hebbian)
 - [ ] Architecture dispatch (sm_86, sm_90 etc.)
 - [ ] Compilation documentation (build matrix, toolchain requirements)
+- [ ] `.cubin`/`.ptx` packaging
 
 **Dependencies**: None (builds on existing kernel-pair pattern)
-**Estimated scope**: Large
+**Estimated scope**: Large (kernel pairs done, architecture dispatch and packaging remain)
 
 ---
 
@@ -264,7 +272,7 @@ Stage 0: Foundation ────────────────────
     ▼
 Stage 1: Algorithm Core ─────────────────────── COMPLETE (805 tests)
     │
-    ├─► S2-M1: Compilation Strategy
+    ├─► S2-M1: Compilation Strategy ─────────── (kernel pairs COMPLETE)
     │       │
     │       ├─► S2-M2: Multi-GPU Distribution
     │       │
@@ -293,7 +301,7 @@ Stage 2 milestones are sequential (each builds on the last). Stage 3 milestones 
 |-------|-----------|-------|--------|
 | Stage 0: Foundation | 3 | 57 + 47 + 98 | COMPLETE |
 | Stage 1: Algorithm Core | 19 | 778 Rust + 27 Python | COMPLETE |
-| Stage 2: Production Infra | 4 | TBD | NOT STARTED |
+| Stage 2: Production Infra | 4 | 29 CUDA (S2-M1) | IN PROGRESS |
 | Stage 3: Extensions | 5 | TBD | NOT STARTED |
 
-**Current position**: Stage 1 complete. All algorithms from the NL paper suite are implemented, gradient-checked, and convergence-tested. The research layer is done. What remains is production infrastructure (Stage 2) and optional algorithm extensions (Stage 3).
+**Current position**: Stage 2 in progress. S2-M1 kernel pairs complete (29 new CUDA tests: 11 Delta + 6 Titans + 7 Hebbian + 5 integration). Architecture dispatch and packaging remain. Total test count: 807 Rust + 27 Python + 29 CUDA = **863 tests**.
