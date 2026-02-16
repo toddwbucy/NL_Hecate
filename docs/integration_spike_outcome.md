@@ -55,7 +55,7 @@ The integration spike proves the thesis: **the full NL pipeline learns a predict
 
 ### Loss Trajectories
 
-```
+```text
 Config A (DeltaRule+MAG k=2):
   step   0: 2.7739  (random)
   step 100: 1.9737

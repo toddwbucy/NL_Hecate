@@ -144,6 +144,13 @@ fn stream_train(
     lr: f32,
     seed: u64,
 ) -> TrainResult {
+    assert!(steps > 0, "stream_train requires steps > 0");
+    assert!(
+        corpus.len() >= cfg.swa.seq_len,
+        "corpus length {} must be >= seq_len {}",
+        corpus.len(),
+        cfg.swa.seq_len
+    );
     let mut params = MAGParams::init(cfg, seed);
     let stream = Box::new(VecStream::new(corpus));
     let mut conductor = Conductor::new(cfg.k, cfg.chunk_sizes.clone())
