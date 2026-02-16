@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 NL_Hecate is a specification-first implementation of the Nested Learning (NL) research program from the Mirrokni/Behrouz research group at Google Research. It implements self-modifying neural networks where optimization IS the forward pass — no train/eval distinction, no external optimizer, no epochs.
 
-**Current phase**: v0.4.0 specifications complete. Implementation has not begun. Next step is the Phase 0 Enzyme spike (2-week proof-of-concept).
+**Current status**: Stages 0-1 complete (foundation + full algorithm core). 778 Rust + 27 Python tests passing. See `ROADMAP.md` for detailed milestone tracking and what's next (Stage 2: production infrastructure).
 
 **Name origin**: Hecate — goddess of crossroads and thresholds — standing at the boundary between conventional ML frameworks and what the NL papers describe.
 
@@ -80,15 +80,13 @@ Inner loop MUST be fp32 (non-negotiable). bf16 drift corrupts memory after ~100 
 
 Full index: `specs/constraints/code_smells/00_index.md`
 
-## Implementation Roadmap (Track Zero)
+## Implementation Roadmap
 
-1. **Phase 0** (2 weeks): Enzyme spike — prove Enzyme differentiates through Rust trait dispatch + manual chain-rule composition at kernel boundaries (see `spike/`)
-2. **Track Zero-A** (2-4 weeks): Pure SWA attention, no memory — validate full Rust→Enzyme→CUDA→Python pipeline
-3. **Track Zero-B**: Delta Rule + MAG — validate gradient flow through memory
-4. **Phase 2**: CMS k=2 — verify multi-level scheduling
-5. **Phase 3**: Full design space k=4 — combinatorial validation
+See `ROADMAP.md` for the full milestone-level roadmap with dependency graph.
 
-See `specs/infrastructure/track_zero/00_track_zero.md`.
+**Completed**: Stage 0 (Foundation) and Stage 1 (Algorithm Core) — all 22 milestones.
+**Next**: Stage 2 (Production Infrastructure) — compilation, multi-GPU, serving, edge deployment.
+**Optional**: Stage 3 (Extensions) — pluggable retention, M3 optimizer, CMS variants, Atlas Omega.
 
 ## Spec File Conventions
 
