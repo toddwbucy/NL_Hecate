@@ -20,6 +20,7 @@ use crate::tensor::{
     matmul_f32, transpose_f32, sigmoid_f32,
     frobenius_dot_f32,
 };
+use crate::retention::l2_apply_retention;
 use crate::model::MemoryLevelParams;
 use crate::delta_rule::{MemoryRule, MemoryState, Gates, MemoryError};
 
@@ -66,10 +67,10 @@ impl MemoryRule for HebbianRule {
     fn write(&self, state: &mut MemoryState, k: &[f32], v: &[f32], gates: &Gates) -> Result<(), MemoryError> {
         let d = state.d;
         // M = (1-alpha) * M + outer(v, k)  — pure associative, no error
-        let retention = 1.0 - gates.alpha;
+        l2_apply_retention(&mut state.m, 1.0 - gates.alpha);
         for i in 0..d {
             for j in 0..d {
-                state.m[i * d + j] = retention * state.m[i * d + j] + v[i] * k[j];
+                state.m[i * d + j] += v[i] * k[j];
             }
         }
         Ok(())
@@ -139,13 +140,13 @@ impl MemoryRule for HebbianRule {
             alpha[t] = sigmoid_f32(alpha_pre_t);
 
             // M_{t+1} = (1 - alpha_t) * M_t + outer(v_t, k_t)
-            let retention = 1.0 - alpha[t];
             let m_t_off = t * d * d;
             let m_next_off = (t + 1) * d * d;
+            m_states.copy_within(m_t_off..m_t_off + d * d, m_next_off);
+            l2_apply_retention(&mut m_states[m_next_off..m_next_off + d * d], 1.0 - alpha[t]);
             for i in 0..d {
                 for j in 0..d {
-                    m_states[m_next_off + i * d + j] =
-                        retention * m_states[m_t_off + i * d + j] + v_t[i] * k_t[j];
+                    m_states[m_next_off + i * d + j] += v_t[i] * k_t[j];
                 }
             }
 
@@ -242,10 +243,8 @@ impl MemoryRule for HebbianRule {
             }
 
             // d_M_prev = (1 - alpha_t) * d_M  (propagate to previous step)
-            let retention = 1.0 - alpha_t;
-            for i in 0..(d * d) {
-                d_m_prev[i] = retention * d_m[i];
-            }
+            d_m_prev.copy_from_slice(&d_m);
+            l2_apply_retention(&mut d_m_prev, 1.0 - alpha_t);
 
             // ── Gate backward: alpha_t = sigmoid(alpha_pre_t) ──
             let sig_deriv = alpha_t * (1.0 - alpha_t);

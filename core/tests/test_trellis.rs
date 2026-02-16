@@ -2,6 +2,7 @@
 //! two-pass state evolution, CMS k=2, comparison vs Delta Rule.
 
 use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind, CompositionKind};
+use nl_hecate_core::retention::RetentionKind;
 use nl_hecate_core::mag::{cms_forward, cms_backward, mag_forward, mag_backward, MemoryCache};
 use nl_hecate_core::conductor::{Conductor, ContextState, ErrorBuffer};
 
@@ -212,6 +213,7 @@ fn test_trellis_vs_delta() {
         d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
         composition: CompositionKind::MAG,
         parallel: None,
+        retention: RetentionKind::L2WeightDecay,
     };
     let cfg_trellis = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
@@ -221,6 +223,7 @@ fn test_trellis_vs_delta() {
         d_compress: 8, lambda_k: 0.01, lambda_v: 0.01,
         composition: CompositionKind::MAG,
         parallel: None,
+        retention: RetentionKind::L2WeightDecay,
     };
 
     let input_ids: Vec<usize> = (0..swa.seq_len).map(|t| t % swa.vocab_size).collect();

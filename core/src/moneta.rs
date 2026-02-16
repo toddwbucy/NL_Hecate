@@ -26,6 +26,7 @@ use crate::tensor::{
     matmul_f32, transpose_f32, sigmoid_f32, softplus_f32,
     silu_f32, silu_prime_f32, frobenius_dot_f32,
 };
+use crate::retention::{l2_apply_retention, l2_retention_gradient};
 use crate::model::MemoryLevelParams;
 use crate::delta_rule::{MemoryRule, MemoryState, Gates, MemoryError};
 
@@ -267,19 +268,23 @@ impl MemoryRule for Moneta {
                 }
             }
 
-            // Retention: L2 global
-            // ret_grad_W1 = lambda_2 * 2 * W1,  ret_grad_W2 = lambda_2 * 2 * W2
-            let l2_2 = l2 * 2.0;
+            // Retention: L2 global penalty gradient + multiplicative decay
+            let ret_grad_w1 = l2_retention_gradient(w1_t, l2);
+            let ret_grad_w2 = l2_retention_gradient(w2_t, l2);
 
             // Update: W1 = alpha_t * W1 - theta_t * (grad_W1 + ret_grad_W1)
             //         W2 = alpha_t * W2 - theta_t * (grad_W2 + ret_grad_W2)
             let alpha_t = alpha[t];
             let theta_t = theta[t];
+            w1_next.copy_from_slice(w1_t);
+            l2_apply_retention(w1_next, alpha_t);
             for i in 0..w1_size {
-                w1_next[i] = alpha_t * w1_t[i] - theta_t * (grad_w1[i] + l2_2 * w1_t[i]);
+                w1_next[i] -= theta_t * (grad_w1[i] + ret_grad_w1[i]);
             }
+            w2_next.copy_from_slice(w2_t);
+            l2_apply_retention(w2_next, alpha_t);
             for i in 0..w2_size {
-                w2_next[i] = alpha_t * w2_t[i] - theta_t * (grad_w2[i] + l2_2 * w2_t[i]);
+                w2_next[i] -= theta_t * (grad_w2[i] + ret_grad_w2[i]);
             }
 
             // Read: y_t = W2_next @ silu(W1_next @ q_t)

@@ -37,6 +37,7 @@ use crate::tensor::{
     matmul_f32, transpose_f32, softmax_f32, log_f32,
     sigmoid_f32, softplus_f32, silu_f32, silu_prime_f32,
 };
+use crate::retention::kl_apply_retention;
 use crate::model::MemoryLevelParams;
 use crate::delta_rule::{MemoryRule, MemoryState, Gates, MemoryError};
 
@@ -185,8 +186,7 @@ impl MemoryRule for MEMORA {
         let mut log_w2_prev = vec![0.0f32; seq_len * w2_size];
 
         // Temp buffers for per-row softmax update
-        let mut z_buf = vec![0.0f32; d.max(dh)];
-        let mut softmax_buf = vec![0.0f32; d.max(dh)];
+        // z_buf and softmax_buf are now internal to kl_apply_retention
 
         for t in 0..seq_len {
             let k_t = &k_mem[t * d..(t + 1) * d];
@@ -292,29 +292,12 @@ impl MemoryRule for MEMORA {
             let lw2_base = t * w2_size;
             log_f32(w2_t, &mut log_w2_prev[lw2_base..lw2_base + w2_size]);
 
-            // KL-optimal softmax update for W1: d_hidden rows of length d
-            //   z[i] = alpha_t * log(w1_t[i]) - theta_t * grad_w1[i]
-            //   w1_next[row] = softmax(z)
-            for r in 0..dh {
-                let row_base = r * d;
-                for c in 0..d {
-                    z_buf[c] = alpha_t * log_w1_prev[lw1_base + row_base + c]
-                             - theta_t * grad_w1[row_base + c];
-                }
-                softmax_f32(&z_buf[..d], &mut softmax_buf[..d], 1, d);
-                w1_next[row_base..row_base + d].copy_from_slice(&softmax_buf[..d]);
-            }
+            // KL-optimal softmax update for W1 and W2
+            let w1_updated = kl_apply_retention(w1_t, &grad_w1, alpha_t, theta_t, dh, d);
+            w1_next.copy_from_slice(&w1_updated);
 
-            // KL-optimal softmax update for W2: d rows of length dh
-            for r in 0..d {
-                let row_base = r * dh;
-                for c in 0..dh {
-                    z_buf[c] = alpha_t * log_w2_prev[lw2_base + row_base + c]
-                             - theta_t * grad_w2[row_base + c];
-                }
-                softmax_f32(&z_buf[..dh], &mut softmax_buf[..dh], 1, dh);
-                w2_next[row_base..row_base + dh].copy_from_slice(&softmax_buf[..dh]);
-            }
+            let w2_updated = kl_apply_retention(w2_t, &grad_w2, alpha_t, theta_t, d, dh);
+            w2_next.copy_from_slice(&w2_updated);
         }
 
         let cache = MEMORACache {

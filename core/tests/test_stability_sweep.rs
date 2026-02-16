@@ -28,6 +28,7 @@ use nl_hecate_core::mag::{mag_forward, mag_backward, cms_forward, cms_backward};
 use nl_hecate_core::mal::{mal_forward, mal_backward, cms_mal_forward, cms_mal_backward};
 use nl_hecate_core::mac::{mac_forward, mac_backward, cms_mac_forward, cms_mac_backward};
 use nl_hecate_core::conductor::{Conductor, ContextState, ErrorBuffer};
+use nl_hecate_core::retention::RetentionKind;
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -88,6 +89,11 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
         lambda_k,
         lambda_v,
         parallel: None,
+        retention: match rule {
+            MemoryRuleKind::MEMORA => RetentionKind::KLDivergence,
+            MemoryRuleKind::LatticeOSR => RetentionKind::SphereNormalization,
+            _ => RetentionKind::L2WeightDecay,
+        },
     }
 }
 

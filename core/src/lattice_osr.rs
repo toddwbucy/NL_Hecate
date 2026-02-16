@@ -33,6 +33,7 @@ use crate::tensor::{
     matmul_f32, transpose_f32, sigmoid_f32, softmax_f32,
     frobenius_dot_f32, vec_norm_f32, vec_normalize_f32,
 };
+use crate::retention::sphere_project_and_normalize;
 use crate::model::MemoryLevelParams;
 use crate::delta_rule::{MemoryRule, MemoryState, Gates, MemoryError};
 
@@ -244,34 +245,13 @@ impl MemoryRule for LatticeOSR {
                 slot_gates[t * m + i] = gate_i;
 
                 // delta_s = alpha_t * gate_i * v_t
-                // orthogonal projection: remove parallel component
-                let mut p = 0.0f32;
-                for j in 0..d {
-                    p += slot[j] * alpha[t] * gate_i * v_t[j];
-                }
+                let scale = alpha[t] * gate_i;
+                let delta_s: Vec<f32> = v_t.iter().map(|&vj| scale * vj).collect();
 
-                // s_unnorm = slot + (delta_s - p * slot) = slot * (1 - p) + delta_s
-                let mut s_unnorm = vec![0.0f32; d];
-                for j in 0..d {
-                    let delta_s_j = alpha[t] * gate_i * v_t[j];
-                    let ortho_j = delta_s_j - p * slot[j];
-                    s_unnorm[j] = slot[j] + ortho_j;
-                }
-
-                let norm = vec_norm_f32(&s_unnorm);
+                // Sphere retention: orthogonal projection + normalize
+                let (s_new, norm) = sphere_project_and_normalize(slot, &delta_s, d);
                 s_unnorm_norms[t * m + i] = norm;
-
-                // Normalize to unit sphere
-                if norm > 1e-8 {
-                    let inv = 1.0 / norm;
-                    for j in 0..d {
-                        s_next[i * d + j] = s_unnorm[j] * inv;
-                    }
-                } else {
-                    // Keep previous slot if degenerate
-                    s_next[i * d..(i + 1) * d]
-                        .copy_from_slice(slot);
-                }
+                s_next[i * d..(i + 1) * d].copy_from_slice(&s_new);
             }
         }
 

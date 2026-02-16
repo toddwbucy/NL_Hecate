@@ -15,6 +15,7 @@ use nl_hecate_core::context_stream::VecStream;
 use nl_hecate_core::mag::{cms_forward, cms_backward};
 use nl_hecate_core::mal::{cms_mal_forward, cms_mal_backward};
 use nl_hecate_core::mac::{cms_mac_forward, cms_mac_backward};
+use nl_hecate_core::retention::RetentionKind;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -56,6 +57,7 @@ fn spike_config_a() -> MAGConfig {
         lambda_k: 0.0,
         lambda_v: 0.0,
         parallel: None,
+        retention: RetentionKind::L2WeightDecay,
     }
 }
 
@@ -79,6 +81,7 @@ fn spike_config_b() -> MAGConfig {
         lambda_k: 0.0,
         lambda_v: 0.0,
         parallel: None,
+        retention: RetentionKind::L2WeightDecay,
     }
 }
 
@@ -102,6 +105,7 @@ fn spike_config_c() -> MAGConfig {
         lambda_k: 0.0,
         lambda_v: 0.0,
         parallel: None,
+        retention: RetentionKind::L2WeightDecay,
     }
 }
 
@@ -680,6 +684,11 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
         lambda_k,
         lambda_v,
         parallel: None,
+        retention: match rule {
+            MemoryRuleKind::MEMORA => RetentionKind::KLDivergence,
+            MemoryRuleKind::LatticeOSR => RetentionKind::SphereNormalization,
+            _ => RetentionKind::L2WeightDecay,
+        },
     }
 }
 
