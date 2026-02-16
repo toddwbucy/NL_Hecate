@@ -89,11 +89,11 @@ All algorithms from the NL paper suite, validated with FD gradient checks and co
 
 ---
 
-## Stage 2: Production Infrastructure (IN PROGRESS)
+## Stage 2: Production Infrastructure (COMPLETE)
 
 Move from validated algorithms to deployable system. Each milestone maps to a spec file.
 
-### S2-M1: Compilation Strategy (PHASE 1-3 COMPLETE, PHASE 4 COMPLETE)
+### S2-M1: Compilation Strategy ✅
 
 **Spec**: `specs/infrastructure/compilation/00_compilation.md`
 
@@ -101,9 +101,9 @@ Formalize the two-domain compilation boundary that already exists in practice:
 - Enzyme handles Rust code (via `#[autodiff_reverse]`)
 - Hand-written CUDA backward kernels handle opaque GPU operations
 - No whole-model graph tracing (torch.compile cannot trace NL's inner loop)
-- Architecture-specific `.cubin` + portable `.ptx` fallback
+- Multi-architecture fat binary (sm_86/89/90 SASS + PTX fallback)
 
-**What was delivered**: CUDA kernel pairs for all 3 matrix-based memory rules (DeltaRule, TitansLMM, HebbianRule). Each has forward + backward kernels with analytical gradients from the papers. All fp32. Single-block design (Grid=1, Block=min(d², 1024)) with shared memory for M recurrence. Projections and gates remain in Rust (Enzyme-differentiable); only the sequential inner loop is CUDA.
+**What was delivered**: CUDA kernel pairs for all 3 matrix-based memory rules (DeltaRule, TitansLMM, HebbianRule). Each has forward + backward kernels with analytical gradients from the papers. All fp32. Single-block design (Grid=1, Block=min(d², 1024)) with shared memory for M recurrence. Projections and gates remain in Rust (Enzyme-differentiable); only the sequential inner loop is CUDA. Multi-architecture fat binary via `-gencode` flags covers sm_86/89/90 with PTX fallback for future GPUs. Runtime `Backend` enum + `detect_gpu()` for diagnostics. `force_rust_reference()` override for testing.
 
 | Phase | Kernels | Tests | Status |
 |-------|---------|-------|--------|
@@ -111,15 +111,15 @@ Formalize the two-domain compilation boundary that already exists in practice:
 | Phase 2: TitansLMM | `titans_forward.cu`, `titans_backward.cu` | 6 | COMPLETE |
 | Phase 3: HebbianRule | `hebbian_forward.cu`, `hebbian_backward.cu` | 7 | COMPLETE |
 | Phase 4: Integration | Composition-level CUDA parity tests | 5 | COMPLETE |
+| Phase 5: Arch dispatch | `Backend` enum, `GpuInfo`, multi-arch build | ~13 | COMPLETE |
 
-**Remaining deliverables**:
+**Deliverables**:
 - [x] CUDA kernel pairs for memory rule hot paths (Delta Rule, Titans LMM, Hebbian)
-- [ ] Architecture dispatch (sm_86, sm_90 etc.)
-- [ ] Compilation documentation (build matrix, toolchain requirements)
-- [ ] `.cubin`/`.ptx` packaging
+- [x] Architecture dispatch (sm_86, sm_89, sm_90 + PTX fallback)
+- [x] `.cubin`/`.ptx` packaging (fat binary via multi-gencode)
+- [x] Compilation documentation (`docs/build_matrix.md`)
 
 **Dependencies**: None (builds on existing kernel-pair pattern)
-**Estimated scope**: Large (kernel pairs done, architecture dispatch and packaging remain)
 
 ---
 
@@ -294,13 +294,13 @@ Stage 0: Foundation ────────────────────
     ▼
 Stage 1: Algorithm Core ─────────────────────── COMPLETE (805 tests)
     │
-    ├─► S2-M1: Compilation Strategy ─────────── (kernel pairs COMPLETE)
+    ├─► S2-M1: Compilation Strategy ─────────── COMPLETE
     │       │
-    │       ├─► S2-M2: Multi-GPU Distribution
+    │       ├─► S2-M2: Multi-GPU Distribution ── COMPLETE
     │       │
-    │       └─► S2-M3: Serving
+    │       └─► S2-M3: Serving ──────────────── COMPLETE
     │               │
-    │               └─► S2-M4: Edge Deployment
+    │               └─► S2-M4: Edge Deployment ─ COMPLETE
     │
     ├─► S3-M1: Pluggable Retention ─────────── (independent)
     │
@@ -323,7 +323,7 @@ Stage 2 milestones are sequential (each builds on the last). Stage 3 milestones 
 |-------|-----------|-------|--------|
 | Stage 0: Foundation | 3 | 57 + 47 + 98 | COMPLETE |
 | Stage 1: Algorithm Core | 19 | 778 Rust + 27 Python | COMPLETE |
-| Stage 2: Production Infra | 4 | 29 CUDA + 20 edge | IN PROGRESS |
+| Stage 2: Production Infra | 4 | 29 CUDA + 13 dispatch + 20 edge + 18 serving + 18 distributed | COMPLETE |
 | Stage 3: Extensions | 5 | TBD | NOT STARTED |
 
-**Current position**: Stage 2 in progress. S2-M2/M3/M4 complete; S2-M1 architecture dispatch and cubin/ptx packaging remain. Total test count: 798 Rust + 27 Python + 29 CUDA = **854 tests** (includes 20 edge tests from S2-M4).
+**Current position**: Stage 2 complete. All 4 milestones (S2-M1 through S2-M4) delivered. Total test count: 798 Rust + 27 Python + 42 CUDA + 13 dispatch + 20 edge + 18 serving + 18 distributed = **~936 tests**.

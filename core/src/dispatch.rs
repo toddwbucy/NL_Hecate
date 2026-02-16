@@ -4,14 +4,170 @@
 /// With `--features cuda` → CUDA kernels via FFI (cuda_ffi.rs).
 ///
 /// Both paths produce comparable results (verified by tests).
-/// Dispatch is compile-time only — no runtime GPU detection overhead.
+/// Primary dispatch is compile-time (`#[cfg(feature = "cuda")]`).
+/// Runtime override via `force_rust_reference()` for testing/debugging.
 ///
 /// SWA: bf16 storage, f32 compute (FlashAttention-style).
 /// Memory rules (Delta, Titans, Hebbian): all fp32 (M must be fp32 per spec).
 
+use std::sync::atomic::{AtomicU8, Ordering};
+
+// ══════════════════════════════════════════════════════════════════════
+// Backend enum + GPU detection
+// ══════════════════════════════════════════════════════════════════════
+
+/// GPU compute backend.
+///
+/// Describes which code path actually runs kernels:
+/// - `RustReference`: pure Rust (always available, Enzyme-compatible)
+/// - `CudaNative`: architecture-specific SASS (sm_86/89/90)
+/// - `CudaPtx`: JIT-compiled PTX for architectures without explicit SASS
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    /// Pure Rust reference implementation (always available, Enzyme-compatible).
+    RustReference,
+    /// CUDA with architecture-specific SASS (native performance).
+    CudaNative,
+    /// CUDA with JIT-compiled PTX (forward-compatible fallback).
+    CudaPtx,
+}
+
+/// Known SM versions with embedded SASS in the fat binary.
+const NATIVE_SM_VERSIONS: &[i32] = &[86, 89, 90];
+
+/// Minimum supported SM version (PTX fallback baseline).
+const MIN_SM_VERSION: i32 = 86;
+
+/// GPU device information queried from the CUDA runtime.
+#[derive(Clone, Debug)]
+pub struct GpuInfo {
+    /// Device name (e.g., "NVIDIA RTX A6000").
+    pub name: String,
+    /// Major compute capability (e.g., 8 for sm_86).
+    pub compute_major: i32,
+    /// Minor compute capability (e.g., 6 for sm_86).
+    pub compute_minor: i32,
+    /// Combined SM version (major * 10 + minor, e.g., 86).
+    pub sm_version: i32,
+}
+
+/// Query the current CUDA device properties.
+///
+/// Returns `Some(GpuInfo)` when CUDA is available and a GPU is present.
+/// Returns `None` when compiled without `cuda` feature or no GPU found.
+#[cfg(feature = "cuda")]
+pub fn detect_gpu() -> Option<GpuInfo> {
+    #[repr(C)]
+    struct CudaDeviceProp {
+        name: [u8; 256],
+        // We only need name and compute capability.
+        // cudaDeviceProp is a large struct (~900 bytes); we allocate the full
+        // size and read only the fields we need.
+        _padding: [u8; 1024],
+    }
+
+    extern "C" {
+        fn cudaGetDeviceCount(count: *mut i32) -> i32;
+        fn cudaGetDeviceProperties(prop: *mut CudaDeviceProp, device: i32) -> i32;
+    }
+
+    let mut count = 0i32;
+    let rc = unsafe { cudaGetDeviceCount(&mut count) };
+    if rc != 0 || count == 0 {
+        return None;
+    }
+
+    let mut prop = CudaDeviceProp {
+        name: [0u8; 256],
+        _padding: [0u8; 1024],
+    };
+    let rc = unsafe { cudaGetDeviceProperties(&mut prop, 0) };
+    if rc != 0 {
+        return None;
+    }
+
+    // Extract null-terminated name string.
+    let name_end = prop.name.iter().position(|&b| b == 0).unwrap_or(256);
+    let name = String::from_utf8_lossy(&prop.name[..name_end]).to_string();
+
+    // Compute capability is at byte offsets matching cudaDeviceProp layout.
+    // After `name[256]`, the next fields in cudaDeviceProp are:
+    //   totalGlobalMem (size_t = 8 bytes), then various fields...
+    //   major is at a known offset. We use a different FFI approach:
+    // Actually, cudaDeviceGetAttribute is simpler and more reliable.
+    extern "C" {
+        fn cudaDeviceGetAttribute(value: *mut i32, attr: i32, device: i32) -> i32;
+    }
+    // cudaDevAttrComputeCapabilityMajor = 75
+    // cudaDevAttrComputeCapabilityMinor = 76
+    let mut major = 0i32;
+    let mut minor = 0i32;
+    unsafe {
+        cudaDeviceGetAttribute(&mut major, 75, 0);
+        cudaDeviceGetAttribute(&mut minor, 76, 0);
+    }
+
+    Some(GpuInfo {
+        name,
+        compute_major: major,
+        compute_minor: minor,
+        sm_version: major * 10 + minor,
+    })
+}
+
+/// Query the current CUDA device properties.
+///
+/// Always returns `None` when compiled without `cuda` feature.
+#[cfg(not(feature = "cuda"))]
+pub fn detect_gpu() -> Option<GpuInfo> {
+    None
+}
+
+/// Select the appropriate backend based on detected GPU.
+///
+/// - No GPU → `RustReference`
+/// - GPU with native SASS (sm_86/89/90) → `CudaNative`
+/// - GPU sm >= 86 but no explicit SASS → `CudaPtx` (JIT fallback)
+/// - GPU sm < 86 → `RustReference` (unsupported)
+pub fn select_backend(gpu: &Option<GpuInfo>) -> Backend {
+    match gpu {
+        None => Backend::RustReference,
+        Some(info) => {
+            if info.sm_version < MIN_SM_VERSION {
+                Backend::RustReference
+            } else if NATIVE_SM_VERSIONS.contains(&info.sm_version) {
+                Backend::CudaNative
+            } else {
+                Backend::CudaPtx
+            }
+        }
+    }
+}
+
+// ── Runtime backend override ────────────────────────────────────────
+
+/// 0 = auto (use CUDA if available), 1 = force Rust reference.
+static FORCE_BACKEND: AtomicU8 = AtomicU8::new(0);
+
+/// Force all dispatch functions to use the Rust reference path,
+/// even when CUDA is compiled in. Useful for testing and debugging.
+pub fn force_rust_reference(force: bool) {
+    FORCE_BACKEND.store(if force { 1 } else { 0 }, Ordering::SeqCst);
+}
+
+/// Check if the Rust reference path is forced.
+pub fn is_rust_forced() -> bool {
+    FORCE_BACKEND.load(Ordering::SeqCst) != 0
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Dispatch functions
+// ══════════════════════════════════════════════════════════════════════
+
 /// SWA forward dispatch.
 ///
 /// Calls either the Rust reference or CUDA kernel depending on feature gate.
+/// Respects `force_rust_reference()` override.
 pub fn swa_forward_dispatch(
     q: &[f32],
     k: &[f32],
@@ -25,22 +181,22 @@ pub fn swa_forward_dispatch(
 ) {
     #[cfg(feature = "cuda")]
     {
-        assert!(
-            head_dim <= 32,
-            "CUDA SWA kernels require head_dim <= 32 (one warp), got head_dim={head_dim}"
-        );
-        cuda_forward(q, k, v, out, attn_weights, seq_len, num_heads, head_dim, window_size);
-        return;
+        if !is_rust_forced() {
+            assert!(
+                head_dim <= 32,
+                "CUDA SWA kernels require head_dim <= 32 (one warp), got head_dim={head_dim}"
+            );
+            cuda_forward(q, k, v, out, attn_weights, seq_len, num_heads, head_dim, window_size);
+            return;
+        }
     }
-    #[cfg(not(feature = "cuda"))]
-    {
-        crate::swa::swa_forward(q, k, v, out, attn_weights, seq_len, num_heads, head_dim, window_size);
-    }
+    crate::swa::swa_forward(q, k, v, out, attn_weights, seq_len, num_heads, head_dim, window_size);
 }
 
 /// SWA backward dispatch.
 ///
 /// Calls either the Rust reference or CUDA kernel depending on feature gate.
+/// Respects `force_rust_reference()` override.
 /// dQ, dK, dV are NOT zeroed by this function — caller must pre-zero.
 pub fn swa_backward_dispatch(
     q: &[f32],
@@ -58,19 +214,18 @@ pub fn swa_backward_dispatch(
 ) {
     #[cfg(feature = "cuda")]
     {
-        assert!(
-            head_dim <= 32,
-            "CUDA SWA kernels require head_dim <= 32 (one warp), got head_dim={head_dim}"
-        );
-        cuda_backward(q, k, v, attn_weights, d_attn_out, d_q, d_k, d_v,
-                      seq_len, num_heads, head_dim, window_size);
-        return;
+        if !is_rust_forced() {
+            assert!(
+                head_dim <= 32,
+                "CUDA SWA kernels require head_dim <= 32 (one warp), got head_dim={head_dim}"
+            );
+            cuda_backward(q, k, v, attn_weights, d_attn_out, d_q, d_k, d_v,
+                          seq_len, num_heads, head_dim, window_size);
+            return;
+        }
     }
-    #[cfg(not(feature = "cuda"))]
-    {
-        crate::swa::swa_backward_rust(q, k, v, attn_weights, d_attn_out, d_q, d_k, d_v,
-                                       seq_len, num_heads, head_dim, window_size);
-    }
+    crate::swa::swa_backward_rust(q, k, v, attn_weights, d_attn_out, d_q, d_k, d_v,
+                                   seq_len, num_heads, head_dim, window_size);
 }
 
 // ── CUDA dispatch helpers (device memory management) ────────────────
@@ -387,15 +542,14 @@ pub fn delta_forward_dispatch(
 ) {
     #[cfg(feature = "cuda")]
     {
-        cuda_delta_forward(k_mem, v_mem, q_mem, alpha, theta, m_initial,
-                           m_states, y, seq_len, d);
-        return;
+        if !is_rust_forced() {
+            cuda_delta_forward(k_mem, v_mem, q_mem, alpha, theta, m_initial,
+                               m_states, y, seq_len, d);
+            return;
+        }
     }
-    #[cfg(not(feature = "cuda"))]
-    {
-        rust_delta_forward(k_mem, v_mem, q_mem, alpha, theta, m_initial,
-                           m_states, y, seq_len, d);
-    }
+    rust_delta_forward(k_mem, v_mem, q_mem, alpha, theta, m_initial,
+                       m_states, y, seq_len, d);
 }
 
 /// Delta Rule backward inner loop dispatch.
@@ -420,17 +574,16 @@ pub fn delta_backward_dispatch(
 ) {
     #[cfg(feature = "cuda")]
     {
-        cuda_delta_backward(k_mem, v_mem, q_mem, alpha, theta, m_states, d_y,
-                            d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta, d_m_initial,
-                            seq_len, d);
-        return;
+        if !is_rust_forced() {
+            cuda_delta_backward(k_mem, v_mem, q_mem, alpha, theta, m_states, d_y,
+                                d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta, d_m_initial,
+                                seq_len, d);
+            return;
+        }
     }
-    #[cfg(not(feature = "cuda"))]
-    {
-        rust_delta_backward(k_mem, v_mem, q_mem, alpha, theta, m_states, d_y,
-                            d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta, d_m_initial,
-                            seq_len, d);
-    }
+    rust_delta_backward(k_mem, v_mem, q_mem, alpha, theta, m_states, d_y,
+                        d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta, d_m_initial,
+                        seq_len, d);
 }
 
 // ── Titans LMM dispatch ─────────────────────────────────────────────
@@ -453,17 +606,16 @@ pub fn titans_forward_dispatch(
 ) {
     #[cfg(feature = "cuda")]
     {
-        cuda_titans_forward(k_mem, v_mem, q_mem, alpha, theta, eta,
-                            m_initial, s_initial, m_states, s_states, y,
-                            seq_len, d);
-        return;
+        if !is_rust_forced() {
+            cuda_titans_forward(k_mem, v_mem, q_mem, alpha, theta, eta,
+                                m_initial, s_initial, m_states, s_states, y,
+                                seq_len, d);
+            return;
+        }
     }
-    #[cfg(not(feature = "cuda"))]
-    {
-        rust_titans_forward(k_mem, v_mem, q_mem, alpha, theta, eta,
-                            m_initial, s_initial, m_states, s_states, y,
-                            seq_len, d);
-    }
+    rust_titans_forward(k_mem, v_mem, q_mem, alpha, theta, eta,
+                        m_initial, s_initial, m_states, s_states, y,
+                        seq_len, d);
 }
 
 /// Titans LMM backward inner loop dispatch.
@@ -490,23 +642,22 @@ pub fn titans_backward_dispatch(
 ) {
     #[cfg(feature = "cuda")]
     {
-        cuda_titans_backward(k_mem, v_mem, q_mem, alpha, theta, eta,
-                             m_states, s_states, d_y,
-                             d_k_mem, d_v_mem, d_q_mem,
-                             d_alpha, d_theta, d_eta,
-                             d_m_initial, d_s_initial,
-                             seq_len, d);
-        return;
+        if !is_rust_forced() {
+            cuda_titans_backward(k_mem, v_mem, q_mem, alpha, theta, eta,
+                                 m_states, s_states, d_y,
+                                 d_k_mem, d_v_mem, d_q_mem,
+                                 d_alpha, d_theta, d_eta,
+                                 d_m_initial, d_s_initial,
+                                 seq_len, d);
+            return;
+        }
     }
-    #[cfg(not(feature = "cuda"))]
-    {
-        rust_titans_backward(k_mem, v_mem, q_mem, alpha, theta, eta,
-                             m_states, s_states, d_y,
-                             d_k_mem, d_v_mem, d_q_mem,
-                             d_alpha, d_theta, d_eta,
-                             d_m_initial, d_s_initial,
-                             seq_len, d);
-    }
+    rust_titans_backward(k_mem, v_mem, q_mem, alpha, theta, eta,
+                         m_states, s_states, d_y,
+                         d_k_mem, d_v_mem, d_q_mem,
+                         d_alpha, d_theta, d_eta,
+                         d_m_initial, d_s_initial,
+                         seq_len, d);
 }
 
 // ── Hebbian Rule dispatch ───────────────────────────────────────────
@@ -525,15 +676,14 @@ pub fn hebbian_forward_dispatch(
 ) {
     #[cfg(feature = "cuda")]
     {
-        cuda_hebbian_forward(k_mem, v_mem, q_mem, alpha, m_initial,
-                             m_states, y, seq_len, d);
-        return;
+        if !is_rust_forced() {
+            cuda_hebbian_forward(k_mem, v_mem, q_mem, alpha, m_initial,
+                                 m_states, y, seq_len, d);
+            return;
+        }
     }
-    #[cfg(not(feature = "cuda"))]
-    {
-        rust_hebbian_forward(k_mem, v_mem, q_mem, alpha, m_initial,
-                             m_states, y, seq_len, d);
-    }
+    rust_hebbian_forward(k_mem, v_mem, q_mem, alpha, m_initial,
+                         m_states, y, seq_len, d);
 }
 
 /// Hebbian Rule backward inner loop dispatch.
@@ -554,24 +704,22 @@ pub fn hebbian_backward_dispatch(
 ) {
     #[cfg(feature = "cuda")]
     {
-        cuda_hebbian_backward(k_mem, v_mem, q_mem, alpha, m_states, d_y,
-                              d_k_mem, d_v_mem, d_q_mem, d_alpha, d_m_initial,
-                              seq_len, d);
-        return;
+        if !is_rust_forced() {
+            cuda_hebbian_backward(k_mem, v_mem, q_mem, alpha, m_states, d_y,
+                                  d_k_mem, d_v_mem, d_q_mem, d_alpha, d_m_initial,
+                                  seq_len, d);
+            return;
+        }
     }
-    #[cfg(not(feature = "cuda"))]
-    {
-        rust_hebbian_backward(k_mem, v_mem, q_mem, alpha, m_states, d_y,
-                              d_k_mem, d_v_mem, d_q_mem, d_alpha, d_m_initial,
-                              seq_len, d);
-    }
+    rust_hebbian_backward(k_mem, v_mem, q_mem, alpha, m_states, d_y,
+                          d_k_mem, d_v_mem, d_q_mem, d_alpha, d_m_initial,
+                          seq_len, d);
 }
 
 // ── Rust reference inner loops ──────────────────────────────────────
-// Used when not compiled with --features cuda
+// Always compiled. Used as fallback when CUDA is absent or force_rust_reference() is set.
 
 /// Rust reference Delta Rule forward inner loop.
-#[cfg(not(feature = "cuda"))]
 fn rust_delta_forward(
     k_mem: &[f32], v_mem: &[f32], q_mem: &[f32],
     alpha: &[f32], theta: &[f32], m_initial: &[f32],
@@ -617,7 +765,6 @@ fn rust_delta_forward(
 }
 
 /// Rust reference Delta Rule backward inner loop.
-#[cfg(not(feature = "cuda"))]
 fn rust_delta_backward(
     k_mem: &[f32], v_mem: &[f32], q_mem: &[f32],
     alpha: &[f32], theta: &[f32], m_states: &[f32], d_y: &[f32],
@@ -711,7 +858,6 @@ fn rust_delta_backward(
 }
 
 /// Rust reference Titans forward inner loop.
-#[cfg(not(feature = "cuda"))]
 fn rust_titans_forward(
     k_mem: &[f32], v_mem: &[f32], q_mem: &[f32],
     alpha: &[f32], theta: &[f32], eta: &[f32],
@@ -768,7 +914,6 @@ fn rust_titans_forward(
 }
 
 /// Rust reference Titans backward inner loop.
-#[cfg(not(feature = "cuda"))]
 #[allow(clippy::too_many_arguments)]
 fn rust_titans_backward(
     k_mem: &[f32], v_mem: &[f32], q_mem: &[f32],
@@ -881,7 +1026,6 @@ fn rust_titans_backward(
 }
 
 /// Rust reference Hebbian forward inner loop.
-#[cfg(not(feature = "cuda"))]
 fn rust_hebbian_forward(
     k_mem: &[f32], v_mem: &[f32], q_mem: &[f32],
     alpha: &[f32], m_initial: &[f32],
@@ -918,7 +1062,6 @@ fn rust_hebbian_forward(
 }
 
 /// Rust reference Hebbian backward inner loop.
-#[cfg(not(feature = "cuda"))]
 fn rust_hebbian_backward(
     k_mem: &[f32], v_mem: &[f32], q_mem: &[f32],
     alpha: &[f32], m_states: &[f32], d_y: &[f32],

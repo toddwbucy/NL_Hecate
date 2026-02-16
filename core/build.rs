@@ -4,6 +4,10 @@
 /// then links them into the final binary. These object files contain machine
 /// code (PTX/SASS), NOT LLVM IR — making them opaque to Enzyme's AD pass.
 /// This is the barrier pattern from Phase 0 Finding #3.
+///
+/// Multi-architecture support: nvcc embeds SASS for sm_86/89/90 plus PTX
+/// for compute_86 as a forward-compatible fallback. The CUDA runtime
+/// automatically selects the correct variant at kernel launch time.
 
 fn main() {
     #[cfg(feature = "cuda")]
@@ -14,8 +18,12 @@ fn main() {
         cc::Build::new()
             .cuda(true)
             .cudart("shared")
-            .flag("-gencode")
-            .flag("arch=compute_86,code=sm_86")
+            // Architecture-specific SASS (native performance)
+            .flag("-gencode").flag("arch=compute_86,code=sm_86")   // A6000, RTX 3090
+            .flag("-gencode").flag("arch=compute_89,code=sm_89")   // RTX 4090, RTX 2000 Ada
+            .flag("-gencode").flag("arch=compute_90,code=sm_90")   // H100
+            // PTX fallback (JIT-compiled for future GPUs >= sm_86)
+            .flag("-gencode").flag("arch=compute_86,code=compute_86")
             .flag("-O2")
             .flag("--use_fast_math")
             .flag("-Xcompiler")
