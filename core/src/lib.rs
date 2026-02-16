@@ -32,3 +32,7 @@ pub(crate) mod cuda_ffi;
 pub mod conductor;
 pub mod context_stream;
 pub mod dispatch;
+#[cfg(feature = "distributed")]
+pub mod distributed;
+#[cfg(feature = "serving")]
+pub mod serving;

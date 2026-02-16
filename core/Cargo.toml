@@ -20,6 +20,8 @@ opt-level = 2
 
 [features]
 cuda = ["cc"]
+distributed = []
+serving = []
 internal = []
 
 [dependencies]
