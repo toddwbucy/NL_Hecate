@@ -1,4 +1,4 @@
-#![feature(autodiff)]
+#![cfg_attr(feature = "enzyme", feature(autodiff))]
 
 pub mod tensor;
 pub mod swa;
@@ -36,3 +36,5 @@ pub mod dispatch;
 pub mod distributed;
 #[cfg(feature = "serving")]
 pub mod serving;
+#[cfg(feature = "edge")]
+pub mod edge;
