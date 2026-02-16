@@ -1,6 +1,7 @@
 //! CMS integration tests: multi-step training, error buffer health, falsification.
 
 use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind, CompositionKind};
+use nl_hecate_core::retention::RetentionKind;
 use nl_hecate_core::mag::{cms_forward, cms_backward};
 use nl_hecate_core::conductor::{Conductor, Pulse, ContextState, ErrorBuffer};
 
@@ -204,7 +205,10 @@ fn test_k2_beats_k1() {
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
         parallel: None,
-    };
+
+        retention: RetentionKind::L2WeightDecay,
+
+        };
     // k=2 config
     let cfg_k2 = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
@@ -213,7 +217,10 @@ fn test_k2_beats_k1() {
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
         parallel: None,
-    };
+
+        retention: RetentionKind::L2WeightDecay,
+
+        };
 
     let input_ids: Vec<usize> = (0..swa.seq_len).map(|t| t % swa.vocab_size).collect();
     let target_ids: Vec<usize> = (1..=swa.seq_len).map(|t| t % swa.vocab_size).collect();
@@ -387,7 +394,10 @@ fn test_k4_vs_k2_multiscale() {
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
         parallel: None,
-    };
+
+        retention: RetentionKind::L2WeightDecay,
+
+        };
     let cfg_k4 = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
         memory_rule: MemoryRuleKind::DeltaRule,
@@ -395,7 +405,10 @@ fn test_k4_vs_k2_multiscale() {
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
         parallel: None,
-    };
+
+        retention: RetentionKind::L2WeightDecay,
+
+        };
 
     let slow_period = 8;
     let num_regimes = 4;
@@ -480,7 +493,10 @@ fn test_k4_diagnostics() {
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
         parallel: None,
-    };
+
+        retention: RetentionKind::L2WeightDecay,
+
+        };
 
     let (input_ids, target_ids) = make_multiscale_data(
         cfg.swa.seq_len, cfg.swa.vocab_size, 8, 4, 42,
@@ -743,7 +759,10 @@ fn test_cms_stability_boundary() {
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
         parallel: None,
-    };
+
+        retention: RetentionKind::L2WeightDecay,
+
+        };
     let cfg_k2 = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
         memory_rule: MemoryRuleKind::DeltaRule,
@@ -751,7 +770,10 @@ fn test_cms_stability_boundary() {
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
         parallel: None,
-    };
+
+        retention: RetentionKind::L2WeightDecay,
+
+        };
 
     let slow_period = 8;
     let num_regimes = 4;
@@ -933,7 +955,10 @@ fn test_k4_normalization_magnitude() {
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
         parallel: None,
-    };
+
+        retention: RetentionKind::L2WeightDecay,
+
+        };
     let params_k4 = MAGParams::init(&cfg_k4, 42);
     let mut context = ContextState::new(cfg_k4.k, cfg_k4.swa.d_model);
     let pulse = Pulse { global_step: 0, active_levels: vec![true, true, true, true] };
@@ -994,7 +1019,10 @@ fn test_k4_uniform_init_stable() {
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
         parallel: None,
-    };
+
+        retention: RetentionKind::L2WeightDecay,
+
+        };
 
     let (input_ids, target_ids) = make_multiscale_data(
         cfg.swa.seq_len, cfg.swa.vocab_size, 8, 4, 42,
@@ -1041,7 +1069,10 @@ fn test_k4_normalized_stable() {
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
         parallel: None,
-    };
+
+        retention: RetentionKind::L2WeightDecay,
+
+        };
 
     let (input_ids, target_ids) = make_multiscale_data(
         swa.seq_len, swa.vocab_size, 8, 4, 42,

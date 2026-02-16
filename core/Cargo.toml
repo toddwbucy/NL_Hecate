@@ -35,9 +35,14 @@ paste = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
 serial_test = "3"
 
+[[test]]
+name = "test_edge"
+required-features = ["edge"]
+
 [[bench]]
 name = "edge_bench"
 harness = false
+required-features = ["edge"]
 
 [build-dependencies]
 cc = { version = "1.0", features = ["parallel"], optional = true }

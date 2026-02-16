@@ -1,7 +1,7 @@
 # NL_Hecate Progress Report
 
 **Project**: NL_Hecate — Nested Learning implementation in Rust + Enzyme AD + CUDA
-**Status**: Stages 0-2 COMPLETE. Integration spike validates end-to-end learning. Ready for Stage 3.
+**Status**: Stages 0-2 COMPLETE. Stage 3 IN PROGRESS (S3-M1 Pluggable Retention complete).
 
 ---
 
@@ -11,9 +11,9 @@ NL_Hecate implements the Nested Learning research program (Mirrokni/Behrouz, Goo
 
 An integration spike (17 tests) validates the thesis end-to-end: the full VecStream -> Conductor -> cms_forward -> cms_backward -> apply pipeline learns a repeating token pattern, achieving 100% prediction accuracy across 3 representative configs. The serving path (Session::process_chunk) produces identical behavior to the raw loop.
 
-**Total test count**: 858 Rust + 27 Python = **885 total**
-**PRs merged**: 29
-**Codebase**: ~24.9K lines Rust source + ~9.5K lines Rust tests + ~1.3K lines CUDA + ~1.2K lines Python
+**Total test count**: 894 Rust + 27 Python = **921 total**
+**PRs merged**: 30
+**Codebase**: ~25.3K lines Rust source + ~9.9K lines Rust tests + ~1.3K lines CUDA + ~1.2K lines Python
 
 ---
 
@@ -100,6 +100,17 @@ All 22 milestones delivered. This is the mathematical heart of the system — ev
 - ~34k tok/s on x86_64 for d=64 (exceeds 18k target)
 - `#![feature(autodiff)]` gated behind `enzyme` feature for portability
 
+### Stage 3: Extensions (IN PROGRESS — 1/5 milestones)
+
+**S3-M1: Pluggable Retention** (PR #31)
+- Extracted retention mechanisms from inline code in all 8 memory rules into `core/src/retention.rs`
+- `RetentionKind` enum: L2WeightDecay, KLDivergence, ElasticNet (NEW), SphereNormalization
+- 6 free functions + 2 in-place variants for zero-alloc hot paths
+- `RetentionKind` field added to `MAGConfig` (24 constructors, all test files updated)
+- Cross-rule retention swapping enabled (e.g. DeltaRule+ElasticNet) — CS-36 compliance
+- PyO3 `retention` kwarg for Python-side configuration
+- 22 dedicated retention tests + 17 inline unit tests, 847 base tests passing (0 failures)
+
 ### Integration Spike: End-to-End Validation
 
 **17 tests** validating that the full pipeline actually learns a predictable pattern.
@@ -144,7 +155,7 @@ y_combined = SUM(level outputs) grows linearly with k. At k=4, the summed signal
 ## Architecture
 
 ```text
-core/src/                          (~24,900 lines, 31 modules)
+core/src/                          (~25,300 lines, 32 modules)
   tensor.rs        — SIMD-friendly primitives, RNG, sigmoid, softplus
   swa.rs           — Sliding Window Attention forward/backward
   model.rs         — SWAConfig/Params, MAGConfig/Params, MemoryLevelParams
@@ -159,6 +170,7 @@ core/src/                          (~24,900 lines, 31 modules)
   memora.rs        — MEMORA (KL-softmax, emergence)
   lattice_osr.rs   — Lattice OSR (orthogonal state recurrence)
   trellis.rs       — Trellis (two-pass KV compression)
+  retention.rs     — Pluggable retention (L2/KL/ElasticNet/Sphere) + in-place variants
   mag.rs           — MAG composition + CMS forward/backward
   mal.rs           — MAL composition
   mac.rs           — MAC composition
@@ -224,6 +236,8 @@ python/                            (~1,200 lines)
 | #27 | Serving non-stationary models (S2-M3) | S2 |
 | #28 | Edge deployment for zero-dependency micro models (S2-M4) | S2 |
 | #29 | Multi-arch CUDA dispatch + build matrix (S2-M1 Phase 5) | S2 |
+| #30 | Update progress report and integration spike tests | S2 |
+| #31 | Pluggable retention trait — MIRAS Knob #3 (S3-M1) | S3 |
 
 ---
 
@@ -231,13 +245,13 @@ python/                            (~1,200 lines)
 
 | Metric | Value |
 |---|---|
-| Total tests | 885 (858 Rust + 27 Python) |
-| Rust tests (verified) | 858 passed, 0 failed, 2 ignored |
+| Total tests | 921 (894 Rust + 27 Python) |
+| Rust tests (verified) | 847 base + 47 feature-gated = 894 passed, 0 failed, 2 ignored |
 | Python tests | 27 |
-| PRs merged | 29 |
+| PRs merged | 31 |
 | Spec files | 48 |
-| Lines of Rust (core/src) | ~24,900 |
-| Lines of Rust (core/tests) | ~9,500 |
+| Lines of Rust (core/src) | ~25,300 |
+| Lines of Rust (core/tests) | ~9,900 |
 | Lines of CUDA (kernels) | ~1,250 |
 | Lines of Python (bindings+tests) | ~1,200 |
 | Memory rules | 8/8 |
@@ -250,13 +264,13 @@ python/                            (~1,200 lines)
 
 ---
 
-## What's Next: Stage 3 (Extensions)
+## What's Next: Stage 3 (Extensions) — 1/5 complete
 
-Stage 2 is complete. The integration spike confirms the foundation is solid — all 3 tested configs learn a repeating pattern end-to-end, serving path matches raw loop exactly, and checkpoint/restore is deterministic.
+S3-M1 (Pluggable Retention) is complete. Retention is now a first-class composable knob — any rule can use any retention mechanism, unlocking the full 4-knob MIRAS design space.
 
-Stage 3 extends the algorithm design space. All milestones are independent:
+Remaining Stage 3 milestones are independent:
 
-- **S3-M1: Pluggable Retention Trait** — Extract retention into composable trait, add elastic net + f-divergence
+- ~~**S3-M1: Pluggable Retention**~~ — COMPLETE (PR #31)
 - **S3-M2: M3 Multi-Scale Optimizer** — Apply CMS to the optimizer itself (k momentum accumulators)
 - **S3-M3: CMS Deployment Variants** — Nested, sequential, independent, hybrid CMS patterns
 - **S3-M4: Atlas Omega Rule** — 9th MIRAS variant, enables Atlas Parallel strategy

@@ -22,6 +22,7 @@ use crate::tensor::{
     matmul_f32, transpose_f32, sigmoid_f32, softplus_f32,
     outer_product_f32, frobenius_dot_f32,
 };
+use crate::retention::l2_apply_retention;
 use crate::model::MemoryLevelParams;
 
 // ── Memory rule trait ────────────────────────────────────────────────
@@ -178,12 +179,12 @@ impl MemoryRule for DeltaRule {
 
         // error = prediction - v; grad = outer(error, k)
         // M = (1-alpha) * M - theta * outer(error, k)
-        let retention = 1.0 - gates.alpha;
         let lr = gates.theta;
+        l2_apply_retention(&mut state.m, 1.0 - gates.alpha);
         for i in 0..d {
             let err_i = prediction[i] - v[i];
             for j in 0..d {
-                state.m[i * d + j] = retention * state.m[i * d + j] - lr * err_i * k[j];
+                state.m[i * d + j] -= lr * err_i * k[j];
             }
         }
         Ok(())
@@ -283,11 +284,13 @@ impl MemoryRule for DeltaRule {
             outer_product_f32(&error[e_base..e_base + d], k_t, &mut grad_outer[g_base..g_base + d * d]);
 
             // M_{t+1} = (1-alpha_t) * M_t - theta_t * grad
-            let retention = 1.0 - alpha[t];
             let lr = theta[t];
+            let m_next_off = (t + 1) * d * d;
+            let m_t_off = t * d * d;
+            m_states.copy_within(m_t_off..m_t_off + d * d, m_next_off);
+            l2_apply_retention(&mut m_states[m_next_off..m_next_off + d * d], 1.0 - alpha[t]);
             for i in 0..(d * d) {
-                m_states[(t + 1) * d * d + i] = retention * m_states[t * d * d + i]
-                    - lr * grad_outer[g_base + i];
+                m_states[m_next_off + i] -= lr * grad_outer[g_base + i];
             }
 
             // y_t = M_{t+1} @ q_t
@@ -376,11 +379,8 @@ impl MemoryRule for DeltaRule {
             }
 
             // d_M_t = (1 - alpha) * d_M  (propagate to previous step)
-            let retention = 1.0 - alpha_t;
-            let mut d_m_prev = vec![0.0f32; d * d];
-            for i in 0..(d * d) {
-                d_m_prev[i] = retention * d_m[i];
-            }
+            let mut d_m_prev = d_m.clone();
+            l2_apply_retention(&mut d_m_prev, 1.0 - alpha_t);
 
             // ── grad = outer(error, k) backward ──
             let mut d_err = vec![0.0f32; d];

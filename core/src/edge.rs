@@ -10,6 +10,7 @@
 /// is provided externally (benchmarks, serving module).
 
 use crate::model::{MAGConfig, MAGParams, CompositionKind, MemoryRuleKind};
+use crate::retention::default_retention;
 use crate::conductor::{Conductor, ContextState, ErrorBuffer};
 use crate::mag::{cms_forward, cms_backward};
 
@@ -64,6 +65,7 @@ impl EdgeConfig {
             lambda_k: 0.0,
             lambda_v: 0.0,
             parallel: None,
+            retention: default_retention(self.memory_rule),
         }
     }
 

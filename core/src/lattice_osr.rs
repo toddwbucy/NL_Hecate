@@ -33,6 +33,7 @@ use crate::tensor::{
     matmul_f32, transpose_f32, sigmoid_f32, softmax_f32,
     frobenius_dot_f32, vec_norm_f32, vec_normalize_f32,
 };
+use crate::retention::sphere_project_and_normalize_inplace;
 use crate::model::MemoryLevelParams;
 use crate::delta_rule::{MemoryRule, MemoryState, Gates, MemoryError};
 
@@ -192,6 +193,11 @@ impl MemoryRule for LatticeOSR {
         let mut s_unnorm_norms = vec![0.0f32; seq_len * m];
         let mut y = vec![0.0f32; seq_len * d];
 
+        // Scratch buffers reused across the seq_len × m loop (avoid per-iteration allocs)
+        let mut delta_s_scratch = vec![0.0f32; d];
+        let mut s_new_scratch = vec![0.0f32; d];
+        let mut read_scores = vec![0.0f32; m];
+
         for t in 0..seq_len {
             let k_t = &k_mem[t * d..(t + 1) * d];
             let v_t = &v_mem[t * d..(t + 1) * d];
@@ -213,7 +219,6 @@ impl MemoryRule for LatticeOSR {
             alpha[t] = sigmoid_f32(alpha_pre_t);
 
             // OBSERVE: read from current slots S_t
-            let mut read_scores = vec![0.0f32; m];
             for i in 0..m {
                 let slot = &s_states[s_t_off + i * d..s_t_off + (i + 1) * d];
                 read_scores[i] = frobenius_dot_f32(slot, q_t);
@@ -243,35 +248,18 @@ impl MemoryRule for LatticeOSR {
                 let gate_i = sigmoid_f32(score_i);
                 slot_gates[t * m + i] = gate_i;
 
-                // delta_s = alpha_t * gate_i * v_t
-                // orthogonal projection: remove parallel component
-                let mut p = 0.0f32;
+                // delta_s = alpha_t * gate_i * v_t (write into scratch)
+                let scale = alpha[t] * gate_i;
                 for j in 0..d {
-                    p += slot[j] * alpha[t] * gate_i * v_t[j];
+                    delta_s_scratch[j] = scale * v_t[j];
                 }
 
-                // s_unnorm = slot + (delta_s - p * slot) = slot * (1 - p) + delta_s
-                let mut s_unnorm = vec![0.0f32; d];
-                for j in 0..d {
-                    let delta_s_j = alpha[t] * gate_i * v_t[j];
-                    let ortho_j = delta_s_j - p * slot[j];
-                    s_unnorm[j] = slot[j] + ortho_j;
-                }
-
-                let norm = vec_norm_f32(&s_unnorm);
+                // Sphere retention: orthogonal projection + normalize (in-place)
+                let norm = sphere_project_and_normalize_inplace(
+                    slot, &delta_s_scratch, d, &mut s_new_scratch,
+                );
                 s_unnorm_norms[t * m + i] = norm;
-
-                // Normalize to unit sphere
-                if norm > 1e-8 {
-                    let inv = 1.0 / norm;
-                    for j in 0..d {
-                        s_next[i * d + j] = s_unnorm[j] * inv;
-                    }
-                } else {
-                    // Keep previous slot if degenerate
-                    s_next[i * d..(i + 1) * d]
-                        .copy_from_slice(slot);
-                }
+                s_next[i * d..(i + 1) * d].copy_from_slice(&s_new_scratch[..d]);
             }
         }
 

@@ -198,24 +198,29 @@ Deploy micro models (d <= 128) on CPU with zero external dependencies. The inner
 
 ---
 
-## Stage 3: Extensions (NOT STARTED)
+## Stage 3: Extensions (IN PROGRESS — 1/5 milestones complete)
 
 Algorithm-level extensions that enrich the design space. None are blockers for Stage 2.
 
-### S3-M1: Pluggable Retention Trait
+### S3-M1: Pluggable Retention ✅
 
 **Specs**: `specs/algorithms/retention_mechanisms/00_interface.md`, `03_elastic_net.md`, `04_f_divergence.md`
 
-Currently retention is baked into each memory rule. This milestone extracts it into a composable trait.
+Retention was fused inline in each memory rule's `step()`. This milestone extracts it into standalone free functions dispatched via `RetentionKind` enum (matching existing `MemoryRuleKind`/`CompositionKind` patterns), enabling cross-rule retention swapping (e.g. DeltaRule+ElasticNet) for CS-36 compliance.
+
+**What was delivered**: `core/src/retention.rs` (450 lines) with `RetentionKind` enum (L2WeightDecay, KLDivergence, ElasticNet, SphereNormalization), `RetentionConfig` struct, `default_retention()` mapping, and 6 free functions (`l2_apply_retention`, `l2_retention_gradient`, `l2_decoupled_gradient`, `kl_apply_retention[_inplace]`, `elastic_net_apply`, `sphere_project_and_normalize[_inplace]`). All 8 rules refactored. `RetentionKind` added to `MAGConfig`. PyO3 `retention` kwarg. In-place variants for hot-loop callers (lattice_osr, memora, trellis) eliminate per-iteration heap allocations.
 
 **Deliverables**:
-- [ ] `RetentionMechanism` trait with `compute_retention()` and `apply_retention()`
-- [ ] Elastic Net retention (L1+L2 with hard thresholding for sparsity)
-- [ ] f-Divergence framework (proves L2, KL, TV are all special cases)
-- [ ] Existing rules refactored to use pluggable trait (backward compatible)
+- [x] `RetentionKind` enum + free function dispatch (L2, KL, ElasticNet, Sphere)
+- [x] Elastic Net retention (L1+L2 with soft thresholding for sparsity)
+- [x] In-place variants for zero-alloc hot paths (`kl_apply_retention_inplace`, `sphere_project_and_normalize_inplace`)
+- [x] All 8 rules refactored to use pluggable functions (bit-identical backward compatibility)
+- [x] `RetentionKind` field on `MAGConfig` (24 constructors + all test files updated)
+- [x] PyO3 bindings (`retention` kwarg: "l2", "kl", "elastic_net", "sphere")
+- [x] 22 dedicated retention tests + 17 inline unit tests
 
 **Dependencies**: None
-**Estimated scope**: Medium (trait extraction + refactor of 8 rules)
+**PR**: #31
 
 ---
 
@@ -302,7 +307,7 @@ Stage 1: Algorithm Core ──────────────────�
     │               │
     │               └─► S2-M4: Edge Deployment ─ COMPLETE
     │
-    ├─► S3-M1: Pluggable Retention ─────────── (independent)
+    ├─► S3-M1: Pluggable Retention ─────────── COMPLETE (PR #31)
     │
     ├─► S3-M2: M3 Optimizer ────────────────── (independent)
     │       │
@@ -324,6 +329,6 @@ Stage 2 milestones are sequential (each builds on the last). Stage 3 milestones 
 | Stage 0: Foundation | 3 | 57 + 47 + 98 | COMPLETE |
 | Stage 1: Algorithm Core | 19 | 778 Rust + 27 Python | COMPLETE |
 | Stage 2: Production Infra | 4 | 29 CUDA + 13 dispatch + 20 edge + 18 serving + 18 distributed | COMPLETE |
-| Stage 3: Extensions | 5 | TBD | NOT STARTED |
+| Stage 3: Extensions | 5 | 22 retention (S3-M1) | 1/5 COMPLETE |
 
-**Current position**: Stage 2 complete. All 4 milestones (S2-M1 through S2-M4) delivered. Total test count: 798 Rust + 27 Python + 42 CUDA + 13 dispatch + 20 edge + 18 serving + 18 distributed = **~936 tests**.
+**Current position**: Stage 3 in progress. S3-M1 (Pluggable Retention) complete. Total test count: 847 Rust (base) + 11 edge + 18 serving + 18 distributed + 27 Python = **~921 tests**.

@@ -37,6 +37,7 @@ use crate::tensor::{
     matmul_f32, transpose_f32, softmax_f32, log_f32,
     sigmoid_f32, softplus_f32, silu_f32, silu_prime_f32,
 };
+use crate::retention::kl_apply_retention_inplace;
 use crate::model::MemoryLevelParams;
 use crate::delta_rule::{MemoryRule, MemoryState, Gates, MemoryError};
 
@@ -184,9 +185,13 @@ impl MemoryRule for MEMORA {
         let mut log_w1_prev = vec![0.0f32; seq_len * w1_size];
         let mut log_w2_prev = vec![0.0f32; seq_len * w2_size];
 
-        // Temp buffers for per-row softmax update
-        let mut z_buf = vec![0.0f32; d.max(dh)];
-        let mut softmax_buf = vec![0.0f32; d.max(dh)];
+        // Reusable scratch buffers for kl_apply_retention_inplace (avoid per-call allocs).
+        // max_size covers both W1 (dh*d) and W2 (d*dh) — they're equal but use max for clarity.
+        let max_size = w1_size.max(w2_size);
+        let max_cols = d.max(dh);
+        let mut kl_out_buf = vec![0.0f32; max_size];
+        let mut kl_log_buf = vec![0.0f32; max_size];
+        let mut kl_z_buf = vec![0.0f32; max_cols];
 
         for t in 0..seq_len {
             let k_t = &k_mem[t * d..(t + 1) * d];
@@ -292,29 +297,18 @@ impl MemoryRule for MEMORA {
             let lw2_base = t * w2_size;
             log_f32(w2_t, &mut log_w2_prev[lw2_base..lw2_base + w2_size]);
 
-            // KL-optimal softmax update for W1: d_hidden rows of length d
-            //   z[i] = alpha_t * log(w1_t[i]) - theta_t * grad_w1[i]
-            //   w1_next[row] = softmax(z)
-            for r in 0..dh {
-                let row_base = r * d;
-                for c in 0..d {
-                    z_buf[c] = alpha_t * log_w1_prev[lw1_base + row_base + c]
-                             - theta_t * grad_w1[row_base + c];
-                }
-                softmax_f32(&z_buf[..d], &mut softmax_buf[..d], 1, d);
-                w1_next[row_base..row_base + d].copy_from_slice(&softmax_buf[..d]);
-            }
+            // KL-optimal softmax update for W1 and W2 (in-place, reusing scratch buffers)
+            kl_apply_retention_inplace(
+                w1_t, &grad_w1, alpha_t, theta_t, dh, d,
+                &mut kl_out_buf, &mut kl_log_buf, &mut kl_z_buf,
+            );
+            w1_next.copy_from_slice(&kl_out_buf[..w1_size]);
 
-            // KL-optimal softmax update for W2: d rows of length dh
-            for r in 0..d {
-                let row_base = r * dh;
-                for c in 0..dh {
-                    z_buf[c] = alpha_t * log_w2_prev[lw2_base + row_base + c]
-                             - theta_t * grad_w2[row_base + c];
-                }
-                softmax_f32(&z_buf[..dh], &mut softmax_buf[..dh], 1, dh);
-                w2_next[row_base..row_base + dh].copy_from_slice(&softmax_buf[..dh]);
-            }
+            kl_apply_retention_inplace(
+                w2_t, &grad_w2, alpha_t, theta_t, d, dh,
+                &mut kl_out_buf, &mut kl_log_buf, &mut kl_z_buf,
+            );
+            w2_next.copy_from_slice(&kl_out_buf[..w2_size]);
         }
 
         let cache = MEMORACache {

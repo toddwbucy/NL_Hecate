@@ -32,6 +32,7 @@ use crate::tensor::{
     silu_prime_f32,
     normalized_silu_f32,
 };
+use crate::retention::l2_apply_retention;
 use crate::model::MemoryLevelParams;
 use crate::delta_rule::{MemoryRule, MemoryState, Gates, MemoryError};
 
@@ -180,6 +181,10 @@ impl MemoryRule for Trellis {
         let mut error_v = vec![0.0f32; seq_len * d];
         let mut y = vec![0.0f32; seq_len * d];
 
+        // Scratch buffers reused across token loop (avoid per-iteration allocs)
+        let mut sk_grad = vec![0.0f32; sk_size];
+        let mut sv_grad = vec![0.0f32; sv_size];
+
         for t in 0..seq_len {
             let x_t = &embedded[t * d..(t + 1) * d];
             let k_t = &k_mem[t * d..(t + 1) * d];
@@ -260,12 +265,19 @@ impl MemoryRule for Trellis {
             let alpha_t = alpha[t];
             let theta_t = theta[t];
 
+            // Compute grad from S_K_t before retention decay (reuse scratch buffer)
+            sk_grad.fill(0.0);
             for i in 0..d_k {
                 for j in 0..d {
-                    let grad = error_k[t * d_k + i] * x_t[j] + self.lambda_k * sk_states[sk_t_off + i * d + j];
-                    sk_states[sk_next_off + i * d + j] =
-                        (1.0 - alpha_t) * sk_states[sk_t_off + i * d + j] - theta_t * grad;
+                    sk_grad[i * d + j] = error_k[t * d_k + i] * x_t[j] + self.lambda_k * sk_states[sk_t_off + i * d + j];
                 }
+            }
+            // Apply retention: S_K_{t+1} = (1 - alpha_t) * S_K_t
+            sk_states.copy_within(sk_t_off..sk_t_off + sk_size, sk_next_off);
+            l2_apply_retention(&mut sk_states[sk_next_off..sk_next_off + sk_size], 1.0 - alpha_t);
+            // Subtract learning rate * gradient
+            for i in 0..sk_size {
+                sk_states[sk_next_off + i] -= theta_t * sk_grad[i];
             }
 
             // ── ADVANCE Pass 2: Value Compression ──
@@ -305,12 +317,19 @@ impl MemoryRule for Trellis {
             // S_V_{t+1} = (1 - alpha_t) * S_V_t - theta_t * grad_S_V
             let sv_next_off = (t + 1) * sv_size;
 
+            // Compute grad from S_V_t before retention decay (reuse scratch buffer)
+            sv_grad.fill(0.0);
             for i in 0..d {
                 for j in 0..d_k {
-                    let grad = error_v[t * d + i] * ck_out[j] + self.lambda_v * sv_states[sv_t_off + i * d_k + j];
-                    sv_states[sv_next_off + i * d_k + j] =
-                        (1.0 - alpha_t) * sv_states[sv_t_off + i * d_k + j] - theta_t * grad;
+                    sv_grad[i * d_k + j] = error_v[t * d + i] * ck_out[j] + self.lambda_v * sv_states[sv_t_off + i * d_k + j];
                 }
+            }
+            // Apply retention: S_V_{t+1} = (1 - alpha_t) * S_V_t
+            sv_states.copy_within(sv_t_off..sv_t_off + sv_size, sv_next_off);
+            l2_apply_retention(&mut sv_states[sv_next_off..sv_next_off + sv_size], 1.0 - alpha_t);
+            // Subtract learning rate * gradient
+            for i in 0..sv_size {
+                sv_states[sv_next_off + i] -= theta_t * sv_grad[i];
             }
         }
 

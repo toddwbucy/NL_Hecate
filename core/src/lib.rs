@@ -13,6 +13,7 @@ pub mod yaad;
 pub mod memora;
 pub mod lattice_osr;
 pub mod trellis;
+pub mod retention;
 pub mod mag;
 pub mod mal;
 pub mod mac;

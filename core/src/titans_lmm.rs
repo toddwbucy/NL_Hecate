@@ -23,6 +23,7 @@ use crate::tensor::{
     matmul_f32, transpose_f32, sigmoid_f32, softplus_f32,
     outer_product_f32, frobenius_dot_f32,
 };
+use crate::retention::l2_apply_retention;
 use crate::model::MemoryLevelParams;
 use crate::delta_rule::{MemoryRule, MemoryState, Gates, MemoryError};
 
@@ -204,17 +205,19 @@ impl MemoryRule for TitansLMM {
             let theta_t = theta[t];
             let s_t_off = t * d * d;
             let s_next_off = (t + 1) * d * d;
+            s_states.copy_within(s_t_off..s_t_off + d * d, s_next_off);
+            l2_apply_retention(&mut s_states[s_next_off..s_next_off + d * d], eta_t);
             for i in 0..(d * d) {
-                s_states[s_next_off + i] = eta_t * s_states[s_t_off + i]
-                    - theta_t * grad_outer[g_base + i];
+                s_states[s_next_off + i] -= theta_t * grad_outer[g_base + i];
             }
 
             // M_{t+1} = (1-alpha_t) * M_t + S_{t+1}  (memory update with momentum)
-            let retention = 1.0 - alpha[t];
             let m_next_off = (t + 1) * d * d;
+            let m_t_off = t * d * d;
+            m_states.copy_within(m_t_off..m_t_off + d * d, m_next_off);
+            l2_apply_retention(&mut m_states[m_next_off..m_next_off + d * d], 1.0 - alpha[t]);
             for i in 0..(d * d) {
-                m_states[m_next_off + i] = retention * m_states[t * d * d + i]
-                    + s_states[s_next_off + i];
+                m_states[m_next_off + i] += s_states[s_next_off + i];
             }
 
             // y_t = M_{t+1} @ q_t
@@ -300,11 +303,8 @@ impl MemoryRule for TitansLMM {
 
             let d_alpha_scalar = -frobenius_dot_f32(&d_m, m_t);
 
-            let retention = 1.0 - alpha_t;
-            let mut d_m_prev = vec![0.0f32; d * d];
-            for i in 0..(d * d) {
-                d_m_prev[i] = retention * d_m[i];
-            }
+            let mut d_m_prev = d_m.clone();
+            l2_apply_retention(&mut d_m_prev, 1.0 - alpha_t);
 
             // ── S_{t+1} = eta * S_t - theta * grad backward ──
             let d_eta_scalar = frobenius_dot_f32(s_t, &d_s);
@@ -317,10 +317,8 @@ impl MemoryRule for TitansLMM {
             }
 
             // d_S_prev = eta * d_S (propagate to previous step)
-            let mut d_s_prev = vec![0.0f32; d * d];
-            for i in 0..(d * d) {
-                d_s_prev[i] = eta_t * d_s[i];
-            }
+            let mut d_s_prev = d_s.clone();
+            l2_apply_retention(&mut d_s_prev, eta_t);
 
             // ── grad = outer(error, k) backward ──
             let mut d_err = vec![0.0f32; d];

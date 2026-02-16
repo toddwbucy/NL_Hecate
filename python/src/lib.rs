@@ -9,6 +9,7 @@ use pyo3::types::PyDict;
 
 use nl_hecate_core::model::{SWAConfig as RustConfig, SWAParams as RustParams};
 use nl_hecate_core::model::{MAGConfig as RustMAGConfig, MAGParams as RustMAGParams, MemoryRuleKind, CompositionKind};
+use nl_hecate_core::retention::{RetentionKind, default_retention};
 use nl_hecate_core::forward::{forward as rust_forward, ForwardCache as RustCache};
 use nl_hecate_core::backward::backward_full as rust_backward_full;
 use nl_hecate_core::gradient::compute_gradients as rust_compute_gradients;
@@ -194,6 +195,7 @@ impl MAGConfig {
         k=1, chunk_sizes=None, memory_rule="delta", composition="mag",
         d_hidden=None, lp_p=None, lq_q=None, lambda_local=None, lambda_2=None,
         delta=None, m_slots=None, d_compress=None, lambda_k=None, lambda_v=None,
+        retention=None,
     ))]
     fn new(
         d_model: usize,
@@ -217,6 +219,7 @@ impl MAGConfig {
         d_compress: Option<usize>,
         lambda_k: Option<f32>,
         lambda_v: Option<f32>,
+        retention: Option<&str>,
     ) -> PyResult<Self> {
         if d_model != num_heads * head_dim {
             return Err(PyValueError::new_err(format!(
@@ -260,6 +263,18 @@ impl MAGConfig {
                 "Unknown memory_rule '{memory_rule}'. Expected: delta, titans, hebbian, moneta, yaad, memora, lattice, trellis"
             ))),
         };
+        let ret_kind = match retention {
+            Some(s) => match s.to_lowercase().as_str() {
+                "l2" | "l2_weight_decay" => RetentionKind::L2WeightDecay,
+                "kl" | "kl_divergence" => RetentionKind::KLDivergence,
+                "elastic_net" | "elastic" => RetentionKind::ElasticNet,
+                "sphere" | "sphere_normalization" => RetentionKind::SphereNormalization,
+                _ => return Err(PyValueError::new_err(format!(
+                    "Unknown retention '{s}'. Expected: l2, kl, elastic_net, sphere"
+                ))),
+            },
+            None => default_retention(rule),
+        };
         Ok(MAGConfig {
             inner: RustMAGConfig {
                 swa: RustConfig {
@@ -286,6 +301,7 @@ impl MAGConfig {
                 lambda_k: lambda_k.unwrap_or(0.0),
                 lambda_v: lambda_v.unwrap_or(0.0),
                 parallel: None,
+                retention: ret_kind,
             },
         })
     }
@@ -388,6 +404,7 @@ impl MAGForwardCache {
     k=1, chunk_sizes=None, memory_rule="delta", composition="mag",
     d_hidden=None, lp_p=None, lq_q=None, lambda_local=None, lambda_2=None,
     delta=None, m_slots=None, d_compress=None, lambda_k=None, lambda_v=None,
+    retention=None,
 ))]
 fn mag_create_config(
     d_model: usize,
@@ -411,11 +428,13 @@ fn mag_create_config(
     d_compress: Option<usize>,
     lambda_k: Option<f32>,
     lambda_v: Option<f32>,
+    retention: Option<&str>,
 ) -> PyResult<MAGConfig> {
     MAGConfig::new(
         d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled,
         k, chunk_sizes, memory_rule, composition,
         d_hidden, lp_p, lq_q, lambda_local, lambda_2, delta, m_slots, d_compress, lambda_k, lambda_v,
+        retention,
     )
 }
 

@@ -2,7 +2,7 @@
 
 **Spec-first Rust implementation of the Nested Learning research program**
 
-Stage 0-2 complete | ~936 tests | Apache 2.0
+Stage 0-2 complete, Stage 3 in progress | ~921 tests | Apache 2.0
 
 ---
 
@@ -43,7 +43,7 @@ Every memory update rule is specified by four orthogonal choices:
 |------|---------|
 | **Memory Structure** | vector, d x d matrix, 2-layer MLP |
 | **Attentional Bias** | L2, dot-product, Huber, l_p |
-| **Retention** | L2 decay, KL divergence, elastic net, sphere normalization |
+| **Retention** | L2 decay, KL divergence, elastic net, sphere normalization (all pluggable via `RetentionKind`) |
 | **Algorithm** | GD, GD+momentum, Newton-Schulz, FTRL |
 
 Eight named variants implement specific knob combinations: **Titans LMM**, **Delta Rule**, **Hebbian**, **MONETA**, **YAAD**, **MEMORA**, **Lattice OSR**, **Trellis**.
@@ -75,7 +75,7 @@ Eight named variants implement specific knob combinations: **Titans LMM**, **Del
 | **Stage 0** | Foundation — Enzyme spike, SWA pipeline, Delta Rule + MAG | 202 | Complete |
 | **Stage 1** | Algorithm Core — all 8 Miras rules, 3 compositions, CMS k=1/2/4, 5 parallelization strategies, ContextStream, 100K stability sweep, PyO3 bindings | 805 | Complete |
 | **Stage 2** | Production Infra — CUDA kernel pairs, multi-GPU sync, serving, edge deployment, architecture dispatch | ~131 | Complete |
-| **Stage 3** | Extensions — pluggable retention, M3 optimizer, CMS variants | — | Not started |
+| **Stage 3** | Extensions — pluggable retention (done), M3 optimizer, CMS variants | 22 | In progress (1/5) |
 
 See [ROADMAP.md](ROADMAP.md) for per-milestone detail and [PROGRESS_REPORT.md](PROGRESS_REPORT.md) for the executive summary.
 
@@ -137,7 +137,7 @@ NL_Hecate/
 │   ├── infrastructure/       #   Enzyme AD, scheduling, distribution, serving
 │   └── constraints/          #   48 code smell constraints (CS-01 through CS-48)
 ├── core/                     # Rust core crate (nl-hecate-core)
-│   ├── src/                  #   30 modules: rules, compositions, CMS, dispatch, ...
+│   ├── src/                  #   31 modules: rules, compositions, retention, CMS, dispatch, ...
 │   ├── kernels/              #   8 CUDA kernels (4 forward + 4 backward)
 │   ├── tests/                #   Integration test suites
 │   └── benches/              #   Criterion benchmarks (edge throughput)
