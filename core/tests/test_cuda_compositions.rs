@@ -7,6 +7,9 @@
 
 #![cfg(feature = "cuda")]
 
+mod cuda_test_utils;
+use cuda_test_utils::check_close;
+
 use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind};
 use nl_hecate_core::mag::{mag_forward, mag_backward, MemoryCache, cms_forward};
 use nl_hecate_core::mal::mal_forward;
@@ -14,22 +17,6 @@ use nl_hecate_core::conductor::{Conductor, ContextState};
 use nl_hecate_core::dispatch::{
     delta_forward_dispatch, titans_forward_dispatch, hebbian_forward_dispatch,
 };
-
-fn check_close(name: &str, a: &[f32], b: &[f32], tol: f32) {
-    assert_eq!(a.len(), b.len(), "{name}: length mismatch {} vs {}", a.len(), b.len());
-    let mut max_diff = 0.0f32;
-    let mut max_idx = 0;
-    for i in 0..a.len() {
-        let diff = (a[i] - b[i]).abs();
-        if diff > max_diff { max_diff = diff; max_idx = i; }
-    }
-    assert!(
-        max_diff < tol,
-        "{name}: max diff {max_diff:.6e} at idx {max_idx} (a={:.6e}, b={:.6e}), tol={tol:.0e}",
-        a[max_idx], b[max_idx]
-    );
-    eprintln!("  {name}: max_diff={max_diff:.6e} (tol={tol:.0e}) ✓");
-}
 
 fn make_test_data(cfg: &MAGConfig) -> (Vec<usize>, Vec<usize>) {
     let input_ids: Vec<usize> = (0..cfg.swa.seq_len).collect();

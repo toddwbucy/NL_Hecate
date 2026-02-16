@@ -987,37 +987,37 @@ fn cuda_delta_forward(
     seq_len: usize, d: usize,
 ) {
     let dd = d * d;
-    let d_km = DevBuf::new(seq_len * d);
-    let d_vm = DevBuf::new(seq_len * d);
-    let d_qm = DevBuf::new(seq_len * d);
-    let d_alpha = DevBuf::new(seq_len);
-    let d_theta = DevBuf::new(seq_len);
-    let d_minit = DevBuf::new(dd);
-    let d_mstates = DevBuf::new((seq_len + 1) * dd);
-    let d_y = DevBuf::new(seq_len * d);
+    let dev_km = DevBuf::new(seq_len * d);
+    let dev_vm = DevBuf::new(seq_len * d);
+    let dev_qm = DevBuf::new(seq_len * d);
+    let dev_alpha = DevBuf::new(seq_len);
+    let dev_theta = DevBuf::new(seq_len);
+    let dev_minit = DevBuf::new(dd);
+    let dev_mstates = DevBuf::new((seq_len + 1) * dd);
+    let dev_y = DevBuf::new(seq_len * d);
 
-    d_km.copy_from_host(k_mem);
-    d_vm.copy_from_host(v_mem);
-    d_qm.copy_from_host(q_mem);
-    d_alpha.copy_from_host(alpha);
-    d_theta.copy_from_host(theta);
-    d_minit.copy_from_host(m_initial);
-    d_mstates.zero();
-    d_y.zero();
+    dev_km.copy_from_host(k_mem);
+    dev_vm.copy_from_host(v_mem);
+    dev_qm.copy_from_host(q_mem);
+    dev_alpha.copy_from_host(alpha);
+    dev_theta.copy_from_host(theta);
+    dev_minit.copy_from_host(m_initial);
+    dev_mstates.zero();
+    dev_y.zero();
 
     unsafe {
         crate::cuda_ffi::delta_forward_f32_cuda(
-            d_km.ptr, d_vm.ptr, d_qm.ptr,
-            d_alpha.ptr, d_theta.ptr, d_minit.ptr,
-            d_mstates.ptr, d_y.ptr,
+            dev_km.ptr, dev_vm.ptr, dev_qm.ptr,
+            dev_alpha.ptr, dev_theta.ptr, dev_minit.ptr,
+            dev_mstates.ptr, dev_y.ptr,
             seq_len as i32, d as i32,
         );
         let rc = cudaDeviceSynchronize();
         assert_eq!(rc, 0, "cudaDeviceSynchronize failed after delta forward (error {rc})");
     }
 
-    d_mstates.copy_to_host(m_states);
-    d_y.copy_to_host(y);
+    dev_mstates.copy_to_host(m_states);
+    dev_y.copy_to_host(y);
 }
 
 #[cfg(feature = "cuda")]
