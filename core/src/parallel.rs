@@ -184,7 +184,7 @@ pub fn supported_strategies(rule: MemoryRuleKind) -> &'static [&'static str] {
         MemoryRuleKind::TitansLMM => &["sequential", "chunkwise_gd", "associative_scan_partial", "tnt"],
         MemoryRuleKind::LatticeOSR => &["sequential", "chunkwise_gd", "tnt", "lattice_gla"],
         MemoryRuleKind::Trellis => &["sequential", "chunkwise_gd", "tnt", "lattice_gla"],
-        MemoryRuleKind::AtlasOmega => &["sequential", "atlas_parallel"],
+        MemoryRuleKind::AtlasOmega => &["sequential", "chunkwise_gd", "tnt", "atlas_parallel"],
         // DeltaRule, MONETA, YAAD, MEMORA
         _ => &["sequential", "chunkwise_gd", "tnt"],
     }

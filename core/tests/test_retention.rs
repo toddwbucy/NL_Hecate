@@ -76,6 +76,7 @@ fn test_default_retention_all_rules() {
     assert_eq!(default_retention(MemoryRuleKind::Moneta), RetentionKind::L2WeightDecay);
     assert_eq!(default_retention(MemoryRuleKind::YAAD), RetentionKind::L2WeightDecay);
     assert_eq!(default_retention(MemoryRuleKind::Trellis), RetentionKind::L2WeightDecay);
+    assert_eq!(default_retention(MemoryRuleKind::AtlasOmega), RetentionKind::L2WeightDecay);
     assert_eq!(default_retention(MemoryRuleKind::MEMORA), RetentionKind::KLDivergence);
     assert_eq!(default_retention(MemoryRuleKind::LatticeOSR), RetentionKind::SphereNormalization);
 }

@@ -326,7 +326,7 @@ impl MAGConfig {
             "trellis" => MemoryRuleKind::Trellis,
             "atlas" | "atlas_omega" => MemoryRuleKind::AtlasOmega,
             _ => return Err(PyValueError::new_err(format!(
-                "Unknown memory_rule '{memory_rule}'. Expected: delta, titans, hebbian, moneta, yaad, memora, lattice, trellis, atlas"
+                "Unknown memory_rule '{memory_rule}'. Expected: delta, titans, hebbian, moneta, yaad, memora, lattice, trellis, atlas, atlas_omega"
             ))),
         };
         let ret_kind = match retention {

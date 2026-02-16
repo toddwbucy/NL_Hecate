@@ -105,10 +105,13 @@ fn extract_final_state(cache: &MemoryCache, seq_len: usize, d: usize, cfg: &MAGC
     }
 }
 
-/// Extract the final momentum state from a Titans cache (for boundary propagation).
+/// Extract the final momentum state from a Titans/Atlas cache (for boundary propagation).
 fn extract_final_momentum(cache: &MemoryCache, seq_len: usize, d: usize) -> Option<Vec<f32>> {
     match cache {
         MemoryCache::Titans(c) => {
+            Some(c.s_states[seq_len * d * d..(seq_len + 1) * d * d].to_vec())
+        }
+        MemoryCache::Atlas(c) => {
             Some(c.s_states[seq_len * d * d..(seq_len + 1) * d * d].to_vec())
         }
         _ => None,

@@ -598,11 +598,12 @@ fn test_spike_multi_config_diagnostic() {
 //
 // MAC requires window_size >= 2*seq_len. k=4 gets more steps (Level 3 fires at 512).
 
-/// All 8 memory rules.
+/// All 9 memory rules.
 const ALL_RULES: &[MemoryRuleKind] = &[
     MemoryRuleKind::DeltaRule,
     MemoryRuleKind::TitansLMM,
     MemoryRuleKind::HebbianRule,
+    MemoryRuleKind::AtlasOmega,
     MemoryRuleKind::Moneta,
     MemoryRuleKind::YAAD,
     MemoryRuleKind::MEMORA,

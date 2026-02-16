@@ -289,7 +289,7 @@ fn matmul_t_a(a: &[f32], b: &[f32], d: usize) -> Vec<f32> {
 /// Flatten all MAGParams weight vectors into a single contiguous Vec<f32>.
 ///
 /// Order: SWA (embed, q, k, v, o, unembed) then each level
-/// (k_mem, v_mem, q_mem, alpha, b_alpha, theta, b_theta, eta, b_eta).
+/// (k_mem, v_mem, q_mem, alpha, b_alpha, theta, b_theta, eta, b_eta, w_omega).
 pub fn flatten_mag_params(params: &MAGParams) -> Vec<f32> {
     let mut flat = Vec::with_capacity(params.num_params());
 

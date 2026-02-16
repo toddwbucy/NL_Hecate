@@ -423,7 +423,7 @@ pub fn hebbian_scan_backward(
         b_theta: vec![],
         w_eta: vec![],
         b_eta: vec![],
-        w_omega: vec![],
+        w_omega: vec![0.0f32; level_params.w_omega.len()],
     };
 
     (grads, d_embedded)
