@@ -101,6 +101,7 @@ pub fn l2_decoupled_gradient(
     lambda_local: f32,
     lambda_2: f32,
 ) -> Vec<f32> {
+    debug_assert_eq!(w.len(), w_boundary.len());
     let ll2 = 2.0 * lambda_local;
     let lg2 = 2.0 * lambda_2;
     w.iter()
