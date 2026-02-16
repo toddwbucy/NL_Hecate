@@ -4,6 +4,7 @@
 /// All weight matrices are flat Vec<f32> in row-major layout.
 
 use crate::tensor::SimpleRng;
+use crate::parallel::ParallelConfig;
 
 /// Which composition pattern to use (Titans Section 4).
 ///
@@ -325,6 +326,8 @@ pub struct MAGConfig {
     pub lambda_k: f32,
     /// Value state L2 decay rate for Trellis (default: 0.0).
     pub lambda_v: f32,
+    /// Parallelization config. None = sequential (backward compatible).
+    pub parallel: Option<ParallelConfig>,
 }
 
 /// Default gate bias init values per level index.
@@ -383,6 +386,7 @@ impl MAGConfig {
             k: 1,
             chunk_sizes: vec![1],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            parallel: None,
         }
     }
 
@@ -403,6 +407,7 @@ impl MAGConfig {
             k: 2,
             chunk_sizes: vec![1, 8],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            parallel: None,
         }
     }
 
@@ -423,6 +428,7 @@ impl MAGConfig {
             k: 1,
             chunk_sizes: vec![1],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            parallel: None,
         }
     }
 
@@ -444,6 +450,7 @@ impl MAGConfig {
             k: 2,
             chunk_sizes: vec![1, 8],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            parallel: None,
         }
     }
 
@@ -465,6 +472,7 @@ impl MAGConfig {
             k: 4,
             chunk_sizes: vec![1, 8, 64, 512],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            parallel: None,
         }
     }
 
@@ -486,6 +494,7 @@ impl MAGConfig {
             k: 4,
             chunk_sizes: vec![1, 8, 64, 512],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            parallel: None,
         }
     }
 
@@ -506,6 +515,7 @@ impl MAGConfig {
             k: 1,
             chunk_sizes: vec![1],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            parallel: None,
         }
     }
 
@@ -526,6 +536,7 @@ impl MAGConfig {
             k: 1,
             chunk_sizes: vec![1],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            parallel: None,
         }
     }
 
@@ -546,6 +557,7 @@ impl MAGConfig {
             k: 2,
             chunk_sizes: vec![1, 8],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            parallel: None,
         }
     }
 
@@ -566,6 +578,7 @@ impl MAGConfig {
             k: 2,
             chunk_sizes: vec![1, 8],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            parallel: None,
         }
     }
 
@@ -595,6 +608,7 @@ impl MAGConfig {
             d_compress: 0,
             lambda_k: 0.0,
             lambda_v: 0.0,
+            parallel: None,
         }
     }
 
@@ -624,6 +638,7 @@ impl MAGConfig {
             d_compress: 0,
             lambda_k: 0.0,
             lambda_v: 0.0,
+            parallel: None,
         }
     }
 
@@ -653,6 +668,7 @@ impl MAGConfig {
             d_compress: 0,
             lambda_k: 0.0,
             lambda_v: 0.0,
+            parallel: None,
         }
     }
 
@@ -682,6 +698,7 @@ impl MAGConfig {
             d_compress: 0,
             lambda_k: 0.0,
             lambda_v: 0.0,
+            parallel: None,
         }
     }
 
@@ -711,6 +728,7 @@ impl MAGConfig {
             d_compress: 0,
             lambda_k: 0.0,
             lambda_v: 0.0,
+            parallel: None,
         }
     }
 
@@ -740,6 +758,7 @@ impl MAGConfig {
             d_compress: 0,
             lambda_k: 0.0,
             lambda_v: 0.0,
+            parallel: None,
         }
     }
 
@@ -761,6 +780,7 @@ impl MAGConfig {
             chunk_sizes: vec![1],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
             m_slots: 4, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            parallel: None,
         }
     }
 
@@ -782,6 +802,7 @@ impl MAGConfig {
             chunk_sizes: vec![1, 8],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
             m_slots: 4, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            parallel: None,
         }
     }
 
@@ -806,6 +827,7 @@ impl MAGConfig {
             d_compress: 8,
             lambda_k: 0.01,
             lambda_v: 0.01,
+            parallel: None,
         }
     }
 
@@ -830,6 +852,7 @@ impl MAGConfig {
             d_compress: 8,
             lambda_k: 0.01,
             lambda_v: 0.01,
+            parallel: None,
         }
     }
 
@@ -850,6 +873,7 @@ impl MAGConfig {
             k: 1,
             chunk_sizes: vec![1],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            parallel: None,
         }
     }
 
@@ -870,6 +894,7 @@ impl MAGConfig {
             k: 2,
             chunk_sizes: vec![1, 8],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            parallel: None,
         }
     }
 
@@ -891,6 +916,7 @@ impl MAGConfig {
             k: 1,
             chunk_sizes: vec![1],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            parallel: None,
         }
     }
 
@@ -911,6 +937,7 @@ impl MAGConfig {
             k: 2,
             chunk_sizes: vec![1, 8],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            parallel: None,
         }
     }
 }

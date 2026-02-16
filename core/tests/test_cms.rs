@@ -203,6 +203,7 @@ fn test_k2_beats_k1() {
         k: 1, chunk_sizes: vec![1],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
+        parallel: None,
     };
     // k=2 config
     let cfg_k2 = MAGConfig {
@@ -211,6 +212,7 @@ fn test_k2_beats_k1() {
         k: 2, chunk_sizes: vec![1, 8],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
+        parallel: None,
     };
 
     let input_ids: Vec<usize> = (0..swa.seq_len).map(|t| t % swa.vocab_size).collect();
@@ -384,6 +386,7 @@ fn test_k4_vs_k2_multiscale() {
         k: 2, chunk_sizes: vec![1, 8],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
+        parallel: None,
     };
     let cfg_k4 = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
@@ -391,6 +394,7 @@ fn test_k4_vs_k2_multiscale() {
         k: 4, chunk_sizes: vec![1, 8, 64, 512],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
+        parallel: None,
     };
 
     let slow_period = 8;
@@ -475,6 +479,7 @@ fn test_k4_diagnostics() {
         chunk_sizes: vec![1, 8, 64, 512],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
+        parallel: None,
     };
 
     let (input_ids, target_ids) = make_multiscale_data(
@@ -737,6 +742,7 @@ fn test_cms_stability_boundary() {
         k: 1, chunk_sizes: vec![1],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
+        parallel: None,
     };
     let cfg_k2 = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
@@ -744,6 +750,7 @@ fn test_cms_stability_boundary() {
         k: 2, chunk_sizes: vec![1, 8],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
+        parallel: None,
     };
 
     let slow_period = 8;
@@ -925,6 +932,7 @@ fn test_k4_normalization_magnitude() {
         k: 4, chunk_sizes: vec![1, 8, 64, 512],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
+        parallel: None,
     };
     let params_k4 = MAGParams::init(&cfg_k4, 42);
     let mut context = ContextState::new(cfg_k4.k, cfg_k4.swa.d_model);
@@ -985,6 +993,7 @@ fn test_k4_uniform_init_stable() {
         k: 4, chunk_sizes: vec![1, 8, 64, 512],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
+        parallel: None,
     };
 
     let (input_ids, target_ids) = make_multiscale_data(
@@ -1031,6 +1040,7 @@ fn test_k4_normalized_stable() {
         k: 4, chunk_sizes: vec![1, 8, 64, 512],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
+        parallel: None,
     };
 
     let (input_ids, target_ids) = make_multiscale_data(

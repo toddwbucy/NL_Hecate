@@ -285,6 +285,7 @@ impl MAGConfig {
                 d_compress: d_compress.unwrap_or(0),
                 lambda_k: lambda_k.unwrap_or(0.0),
                 lambda_v: lambda_v.unwrap_or(0.0),
+                parallel: None,
             },
         })
     }

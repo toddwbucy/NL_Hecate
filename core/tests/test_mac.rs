@@ -199,6 +199,7 @@ fn test_mac_vs_mag() {
         k: 1, chunk_sizes: vec![1],
         d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
         composition: CompositionKind::MAG,
+        parallel: None,
     };
     let cfg_mac = MAGConfig {
         swa: swa_mac, memory_enabled: true,
@@ -206,6 +207,7 @@ fn test_mac_vs_mag() {
         k: 1, chunk_sizes: vec![1],
         d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
         composition: CompositionKind::MAC,
+        parallel: None,
     };
 
     let seq_len = 8;

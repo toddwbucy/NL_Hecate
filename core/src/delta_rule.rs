@@ -162,7 +162,9 @@ impl MemoryRule for DeltaRule {
 
     fn level(&self) -> usize { 0 }
 
-    fn supported_parallelization(&self) -> &'static [&'static str] { &["sequential"] }
+    fn supported_parallelization(&self) -> &'static [&'static str] {
+        crate::parallel::supported_strategies(crate::model::MemoryRuleKind::DeltaRule)
+    }
 
     fn init(&self, d: usize) -> MemoryState {
         MemoryState { m: vec![0.0f32; d * d], d }
@@ -750,7 +752,10 @@ mod tests {
     fn test_delta_level_and_parallelization() {
         let rule = DeltaRule;
         assert_eq!(rule.level(), 0);
-        assert_eq!(rule.supported_parallelization(), &["sequential"]);
+        let strategies = rule.supported_parallelization();
+        assert!(strategies.contains(&"sequential"));
+        assert!(strategies.contains(&"chunkwise_gd"));
+        assert!(strategies.contains(&"tnt"));
     }
 
     // ── Read-only tests ──────────────────────────────────────────────

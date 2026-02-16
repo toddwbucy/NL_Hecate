@@ -87,6 +87,7 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
         d_compress,
         lambda_k,
         lambda_v,
+        parallel: None,
     }
 }
 

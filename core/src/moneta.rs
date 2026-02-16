@@ -93,7 +93,9 @@ impl MemoryRule for Moneta {
 
     fn level(&self) -> usize { 0 }
 
-    fn supported_parallelization(&self) -> &'static [&'static str] { &["sequential"] }
+    fn supported_parallelization(&self) -> &'static [&'static str] {
+        crate::parallel::supported_strategies(crate::model::MemoryRuleKind::Moneta)
+    }
 
     fn init(&self, d: usize) -> MemoryState {
         // For API compatibility — actual MONETA state is W1+W2, not a d×d matrix.
@@ -972,7 +974,10 @@ mod tests {
     fn test_moneta_level_and_parallelization() {
         let rule = Moneta { d_hidden: 4, lp_p: 2.0, lambda_2: 0.01 };
         assert_eq!(rule.level(), 0);
-        assert_eq!(rule.supported_parallelization(), &["sequential"]);
+        let strategies = rule.supported_parallelization();
+        assert!(strategies.contains(&"sequential"));
+        assert!(strategies.contains(&"chunkwise_gd"));
+        assert!(strategies.contains(&"tnt"));
     }
 
     // ── Read-only tests ──────────────────────────────────────────────

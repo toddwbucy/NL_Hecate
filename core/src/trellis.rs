@@ -99,7 +99,9 @@ impl MemoryRule for Trellis {
     type Cache = TrellisCache;
 
     fn level(&self) -> usize { 0 }
-    fn supported_parallelization(&self) -> &'static [&'static str] { &["sequential"] }
+    fn supported_parallelization(&self) -> &'static [&'static str] {
+        crate::parallel::supported_strategies(crate::model::MemoryRuleKind::Trellis)
+    }
 
     fn init(&self, d: usize) -> MemoryState {
         // Trellis uses two matrices, but MemoryState only has one flat vec.
@@ -1046,7 +1048,11 @@ mod tests {
     fn test_trellis_level_and_parallelization() {
         let rule = Trellis { d_k: 8, lambda_k: 0.01, lambda_v: 0.01 };
         assert_eq!(rule.level(), 0);
-        assert_eq!(rule.supported_parallelization(), &["sequential"]);
+        let strategies = rule.supported_parallelization();
+        assert!(strategies.contains(&"sequential"));
+        assert!(strategies.contains(&"chunkwise_gd"));
+        assert!(strategies.contains(&"tnt"));
+        assert!(strategies.contains(&"lattice_gla"));
     }
 
     // ── Read-only tests ──────────────────────────────────────────────
