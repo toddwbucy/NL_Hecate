@@ -130,7 +130,8 @@ fn context_memory_size(cfg: &MAGConfig) -> usize {
     match cfg.memory_rule {
         MemoryRuleKind::DeltaRule
         | MemoryRuleKind::TitansLMM
-        | MemoryRuleKind::HebbianRule => d * d,
+        | MemoryRuleKind::HebbianRule
+        | MemoryRuleKind::AtlasOmega => d * d,
         MemoryRuleKind::Moneta
         | MemoryRuleKind::YAAD
         | MemoryRuleKind::MEMORA => {
@@ -644,7 +645,8 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
         match rule {
             MemoryRuleKind::DeltaRule
             | MemoryRuleKind::TitansLMM
-            | MemoryRuleKind::HebbianRule => {
+            | MemoryRuleKind::HebbianRule
+            | MemoryRuleKind::AtlasOmega => {
                 (0, 2.0, 2.0, 0.0, 0.0, 1.0, 0, 0, 0.0, 0.0)
             }
             MemoryRuleKind::Moneta => {
@@ -701,7 +703,8 @@ fn rule_family(rule: &MemoryRuleKind) -> &'static str {
     match rule {
         MemoryRuleKind::DeltaRule
         | MemoryRuleKind::TitansLMM
-        | MemoryRuleKind::HebbianRule => "matrix",
+        | MemoryRuleKind::HebbianRule
+        | MemoryRuleKind::AtlasOmega => "matrix",
         MemoryRuleKind::Moneta
         | MemoryRuleKind::YAAD
         | MemoryRuleKind::MEMORA => "mlp",

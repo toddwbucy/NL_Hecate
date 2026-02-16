@@ -18,6 +18,7 @@ use crate::yaad::{YAAD, yaad_read_only, yaad_read_only_backward};
 use crate::memora::{MEMORA, memora_read_only, memora_read_only_backward};
 use crate::lattice_osr::{LatticeOSR, lattice_read_only, lattice_read_only_backward};
 use crate::trellis::{Trellis, trellis_read_only, trellis_read_only_backward};
+use crate::atlas_omega::AtlasOmega;
 use crate::conductor::{Pulse, ContextState, ErrorBuffer};
 use crate::mag::MemoryCache;
 
@@ -134,6 +135,10 @@ fn step_dispatch(
             let (y, c) = rule.step(level_params, input, s, d, initial_m);
             (y, MemoryCache::Trellis(c))
         }
+        MemoryRuleKind::AtlasOmega => {
+            let (y, c) = AtlasOmega.step(level_params, input, s, d, initial_m);
+            (y, MemoryCache::Atlas(c))
+        }
     }
 }
 
@@ -169,6 +174,7 @@ fn step_backward_dispatch(
             let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
             rule.step_backward(level_params, c, d_y, input)
         }
+        MemoryCache::Atlas(c) => AtlasOmega.step_backward(level_params, c, d_y, input),
     }
 }
 

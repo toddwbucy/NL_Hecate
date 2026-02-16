@@ -312,6 +312,7 @@ pub fn flatten_mag_params(params: &MAGParams) -> Vec<f32> {
         flat.extend_from_slice(&level.b_theta);
         flat.extend_from_slice(&level.w_eta);
         flat.extend_from_slice(&level.b_eta);
+        flat.extend_from_slice(&level.w_omega);
     }
 
     flat
@@ -354,6 +355,7 @@ pub fn unflatten_to_mag_grads(flat: &[f32], template: &MAGParams) -> MAGParams {
             b_theta: take(flat, &mut offset, tl.b_theta.len()),
             w_eta: take(flat, &mut offset, tl.w_eta.len()),
             b_eta: take(flat, &mut offset, tl.b_eta.len()),
+            w_omega: take(flat, &mut offset, tl.w_omega.len()),
         });
     }
 

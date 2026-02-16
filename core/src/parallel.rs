@@ -173,7 +173,7 @@ pub fn strategy_supported(rule: MemoryRuleKind, strategy: ParallelStrategy) -> b
             rule,
             MemoryRuleKind::LatticeOSR | MemoryRuleKind::Trellis
         ),
-        ParallelStrategy::AtlasParallel => false, // Atlas Omega not yet implemented
+        ParallelStrategy::AtlasParallel => matches!(rule, MemoryRuleKind::AtlasOmega),
     }
 }
 
@@ -184,6 +184,7 @@ pub fn supported_strategies(rule: MemoryRuleKind) -> &'static [&'static str] {
         MemoryRuleKind::TitansLMM => &["sequential", "chunkwise_gd", "associative_scan_partial", "tnt"],
         MemoryRuleKind::LatticeOSR => &["sequential", "chunkwise_gd", "tnt", "lattice_gla"],
         MemoryRuleKind::Trellis => &["sequential", "chunkwise_gd", "tnt", "lattice_gla"],
+        MemoryRuleKind::AtlasOmega => &["sequential", "atlas_parallel"],
         // DeltaRule, MONETA, YAAD, MEMORA
         _ => &["sequential", "chunkwise_gd", "tnt"],
     }
@@ -240,6 +241,7 @@ mod tests {
             MemoryRuleKind::HebbianRule, MemoryRuleKind::Moneta,
             MemoryRuleKind::YAAD, MemoryRuleKind::MEMORA,
             MemoryRuleKind::LatticeOSR, MemoryRuleKind::Trellis,
+            MemoryRuleKind::AtlasOmega,
         ] {
             assert!(strategy_supported(rule, ParallelStrategy::Sequential),
                 "Sequential should be supported by {:?}", rule);
@@ -267,8 +269,9 @@ mod tests {
     }
 
     #[test]
-    fn test_atlas_parallel_unsupported() {
-        // Atlas Omega not yet implemented — all rules should return false
+    fn test_atlas_parallel_support() {
+        // AtlasParallel only supported by AtlasOmega
+        assert!(strategy_supported(MemoryRuleKind::AtlasOmega, ParallelStrategy::AtlasParallel));
         for rule in [
             MemoryRuleKind::DeltaRule, MemoryRuleKind::TitansLMM,
             MemoryRuleKind::HebbianRule, MemoryRuleKind::Moneta,

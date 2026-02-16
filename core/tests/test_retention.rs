@@ -56,7 +56,8 @@ fn context_memory_size(cfg: &MAGConfig) -> usize {
     match cfg.memory_rule {
         MemoryRuleKind::DeltaRule
         | MemoryRuleKind::TitansLMM
-        | MemoryRuleKind::HebbianRule => d * d,
+        | MemoryRuleKind::HebbianRule
+        | MemoryRuleKind::AtlasOmega => d * d,
         MemoryRuleKind::Moneta
         | MemoryRuleKind::YAAD
         | MemoryRuleKind::MEMORA => cfg.d_hidden * d + d * cfg.d_hidden,

@@ -64,7 +64,7 @@ fn memory_state_size(cfg: &MAGConfig) -> usize {
     let d = cfg.swa.d_model;
     match cfg.memory_rule {
         MemoryRuleKind::DeltaRule | MemoryRuleKind::TitansLMM
-        | MemoryRuleKind::HebbianRule => d * d,
+        | MemoryRuleKind::HebbianRule | MemoryRuleKind::AtlasOmega => d * d,
         MemoryRuleKind::Moneta | MemoryRuleKind::YAAD | MemoryRuleKind::MEMORA => {
             let dh = cfg.d_hidden;
             dh * d + d * dh // W1 + W2
