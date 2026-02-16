@@ -293,15 +293,14 @@ fn test_low_temperature_sharpens_gates() {
     );
 }
 
-// ── Hard gating ─────────────────────────────────────────────────────
+// ── Threshold gating (no mode distinction, CS-10) ───────────────────
 
 #[test]
-fn test_hard_gating_thresholds() {
+fn test_threshold_gating() {
     let d = 8;
     let k = 2;
     let chunk_sizes = vec![1, 8];
     let config = DynamicFreqConfig {
-        hard_gating: true,
         threshold: 0.5,
         ..Default::default()
     };
@@ -331,7 +330,6 @@ fn test_all_gates_open() {
     let k = 4;
     let chunk_sizes = vec![1, 8, 64, 512];
     let config = DynamicFreqConfig {
-        hard_gating: true,
         threshold: 0.5,
         ..Default::default()
     };
@@ -357,7 +355,6 @@ fn test_all_gates_closed_except_level0() {
     let k = 4;
     let chunk_sizes = vec![1, 8, 64, 512];
     let config = DynamicFreqConfig {
-        hard_gating: true,
         threshold: 0.5,
         ..Default::default()
     };

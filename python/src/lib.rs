@@ -200,7 +200,16 @@ fn parse_m3_config(d: &Bound<'_, PyDict>) -> PyResult<RustM3Config> {
         1 => RustM3Config::default_k1(),
         2 => RustM3Config::default_k2(),
         4 => RustM3Config::default_k4(),
-        _ => RustM3Config::default_k1(), // fallback, user should provide all fields
+        _ => {
+            // Non-standard k: require all fields explicitly
+            if d.get_item("etas")?.is_none() || d.get_item("thetas")?.is_none()
+               || d.get_item("weights")?.is_none() || d.get_item("frequencies")?.is_none() {
+                return Err(PyValueError::new_err(format!(
+                    "k={k} is non-standard; must provide 'etas', 'thetas', 'weights', 'frequencies'"
+                )));
+            }
+            RustM3Config::default_k1() // values will be overwritten below
+        }
     };
     let etas: Vec<f32> = match d.get_item("etas")? {
         Some(v) => v.extract()?,
@@ -226,7 +235,11 @@ fn parse_m3_config(d: &Bound<'_, PyDict>) -> PyResult<RustM3Config> {
         Some(v) => v.extract()?,
         None => 5,
     };
-    let cfg = RustM3Config { k, etas, thetas, weights, frequencies, use_newton_schulz, ns_iterations };
+    let ns_dim: Option<usize> = match d.get_item("ns_dim")? {
+        Some(v) => Some(v.extract()?),
+        None => None,
+    };
+    let cfg = RustM3Config { k, etas, thetas, weights, frequencies, use_newton_schulz, ns_iterations, ns_dim };
     cfg.validate().map_err(PyValueError::new_err)?;
     Ok(cfg)
 }

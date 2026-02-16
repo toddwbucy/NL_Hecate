@@ -85,19 +85,21 @@ impl FreqGateParams {
 }
 
 /// Configuration for dynamic frequency scheduling.
+///
+/// No hard_gating mode — forward code is identical in all phases (CS-10).
+/// Use low temperature (e.g. 0.01) for near-binary gating when desired.
 #[derive(Clone, Debug)]
 pub struct DynamicFreqConfig {
     /// Temperature for sigmoid gating. Lower = sharper decisions.
-    /// Default: 1.0. At inference, can be set very low for hard gating.
+    /// Default: 1.0. Use very low values (0.01) for near-binary behavior.
+    /// Clamped to >= 1e-6 to prevent division by zero.
     pub temperature: f32,
-    /// Threshold for hard gating (gate > threshold → fire).
-    /// Used when `hard_gating` is true. Default: 0.5.
+    /// Threshold for converting soft gates to boolean active_levels.
+    /// Only used by `gate_to_active()` for Pulse generation. Default: 0.5.
     pub threshold: f32,
-    /// Whether to use hard thresholding (for inference/testing).
-    /// Default: false (soft gating for differentiable training).
-    pub hard_gating: bool,
     /// Minimum gate value floor. Prevents complete shutdown of a level.
     /// Default: 0.0 (no floor). Set to e.g. 0.01 to ensure some gradient flow.
+    /// Gradients are zeroed when the gate is clamped to this floor.
     pub min_gate: f32,
 }
 
@@ -106,7 +108,6 @@ impl Default for DynamicFreqConfig {
         DynamicFreqConfig {
             temperature: 1.0,
             threshold: 0.5,
-            hard_gating: false,
             min_gate: 0.0,
         }
     }
@@ -237,14 +238,15 @@ impl FrequencyScheduler {
                 logit += gate.w_freq[dd] * mean_emb[dd];
             }
 
-            // Apply temperature scaling
-            let scaled_logit = logit / self.config.temperature;
+            // Apply temperature scaling (clamped to prevent div-by-zero)
+            let temp = self.config.temperature.max(1e-6);
+            let scaled_logit = logit / temp;
 
             // Sigmoid gate
-            let gate_val = 1.0 / (1.0 + (-scaled_logit).exp());
+            let gate_raw = 1.0 / (1.0 + (-scaled_logit).exp());
 
-            // Apply min_gate floor
-            let gate_val = gate_val.max(self.config.min_gate);
+            // Apply min_gate floor (backward zeros gradient when clamped)
+            let gate_val = gate_raw.max(self.config.min_gate);
 
             gate_logits.push(logit);
             gate_values.push(gate_val);
@@ -259,19 +261,20 @@ impl FrequencyScheduler {
         (gate_values, cache)
     }
 
-    /// Convert soft gate values to boolean active_levels for Pulse.
-    /// With hard_gating: threshold comparison.
-    /// Without hard_gating: always active (soft gating applied to outputs instead).
+    /// Convert soft gate values to boolean active_levels for Pulse generation.
+    ///
+    /// Uses threshold comparison uniformly — no mode distinction (CS-10).
+    /// All levels are always "active" in the Pulse; the soft gate value
+    /// scales the output contribution. The boolean here is for Pulse
+    /// compatibility: levels below threshold still fire but contribute
+    /// gate-scaled (near-zero) output.
     pub fn gate_to_active(&self, gate_values: &[f32]) -> Vec<bool> {
         let mut active = Vec::with_capacity(gate_values.len());
         for (i, &gv) in gate_values.iter().enumerate() {
             if i == 0 {
                 active.push(true); // Level 0 always active
-            } else if self.config.hard_gating {
-                active.push(gv > self.config.threshold);
             } else {
-                // Soft gating: all levels "active" but output scaled by gate
-                active.push(true);
+                active.push(gv > self.config.threshold);
             }
         }
         active
@@ -294,11 +297,18 @@ impl FrequencyScheduler {
         let k = self.k();
         let mut grads = FrequencyScheduler::zeros_like(k, d);
 
+        let temp = self.config.temperature.max(1e-6);
+
         for level_idx in 0..self.gates.len() {
             let gate_val = cache.gate_values[level_idx + 1]; // +1 because gate_values includes level 0
 
+            // If gate was clamped to min_gate, zero gradient (respect the clamp)
+            if self.config.min_gate > 0.0 && gate_val <= self.config.min_gate {
+                continue;
+            }
+
             // d_gate / d_logit = gate_val * (1 - gate_val) / temperature
-            let d_sigmoid = gate_val * (1.0 - gate_val) / self.config.temperature;
+            let d_sigmoid = gate_val * (1.0 - gate_val) / temp;
 
             // d_loss / d_logit = d_loss/d_gate * d_gate/d_logit
             let d_logit = d_scale_per_level[level_idx + 1] * d_sigmoid;
@@ -404,12 +414,12 @@ mod tests {
     }
 
     #[test]
-    fn test_hard_gating() {
+    fn test_threshold_gating() {
+        // No mode distinction — gate_to_active always uses threshold (CS-10)
         let d = 8;
         let k = 2;
         let chunk_sizes = vec![1, 8];
         let config = DynamicFreqConfig {
-            hard_gating: true,
             threshold: 0.5,
             ..Default::default()
         };
@@ -422,6 +432,26 @@ mod tests {
         assert!(active[0]); // Level 0 always active
         // Level 1: bias ≈ -ln(7) ≈ -1.95 → sigmoid ≈ 0.125 < 0.5 → inactive
         assert!(!active[1], "Level 1 should be inactive with default bias for chunk_size=8");
+    }
+
+    #[test]
+    fn test_low_temperature_near_binary() {
+        // Instead of hard_gating mode, use very low temperature for near-binary behavior
+        let d = 8;
+        let k = 2;
+        let chunk_sizes = vec![1, 8];
+        let config = DynamicFreqConfig {
+            temperature: 0.01,
+            threshold: 0.5,
+            ..Default::default()
+        };
+        let sched = FrequencyScheduler::new(k, d, &chunk_sizes, 42, config);
+
+        let embedded = vec![0.0f32; 4 * d];
+        let (gate_values, _) = sched.compute_gates(&embedded, 4, d);
+        // With temp=0.01, gate should be very close to 0 or 1
+        assert!(gate_values[1] < 0.001 || gate_values[1] > 0.999,
+            "Low temperature should produce near-binary gate, got {}", gate_values[1]);
     }
 
     #[test]
