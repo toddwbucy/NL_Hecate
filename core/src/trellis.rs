@@ -181,6 +181,10 @@ impl MemoryRule for Trellis {
         let mut error_v = vec![0.0f32; seq_len * d];
         let mut y = vec![0.0f32; seq_len * d];
 
+        // Scratch buffers reused across token loop (avoid per-iteration allocs)
+        let mut sk_grad = vec![0.0f32; sk_size];
+        let mut sv_grad = vec![0.0f32; sv_size];
+
         for t in 0..seq_len {
             let x_t = &embedded[t * d..(t + 1) * d];
             let k_t = &k_mem[t * d..(t + 1) * d];
@@ -261,8 +265,8 @@ impl MemoryRule for Trellis {
             let alpha_t = alpha[t];
             let theta_t = theta[t];
 
-            // Compute grad from S_K_t before retention decay
-            let mut sk_grad = vec![0.0f32; sk_size];
+            // Compute grad from S_K_t before retention decay (reuse scratch buffer)
+            sk_grad.fill(0.0);
             for i in 0..d_k {
                 for j in 0..d {
                     sk_grad[i * d + j] = error_k[t * d_k + i] * x_t[j] + self.lambda_k * sk_states[sk_t_off + i * d + j];
@@ -313,8 +317,8 @@ impl MemoryRule for Trellis {
             // S_V_{t+1} = (1 - alpha_t) * S_V_t - theta_t * grad_S_V
             let sv_next_off = (t + 1) * sv_size;
 
-            // Compute grad from S_V_t before retention decay
-            let mut sv_grad = vec![0.0f32; sv_size];
+            // Compute grad from S_V_t before retention decay (reuse scratch buffer)
+            sv_grad.fill(0.0);
             for i in 0..d {
                 for j in 0..d_k {
                     sv_grad[i * d_k + j] = error_v[t * d + i] * ck_out[j] + self.lambda_v * sv_states[sv_t_off + i * d_k + j];

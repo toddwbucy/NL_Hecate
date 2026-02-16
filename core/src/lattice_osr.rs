@@ -33,7 +33,7 @@ use crate::tensor::{
     matmul_f32, transpose_f32, sigmoid_f32, softmax_f32,
     frobenius_dot_f32, vec_norm_f32, vec_normalize_f32,
 };
-use crate::retention::sphere_project_and_normalize;
+use crate::retention::sphere_project_and_normalize_inplace;
 use crate::model::MemoryLevelParams;
 use crate::delta_rule::{MemoryRule, MemoryState, Gates, MemoryError};
 
@@ -193,6 +193,11 @@ impl MemoryRule for LatticeOSR {
         let mut s_unnorm_norms = vec![0.0f32; seq_len * m];
         let mut y = vec![0.0f32; seq_len * d];
 
+        // Scratch buffers reused across the seq_len × m loop (avoid per-iteration allocs)
+        let mut delta_s_scratch = vec![0.0f32; d];
+        let mut s_new_scratch = vec![0.0f32; d];
+        let mut read_scores = vec![0.0f32; m];
+
         for t in 0..seq_len {
             let k_t = &k_mem[t * d..(t + 1) * d];
             let v_t = &v_mem[t * d..(t + 1) * d];
@@ -214,7 +219,6 @@ impl MemoryRule for LatticeOSR {
             alpha[t] = sigmoid_f32(alpha_pre_t);
 
             // OBSERVE: read from current slots S_t
-            let mut read_scores = vec![0.0f32; m];
             for i in 0..m {
                 let slot = &s_states[s_t_off + i * d..s_t_off + (i + 1) * d];
                 read_scores[i] = frobenius_dot_f32(slot, q_t);
@@ -244,14 +248,18 @@ impl MemoryRule for LatticeOSR {
                 let gate_i = sigmoid_f32(score_i);
                 slot_gates[t * m + i] = gate_i;
 
-                // delta_s = alpha_t * gate_i * v_t
+                // delta_s = alpha_t * gate_i * v_t (write into scratch)
                 let scale = alpha[t] * gate_i;
-                let delta_s: Vec<f32> = v_t.iter().map(|&vj| scale * vj).collect();
+                for j in 0..d {
+                    delta_s_scratch[j] = scale * v_t[j];
+                }
 
-                // Sphere retention: orthogonal projection + normalize
-                let (s_new, norm) = sphere_project_and_normalize(slot, &delta_s, d);
+                // Sphere retention: orthogonal projection + normalize (in-place)
+                let norm = sphere_project_and_normalize_inplace(
+                    slot, &delta_s_scratch, d, &mut s_new_scratch,
+                );
                 s_unnorm_norms[t * m + i] = norm;
-                s_next[i * d..(i + 1) * d].copy_from_slice(&s_new);
+                s_next[i * d..(i + 1) * d].copy_from_slice(&s_new_scratch[..d]);
             }
         }
 

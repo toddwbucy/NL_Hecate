@@ -37,7 +37,7 @@ use crate::tensor::{
     matmul_f32, transpose_f32, softmax_f32, log_f32,
     sigmoid_f32, softplus_f32, silu_f32, silu_prime_f32,
 };
-use crate::retention::kl_apply_retention;
+use crate::retention::kl_apply_retention_inplace;
 use crate::model::MemoryLevelParams;
 use crate::delta_rule::{MemoryRule, MemoryState, Gates, MemoryError};
 
@@ -185,8 +185,13 @@ impl MemoryRule for MEMORA {
         let mut log_w1_prev = vec![0.0f32; seq_len * w1_size];
         let mut log_w2_prev = vec![0.0f32; seq_len * w2_size];
 
-        // Temp buffers for per-row softmax update
-        // z_buf and softmax_buf are now internal to kl_apply_retention
+        // Reusable scratch buffers for kl_apply_retention_inplace (avoid per-call allocs).
+        // max_size covers both W1 (dh*d) and W2 (d*dh) — they're equal but use max for clarity.
+        let max_size = w1_size.max(w2_size);
+        let max_cols = d.max(dh);
+        let mut kl_out_buf = vec![0.0f32; max_size];
+        let mut kl_log_buf = vec![0.0f32; max_size];
+        let mut kl_z_buf = vec![0.0f32; max_cols];
 
         for t in 0..seq_len {
             let k_t = &k_mem[t * d..(t + 1) * d];
@@ -292,12 +297,18 @@ impl MemoryRule for MEMORA {
             let lw2_base = t * w2_size;
             log_f32(w2_t, &mut log_w2_prev[lw2_base..lw2_base + w2_size]);
 
-            // KL-optimal softmax update for W1 and W2
-            let w1_updated = kl_apply_retention(w1_t, &grad_w1, alpha_t, theta_t, dh, d);
-            w1_next.copy_from_slice(&w1_updated);
+            // KL-optimal softmax update for W1 and W2 (in-place, reusing scratch buffers)
+            kl_apply_retention_inplace(
+                w1_t, &grad_w1, alpha_t, theta_t, dh, d,
+                &mut kl_out_buf, &mut kl_log_buf, &mut kl_z_buf,
+            );
+            w1_next.copy_from_slice(&kl_out_buf[..w1_size]);
 
-            let w2_updated = kl_apply_retention(w2_t, &grad_w2, alpha_t, theta_t, d, dh);
-            w2_next.copy_from_slice(&w2_updated);
+            kl_apply_retention_inplace(
+                w2_t, &grad_w2, alpha_t, theta_t, d, dh,
+                &mut kl_out_buf, &mut kl_log_buf, &mut kl_z_buf,
+            );
+            w2_next.copy_from_slice(&kl_out_buf[..w2_size]);
         }
 
         let cache = MEMORACache {

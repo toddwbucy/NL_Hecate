@@ -151,6 +151,41 @@ pub fn kl_apply_retention(
     result
 }
 
+/// In-place variant: writes result into `out`, uses `log_buf` and `z_buf`
+/// as scratch space. Avoids per-call allocations.
+///
+/// `out`:     mutable slice of length >= rows*cols (receives the result)
+/// `log_buf`: mutable slice of length >= rows*cols (scratch for log(w_prev))
+/// `z_buf`:   mutable slice of length >= cols (scratch for per-row z/softmax)
+#[inline]
+pub fn kl_apply_retention_inplace(
+    w_prev: &[f32],
+    grad: &[f32],
+    alpha: f32,
+    theta: f32,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    log_buf: &mut [f32],
+    z_buf: &mut [f32],
+) {
+    debug_assert_eq!(w_prev.len(), rows * cols);
+    debug_assert_eq!(grad.len(), rows * cols);
+    debug_assert!(out.len() >= rows * cols);
+    debug_assert!(log_buf.len() >= rows * cols);
+    debug_assert!(z_buf.len() >= cols);
+
+    log_f32(w_prev, &mut log_buf[..rows * cols]);
+
+    for r in 0..rows {
+        let row_base = r * cols;
+        for c in 0..cols {
+            z_buf[c] = alpha * log_buf[row_base + c] - theta * grad[row_base + c];
+        }
+        softmax_f32(&z_buf[..cols], &mut out[row_base..row_base + cols], 1, cols);
+    }
+}
+
 // ── Elastic Net (NEW) ───────────────────────────────────────────────
 
 /// Apply elastic net retention in-place:
@@ -193,8 +228,25 @@ pub fn sphere_project_and_normalize(
     delta_s: &[f32],
     d: usize,
 ) -> (Vec<f32>, f32) {
+    let mut s_new = vec![0.0f32; d];
+    let norm = sphere_project_and_normalize_inplace(slot, delta_s, d, &mut s_new);
+    (s_new, norm)
+}
+
+/// In-place variant: writes result into `s_new_out`, returns unnorm_norm.
+///
+/// Avoids per-call Vec allocation. Callers allocate `s_new_out` once (len >= d)
+/// and reuse across iterations.
+#[inline]
+pub fn sphere_project_and_normalize_inplace(
+    slot: &[f32],
+    delta_s: &[f32],
+    d: usize,
+    s_new_out: &mut [f32],
+) -> f32 {
     debug_assert_eq!(slot.len(), d);
     debug_assert_eq!(delta_s.len(), d);
+    debug_assert!(s_new_out.len() >= d);
 
     // Compute parallel component: p = dot(s, delta_s)
     let mut p = 0.0f32;
@@ -203,22 +255,21 @@ pub fn sphere_project_and_normalize(
     }
 
     // s_unnorm = s + (delta_s - p * s)
-    let mut s_unnorm = vec![0.0f32; d];
     for j in 0..d {
-        s_unnorm[j] = slot[j] + delta_s[j] - p * slot[j];
+        s_new_out[j] = slot[j] + delta_s[j] - p * slot[j];
     }
 
-    let norm = vec_norm_f32(&s_unnorm);
+    let norm = vec_norm_f32(&s_new_out[..d]);
     if norm > 1e-8 {
         let inv = 1.0 / norm;
         for j in 0..d {
-            s_unnorm[j] *= inv;
+            s_new_out[j] *= inv;
         }
     } else {
-        s_unnorm.copy_from_slice(slot);
+        s_new_out[..d].copy_from_slice(slot);
     }
 
-    (s_unnorm, norm)
+    norm
 }
 
 #[cfg(test)]
