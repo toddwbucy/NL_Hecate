@@ -60,7 +60,7 @@ fn cms_train(
         final_loss = loss;
 
         let grads = cms_backward(params, cfg, &cache, input_ids, target_ids, &mut error_buffers);
-        params.sgd_step(&grads, lr);
+        params.apply_weight_gradients(&grads, lr);
 
         for level in 0..cfg.k {
             if pulse.active_levels[level] && error_buffers[level].steps_accumulated > 0 {
@@ -92,7 +92,7 @@ fn test_hebbian_k1_smoke() {
         }
 
         let grads = mag_backward(&params, &cfg, &cache, &input_ids, &target_ids);
-        params.sgd_step(&grads, 0.01);
+        params.apply_weight_gradients(&grads, 0.01);
     }
 
     let final_loss = {
@@ -119,7 +119,7 @@ fn test_hebbian_k1_convergence() {
             initial_loss = Some(loss);
         }
         let grads = mag_backward(&params, &cfg, &cache, &input_ids, &target_ids);
-        params.sgd_step(&grads, 0.01);
+        params.apply_weight_gradients(&grads, 0.01);
     }
 
     let final_loss = {
@@ -191,6 +191,7 @@ fn test_hebbian_vs_delta() {
         k: 1, chunk_sizes: vec![1],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
+        parallel: None,
     };
     let cfg_hebbian = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
@@ -198,6 +199,7 @@ fn test_hebbian_vs_delta() {
         k: 1, chunk_sizes: vec![1],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
+        parallel: None,
     };
 
     let input_ids: Vec<usize> = (0..swa.seq_len).map(|t| t % swa.vocab_size).collect();
@@ -212,7 +214,7 @@ fn test_hebbian_vs_delta() {
         let (loss, cache) = mag_forward(&params_delta, &cfg_delta, &input_ids, &target_ids);
         if delta_initial.is_none() { delta_initial = Some(loss); }
         let grads = mag_backward(&params_delta, &cfg_delta, &cache, &input_ids, &target_ids);
-        params_delta.sgd_step(&grads, lr);
+        params_delta.apply_weight_gradients(&grads, lr);
     }
     let delta_final = mag_forward(&params_delta, &cfg_delta, &input_ids, &target_ids).0;
 
@@ -223,7 +225,7 @@ fn test_hebbian_vs_delta() {
         let (loss, cache) = mag_forward(&params_hebbian, &cfg_hebbian, &input_ids, &target_ids);
         if hebbian_initial.is_none() { hebbian_initial = Some(loss); }
         let grads = mag_backward(&params_hebbian, &cfg_hebbian, &cache, &input_ids, &target_ids);
-        params_hebbian.sgd_step(&grads, lr);
+        params_hebbian.apply_weight_gradients(&grads, lr);
     }
     let hebbian_final = mag_forward(&params_hebbian, &cfg_hebbian, &input_ids, &target_ids).0;
 

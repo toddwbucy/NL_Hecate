@@ -62,7 +62,7 @@ fn cms_mac_train(
         final_loss = loss;
 
         let grads = cms_mac_backward(params, cfg, &cache, input_ids, target_ids, &mut error_buffers);
-        params.sgd_step(&grads, lr);
+        params.apply_weight_gradients(&grads, lr);
 
         for level in 0..cfg.k {
             if pulse.active_levels[level] && error_buffers[level].steps_accumulated > 0 {
@@ -94,7 +94,7 @@ fn test_mac_k1_smoke() {
         }
 
         let grads = mac_backward(&params, &cfg, &cache, &input_ids, &target_ids);
-        params.sgd_step(&grads, 0.01);
+        params.apply_weight_gradients(&grads, 0.01);
     }
 
     let final_loss = mac_forward(&params, &cfg, &input_ids, &target_ids).0;
@@ -118,7 +118,7 @@ fn test_mac_k1_convergence() {
             initial_loss = Some(loss);
         }
         let grads = mac_backward(&params, &cfg, &cache, &input_ids, &target_ids);
-        params.sgd_step(&grads, 0.01);
+        params.apply_weight_gradients(&grads, 0.01);
     }
 
     let final_loss = mac_forward(&params, &cfg, &input_ids, &target_ids).0;
@@ -199,6 +199,7 @@ fn test_mac_vs_mag() {
         k: 1, chunk_sizes: vec![1],
         d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
         composition: CompositionKind::MAG,
+        parallel: None,
     };
     let cfg_mac = MAGConfig {
         swa: swa_mac, memory_enabled: true,
@@ -206,6 +207,7 @@ fn test_mac_vs_mag() {
         k: 1, chunk_sizes: vec![1],
         d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
         composition: CompositionKind::MAC,
+        parallel: None,
     };
 
     let seq_len = 8;
@@ -222,7 +224,7 @@ fn test_mac_vs_mag() {
         let (loss, cache) = mag_forward(&params_mag, &cfg_mag, &input_ids, &target_ids);
         if mag_initial.is_none() { mag_initial = Some(loss); }
         let grads = mag_backward(&params_mag, &cfg_mag, &cache, &input_ids, &target_ids);
-        params_mag.sgd_step(&grads, lr);
+        params_mag.apply_weight_gradients(&grads, lr);
     }
     let mag_final = mag_forward(&params_mag, &cfg_mag, &input_ids, &target_ids).0;
 
@@ -233,7 +235,7 @@ fn test_mac_vs_mag() {
         let (loss, cache) = mac_forward(&params_mac, &cfg_mac, &input_ids, &target_ids);
         if mac_initial.is_none() { mac_initial = Some(loss); }
         let grads = mac_backward(&params_mac, &cfg_mac, &cache, &input_ids, &target_ids);
-        params_mac.sgd_step(&grads, lr);
+        params_mac.apply_weight_gradients(&grads, lr);
     }
     let mac_final = mac_forward(&params_mac, &cfg_mac, &input_ids, &target_ids).0;
 

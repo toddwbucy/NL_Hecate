@@ -60,7 +60,7 @@ fn cms_train(
         final_loss = loss;
 
         let grads = cms_backward(params, cfg, &cache, input_ids, target_ids, &mut error_buffers);
-        params.sgd_step(&grads, lr);
+        params.apply_weight_gradients(&grads, lr);
 
         for level in 0..cfg.k {
             if pulse.active_levels[level] && error_buffers[level].steps_accumulated > 0 {
@@ -92,7 +92,7 @@ fn test_titans_k1_smoke() {
         }
 
         let grads = mag_backward(&params, &cfg, &cache, &input_ids, &target_ids);
-        params.sgd_step(&grads, 0.01);
+        params.apply_weight_gradients(&grads, 0.01);
     }
 
     let final_loss = {
@@ -119,7 +119,7 @@ fn test_titans_k1_convergence() {
             initial_loss = Some(loss);
         }
         let grads = mag_backward(&params, &cfg, &cache, &input_ids, &target_ids);
-        params.sgd_step(&grads, 0.01);
+        params.apply_weight_gradients(&grads, 0.01);
     }
 
     let final_loss = {
@@ -193,6 +193,7 @@ fn test_titans_vs_delta() {
         k: 1, chunk_sizes: vec![1],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
+        parallel: None,
     };
     let cfg_titans = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
@@ -200,6 +201,7 @@ fn test_titans_vs_delta() {
         k: 1, chunk_sizes: vec![1],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
+        parallel: None,
     };
 
     let input_ids: Vec<usize> = (0..swa.seq_len).map(|t| t % swa.vocab_size).collect();
@@ -214,7 +216,7 @@ fn test_titans_vs_delta() {
         let (loss, cache) = mag_forward(&params_delta, &cfg_delta, &input_ids, &target_ids);
         if delta_initial.is_none() { delta_initial = Some(loss); }
         let grads = mag_backward(&params_delta, &cfg_delta, &cache, &input_ids, &target_ids);
-        params_delta.sgd_step(&grads, lr);
+        params_delta.apply_weight_gradients(&grads, lr);
     }
     let delta_final = mag_forward(&params_delta, &cfg_delta, &input_ids, &target_ids).0;
 
@@ -225,7 +227,7 @@ fn test_titans_vs_delta() {
         let (loss, cache) = mag_forward(&params_titans, &cfg_titans, &input_ids, &target_ids);
         if titans_initial.is_none() { titans_initial = Some(loss); }
         let grads = mag_backward(&params_titans, &cfg_titans, &cache, &input_ids, &target_ids);
-        params_titans.sgd_step(&grads, lr);
+        params_titans.apply_weight_gradients(&grads, lr);
     }
     let titans_final = mag_forward(&params_titans, &cfg_titans, &input_ids, &target_ids).0;
 

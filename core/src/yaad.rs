@@ -110,7 +110,9 @@ impl MemoryRule for YAAD {
 
     fn level(&self) -> usize { 0 }
 
-    fn supported_parallelization(&self) -> &'static [&'static str] { &["sequential"] }
+    fn supported_parallelization(&self) -> &'static [&'static str] {
+        crate::parallel::supported_strategies(crate::model::MemoryRuleKind::YAAD)
+    }
 
     fn init(&self, d: usize) -> MemoryState {
         // For API compatibility — actual YAAD state is W1+W2+boundaries, not a d×d matrix.
@@ -923,7 +925,10 @@ mod tests {
     fn test_yaad_level_and_parallelization() {
         let rule = YAAD { d_hidden: 4, delta: 1.0, lambda_local: 0.01, lambda_2: 0.01 };
         assert_eq!(rule.level(), 0);
-        assert_eq!(rule.supported_parallelization(), &["sequential"]);
+        let strategies = rule.supported_parallelization();
+        assert!(strategies.contains(&"sequential"));
+        assert!(strategies.contains(&"chunkwise_gd"));
+        assert!(strategies.contains(&"tnt"));
     }
 
     // ── Read-only tests ──────────────────────────────────────────────

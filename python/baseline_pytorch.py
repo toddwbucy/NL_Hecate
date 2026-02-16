@@ -153,7 +153,7 @@ def forward_pytorch(weights, input_ids, target_ids):
     return loss
 
 
-def sgd_step_pytorch(weights, lr):
+def apply_weight_gradients_pytorch(weights, lr):
     """Manual SGD: param -= lr * grad, then zero grads."""
     with torch.no_grad():
         for w in weights.values():
@@ -194,13 +194,13 @@ def run_comparison(num_steps=100, lr=0.05):
 
         # Rust forward + backward + SGD
         rust_loss, rust_grads = nl_hecate.compute_gradients(rust_params, cfg, inp, tgt)
-        nl_hecate.sgd_step(rust_params, rust_grads, lr)
+        nl_hecate.apply_weight_gradients(rust_params, rust_grads, lr)
 
         # PyTorch forward + backward + SGD
         pt_loss_tensor = forward_pytorch(pt_weights, inp, tgt)
         pt_loss = pt_loss_tensor.item()
         pt_loss_tensor.backward()
-        sgd_step_pytorch(pt_weights, lr)
+        apply_weight_gradients_pytorch(pt_weights, lr)
 
         # Check finite
         if not math.isfinite(rust_loss) or not math.isfinite(pt_loss):
@@ -259,7 +259,7 @@ def run_timing(num_steps=500, lr=0.05):
     for step in range(num_steps):
         inp, tgt = CHUNKS[step % len(CHUNKS)]
         _loss, grads = nl_hecate.compute_gradients(rust_params, cfg, inp, tgt)
-        nl_hecate.sgd_step(rust_params, grads, lr)
+        nl_hecate.apply_weight_gradients(rust_params, grads, lr)
     rust_elapsed = time.perf_counter() - t0
     rust_tps = total_tokens / rust_elapsed
 
@@ -271,7 +271,7 @@ def run_timing(num_steps=500, lr=0.05):
         inp, tgt = CHUNKS[step % len(CHUNKS)]
         loss = forward_pytorch(pt_weights, inp, tgt)
         loss.backward()
-        sgd_step_pytorch(pt_weights, lr)
+        apply_weight_gradients_pytorch(pt_weights, lr)
     pt_elapsed = time.perf_counter() - t0
     pt_tps = total_tokens / pt_elapsed
 
@@ -411,7 +411,7 @@ def forward_pytorch_mag(weights, input_ids, target_ids):
     return loss
 
 
-def sgd_step_mag_pytorch(weights, lr):
+def apply_weight_gradients_mag_pytorch(weights, lr):
     """Manual SGD for MAG weights."""
     with torch.no_grad():
         for w in weights.values():
@@ -445,13 +445,13 @@ def run_comparison_mag(num_steps=100, lr=0.01):
 
         # Rust forward + backward + SGD
         rust_loss, rust_grads = nl_hecate.mag_compute_gradients(rust_params, cfg, inp, tgt)
-        nl_hecate.mag_sgd_step(rust_params, rust_grads, lr)
+        nl_hecate.mag_apply_weight_gradients(rust_params, rust_grads, lr)
 
         # PyTorch forward + backward + SGD
         pt_loss_tensor = forward_pytorch_mag(pt_weights, inp, tgt)
         pt_loss = pt_loss_tensor.item()
         pt_loss_tensor.backward()
-        sgd_step_mag_pytorch(pt_weights, lr)
+        apply_weight_gradients_mag_pytorch(pt_weights, lr)
 
         if not math.isfinite(rust_loss) or not math.isfinite(pt_loss):
             all_finite = False
@@ -505,7 +505,7 @@ def run_timing_mag(num_steps=200, lr=0.01):
     for step in range(num_steps):
         inp, tgt = MAG_CHUNKS[step % len(MAG_CHUNKS)]
         _loss, grads = nl_hecate.mag_compute_gradients(rust_params, cfg, inp, tgt)
-        nl_hecate.mag_sgd_step(rust_params, grads, lr)
+        nl_hecate.mag_apply_weight_gradients(rust_params, grads, lr)
     rust_elapsed = time.perf_counter() - t0
     rust_tps = total_tokens / rust_elapsed
 
@@ -517,7 +517,7 @@ def run_timing_mag(num_steps=200, lr=0.01):
         inp, tgt = MAG_CHUNKS[step % len(MAG_CHUNKS)]
         loss = forward_pytorch_mag(pt_weights, inp, tgt)
         loss.backward()
-        sgd_step_mag_pytorch(pt_weights, lr)
+        apply_weight_gradients_mag_pytorch(pt_weights, lr)
     pt_elapsed = time.perf_counter() - t0
     pt_tps = total_tokens / pt_elapsed
 

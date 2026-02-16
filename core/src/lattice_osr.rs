@@ -91,7 +91,9 @@ impl MemoryRule for LatticeOSR {
 
     fn level(&self) -> usize { 0 }
 
-    fn supported_parallelization(&self) -> &'static [&'static str] { &["sequential"] }
+    fn supported_parallelization(&self) -> &'static [&'static str] {
+        crate::parallel::supported_strategies(crate::model::MemoryRuleKind::LatticeOSR)
+    }
 
     fn init(&self, d: usize) -> MemoryState {
         MemoryState { m: init_slots(self.m_slots, d), d }
@@ -838,7 +840,11 @@ mod tests {
     fn test_lattice_level_and_parallelization() {
         let rule = LatticeOSR { m_slots: 4 };
         assert_eq!(rule.level(), 0);
-        assert_eq!(rule.supported_parallelization(), &["sequential"]);
+        let strategies = rule.supported_parallelization();
+        assert!(strategies.contains(&"sequential"));
+        assert!(strategies.contains(&"chunkwise_gd"));
+        assert!(strategies.contains(&"tnt"));
+        assert!(strategies.contains(&"lattice_gla"));
     }
 
     // ── Read-only tests ──────────────────────────────────────────────

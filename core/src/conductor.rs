@@ -178,10 +178,10 @@ impl ErrorBuffer {
         self.steps_accumulated += 1;
     }
 
-    /// Apply accumulated gradients via SGD and reset.
+    /// Apply accumulated gradients as outer-loop weight update and reset.
     pub fn apply_and_reset(&mut self, params: &mut MemoryLevelParams, lr: f32) {
         if self.steps_accumulated > 0 {
-            params.sgd_step(&self.grads, lr);
+            params.apply_weight_gradients(&self.grads, lr);
             self.grads = MemoryLevelParams::zeros_like(self.d);
             self.steps_accumulated = 0;
         }

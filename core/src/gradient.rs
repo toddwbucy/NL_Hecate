@@ -1017,9 +1017,13 @@ mod tests {
         assert!(passed == checked, "swa_w_o: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
     }
 
-    /// Training convergence: loss decreases over SGD steps.
+    /// Outer-loop weight descent: loss decreases as projection weights are updated
+    /// via Enzyme-computed gradients. This validates the outer loop — the inner loop
+    /// (memory self-modification inside the forward pass) runs without any external
+    /// optimizer. See CS-10 through CS-17 for the no-epochs/no-external-optimizer
+    /// constraints, which apply to the inner loop.
     #[test]
-    fn test_mag_training_convergence() {
+    fn test_mag_outer_loop_weight_descent() {
         let cfg = mag_grad_check_config();
         let mut params = MAGParams::init(&cfg, 42);
         let (input_ids, target_ids) = mag_make_test_data(&cfg);
@@ -1028,14 +1032,14 @@ mod tests {
         eprintln!("MAG initial loss: {initial_loss:.4}");
 
         let lr = 0.01;
-        let steps = 1000;
-        for _ in 0..steps {
+        let outer_steps = 1000;
+        for _ in 0..outer_steps {
             let (_loss, grads) = mag_compute_gradients(&params, &cfg, &input_ids, &target_ids);
-            params.sgd_step(&grads, lr);
+            params.apply_weight_gradients(&grads, lr);
         }
 
         let (final_loss, cache) = mag_forward(&params, &cfg, &input_ids, &target_ids);
-        eprintln!("MAG final loss after {steps} steps: {final_loss:.4}");
+        eprintln!("MAG final loss after {outer_steps} outer-loop steps: {final_loss:.4}");
 
         assert!(final_loss < initial_loss,
             "Loss should decrease: initial={initial_loss:.4}, final={final_loss:.4}");

@@ -16,6 +16,12 @@ pub mod trellis;
 pub mod mag;
 pub mod mal;
 pub mod mac;
+pub mod parallel;
+pub mod chunkwise_gd;
+pub mod associative_scan;
+pub mod tnt;
+pub mod lattice_gla;
+pub mod atlas_parallel;
 #[cfg(feature = "internal")]
 pub mod gradient;
 #[cfg(not(feature = "internal"))]

@@ -71,7 +71,7 @@ fn cms_train(
         final_loss = loss;
 
         let grads = cms_backward(params, cfg, &cache, input_ids, target_ids, &mut error_buffers);
-        params.sgd_step(&grads, lr);
+        params.apply_weight_gradients(&grads, lr);
 
         // Apply error buffer for levels that just became active
         for level in 0..cfg.k {
@@ -203,6 +203,7 @@ fn test_k2_beats_k1() {
         k: 1, chunk_sizes: vec![1],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
+        parallel: None,
     };
     // k=2 config
     let cfg_k2 = MAGConfig {
@@ -211,6 +212,7 @@ fn test_k2_beats_k1() {
         k: 2, chunk_sizes: vec![1, 8],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
+        parallel: None,
     };
 
     let input_ids: Vec<usize> = (0..swa.seq_len).map(|t| t % swa.vocab_size).collect();
@@ -384,6 +386,7 @@ fn test_k4_vs_k2_multiscale() {
         k: 2, chunk_sizes: vec![1, 8],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
+        parallel: None,
     };
     let cfg_k4 = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
@@ -391,6 +394,7 @@ fn test_k4_vs_k2_multiscale() {
         k: 4, chunk_sizes: vec![1, 8, 64, 512],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
+        parallel: None,
     };
 
     let slow_period = 8;
@@ -475,6 +479,7 @@ fn test_k4_diagnostics() {
         chunk_sizes: vec![1, 8, 64, 512],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
+        parallel: None,
     };
 
     let (input_ids, target_ids) = make_multiscale_data(
@@ -505,7 +510,7 @@ fn test_k4_diagnostics() {
         let pulse = conductor.pulse();
         let (loss, cache) = cms_forward(&params, &cfg, &input_ids, &target_ids, &pulse, &mut context);
         let grads = cms_backward(&params, &cfg, &cache, &input_ids, &target_ids, &mut error_buffers);
-        params.sgd_step(&grads, lr);
+        params.apply_weight_gradients(&grads, lr);
 
         for level in 0..cfg.k {
             if pulse.active_levels[level] && error_buffers[level].steps_accumulated > 0 {
@@ -589,7 +594,7 @@ fn test_k4_error_buffer_health() {
         let grads = cms_backward(&params, &cfg, &cache, &input_ids, &target_ids, &mut error_buffers);
 
         // SGD update so gradients decorrelate between steps
-        params.sgd_step(&grads, lr);
+        params.apply_weight_gradients(&grads, lr);
 
         // Check and apply error buffers when levels fire
         for lev in 1..cfg.k {
@@ -650,7 +655,7 @@ fn test_k2_diagnostics() {
         let pulse = conductor.pulse();
         let (loss, cache) = cms_forward(&params, &cfg, &input_ids, &target_ids, &pulse, &mut context);
         let grads = cms_backward(&params, &cfg, &cache, &input_ids, &target_ids, &mut error_buffers);
-        params.sgd_step(&grads, lr);
+        params.apply_weight_gradients(&grads, lr);
 
         for level in 0..cfg.k {
             if pulse.active_levels[level] && error_buffers[level].steps_accumulated > 0 {
@@ -737,6 +742,7 @@ fn test_cms_stability_boundary() {
         k: 1, chunk_sizes: vec![1],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
+        parallel: None,
     };
     let cfg_k2 = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
@@ -744,6 +750,7 @@ fn test_cms_stability_boundary() {
         k: 2, chunk_sizes: vec![1, 8],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
+        parallel: None,
     };
 
     let slow_period = 8;
@@ -796,7 +803,7 @@ fn test_cms_stability_boundary() {
             break;
         }
 
-        params_k1.sgd_step(&grads, lr);
+        params_k1.apply_weight_gradients(&grads, lr);
 
         for level in 0..cfg_k1.k {
             if pulse.active_levels[level] && error_bufs_k1[level].steps_accumulated > 0 {
@@ -840,7 +847,7 @@ fn test_cms_stability_boundary() {
         let grads = cms_backward(
             &params_k2, &cfg_k2, &cache, &input_ids, &target_ids, &mut error_bufs_k2,
         );
-        params_k2.sgd_step(&grads, lr);
+        params_k2.apply_weight_gradients(&grads, lr);
 
         for level in 0..cfg_k2.k {
             if pulse.active_levels[level] && error_bufs_k2[level].steps_accumulated > 0 {
@@ -925,6 +932,7 @@ fn test_k4_normalization_magnitude() {
         k: 4, chunk_sizes: vec![1, 8, 64, 512],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
+        parallel: None,
     };
     let params_k4 = MAGParams::init(&cfg_k4, 42);
     let mut context = ContextState::new(cfg_k4.k, cfg_k4.swa.d_model);
@@ -985,6 +993,7 @@ fn test_k4_uniform_init_stable() {
         k: 4, chunk_sizes: vec![1, 8, 64, 512],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
+        parallel: None,
     };
 
     let (input_ids, target_ids) = make_multiscale_data(
@@ -1031,6 +1040,7 @@ fn test_k4_normalized_stable() {
         k: 4, chunk_sizes: vec![1, 8, 64, 512],
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             composition: CompositionKind::MAG,
+        parallel: None,
     };
 
     let (input_ids, target_ids) = make_multiscale_data(
