@@ -105,6 +105,13 @@ pub fn sync_gradients(
     pulse: &Pulse,
     pg: &dyn ProcessGroup,
 ) -> usize {
+    debug_assert_eq!(
+        pulse.active_levels.len(),
+        grads.levels.len(),
+        "pulse.active_levels length ({}) must match grads.levels length ({})",
+        pulse.active_levels.len(),
+        grads.levels.len(),
+    );
     let ws = pg.world_size() as f32;
     let mut allreduce_count = 0usize;
 
@@ -217,6 +224,10 @@ impl ThroughputTracker {
 ///
 /// Composes existing primitives (cms_forward, cms_backward, sync_gradients,
 /// apply_weight_gradients, ErrorBuffer) into a single step with throughput reporting.
+///
+/// **Not a public training API (CS-18).** The forward pass remains the only
+/// external API surface. This function is an internal orchestration helper
+/// behind the `distributed` feature gate for testing and internal use only.
 pub fn distributed_step(
     params: &mut MAGParams,
     cfg: &MAGConfig,
