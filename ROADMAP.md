@@ -326,4 +326,4 @@ Stage 2 milestones are sequential (each builds on the last). Stage 3 milestones 
 | Stage 2: Production Infra | 4 | 29 CUDA + 20 edge | IN PROGRESS |
 | Stage 3: Extensions | 5 | TBD | NOT STARTED |
 
-**Current position**: Stage 2 complete. S2-M4 edge deployment validated: ~34k tok/s for d=64 micro models, wasm32 cross-compilation works, enzyme feature-gated. Total test count: 798 Rust + 27 Python + 29 CUDA = **854 tests**.
+**Current position**: Stage 2 in progress. S2-M2/M3/M4 complete; S2-M1 architecture dispatch and cubin/ptx packaging remain. Total test count: 798 Rust + 27 Python + 29 CUDA = **854 tests** (includes 20 edge tests from S2-M4).

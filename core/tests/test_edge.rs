@@ -147,6 +147,7 @@ fn test_model_size_d128_under_1mb() {
 // ── Throughput smoke tests ──────────────────────────────────────────
 
 #[test]
+#[ignore] // Perf test: run with --ignored or RUN_EDGE_PERF_TESTS=1
 fn test_throughput_above_1k_tok_s() {
     // Conservative: > 1k tok/s on x86_64 (Criterion shows ~34k for d=64)
     let cfg = EdgeConfig::micro_d64();
@@ -170,6 +171,7 @@ fn test_throughput_above_1k_tok_s() {
 }
 
 #[test]
+#[ignore] // Perf test: run with --ignored or RUN_EDGE_PERF_TESTS=1
 fn test_forward_latency_under_1ms() {
     // d=64, seq=16: Criterion shows ~471µs
     let cfg = EdgeConfig::micro_d64();
