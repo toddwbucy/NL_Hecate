@@ -132,8 +132,8 @@ impl SWAParams {
             + self.w_v.len() + self.w_o.len() + self.w_unembed.len()
     }
 
-    /// Apply SGD: param -= lr * grad for all weight matrices.
-    pub fn sgd_step(&mut self, grads: &SWAParams, lr: f32) {
+    /// Outer-loop weight update: param -= lr * grad for all projection weights.
+    pub fn apply_weight_gradients(&mut self, grads: &SWAParams, lr: f32) {
         fn step(param: &mut [f32], grad: &[f32], lr: f32) {
             for i in 0..param.len() {
                 param[i] -= lr * grad[i];
@@ -237,8 +237,8 @@ impl MemoryLevelParams {
             + self.w_eta.len() + self.b_eta.len()
     }
 
-    /// Apply SGD: param -= lr * grad for all weight matrices.
-    pub fn sgd_step(&mut self, grads: &MemoryLevelParams, lr: f32) {
+    /// Outer-loop weight update: param -= lr * grad for all projection weights.
+    pub fn apply_weight_gradients(&mut self, grads: &MemoryLevelParams, lr: f32) {
         fn step(param: &mut [f32], grad: &[f32], lr: f32) {
             for i in 0..param.len() {
                 param[i] -= lr * grad[i];
@@ -991,11 +991,11 @@ impl MAGParams {
             + self.levels.iter().map(|l| l.num_params()).sum::<usize>()
     }
 
-    /// Apply SGD: param -= lr * grad for all weight matrices across all levels.
-    pub fn sgd_step(&mut self, grads: &MAGParams, lr: f32) {
-        self.swa.sgd_step(&grads.swa, lr);
+    /// Outer-loop weight update: param -= lr * grad for all projection weights across all levels.
+    pub fn apply_weight_gradients(&mut self, grads: &MAGParams, lr: f32) {
+        self.swa.apply_weight_gradients(&grads.swa, lr);
         for (level, level_grads) in self.levels.iter_mut().zip(grads.levels.iter()) {
-            level.sgd_step(level_grads, lr);
+            level.apply_weight_gradients(level_grads, lr);
         }
     }
 }

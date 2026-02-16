@@ -71,7 +71,7 @@ fn cms_train(
         final_loss = loss;
 
         let grads = cms_backward(params, cfg, &cache, input_ids, target_ids, &mut error_buffers);
-        params.sgd_step(&grads, lr);
+        params.apply_weight_gradients(&grads, lr);
 
         // Apply error buffer for levels that just became active
         for level in 0..cfg.k {
@@ -510,7 +510,7 @@ fn test_k4_diagnostics() {
         let pulse = conductor.pulse();
         let (loss, cache) = cms_forward(&params, &cfg, &input_ids, &target_ids, &pulse, &mut context);
         let grads = cms_backward(&params, &cfg, &cache, &input_ids, &target_ids, &mut error_buffers);
-        params.sgd_step(&grads, lr);
+        params.apply_weight_gradients(&grads, lr);
 
         for level in 0..cfg.k {
             if pulse.active_levels[level] && error_buffers[level].steps_accumulated > 0 {
@@ -594,7 +594,7 @@ fn test_k4_error_buffer_health() {
         let grads = cms_backward(&params, &cfg, &cache, &input_ids, &target_ids, &mut error_buffers);
 
         // SGD update so gradients decorrelate between steps
-        params.sgd_step(&grads, lr);
+        params.apply_weight_gradients(&grads, lr);
 
         // Check and apply error buffers when levels fire
         for lev in 1..cfg.k {
@@ -655,7 +655,7 @@ fn test_k2_diagnostics() {
         let pulse = conductor.pulse();
         let (loss, cache) = cms_forward(&params, &cfg, &input_ids, &target_ids, &pulse, &mut context);
         let grads = cms_backward(&params, &cfg, &cache, &input_ids, &target_ids, &mut error_buffers);
-        params.sgd_step(&grads, lr);
+        params.apply_weight_gradients(&grads, lr);
 
         for level in 0..cfg.k {
             if pulse.active_levels[level] && error_buffers[level].steps_accumulated > 0 {
@@ -803,7 +803,7 @@ fn test_cms_stability_boundary() {
             break;
         }
 
-        params_k1.sgd_step(&grads, lr);
+        params_k1.apply_weight_gradients(&grads, lr);
 
         for level in 0..cfg_k1.k {
             if pulse.active_levels[level] && error_bufs_k1[level].steps_accumulated > 0 {
@@ -847,7 +847,7 @@ fn test_cms_stability_boundary() {
         let grads = cms_backward(
             &params_k2, &cfg_k2, &cache, &input_ids, &target_ids, &mut error_bufs_k2,
         );
-        params_k2.sgd_step(&grads, lr);
+        params_k2.apply_weight_gradients(&grads, lr);
 
         for level in 0..cfg_k2.k {
             if pulse.active_levels[level] && error_bufs_k2[level].steps_accumulated > 0 {

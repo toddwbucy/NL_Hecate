@@ -66,7 +66,7 @@ fn cms_train(
         final_loss = loss;
 
         let grads = cms_backward(params, cfg, &cache, input_ids, target_ids, &mut error_buffers);
-        params.sgd_step(&grads, lr);
+        params.apply_weight_gradients(&grads, lr);
 
         for level in 0..cfg.k {
             if pulse.active_levels[level] && error_buffers[level].steps_accumulated > 0 {
@@ -98,7 +98,7 @@ fn test_trellis_k1_smoke() {
         }
 
         let grads = mag_backward(&params, &cfg, &cache, &input_ids, &target_ids);
-        params.sgd_step(&grads, 0.01);
+        params.apply_weight_gradients(&grads, 0.01);
     }
 
     let final_loss = {
@@ -125,7 +125,7 @@ fn test_trellis_k1_convergence() {
             initial_loss = Some(loss);
         }
         let grads = mag_backward(&params, &cfg, &cache, &input_ids, &target_ids);
-        params.sgd_step(&grads, 0.01);
+        params.apply_weight_gradients(&grads, 0.01);
     }
 
     let final_loss = {
@@ -235,7 +235,7 @@ fn test_trellis_vs_delta() {
         let (loss, cache) = mag_forward(&params_delta, &cfg_delta, &input_ids, &target_ids);
         if delta_initial.is_none() { delta_initial = Some(loss); }
         let grads = mag_backward(&params_delta, &cfg_delta, &cache, &input_ids, &target_ids);
-        params_delta.sgd_step(&grads, lr);
+        params_delta.apply_weight_gradients(&grads, lr);
     }
     let delta_final = mag_forward(&params_delta, &cfg_delta, &input_ids, &target_ids).0;
 
@@ -246,7 +246,7 @@ fn test_trellis_vs_delta() {
         let (loss, cache) = mag_forward(&params_trellis, &cfg_trellis, &input_ids, &target_ids);
         if trellis_initial.is_none() { trellis_initial = Some(loss); }
         let grads = mag_backward(&params_trellis, &cfg_trellis, &cache, &input_ids, &target_ids);
-        params_trellis.sgd_step(&grads, lr);
+        params_trellis.apply_weight_gradients(&grads, lr);
     }
     let trellis_final = mag_forward(&params_trellis, &cfg_trellis, &input_ids, &target_ids).0;
 

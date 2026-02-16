@@ -23,7 +23,7 @@ fn mag_train(
     for _ in 0..steps {
         let (_, cache) = mag_forward(params, cfg, input_ids, target_ids);
         let grads = mag_backward(params, cfg, &cache, input_ids, target_ids);
-        params.sgd_step(&grads, lr);
+        params.apply_weight_gradients(&grads, lr);
     }
     let (final_loss, _) = mag_forward(params, cfg, input_ids, target_ids);
     (initial_loss, final_loss)
@@ -53,7 +53,7 @@ fn cms_train(
         let (loss, cache) = cms_forward(params, cfg, input_ids, target_ids, &pulse, &mut context);
         if step == 0 { initial_loss = loss; }
         let grads = cms_backward(params, cfg, &cache, input_ids, target_ids, &mut error_buffers);
-        params.sgd_step(&grads, lr);
+        params.apply_weight_gradients(&grads, lr);
         // Apply error buffer grads when levels become active
         for level in 0..cfg.k {
             if pulse.active_levels[level] && error_buffers[level].steps_accumulated > 0 {
@@ -105,7 +105,7 @@ fn test_memora_simplex_preserved_after_training() {
     for _ in 0..50 {
         let (_, cache) = mag_forward(&params, &cfg, &input_ids, &target_ids);
         let grads = mag_backward(&params, &cfg, &cache, &input_ids, &target_ids);
-        params.sgd_step(&grads, 0.01);
+        params.apply_weight_gradients(&grads, 0.01);
     }
 
     // Run one more forward to check simplex on the cached W states

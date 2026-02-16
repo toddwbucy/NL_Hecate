@@ -850,7 +850,11 @@ mod tests {
     }
 
     #[test]
-    fn test_hebbian_scan_training() {
+    fn test_hebbian_scan_outer_loop_weight_descent() {
+        // Validates outer-loop gradient flow: Enzyme-computed gradients on
+        // projection weights (W_K, W_V, W_Q, W_alpha, b_alpha) decrease a proxy
+        // loss when applied as weight updates. This is the outer loop — distinct
+        // from the inner loop (memory updates inside the forward pass).
         let cfg = MAGConfig::hebbian_test_config();
         let mut level_params = MAGParams::init(&cfg, 42).levels.into_iter().next().unwrap();
         let s = cfg.swa.seq_len;
@@ -866,17 +870,18 @@ mod tests {
         let mut first_loss = 0.0f32;
         let mut last_loss = 0.0f32;
 
-        for step in 0..100 {
+        for outer_step in 0..100 {
             let (y, cache) = hebbian_scan_forward(&level_params, &embedded, s, d, None);
             let loss: f32 = y.iter().zip(target.iter())
                 .map(|(a, b)| (a - b).powi(2)).sum::<f32>() / (s * d) as f32;
-            if step == 0 { first_loss = loss; }
-            if step == 99 { last_loss = loss; }
+            if outer_step == 0 { first_loss = loss; }
+            if outer_step == 99 { last_loss = loss; }
 
             let d_y: Vec<f32> = y.iter().zip(target.iter())
                 .map(|(a, b)| 2.0 * (a - b) / (s * d) as f32).collect();
             let (grads, _) = hebbian_scan_backward(&level_params, &cache, &d_y, &embedded);
 
+            // Outer-loop weight update (projection weights, not inner-loop memory)
             for (w, g) in level_params.w_k_mem.iter_mut().zip(grads.w_k_mem.iter()) { *w -= lr * g; }
             for (w, g) in level_params.w_v_mem.iter_mut().zip(grads.w_v_mem.iter()) { *w -= lr * g; }
             for (w, g) in level_params.w_q_mem.iter_mut().zip(grads.w_q_mem.iter()) { *w -= lr * g; }
@@ -885,7 +890,7 @@ mod tests {
         }
 
         assert!(last_loss < first_loss,
-            "Hebbian scan training should converge: first={first_loss:.6} last={last_loss:.6}");
+            "Hebbian scan outer-loop weight descent should converge: first={first_loss:.6} last={last_loss:.6}");
     }
 
     #[test]

@@ -62,7 +62,7 @@ fn cms_mal_train(
         final_loss = loss;
 
         let grads = cms_mal_backward(params, cfg, &cache, input_ids, target_ids, &mut error_buffers);
-        params.sgd_step(&grads, lr);
+        params.apply_weight_gradients(&grads, lr);
 
         for level in 0..cfg.k {
             if pulse.active_levels[level] && error_buffers[level].steps_accumulated > 0 {
@@ -94,7 +94,7 @@ fn test_mal_k1_smoke() {
         }
 
         let grads = mal_backward(&params, &cfg, &cache, &input_ids, &target_ids);
-        params.sgd_step(&grads, 0.01);
+        params.apply_weight_gradients(&grads, 0.01);
     }
 
     let final_loss = mal_forward(&params, &cfg, &input_ids, &target_ids).0;
@@ -118,7 +118,7 @@ fn test_mal_k1_convergence() {
             initial_loss = Some(loss);
         }
         let grads = mal_backward(&params, &cfg, &cache, &input_ids, &target_ids);
-        params.sgd_step(&grads, 0.01);
+        params.apply_weight_gradients(&grads, 0.01);
     }
 
     let final_loss = mal_forward(&params, &cfg, &input_ids, &target_ids).0;
@@ -208,7 +208,7 @@ fn test_mal_vs_mag() {
         let (loss, cache) = mag_forward(&params_mag, &cfg_mag, &input_ids, &target_ids);
         if mag_initial.is_none() { mag_initial = Some(loss); }
         let grads = mag_backward(&params_mag, &cfg_mag, &cache, &input_ids, &target_ids);
-        params_mag.sgd_step(&grads, lr);
+        params_mag.apply_weight_gradients(&grads, lr);
     }
     let mag_final = mag_forward(&params_mag, &cfg_mag, &input_ids, &target_ids).0;
 
@@ -219,7 +219,7 @@ fn test_mal_vs_mag() {
         let (loss, cache) = mal_forward(&params_mal, &cfg_mal, &input_ids, &target_ids);
         if mal_initial.is_none() { mal_initial = Some(loss); }
         let grads = mal_backward(&params_mal, &cfg_mal, &cache, &input_ids, &target_ids);
-        params_mal.sgd_step(&grads, lr);
+        params_mal.apply_weight_gradients(&grads, lr);
     }
     let mal_final = mal_forward(&params_mal, &cfg_mal, &input_ids, &target_ids).0;
 

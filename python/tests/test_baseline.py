@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from baseline_pytorch import (
     load_weights_from_rust,
     forward_pytorch,
-    sgd_step_pytorch,
+    apply_weight_gradients_pytorch,
     make_config,
     make_chunks,
     TEXT,
@@ -21,7 +21,7 @@ from baseline_pytorch import (
     # MAG imports
     load_mag_weights_from_rust,
     forward_pytorch_mag,
-    sgd_step_mag_pytorch,
+    apply_weight_gradients_mag_pytorch,
     make_mag_config,
     make_mag_chunks,
     MAG_TEXT,
@@ -73,12 +73,12 @@ def test_loss_matches_10_steps():
         inp, tgt = CHUNKS[step % len(CHUNKS)]
 
         rust_loss, grads = nl_hecate.compute_gradients(rust_params, cfg, inp, tgt)
-        nl_hecate.sgd_step(rust_params, grads, lr)
+        nl_hecate.apply_weight_gradients(rust_params, grads, lr)
 
         pt_loss_t = forward_pytorch(pt_weights, inp, tgt)
         pt_loss = pt_loss_t.item()
         pt_loss_t.backward()
-        sgd_step_pytorch(pt_weights, lr)
+        apply_weight_gradients_pytorch(pt_weights, lr)
 
         assert math.isfinite(rust_loss), f"Rust loss not finite at step {step}"
         assert math.isfinite(pt_loss), f"PyTorch loss not finite at step {step}"
@@ -143,12 +143,12 @@ def test_mag_loss_matches_10_steps():
         inp, tgt = MAG_CHUNKS_TEST[step % len(MAG_CHUNKS_TEST)]
 
         rust_loss, grads = nl_hecate.mag_compute_gradients(rust_params, cfg, inp, tgt)
-        nl_hecate.mag_sgd_step(rust_params, grads, lr)
+        nl_hecate.mag_apply_weight_gradients(rust_params, grads, lr)
 
         pt_loss_t = forward_pytorch_mag(pt_weights, inp, tgt)
         pt_loss = pt_loss_t.item()
         pt_loss_t.backward()
-        sgd_step_mag_pytorch(pt_weights, lr)
+        apply_weight_gradients_mag_pytorch(pt_weights, lr)
 
         assert math.isfinite(rust_loss), f"Rust MAG loss not finite at step {step}"
         assert math.isfinite(pt_loss), f"PyTorch MAG loss not finite at step {step}"

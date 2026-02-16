@@ -633,8 +633,12 @@ mod tests {
                 }
 
                 #[test]
-                fn [<test_ $test_prefix _training_convergence>]() {
-                    // Training with chunkwise GD at C=4 should decrease loss
+                fn [<test_ $test_prefix _outer_loop_weight_descent>]() {
+                    // Validates outer-loop gradient flow: Enzyme-computed gradients on
+                    // projection weights decrease a proxy loss when applied as weight
+                    // updates. This is the outer loop — distinct from the inner loop
+                    // (memory updates inside the forward pass, which has no external
+                    // optimizer). See CS-10 through CS-17.
                     let cfg = MAGConfig::$config_fn();
                     let mut level_params = MAGParams::init(&cfg, 42).levels.into_iter().next().unwrap();
                     let s = cfg.swa.seq_len;
@@ -642,7 +646,6 @@ mod tests {
                     let lr = 0.1;
                     let chunk_size = 4.min(s);
 
-                    // Use larger-scale embedded and target for measurable gradient signal
                     let mut rng = SimpleRng::new(99);
                     let mut embedded = vec![0.0f32; s * d];
                     rng.fill_uniform(&mut embedded, 1.0);
@@ -653,20 +656,18 @@ mod tests {
                     let mut first_loss = 0.0f32;
                     let mut last_loss = 0.0f32;
 
-                    for step in 0..100 {
+                    for outer_step in 0..100 {
                         let (y, cache) = chunkwise_gd_forward(
                             &level_params, &embedded, s, d, chunk_size, &cfg, None,
                         );
 
-                        // MSE loss
                         let loss: f32 = y.iter().zip(target.iter())
                             .map(|(a, b)| (a - b).powi(2))
                             .sum::<f32>() / (s * d) as f32;
 
-                        if step == 0 { first_loss = loss; }
-                        if step == 99 { last_loss = loss; }
+                        if outer_step == 0 { first_loss = loss; }
+                        if outer_step == 99 { last_loss = loss; }
 
-                        // d_loss/dy = 2*(y-target) / N
                         let d_y: Vec<f32> = y.iter().zip(target.iter())
                             .map(|(a, b)| 2.0 * (a - b) / (s * d) as f32)
                             .collect();
@@ -675,7 +676,7 @@ mod tests {
                             &level_params, &cache, &d_y, &embedded, &cfg,
                         );
 
-                        // SGD step
+                        // Outer-loop weight update (projection weights, not inner-loop memory)
                         for (w, g) in level_params.w_k_mem.iter_mut().zip(grads.w_k_mem.iter()) { *w -= lr * g; }
                         for (w, g) in level_params.w_v_mem.iter_mut().zip(grads.w_v_mem.iter()) { *w -= lr * g; }
                         for (w, g) in level_params.w_q_mem.iter_mut().zip(grads.w_q_mem.iter()) { *w -= lr * g; }
@@ -691,9 +692,9 @@ mod tests {
 
                     // Matrix rules (Delta, Hebbian, etc.) should see clear convergence.
                     // MLP rules (MONETA, YAAD) have inner-loop GD that dominates — outer-loop
-                    // projection weight SGD may barely move loss at tiny scale. Allow non-increase.
+                    // projection weight updates may barely move loss at tiny scale. Allow non-increase.
                     assert!(last_loss <= first_loss + 1e-6,
-                        "{}: training loss should not increase: first={first_loss:.6} last={last_loss:.6}",
+                        "{}: outer-loop loss should not increase: first={first_loss:.6} last={last_loss:.6}",
                         stringify!($test_prefix));
                 }
             }

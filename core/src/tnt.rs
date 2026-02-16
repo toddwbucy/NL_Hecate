@@ -545,7 +545,11 @@ mod tests {
     }
 
     #[test]
-    fn test_tnt_training_convergence() {
+    fn test_tnt_outer_loop_weight_descent() {
+        // Validates outer-loop gradient flow through TNT hierarchical parallelization.
+        // The outer loop updates projection weights (W_K, W_V, W_Q) via Enzyme AD.
+        // The inner loop (memory updates inside the forward pass) runs without any
+        // external optimizer — it IS the forward pass. See CS-10 through CS-17.
         let cfg = MAGConfig::test_config();
         let mut level_params = MAGParams::init(&cfg, 42).levels.into_iter().next().unwrap();
         let s = cfg.swa.seq_len;
@@ -562,14 +566,14 @@ mod tests {
         let mut first_loss = 0.0f32;
         let mut last_loss = 0.0f32;
 
-        for step in 0..100 {
+        for outer_step in 0..100 {
             let (y, cache) = tnt_forward(
                 &level_params, &embedded, s, d, &tnt, &cfg, None,
             );
             let loss: f32 = y.iter().zip(target.iter())
                 .map(|(a, b)| (a - b).powi(2)).sum::<f32>() / (s * d) as f32;
-            if step == 0 { first_loss = loss; }
-            if step == 99 { last_loss = loss; }
+            if outer_step == 0 { first_loss = loss; }
+            if outer_step == 99 { last_loss = loss; }
 
             let d_y: Vec<f32> = y.iter().zip(target.iter())
                 .map(|(a, b)| 2.0 * (a - b) / (s * d) as f32).collect();
@@ -577,13 +581,14 @@ mod tests {
                 &level_params, &cache, &d_y, &embedded, &tnt, &cfg,
             );
 
+            // Outer-loop weight update (projection weights, not inner-loop memory)
             for (w, g) in level_params.w_k_mem.iter_mut().zip(grads.w_k_mem.iter()) { *w -= lr * g; }
             for (w, g) in level_params.w_v_mem.iter_mut().zip(grads.w_v_mem.iter()) { *w -= lr * g; }
             for (w, g) in level_params.w_q_mem.iter_mut().zip(grads.w_q_mem.iter()) { *w -= lr * g; }
         }
 
         assert!(last_loss <= first_loss + 1e-6,
-            "TNT training should not diverge: first={first_loss:.6} last={last_loss:.6}");
+            "TNT outer-loop weight descent should not diverge: first={first_loss:.6} last={last_loss:.6}");
     }
 
     #[test]

@@ -24,7 +24,7 @@ def test_sgd_training_loop():
     lr = 0.01
     for _ in range(50):
         _loss, grads = nl_hecate.compute_gradients(params, cfg, input_ids, target_ids)
-        nl_hecate.sgd_step(params, grads, lr)
+        nl_hecate.apply_weight_gradients(params, grads, lr)
 
     final_loss, _ = nl_hecate.forward(params, cfg, input_ids, target_ids)
     assert final_loss < initial_loss, (
@@ -43,7 +43,7 @@ def test_training_loss_trend():
     for _ in range(50):
         loss, grads = nl_hecate.compute_gradients(params, cfg, input_ids, target_ids)
         losses.append(loss)
-        nl_hecate.sgd_step(params, grads, lr)
+        nl_hecate.apply_weight_gradients(params, grads, lr)
 
     # Compare average of first 10 vs last 10
     avg_first = sum(losses[:10]) / 10
@@ -78,7 +78,7 @@ def test_mag_sgd_training_loop():
     lr = 0.01
     for _ in range(50):
         _loss, grads = nl_hecate.mag_compute_gradients(params, cfg, input_ids, target_ids)
-        nl_hecate.mag_sgd_step(params, grads, lr)
+        nl_hecate.mag_apply_weight_gradients(params, grads, lr)
 
     final_loss, _ = nl_hecate.mag_forward(params, cfg, input_ids, target_ids)
     assert final_loss < initial_loss, (
@@ -97,7 +97,7 @@ def test_mag_training_loss_trend():
     for _ in range(50):
         loss, grads = nl_hecate.mag_compute_gradients(params, cfg, input_ids, target_ids)
         losses.append(loss)
-        nl_hecate.mag_sgd_step(params, grads, lr)
+        nl_hecate.mag_apply_weight_gradients(params, grads, lr)
 
     avg_first = sum(losses[:10]) / 10
     avg_last = sum(losses[-10:]) / 10

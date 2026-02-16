@@ -175,8 +175,8 @@ fn compute_gradients(
 }
 
 #[pyfunction]
-fn sgd_step(params: &mut SWAParams, grads: &SWAParams, lr: f32) {
-    params.inner.sgd_step(&grads.inner, lr);
+fn apply_weight_gradients(params: &mut SWAParams, grads: &SWAParams, lr: f32) {
+    params.inner.apply_weight_gradients(&grads.inner, lr);
 }
 
 // ── MAGConfig ──────────────────────────────────────────────────────
@@ -489,8 +489,8 @@ fn mag_compute_gradients(
 }
 
 #[pyfunction]
-fn mag_sgd_step(params: &mut MAGParams, grads: &MAGParams, lr: f32) {
-    params.inner.sgd_step(&grads.inner, lr);
+fn mag_apply_weight_gradients(params: &mut MAGParams, grads: &MAGParams, lr: f32) {
+    params.inner.apply_weight_gradients(&grads.inner, lr);
 }
 
 // ── Module ───────────────────────────────────────────────────────────
@@ -505,7 +505,7 @@ fn nl_hecate(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(forward, m)?)?;
     m.add_function(wrap_pyfunction!(backward, m)?)?;
     m.add_function(wrap_pyfunction!(compute_gradients, m)?)?;
-    m.add_function(wrap_pyfunction!(sgd_step, m)?)?;
+    m.add_function(wrap_pyfunction!(apply_weight_gradients, m)?)?;
     // MAG
     m.add_class::<MAGConfig>()?;
     m.add_class::<MAGParams>()?;
@@ -515,6 +515,6 @@ fn nl_hecate(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mag_forward, m)?)?;
     m.add_function(wrap_pyfunction!(mag_backward, m)?)?;
     m.add_function(wrap_pyfunction!(mag_compute_gradients, m)?)?;
-    m.add_function(wrap_pyfunction!(mag_sgd_step, m)?)?;
+    m.add_function(wrap_pyfunction!(mag_apply_weight_gradients, m)?)?;
     Ok(())
 }

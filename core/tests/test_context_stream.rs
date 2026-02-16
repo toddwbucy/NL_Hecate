@@ -287,7 +287,7 @@ fn test_config_mismatch_rejected() {
 // ── Test 11: CMS k=2 training driven by ContextStream ──────────────────
 
 #[test]
-fn test_cms_training_via_stream() {
+fn test_cms_build_via_stream() {
     let cfg = MAGConfig::test_config_k2();
     let mut params = MAGParams::init(&cfg, 42);
 
@@ -324,7 +324,7 @@ fn test_cms_training_via_stream() {
         let grads = cms_backward(
             &params, &cfg, &cache, &chunk.input_ids, &chunk.target_ids, &mut error_buffers,
         );
-        params.sgd_step(&grads, lr);
+        params.apply_weight_gradients(&grads, lr);
 
         for level in 0..cfg.k {
             if pulse.active_levels[level] && error_buffers[level].steps_accumulated > 0 {

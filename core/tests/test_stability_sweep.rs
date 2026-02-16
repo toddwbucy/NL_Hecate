@@ -171,7 +171,7 @@ fn run_sweep_k1(cfg: &MAGConfig, steps: usize, lr: f32, seed: u64) -> SweepResul
             milestones.push((step, loss));
         }
 
-        params.sgd_step(&grads, lr);
+        params.apply_weight_gradients(&grads, lr);
     }
 
     milestones.push((steps, final_loss));
@@ -235,7 +235,7 @@ fn run_sweep_cms(cfg: &MAGConfig, steps: usize, lr: f32, seed: u64) -> SweepResu
             milestones.push((step, loss));
         }
 
-        params.sgd_step(&grads, lr);
+        params.apply_weight_gradients(&grads, lr);
 
         for level in 0..cfg.k {
             if pulse.active_levels[level] && error_buffers[level].steps_accumulated > 0 {

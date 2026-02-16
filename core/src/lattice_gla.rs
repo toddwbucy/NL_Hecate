@@ -371,7 +371,11 @@ mod tests {
     }
 
     #[test]
-    fn test_lattice_gla_training() {
+    fn test_lattice_gla_outer_loop_weight_descent() {
+        // Validates outer-loop gradient flow: Enzyme-computed gradients on
+        // projection weights (W_K, W_V, W_Q) decrease a proxy loss when applied
+        // as weight updates. This is the outer loop — distinct from the inner loop
+        // (memory updates inside the forward pass, which has no external optimizer).
         let cfg = MAGConfig::lattice_test_config();
         let mut lp = MAGParams::init(&cfg, 42).levels.into_iter().next().unwrap();
         let s = cfg.swa.seq_len;
@@ -387,24 +391,25 @@ mod tests {
         let mut first_loss = 0.0f32;
         let mut last_loss = 0.0f32;
 
-        for step in 0..100 {
+        for outer_step in 0..100 {
             let (y, cache) = lattice_gla_forward(&lp, &embedded, s, d, 2, &cfg, None);
             let loss: f32 = y.iter().zip(target.iter())
                 .map(|(a, b)| (a - b).powi(2)).sum::<f32>() / (s * d) as f32;
-            if step == 0 { first_loss = loss; }
-            if step == 99 { last_loss = loss; }
+            if outer_step == 0 { first_loss = loss; }
+            if outer_step == 99 { last_loss = loss; }
 
             let d_y: Vec<f32> = y.iter().zip(target.iter())
                 .map(|(a, b)| 2.0 * (a - b) / (s * d) as f32).collect();
             let (grads, _) = lattice_gla_backward(&lp, &cache, &d_y, &embedded, &cfg);
 
+            // Outer-loop weight update (projection weights, not inner-loop memory)
             for (w, g) in lp.w_k_mem.iter_mut().zip(grads.w_k_mem.iter()) { *w -= lr * g; }
             for (w, g) in lp.w_v_mem.iter_mut().zip(grads.w_v_mem.iter()) { *w -= lr * g; }
             for (w, g) in lp.w_q_mem.iter_mut().zip(grads.w_q_mem.iter()) { *w -= lr * g; }
         }
 
         assert!(last_loss <= first_loss + 1e-6,
-            "Lattice GLA training should not diverge: {first_loss:.6} → {last_loss:.6}");
+            "Lattice GLA outer-loop weight descent should not diverge: {first_loss:.6} → {last_loss:.6}");
     }
 
     // ─── Trellis tests ──────────────────────────────────────
@@ -486,7 +491,9 @@ mod tests {
     }
 
     #[test]
-    fn test_trellis_gla_training() {
+    fn test_trellis_gla_outer_loop_weight_descent() {
+        // Validates outer-loop gradient flow through Trellis GLA parallelization.
+        // See test_lattice_gla_outer_loop_weight_descent for design rationale.
         let cfg = MAGConfig::trellis_test_config();
         let mut lp = MAGParams::init(&cfg, 42).levels.into_iter().next().unwrap();
         let s = cfg.swa.seq_len;
@@ -502,24 +509,25 @@ mod tests {
         let mut first_loss = 0.0f32;
         let mut last_loss = 0.0f32;
 
-        for step in 0..100 {
+        for outer_step in 0..100 {
             let (y, cache) = trellis_gla_forward(&lp, &embedded, s, d, 2, &cfg, None);
             let loss: f32 = y.iter().zip(target.iter())
                 .map(|(a, b)| (a - b).powi(2)).sum::<f32>() / (s * d) as f32;
-            if step == 0 { first_loss = loss; }
-            if step == 99 { last_loss = loss; }
+            if outer_step == 0 { first_loss = loss; }
+            if outer_step == 99 { last_loss = loss; }
 
             let d_y: Vec<f32> = y.iter().zip(target.iter())
                 .map(|(a, b)| 2.0 * (a - b) / (s * d) as f32).collect();
             let (grads, _) = trellis_gla_backward(&lp, &cache, &d_y, &embedded, &cfg);
 
+            // Outer-loop weight update (projection weights, not inner-loop memory)
             for (w, g) in lp.w_k_mem.iter_mut().zip(grads.w_k_mem.iter()) { *w -= lr * g; }
             for (w, g) in lp.w_v_mem.iter_mut().zip(grads.w_v_mem.iter()) { *w -= lr * g; }
             for (w, g) in lp.w_q_mem.iter_mut().zip(grads.w_q_mem.iter()) { *w -= lr * g; }
         }
 
         assert!(last_loss <= first_loss + 1e-6,
-            "Trellis GLA training should not diverge: {first_loss:.6} → {last_loss:.6}");
+            "Trellis GLA outer-loop weight descent should not diverge: {first_loss:.6} → {last_loss:.6}");
     }
 
     #[test]
