@@ -1,77 +1,96 @@
 # NL_Hecate Progress Report
 
 **Project**: NL_Hecate — Nested Learning implementation in Rust + Enzyme AD + CUDA
-**Status**: Phase 3 in progress
+**Status**: Stage 2 (Production Infrastructure) in progress — S2-M1 through S2-M3 complete
 
 ---
 
 ## Executive Summary
 
-NL_Hecate implements the Nested Learning research program (Mirrokni/Behrouz, Google Research) in Rust with Enzyme AD and CUDA kernels. The project has validated the full pipeline from Enzyme differentiation through 4-level continuous memory systems with two MIRAS memory rules, and has produced a concrete empirical result: **CMS nesting provides implicit regularization that extends the stable operating range of inner-loop learning rates**.
+NL_Hecate implements the Nested Learning research program (Mirrokni/Behrouz, Google Research) in Rust with Enzyme AD and CUDA kernels. In roughly 48 hours of implementation across Stages 1-2, the project built the essential forward/backward/optimize pipeline — 8 memory rules, 3 composition patterns, 5 parallelization strategies, CUDA kernel pairs, multi-GPU sync, and serving — that replaces PyTorch's training/inference stack with a unified self-modifying forward pass.
 
-**Total test count**: 166 Rust lib + 17 CMS integration + 5 Enzyme vec + 5 Titans = **193 Rust tests** + 27 Python = **220 total**
-**PRs merged**: 12
+**Total test count**: 796 Rust + 27 Python = **823 total** (796 = 778 existing + 18 serving)
+**PRs merged**: 25 (plus S2-M2 and S2-M3 pending)
+**Codebase**: ~24K lines Rust source + ~8K lines Rust tests + ~1.2K lines CUDA + ~1.2K lines Python
 
 ---
 
-## Phase Summary
+## Stage Summary
 
-### Phase 0: Enzyme Spike (COMPLETE — 57/57)
+### Stage 0: Foundation (COMPLETE)
+
+**Phase 0: Enzyme Spike** (57/57 tests)
 - Proved Enzyme differentiates through Rust trait dispatch
 - Manual chain-rule composition at kernel boundaries works
-- `#[custom_vjp]` not needed — manual composition is sufficient
 - Toolchain pinned at SHA d7daac06 (rustc 1.95.0-nightly)
 
-### Track Zero-A: Pure SWA Attention (COMPLETE — 67 tests)
-1. **Phase 1** — Rust core: forward/backward, 6 weight matrices gradient-checked vs FD
-2. **Phase 2** — CUDA kernels: SWA forward+backward pair, feature-gated dispatch, warp reduction
-3. **Phase 3** — PyO3 bindings: Maturin build, Python API
-4. **Phase 4** — PyTorch regression baseline: validates Rust matches PyTorch
+**Track Zero-A: Pure SWA Attention** (67 tests)
+- Rust core: forward/backward, 6 weight matrices gradient-checked vs FD
+- CUDA kernels: SWA forward+backward pair, feature-gated dispatch, warp reduction
+- PyO3 bindings: Maturin build, Python API
+- PyTorch regression baseline: validates Rust matches PyTorch
 
-### Track Zero-B: Delta Rule + MAG (COMPLETE — 98 tests)
-1. **Phase 1** — MemoryRule trait, DeltaRule impl, MAG dual-branch composition, sigmoid gating
-2. **Phase 2** — PyO3 bindings + PyTorch baseline for MAG
-- 7 memory weight matrices gradient-checked (w_k_mem, w_v_mem, w_q_mem, w_alpha, b_alpha, w_theta, b_theta)
+**Track Zero-B: Delta Rule + MAG** (98 tests)
+- MemoryRule trait, DeltaRule impl, MAG dual-branch composition, sigmoid gating
+- 7 memory weight matrices gradient-checked
 - Gate bias init: b_alpha=3.0 (sigmoid~0.95), b_theta=-4.6 (softplus~0.01)
 
-### Phase 2: CMS k=2 (COMPLETE — 140 tests)
-- Conductor/Pulse scheduling: Level 0 fires every step, Level 1 every 8th
-- ErrorBuffer: frozen levels accumulate gradients, apply on reactivation
-- ContextState: persists memory across forward calls
-- 14 FD gradient checks (7 per level)
-- 5 integration tests: 100/1K/10K steps, error buffer health, k=1 vs k=2
+### Stage 1: Algorithm Core (COMPLETE — 778 Rust + 27 Python = 805 tests)
 
-### Phase 2.5: k=2 Validation (COMPLETE — 142 tests)
-- **Key result: k=2 beats k=1 by 62.33%** (loss 0.056 vs 0.149)
-- d=32 validation configs (32x32=1024 param memory per level)
-- Multi-scale data generator with fast+slow temporal patterns
-- Diagnostic test: gate stats, per-level output norms, memory norms at milestones
+All 22 milestones delivered. This is the mathematical heart of the system — everything that PyTorch's autograd + optimizer + DataLoader + model.train()/model_eval() does, reimplemented as a single self-modifying forward pass.
 
-### Phase 3: CMS k=4 (COMPLETE — 169 tests)
-- Full 4-level frequency hierarchy: [1, 8, 64, 512] step periods
-- 14 new FD gradient checks (7 per level for levels 2,3)
-- 6 integration tests: 100/1K/10K steps + k=4 vs k=2 comparison + diagnostics + error buffer
-- k=4 beats k=2 by 2.42% (loss 0.0549 vs 0.0563 at d=32/seq=32)
-- **Finding**: Additive level composition (y_combined = SUM) grows linearly with k, requiring conservative gate init on higher levels
+**Memory Rules (8/8)**:
+- Delta Rule (GD, matrix structure, L2 bias)
+- Titans LMM (GD+momentum, eta gate, momentum accumulator S)
+- Hebbian Rule (direct correlation, no gradient descent)
+- MONETA (2-layer MLP, l_p bias, elastic net retention)
+- YAAD (Huber loss, decoupled local+global retention)
+- MEMORA (KL-softmax bias, emergence-based retention)
+- Lattice OSR (orthogonal state recurrence, slot-based compression)
+- Trellis (two-pass KV compression, separate key/value decay)
 
-### Titans LMM (COMPLETE — 174 tests)
-- Second MIRAS variant: GD + momentum algorithm (adds eta gate + momentum accumulator S)
-- 5 new tests: smoke, convergence, momentum nonzero, k=2 multiscale, Titans vs Delta comparison
-- Validates that MemoryRule trait abstraction works for multiple rule types
-- Titans LMM converges comparably to Delta Rule at small scale
+**Composition Patterns (3/3)**:
+- MAG: Memory gates attention output via sigmoid (parallel branches)
+- MAL: Memory preprocesses input for attention (sequential, residual)
+- MAC: Memory provides context, attention processes assembled input
 
-### Phase 3.5: Output Normalization (COMPLETE — 192 tests)
-- 1/sqrt(k) normalization of combined level outputs for k>2
-- Prevents sigmoid saturation from additive signal growth
-- Applied in both forward (y_combined scaling) and backward (d_y_combined chain rule)
-- k=2 unaffected (guard: only k>2 is normalized)
-- 3 new tests: magnitude invariance, uniform init stability, k=4 convergence
+**CMS Frequency Scheduling**:
+- k=1 (single level), k=2 (two-frequency), k=4 (full hierarchy: 1/8/64/512)
+- Conductor/Pulse timing, ErrorBuffer gradient accumulation, ContextState persistence
+- 1/sqrt(k) output normalization for k>2
 
-### Stability Boundary (COMPLETE — 193 tests)
-- **Key result: CMS nesting is stabilizing** — proved with reproducible test
-- At b_theta=1.2 (softplus=1.49), lr=0.02: k=1 diverges at step ~9K, k=2 converges with 98.7% loss reduction
-- Same model, same data, same lr — only difference is k
-- Empirically measured boundary: k=1 stable at b_theta<=1.0, diverges at 1.2; k=2 stable through 1.2, diverges at 1.5
+**Parallelization Strategies (5/5)**:
+- Chunkwise GD (baseline)
+- Associative Scan (parallel prefix)
+- TNT Hierarchical (chunk+inter-chunk)
+- Lattice GLA (gated linear attention)
+- Atlas Parallel (memory-optimized)
+
+**Infrastructure**:
+- ContextStream: replaces DataLoader (no epochs, monotonic cursor, checkpoint-serializable)
+- 100K stability sweep across all rule/composition/k combinations
+- PyO3 bindings for all rules + compositions
+
+### Stage 2: Production Infrastructure (IN PROGRESS — S2-M1 through S2-M3 complete)
+
+**S2-M1: CUDA Kernel Pairs** (PR #25)
+- Forward + backward kernels for SWA, Delta Rule, Titans LMM, Hebbian
+- Composition dispatch kernels for MAG/MAL/MAC
+- Warp reduction via __shfl_down_sync, atomicAdd scatter
+- Forward tolerance: 1e-5, backward: 1e-4 per-element vs Rust reference
+
+**S2-M2: CMS-Aware Multi-GPU Gradient Sync** (PR #26)
+- Replaces DDP: only active CMS levels synchronized (not all parameters every step)
+- MockProcessGroup for testing without real multi-GPU hardware
+- AllReduce averaging + ErrorBuffer integration for frozen levels
+
+**S2-M3: Serving Non-Stationary Models** (this PR)
+- Session struct: per-user isolated ContextState + Conductor
+- Two modes: Test (bounded) and Stream (unbounded via ContextStream) — no mode flag (CS-10)
+- process_chunk calls cms_forward directly — same path as build (CS-18)
+- LatencyTracker: average/worst/p99 for SLA validation
+- Checkpoint/restore with pulse_id verification
+- 18 tests proving: latency stability, memory evolution, session isolation, params read-only
 
 ---
 
@@ -81,8 +100,6 @@ NL_Hecate implements the Nested Learning research program (Mirrokni/Behrouz, Goo
 
 The most significant finding: multi-level CMS nesting provides **implicit regularization** that extends the stable operating range of inner-loop learning rates.
 
-Empirically measured stability boundary at d=32, lr=0.02:
-
 | b_theta | softplus(b_theta) | k=1 | k=2 |
 |---|---|---|---|
 | 0.0 | 0.69 | converges (0.149) | converges (0.150, tie) |
@@ -90,110 +107,100 @@ Empirically measured stability boundary at d=32, lr=0.02:
 | **1.2** | **1.49** | **NaN at step ~9K** | **converges (0.055)** |
 | 1.5 | 1.74 | NaN at step ~8.5K | NaN |
 
-The mechanism: k=2 distributes the outer-loop gradient across two levels. The slow level (fires every 8th step) acts as a temporal momentum buffer that smooths the optimization landscape. This is analogous to mini-batch SGD's variance reduction, but applied to the temporal axis of memory updates.
+### 2. Inner Loop IS the Forward Pass
 
-### 2. CMS Advantage Requires Per-Level Tuning
+The serving module proves the central NL thesis: there is no train/eval distinction. Session::process_chunk calls cms_forward — the exact same function used during build. Memory self-modifies during inference. Per-token latency is O(1) with respect to context length because memory matrices are fixed-size (d times d).
 
-At identical initialization (b_theta=0.0 for both levels), k=1 and k=2 tie (~0.149). The advantage emerges only when k=2's extended stability range is exploited with more aggressive init (b_theta=1.0 on Level 0).
+### 3. MLP Rules: Inner Loop Dominates
 
-### 3. Additive Level Composition Scaling
+For MONETA/YAAD/MEMORA (MLP-based memory structure), the outer-loop SGD barely affects loss. The MLP inner loop is expressive enough to fit without outer-loop weight changes. This suggests MLP memory rules may be more suitable for pure serving (no outer-loop needed) than matrix rules.
 
-y_combined = SUM(level outputs) grows linearly with k. At k=4, the summed signal pushes sigmoid into saturation, causing gradient vanishing. Fixed with 1/sqrt(k) normalization (variance-preserving, applied only for k>2).
+### 4. Additive Level Composition Scaling
 
-### 4. Inner-Loop and Outer-Loop Entanglement
-
-Output normalization scales backward gradients to ALL memory parameters, making gate biases learn 1/sqrt(k) slower. The inner-loop learning rate (controlled by b_theta) is independent of output normalization — higher levels need conservative b_theta regardless because their memory M accumulates over more steps.
-
-### Hyperparameter Sensitivity at d=32
-
-| Setting | k=1 | k=2 |
-|---|---|---|
-| b_theta=-4.6 (default) | gate stuck at 0.5 | gate stuck at 0.5 |
-| b_theta=0.0, lr=0.02 | 0.149 (converges) | 0.150 (converges, tie) |
-| b_theta=1.0, lr=0.02 | converges (near boundary) | **0.056** (converges) |
-| b_theta=1.2, lr=0.02 | **NaN** (step ~9K) | **0.055** (converges, 98.7% reduction) |
+y_combined = SUM(level outputs) grows linearly with k. At k=4, the summed signal pushes sigmoid into saturation. Fixed with 1/sqrt(k) normalization (variance-preserving, applied only for k>2).
 
 ---
 
 ## Architecture
 
 ```text
-core/src/                        (~6,800 lines)
-  tensor.rs       — SIMD-friendly primitives, RNG, sigmoid, softplus, outer product
-  swa.rs          — Sliding Window Attention forward/backward
-  model.rs        — SWAConfig/Params, MAGConfig/Params, MemoryLevelParams
-  forward.rs      — SWA forward pass
-  backward.rs     — SWA backward pass (Enzyme AD)
-  gradient.rs     — FD gradient checking framework, MAG/CMS gradient computation
-  delta_rule.rs   — MemoryRule trait + DeltaRule impl (INIT/WRITE/READ/STEP)
-  titans_lmm.rs   — TitansLMM impl (GD + momentum, eta gate)
-  mag.rs          — MAG composition + CMS forward/backward + 1/sqrt(k) normalization
-  conductor.rs    — Conductor/Pulse/ContextState/ErrorBuffer
-  dispatch.rs     — CPU/CUDA feature-gated dispatch
-  cuda_ffi.rs     — CUDA FFI bindings
+core/src/                          (~24,400 lines, 30 modules)
+  tensor.rs        — SIMD-friendly primitives, RNG, sigmoid, softplus
+  swa.rs           — Sliding Window Attention forward/backward
+  model.rs         — SWAConfig/Params, MAGConfig/Params, MemoryLevelParams
+  forward.rs       — SWA forward pass
+  backward.rs      — SWA backward pass (Enzyme AD)
+  gradient.rs      — FD gradient checking, MAG/CMS/MAL/MAC gradient computation
+  delta_rule.rs    — MemoryRule trait + DeltaRule (GD, matrix, L2)
+  titans_lmm.rs    — TitansLMM (GD+momentum, eta gate)
+  hebbian_rule.rs  — HebbianRule (direct correlation)
+  moneta.rs        — MONETA (MLP, l_p, elastic net)
+  yaad.rs          — YAAD (Huber, decoupled retention)
+  memora.rs        — MEMORA (KL-softmax, emergence)
+  lattice_osr.rs   — Lattice OSR (orthogonal state recurrence)
+  trellis.rs       — Trellis (two-pass KV compression)
+  mag.rs           — MAG composition + CMS forward/backward
+  mal.rs           — MAL composition
+  mac.rs           — MAC composition
+  dispatch.rs      — CPU/CUDA feature-gated dispatch
+  conductor.rs     — Conductor/Pulse/ContextState/ErrorBuffer
+  context_stream.rs — ContextStream trait + VecStream
+  parallel.rs      — Parallelization strategy configs
+  chunkwise_gd.rs  — Chunkwise GD parallelization
+  associative_scan.rs — Parallel prefix scan
+  tnt.rs           — TNT hierarchical parallelization
+  lattice_gla.rs   — Gated linear attention
+  atlas_parallel.rs — Atlas memory-optimized parallel
+  serving.rs       — Session/LatencyTracker/Checkpoint (feature: serving)
+  distributed.rs   — CMS-aware multi-GPU sync (feature: distributed)
+  cuda_ffi.rs      — CUDA FFI bindings (feature: cuda)
 
-core/kernels/                    (~284 lines)
-  swa_forward.cu  — CUDA SWA forward kernel (warp reduction, __shfl_down_sync)
-  swa_backward.cu — CUDA SWA backward kernel (analytical gradients, atomicAdd)
+core/kernels/                      (~1,250 lines, 8 kernel files)
+  swa_forward.cu / swa_backward.cu
+  delta_forward.cu / delta_backward.cu
+  titans_forward.cu / titans_backward.cu
+  hebbian_forward.cu / hebbian_backward.cu
 
-core/tests/                      (~2,074 lines)
-  test_enzyme_vec.rs  — Enzyme + Vec<f32> validation (5 tests)
-  test_cms.rs         — CMS integration + validation + stability boundary (17 tests)
-  test_cuda_swa.rs    — CUDA kernel tests (feature-gated)
-  test_titans.rs      — Titans LMM integration tests (5 tests)
+core/tests/                        (~8,350 lines, 23 test files)
 
-python/                          (~455 lines)
-  nl_hecate/      — PyO3 bindings
-  tests/          — PyTorch baseline + binding tests (27 tests)
+python/                            (~1,200 lines)
+  nl_hecate/       — PyO3 bindings (all rules + compositions)
+  tests/           — PyTorch baseline + binding tests (27 tests)
 ```
-
----
-
-## Test Breakdown
-
-| Suite | Count | Coverage |
-|---|---|---|
-| Rust lib (core/src) | 166 | Tensor ops, SWA, Delta Rule, Titans LMM, MAG, conductor, FD gradient checks |
-| CMS integration (core/tests/test_cms.rs) | 17 | k=2/k=4 smoke/convergence/10K, stability boundary, normalization, diagnostics |
-| Enzyme vec (core/tests/test_enzyme_vec.rs) | 5 | Enzyme AD with Vec<f32>, struct fields, slice params |
-| Titans (core/tests/test_titans.rs) | 5 | Titans LMM: smoke, convergence, momentum, k=2, vs Delta |
-| Python (python/tests/) | 27 | PyO3 bindings, PyTorch baseline comparison |
-| **Total** | **220** | |
-
-CUDA tests (test_cuda_swa.rs) are feature-gated and run separately with `--features cuda`.
 
 ---
 
 ## PR History
 
-| PR | Title |
-|---|---|
-| #1 | Phase 0: Enzyme spike test suite |
-| #2 | Phase 0 spike complete: 57/57 pass, OUTCOME 1 GO |
-| #3 | Track Zero-A Phase 1: Rust core with SWA forward/backward |
-| #4 | Track Zero-A Phase 2: CUDA SWA kernel pair |
-| #5 | Track Zero-A Phase 3: PyO3 Python bindings |
-| #6 | Track Zero-A Phase 4: PyTorch regression baseline |
-| #7 | Track Zero-B Phase 1: Delta Rule + MAG composition |
-| #8 | Track Zero-B Phase 2: PyO3 bindings + PyTorch MAG baseline |
-| #9 | Phase 2: CMS k=2 — multi-level memory scheduling |
-| #10 | Phase 3: CMS k=4 — full frequency hierarchy |
-| #11 | Titans LMM: GD+momentum memory rule |
-| #12 | Phase 3.5: CMS output normalization (1/sqrt(k) for k>2) |
-
----
-
-## Next: Completing Phase 3
-
-Phase 3 requires multiple memory rules and a combinatorial sweep. Current status:
-
-**Memory Rules**: 2/9 implemented (Delta Rule, Titans LMM). Next: Hebbian (simplest), MONETA (MLP family), Lattice OSR (compression family).
-
-**Composition Patterns**: 1/3 implemented (MAG). MAC and MAL are optional for Phase 3.
-
-**Parallelization**: 1/5 implemented (Chunkwise GD, implicit). Associative Scan and TNT Hierarchical are lower priority.
-
-**Combinatorial Sweep**: Not started. Requires an automated harness to test valid MIRAS pairings across 100/1K/10K step horizons. Falsification criterion: >20% degenerate dynamics invalidates the orthogonality framing.
+| PR | Title | Stage |
+|---|---|---|
+| #1 | Phase 0: Enzyme spike test suite | S0 |
+| #2 | Phase 0 spike complete: 57/57 pass, OUTCOME 1 GO | S0 |
+| #3 | Track Zero-A Phase 1: Rust core with SWA forward/backward | S0 |
+| #4 | Track Zero-A Phase 2: CUDA SWA kernel pair | S0 |
+| #5 | Track Zero-A Phase 3: PyO3 Python bindings | S0 |
+| #6 | Track Zero-A Phase 4: PyTorch regression baseline | S0 |
+| #7 | Track Zero-B Phase 1: Delta Rule + MAG composition | S0 |
+| #8 | Track Zero-B Phase 2: PyO3 bindings + PyTorch MAG baseline | S0 |
+| #9 | CMS k=2 — multi-level memory scheduling | S0 |
+| #10 | CMS k=4 — full frequency hierarchy | S0 |
+| #11 | Titans LMM: GD+momentum memory rule | S1 |
+| #12 | CMS output normalization (1/sqrt(k) for k>2) | S1 |
+| #13 | Stability boundary test | S1 |
+| #14 | Hebbian rule implementation | S1 |
+| #15 | MONETA: MLP memory rule | S1 |
+| #16 | YAAD: Huber decoupled retention | S1 |
+| #17 | MEMORA: KL-softmax emergence | S1 |
+| #18 | Lattice OSR: orthogonal state recurrence | S1 |
+| #19 | Trellis: two-pass KV compression | S1 |
+| #20 | Update PyO3 bindings for all MIRAS rules | S1 |
+| #21 | MAC/MAL composition patterns | S1 |
+| #22 | ContextStream implementation | S1 |
+| #23 | 100K stability sweep expansion | S1 |
+| #24 | Parallelization strategies (5/5) | S1 |
+| #25 | CUDA kernel pairs (S2-M1) | S2 |
+| #26 | CMS-aware multi-GPU gradient sync (S2-M2) | S2 |
+| #27 | Serving non-stationary models (S2-M3) | S2 |
 
 ---
 
@@ -201,16 +208,30 @@ Phase 3 requires multiple memory rules and a combinatorial sweep. Current status
 
 | Metric | Value |
 |---|---|
-| Total tests | 220 (193 Rust + 27 Python) |
-| Rust lib tests | 166 |
-| Rust integration tests | 27 (17 CMS + 5 Enzyme + 5 Titans) |
+| Total tests | 823 (796 Rust + 27 Python) |
+| Rust lib tests | 611 |
+| Rust integration tests | 185 |
 | Python tests | 27 |
-| PRs merged | 12 |
+| PRs merged/pending | 27 |
 | Spec files | 48 |
-| Lines of Rust (core/src) | ~6,800 |
-| Lines of Rust (core/tests) | ~2,074 |
-| Lines of CUDA (kernels) | ~284 |
-| Lines of Python (bindings+tests) | ~455 |
-| Memory rules implemented | 2 (Delta Rule, Titans LMM) |
+| Lines of Rust (core/src) | ~24,400 |
+| Lines of Rust (core/tests) | ~8,350 |
+| Lines of CUDA (kernels) | ~1,250 |
+| Lines of Python (bindings+tests) | ~1,200 |
+| Memory rules | 8/8 |
+| Composition patterns | 3/3 |
+| Parallelization strategies | 5/5 |
 | CMS levels validated | k=1, k=2, k=4 |
-| MIRAS knobs exercised | Structure (matrix), Bias (L2), Retention (L2 decay), Algorithm (GD, GD+momentum) |
+| MIRAS knobs exercised | All 4 (Structure, Bias, Retention, Algorithm) |
+
+---
+
+## What's Next: S2-M4 (Edge Deployment)
+
+Deploy micro models (d <= 128) on CPU with zero external dependencies. The inner loop enables on-device adaptation without retraining.
+
+- Profile 1: Inner-loop only (no Enzyme on target, pre-computed outer-loop weights)
+- Profile 2: Full NL (Enzyme on target for fine-tuning)
+- Profile 3: WASM (browser deployment)
+- Target matrix: x86, aarch64, armv7, riscv64, wasm32
+- Benchmark: 18k tok/s target on single CPU thread (d=64-128)
