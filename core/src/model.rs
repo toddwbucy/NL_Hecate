@@ -7,6 +7,7 @@ use crate::tensor::SimpleRng;
 use crate::parallel::ParallelConfig;
 use crate::retention::{RetentionKind, default_retention};
 use crate::m3::{M3Config, M3State, m3_step, flatten_mag_params, unflatten_to_mag_grads};
+use crate::dynamic_freq::DynamicFreqConfig;
 
 /// Which composition pattern to use (Titans Section 4).
 ///
@@ -335,6 +336,11 @@ pub struct MAGConfig {
     pub retention: RetentionKind,
     /// M3 multi-scale optimizer config. None = plain SGD (default).
     pub m3: Option<M3Config>,
+    /// Enable dynamic frequency scheduling (learned gates instead of fixed modulo).
+    /// Default: false (fixed scheduling, backward compatible).
+    pub dynamic_scheduling: bool,
+    /// Dynamic frequency scheduler config (only used when dynamic_scheduling=true).
+    pub dynamic_freq_config: DynamicFreqConfig,
 }
 
 /// Default gate bias init values per level index.
@@ -396,6 +402,8 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: DynamicFreqConfig::default(),
         }
     }
 
@@ -419,6 +427,8 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: DynamicFreqConfig::default(),
         }
     }
 
@@ -442,6 +452,8 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: DynamicFreqConfig::default(),
         }
     }
 
@@ -466,6 +478,8 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: DynamicFreqConfig::default(),
         }
     }
 
@@ -490,6 +504,8 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: DynamicFreqConfig::default(),
         }
     }
 
@@ -514,6 +530,8 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: DynamicFreqConfig::default(),
         }
     }
 
@@ -537,6 +555,8 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: DynamicFreqConfig::default(),
         }
     }
 
@@ -560,6 +580,8 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: DynamicFreqConfig::default(),
         }
     }
 
@@ -583,6 +605,8 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: DynamicFreqConfig::default(),
         }
     }
 
@@ -606,6 +630,8 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: DynamicFreqConfig::default(),
         }
     }
 
@@ -638,6 +664,8 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: DynamicFreqConfig::default(),
         }
     }
 
@@ -670,6 +698,8 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: DynamicFreqConfig::default(),
         }
     }
 
@@ -702,6 +732,8 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: DynamicFreqConfig::default(),
         }
     }
 
@@ -734,6 +766,8 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: DynamicFreqConfig::default(),
         }
     }
 
@@ -766,6 +800,8 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::MEMORA),
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: DynamicFreqConfig::default(),
         }
     }
 
@@ -798,6 +834,8 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::MEMORA),
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: DynamicFreqConfig::default(),
         }
     }
 
@@ -822,6 +860,8 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::LatticeOSR),
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: DynamicFreqConfig::default(),
         }
     }
 
@@ -846,6 +886,8 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::LatticeOSR),
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: DynamicFreqConfig::default(),
         }
     }
 
@@ -873,6 +915,8 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: DynamicFreqConfig::default(),
         }
     }
 
@@ -900,6 +944,8 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: DynamicFreqConfig::default(),
         }
     }
 
@@ -923,6 +969,8 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: DynamicFreqConfig::default(),
         }
     }
 
@@ -946,6 +994,8 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: DynamicFreqConfig::default(),
         }
     }
 
@@ -970,6 +1020,8 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: DynamicFreqConfig::default(),
         }
     }
 
@@ -993,6 +1045,8 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: DynamicFreqConfig::default(),
         }
     }
 }

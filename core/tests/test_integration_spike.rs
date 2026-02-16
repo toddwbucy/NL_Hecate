@@ -59,6 +59,8 @@ fn spike_config_a() -> MAGConfig {
         parallel: None,
         retention: RetentionKind::L2WeightDecay,
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: nl_hecate_core::dynamic_freq::DynamicFreqConfig::default(),
     }
 }
 
@@ -84,6 +86,8 @@ fn spike_config_b() -> MAGConfig {
         parallel: None,
         retention: RetentionKind::L2WeightDecay,
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: nl_hecate_core::dynamic_freq::DynamicFreqConfig::default(),
     }
 }
 
@@ -109,6 +113,8 @@ fn spike_config_c() -> MAGConfig {
         parallel: None,
         retention: RetentionKind::L2WeightDecay,
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: nl_hecate_core::dynamic_freq::DynamicFreqConfig::default(),
     }
 }
 
@@ -693,6 +699,8 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
             _ => RetentionKind::L2WeightDecay,
         },
         m3: None,
+        dynamic_scheduling: false,
+        dynamic_freq_config: nl_hecate_core::dynamic_freq::DynamicFreqConfig::default(),
     }
 }
 

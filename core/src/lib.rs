@@ -34,6 +34,7 @@ pub mod cms_variants;
 pub(crate) mod cuda_ffi;
 pub mod conductor;
 pub mod context_stream;
+pub mod dynamic_freq;
 pub mod dispatch;
 #[cfg(feature = "distributed")]
 pub mod distributed;

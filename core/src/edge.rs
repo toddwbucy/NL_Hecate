@@ -67,6 +67,8 @@ impl EdgeConfig {
             parallel: None,
             retention: default_retention(self.memory_rule),
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: crate::dynamic_freq::DynamicFreqConfig::default(),
         }
     }
 

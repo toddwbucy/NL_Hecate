@@ -359,6 +359,8 @@ impl MAGConfig {
                 parallel: None,
                 retention: ret_kind,
                 m3: m3_cfg,
+                dynamic_scheduling: false,
+                dynamic_freq_config: nl_hecate_core::dynamic_freq::DynamicFreqConfig::default(),
             },
         })
     }

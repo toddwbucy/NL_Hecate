@@ -203,6 +203,8 @@ fn test_mac_vs_mag() {
         parallel: None,
         retention: RetentionKind::L2WeightDecay,
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: nl_hecate_core::dynamic_freq::DynamicFreqConfig::default(),
     };
     let cfg_mac = MAGConfig {
         swa: swa_mac, memory_enabled: true,
@@ -213,6 +215,8 @@ fn test_mac_vs_mag() {
         parallel: None,
         retention: RetentionKind::L2WeightDecay,
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: nl_hecate_core::dynamic_freq::DynamicFreqConfig::default(),
     };
 
     let seq_len = 8;

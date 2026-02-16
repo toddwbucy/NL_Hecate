@@ -95,6 +95,8 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
             _ => RetentionKind::L2WeightDecay,
         },
         m3: None,
+        dynamic_scheduling: false,
+        dynamic_freq_config: nl_hecate_core::dynamic_freq::DynamicFreqConfig::default(),
     }
 }
 

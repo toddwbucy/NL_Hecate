@@ -213,6 +213,8 @@ fn test_lattice_vs_delta() {
         parallel: None,
         retention: RetentionKind::L2WeightDecay,
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: nl_hecate_core::dynamic_freq::DynamicFreqConfig::default(),
     };
     let cfg_lattice = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
@@ -223,6 +225,8 @@ fn test_lattice_vs_delta() {
         parallel: None,
         retention: RetentionKind::SphereNormalization,
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: nl_hecate_core::dynamic_freq::DynamicFreqConfig::default(),
     };
 
     let input_ids: Vec<usize> = (0..swa.seq_len).map(|t| t % swa.vocab_size).collect();

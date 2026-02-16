@@ -48,6 +48,8 @@ fn tiny_config(rule: MemoryRuleKind, retention: RetentionKind) -> MAGConfig {
         parallel: None,
         retention,
         m3: None,
+        dynamic_scheduling: false,
+        dynamic_freq_config: nl_hecate_core::dynamic_freq::DynamicFreqConfig::default(),
     }
 }
 

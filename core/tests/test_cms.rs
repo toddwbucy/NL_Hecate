@@ -208,6 +208,8 @@ fn test_k2_beats_k1() {
 
         retention: RetentionKind::L2WeightDecay,
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: nl_hecate_core::dynamic_freq::DynamicFreqConfig::default(),
 
         };
     // k=2 config
@@ -221,6 +223,8 @@ fn test_k2_beats_k1() {
 
         retention: RetentionKind::L2WeightDecay,
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: nl_hecate_core::dynamic_freq::DynamicFreqConfig::default(),
 
         };
 
@@ -399,6 +403,8 @@ fn test_k4_vs_k2_multiscale() {
 
         retention: RetentionKind::L2WeightDecay,
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: nl_hecate_core::dynamic_freq::DynamicFreqConfig::default(),
 
         };
     let cfg_k4 = MAGConfig {
@@ -411,6 +417,8 @@ fn test_k4_vs_k2_multiscale() {
 
         retention: RetentionKind::L2WeightDecay,
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: nl_hecate_core::dynamic_freq::DynamicFreqConfig::default(),
 
         };
 
@@ -500,6 +508,8 @@ fn test_k4_diagnostics() {
 
         retention: RetentionKind::L2WeightDecay,
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: nl_hecate_core::dynamic_freq::DynamicFreqConfig::default(),
 
         };
 
@@ -767,6 +777,8 @@ fn test_cms_stability_boundary() {
 
         retention: RetentionKind::L2WeightDecay,
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: nl_hecate_core::dynamic_freq::DynamicFreqConfig::default(),
 
         };
     let cfg_k2 = MAGConfig {
@@ -779,6 +791,8 @@ fn test_cms_stability_boundary() {
 
         retention: RetentionKind::L2WeightDecay,
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: nl_hecate_core::dynamic_freq::DynamicFreqConfig::default(),
 
         };
 
@@ -965,6 +979,8 @@ fn test_k4_normalization_magnitude() {
 
         retention: RetentionKind::L2WeightDecay,
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: nl_hecate_core::dynamic_freq::DynamicFreqConfig::default(),
 
         };
     let params_k4 = MAGParams::init(&cfg_k4, 42);
@@ -1030,6 +1046,8 @@ fn test_k4_uniform_init_stable() {
 
         retention: RetentionKind::L2WeightDecay,
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: nl_hecate_core::dynamic_freq::DynamicFreqConfig::default(),
 
         };
 
@@ -1081,6 +1099,8 @@ fn test_k4_normalized_stable() {
 
         retention: RetentionKind::L2WeightDecay,
             m3: None,
+            dynamic_scheduling: false,
+            dynamic_freq_config: nl_hecate_core::dynamic_freq::DynamicFreqConfig::default(),
 
         };
 
