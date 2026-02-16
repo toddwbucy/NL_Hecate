@@ -301,13 +301,19 @@ mod tests {
         let has_nonzero = mem.iter().any(|&v| v != 0.0);
         assert!(has_nonzero, "memory should be non-zero after processing chunks");
 
-        // Checkpoint and restore preserves conductor/stream state
+        // Checkpoint and restore preserves conductor/stream/memory state
         let cp = session.checkpoint();
+        let mem_at_checkpoint = session.context().memory[0].clone();
+
         let stream2 = Box::new(VecStream::new(corpus));
         let mut session2 = Session::new_stream(1, &cfg, stream2);
         session2.restore(&cp).expect("restore should succeed");
         assert_eq!(session2.chunks_processed(), 5);
         assert_eq!(session2.conductor_step(), session.conductor_step());
+
+        // Verify memory state is actually restored
+        let restored_mem = &session2.context().memory[0];
+        assert_eq!(restored_mem, &mem_at_checkpoint, "memory state should be preserved after restore");
     }
 
     // ── Phase E: Integration + Edge Cases ──────────────────────────────

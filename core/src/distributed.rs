@@ -105,14 +105,16 @@ pub fn sync_gradients(
     pulse: &Pulse,
     pg: &dyn ProcessGroup,
 ) -> usize {
-    debug_assert_eq!(
+    assert_eq!(
         pulse.active_levels.len(),
         grads.levels.len(),
         "pulse.active_levels length ({}) must match grads.levels length ({})",
         pulse.active_levels.len(),
         grads.levels.len(),
     );
-    let ws = pg.world_size() as f32;
+    let ws_usize = pg.world_size();
+    assert!(ws_usize > 0, "world_size must be >= 1");
+    let ws = ws_usize as f32;
     let mut allreduce_count = 0usize;
 
     // Always sync SWA gradients

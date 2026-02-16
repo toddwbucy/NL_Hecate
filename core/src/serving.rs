@@ -167,20 +167,27 @@ impl Session {
         Some(self.process_chunk(params, cfg, &chunk.input_ids, &chunk.target_ids))
     }
 
-    /// Atomic checkpoint: conductor state + stream cursor + session metadata.
+    /// Atomic checkpoint: conductor state + context memory + stream cursor + session metadata.
     /// Requires stream to be attached (Stream mode).
     pub fn checkpoint(&mut self) -> SessionCheckpoint {
         let inner = self.conductor.checkpoint();
         SessionCheckpoint {
             session_id: self.id,
             inner,
+            context: self.context.clone(),
             chunks_processed: self.chunks_processed,
         }
     }
 
-    /// Restore from checkpoint. Verifies config and pulse_id consistency.
+    /// Restore from checkpoint. Verifies session_id, config, and pulse_id consistency.
     pub fn restore(&mut self, checkpoint: &SessionCheckpoint) -> Result<(), RestoreError> {
+        assert_eq!(
+            checkpoint.session_id, self.id,
+            "checkpoint session_id ({}) does not match session ({})",
+            checkpoint.session_id, self.id,
+        );
         self.conductor.restore(&checkpoint.inner)?;
+        self.context = checkpoint.context.clone();
         self.chunks_processed = checkpoint.chunks_processed;
         Ok(())
     }
@@ -215,5 +222,6 @@ impl Session {
 pub struct SessionCheckpoint {
     pub session_id: SessionId,
     pub inner: Checkpoint,
+    pub context: ContextState,
     pub chunks_processed: usize,
 }

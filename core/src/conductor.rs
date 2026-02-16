@@ -137,6 +137,7 @@ impl Conductor {
 }
 
 /// Memory state persisted across forward calls (ContextMemory lifetime).
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ContextState {
     /// Per-level M matrices, each [d*d] (row-major).
     pub memory: Vec<Vec<f32>>,
