@@ -16,10 +16,18 @@ pub fn rand_buf(len: usize, seed: u64) -> Vec<f32> {
 
 pub fn check_close(name: &str, a: &[f32], b: &[f32], tol: f32) {
     assert_eq!(a.len(), b.len(), "{name}: length mismatch {} vs {}", a.len(), b.len());
+    if a.is_empty() {
+        return;
+    }
     let mut max_diff = 0.0f32;
     let mut max_idx = 0;
     for i in 0..a.len() {
         let diff = (a[i] - b[i]).abs();
+        assert!(
+            diff.is_finite(),
+            "{name}: non-finite diff at idx {i} (a={:.6e}, b={:.6e})",
+            a[i], b[i]
+        );
         if diff > max_diff { max_diff = diff; max_idx = i; }
     }
     assert!(
