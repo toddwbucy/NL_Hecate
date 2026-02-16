@@ -36,6 +36,7 @@ pub enum MemoryRuleKind {
     MEMORA,
     LatticeOSR,
     Trellis,
+    AtlasOmega,
 }
 
 /// Model configuration — immutable after construction.
@@ -897,6 +898,53 @@ impl MAGConfig {
             d_compress: 8,
             lambda_k: 0.01,
             lambda_v: 0.01,
+            parallel: None,
+            retention: default_retention(MemoryRuleKind::DeltaRule),
+            m3: None,
+        }
+    }
+
+    /// Atlas Omega test configuration: d=8, k=1.
+    /// Uses the Omega rule with state-independent momentum.
+    pub fn atlas_test_config() -> Self {
+        MAGConfig {
+            swa: SWAConfig {
+                d_model: 8,
+                num_heads: 2,
+                head_dim: 4,
+                seq_len: 4,
+                window_size: 4,
+                vocab_size: 16,
+            },
+            memory_enabled: true,
+            composition: CompositionKind::MAG,
+            memory_rule: MemoryRuleKind::AtlasOmega,
+            k: 1,
+            chunk_sizes: vec![1],
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            parallel: None,
+            retention: default_retention(MemoryRuleKind::DeltaRule),
+            m3: None,
+        }
+    }
+
+    /// Atlas Omega test configuration for CMS k=2 testing.
+    pub fn atlas_test_config_k2() -> Self {
+        MAGConfig {
+            swa: SWAConfig {
+                d_model: 8,
+                num_heads: 2,
+                head_dim: 4,
+                seq_len: 8,
+                window_size: 8,
+                vocab_size: 16,
+            },
+            memory_enabled: true,
+            composition: CompositionKind::MAG,
+            memory_rule: MemoryRuleKind::AtlasOmega,
+            k: 2,
+            chunk_sizes: vec![1, 8],
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,

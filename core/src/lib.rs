@@ -23,6 +23,7 @@ pub mod associative_scan;
 pub mod tnt;
 pub mod lattice_gla;
 pub mod atlas_parallel;
+pub mod atlas_omega;
 #[cfg(feature = "internal")]
 pub mod gradient;
 #[cfg(not(feature = "internal"))]

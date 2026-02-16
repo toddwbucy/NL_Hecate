@@ -17,6 +17,8 @@ use crate::yaad::{YAAD, YAADCache, yaad_read_only, yaad_read_only_backward};
 use crate::memora::{MEMORA, MEMORACache, memora_read_only, memora_read_only_backward};
 use crate::lattice_osr::{LatticeOSR, LatticeCache, lattice_read_only, lattice_read_only_backward};
 use crate::trellis::{Trellis, TrellisCache, trellis_read_only, trellis_read_only_backward};
+use crate::atlas_omega::{AtlasOmega, AtlasOmegaCache};
+use crate::atlas_parallel::AtlasOmegaParams;
 use crate::conductor::{Pulse, ContextState, ErrorBuffer};
 
 /// Memory cache enum for static dispatch across memory rule variants.
@@ -30,6 +32,7 @@ pub enum MemoryCache {
     MEMORA(MEMORACache),
     Lattice(LatticeCache),
     Trellis(TrellisCache),
+    Atlas(AtlasOmegaCache),
 }
 
 /// Cache for MAG forward pass — holds both branches' intermediates.
@@ -138,6 +141,11 @@ pub fn mag_forward(
             let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
             let (y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
             (y, MemoryCache::Trellis(cache))
+        }
+        MemoryRuleKind::AtlasOmega => {
+            let rule = AtlasOmega { omega_params: AtlasOmegaParams::init(d, 42) };
+            let (y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
+            (y, MemoryCache::Atlas(cache))
         }
     };
 
@@ -284,6 +292,10 @@ pub fn mag_backward(
         MemoryCache::Trellis(trellis_cache) => {
             let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
             rule.step_backward(&params.levels[0], trellis_cache, &d_y, &cache.embedded)
+        }
+        MemoryCache::Atlas(atlas_cache) => {
+            let rule = AtlasOmega { omega_params: AtlasOmegaParams::init(d, 42) };
+            rule.step_backward(&params.levels[0], atlas_cache, &d_y, &cache.embedded)
         }
     };
 
@@ -524,6 +536,13 @@ pub fn cms_forward(
                     context.memory[level] = ctx_mem;
                     (y, MemoryCache::Trellis(cache))
                 }
+                MemoryRuleKind::AtlasOmega => {
+                    let rule = AtlasOmega { omega_params: AtlasOmegaParams::init(d, 42) };
+                    let (y, cache) = rule.step(&params.levels[level], &embedded, s, d, initial_m);
+                    let m_final_start = s * d * d;
+                    context.memory[level] = cache.m_states[m_final_start..m_final_start + d * d].to_vec();
+                    (y, MemoryCache::Atlas(cache))
+                }
             };
 
             y_per_level.push(y_level);
@@ -749,6 +768,10 @@ pub fn cms_backward(
                 MemoryCache::Trellis(trellis_cache) => {
                     let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
                     rule.step_backward(&params.levels[level], trellis_cache, &d_y_combined, &cache.embedded)
+                }
+                MemoryCache::Atlas(atlas_cache) => {
+                    let rule = AtlasOmega { omega_params: AtlasOmegaParams::init(d, 42) };
+                    rule.step_backward(&params.levels[level], atlas_cache, &d_y_combined, &cache.embedded)
                 }
             };
             grads.levels[level].accumulate(&mem_grads);

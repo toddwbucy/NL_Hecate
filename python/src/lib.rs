@@ -311,8 +311,9 @@ impl MAGConfig {
             "memora" => MemoryRuleKind::MEMORA,
             "lattice" => MemoryRuleKind::LatticeOSR,
             "trellis" => MemoryRuleKind::Trellis,
+            "atlas" | "atlas_omega" => MemoryRuleKind::AtlasOmega,
             _ => return Err(PyValueError::new_err(format!(
-                "Unknown memory_rule '{memory_rule}'. Expected: delta, titans, hebbian, moneta, yaad, memora, lattice, trellis"
+                "Unknown memory_rule '{memory_rule}'. Expected: delta, titans, hebbian, moneta, yaad, memora, lattice, trellis, atlas"
             ))),
         };
         let ret_kind = match retention {
@@ -396,6 +397,7 @@ impl MAGConfig {
             MemoryRuleKind::MEMORA => "memora",
             MemoryRuleKind::LatticeOSR => "lattice",
             MemoryRuleKind::Trellis => "trellis",
+            MemoryRuleKind::AtlasOmega => "atlas",
         }
     }
     #[getter]
@@ -713,6 +715,7 @@ fn parse_block_config(d: &Bound<'_, PyDict>) -> PyResult<RustBlockConfig> {
         "memora" => MemoryRuleKind::MEMORA,
         "lattice" => MemoryRuleKind::LatticeOSR,
         "trellis" => MemoryRuleKind::Trellis,
+        "atlas" | "atlas_omega" => MemoryRuleKind::AtlasOmega,
         _ => return Err(PyValueError::new_err(format!(
             "Unknown memory_rule '{rule_str}'"
         ))),

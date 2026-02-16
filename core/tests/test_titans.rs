@@ -174,6 +174,9 @@ fn test_titans_momentum_nonzero() {
         MemoryCache::Trellis(_) => {
             panic!("Expected TitansLMMCache, got TrellisCache");
         }
+        MemoryCache::Atlas(_) => {
+            panic!("Expected TitansLMMCache, got AtlasCache");
+        }
     }
 }
 

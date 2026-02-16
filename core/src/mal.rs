@@ -16,6 +16,8 @@ use crate::yaad::{YAAD, yaad_read_only, yaad_read_only_backward};
 use crate::memora::{MEMORA, memora_read_only, memora_read_only_backward};
 use crate::lattice_osr::{LatticeOSR, lattice_read_only, lattice_read_only_backward};
 use crate::trellis::{Trellis, trellis_read_only, trellis_read_only_backward};
+use crate::atlas_omega::AtlasOmega;
+use crate::atlas_parallel::AtlasOmegaParams;
 use crate::conductor::{Pulse, ContextState, ErrorBuffer};
 use crate::mag::MemoryCache;
 
@@ -81,6 +83,11 @@ fn dispatch_memory_step(
             let (y, cache) = rule.step(level_params, embedded, s, d, initial_m);
             (y, MemoryCache::Trellis(cache))
         }
+        MemoryRuleKind::AtlasOmega => {
+            let rule = AtlasOmega { omega_params: AtlasOmegaParams::init(d, 42) };
+            let (y, cache) = rule.step(level_params, embedded, s, d, initial_m);
+            (y, MemoryCache::Atlas(cache))
+        }
     }
 }
 
@@ -114,6 +121,10 @@ fn dispatch_memory_backward(
         }
         MemoryCache::Trellis(c) => {
             let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
+            rule.step_backward(level_params, c, d_y, embedded)
+        }
+        MemoryCache::Atlas(c) => {
+            let rule = AtlasOmega { omega_params: AtlasOmegaParams::init(c.d, 42) };
             rule.step_backward(level_params, c, d_y, embedded)
         }
     }
@@ -411,6 +422,10 @@ pub fn persist_memory_state(
             ctx_mem.extend_from_slice(sk_final);
             ctx_mem.extend_from_slice(sv_final);
             *context_mem = ctx_mem;
+        }
+        MemoryCache::Atlas(c) => {
+            let start = s * d * d;
+            *context_mem = c.m_states[start..start + d * d].to_vec();
         }
     }
 }

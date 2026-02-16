@@ -18,6 +18,8 @@ use crate::hebbian_rule::HebbianRule;
 use crate::moneta::Moneta;
 use crate::yaad::YAAD;
 use crate::memora::MEMORA;
+use crate::atlas_omega::AtlasOmega;
+use crate::atlas_parallel::AtlasOmegaParams;
 use crate::lattice_osr::LatticeOSR;
 use crate::trellis::Trellis;
 use crate::parallel::ChunkBoundary;
@@ -99,6 +101,9 @@ fn extract_final_state(cache: &MemoryCache, seq_len: usize, d: usize, cfg: &MAGC
             state.extend_from_slice(&c.sv_states[seq_len * sv_size..(seq_len + 1) * sv_size]);
             state
         }
+        MemoryCache::Atlas(c) => {
+            c.m_states[seq_len * d * d..(seq_len + 1) * d * d].to_vec()
+        }
     }
 }
 
@@ -159,6 +164,11 @@ fn run_chunk(
             let (y, cache) = rule.step(level_params, embedded_chunk, chunk_len, d, initial_m);
             (y, MemoryCache::Trellis(cache))
         }
+        MemoryRuleKind::AtlasOmega => {
+            let rule = AtlasOmega { omega_params: AtlasOmegaParams::init(d, 42) };
+            let (y, cache) = rule.step(level_params, embedded_chunk, chunk_len, d, initial_m);
+            (y, MemoryCache::Atlas(cache))
+        }
     }
 }
 
@@ -192,6 +202,10 @@ fn run_chunk_backward(
         }
         MemoryCache::Trellis(c) => {
             let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
+            rule.step_backward(level_params, c, d_y_chunk, embedded_chunk)
+        }
+        MemoryCache::Atlas(c) => {
+            let rule = AtlasOmega { omega_params: AtlasOmegaParams::init(c.d, 42) };
             rule.step_backward(level_params, c, d_y_chunk, embedded_chunk)
         }
     }

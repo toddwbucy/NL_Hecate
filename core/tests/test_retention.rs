@@ -62,6 +62,7 @@ fn context_memory_size(cfg: &MAGConfig) -> usize {
         | MemoryRuleKind::MEMORA => cfg.d_hidden * d + d * cfg.d_hidden,
         MemoryRuleKind::LatticeOSR => cfg.m_slots * d,
         MemoryRuleKind::Trellis => 2 * cfg.d_compress * d,
+        MemoryRuleKind::AtlasOmega => d * d,
     }
 }
 

@@ -173,7 +173,7 @@ pub fn strategy_supported(rule: MemoryRuleKind, strategy: ParallelStrategy) -> b
             rule,
             MemoryRuleKind::LatticeOSR | MemoryRuleKind::Trellis
         ),
-        ParallelStrategy::AtlasParallel => false, // Atlas Omega not yet implemented
+        ParallelStrategy::AtlasParallel => matches!(rule, MemoryRuleKind::AtlasOmega),
     }
 }
 
@@ -184,6 +184,7 @@ pub fn supported_strategies(rule: MemoryRuleKind) -> &'static [&'static str] {
         MemoryRuleKind::TitansLMM => &["sequential", "chunkwise_gd", "associative_scan_partial", "tnt"],
         MemoryRuleKind::LatticeOSR => &["sequential", "chunkwise_gd", "tnt", "lattice_gla"],
         MemoryRuleKind::Trellis => &["sequential", "chunkwise_gd", "tnt", "lattice_gla"],
+        MemoryRuleKind::AtlasOmega => &["sequential", "chunkwise_gd", "tnt", "atlas_parallel"],
         // DeltaRule, MONETA, YAAD, MEMORA
         _ => &["sequential", "chunkwise_gd", "tnt"],
     }

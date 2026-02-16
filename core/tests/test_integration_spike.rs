@@ -139,6 +139,7 @@ fn context_memory_size(cfg: &MAGConfig) -> usize {
         }
         MemoryRuleKind::LatticeOSR => cfg.m_slots * d,
         MemoryRuleKind::Trellis => 2 * cfg.d_compress * d,
+        MemoryRuleKind::AtlasOmega => d * d,
     }
 }
 
@@ -667,6 +668,10 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
                 // d_compress > 0, d_compress <= d_model, lambda_k/v for decay
                 (0, 2.0, 2.0, 0.0, 0.0, 1.0, 0, 4, 0.01, 0.01)
             }
+            MemoryRuleKind::AtlasOmega => {
+                // Same as DeltaRule/TitansLMM — d×d matrix memory
+                (0, 2.0, 2.0, 0.0, 0.0, 1.0, 0, 0, 0.0, 0.0)
+            }
         };
 
     MAGConfig {
@@ -707,6 +712,7 @@ fn rule_family(rule: &MemoryRuleKind) -> &'static str {
         | MemoryRuleKind::MEMORA => "mlp",
         MemoryRuleKind::LatticeOSR
         | MemoryRuleKind::Trellis => "compression",
+        MemoryRuleKind::AtlasOmega => "matrix",
     }
 }
 

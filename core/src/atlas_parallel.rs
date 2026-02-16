@@ -1,13 +1,18 @@
-/// Atlas Parallel — placeholder for Atlas Omega parallelization strategy.
+/// Atlas Parallel — parallelization strategy for Atlas Omega rule.
 ///
-/// Atlas Omega is a planned MIRAS variant that uses a state-independent omega
-/// function: omega = W_omega @ silu(concat(k, v)). Because omega is independent
-/// of the memory state, all tokens can be computed in parallel.
+/// Atlas Omega uses a state-independent omega function:
+///   omega = W_omega @ silu(concat(k, v))
+/// Because omega is independent of the memory state, all tokens' momentum
+/// updates can be computed in parallel (Atlas paper Section 5, Eqs 34-41).
 ///
-/// This module defines the types and omega function but panics on forward/backward
-/// since the Atlas Omega rule is not yet implemented.
+/// This module provides:
+/// - AtlasOmegaParams: weights for the omega function
+/// - atlas_omega(): the state-independent surrogate gradient function
+/// - atlas_parallel_forward(): parallel forward using pre-computed omegas
+/// - atlas_parallel_backward(): corresponding backward pass
 
-use crate::tensor::silu_f32;
+use crate::tensor::{silu_f32, matmul_f32, transpose_f32, sigmoid_f32, softplus_f32};
+use crate::atlas_omega::AtlasOmegaCache;
 
 /// Parameters for the Atlas Omega function.
 #[derive(Clone, Debug)]
@@ -77,40 +82,163 @@ pub fn atlas_omega(k: &[f32], v: &[f32], params: &AtlasOmegaParams, d: usize) ->
     omega
 }
 
-/// Atlas parallel forward — NOT YET IMPLEMENTED.
+/// Atlas parallel forward — compute all omega/gates in parallel, then accumulate memory.
 ///
-/// Panics with a clear message. Atlas Omega rule must first be implemented
-/// as a MIRAS variant before this parallelization strategy can be used.
+/// This is the parallel version of the Atlas Omega rule's step() function.
+/// The key parallelism: because omega is state-independent, all per-token
+/// omega values and gates can be computed first (embarrassingly parallel),
+/// then momentum S and memory M are accumulated sequentially.
 ///
-/// Note: `#[no_autodiff]` is not needed here — `-> !` (never type) means this
-/// function can never appear in a differentiable call graph, and `AtlasOmega`
-/// is not in `MemoryRuleKind`, so `strategy_supported()` prevents runtime selection.
+/// Returns (y [seq_len, d], AtlasOmegaCache).
 pub fn atlas_parallel_forward(
-    _level_params: &crate::model::MemoryLevelParams,
-    _embedded: &[f32],
-    _seq_len: usize,
-    _d: usize,
+    level_params: &crate::model::MemoryLevelParams,
+    embedded: &[f32],
+    seq_len: usize,
+    d: usize,
     _cfg: &crate::model::MAGConfig,
-    _initial_m: Option<Vec<f32>>,
-) -> ! {
-    unimplemented!(
-        "Atlas parallel forward requires the Atlas Omega MIRAS variant, \
-         which is not yet implemented. Add AtlasOmega to the MemoryRuleKind enum \
-         and implement the MemoryRule trait first."
-    )
+    initial_m: Option<Vec<f32>>,
+) -> (Vec<f32>, AtlasOmegaCache) {
+    let dd = d * d;
+    let omega_params = AtlasOmegaParams::init(d, 42);
+
+    // Project embedded → k_mem, v_mem, q_mem
+    let mut w_k_mem_t = vec![0.0f32; dd];
+    let mut w_v_mem_t = vec![0.0f32; dd];
+    let mut w_q_mem_t = vec![0.0f32; dd];
+    transpose_f32(&level_params.w_k_mem, &mut w_k_mem_t, d, d);
+    transpose_f32(&level_params.w_v_mem, &mut w_v_mem_t, d, d);
+    transpose_f32(&level_params.w_q_mem, &mut w_q_mem_t, d, d);
+
+    let mut k_mem = vec![0.0f32; seq_len * d];
+    let mut v_mem = vec![0.0f32; seq_len * d];
+    let mut q_mem = vec![0.0f32; seq_len * d];
+    matmul_f32(embedded, &w_k_mem_t, &mut k_mem, seq_len, d, d);
+    matmul_f32(embedded, &w_v_mem_t, &mut v_mem, seq_len, d, d);
+    matmul_f32(embedded, &w_q_mem_t, &mut q_mem, seq_len, d, d);
+
+    // PARALLEL PHASE 1: Compute all omegas and gates independently
+    // (These are all state-independent — can be parallelized)
+    let mut concat_kv = vec![0.0f32; seq_len * 2 * d];
+    let mut alpha_pre = vec![0.0f32; seq_len];
+    let mut alpha = vec![0.0f32; seq_len];
+    let mut theta_pre = vec![0.0f32; seq_len];
+    let mut theta = vec![0.0f32; seq_len];
+    let mut eta_pre = vec![0.0f32; seq_len];
+    let mut eta = vec![0.0f32; seq_len];
+    let mut omega_mats = vec![0.0f32; seq_len * dd];
+    let mut silu_kv = vec![0.0f32; seq_len * 2 * d];
+
+    for t in 0..seq_len {
+        let k_t = &k_mem[t * d..(t + 1) * d];
+        let v_t = &v_mem[t * d..(t + 1) * d];
+        let c_base = t * 2 * d;
+
+        // Concat(k, v)
+        concat_kv[c_base..c_base + d].copy_from_slice(k_t);
+        concat_kv[c_base + d..c_base + 2 * d].copy_from_slice(v_t);
+        let concat_t = &concat_kv[c_base..c_base + 2 * d];
+
+        // Gates
+        let mut ap = level_params.b_alpha[0];
+        let mut tp = level_params.b_theta[0];
+        let mut ep = level_params.b_eta[0];
+        for i in 0..(2 * d) {
+            ap += concat_t[i] * level_params.w_alpha[i];
+            tp += concat_t[i] * level_params.w_theta[i];
+            ep += concat_t[i] * level_params.w_eta[i];
+        }
+        alpha_pre[t] = ap;
+        alpha[t] = sigmoid_f32(ap);
+        theta_pre[t] = tp;
+        theta[t] = softplus_f32(tp);
+        eta_pre[t] = ep;
+        eta[t] = sigmoid_f32(ep);
+
+        // silu(concat(k, v))
+        let sk_base = t * 2 * d;
+        for i in 0..(2 * d) {
+            silu_kv[sk_base + i] = silu_f32(concat_t[i]);
+        }
+        let silu_t = &silu_kv[sk_base..sk_base + 2 * d];
+
+        // omega_vec = W_omega @ silu_t
+        let mut omega_vec = vec![0.0f32; d];
+        for i in 0..d {
+            let mut sum = 0.0f32;
+            for j in 0..(2 * d) {
+                sum += omega_params.w_omega[i * 2 * d + j] * silu_t[j];
+            }
+            omega_vec[i] = sum;
+        }
+
+        // omega_mat = outer(omega_vec, k_t)
+        let om_base = t * dd;
+        for i in 0..d {
+            for j in 0..d {
+                omega_mats[om_base + i * d + j] = omega_vec[i] * k_t[j];
+            }
+        }
+    }
+
+    // SEQUENTIAL PHASE: Accumulate S and M (inherently sequential)
+    let mut m_states = vec![0.0f32; (seq_len + 1) * dd];
+    let mut s_states = vec![0.0f32; (seq_len + 1) * dd];
+    if let Some(m0) = initial_m {
+        debug_assert_eq!(m0.len(), dd);
+        m_states[..dd].copy_from_slice(&m0);
+    }
+
+    let mut y = vec![0.0f32; seq_len * d];
+
+    for t in 0..seq_len {
+        let q_t = &q_mem[t * d..(t + 1) * d];
+        let om_base = t * dd;
+        let s_t = t * dd;
+        let s_next = (t + 1) * dd;
+        let m_t = t * dd;
+        let m_next = (t + 1) * dd;
+
+        // S_{t+1} = eta * S_t - theta * omega_mat
+        for i in 0..dd {
+            s_states[s_next + i] = eta[t] * s_states[s_t + i] - theta[t] * omega_mats[om_base + i];
+        }
+
+        // M_{t+1} = (1-alpha) * M_t + S_{t+1}
+        let retention = 1.0 - alpha[t];
+        for i in 0..dd {
+            m_states[m_next + i] = retention * m_states[m_t + i] + s_states[s_next + i];
+        }
+
+        // y_t = M_{t+1} @ q_t
+        let m_next_slice = &m_states[m_next..m_next + dd];
+        matmul_f32(m_next_slice, q_t, &mut y[t * d..(t + 1) * d], d, d, 1);
+    }
+
+    let cache = AtlasOmegaCache {
+        seq_len, d, m_states, s_states, k_mem, v_mem, q_mem, concat_kv,
+        alpha_pre, alpha, theta_pre, theta, eta_pre, eta,
+        omega_mats, silu_kv, y: y.clone(),
+    };
+
+    (y, cache)
 }
 
-/// Atlas parallel backward — NOT YET IMPLEMENTED.
+/// Atlas parallel backward.
+///
+/// Delegates to the AtlasOmega rule's step_backward since the backward
+/// pass structure is the same (just the forward was parallelized differently).
 pub fn atlas_parallel_backward(
-    _level_params: &crate::model::MemoryLevelParams,
-    _d_y: &[f32],
-    _embedded: &[f32],
+    level_params: &crate::model::MemoryLevelParams,
+    cache: &AtlasOmegaCache,
+    d_y: &[f32],
+    embedded: &[f32],
     _cfg: &crate::model::MAGConfig,
-) -> ! {
-    unimplemented!(
-        "Atlas parallel backward requires the Atlas Omega MIRAS variant, \
-         which is not yet implemented."
-    )
+) -> (crate::model::MemoryLevelParams, Vec<f32>) {
+    let d = cache.d;
+    let omega_params = AtlasOmegaParams::init(d, 42);
+    let rule = crate::atlas_omega::AtlasOmega { omega_params };
+    use crate::delta_rule::MemoryRule;
+    rule.step_backward(level_params, cache, d_y, embedded)
 }
 
 #[cfg(test)]
@@ -148,15 +276,35 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Atlas Omega MIRAS variant")]
-    fn test_atlas_forward_panics() {
-        let cfg = crate::model::MAGConfig::test_config();
+    fn test_atlas_parallel_forward_matches_sequential() {
+        // The parallel forward should produce identical results to sequential AtlasOmega.step()
+        let cfg = crate::model::MAGConfig::atlas_test_config();
         let params = crate::model::MAGParams::init(&cfg, 42);
-        let embedded = vec![0.0f32; cfg.swa.seq_len * cfg.swa.d_model];
-        atlas_parallel_forward(
-            &params.levels[0], &embedded,
-            cfg.swa.seq_len, cfg.swa.d_model, &cfg, None,
-        );
+        let d = cfg.swa.d_model;
+        let s = cfg.swa.seq_len;
+
+        // Create embedded input
+        use crate::tensor::SimpleRng;
+        let mut rng = SimpleRng::new(99);
+        let mut embedded = vec![0.0f32; s * d];
+        rng.fill_uniform(&mut embedded, 0.1);
+
+        // Sequential (via AtlasOmega.step())
+        let omega_params = AtlasOmegaParams::init(d, 42);
+        let rule = crate::atlas_omega::AtlasOmega { omega_params };
+        use crate::delta_rule::MemoryRule;
+        let (y_seq, _) = rule.step(&params.levels[0], &embedded, s, d, None);
+
+        // Parallel
+        let (y_par, _) = atlas_parallel_forward(&params.levels[0], &embedded, s, d, &cfg, None);
+
+        // They should match exactly
+        for i in 0..(s * d) {
+            assert!(
+                (y_seq[i] - y_par[i]).abs() < 1e-6,
+                "Mismatch at {i}: seq={}, par={}", y_seq[i], y_par[i]
+            );
+        }
     }
 
     #[test]
