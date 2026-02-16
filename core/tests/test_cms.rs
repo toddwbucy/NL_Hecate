@@ -207,6 +207,7 @@ fn test_k2_beats_k1() {
         parallel: None,
 
         retention: RetentionKind::L2WeightDecay,
+            m3: None,
 
         };
     // k=2 config
@@ -219,6 +220,7 @@ fn test_k2_beats_k1() {
         parallel: None,
 
         retention: RetentionKind::L2WeightDecay,
+            m3: None,
 
         };
 
@@ -396,6 +398,7 @@ fn test_k4_vs_k2_multiscale() {
         parallel: None,
 
         retention: RetentionKind::L2WeightDecay,
+            m3: None,
 
         };
     let cfg_k4 = MAGConfig {
@@ -407,6 +410,7 @@ fn test_k4_vs_k2_multiscale() {
         parallel: None,
 
         retention: RetentionKind::L2WeightDecay,
+            m3: None,
 
         };
 
@@ -495,6 +499,7 @@ fn test_k4_diagnostics() {
         parallel: None,
 
         retention: RetentionKind::L2WeightDecay,
+            m3: None,
 
         };
 
@@ -761,6 +766,7 @@ fn test_cms_stability_boundary() {
         parallel: None,
 
         retention: RetentionKind::L2WeightDecay,
+            m3: None,
 
         };
     let cfg_k2 = MAGConfig {
@@ -772,6 +778,7 @@ fn test_cms_stability_boundary() {
         parallel: None,
 
         retention: RetentionKind::L2WeightDecay,
+            m3: None,
 
         };
 
@@ -957,6 +964,7 @@ fn test_k4_normalization_magnitude() {
         parallel: None,
 
         retention: RetentionKind::L2WeightDecay,
+            m3: None,
 
         };
     let params_k4 = MAGParams::init(&cfg_k4, 42);
@@ -1021,6 +1029,7 @@ fn test_k4_uniform_init_stable() {
         parallel: None,
 
         retention: RetentionKind::L2WeightDecay,
+            m3: None,
 
         };
 
@@ -1071,6 +1080,7 @@ fn test_k4_normalized_stable() {
         parallel: None,
 
         retention: RetentionKind::L2WeightDecay,
+            m3: None,
 
         };
 

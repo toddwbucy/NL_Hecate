@@ -58,6 +58,7 @@ fn spike_config_a() -> MAGConfig {
         lambda_v: 0.0,
         parallel: None,
         retention: RetentionKind::L2WeightDecay,
+            m3: None,
     }
 }
 
@@ -82,6 +83,7 @@ fn spike_config_b() -> MAGConfig {
         lambda_v: 0.0,
         parallel: None,
         retention: RetentionKind::L2WeightDecay,
+            m3: None,
     }
 }
 
@@ -106,6 +108,7 @@ fn spike_config_c() -> MAGConfig {
         lambda_v: 0.0,
         parallel: None,
         retention: RetentionKind::L2WeightDecay,
+            m3: None,
     }
 }
 
@@ -689,6 +692,7 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
             MemoryRuleKind::LatticeOSR => RetentionKind::SphereNormalization,
             _ => RetentionKind::L2WeightDecay,
         },
+        m3: None,
     }
 }
 

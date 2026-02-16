@@ -196,6 +196,7 @@ fn test_titans_vs_delta() {
             composition: CompositionKind::MAG,
         parallel: None,
         retention: RetentionKind::L2WeightDecay,
+            m3: None,
     };
     let cfg_titans = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
@@ -205,6 +206,7 @@ fn test_titans_vs_delta() {
             composition: CompositionKind::MAG,
         parallel: None,
         retention: RetentionKind::L2WeightDecay,
+            m3: None,
     };
 
     let input_ids: Vec<usize> = (0..swa.seq_len).map(|t| t % swa.vocab_size).collect();

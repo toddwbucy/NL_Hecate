@@ -94,6 +94,7 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
             MemoryRuleKind::LatticeOSR => RetentionKind::SphereNormalization,
             _ => RetentionKind::L2WeightDecay,
         },
+        m3: None,
     }
 }
 

@@ -6,6 +6,7 @@
 use crate::tensor::SimpleRng;
 use crate::parallel::ParallelConfig;
 use crate::retention::{RetentionKind, default_retention};
+use crate::m3::{M3Config, M3State, m3_step, flatten_mag_params, unflatten_to_mag_grads};
 
 /// Which composition pattern to use (Titans Section 4).
 ///
@@ -332,6 +333,8 @@ pub struct MAGConfig {
     /// Which retention mechanism to use. Default: derived from memory_rule.
     /// Override to use a non-default mechanism (e.g., ElasticNet with DeltaRule).
     pub retention: RetentionKind,
+    /// M3 multi-scale optimizer config. None = plain SGD (default).
+    pub m3: Option<M3Config>,
 }
 
 /// Default gate bias init values per level index.
@@ -392,6 +395,7 @@ impl MAGConfig {
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
+            m3: None,
         }
     }
 
@@ -414,6 +418,7 @@ impl MAGConfig {
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
+            m3: None,
         }
     }
 
@@ -436,6 +441,7 @@ impl MAGConfig {
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
+            m3: None,
         }
     }
 
@@ -459,6 +465,7 @@ impl MAGConfig {
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
+            m3: None,
         }
     }
 
@@ -482,6 +489,7 @@ impl MAGConfig {
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
+            m3: None,
         }
     }
 
@@ -505,6 +513,7 @@ impl MAGConfig {
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
+            m3: None,
         }
     }
 
@@ -527,6 +536,7 @@ impl MAGConfig {
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
+            m3: None,
         }
     }
 
@@ -549,6 +559,7 @@ impl MAGConfig {
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
+            m3: None,
         }
     }
 
@@ -571,6 +582,7 @@ impl MAGConfig {
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
+            m3: None,
         }
     }
 
@@ -593,6 +605,7 @@ impl MAGConfig {
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
+            m3: None,
         }
     }
 
@@ -624,6 +637,7 @@ impl MAGConfig {
             lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
+            m3: None,
         }
     }
 
@@ -655,6 +669,7 @@ impl MAGConfig {
             lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
+            m3: None,
         }
     }
 
@@ -686,6 +701,7 @@ impl MAGConfig {
             lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
+            m3: None,
         }
     }
 
@@ -717,6 +733,7 @@ impl MAGConfig {
             lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
+            m3: None,
         }
     }
 
@@ -748,6 +765,7 @@ impl MAGConfig {
             lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::MEMORA),
+            m3: None,
         }
     }
 
@@ -779,6 +797,7 @@ impl MAGConfig {
             lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::MEMORA),
+            m3: None,
         }
     }
 
@@ -802,6 +821,7 @@ impl MAGConfig {
             m_slots: 4, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::LatticeOSR),
+            m3: None,
         }
     }
 
@@ -825,6 +845,7 @@ impl MAGConfig {
             m_slots: 4, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::LatticeOSR),
+            m3: None,
         }
     }
 
@@ -851,6 +872,7 @@ impl MAGConfig {
             lambda_v: 0.01,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
+            m3: None,
         }
     }
 
@@ -877,6 +899,7 @@ impl MAGConfig {
             lambda_v: 0.01,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
+            m3: None,
         }
     }
 
@@ -899,6 +922,7 @@ impl MAGConfig {
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
+            m3: None,
         }
     }
 
@@ -921,6 +945,7 @@ impl MAGConfig {
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
+            m3: None,
         }
     }
 
@@ -944,6 +969,7 @@ impl MAGConfig {
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
+            m3: None,
         }
     }
 
@@ -966,6 +992,7 @@ impl MAGConfig {
             d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
+            m3: None,
         }
     }
 }
@@ -1025,6 +1052,20 @@ impl MAGParams {
         for (level, level_grads) in self.levels.iter_mut().zip(grads.levels.iter()) {
             level.apply_weight_gradients(level_grads, lr);
         }
+    }
+
+    /// Outer-loop weight update using M3 multi-scale optimizer.
+    ///
+    /// Flattens gradients → runs M3 step → unflattens → applies update.
+    /// The M3 step transforms gradients through multi-scale momentum before application.
+    pub fn apply_weight_gradients_m3(
+        &mut self, grads: &MAGParams, m3_state: &mut M3State, m3_cfg: &M3Config,
+    ) {
+        let flat_grads = flatten_mag_params(grads);
+        let update = m3_step(m3_state, m3_cfg, &flat_grads);
+        let update_as_grads = unflatten_to_mag_grads(&update, self);
+        // Apply: param -= update (m3_step already scaled by theta)
+        self.apply_weight_gradients(&update_as_grads, 1.0);
     }
 }
 

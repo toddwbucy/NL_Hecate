@@ -11,6 +11,7 @@ use std::time::Instant;
 use crate::model::{MAGConfig, MAGParams};
 use crate::conductor::{Pulse, Conductor, ContextState, ErrorBuffer};
 use crate::mag::{cms_forward, cms_backward};
+use crate::m3::{M3Config, M3State};
 
 // ── ProcessGroup trait ────────────────────────────────────────────────
 
@@ -241,6 +242,39 @@ pub fn distributed_step(
     pg: &dyn ProcessGroup,
     lr: f32,
 ) -> (f32, ThroughputReport) {
+    distributed_step_impl(params, cfg, input_ids, target_ids, conductor, context, error_buffers, pg, lr, None)
+}
+
+/// Distributed step with M3 optimizer. Same as `distributed_step` but uses
+/// M3 multi-scale momentum instead of plain SGD for weight updates.
+pub fn distributed_step_m3(
+    params: &mut MAGParams,
+    cfg: &MAGConfig,
+    input_ids: &[usize],
+    target_ids: &[usize],
+    conductor: &mut Conductor,
+    context: &mut ContextState,
+    error_buffers: &mut [ErrorBuffer],
+    pg: &dyn ProcessGroup,
+    lr: f32,
+    m3_state: &mut M3State,
+    m3_cfg: &M3Config,
+) -> (f32, ThroughputReport) {
+    distributed_step_impl(params, cfg, input_ids, target_ids, conductor, context, error_buffers, pg, lr, Some((m3_state, m3_cfg)))
+}
+
+fn distributed_step_impl(
+    params: &mut MAGParams,
+    cfg: &MAGConfig,
+    input_ids: &[usize],
+    target_ids: &[usize],
+    conductor: &mut Conductor,
+    context: &mut ContextState,
+    error_buffers: &mut [ErrorBuffer],
+    pg: &dyn ProcessGroup,
+    lr: f32,
+    m3: Option<(&mut M3State, &M3Config)>,
+) -> (f32, ThroughputReport) {
     let start = Instant::now();
 
     // 1. Generate pulse (all ranks produce identical pulse from same step counter)
@@ -255,8 +289,11 @@ pub fn distributed_step(
     // 4. CMS-aware gradient sync
     let allreduce_count = sync_gradients(&mut grads, &pulse, pg);
 
-    // 5. Apply weight gradients (outer-loop SGD)
-    params.apply_weight_gradients(&grads, lr);
+    // 5. Apply weight gradients
+    match m3 {
+        Some((m3_state, m3_cfg)) => params.apply_weight_gradients_m3(&grads, m3_state, m3_cfg),
+        None => params.apply_weight_gradients(&grads, lr),
+    }
 
     // 6. Apply error buffers for levels that just became active
     for level in 0..cfg.k {

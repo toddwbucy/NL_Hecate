@@ -66,6 +66,7 @@ impl EdgeConfig {
             lambda_v: 0.0,
             parallel: None,
             retention: default_retention(self.memory_rule),
+            m3: None,
         }
     }
 

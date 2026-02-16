@@ -10,6 +10,12 @@ use pyo3::types::PyDict;
 use nl_hecate_core::model::{SWAConfig as RustConfig, SWAParams as RustParams};
 use nl_hecate_core::model::{MAGConfig as RustMAGConfig, MAGParams as RustMAGParams, MemoryRuleKind, CompositionKind};
 use nl_hecate_core::retention::{RetentionKind, default_retention};
+use nl_hecate_core::m3::M3Config as RustM3Config;
+use nl_hecate_core::cms_variants::{
+    CMSVariant as RustCMSVariant,
+    BlockConfig as RustBlockConfig,
+    MultiBlockConfig as RustMultiBlockConfig,
+};
 use nl_hecate_core::forward::{forward as rust_forward, ForwardCache as RustCache};
 use nl_hecate_core::backward::backward_full as rust_backward_full;
 use nl_hecate_core::gradient::compute_gradients as rust_compute_gradients;
@@ -180,6 +186,51 @@ fn apply_weight_gradients(params: &mut SWAParams, grads: &SWAParams, lr: f32) {
     params.inner.apply_weight_gradients(&grads.inner, lr);
 }
 
+// ── M3 Config parsing ─────────────────────────────────────────────
+
+/// Parse M3Config from a Python dict.
+/// Required keys: "k" (int). Optional: "etas", "thetas", "weights", "frequencies",
+/// "use_newton_schulz", "ns_iterations". Missing optional keys use defaults for the given k.
+fn parse_m3_config(d: &Bound<'_, PyDict>) -> PyResult<RustM3Config> {
+    let k: usize = d.get_item("k")?
+        .ok_or_else(|| PyValueError::new_err("m3 dict requires 'k' key"))?
+        .extract()?;
+    // Get defaults for this k
+    let defaults = match k {
+        1 => RustM3Config::default_k1(),
+        2 => RustM3Config::default_k2(),
+        4 => RustM3Config::default_k4(),
+        _ => RustM3Config::default_k1(), // fallback, user should provide all fields
+    };
+    let etas: Vec<f32> = match d.get_item("etas")? {
+        Some(v) => v.extract()?,
+        None => defaults.etas,
+    };
+    let thetas: Vec<f32> = match d.get_item("thetas")? {
+        Some(v) => v.extract()?,
+        None => defaults.thetas,
+    };
+    let weights: Vec<f32> = match d.get_item("weights")? {
+        Some(v) => v.extract()?,
+        None => defaults.weights,
+    };
+    let frequencies: Vec<usize> = match d.get_item("frequencies")? {
+        Some(v) => v.extract()?,
+        None => defaults.frequencies,
+    };
+    let use_newton_schulz: bool = match d.get_item("use_newton_schulz")? {
+        Some(v) => v.extract()?,
+        None => false,
+    };
+    let ns_iterations: usize = match d.get_item("ns_iterations")? {
+        Some(v) => v.extract()?,
+        None => 5,
+    };
+    let cfg = RustM3Config { k, etas, thetas, weights, frequencies, use_newton_schulz, ns_iterations };
+    cfg.validate().map_err(PyValueError::new_err)?;
+    Ok(cfg)
+}
+
 // ── MAGConfig ──────────────────────────────────────────────────────
 
 #[pyclass(frozen)]
@@ -195,7 +246,7 @@ impl MAGConfig {
         k=1, chunk_sizes=None, memory_rule="delta", composition="mag",
         d_hidden=None, lp_p=None, lq_q=None, lambda_local=None, lambda_2=None,
         delta=None, m_slots=None, d_compress=None, lambda_k=None, lambda_v=None,
-        retention=None,
+        retention=None, m3=None,
     ))]
     fn new(
         d_model: usize,
@@ -220,6 +271,7 @@ impl MAGConfig {
         lambda_k: Option<f32>,
         lambda_v: Option<f32>,
         retention: Option<&str>,
+        m3: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
         if d_model != num_heads * head_dim {
             return Err(PyValueError::new_err(format!(
@@ -275,6 +327,10 @@ impl MAGConfig {
             },
             None => default_retention(rule),
         };
+        let m3_cfg = match m3 {
+            Some(d) => Some(parse_m3_config(d)?),
+            None => None,
+        };
         Ok(MAGConfig {
             inner: RustMAGConfig {
                 swa: RustConfig {
@@ -302,6 +358,7 @@ impl MAGConfig {
                 lambda_v: lambda_v.unwrap_or(0.0),
                 parallel: None,
                 retention: ret_kind,
+                m3: m3_cfg,
             },
         })
     }
@@ -404,7 +461,7 @@ impl MAGForwardCache {
     k=1, chunk_sizes=None, memory_rule="delta", composition="mag",
     d_hidden=None, lp_p=None, lq_q=None, lambda_local=None, lambda_2=None,
     delta=None, m_slots=None, d_compress=None, lambda_k=None, lambda_v=None,
-    retention=None,
+    retention=None, m3=None,
 ))]
 fn mag_create_config(
     d_model: usize,
@@ -429,12 +486,13 @@ fn mag_create_config(
     lambda_k: Option<f32>,
     lambda_v: Option<f32>,
     retention: Option<&str>,
+    m3: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<MAGConfig> {
     MAGConfig::new(
         d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled,
         k, chunk_sizes, memory_rule, composition,
         d_hidden, lp_p, lq_q, lambda_local, lambda_2, delta, m_slots, d_compress, lambda_k, lambda_v,
-        retention,
+        retention, m3,
     )
 }
 
@@ -512,6 +570,171 @@ fn mag_apply_weight_gradients(params: &mut MAGParams, grads: &MAGParams, lr: f32
     params.inner.apply_weight_gradients(&grads.inner, lr);
 }
 
+// ── MultiBlockConfig ──────────────────────────────────────────────────
+
+#[pyclass(frozen)]
+struct MultiBlockConfig {
+    inner: RustMultiBlockConfig,
+}
+
+#[pymethods]
+impl MultiBlockConfig {
+    /// Create a Basic variant from an existing MAGConfig (backward compatible).
+    #[staticmethod]
+    fn basic(cfg: &MAGConfig) -> PyResult<Self> {
+        let mbc = RustMultiBlockConfig::basic(&cfg.inner)
+            .map_err(PyValueError::new_err)?;
+        Ok(MultiBlockConfig { inner: mbc })
+    }
+
+    /// Create a Sequential variant (k non-decreasing across blocks).
+    #[staticmethod]
+    #[pyo3(signature = (blocks, d_model, num_heads, seq_len, vocab_size))]
+    fn sequential(
+        blocks: Vec<Bound<'_, PyDict>>,
+        d_model: usize,
+        num_heads: usize,
+        seq_len: usize,
+        vocab_size: usize,
+    ) -> PyResult<Self> {
+        let rust_blocks = blocks.iter().map(parse_block_config).collect::<PyResult<Vec<_>>>()?;
+        let mbc = RustMultiBlockConfig::sequential(rust_blocks, d_model, num_heads, seq_len, vocab_size)
+            .map_err(PyValueError::new_err)?;
+        Ok(MultiBlockConfig { inner: mbc })
+    }
+
+    /// Create a Nested variant (every CMS block must have M3 config).
+    #[staticmethod]
+    #[pyo3(signature = (blocks, d_model, num_heads, seq_len, vocab_size))]
+    fn nested(
+        blocks: Vec<Bound<'_, PyDict>>,
+        d_model: usize,
+        num_heads: usize,
+        seq_len: usize,
+        vocab_size: usize,
+    ) -> PyResult<Self> {
+        let rust_blocks = blocks.iter().map(parse_block_config).collect::<PyResult<Vec<_>>>()?;
+        let mbc = RustMultiBlockConfig::nested(rust_blocks, d_model, num_heads, seq_len, vocab_size)
+            .map_err(PyValueError::new_err)?;
+        Ok(MultiBlockConfig { inner: mbc })
+    }
+
+    /// Create an Independent variant (per-block independent schedules).
+    #[staticmethod]
+    #[pyo3(signature = (blocks, d_model, num_heads, seq_len, vocab_size))]
+    fn independent(
+        blocks: Vec<Bound<'_, PyDict>>,
+        d_model: usize,
+        num_heads: usize,
+        seq_len: usize,
+        vocab_size: usize,
+    ) -> PyResult<Self> {
+        let rust_blocks = blocks.iter().map(parse_block_config).collect::<PyResult<Vec<_>>>()?;
+        let mbc = RustMultiBlockConfig::independent(rust_blocks, d_model, num_heads, seq_len, vocab_size)
+            .map_err(PyValueError::new_err)?;
+        Ok(MultiBlockConfig { inner: mbc })
+    }
+
+    /// Create a Hybrid variant (mix of CMS and non-CMS blocks).
+    #[staticmethod]
+    #[pyo3(signature = (blocks, d_model, num_heads, seq_len, vocab_size))]
+    fn hybrid(
+        blocks: Vec<Bound<'_, PyDict>>,
+        d_model: usize,
+        num_heads: usize,
+        seq_len: usize,
+        vocab_size: usize,
+    ) -> PyResult<Self> {
+        let rust_blocks = blocks.iter().map(parse_block_config).collect::<PyResult<Vec<_>>>()?;
+        let mbc = RustMultiBlockConfig::hybrid(rust_blocks, d_model, num_heads, seq_len, vocab_size)
+            .map_err(PyValueError::new_err)?;
+        Ok(MultiBlockConfig { inner: mbc })
+    }
+
+    #[getter]
+    fn variant(&self) -> &str {
+        match self.inner.variant {
+            RustCMSVariant::Basic => "basic",
+            RustCMSVariant::Nested => "nested",
+            RustCMSVariant::Sequential => "sequential",
+            RustCMSVariant::Independent => "independent",
+            RustCMSVariant::Hybrid => "hybrid",
+        }
+    }
+
+    #[getter]
+    fn num_blocks(&self) -> usize { self.inner.blocks.len() }
+
+    #[getter]
+    fn d_model(&self) -> usize { self.inner.d_model }
+
+    #[getter]
+    fn vocab_size(&self) -> usize { self.inner.vocab_size }
+
+    fn total_params_estimate(&self) -> usize {
+        self.inner.total_params_estimate()
+    }
+}
+
+/// Parse a Python dict into a RustBlockConfig.
+/// Required keys: "composition" (str). Optional: "memory_rule", "cms_enabled", "k", "m3".
+fn parse_block_config(d: &Bound<'_, PyDict>) -> PyResult<RustBlockConfig> {
+    let comp_str: String = d.get_item("composition")?
+        .ok_or_else(|| PyValueError::new_err("block dict requires 'composition' key"))?
+        .extract()?;
+    let comp = match comp_str.to_lowercase().as_str() {
+        "mag" => CompositionKind::MAG,
+        "mal" => CompositionKind::MAL,
+        "mac" => CompositionKind::MAC,
+        _ => return Err(PyValueError::new_err(format!(
+            "Unknown composition '{comp_str}'. Expected: mag, mal, mac"
+        ))),
+    };
+
+    let cms_enabled: bool = match d.get_item("cms_enabled")? {
+        Some(v) => v.extract()?,
+        None => true,
+    };
+
+    if !cms_enabled {
+        return Ok(RustBlockConfig::default_standard(comp));
+    }
+
+    let rule_str: String = match d.get_item("memory_rule")? {
+        Some(v) => v.extract()?,
+        None => "delta".into(),
+    };
+    let rule = match rule_str.to_lowercase().as_str() {
+        "delta" => MemoryRuleKind::DeltaRule,
+        "titans" => MemoryRuleKind::TitansLMM,
+        "hebbian" => MemoryRuleKind::HebbianRule,
+        "moneta" => MemoryRuleKind::Moneta,
+        "yaad" => MemoryRuleKind::YAAD,
+        "memora" => MemoryRuleKind::MEMORA,
+        "lattice" => MemoryRuleKind::LatticeOSR,
+        "trellis" => MemoryRuleKind::Trellis,
+        _ => return Err(PyValueError::new_err(format!(
+            "Unknown memory_rule '{rule_str}'"
+        ))),
+    };
+
+    let k: usize = match d.get_item("k")? {
+        Some(v) => v.extract()?,
+        None => 1,
+    };
+
+    let mut block = RustBlockConfig::default_cms(k, rule, comp);
+
+    // Optional M3 config
+    if let Some(m3_dict) = d.get_item("m3")? {
+        let m3_d: &Bound<'_, PyDict> = m3_dict.downcast()
+            .map_err(|_| PyValueError::new_err("m3 must be a dict"))?;
+        block.m3 = Some(parse_m3_config(m3_d)?);
+    }
+
+    Ok(block)
+}
+
 // ── Module ───────────────────────────────────────────────────────────
 
 #[pymodule]
@@ -535,5 +758,7 @@ fn nl_hecate(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mag_backward, m)?)?;
     m.add_function(wrap_pyfunction!(mag_compute_gradients, m)?)?;
     m.add_function(wrap_pyfunction!(mag_apply_weight_gradients, m)?)?;
+    // CMS Variants
+    m.add_class::<MultiBlockConfig>()?;
     Ok(())
 }

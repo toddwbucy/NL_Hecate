@@ -47,6 +47,7 @@ fn tiny_config(rule: MemoryRuleKind, retention: RetentionKind) -> MAGConfig {
         lambda_v: 0.01,
         parallel: None,
         retention,
+        m3: None,
     }
 }
 
