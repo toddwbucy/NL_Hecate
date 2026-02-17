@@ -10,10 +10,11 @@
 /// - Elastic net: L2 decay + L1 soft thresholding (NEW)
 /// - Sphere normalization: orthogonal projection + normalize (Lattice OSR)
 
+use serde::{Serialize, Deserialize};
 use crate::tensor::{log_f32, softmax_f32, vec_norm_f32};
 
 /// Which retention mechanism to apply.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum RetentionKind {
     /// Multiplicative decay: w[i] *= retain_factor.
     /// Used by Delta, Hebbian, Titans, Trellis, Moneta, YAAD.
