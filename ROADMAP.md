@@ -114,12 +114,16 @@ Formalize the two-domain compilation boundary that already exists in practice:
 | Phase 3: HebbianRule | `hebbian_forward.cu`, `hebbian_backward.cu` | 7 | COMPLETE |
 | Phase 4: Integration | Composition-level CUDA parity tests | 5 | COMPLETE |
 | Phase 5: Arch dispatch | `Backend` enum, `GpuInfo`, multi-arch build | ~13 | COMPLETE |
+| **S2-M1a**: SWA head_dim fix | Replace warp shuffle with shared-mem tree reduction in `swa_forward.cu`/`swa_backward.cu`. Power-of-two guard in dispatch. | +4 (17 total SWA) | COMPLETE |
+| **S2-M1b**: GPU-resident model | `GpuBuf<T>` RAII primitive, `GpuMAGParams`/`GpuContextState` on device, 3 new CUDA kernels (embedding, elementwise, cross_entropy), `_dd` dispatch variants, `gpu_cms_forward`/`gpu_cms_backward`/`gpu_weight_update`. PCIe: 8KB in + 4B out per step. | 6 | COMPLETE |
 
 **Deliverables**:
 - [x] CUDA kernel pairs for memory rule hot paths (Delta Rule, Titans LMM, Hebbian)
 - [x] Architecture dispatch (sm_86, sm_89, sm_90 + PTX fallback)
 - [x] `.cubin`/`.ptx` packaging (fat binary via multi-gencode)
 - [x] Compilation documentation (`docs/build_matrix.md`)
+- [x] SWA kernels fixed for head_dim > 32 (S2-M1a: shared-mem tree reduction, PR #40)
+- [x] GPU-resident model: zero PCIe forward/backward/update (S2-M1b, PR #41)
 
 **Dependencies**: None (builds on existing kernel-pair pattern)
 
@@ -352,17 +356,42 @@ Load a checkpoint and interactively generate text. Autoregressive byte generatio
 
 ---
 
-### S4-M5: Declared Checkpoint Format (PLANNED)
+### S4-M5: Declared Checkpoint Format ✅
 
-Current checkpoint serialization is serde default (JSON dump of raw structs). Post-MVP, add a declared format with:
-- Schema version for forward-compatible migration
-- Optional ContextState persistence (for resuming builds mid-stream)
-- Optional Conductor state (step counter, stream cursor) for exact resume
-- Binary format option (the JSON checkpoint for a real model will be large)
+Versioned checkpoint format with schema migration, optional ContextState/Conductor state for build resume, and binary format option.
 
-Outer-loop params only is correct for serving (memory reconstructs at test time). But build resume and model distribution need a versioned, documented format.
+**PR**: #39
 
-**Dependencies**: S4-M1 through S4-M4 (MVP must work first)
+---
+
+### S4-M6: Model Design — First Real Build ✅
+
+Concrete model configuration proving the build→serve pipeline works end-to-end on real text data.
+
+**What was delivered**: `configs/toy_60m.json` config (d=2048, heads=16, seq_len=512, k=2 CMS [1,8], Titans LMM + MAG). `data/download_fineweb.py` script for FineWeb byte-level data acquisition. `build.py` enhanced with `--config` JSON loading, binary `.bin` data support, and `--chunk_sizes` argument. Config file provides defaults, CLI args override.
+
+**Architecture**: ~59.8M params, byte-level tokenizer (vocab=256), Titans LMM (matrix M + momentum S), MAG composition, k=2 CMS (Level 0 every step, Level 1 every 8th).
+
+**Deliverables**:
+- [x] `python/configs/toy_60m.json` — model config
+- [x] `python/data/download_fineweb.py` — FineWeb data acquisition
+- [x] `python/build.py` — `--config` flag, binary data, `--chunk_sizes`
+- [x] Success criteria defined: loss convergence, no NaN, k=2 >= k=1, checkpoint roundtrip
+
+**Dependencies**: S4-M5 (declared checkpoint format)
+
+---
+
+### S4-M7: Build Hardening (PLANNED)
+
+Run the toy_60m config end-to-end. Validate all success criteria:
+1. Loss converges (byte-level CE from ~5.5 to <4.0)
+2. No NaN/Inf through 5000 steps
+3. k=2 matches or beats k=1 baseline
+4. Checkpoint save → load → continue with no loss spike
+5. Serve generates coherent byte sequences
+
+**Dependencies**: S4-M6 (model design + config)
 **Status**: NOT STARTED
 
 ---
@@ -376,6 +405,10 @@ Stage 0: Foundation ────────────────────
 Stage 1: Algorithm Core ─────────────────────── COMPLETE (805 tests)
     │
     ├─► S2-M1: Compilation Strategy ─────────── COMPLETE
+    │       │
+    │       ├─► S2-M1a: SWA head_dim fix ──────── COMPLETE (PR #40)
+    │       │
+    │       ├─► S2-M1b: GPU-resident model ────── COMPLETE (PR #41)
     │       │
     │       ├─► S2-M2: Multi-GPU Distribution ── COMPLETE
     │       │
@@ -401,7 +434,11 @@ Stage 1: Algorithm Core ──────────────────�
                     │
                     ├─► S4-M4: Serve Script ──── COMPLETE (PR #38)
                     │
-                    └─► S4-M5: Declared Ckpt ─── PLANNED
+                    └─► S4-M5: Declared Ckpt ─── COMPLETE (PR #39)
+                            │
+                            └─► S4-M6: Model Design ── COMPLETE
+                                    │
+                                    └─► S4-M7: Build Hardening ── PLANNED
 ```
 
 Stage 2 milestones are sequential (each builds on the last). Stage 3 milestones are independent of each other and can be done in any order. Stage 3 does not block Stage 2. Stage 4 depends on S4-M1 (serialization) for the full build→save→load→serve pipeline.
@@ -414,9 +451,9 @@ Stage 2 milestones are sequential (each builds on the last). Stage 3 milestones 
 |-------|-----------|-------|--------|
 | Stage 0: Foundation | 3 | 57 + 47 + 98 | COMPLETE |
 | Stage 1: Algorithm Core | 19 | 778 Rust + 27 Python | COMPLETE |
-| Stage 2: Production Infra | 4 | 29 CUDA + 13 dispatch + 20 edge + 18 serving + 18 distributed | COMPLETE |
+| Stage 2: Production Infra | 4 (+M1a, +M1b) | 33 CUDA + 13 dispatch + 6 GPU-resident + 20 edge + 18 serving + 18 distributed | COMPLETE |
 | Stage 3: Extensions | 5 | 22 retention + 35 M3/variants + 26 Atlas + 22 dynamic freq = 105 | COMPLETE |
 
-| Stage 4: MVP Build & Serve | 5 (4 done, 1 planned) | 27 Python (existing, no regressions) | IN PROGRESS |
+| Stage 4: MVP Build & Serve | 7 (6 done, 1 planned) | 27 Python (existing, no regressions) | IN PROGRESS |
 
-**Current position**: S0–S3 complete. S4 MVP delivered (M1–M4): can build a model on text and serve it locally. S4-M5 (declared checkpoint format) planned for post-MVP. Total test count: 940 Rust + 27 Python = **967 tests**.
+**Current position**: S0–S3 complete. S4 MVP pipeline delivered (M1–M6): can build a model on real text data and serve it locally. S4-M7 (build hardening) is next — run the 60M toy model end-to-end. Total test count: 950 Rust + 27 Python = **977 tests**.
