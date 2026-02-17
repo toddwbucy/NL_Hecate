@@ -17,6 +17,7 @@ use nl_hecate_core::mag::{cms_forward, cms_backward};
 use nl_hecate_core::mal::{cms_mal_forward, cms_mal_backward};
 use nl_hecate_core::mac::{cms_mac_forward, cms_mac_backward};
 use nl_hecate_core::retention::RetentionKind;
+use nl_hecate_core::dispatch::force_rust_reference;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -816,6 +817,7 @@ fn run_sweep_combo(
 /// Runs all combos and reports results in a table, then asserts all passed.
 #[test]
 fn test_sweep_all_combinations() {
+    force_rust_reference(true);
     let mut results = Vec::new();
     let mut failures = Vec::new();
 
@@ -892,6 +894,7 @@ fn test_sweep_titans_lmm() {
 
 #[test]
 fn test_sweep_hebbian() {
+    force_rust_reference(true);
     for &comp in ALL_COMPOSITIONS {
         for &k in ALL_K_VALUES {
             let (name, _, _, _, passed) = run_sweep_combo(MemoryRuleKind::HebbianRule, comp, k);

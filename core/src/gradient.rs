@@ -720,6 +720,17 @@ pub(crate) fn cms_mac_check_weight_gradient(
 mod tests {
     use super::*;
 
+    /// Force Rust reference for all gradient tests when CUDA is available.
+    /// FD gradient checking requires both analytical and numerical paths to use
+    /// identical arithmetic. cuBLAS rounding differs from Rust, which can flip
+    /// marginal gradient signs (especially in MAL's residual connection path).
+    #[cfg(feature = "cuda")]
+    fn ensure_rust_reference() {
+        crate::dispatch::force_rust_reference(true);
+    }
+    #[cfg(not(feature = "cuda"))]
+    fn ensure_rust_reference() {}
+
     /// Tiny config for gradient checking. Smaller model = larger gradients per
     /// parameter = better FD resolution at f32 precision.
     fn grad_check_config() -> SWAConfig {
@@ -4567,6 +4578,7 @@ mod tests {
 
     #[test]
     fn test_mal_gradient_w_k_mem() {
+        ensure_rust_reference();
         let cfg = mal_grad_check_config();
         let params = mal_params_for_grad_check(&cfg, 42);
         let (input_ids, target_ids) = mal_make_test_data(&cfg);
@@ -4597,6 +4609,7 @@ mod tests {
 
     #[test]
     fn test_mal_gradient_w_q_mem() {
+        ensure_rust_reference();
         let cfg = mal_grad_check_config();
         let params = mal_params_for_grad_check(&cfg, 42);
         let (input_ids, target_ids) = mal_make_test_data(&cfg);
@@ -4695,6 +4708,7 @@ mod tests {
 
     #[test]
     fn test_mal_cms_gradient_l0_w_k_mem() {
+        ensure_rust_reference();
         let cfg = mal_cms_grad_check_config_k2();
         let params = mal_cms_params_for_grad_check(&cfg, 42);
         let (input_ids, target_ids) = mal_cms_make_test_data(&cfg);
@@ -4731,6 +4745,7 @@ mod tests {
 
     #[test]
     fn test_mal_cms_gradient_l0_w_q_mem() {
+        ensure_rust_reference();
         let cfg = mal_cms_grad_check_config_k2();
         let params = mal_cms_params_for_grad_check(&cfg, 42);
         let (input_ids, target_ids) = mal_cms_make_test_data(&cfg);
@@ -4823,6 +4838,7 @@ mod tests {
 
     #[test]
     fn test_mal_cms_gradient_l1_w_k_mem() {
+        ensure_rust_reference();
         let cfg = mal_cms_grad_check_config_k2();
         let params = mal_cms_params_for_grad_check(&cfg, 42);
         let (input_ids, target_ids) = mal_cms_make_test_data(&cfg);
@@ -4859,6 +4875,7 @@ mod tests {
 
     #[test]
     fn test_mal_cms_gradient_l1_w_q_mem() {
+        ensure_rust_reference();
         let cfg = mal_cms_grad_check_config_k2();
         let params = mal_cms_params_for_grad_check(&cfg, 42);
         let (input_ids, target_ids) = mal_cms_make_test_data(&cfg);

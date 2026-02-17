@@ -3,13 +3,16 @@
 NL-Hecate build script: train a model on text using stateful CMS, save checkpoint.
 
 Usage:
-    python build.py --data sample.txt --steps 500 --d_model 64 --seq_len 32 --lr 0.01
-    python build.py --steps 200  # uses built-in demo text
+    python build.py --config configs/toy_60m.json                    # from config file
+    python build.py --config configs/toy_60m.json --lr 0.0005        # config + CLI override
+    python build.py --data sample.txt --steps 500 --d_model 64       # pure CLI args
+    python build.py --steps 200                                      # uses built-in demo text
 
 All math stays in Rust. This script is pure orchestration (CS-18).
 """
 
 import argparse
+import json
 import math
 import os
 from pathlib import Path
@@ -48,92 +51,147 @@ DEMO_TEXT = (
 ) * 10
 
 
+def load_config_file(path: str) -> dict:
+    """Load a JSON config file and return as dict."""
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def load_binary_tokens(path: str) -> list[int]:
+    """Load a binary file where each byte IS a token ID."""
+    with open(path, "rb") as f:
+        return list(f.read())
+
+
 def main():
     parser = argparse.ArgumentParser(description="NL-Hecate build script")
-    parser.add_argument("--data", type=str, default=None, help="Path to text file")
-    parser.add_argument("--steps", type=int, default=500, help="Build steps")
-    parser.add_argument("--d_model", type=int, default=64, help="Model dimension")
-    parser.add_argument("--num_heads", type=int, default=4, help="Number of attention heads")
-    parser.add_argument("--seq_len", type=int, default=32, help="Sequence length")
-    parser.add_argument("--window_size", type=int, default=16, help="SWA window size")
-    parser.add_argument("--k", type=int, default=1, help="CMS frequency levels")
-    parser.add_argument("--memory_rule", type=str, default="delta", help="Memory rule")
-    parser.add_argument("--composition", type=str, default="mag", help="Composition pattern")
-    parser.add_argument("--lr", type=float, default=0.01, help="Learning rate")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--save_path", type=str, default="checkpoints/model.json",
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to JSON config file (overrides CLI defaults)")
+    parser.add_argument("--data", type=str, default=None, help="Path to data file (.txt or .bin)")
+    parser.add_argument("--steps", type=int, default=None, help="Build steps")
+    parser.add_argument("--d_model", type=int, default=None, help="Model dimension")
+    parser.add_argument("--num_heads", type=int, default=None, help="Number of attention heads")
+    parser.add_argument("--seq_len", type=int, default=None, help="Sequence length")
+    parser.add_argument("--window_size", type=int, default=None, help="SWA window size")
+    parser.add_argument("--k", type=int, default=None, help="CMS frequency levels")
+    parser.add_argument("--chunk_sizes", type=str, default=None,
+                        help="Comma-separated chunk sizes per level (e.g. '1,8')")
+    parser.add_argument("--memory_rule", type=str, default=None, help="Memory rule")
+    parser.add_argument("--composition", type=str, default=None, help="Composition pattern")
+    parser.add_argument("--lr", type=float, default=None, help="Learning rate")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed")
+    parser.add_argument("--save_path", type=str, default=None,
                         help="Checkpoint save path")
-    parser.add_argument("--save_every", type=int, default=0,
+    parser.add_argument("--save_every", type=int, default=None,
                         help="Save checkpoint every N steps (0 = only at end)")
-    parser.add_argument("--log_every", type=int, default=10, help="Log every N steps")
+    parser.add_argument("--log_every", type=int, default=None, help="Log every N steps")
     args = parser.parse_args()
 
+    # ── Merge config file + CLI args ─────────────────────────────────
+    # Config file provides defaults; CLI args override.
+    file_cfg = {}
+    if args.config:
+        file_cfg = load_config_file(args.config)
+        print(f"Loaded config: {args.config}")
+
+    m = file_cfg.get("model", {})
+    b = file_cfg.get("build", {})
+    d = file_cfg.get("data", {})
+
+    # Resolve each parameter: CLI arg > config file > hardcoded default
+    data_path   = args.data        or d.get("path")
+    steps       = args.steps       or b.get("steps", 500)
+    d_model     = args.d_model     or m.get("d_model", 64)
+    num_heads   = args.num_heads   or m.get("num_heads", 4)
+    seq_len     = args.seq_len     or m.get("seq_len", 32)
+    window_size = args.window_size or m.get("window_size", 16)
+    k           = args.k           or m.get("k", 1)
+    memory_rule = args.memory_rule or m.get("memory_rule", "delta")
+    composition = args.composition or m.get("composition", "mag")
+    lr          = args.lr          or b.get("lr", 0.01)
+    seed        = args.seed        if args.seed is not None else b.get("seed", 42)
+    save_path   = args.save_path   or b.get("save_path", "checkpoints/model.json")
+    save_every  = args.save_every  if args.save_every is not None else b.get("save_every", 0)
+    log_every   = args.log_every   if args.log_every is not None else b.get("log_every", 10)
+
+    # chunk_sizes: CLI string "1,8" > config list [1, 8] > default [1]*k
+    if args.chunk_sizes:
+        chunk_sizes = [int(x) for x in args.chunk_sizes.split(",")]
+    elif "chunk_sizes" in m:
+        chunk_sizes = m["chunk_sizes"]
+    else:
+        chunk_sizes = [1] * k
+
     # ── Load data ────────────────────────────────────────────────────
-    if args.data:
-        with open(args.data, "r", encoding="utf-8") as f:
-            text = f.read()
-        print(f"Loaded {len(text):,} chars from {args.data}")
+    if data_path:
+        if data_path.endswith(".bin"):
+            token_ids = load_binary_tokens(data_path)
+            print(f"Loaded {len(token_ids):,} byte tokens from {data_path}")
+        else:
+            with open(data_path, "r", encoding="utf-8") as f:
+                text = f.read()
+            print(f"Loaded {len(text):,} chars from {data_path}")
+            token_ids = encode(text)
     else:
         text = DEMO_TEXT
         print(f"Using built-in demo text ({len(text):,} chars)")
+        token_ids = encode(text)
 
-    token_ids = encode(text)
-    if len(token_ids) < args.seq_len + 1:
-        print(f"Error: text too short ({len(token_ids)} tokens < seq_len+1={args.seq_len + 1})")
+    if len(token_ids) < seq_len + 1:
+        print(f"Error: text too short ({len(token_ids)} tokens < seq_len+1={seq_len + 1})")
         return
 
     # ── Config ───────────────────────────────────────────────────────
-    if args.d_model % args.num_heads != 0:
-        print(f"Error: d_model ({args.d_model}) must be divisible by num_heads ({args.num_heads})")
+    if d_model % num_heads != 0:
+        print(f"Error: d_model ({d_model}) must be divisible by num_heads ({num_heads})")
         return
-    head_dim = args.d_model // args.num_heads
-    chunk_sizes = [1] * args.k  # level 0 fires every step
+    head_dim = d_model // num_heads
 
     cfg = nl_hecate.MAGConfig(
-        d_model=args.d_model,
-        num_heads=args.num_heads,
+        d_model=d_model,
+        num_heads=num_heads,
         head_dim=head_dim,
-        seq_len=args.seq_len,
-        window_size=args.window_size,
+        seq_len=seq_len,
+        window_size=window_size,
         vocab_size=256,
         memory_enabled=True,
-        k=args.k,
+        k=k,
         chunk_sizes=chunk_sizes,
-        memory_rule=args.memory_rule,
-        composition=args.composition,
+        memory_rule=memory_rule,
+        composition=composition,
     )
-    params = nl_hecate.mag_init_params(cfg, args.seed)
+    params = nl_hecate.mag_init_params(cfg, seed)
 
     print(f"\n{'=' * 60}")
     print("NL-Hecate Build")
     print(f"{'=' * 60}")
-    print(f"  Model:    d={args.d_model}, heads={args.num_heads}, "
-          f"seq_len={args.seq_len}, vocab=256")
-    print(f"  Memory:   rule={args.memory_rule}, composition={args.composition}, k={args.k}")
+    print(f"  Model:    d={d_model}, heads={num_heads}, "
+          f"seq_len={seq_len}, vocab=256")
+    print(f"  Memory:   rule={memory_rule}, composition={composition}, k={k}")
+    print(f"  CMS:      chunk_sizes={chunk_sizes}")
     print(f"  Params:   {params.num_params():,}")
     print(f"  Data:     {len(token_ids):,} tokens")
-    print(f"  Build:    {args.steps} steps, lr={args.lr}")
+    print(f"  Build:    {steps} steps, lr={lr}")
     print(f"{'=' * 60}\n")
 
     # ── Stateful CMS build loop ──────────────────────────────────────
-    conductor = nl_hecate.Conductor(args.k, chunk_sizes)
+    conductor = nl_hecate.Conductor(k, chunk_sizes)
     stream = nl_hecate.VecStream(token_ids)
     conductor.attach_stream(stream)
-    context = nl_hecate.ContextState(args.k, args.d_model)
-    error_buffers = nl_hecate.ErrorBufferList(args.k, args.d_model)
+    context = nl_hecate.ContextState(k, d_model)
+    error_buffers = nl_hecate.ErrorBufferList(k, d_model)
 
     losses = []
     t_start = time.perf_counter()
 
-    for step in range(args.steps):
-        result = conductor.next_chunk(args.seq_len)
+    for step in range(steps):
+        result = conductor.next_chunk(seq_len)
         if result is None:
-            # Should not happen with VecStream (auto-wraps), but be defensive
             break
         input_ids, target_ids, pulse = result
 
         # Skip truncated chunks at corpus boundary
-        if len(input_ids) != args.seq_len:
+        if len(input_ids) != seq_len:
             conductor.advance()
             continue
 
@@ -144,22 +202,22 @@ def main():
             params, cfg, cache, input_ids, target_ids, error_buffers)
 
         # Outer-loop weight update
-        nl_hecate.mag_apply_weight_gradients(params, grads, args.lr)
+        nl_hecate.mag_apply_weight_gradients(params, grads, lr)
 
         # Apply frozen-level error buffers when levels activate
-        error_buffers.apply_for_active(params, pulse, args.lr)
+        error_buffers.apply_for_active(params, pulse, lr)
 
         # Advance conductor (CS-32: observe-then-advance)
         conductor.advance()
         losses.append(loss)
 
         # Logging
-        if step % args.log_every == 0 or step == args.steps - 1:
+        if step % log_every == 0 or step == steps - 1:
             print(f"  step {step:5d}  loss={loss:.4f}")
 
         # Periodic checkpoint (resumable — includes build state)
-        if args.save_every > 0 and step > 0 and step % args.save_every == 0:
-            p = Path(args.save_path)
+        if save_every > 0 and step > 0 and step % save_every == 0:
+            p = Path(save_path)
             ckpt_path = str(p.with_stem(f"{p.stem}_step{step}"))
             os.makedirs(os.path.dirname(ckpt_path) or ".", exist_ok=True)
             nl_hecate.save_build_checkpoint(ckpt_path, params, cfg, conductor, context)
@@ -167,12 +225,12 @@ def main():
 
     t_end = time.perf_counter()
     elapsed = t_end - t_start
-    total_tokens = len(losses) * args.seq_len
+    total_tokens = len(losses) * seq_len
     tok_per_sec = total_tokens / elapsed if elapsed > 0 else 0
 
     # ── Final checkpoint ─────────────────────────────────────────────
-    os.makedirs(os.path.dirname(args.save_path) or ".", exist_ok=True)
-    nl_hecate.save_checkpoint(args.save_path, params, cfg)
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    nl_hecate.save_checkpoint(save_path, params, cfg)
 
     # ── Summary ──────────────────────────────────────────────────────
     print(f"\n{'=' * 60}")
@@ -186,7 +244,7 @@ def main():
         avg_first = sum(losses[:10]) / min(10, len(losses))
         avg_last = sum(losses[-10:]) / min(10, len(losses))
         print(f"  Avg loss:  first10={avg_first:.4f}, last10={avg_last:.4f}")
-    print(f"  Saved:     {args.save_path}")
+    print(f"  Saved:     {save_path}")
     print(f"{'=' * 60}")
 
 

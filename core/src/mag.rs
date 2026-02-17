@@ -7,7 +7,7 @@
 /// Two branches share `embedded` input. Memory output gates attention output
 /// via element-wise multiply with sigmoid activation.
 
-use crate::tensor::{matmul_f32, transpose_f32, cross_entropy_loss, sigmoid_f32};
+use crate::tensor::{transpose_f32, cross_entropy_loss, sigmoid_f32};
 use crate::model::{MAGConfig, MAGParams, MemoryRuleKind};
 use crate::delta_rule::{MemoryRule, DeltaRule, DeltaRuleCache, delta_rule_read_only, delta_rule_read_only_backward};
 use crate::titans_lmm::{TitansLMM, TitansLMMCache};
@@ -87,20 +87,13 @@ pub fn mag_forward(
         embedded[t * d..(t + 1) * d].copy_from_slice(src);
     }
 
-    // Stage 2a: Attention branch — QKV projections
-    let mut w_q_t = vec![0.0f32; d * d];
-    let mut w_k_t = vec![0.0f32; d * d];
-    let mut w_v_t = vec![0.0f32; d * d];
-    transpose_f32(&params.swa.w_q, &mut w_q_t, d, d);
-    transpose_f32(&params.swa.w_k, &mut w_k_t, d, d);
-    transpose_f32(&params.swa.w_v, &mut w_v_t, d, d);
-
+    // Stage 2a: Attention branch — QKV projections (fused transpose-matmul via cuBLAS)
     let mut q = vec![0.0f32; s * d];
     let mut k = vec![0.0f32; s * d];
     let mut vv = vec![0.0f32; s * d];
-    matmul_f32(&embedded, &w_q_t, &mut q, s, d, d);
-    matmul_f32(&embedded, &w_k_t, &mut k, s, d, d);
-    matmul_f32(&embedded, &w_v_t, &mut vv, s, d, d);
+    crate::dispatch::matmul_transb_dispatch(&embedded, &params.swa.w_q, &mut q, s, d, d);
+    crate::dispatch::matmul_transb_dispatch(&embedded, &params.swa.w_k, &mut k, s, d, d);
+    crate::dispatch::matmul_transb_dispatch(&embedded, &params.swa.w_v, &mut vv, s, d, d);
 
     // Stage 3a: SWA Attention
     let mut attn_out = vec![0.0f32; s * d];
@@ -160,15 +153,13 @@ pub fn mag_forward(
         gated_out[i] = attn_out[i] * gate[i];
     }
 
-    // Stage 5: Output projection — projected = gated_out @ W_O^T
-    let mut w_o_t = vec![0.0f32; d * d];
-    transpose_f32(&params.swa.w_o, &mut w_o_t, d, d);
+    // Stage 5: Output projection — projected = gated_out @ W_O^T (fused transpose-matmul)
     let mut projected = vec![0.0f32; s * d];
-    matmul_f32(&gated_out, &w_o_t, &mut projected, s, d, d);
+    crate::dispatch::matmul_transb_dispatch(&gated_out, &params.swa.w_o, &mut projected, s, d, d);
 
     // Stage 6: Unembed — logits = projected @ W_unembed
     let mut logits = vec![0.0f32; s * v];
-    matmul_f32(&projected, &params.swa.w_unembed, &mut logits, s, d, v);
+    crate::dispatch::matmul_dispatch(&projected, &params.swa.w_unembed, &mut logits, s, d, v);
 
     // Stage 7: Cross-entropy loss
     let loss = cross_entropy_loss(&logits, target_ids, s, v);
@@ -230,23 +221,21 @@ pub fn mag_backward(
     }
 
     // ── Stage 6: Unembed backward ────────────────────────────────────
-    let mut w_unembed_t = vec![0.0f32; v * d];
-    transpose_f32(&params.swa.w_unembed, &mut w_unembed_t, d, v);
     let mut d_projected = vec![0.0f32; s * d];
-    matmul_f32(&d_logits, &w_unembed_t, &mut d_projected, s, v, d);
+    crate::dispatch::matmul_transb_dispatch(&d_logits, &params.swa.w_unembed, &mut d_projected, s, v, d);
 
     let mut projected_t = vec![0.0f32; d * s];
     transpose_f32(&cache.projected, &mut projected_t, s, d);
-    matmul_f32(&projected_t, &d_logits, &mut grads.swa.w_unembed, d, s, v);
+    crate::dispatch::matmul_dispatch(&projected_t, &d_logits, &mut grads.swa.w_unembed, d, s, v);
 
     // ── Stage 5: Output projection backward ──────────────────────────
     // projected = gated_out @ W_O^T
     let mut d_gated_out = vec![0.0f32; s * d];
-    matmul_f32(&d_projected, &params.swa.w_o, &mut d_gated_out, s, d, d);
+    crate::dispatch::matmul_dispatch(&d_projected, &params.swa.w_o, &mut d_gated_out, s, d, d);
 
     let mut d_projected_t = vec![0.0f32; d * s];
     transpose_f32(&d_projected, &mut d_projected_t, s, d);
-    matmul_f32(&d_projected_t, &cache.gated_out, &mut grads.swa.w_o, d, s, d);
+    crate::dispatch::matmul_dispatch(&d_projected_t, &cache.gated_out, &mut grads.swa.w_o, d, s, d);
 
     // ── Stage 4: Gating backward ─────────────────────────────────────
     // gated_out = attn_out * gate
@@ -319,21 +308,21 @@ pub fn mag_backward(
     // ── Stage 2a: QKV projection backward ────────────────────────────
     let mut d_embedded = vec![0.0f32; s * d];
 
-    crate::tensor::matmul_acc_f32(&d_q, &params.swa.w_q, &mut d_embedded, s, d, d);
-    crate::tensor::matmul_acc_f32(&d_k, &params.swa.w_k, &mut d_embedded, s, d, d);
-    crate::tensor::matmul_acc_f32(&d_v, &params.swa.w_v, &mut d_embedded, s, d, d);
+    crate::dispatch::matmul_acc_dispatch(&d_q, &params.swa.w_q, &mut d_embedded, s, d, d);
+    crate::dispatch::matmul_acc_dispatch(&d_k, &params.swa.w_k, &mut d_embedded, s, d, d);
+    crate::dispatch::matmul_acc_dispatch(&d_v, &params.swa.w_v, &mut d_embedded, s, d, d);
 
     let mut d_q_t = vec![0.0f32; d * s];
     transpose_f32(&d_q, &mut d_q_t, s, d);
-    matmul_f32(&d_q_t, &cache.embedded, &mut grads.swa.w_q, d, s, d);
+    crate::dispatch::matmul_dispatch(&d_q_t, &cache.embedded, &mut grads.swa.w_q, d, s, d);
 
     let mut d_k_t = vec![0.0f32; d * s];
     transpose_f32(&d_k, &mut d_k_t, s, d);
-    matmul_f32(&d_k_t, &cache.embedded, &mut grads.swa.w_k, d, s, d);
+    crate::dispatch::matmul_dispatch(&d_k_t, &cache.embedded, &mut grads.swa.w_k, d, s, d);
 
     let mut d_v_t = vec![0.0f32; d * s];
     transpose_f32(&d_v, &mut d_v_t, s, d);
-    matmul_f32(&d_v_t, &cache.embedded, &mut grads.swa.w_v, d, s, d);
+    crate::dispatch::matmul_dispatch(&d_v_t, &cache.embedded, &mut grads.swa.w_v, d, s, d);
 
     // ── Combine d_embedded from both branches ────────────────────────
     for i in 0..(s * d) {
@@ -444,20 +433,13 @@ pub fn cms_forward(
     };
     let pulse = &effective_pulse;
 
-    // Stage 2a: Attention branch — QKV projections
-    let mut w_q_t = vec![0.0f32; d * d];
-    let mut w_k_t = vec![0.0f32; d * d];
-    let mut w_v_t = vec![0.0f32; d * d];
-    transpose_f32(&params.swa.w_q, &mut w_q_t, d, d);
-    transpose_f32(&params.swa.w_k, &mut w_k_t, d, d);
-    transpose_f32(&params.swa.w_v, &mut w_v_t, d, d);
-
+    // Stage 2a: Attention branch — QKV projections (fused transpose-matmul via cuBLAS)
     let mut q = vec![0.0f32; s * d];
     let mut k = vec![0.0f32; s * d];
     let mut vv = vec![0.0f32; s * d];
-    matmul_f32(&embedded, &w_q_t, &mut q, s, d, d);
-    matmul_f32(&embedded, &w_k_t, &mut k, s, d, d);
-    matmul_f32(&embedded, &w_v_t, &mut vv, s, d, d);
+    crate::dispatch::matmul_transb_dispatch(&embedded, &params.swa.w_q, &mut q, s, d, d);
+    crate::dispatch::matmul_transb_dispatch(&embedded, &params.swa.w_k, &mut k, s, d, d);
+    crate::dispatch::matmul_transb_dispatch(&embedded, &params.swa.w_v, &mut vv, s, d, d);
 
     // Stage 3a: SWA Attention
     let mut attn_out = vec![0.0f32; s * d];
@@ -635,15 +617,13 @@ pub fn cms_forward(
         gated_out[i] = attn_out[i] * gate[i];
     }
 
-    // Stage 5: Output projection
-    let mut w_o_t = vec![0.0f32; d * d];
-    transpose_f32(&params.swa.w_o, &mut w_o_t, d, d);
+    // Stage 5: Output projection (fused transpose-matmul via cuBLAS)
     let mut projected = vec![0.0f32; s * d];
-    matmul_f32(&gated_out, &w_o_t, &mut projected, s, d, d);
+    crate::dispatch::matmul_transb_dispatch(&gated_out, &params.swa.w_o, &mut projected, s, d, d);
 
     // Stage 6: Unembed
     let mut logits = vec![0.0f32; s * v];
-    matmul_f32(&projected, &params.swa.w_unembed, &mut logits, s, d, v);
+    crate::dispatch::matmul_dispatch(&projected, &params.swa.w_unembed, &mut logits, s, d, v);
 
     // Stage 7: Cross-entropy loss
     let loss = cross_entropy_loss(&logits, target_ids, s, v);
@@ -713,22 +693,20 @@ pub fn cms_backward(
     }
 
     // ── Stage 6: Unembed backward ────────────────────────────────────
-    let mut w_unembed_t = vec![0.0f32; v * d];
-    transpose_f32(&params.swa.w_unembed, &mut w_unembed_t, d, v);
     let mut d_projected = vec![0.0f32; s * d];
-    matmul_f32(&d_logits, &w_unembed_t, &mut d_projected, s, v, d);
+    crate::dispatch::matmul_transb_dispatch(&d_logits, &params.swa.w_unembed, &mut d_projected, s, v, d);
 
     let mut projected_t = vec![0.0f32; d * s];
     transpose_f32(&cache.projected, &mut projected_t, s, d);
-    matmul_f32(&projected_t, &d_logits, &mut grads.swa.w_unembed, d, s, v);
+    crate::dispatch::matmul_dispatch(&projected_t, &d_logits, &mut grads.swa.w_unembed, d, s, v);
 
     // ── Stage 5: Output projection backward ──────────────────────────
     let mut d_gated_out = vec![0.0f32; s * d];
-    matmul_f32(&d_projected, &params.swa.w_o, &mut d_gated_out, s, d, d);
+    crate::dispatch::matmul_dispatch(&d_projected, &params.swa.w_o, &mut d_gated_out, s, d, d);
 
     let mut d_projected_t = vec![0.0f32; d * s];
     transpose_f32(&d_projected, &mut d_projected_t, s, d);
-    matmul_f32(&d_projected_t, &cache.gated_out, &mut grads.swa.w_o, d, s, d);
+    crate::dispatch::matmul_dispatch(&d_projected_t, &cache.gated_out, &mut grads.swa.w_o, d, s, d);
 
     // ── Stage 4: Gating backward ─────────────────────────────────────
     let mut d_attn_out = vec![0.0f32; s * d];
@@ -884,21 +862,21 @@ pub fn cms_backward(
     // ── Stage 2a: QKV projection backward ────────────────────────────
     let mut d_embedded = vec![0.0f32; s * d];
 
-    crate::tensor::matmul_acc_f32(&d_q, &params.swa.w_q, &mut d_embedded, s, d, d);
-    crate::tensor::matmul_acc_f32(&d_k, &params.swa.w_k, &mut d_embedded, s, d, d);
-    crate::tensor::matmul_acc_f32(&d_v, &params.swa.w_v, &mut d_embedded, s, d, d);
+    crate::dispatch::matmul_acc_dispatch(&d_q, &params.swa.w_q, &mut d_embedded, s, d, d);
+    crate::dispatch::matmul_acc_dispatch(&d_k, &params.swa.w_k, &mut d_embedded, s, d, d);
+    crate::dispatch::matmul_acc_dispatch(&d_v, &params.swa.w_v, &mut d_embedded, s, d, d);
 
     let mut d_q_t = vec![0.0f32; d * s];
     transpose_f32(&d_q, &mut d_q_t, s, d);
-    matmul_f32(&d_q_t, &cache.embedded, &mut grads.swa.w_q, d, s, d);
+    crate::dispatch::matmul_dispatch(&d_q_t, &cache.embedded, &mut grads.swa.w_q, d, s, d);
 
     let mut d_k_t = vec![0.0f32; d * s];
     transpose_f32(&d_k, &mut d_k_t, s, d);
-    matmul_f32(&d_k_t, &cache.embedded, &mut grads.swa.w_k, d, s, d);
+    crate::dispatch::matmul_dispatch(&d_k_t, &cache.embedded, &mut grads.swa.w_k, d, s, d);
 
     let mut d_v_t = vec![0.0f32; d * s];
     transpose_f32(&d_v, &mut d_v_t, s, d);
-    matmul_f32(&d_v_t, &cache.embedded, &mut grads.swa.w_v, d, s, d);
+    crate::dispatch::matmul_dispatch(&d_v_t, &cache.embedded, &mut grads.swa.w_v, d, s, d);
 
     // ── Combine d_embedded from both branches ────────────────────────
     for i in 0..(s * d) {

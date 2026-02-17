@@ -210,20 +210,13 @@ impl MemoryRule for DeltaRule {
     ) -> (Vec<f32>, DeltaRuleCache) {
         debug_assert_eq!(embedded.len(), seq_len * d);
 
-        // Project embedded → k_mem, v_mem, q_mem via W^T
-        let mut w_k_mem_t = vec![0.0f32; d * d];
-        let mut w_v_mem_t = vec![0.0f32; d * d];
-        let mut w_q_mem_t = vec![0.0f32; d * d];
-        transpose_f32(&level_params.w_k_mem, &mut w_k_mem_t, d, d);
-        transpose_f32(&level_params.w_v_mem, &mut w_v_mem_t, d, d);
-        transpose_f32(&level_params.w_q_mem, &mut w_q_mem_t, d, d);
-
+        // Project embedded → k_mem, v_mem, q_mem via W^T (fused transpose-matmul)
         let mut k_mem = vec![0.0f32; seq_len * d];
         let mut v_mem = vec![0.0f32; seq_len * d];
         let mut q_mem = vec![0.0f32; seq_len * d];
-        matmul_f32(embedded, &w_k_mem_t, &mut k_mem, seq_len, d, d);
-        matmul_f32(embedded, &w_v_mem_t, &mut v_mem, seq_len, d, d);
-        matmul_f32(embedded, &w_q_mem_t, &mut q_mem, seq_len, d, d);
+        crate::dispatch::matmul_transb_dispatch(embedded, &level_params.w_k_mem, &mut k_mem, seq_len, d, d);
+        crate::dispatch::matmul_transb_dispatch(embedded, &level_params.w_v_mem, &mut v_mem, seq_len, d, d);
+        crate::dispatch::matmul_transb_dispatch(embedded, &level_params.w_q_mem, &mut q_mem, seq_len, d, d);
 
         // Allocate cache — seed M_0 from initial_m if provided, else zeros
         let mut m_states = vec![0.0f32; (seq_len + 1) * d * d];
@@ -457,19 +450,19 @@ impl MemoryRule for DeltaRule {
 
         let mut d_k_mem_t = vec![0.0f32; d * s];
         transpose_f32(&d_k_mem, &mut d_k_mem_t, s, d);
-        matmul_f32(&d_k_mem_t, embedded, &mut grads.w_k_mem, d, s, d);
+        crate::dispatch::matmul_dispatch(&d_k_mem_t, embedded, &mut grads.w_k_mem, d, s, d);
 
         let mut d_v_mem_t = vec![0.0f32; d * s];
         transpose_f32(&d_v_mem, &mut d_v_mem_t, s, d);
-        matmul_f32(&d_v_mem_t, embedded, &mut grads.w_v_mem, d, s, d);
+        crate::dispatch::matmul_dispatch(&d_v_mem_t, embedded, &mut grads.w_v_mem, d, s, d);
 
         let mut d_q_mem_t = vec![0.0f32; d * s];
         transpose_f32(&d_q_mem, &mut d_q_mem_t, s, d);
-        matmul_f32(&d_q_mem_t, embedded, &mut grads.w_q_mem, d, s, d);
+        crate::dispatch::matmul_dispatch(&d_q_mem_t, embedded, &mut grads.w_q_mem, d, s, d);
 
-        crate::tensor::matmul_acc_f32(&d_k_mem, &level_params.w_k_mem, &mut d_embedded, s, d, d);
-        crate::tensor::matmul_acc_f32(&d_v_mem, &level_params.w_v_mem, &mut d_embedded, s, d, d);
-        crate::tensor::matmul_acc_f32(&d_q_mem, &level_params.w_q_mem, &mut d_embedded, s, d, d);
+        crate::dispatch::matmul_acc_dispatch(&d_k_mem, &level_params.w_k_mem, &mut d_embedded, s, d, d);
+        crate::dispatch::matmul_acc_dispatch(&d_v_mem, &level_params.w_v_mem, &mut d_embedded, s, d, d);
+        crate::dispatch::matmul_acc_dispatch(&d_q_mem, &level_params.w_q_mem, &mut d_embedded, s, d, d);
 
         (grads, d_embedded)
     }
@@ -489,11 +482,9 @@ pub fn delta_rule_read_only(
     debug_assert_eq!(embedded.len(), seq_len * d);
     debug_assert_eq!(frozen_m.len(), d * d);
 
-    // Project embedded → q_mem via W_Q_mem^T
-    let mut w_q_mem_t = vec![0.0f32; d * d];
-    transpose_f32(&level_params.w_q_mem, &mut w_q_mem_t, d, d);
+    // Project embedded → q_mem via W_Q_mem^T (fused transpose-matmul)
     let mut q_mem = vec![0.0f32; seq_len * d];
-    matmul_f32(embedded, &w_q_mem_t, &mut q_mem, seq_len, d, d);
+    crate::dispatch::matmul_transb_dispatch(embedded, &level_params.w_q_mem, &mut q_mem, seq_len, d, d);
 
     // y_t = M @ q_t for each token
     let mut y = vec![0.0f32; seq_len * d];
@@ -541,10 +532,10 @@ pub fn delta_rule_read_only_backward(
     // q_mem = embedded @ W_Q_mem^T → d_W_Q_mem, d_embedded
     let mut d_q_mem_t = vec![0.0f32; d * seq_len];
     transpose_f32(&d_q_mem, &mut d_q_mem_t, seq_len, d);
-    matmul_f32(&d_q_mem_t, embedded, &mut grads.w_q_mem, d, seq_len, d);
+    crate::dispatch::matmul_dispatch(&d_q_mem_t, embedded, &mut grads.w_q_mem, d, seq_len, d);
 
     let mut d_embedded = vec![0.0f32; seq_len * d];
-    crate::tensor::matmul_acc_f32(&d_q_mem, &level_params.w_q_mem, &mut d_embedded, seq_len, d, d);
+    crate::dispatch::matmul_acc_dispatch(&d_q_mem, &level_params.w_q_mem, &mut d_embedded, seq_len, d, d);
 
     (grads, d_embedded)
 }
