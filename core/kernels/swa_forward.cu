@@ -68,10 +68,10 @@ __global__ void swa_forward_kernel(
             partial = q_row[d] * __bfloat162float(k[k_pos * total_dim + h_offset + d]);
         }
 
-        // Shared-memory tree reduction (works for any head_dim up to 1024)
+        // Shared-memory tree reduction (works for any power-of-two head_dim up to 1024)
         reduce[d] = partial;
         __syncthreads();
-        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
             if (d < s) {
                 reduce[d] += reduce[d + s];
             }
