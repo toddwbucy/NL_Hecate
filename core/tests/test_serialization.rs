@@ -198,7 +198,7 @@ fn test_save_load_checkpoint() {
     let params = MAGParams::init(&cfg, 42);
 
     save_checkpoint(&path, &params, &cfg).unwrap();
-    let (loaded_params, loaded_cfg) = load_checkpoint(&path).unwrap();
+    let (loaded_params, loaded_cfg, _build_state) = load_checkpoint(&path).unwrap();
 
     assert_mag_params_eq(&params, &loaded_params);
     assert_mag_config_eq(&cfg, &loaded_cfg);

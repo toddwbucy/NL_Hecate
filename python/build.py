@@ -157,13 +157,13 @@ def main():
         if step % args.log_every == 0 or step == args.steps - 1:
             print(f"  step {step:5d}  loss={loss:.4f}")
 
-        # Periodic checkpoint
+        # Periodic checkpoint (resumable — includes build state)
         if args.save_every > 0 and step > 0 and step % args.save_every == 0:
             p = Path(args.save_path)
             ckpt_path = str(p.with_stem(f"{p.stem}_step{step}"))
             os.makedirs(os.path.dirname(ckpt_path) or ".", exist_ok=True)
-            nl_hecate.save_checkpoint(ckpt_path, params, cfg)
-            print(f"  [checkpoint saved: {ckpt_path}]")
+            nl_hecate.save_build_checkpoint(ckpt_path, params, cfg, conductor, context)
+            print(f"  [build checkpoint saved: {ckpt_path}]")
 
     t_end = time.perf_counter()
     elapsed = t_end - t_start
