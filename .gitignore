@@ -34,3 +34,6 @@ python/checkpoints/
 python/__pycache__/
 python/tests/__pycache__/
 python/.venv/
+
+# Hermes workspace config
+.hermes/

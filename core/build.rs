@@ -40,6 +40,7 @@ fn main() {
             .file("kernels/embedding.cu")
             .file("kernels/elementwise.cu")
             .file("kernels/cross_entropy.cu")
+            .file("kernels/adamw.cu")
             .compile("nl_hecate_cuda_kernels");
 
         println!("cargo:rustc-link-search=native={}/lib64", cuda_path);
@@ -56,5 +57,6 @@ fn main() {
         println!("cargo:rerun-if-changed=kernels/embedding.cu");
         println!("cargo:rerun-if-changed=kernels/elementwise.cu");
         println!("cargo:rerun-if-changed=kernels/cross_entropy.cu");
+        println!("cargo:rerun-if-changed=kernels/adamw.cu");
     }
 }

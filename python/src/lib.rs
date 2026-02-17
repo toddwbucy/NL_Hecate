@@ -23,7 +23,8 @@ use nl_hecate_core::gradient::compute_gradients as rust_compute_gradients;
 use nl_hecate_core::mag::{mag_forward as rust_mag_forward, MAGForwardCache as RustMAGCache, mag_backward as rust_mag_backward};
 use nl_hecate_core::gradient::mag_compute_gradients as rust_mag_compute_gradients;
 use nl_hecate_core::mag::{cms_forward as rust_cms_forward, cms_backward as rust_cms_backward, CMSForwardCache as RustCMSCache};
-use nl_hecate_core::conductor::{Conductor as RustConductor, Pulse as RustPulse, ContextState as RustContextState, ErrorBuffer as RustErrorBuffer};
+use nl_hecate_core::conductor::{Conductor as RustConductor, Pulse as RustPulse, ContextState as RustContextState, ErrorBuffer as RustErrorBuffer, Checkpoint as RustCheckpoint, ConductorState as RustConductorState};
+use nl_hecate_core::context_stream::StreamCursor;
 use nl_hecate_core::context_stream::VecStream as RustVecStream;
 use nl_hecate_core::model::{
     save_checkpoint as rust_save_checkpoint,
@@ -451,6 +452,8 @@ impl MAGConfig {
     }
     #[getter]
     fn k(&self) -> usize { self.inner.k }
+    #[getter]
+    fn chunk_sizes(&self) -> Vec<usize> { self.inner.chunk_sizes.clone() }
 }
 
 // ── MAGParams ──────────────────────────────────────────────────────
@@ -486,6 +489,70 @@ impl MAGParams {
         dict.set_item("w_theta", self.inner.levels[0].w_theta.clone())?;
         dict.set_item("b_theta", self.inner.levels[0].b_theta.clone())?;
         Ok(dict)
+    }
+
+    /// Flatten all params into a single Vec<f32> for Python-side optimizers.
+    /// Order: SWA(embed,q,k,v,o,unembed) then per-level(k_mem,v_mem,q_mem,alpha,b_alpha,theta,b_theta,eta,b_eta,omega,freq,b_freq).
+    fn get_flat_weights(&self) -> Vec<f32> {
+        let mut flat = Vec::with_capacity(self.inner.num_params());
+        flat.extend_from_slice(&self.inner.swa.w_embed);
+        flat.extend_from_slice(&self.inner.swa.w_q);
+        flat.extend_from_slice(&self.inner.swa.w_k);
+        flat.extend_from_slice(&self.inner.swa.w_v);
+        flat.extend_from_slice(&self.inner.swa.w_o);
+        flat.extend_from_slice(&self.inner.swa.w_unembed);
+        for level in &self.inner.levels {
+            flat.extend_from_slice(&level.w_k_mem);
+            flat.extend_from_slice(&level.w_v_mem);
+            flat.extend_from_slice(&level.w_q_mem);
+            flat.extend_from_slice(&level.w_alpha);
+            flat.extend_from_slice(&level.b_alpha);
+            flat.extend_from_slice(&level.w_theta);
+            flat.extend_from_slice(&level.b_theta);
+            flat.extend_from_slice(&level.w_eta);
+            flat.extend_from_slice(&level.b_eta);
+            flat.extend_from_slice(&level.w_omega);
+            flat.extend_from_slice(&level.w_freq);
+            flat.extend_from_slice(&level.b_freq);
+        }
+        flat
+    }
+
+    /// Restore params from a flat Vec<f32> (inverse of get_flat_weights).
+    fn set_flat_weights(&mut self, flat: Vec<f32>) -> PyResult<()> {
+        if flat.len() != self.inner.num_params() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("flat weights length {} != num_params {}", flat.len(), self.inner.num_params())));
+        }
+        let mut offset = 0usize;
+        macro_rules! copy_slice {
+            ($dst:expr) => {{
+                let n = $dst.len();
+                $dst.copy_from_slice(&flat[offset..offset + n]);
+                offset += n;
+            }};
+        }
+        copy_slice!(self.inner.swa.w_embed);
+        copy_slice!(self.inner.swa.w_q);
+        copy_slice!(self.inner.swa.w_k);
+        copy_slice!(self.inner.swa.w_v);
+        copy_slice!(self.inner.swa.w_o);
+        copy_slice!(self.inner.swa.w_unembed);
+        for level in &mut self.inner.levels {
+            copy_slice!(level.w_k_mem);
+            copy_slice!(level.w_v_mem);
+            copy_slice!(level.w_q_mem);
+            copy_slice!(level.w_alpha);
+            copy_slice!(level.b_alpha);
+            copy_slice!(level.w_theta);
+            copy_slice!(level.b_theta);
+            copy_slice!(level.w_eta);
+            copy_slice!(level.b_eta);
+            copy_slice!(level.w_omega);
+            copy_slice!(level.w_freq);
+            copy_slice!(level.b_freq);
+        }
+        Ok(())
     }
 }
 
@@ -620,6 +687,8 @@ fn mag_compute_gradients(
 #[pyfunction]
 fn mag_apply_weight_gradients(params: &mut MAGParams, grads: &MAGParams, lr: f32) {
     params.inner.apply_weight_gradients(&grads.inner, lr);
+    // Weight tying: sync w_unembed^T → w_embed (CPU path)
+    params.inner.sync_embed_from_unembed();
 }
 
 // ── MultiBlockConfig ──────────────────────────────────────────────────
@@ -853,6 +922,59 @@ impl Conductor {
         }
     }
 
+    /// Restore conductor state from a build checkpoint dict.
+    fn restore_from_dict(&mut self, state: &Bound<'_, PyDict>) -> PyResult<()> {
+        // Validate that checkpoint k and chunk_sizes match current Conductor
+        if let Some(ck) = state.get_item("conductor_k")? {
+            let ck_val: usize = ck.extract()?;
+            if ck_val != self.inner.k {
+                return Err(PyValueError::new_err(format!(
+                    "checkpoint conductor_k ({}) != current k ({})", ck_val, self.inner.k
+                )));
+            }
+        }
+        if let Some(ccs) = state.get_item("conductor_chunk_sizes")? {
+            let ccs_val: Vec<usize> = ccs.extract()?;
+            if ccs_val != self.inner.chunk_sizes {
+                return Err(PyValueError::new_err(format!(
+                    "checkpoint conductor_chunk_sizes ({:?}) != current ({:?})",
+                    ccs_val, self.inner.chunk_sizes
+                )));
+            }
+        }
+        let conductor_step: usize = state.get_item("conductor_step")?
+            .ok_or_else(|| PyValueError::new_err("missing conductor_step"))?.extract()?;
+        let stream_position: u64 = state.get_item("stream_position")?
+            .ok_or_else(|| PyValueError::new_err("missing stream_position"))?.extract()?;
+        let stream_chunk_id: u64 = state.get_item("stream_chunk_id")?
+            .ok_or_else(|| PyValueError::new_err("missing stream_chunk_id"))?.extract()?;
+        let stream_pulse_id: u64 = state.get_item("stream_pulse_id")?
+            .ok_or_else(|| PyValueError::new_err("missing stream_pulse_id"))?.extract()?;
+        let stream_content_hash: u64 = state.get_item("stream_content_hash")?
+            .ok_or_else(|| PyValueError::new_err("missing stream_content_hash"))?.extract()?;
+        let stream_rng_state: Option<u64> = match state.get_item("stream_rng_state")? {
+            Some(v) if !v.is_none() => Some(v.extract()?),
+            _ => None,
+        };
+        let checkpoint = RustCheckpoint {
+            conductor: RustConductorState {
+                k: self.inner.k,
+                chunk_sizes: self.inner.chunk_sizes.clone(),
+                step: conductor_step,
+            },
+            stream: StreamCursor {
+                position: stream_position,
+                chunk_id: stream_chunk_id,
+                pulse_id: stream_pulse_id,
+                rng_state: stream_rng_state,
+                content_hash: stream_content_hash,
+            },
+        };
+        self.inner.restore(&checkpoint)
+            .map_err(|e| PyValueError::new_err(format!("restore failed: {e:?}")))?;
+        Ok(())
+    }
+
     #[getter]
     fn step(&self) -> usize { self.inner.step() }
 
@@ -893,6 +1015,25 @@ impl ContextState {
     /// Per-level M matrices as list of flat f32 lists.
     #[getter]
     fn memory(&self) -> Vec<Vec<f32>> { self.inner.memory.clone() }
+
+    /// Restore memory from a saved state (list of flat f32 lists, one per level).
+    fn set_memory(&mut self, memory: Vec<Vec<f32>>) -> PyResult<()> {
+        if memory.len() != self.inner.memory.len() {
+            return Err(PyValueError::new_err(format!(
+                "memory length ({}) must equal k ({})", memory.len(), self.inner.memory.len()
+            )));
+        }
+        for (i, (new, old)) in memory.iter().zip(self.inner.memory.iter()).enumerate() {
+            if new.len() != old.len() {
+                return Err(PyValueError::new_err(format!(
+                    "memory[{}] length ({}) must equal existing shape ({})",
+                    i, new.len(), old.len()
+                )));
+            }
+        }
+        self.inner.memory = memory;
+        Ok(())
+    }
 
     #[getter]
     fn d(&self) -> usize { self.inner.d }
@@ -1068,6 +1209,8 @@ fn load_build_checkpoint(py: Python<'_>, path: &str) -> PyResult<(MAGParams, MAG
             dict.set_item("stream_position", bs.stream_cursor.position)?;
             dict.set_item("stream_chunk_id", bs.stream_cursor.chunk_id)?;
             dict.set_item("stream_pulse_id", bs.stream_cursor.pulse_id)?;
+            dict.set_item("stream_content_hash", bs.stream_cursor.content_hash)?;
+            dict.set_item("stream_rng_state", bs.stream_cursor.rng_state)?;
             dict.set_item("context_d", bs.context.d)?;
             dict.set_item("context_memory", bs.context.memory)?;
             dict.into_any().unbind()
@@ -1083,12 +1226,13 @@ fn load_build_checkpoint(py: Python<'_>, path: &str) -> PyResult<(MAGParams, MAG
 /// Forward/backward/update happen entirely on device.
 /// Only input_ids, target_ids, and loss cross PCIe.
 #[cfg(feature = "cuda")]
-#[pyclass]
+#[pyclass(unsendable)]
 struct GpuModel {
     #[allow(dead_code)]
     params: nl_hecate_core::gpu_params::GpuMAGParams,
     context: nl_hecate_core::gpu_params::GpuContextState,
     cfg: nl_hecate_core::model::MAGConfig,
+    adamw_state: Option<nl_hecate_core::gpu_optimizer::GpuAdamWState>,
 }
 
 #[cfg(feature = "cuda")]
@@ -1105,6 +1249,7 @@ impl GpuModel {
             params: gpu_params,
             context: gpu_context,
             cfg: cfg.inner.clone(),
+            adamw_state: None,
         })
     }
 
@@ -1117,6 +1262,7 @@ impl GpuModel {
             params: gpu_params,
             context: gpu_context,
             cfg: cfg.inner.clone(),
+            adamw_state: None,
         })
     }
 
@@ -1158,6 +1304,14 @@ impl GpuModel {
             &mut self.params, &grads, lr,
         );
 
+        // Weight tying: sync w_unembed^T → w_embed after each update.
+        // Compensates for vanishing embedding gradient in deep models.
+        nl_hecate_core::gpu_backward::gpu_sync_embed_weights(
+            &mut self.params,
+            self.cfg.swa.d_model,
+            self.cfg.swa.vocab_size,
+        );
+
         Ok(loss)
     }
 
@@ -1171,6 +1325,144 @@ impl GpuModel {
     fn to_host_context(&self) -> PyResult<ContextState> {
         let host = self.context.to_host(self.cfg.k);
         Ok(ContextState { inner: host })
+    }
+
+    /// GPU forward + backward only (no weight update). Returns (loss, grad_params).
+    /// Used for hybrid GPU+AdamW: Python applies optimizer, then calls upload_params().
+    fn backward_only(&mut self, input_ids: Vec<usize>, target_ids: Vec<usize>,
+                     pulse: &Pulse) -> PyResult<(f32, MAGParams)> {
+        let s = self.cfg.swa.seq_len;
+        let v = self.cfg.swa.vocab_size;
+        if input_ids.len() != s || target_ids.len() != s {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("input/target length must be seq_len {}", s)));
+        }
+        if let Some(&max_id) = input_ids.iter().max() {
+            if max_id >= v {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("input_ids contains {} >= vocab_size {}", max_id, v)));
+            }
+        }
+        if let Some(&max_id) = target_ids.iter().max() {
+            if max_id >= v {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("target_ids contains {} >= vocab_size {}", max_id, v)));
+            }
+        }
+        let (loss, cache) = nl_hecate_core::gpu_forward::gpu_cms_forward(
+            &self.params, &self.cfg, &input_ids, &target_ids,
+            &pulse.inner, &mut self.context,
+        );
+        let grads = nl_hecate_core::gpu_backward::gpu_cms_backward(
+            &self.params, &self.cfg, &cache,
+        );
+        // Download gradients to host as MAGParams
+        let host_grads = grads.to_host(&self.cfg);
+        Ok((loss, MAGParams { inner: host_grads }))
+    }
+
+    /// Upload host params to GPU (after Python-side optimizer update).
+    fn upload_params(&mut self, params: &MAGParams) -> PyResult<()> {
+        self.params = nl_hecate_core::gpu_params::GpuMAGParams::from_host(&params.inner);
+        Ok(())
+    }
+
+    /// Forward-only pass: returns (loss, logits_flat).
+    /// logits_flat is [seq_len * vocab_size] in row-major order.
+    fn forward(&mut self, input_ids: Vec<usize>, target_ids: Vec<usize>,
+               pulse: &Pulse) -> PyResult<(f32, Vec<f32>)> {
+        let s = self.cfg.swa.seq_len;
+        let v = self.cfg.swa.vocab_size;
+        if input_ids.len() != s || target_ids.len() != s {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("input/target length must be seq_len {}", s)));
+        }
+        if let Some(&max_id) = input_ids.iter().max() {
+            if max_id >= v {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("input_ids contains {} >= vocab_size {}", max_id, v)));
+            }
+        }
+        if let Some(&max_id) = target_ids.iter().max() {
+            if max_id >= v {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("target_ids contains {} >= vocab_size {}", max_id, v)));
+            }
+        }
+        let (loss, cache) = nl_hecate_core::gpu_forward::gpu_cms_forward(
+            &self.params, &self.cfg, &input_ids, &target_ids,
+            &pulse.inner, &mut self.context,
+        );
+        let mut logits = vec![0.0f32; s * v];
+        cache.logits.copy_to_host(&mut logits);
+        Ok((loss, logits))
+    }
+
+    /// Full GPU build step with AdamW optimizer. Returns (loss, grad_norm).
+    /// Zero PCIe traffic for weights — only input_ids, target_ids, and loss cross the bus.
+    /// AdamW state is lazily created on first call.
+    #[pyo3(signature = (input_ids, target_ids, pulse, lr, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.1, max_grad_norm=1.0))]
+    fn step_adamw(&mut self, input_ids: Vec<usize>, target_ids: Vec<usize>,
+                  pulse: &Pulse, lr: f32, beta1: f32, beta2: f32,
+                  eps: f32, weight_decay: f32, max_grad_norm: f32) -> PyResult<(f32, f32)> {
+        let s = self.cfg.swa.seq_len;
+        let v = self.cfg.swa.vocab_size;
+        if input_ids.len() != s || target_ids.len() != s {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("input/target length must be seq_len {}", s)));
+        }
+        if let Some(&max_id) = input_ids.iter().max() {
+            if max_id >= v {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("input_ids contains {} >= vocab_size {}", max_id, v)));
+            }
+        }
+        if let Some(&max_id) = target_ids.iter().max() {
+            if max_id >= v {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("target_ids contains {} >= vocab_size {}", max_id, v)));
+            }
+        }
+
+        // Forward
+        let (loss, cache) = nl_hecate_core::gpu_forward::gpu_cms_forward(
+            &self.params, &self.cfg, &input_ids, &target_ids,
+            &pulse.inner, &mut self.context,
+        );
+
+        // Backward
+        let mut grads = nl_hecate_core::gpu_backward::gpu_cms_backward(
+            &self.params, &self.cfg, &cache,
+        );
+
+        // Lazy-init AdamW state
+        if self.adamw_state.is_none() {
+            self.adamw_state = Some(
+                nl_hecate_core::gpu_optimizer::GpuAdamWState::from_params(&self.params)
+            );
+        }
+        let state = self.adamw_state.as_mut().unwrap();
+
+        // AdamW update (with grad clipping)
+        let grad_norm = nl_hecate_core::gpu_optimizer::gpu_adamw_update(
+            &mut self.params, &mut grads, state,
+            lr, beta1, beta2, eps, weight_decay, max_grad_norm,
+        );
+
+        // Weight tying: sync w_unembed^T → w_embed
+        nl_hecate_core::gpu_backward::gpu_sync_embed_weights(
+            &mut self.params,
+            self.cfg.swa.d_model,
+            self.cfg.swa.vocab_size,
+        );
+
+        Ok((loss, grad_norm))
+    }
+
+    /// Get current AdamW optimizer step count.
+    #[getter]
+    fn adamw_step(&self) -> u32 {
+        self.adamw_state.as_ref().map_or(0, |s| s.step)
     }
 }
 

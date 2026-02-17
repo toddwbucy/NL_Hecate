@@ -192,6 +192,15 @@ extern "C" {
         d: i32,
     );
 
+    /// Transpose copy: dst[col * rows + row] = src[row * cols + col].
+    /// Used for weight tying: w_embed = w_unembed^T.
+    pub(crate) fn transpose_copy_cuda(
+        src: *const f32,   // [rows, cols] = w_unembed [d, vocab]
+        dst: *mut f32,     // [cols, rows] = w_embed [vocab, d]
+        rows: i32,         // d_model
+        cols: i32,         // vocab_size
+    );
+
     // ── Elementwise kernels ───────────────────────────────────────────
 
     /// Element-wise sigmoid: out[i] = 1/(1+exp(-x[i])).
@@ -230,6 +239,30 @@ extern "C" {
 
     /// Simple SAXPY: y[i] += alpha * x[i]. For small buffers.
     pub(crate) fn saxpy_cuda(alpha: f32, x: *const f32, y: *mut f32, n: i32);
+
+    // ── AdamW optimizer kernels ─────────────────────────────────────────
+
+    /// Fused AdamW weight update. Updates w, m, v in-place on device.
+    /// bc1_inv = 1/(1-beta1^t), bc2_inv = 1/(1-beta2^t) precomputed on host.
+    pub(crate) fn adamw_update_cuda(
+        w: *mut f32, g: *const f32,
+        m: *mut f32, v: *mut f32,
+        n: i32,
+        lr: f32, beta1: f32, beta2: f32,
+        eps: f32, bc1_inv: f32, bc2_inv: f32,
+        weight_decay: f32,
+    );
+
+    /// Partial reduction for gradient L2 norm squared.
+    /// Writes ceil(n/256) partial sums to partial_sums buffer.
+    /// out_num_blocks receives the number of partials written.
+    pub(crate) fn grad_norm_sq_cuda(
+        g: *const f32, partial_sums: *mut f32,
+        n: i32, out_num_blocks: *mut i32,
+    );
+
+    /// Scale gradient buffer in-place: g[i] *= scale.
+    pub(crate) fn grad_scale_cuda(g: *mut f32, scale: f32, n: i32);
 
     // ── Cross-entropy kernels ─────────────────────────────────────────
 

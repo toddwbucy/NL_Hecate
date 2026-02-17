@@ -50,6 +50,39 @@ pub struct GpuLevelGrads {
 }
 
 #[cfg(feature = "cuda")]
+impl GpuMAGGrads {
+    /// Download GPU gradients to host as a MAGParams (same struct, gradient values).
+    pub fn to_host(&self, cfg: &crate::model::MAGConfig) -> crate::model::MAGParams {
+        let d = cfg.swa.d_model;
+        let v = cfg.swa.vocab_size;
+        let mut swa = crate::model::SWAParams::zeros_like(&cfg.swa);
+        self.d_w_embed.copy_to_host(&mut swa.w_embed);
+        self.d_w_q.copy_to_host(&mut swa.w_q);
+        self.d_w_k.copy_to_host(&mut swa.w_k);
+        self.d_w_v.copy_to_host(&mut swa.w_v);
+        self.d_w_o.copy_to_host(&mut swa.w_o);
+        self.d_w_unembed.copy_to_host(&mut swa.w_unembed);
+
+        let levels: Vec<_> = self.levels.iter().enumerate().map(|(i, lg)| {
+            let mut lp = crate::model::MemoryLevelParams::zeros_like(d);
+            lg.d_w_k_mem.copy_to_host(&mut lp.w_k_mem);
+            lg.d_w_v_mem.copy_to_host(&mut lp.w_v_mem);
+            lg.d_w_q_mem.copy_to_host(&mut lp.w_q_mem);
+            lg.d_w_alpha.copy_to_host(&mut lp.w_alpha);
+            lg.d_b_alpha.copy_to_host(&mut lp.b_alpha);
+            lg.d_w_theta.copy_to_host(&mut lp.w_theta);
+            lg.d_b_theta.copy_to_host(&mut lp.b_theta);
+            lg.d_w_eta.copy_to_host(&mut lp.w_eta);
+            lg.d_b_eta.copy_to_host(&mut lp.b_eta);
+            // w_omega not in GPU grads (gate backward TODO), keep zeros
+            lp
+        }).collect();
+
+        crate::model::MAGParams { swa, levels }
+    }
+}
+
+#[cfg(feature = "cuda")]
 impl GpuLevelGrads {
     fn zeros(d: usize) -> Self {
         GpuLevelGrads {
@@ -452,6 +485,22 @@ pub fn gpu_weight_update(params: &mut GpuMAGParams, grads: &GpuMAGGrads, lr: f32
         }
     }
 
+    crate::dispatch::cuda_sync();
+}
+
+/// Weight tying: copy w_unembed^T → w_embed on GPU.
+/// This ensures the embedding table tracks the unembedding after each weight update,
+/// compensating for the vanishing gradient through the deep chain.
+#[cfg(feature = "cuda")]
+pub fn gpu_sync_embed_weights(params: &mut GpuMAGParams, d: usize, vocab: usize) {
+    unsafe {
+        crate::cuda_ffi::transpose_copy_cuda(
+            params.swa.w_unembed.as_ptr(),  // src: [d, vocab]
+            params.swa.w_embed.ptr(),        // dst: [vocab, d]
+            d as i32,
+            vocab as i32,
+        );
+    }
     crate::dispatch::cuda_sync();
 }
 
