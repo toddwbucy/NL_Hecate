@@ -57,14 +57,14 @@ pub fn truncate_to_bf16(buf: &mut [f32]) {
 //   Rust signatures and row-major memory layout. See specs/infrastructure/
 //   00_enzyme_integration.md for the kernel-pair contract.
 //
-//   | Rust reference         | CUDA kernel pair            | Status       |
+//   | Rust reference         | GPU dispatch                | Status       |
 //   |------------------------|-----------------------------|--------------|
-//   | swa::swa_forward       | swa_forward_f32_cuda        | ✓ Phase 2    |
-//   | swa::swa_backward_rust | swa_backward_f32_cuda       | ✓ Phase 2    |
-//   | matmul_f32             | matmul_f32_cuda_fwd/bwd     | pending      |
-//   | matmul_acc_f32         | matmul_acc_f32_cuda_fwd/bwd | pending      |
-//   | transpose_f32          | transpose_f32_cuda_fwd/bwd  | pending      |
-//   | softmax_f32            | softmax_f32_cuda_fwd/bwd    | pending      |
+//   | swa::swa_forward       | swa_forward_f32_cuda        | ✓ S2-M1      |
+//   | swa::swa_backward_rust | swa_backward_f32_cuda       | ✓ S2-M1      |
+//   | matmul_f32             | cuBLAS cublasSgemm          | ✓ S2-M1b     |
+//   | matmul_acc_f32         | cuBLAS cublasSgemm (beta=1) | ✓ S2-M1b     |
+//   | transpose+matmul       | cuBLAS cublasSgemm (OP_T)   | ✓ S2-M1b     |
+//   | softmax_f32            | (CPU — small, vocab=256)    | N/A          |
 
 /// Matrix multiply: C[M,N] = A[M,K] @ B[K,N].  Row-major.
 /// `out` must be pre-allocated with M*N elements (will be overwritten).

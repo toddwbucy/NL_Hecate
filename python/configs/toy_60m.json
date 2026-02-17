@@ -1,0 +1,39 @@
+{
+    "description": "S4-M6: 60M-param toy model for end-to-end validation",
+
+    "model": {
+        "d_model": 2048,
+        "num_heads": 16,
+        "head_dim": 128,
+        "seq_len": 512,
+        "window_size": 256,
+        "vocab_size": 256,
+        "memory_rule": "titans",
+        "composition": "mag",
+        "k": 2,
+        "chunk_sizes": [1, 8]
+    },
+
+    "build": {
+        "lr": 0.001,
+        "steps": 5000,
+        "save_every": 500,
+        "log_every": 10,
+        "seed": 42
+    },
+
+    "data": {
+        "path": "data/fineweb_100m.bin",
+        "format": "binary"
+    },
+
+    "notes": {
+        "params_estimate": "~59.8M",
+        "rationale": {
+            "titans": "Momentum S smooths noisy gradients (HOPE Table 6)",
+            "mag": "Most validated composition, HOPE-recommended",
+            "k2": "Contract: k=2 must beat k=1 before adding more levels",
+            "chunk_sizes": "Level 0 every step, Level 1 every 8th"
+        }
+    }
+}
