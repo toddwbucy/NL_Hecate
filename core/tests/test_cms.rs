@@ -1,6 +1,7 @@
 //! CMS integration tests: multi-step training, error buffer health, falsification.
 
 use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind, CompositionKind};
+use nl_hecate_core::dynamic_freq::FrequencySchedule;
 use nl_hecate_core::retention::RetentionKind;
 use nl_hecate_core::mag::{cms_forward, cms_backward};
 use nl_hecate_core::conductor::{Conductor, Pulse, ContextState, ErrorBuffer};
@@ -208,6 +209,7 @@ fn test_k2_beats_k1() {
 
         retention: RetentionKind::L2WeightDecay,
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
 
         };
     // k=2 config
@@ -221,6 +223,7 @@ fn test_k2_beats_k1() {
 
         retention: RetentionKind::L2WeightDecay,
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
 
         };
 
@@ -399,6 +402,7 @@ fn test_k4_vs_k2_multiscale() {
 
         retention: RetentionKind::L2WeightDecay,
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
 
         };
     let cfg_k4 = MAGConfig {
@@ -411,6 +415,7 @@ fn test_k4_vs_k2_multiscale() {
 
         retention: RetentionKind::L2WeightDecay,
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
 
         };
 
@@ -500,6 +505,7 @@ fn test_k4_diagnostics() {
 
         retention: RetentionKind::L2WeightDecay,
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
 
         };
 
@@ -767,6 +773,7 @@ fn test_cms_stability_boundary() {
 
         retention: RetentionKind::L2WeightDecay,
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
 
         };
     let cfg_k2 = MAGConfig {
@@ -779,6 +786,7 @@ fn test_cms_stability_boundary() {
 
         retention: RetentionKind::L2WeightDecay,
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
 
         };
 
@@ -965,6 +973,7 @@ fn test_k4_normalization_magnitude() {
 
         retention: RetentionKind::L2WeightDecay,
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
 
         };
     let params_k4 = MAGParams::init(&cfg_k4, 42);
@@ -1030,6 +1039,7 @@ fn test_k4_uniform_init_stable() {
 
         retention: RetentionKind::L2WeightDecay,
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
 
         };
 
@@ -1081,6 +1091,7 @@ fn test_k4_normalized_stable() {
 
         retention: RetentionKind::L2WeightDecay,
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
 
         };
 

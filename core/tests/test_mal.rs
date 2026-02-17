@@ -2,6 +2,7 @@
 //! memory-is-attention-input verification, CMS k=2, comparison vs MAG.
 
 use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind, CompositionKind};
+use nl_hecate_core::dynamic_freq::FrequencySchedule;
 use nl_hecate_core::retention::RetentionKind;
 use nl_hecate_core::mal::{mal_forward, mal_backward, cms_mal_forward, cms_mal_backward};
 use nl_hecate_core::mag::{mag_forward, mag_backward};
@@ -189,6 +190,7 @@ fn test_mal_vs_mag() {
         parallel: None,
         retention: RetentionKind::L2WeightDecay,
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
     };
     let cfg_mal = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
@@ -199,6 +201,7 @@ fn test_mal_vs_mag() {
         parallel: None,
         retention: RetentionKind::L2WeightDecay,
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
     };
 
     let input_ids: Vec<usize> = (0..swa.seq_len).map(|t| t % swa.vocab_size).collect();

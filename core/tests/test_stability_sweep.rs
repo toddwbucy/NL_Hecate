@@ -24,6 +24,7 @@
 //! or no loss decrease), the constraint matrix needs rebuilding.
 
 use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind, CompositionKind, SWAConfig};
+use nl_hecate_core::dynamic_freq::FrequencySchedule;
 use nl_hecate_core::mag::{mag_forward, mag_backward, cms_forward, cms_backward};
 use nl_hecate_core::mal::{mal_forward, mal_backward, cms_mal_forward, cms_mal_backward};
 use nl_hecate_core::mac::{mac_forward, mac_backward, cms_mac_forward, cms_mac_backward};
@@ -95,6 +96,7 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
             _ => RetentionKind::L2WeightDecay,
         },
         m3: None,
+        frequency_schedule: FrequencySchedule::Fixed,
     }
 }
 

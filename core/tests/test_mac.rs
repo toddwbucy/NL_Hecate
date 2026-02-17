@@ -2,6 +2,7 @@
 //! reflective gate verification, CMS k=2, comparison vs MAG.
 
 use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind, CompositionKind};
+use nl_hecate_core::dynamic_freq::FrequencySchedule;
 use nl_hecate_core::retention::RetentionKind;
 use nl_hecate_core::mac::{mac_forward, mac_backward, cms_mac_forward, cms_mac_backward};
 use nl_hecate_core::mag::{mag_forward, mag_backward};
@@ -203,6 +204,7 @@ fn test_mac_vs_mag() {
         parallel: None,
         retention: RetentionKind::L2WeightDecay,
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
     };
     let cfg_mac = MAGConfig {
         swa: swa_mac, memory_enabled: true,
@@ -213,6 +215,7 @@ fn test_mac_vs_mag() {
         parallel: None,
         retention: RetentionKind::L2WeightDecay,
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
     };
 
     let seq_len = 8;

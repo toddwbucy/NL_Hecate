@@ -33,6 +33,7 @@ pub mod m3;
 pub mod cms_variants;
 #[cfg(feature = "cuda")]
 pub(crate) mod cuda_ffi;
+pub mod dynamic_freq;
 pub mod conductor;
 pub mod context_stream;
 pub mod dispatch;

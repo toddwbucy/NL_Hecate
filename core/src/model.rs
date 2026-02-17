@@ -7,6 +7,7 @@ use crate::tensor::SimpleRng;
 use crate::parallel::ParallelConfig;
 use crate::retention::{RetentionKind, default_retention};
 use crate::m3::{M3Config, M3State, m3_step, flatten_mag_params, unflatten_to_mag_grads};
+use crate::dynamic_freq::{FrequencySchedule, default_b_freq};
 
 /// Which composition pattern to use (Titans Section 4).
 ///
@@ -184,6 +185,10 @@ pub struct MemoryLevelParams {
     /// Atlas Omega projection: [d, 2*d]. omega(k,v) = W_omega @ silu(concat(k_mem, v_mem)).
     /// Zero-initialized for non-Atlas rules (adds d*2*d params per level).
     pub w_omega: Vec<f32>,
+    /// Dynamic frequency gate weights: [d]. Empty for Fixed schedule.
+    pub w_freq: Vec<f32>,
+    /// Dynamic frequency gate bias: [1]. Empty for Fixed schedule.
+    pub b_freq: Vec<f32>,
 }
 
 impl MemoryLevelParams {
@@ -222,7 +227,12 @@ impl MemoryLevelParams {
         // atlas_init() below provides Xavier-initialized w_omega.
         let w_omega = vec![0.0f32; d * 2 * d];
 
-        MemoryLevelParams { w_k_mem, w_v_mem, w_q_mem, w_alpha, b_alpha, w_theta, b_theta, w_eta, b_eta, w_omega }
+        // Dynamic frequency gate: empty by default (Fixed schedule).
+        // Populated by MAGParams::init() when FrequencySchedule::Learned.
+        let w_freq = vec![];
+        let b_freq = vec![];
+
+        MemoryLevelParams { w_k_mem, w_v_mem, w_q_mem, w_alpha, b_alpha, w_theta, b_theta, w_eta, b_eta, w_omega, w_freq, b_freq }
     }
 
     /// Initialize with Xavier-initialized w_omega for Atlas Omega rule.
@@ -233,7 +243,17 @@ impl MemoryLevelParams {
         params
     }
 
+    /// Initialize frequency gate weights for learned scheduling.
+    /// Called by MAGParams::init() when FrequencySchedule::Learned.
+    pub fn init_freq_gate(&mut self, d: usize, rng: &mut SimpleRng, level: usize) {
+        let freq_scale = (1.0 / d as f32).sqrt();
+        self.w_freq = vec![0.0f32; d];
+        rng.fill_uniform(&mut self.w_freq, freq_scale);
+        self.b_freq = vec![default_b_freq(level)];
+    }
+
     /// Create zero-initialized shadow for gradient accumulation.
+    /// If `freq_d` > 0, allocates w_freq/b_freq for Learned schedule.
     pub fn zeros_like(d: usize) -> Self {
         MemoryLevelParams {
             w_k_mem: vec![0.0f32; d * d],
@@ -246,7 +266,19 @@ impl MemoryLevelParams {
             w_eta: vec![0.0f32; 2 * d],
             b_eta: vec![0.0f32; 1],
             w_omega: vec![0.0f32; d * 2 * d],
+            w_freq: vec![],
+            b_freq: vec![],
         }
+    }
+
+    /// Create zero-initialized shadow matching the shape of `template`.
+    pub fn zeros_like_from(template: &MemoryLevelParams, d: usize) -> Self {
+        let mut z = Self::zeros_like(d);
+        if !template.w_freq.is_empty() {
+            z.w_freq = vec![0.0f32; template.w_freq.len()];
+            z.b_freq = vec![0.0f32; template.b_freq.len()];
+        }
+        z
     }
 
     /// Total number of parameters in this level.
@@ -256,6 +288,7 @@ impl MemoryLevelParams {
             + self.w_theta.len() + self.b_theta.len()
             + self.w_eta.len() + self.b_eta.len()
             + self.w_omega.len()
+            + self.w_freq.len() + self.b_freq.len()
     }
 
     /// Outer-loop weight update: param -= lr * grad for all projection weights.
@@ -275,6 +308,10 @@ impl MemoryLevelParams {
         step(&mut self.w_eta, &grads.w_eta, lr);
         step(&mut self.b_eta, &grads.b_eta, lr);
         step(&mut self.w_omega, &grads.w_omega, lr);
+        if !self.w_freq.is_empty() && !grads.w_freq.is_empty() {
+            step(&mut self.w_freq, &grads.w_freq, lr);
+            step(&mut self.b_freq, &grads.b_freq, lr);
+        }
     }
 
     /// Element-wise accumulate: self += other.
@@ -294,6 +331,10 @@ impl MemoryLevelParams {
         acc(&mut self.w_eta, &other.w_eta);
         acc(&mut self.b_eta, &other.b_eta);
         acc(&mut self.w_omega, &other.w_omega);
+        if !self.w_freq.is_empty() && !other.w_freq.is_empty() {
+            acc(&mut self.w_freq, &other.w_freq);
+            acc(&mut self.b_freq, &other.b_freq);
+        }
     }
 
     /// Frobenius norm across all weight matrices.
@@ -301,7 +342,8 @@ impl MemoryLevelParams {
         let mut sum = 0.0f32;
         for v in [&self.w_k_mem, &self.w_v_mem, &self.w_q_mem,
                    &self.w_alpha, &self.b_alpha, &self.w_theta, &self.b_theta,
-                   &self.w_eta, &self.b_eta, &self.w_omega] {
+                   &self.w_eta, &self.b_eta, &self.w_omega,
+                   &self.w_freq, &self.b_freq] {
             for &x in v.iter() {
                 sum += x * x;
             }
@@ -356,6 +398,9 @@ pub struct MAGConfig {
     pub retention: RetentionKind,
     /// M3 multi-scale optimizer config. None = plain SGD (default).
     pub m3: Option<M3Config>,
+    /// Frequency scheduling strategy. Fixed = modular arithmetic (default).
+    /// Learned = sigmoid gate per level based on input embeddings.
+    pub frequency_schedule: FrequencySchedule,
 }
 
 /// Default gate bias init values per level index.
@@ -417,6 +462,7 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
         }
     }
 
@@ -440,6 +486,7 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
         }
     }
 
@@ -463,6 +510,7 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
         }
     }
 
@@ -487,6 +535,7 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
         }
     }
 
@@ -511,6 +560,7 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
         }
     }
 
@@ -535,6 +585,7 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
         }
     }
 
@@ -558,6 +609,7 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
         }
     }
 
@@ -581,6 +633,7 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
         }
     }
 
@@ -604,6 +657,7 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
         }
     }
 
@@ -627,6 +681,7 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
         }
     }
 
@@ -659,6 +714,7 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
         }
     }
 
@@ -691,6 +747,7 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
         }
     }
 
@@ -723,6 +780,7 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
         }
     }
 
@@ -755,6 +813,7 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
         }
     }
 
@@ -787,6 +846,7 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::MEMORA),
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
         }
     }
 
@@ -819,6 +879,7 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::MEMORA),
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
         }
     }
 
@@ -843,6 +904,7 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::LatticeOSR),
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
         }
     }
 
@@ -867,6 +929,7 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::LatticeOSR),
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
         }
     }
 
@@ -894,6 +957,7 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
         }
     }
 
@@ -921,6 +985,7 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
         }
     }
 
@@ -944,6 +1009,7 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::AtlasOmega),
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
         }
     }
 
@@ -967,6 +1033,7 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::AtlasOmega),
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
         }
     }
 
@@ -990,6 +1057,7 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
         }
     }
 
@@ -1013,6 +1081,7 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
         }
     }
 
@@ -1037,6 +1106,7 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
         }
     }
 
@@ -1060,6 +1130,57 @@ impl MAGConfig {
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
+        }
+    }
+
+    /// Dynamic frequency test config: k=2, Learned schedule (DeltaRule).
+    pub fn dynamic_freq_test_config() -> Self {
+        use crate::dynamic_freq::LearnedFreqConfig;
+        MAGConfig {
+            swa: SWAConfig {
+                d_model: 8,
+                num_heads: 2,
+                head_dim: 4,
+                seq_len: 8,
+                window_size: 8,
+                vocab_size: 16,
+            },
+            memory_enabled: true,
+            composition: CompositionKind::MAG,
+            memory_rule: MemoryRuleKind::DeltaRule,
+            k: 2,
+            chunk_sizes: vec![1, 8],
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            parallel: None,
+            retention: default_retention(MemoryRuleKind::DeltaRule),
+            m3: None,
+            frequency_schedule: FrequencySchedule::Learned(LearnedFreqConfig::default()),
+        }
+    }
+
+    /// Dynamic frequency test config: k=4, Learned schedule.
+    pub fn dynamic_freq_test_config_k4() -> Self {
+        use crate::dynamic_freq::LearnedFreqConfig;
+        MAGConfig {
+            swa: SWAConfig {
+                d_model: 8,
+                num_heads: 2,
+                head_dim: 4,
+                seq_len: 16,
+                window_size: 16,
+                vocab_size: 16,
+            },
+            memory_enabled: true,
+            composition: CompositionKind::MAG,
+            memory_rule: MemoryRuleKind::DeltaRule,
+            k: 4,
+            chunk_sizes: vec![1, 8, 64, 512],
+            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            parallel: None,
+            retention: default_retention(MemoryRuleKind::DeltaRule),
+            m3: None,
+            frequency_schedule: FrequencySchedule::Learned(LearnedFreqConfig::default()),
         }
     }
 }
@@ -1086,7 +1207,7 @@ impl MAGParams {
         for level in 0..cfg.k {
             // Different seed offset per level to avoid correlation
             let mut rng = SimpleRng::new(seed.wrapping_add(1000 + level as u64 * 500));
-            let level_params = if cfg.memory_rule == MemoryRuleKind::AtlasOmega {
+            let mut level_params = if cfg.memory_rule == MemoryRuleKind::AtlasOmega {
                 MemoryLevelParams::atlas_init(
                     d, &mut rng,
                     default_b_alpha(level),
@@ -1101,6 +1222,11 @@ impl MAGParams {
                     default_b_eta(level),
                 )
             };
+            // Initialize frequency gate if using learned scheduling
+            if matches!(cfg.frequency_schedule, FrequencySchedule::Learned(_)) {
+                let mut freq_rng = SimpleRng::new(seed.wrapping_add(5000 + level as u64 * 100));
+                level_params.init_freq_gate(d, &mut freq_rng, level);
+            }
             levels.push(level_params);
         }
 
@@ -1110,7 +1236,15 @@ impl MAGParams {
     /// Create zero-initialized shadow for gradient accumulation.
     pub fn zeros_like(cfg: &MAGConfig) -> Self {
         let d = cfg.swa.d_model;
-        let levels = (0..cfg.k).map(|_| MemoryLevelParams::zeros_like(d)).collect();
+        let has_freq = matches!(cfg.frequency_schedule, FrequencySchedule::Learned(_));
+        let levels = (0..cfg.k).map(|_| {
+            let mut z = MemoryLevelParams::zeros_like(d);
+            if has_freq {
+                z.w_freq = vec![0.0f32; d];
+                z.b_freq = vec![0.0f32; 1];
+            }
+            z
+        }).collect();
         MAGParams {
             swa: SWAParams::zeros_like(&cfg.swa),
             levels,
