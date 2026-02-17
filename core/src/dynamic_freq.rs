@@ -268,7 +268,7 @@ pub fn default_b_freq(level: usize) -> f32 {
         1 => -1.0,  // sigmoid(-1) ≈ 0.27 — fires ~27% of the time initially
         2 => -2.0,  // sigmoid(-2) ≈ 0.12
         3 => -3.0,  // sigmoid(-3) ≈ 0.05
-        _ => -2.0,
+        _ => -(level as f32),
     }
 }
 

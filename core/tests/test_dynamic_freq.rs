@@ -304,8 +304,9 @@ fn test_w_freq_updates_during_training() {
     let w_freq_0_before = params.levels[0].w_freq.clone();
     let w_freq_1_before = params.levels[1].w_freq.clone();
 
+    // Persist ContextState across steps so memory accumulates.
+    let mut context = ContextState::new(cfg.k, d);
     for step in 0..3 {
-        let mut context = ContextState::new(cfg.k, d);
         let pulse = Pulse { global_step: step, active_levels: vec![true, true] };
         let (_, cache) = cms_forward(&params, &cfg, &input_ids, &target_ids, &pulse, &mut context);
 
@@ -337,8 +338,9 @@ fn test_b_freq_updates_during_training() {
 
     let b_freq_before: Vec<f32> = params.levels.iter().map(|l| l.b_freq[0]).collect();
 
+    // Persist ContextState across steps so memory accumulates.
+    let mut context = ContextState::new(cfg.k, d);
     for step in 0..3 {
-        let mut context = ContextState::new(cfg.k, d);
         let pulse = Pulse { global_step: step, active_levels: vec![true, true] };
         let (_, cache) = cms_forward(&params, &cfg, &input_ids, &target_ids, &pulse, &mut context);
 
