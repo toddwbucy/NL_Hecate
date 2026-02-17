@@ -251,9 +251,17 @@ pub fn compute_gate_surrogate(
 
 // ── Bias Initialization ───────────────────────────────────────────────
 
-/// Default b_freq bias per level index.
-/// Higher levels start with lower bias (less likely to fire), matching
-/// the fixed schedule's geometric spacing.
+/// Default pre-sigmoid bias for the frequency gate at each CMS level.
+///
+/// These biases set the initial firing probability before any learning occurs:
+///   Level 0: bias  0.0 → sigmoid(0)  = 50%, but forced active regardless (spec invariant)
+///   Level 1: bias -1.0 → sigmoid(-1) ≈ 27% initial firing rate
+///   Level 2: bias -2.0 → sigmoid(-2) ≈ 12% initial firing rate
+///   Level 3: bias -3.0 → sigmoid(-3) ≈  5% initial firing rate
+///
+/// The geometric decay in probability mirrors the fixed schedule's spacing
+/// [1, 8, 64, 512] where higher levels fire exponentially less often.
+/// During training, the gate learns to override these defaults based on input.
 pub fn default_b_freq(level: usize) -> f32 {
     match level {
         0 => 0.0,   // sigmoid(0) = 0.5, but Level 0 is forced active anyway

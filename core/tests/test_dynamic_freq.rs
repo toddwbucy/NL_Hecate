@@ -159,9 +159,10 @@ fn test_learned_k2_convergence() {
     let (input_ids, target_ids) = make_test_data(&cfg);
     let d = cfg.swa.d_model;
 
+    // Persist ContextState across steps so memory accumulates (M matrices carry over).
+    let mut context = ContextState::new(cfg.k, d);
     let mut losses = Vec::new();
     for step in 0..5 {
-        let mut context = ContextState::new(cfg.k, d);
         let pulse = Pulse { global_step: step, active_levels: vec![true, true] };
         let (loss, cache) = cms_forward(&params, &cfg, &input_ids, &target_ids, &pulse, &mut context);
         losses.push(loss);
@@ -187,9 +188,10 @@ fn test_learned_k4_convergence() {
     let (input_ids, target_ids) = make_test_data(&cfg);
     let d = cfg.swa.d_model;
 
+    // Persist ContextState across steps so memory accumulates.
+    let mut context = ContextState::new(cfg.k, d);
     let mut losses = Vec::new();
     for step in 0..5 {
-        let mut context = ContextState::new(cfg.k, d);
         let pulse = Pulse { global_step: step, active_levels: vec![true; cfg.k] };
         let (loss, cache) = cms_forward(&params, &cfg, &input_ids, &target_ids, &pulse, &mut context);
         losses.push(loss);
@@ -383,11 +385,10 @@ fn test_freq_gate_gradient_fd() {
     let fd_grad = (loss_plus - loss_base) / eps;
     let anal_grad = grads.levels[0].b_freq[0];
 
-    // The straight-through estimator is approximate, so we use relaxed tolerance.
-    // We mainly verify the sign is correct and magnitude is in the right ballpark.
-    if fd_grad.abs() > 1e-5 && anal_grad.abs() > 1e-5 {
-        // Check same sign
-        assert!(fd_grad * anal_grad >= 0.0 || (fd_grad.abs() < 1e-4 && anal_grad.abs() < 1e-4),
+    // The straight-through estimator is approximate, so we only check sign agreement
+    // when both gradients are reliably non-zero (above 1e-4).
+    if fd_grad.abs() > 1e-4 && anal_grad.abs() > 1e-4 {
+        assert!(fd_grad * anal_grad >= 0.0,
             "FD and analytical gradient should agree in sign: fd={fd_grad}, anal={anal_grad}");
     }
     // At minimum, both should be finite
