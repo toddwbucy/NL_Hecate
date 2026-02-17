@@ -31,8 +31,6 @@ use nl_hecate_core::model::{
     load_checkpoint as rust_load_checkpoint,
     BuildResumeState as RustBuildResumeState,
 };
-use nl_hecate_core::conductor::ConductorState as RustConductorState;
-use nl_hecate_core::context_stream::StreamCursor as RustStreamCursor;
 
 // ── SWAConfig ────────────────────────────────────────────────────────
 
@@ -1028,28 +1026,19 @@ fn save_checkpoint(path: &str, params: &MAGParams, cfg: &MAGConfig) -> PyResult<
 #[pyfunction]
 fn save_build_checkpoint(
     path: &str, params: &MAGParams, cfg: &MAGConfig,
-    conductor: &Conductor, context: &ContextState,
+    conductor: &mut Conductor, context: &ContextState,
 ) -> PyResult<()> {
-    // Extract ConductorState and StreamCursor from the Conductor
-    // We need to build a ConductorState from the Conductor's public fields
-    let cond_state = RustConductorState {
-        k: conductor.inner.k,
-        chunk_sizes: conductor.inner.chunk_sizes.clone(),
-        step: conductor.inner.step(),
-    };
-    // For StreamCursor, we need the conductor to have a stream attached.
-    // We create a cursor from the conductor's checkpoint method if available,
-    // otherwise create a default cursor at the current step.
-    let cursor = RustStreamCursor {
-        position: 0,
-        chunk_id: conductor.inner.step() as u64,
-        pulse_id: conductor.inner.step() as u64,
-        rng_state: None,
-        content_hash: 0,
-    };
+    // Use Conductor::checkpoint() to atomically capture both ConductorState
+    // and the real StreamCursor (with correct position, chunk_id, etc.)
+    if !conductor.inner.has_stream() {
+        return Err(PyValueError::new_err(
+            "save_build_checkpoint requires an attached stream on the Conductor"
+        ));
+    }
+    let ckpt = conductor.inner.checkpoint();
     let build_state = RustBuildResumeState {
-        conductor: cond_state,
-        stream_cursor: cursor,
+        conductor: ckpt.conductor,
+        stream_cursor: ckpt.stream,
         context: context.inner.clone(),
         global_step: conductor.inner.step(),
     };
