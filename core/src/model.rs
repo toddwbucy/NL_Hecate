@@ -1283,30 +1283,94 @@ impl MAGParams {
 
 // ── Checkpoint Serialization ─────────────────────────────────────────
 
-/// Internal wrapper for JSON checkpoint format.
+use crate::conductor::{ConductorState, ContextState};
+use crate::context_stream::StreamCursor;
+
+/// Legacy v0 checkpoint format (no version field). Kept for backward compat.
 #[derive(Serialize, Deserialize)]
 struct ParamCheckpoint {
     config: MAGConfig,
     params: MAGParams,
 }
 
-/// Save MAGParams + MAGConfig to a JSON file.
+/// Optional build-resume state. Omitted for serving checkpoints.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BuildResumeState {
+    pub conductor: ConductorState,
+    pub stream_cursor: StreamCursor,
+    pub context: ContextState,
+    pub global_step: usize,
+}
+
+/// Declared checkpoint format (v1+). Schema-versioned with optional build-resume state.
+#[derive(Serialize, Deserialize)]
+pub struct DeclaredCheckpoint {
+    pub version: u32,
+    pub created_at: String,
+    pub description: Option<String>,
+    pub config: MAGConfig,
+    pub params: MAGParams,
+    pub build_state: Option<BuildResumeState>,
+}
+
+/// Generate ISO 8601 timestamp without chrono dependency.
+fn iso8601_now() -> String {
+    // Use UNIX_EPOCH elapsed seconds; format as readable timestamp.
+    // For a proper ISO 8601, we'd need chrono — but the spec says "no chrono dep".
+    // We format epoch seconds as a string; consumers who need human-readable can parse.
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => format!("epoch:{}", d.as_secs()),
+        Err(_) => "epoch:0".to_string(),
+    }
+}
+
+/// Save MAGParams + MAGConfig as a v1 serving checkpoint (no build state).
 pub fn save_checkpoint(path: &std::path::Path, params: &MAGParams, config: &MAGConfig) -> std::io::Result<()> {
-    let checkpoint = ParamCheckpoint {
+    let checkpoint = DeclaredCheckpoint {
+        version: 1,
+        created_at: iso8601_now(),
+        description: None,
         config: config.clone(),
         params: params.clone(),
+        build_state: None,
     };
     let json = serde_json::to_string(&checkpoint)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     std::fs::write(path, json)
 }
 
-/// Load MAGParams + MAGConfig from a JSON file.
-pub fn load_checkpoint(path: &std::path::Path) -> std::io::Result<(MAGParams, MAGConfig)> {
-    let json = std::fs::read_to_string(path)?;
-    let checkpoint: ParamCheckpoint = serde_json::from_str(&json)
+/// Save MAGParams + MAGConfig + build-resume state as a v1 checkpoint.
+pub fn save_build_checkpoint(
+    path: &std::path::Path,
+    params: &MAGParams,
+    config: &MAGConfig,
+    build_state: BuildResumeState,
+) -> std::io::Result<()> {
+    let checkpoint = DeclaredCheckpoint {
+        version: 1,
+        created_at: iso8601_now(),
+        description: Some("build checkpoint (resumable)".to_string()),
+        config: config.clone(),
+        params: params.clone(),
+        build_state: Some(build_state),
+    };
+    let json = serde_json::to_string(&checkpoint)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    Ok((checkpoint.params, checkpoint.config))
+    std::fs::write(path, json)
+}
+
+/// Load checkpoint. Handles both v1 (DeclaredCheckpoint) and legacy v0 (ParamCheckpoint).
+/// Returns (params, config, optional build state).
+pub fn load_checkpoint(path: &std::path::Path) -> std::io::Result<(MAGParams, MAGConfig, Option<BuildResumeState>)> {
+    let json = std::fs::read_to_string(path)?;
+    // Try v1 first
+    if let Ok(declared) = serde_json::from_str::<DeclaredCheckpoint>(&json) {
+        return Ok((declared.params, declared.config, declared.build_state));
+    }
+    // Fall back to legacy v0
+    let legacy: ParamCheckpoint = serde_json::from_str(&json)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    Ok((legacy.params, legacy.config, None))
 }
 
 #[cfg(test)]
@@ -1578,5 +1642,112 @@ mod tests {
         assert!((default_b_eta(2) - 2.5).abs() < 1e-6);
         assert!((default_b_eta(3) - 3.0).abs() < 1e-6);
         assert!((default_b_eta(4) - 2.0).abs() < 1e-6); // fallback
+    }
+
+    // ── Declared Checkpoint tests ────────────────────────────────────
+
+    #[test]
+    fn test_checkpoint_v1_roundtrip() {
+        let cfg = MAGConfig::test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let dir = std::env::temp_dir().join("hecate_test_ckpt_v1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("serving.json");
+        save_checkpoint(&path, &params, &cfg).unwrap();
+        let (loaded_params, loaded_cfg, build_state) = load_checkpoint(&path).unwrap();
+        assert_eq!(loaded_params.swa.w_q, params.swa.w_q);
+        assert_eq!(loaded_cfg.swa.d_model, cfg.swa.d_model);
+        assert_eq!(loaded_cfg.k, cfg.k);
+        assert!(build_state.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_checkpoint_v1_with_build_state() {
+        use crate::conductor::{ConductorState, ContextState};
+        use crate::context_stream::StreamCursor;
+
+        let cfg = MAGConfig::test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let d = cfg.swa.d_model;
+
+        let build_state = BuildResumeState {
+            conductor: ConductorState { k: 1, chunk_sizes: vec![1], step: 42 },
+            stream_cursor: StreamCursor { position: 100, chunk_id: 42, pulse_id: 42, rng_state: None, content_hash: 0 },
+            context: ContextState::new(1, d),
+            global_step: 42,
+        };
+
+        let dir = std::env::temp_dir().join("hecate_test_ckpt_build");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("build.json");
+        save_build_checkpoint(&path, &params, &cfg, build_state.clone()).unwrap();
+
+        let (loaded_params, loaded_cfg, loaded_bs) = load_checkpoint(&path).unwrap();
+        assert_eq!(loaded_params.swa.w_q, params.swa.w_q);
+        assert_eq!(loaded_cfg.k, cfg.k);
+        let bs = loaded_bs.expect("build_state should be Some");
+        assert_eq!(bs.global_step, 42);
+        assert_eq!(bs.conductor.step, 42);
+        assert_eq!(bs.stream_cursor.position, 100);
+        assert_eq!(bs.context.memory.len(), 1);
+        assert_eq!(bs.context.d, d);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_checkpoint_legacy_compat() {
+        // Write a raw v0 JSON (no version field) and verify load still works
+        let cfg = MAGConfig::test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let legacy = ParamCheckpoint { config: cfg.clone(), params: params.clone() };
+        let json = serde_json::to_string(&legacy).unwrap();
+
+        let dir = std::env::temp_dir().join("hecate_test_ckpt_legacy");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.json");
+        std::fs::write(&path, &json).unwrap();
+
+        let (loaded_params, loaded_cfg, build_state) = load_checkpoint(&path).unwrap();
+        assert_eq!(loaded_params.swa.w_q, params.swa.w_q);
+        assert_eq!(loaded_cfg.swa.d_model, cfg.swa.d_model);
+        assert!(build_state.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_checkpoint_version_field() {
+        let cfg = MAGConfig::test_config();
+        let params = MAGParams::init(&cfg, 42);
+
+        let dir = std::env::temp_dir().join("hecate_test_ckpt_version");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("versioned.json");
+        save_checkpoint(&path, &params, &cfg).unwrap();
+
+        let raw: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&path).unwrap()
+        ).unwrap();
+        assert_eq!(raw["version"], 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_checkpoint_timestamp() {
+        let cfg = MAGConfig::test_config();
+        let params = MAGParams::init(&cfg, 42);
+
+        let dir = std::env::temp_dir().join("hecate_test_ckpt_ts");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ts.json");
+        save_checkpoint(&path, &params, &cfg).unwrap();
+
+        let raw: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&path).unwrap()
+        ).unwrap();
+        let ts = raw["created_at"].as_str().unwrap();
+        assert!(!ts.is_empty());
+        assert!(ts.starts_with("epoch:"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

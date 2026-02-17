@@ -25,7 +25,12 @@ use nl_hecate_core::gradient::mag_compute_gradients as rust_mag_compute_gradient
 use nl_hecate_core::mag::{cms_forward as rust_cms_forward, cms_backward as rust_cms_backward, CMSForwardCache as RustCMSCache};
 use nl_hecate_core::conductor::{Conductor as RustConductor, Pulse as RustPulse, ContextState as RustContextState, ErrorBuffer as RustErrorBuffer};
 use nl_hecate_core::context_stream::VecStream as RustVecStream;
-use nl_hecate_core::model::{save_checkpoint as rust_save_checkpoint, load_checkpoint as rust_load_checkpoint};
+use nl_hecate_core::model::{
+    save_checkpoint as rust_save_checkpoint,
+    save_build_checkpoint as rust_save_build_checkpoint,
+    load_checkpoint as rust_load_checkpoint,
+    BuildResumeState as RustBuildResumeState,
+};
 
 // ── SWAConfig ────────────────────────────────────────────────────────
 
@@ -1019,10 +1024,57 @@ fn save_checkpoint(path: &str, params: &MAGParams, cfg: &MAGConfig) -> PyResult<
 }
 
 #[pyfunction]
+fn save_build_checkpoint(
+    path: &str, params: &MAGParams, cfg: &MAGConfig,
+    conductor: &mut Conductor, context: &ContextState,
+) -> PyResult<()> {
+    // Use Conductor::checkpoint() to atomically capture both ConductorState
+    // and the real StreamCursor (with correct position, chunk_id, etc.)
+    if !conductor.inner.has_stream() {
+        return Err(PyValueError::new_err(
+            "save_build_checkpoint requires an attached stream on the Conductor"
+        ));
+    }
+    let ckpt = conductor.inner.checkpoint();
+    let build_state = RustBuildResumeState {
+        conductor: ckpt.conductor,
+        stream_cursor: ckpt.stream,
+        context: context.inner.clone(),
+        global_step: conductor.inner.step(),
+    };
+    rust_save_build_checkpoint(
+        std::path::Path::new(path), &params.inner, &cfg.inner, build_state,
+    ).map_err(|e| PyValueError::new_err(format!("save_build_checkpoint failed: {e}")))
+}
+
+#[pyfunction]
 fn load_checkpoint(path: &str) -> PyResult<(MAGParams, MAGConfig)> {
-    let (params, config) = rust_load_checkpoint(std::path::Path::new(path))
+    let (params, config, _build_state) = rust_load_checkpoint(std::path::Path::new(path))
         .map_err(|e| PyValueError::new_err(format!("load_checkpoint failed: {e}")))?;
     Ok((MAGParams { inner: params }, MAGConfig { inner: config }))
+}
+
+#[pyfunction]
+fn load_build_checkpoint(py: Python<'_>, path: &str) -> PyResult<(MAGParams, MAGConfig, PyObject)> {
+    let (params, config, build_state) = rust_load_checkpoint(std::path::Path::new(path))
+        .map_err(|e| PyValueError::new_err(format!("load_build_checkpoint failed: {e}")))?;
+    let bs_obj = match build_state {
+        Some(bs) => {
+            let dict = PyDict::new(py);
+            dict.set_item("global_step", bs.global_step)?;
+            dict.set_item("conductor_step", bs.conductor.step)?;
+            dict.set_item("conductor_k", bs.conductor.k)?;
+            dict.set_item("conductor_chunk_sizes", bs.conductor.chunk_sizes)?;
+            dict.set_item("stream_position", bs.stream_cursor.position)?;
+            dict.set_item("stream_chunk_id", bs.stream_cursor.chunk_id)?;
+            dict.set_item("stream_pulse_id", bs.stream_cursor.pulse_id)?;
+            dict.set_item("context_d", bs.context.d)?;
+            dict.set_item("context_memory", bs.context.memory)?;
+            dict.into_any().unbind()
+        }
+        None => py.None(),
+    };
+    Ok((MAGParams { inner: params }, MAGConfig { inner: config }, bs_obj))
 }
 
 // ── Module ───────────────────────────────────────────────────────────
@@ -1060,6 +1112,8 @@ fn nl_hecate(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cms_forward, m)?)?;
     m.add_function(wrap_pyfunction!(cms_backward, m)?)?;
     m.add_function(wrap_pyfunction!(save_checkpoint, m)?)?;
+    m.add_function(wrap_pyfunction!(save_build_checkpoint, m)?)?;
     m.add_function(wrap_pyfunction!(load_checkpoint, m)?)?;
+    m.add_function(wrap_pyfunction!(load_build_checkpoint, m)?)?;
     Ok(())
 }
