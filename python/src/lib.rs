@@ -22,6 +22,10 @@ use nl_hecate_core::backward::backward_full as rust_backward_full;
 use nl_hecate_core::gradient::compute_gradients as rust_compute_gradients;
 use nl_hecate_core::mag::{mag_forward as rust_mag_forward, MAGForwardCache as RustMAGCache, mag_backward as rust_mag_backward};
 use nl_hecate_core::gradient::mag_compute_gradients as rust_mag_compute_gradients;
+use nl_hecate_core::mag::{cms_forward as rust_cms_forward, cms_backward as rust_cms_backward, CMSForwardCache as RustCMSCache};
+use nl_hecate_core::conductor::{Conductor as RustConductor, Pulse as RustPulse, ContextState as RustContextState, ErrorBuffer as RustErrorBuffer};
+use nl_hecate_core::context_stream::VecStream as RustVecStream;
+use nl_hecate_core::model::{save_checkpoint as rust_save_checkpoint, load_checkpoint as rust_load_checkpoint};
 
 // ── SWAConfig ────────────────────────────────────────────────────────
 
@@ -779,6 +783,248 @@ fn parse_block_config(d: &Bound<'_, PyDict>) -> PyResult<RustBlockConfig> {
     Ok(block)
 }
 
+// ── Conductor ────────────────────────────────────────────────────────
+
+#[pyclass(unsendable)]
+struct Conductor {
+    inner: RustConductor,
+}
+
+#[pymethods]
+impl Conductor {
+    #[new]
+    fn new(k: usize, chunk_sizes: Vec<usize>) -> PyResult<Self> {
+        if k < 1 {
+            return Err(PyValueError::new_err("k must be >= 1"));
+        }
+        if chunk_sizes.len() != k {
+            return Err(PyValueError::new_err(format!(
+                "chunk_sizes length ({}) must equal k ({k})", chunk_sizes.len()
+            )));
+        }
+        for (i, &cs) in chunk_sizes.iter().enumerate() {
+            if cs < 1 {
+                return Err(PyValueError::new_err(format!(
+                    "chunk_sizes[{i}] must be >= 1, got {cs}"
+                )));
+            }
+        }
+        Ok(Conductor { inner: RustConductor::new(k, chunk_sizes) })
+    }
+
+    /// Attach a VecStream for integrated data feeding. Consumes the stream.
+    fn attach_stream(&mut self, stream: &mut VecStream) -> PyResult<()> {
+        let vs = stream.inner.take().ok_or_else(||
+            PyValueError::new_err("VecStream already consumed by another Conductor")
+        )?;
+        self.inner = RustConductor::new(self.inner.k, self.inner.chunk_sizes.clone())
+            .with_stream(Box::new(vs));
+        Ok(())
+    }
+
+    /// Generate pulse for current step (does NOT advance).
+    fn pulse(&self) -> Pulse {
+        Pulse { inner: self.inner.pulse() }
+    }
+
+    /// Advance step counter. Call AFTER all observers have read the pulse.
+    fn advance(&mut self) {
+        self.inner.advance();
+    }
+
+    /// Get next chunk from attached stream + generate pulse.
+    /// Returns (input_ids, target_ids, Pulse) or None if corpus empty.
+    fn next_chunk(&mut self, chunk_size: usize) -> PyResult<Option<(Vec<usize>, Vec<usize>, Pulse)>> {
+        if !self.inner.has_stream() {
+            return Err(PyValueError::new_err("no stream attached; call attach_stream() first"));
+        }
+        match self.inner.next_chunk(chunk_size) {
+            Some((chunk, pulse)) => Ok(Some((
+                chunk.input_ids,
+                chunk.target_ids,
+                Pulse { inner: pulse },
+            ))),
+            None => Ok(None),
+        }
+    }
+
+    #[getter]
+    fn step(&self) -> usize { self.inner.step() }
+
+    #[getter]
+    fn k(&self) -> usize { self.inner.k }
+}
+
+// ── Pulse ────────────────────────────────────────────────────────────
+
+#[pyclass(frozen)]
+struct Pulse {
+    inner: RustPulse,
+}
+
+#[pymethods]
+impl Pulse {
+    #[getter]
+    fn global_step(&self) -> usize { self.inner.global_step }
+
+    #[getter]
+    fn active_levels(&self) -> Vec<bool> { self.inner.active_levels.clone() }
+}
+
+// ── ContextState ────────────────────────────────────────────────────
+
+#[pyclass]
+struct ContextState {
+    inner: RustContextState,
+}
+
+#[pymethods]
+impl ContextState {
+    #[new]
+    fn new(k: usize, d: usize) -> Self {
+        ContextState { inner: RustContextState::new(k, d) }
+    }
+
+    /// Per-level M matrices as list of flat f32 lists.
+    #[getter]
+    fn memory(&self) -> Vec<Vec<f32>> { self.inner.memory.clone() }
+
+    #[getter]
+    fn d(&self) -> usize { self.inner.d }
+}
+
+// ── ErrorBufferList ─────────────────────────────────────────────────
+
+#[pyclass]
+struct ErrorBufferList {
+    inner: Vec<RustErrorBuffer>,
+}
+
+#[pymethods]
+impl ErrorBufferList {
+    #[new]
+    fn new(k: usize, d: usize) -> Self {
+        let inner = (0..k).map(|_| RustErrorBuffer::new(d)).collect();
+        ErrorBufferList { inner }
+    }
+
+    /// Number of accumulated gradient steps for a given level.
+    fn steps_accumulated(&self, level: usize) -> PyResult<usize> {
+        self.inner.get(level)
+            .map(|b| b.steps_accumulated)
+            .ok_or_else(|| PyValueError::new_err(format!("level {level} out of bounds")))
+    }
+
+    /// Apply accumulated gradients for one level and reset its buffer.
+    fn apply_and_reset(&mut self, params: &mut MAGParams, level: usize, lr: f32) -> PyResult<()> {
+        let buf = self.inner.get_mut(level)
+            .ok_or_else(|| PyValueError::new_err(format!("level {level} out of bounds")))?;
+        let level_params = params.inner.levels.get_mut(level)
+            .ok_or_else(|| PyValueError::new_err(format!("params has no level {level}")))?;
+        buf.apply_and_reset(level_params, lr);
+        Ok(())
+    }
+
+    /// Apply accumulated gradients for all active levels in the pulse.
+    fn apply_for_active(&mut self, params: &mut MAGParams, pulse: &Pulse, lr: f32) -> PyResult<()> {
+        for level in 0..self.inner.len() {
+            if pulse.inner.active_levels.get(level).copied().unwrap_or(false)
+                && self.inner[level].steps_accumulated > 0
+            {
+                let level_params = params.inner.levels.get_mut(level)
+                    .ok_or_else(|| PyValueError::new_err(format!("params has no level {level}")))?;
+                self.inner[level].apply_and_reset(level_params, lr);
+            }
+        }
+        Ok(())
+    }
+
+    #[getter]
+    fn len(&self) -> usize { self.inner.len() }
+}
+
+// ── VecStream ────────────────────────────────────────────────────────
+
+#[pyclass]
+struct VecStream {
+    inner: Option<RustVecStream>,
+}
+
+#[pymethods]
+impl VecStream {
+    #[new]
+    fn new(corpus: Vec<usize>) -> PyResult<Self> {
+        if corpus.len() < 2 {
+            return Err(PyValueError::new_err("corpus must have at least 2 tokens"));
+        }
+        Ok(VecStream { inner: Some(RustVecStream::new(corpus)) })
+    }
+}
+
+// ── CMSForwardCache ─────────────────────────────────────────────────
+
+#[pyclass]
+struct CMSForwardCache {
+    inner: RustCMSCache,
+}
+
+#[pymethods]
+impl CMSForwardCache {
+    /// Return logits as flat list: [seq_len * vocab_size], row-major.
+    fn get_logits(&self) -> Vec<f32> {
+        self.inner.logits.clone()
+    }
+}
+
+// ── CMS free functions ──────────────────────────────────────────────
+
+#[pyfunction]
+fn cms_forward(
+    params: &MAGParams,
+    cfg: &MAGConfig,
+    input_ids: Vec<usize>,
+    target_ids: Vec<usize>,
+    pulse: &Pulse,
+    context: &mut ContextState,
+) -> PyResult<(f32, CMSForwardCache)> {
+    validate_mag_seq_lens(cfg, &input_ids, &target_ids)?;
+    let (loss, cache) = rust_cms_forward(
+        &params.inner, &cfg.inner, &input_ids, &target_ids,
+        &pulse.inner, &mut context.inner,
+    );
+    Ok((loss, CMSForwardCache { inner: cache }))
+}
+
+#[pyfunction]
+fn cms_backward(
+    params: &MAGParams,
+    cfg: &MAGConfig,
+    cache: &CMSForwardCache,
+    input_ids: Vec<usize>,
+    target_ids: Vec<usize>,
+    error_buffers: &mut ErrorBufferList,
+) -> PyResult<MAGParams> {
+    validate_mag_seq_lens(cfg, &input_ids, &target_ids)?;
+    let grads = rust_cms_backward(
+        &params.inner, &cfg.inner, &cache.inner,
+        &input_ids, &target_ids, &mut error_buffers.inner,
+    );
+    Ok(MAGParams { inner: grads })
+}
+
+#[pyfunction]
+fn save_checkpoint(path: &str, params: &MAGParams, cfg: &MAGConfig) -> PyResult<()> {
+    rust_save_checkpoint(std::path::Path::new(path), &params.inner, &cfg.inner)
+        .map_err(|e| PyValueError::new_err(format!("save_checkpoint failed: {e}")))
+}
+
+#[pyfunction]
+fn load_checkpoint(path: &str) -> PyResult<(MAGParams, MAGConfig)> {
+    let (params, config) = rust_load_checkpoint(std::path::Path::new(path))
+        .map_err(|e| PyValueError::new_err(format!("load_checkpoint failed: {e}")))?;
+    Ok((MAGParams { inner: params }, MAGConfig { inner: config }))
+}
+
 // ── Module ───────────────────────────────────────────────────────────
 
 #[pymodule]
@@ -804,5 +1050,16 @@ fn nl_hecate(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mag_apply_weight_gradients, m)?)?;
     // CMS Variants
     m.add_class::<MultiBlockConfig>()?;
+    // Stateful CMS build loop
+    m.add_class::<Conductor>()?;
+    m.add_class::<Pulse>()?;
+    m.add_class::<ContextState>()?;
+    m.add_class::<ErrorBufferList>()?;
+    m.add_class::<VecStream>()?;
+    m.add_class::<CMSForwardCache>()?;
+    m.add_function(wrap_pyfunction!(cms_forward, m)?)?;
+    m.add_function(wrap_pyfunction!(cms_backward, m)?)?;
+    m.add_function(wrap_pyfunction!(save_checkpoint, m)?)?;
+    m.add_function(wrap_pyfunction!(load_checkpoint, m)?)?;
     Ok(())
 }
