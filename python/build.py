@@ -428,7 +428,9 @@ def main():
     # VecStream needs a Rust Vec<usize>, so mmap must be materialized.
     # Materializing here frees the mmap backing after handoff to Rust.
     if isinstance(token_ids, MmapTokenStream):
-        token_ids = list(token_ids)
+        mm = token_ids
+        token_ids = list(mm)
+        mm.close()
     if bcfg.load:
         conductor = nl_hecate.Conductor(bcfg.k, bcfg.chunk_sizes)
         stream = nl_hecate.VecStream(token_ids)
@@ -602,11 +604,13 @@ def main():
     print(f"{'=' * 60}")
 
     if jsonl:
-        jsonl.log(event="build_end", steps=len(losses), elapsed=elapsed,
-                  tok_per_sec=tok_per_sec,
-                  loss_first=losses[0] if losses else None,
-                  loss_last=losses[-1] if losses else None)
-        jsonl.close()
+        try:
+            jsonl.log(event="build_end", steps=len(losses), elapsed=elapsed,
+                      tok_per_sec=tok_per_sec,
+                      loss_first=losses[0] if losses else None,
+                      loss_last=losses[-1] if losses else None)
+        finally:
+            jsonl.close()
 
 
 if __name__ == "__main__":
