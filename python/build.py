@@ -100,27 +100,31 @@ def main():
 
     # Resolve each parameter: CLI arg > config file > hardcoded default
     data_path   = args.data        or d.get("path")
-    steps       = args.steps       or b.get("steps", 500)
-    d_model     = args.d_model     or m.get("d_model", 64)
-    num_heads   = args.num_heads   or m.get("num_heads", 4)
-    seq_len     = args.seq_len     or m.get("seq_len", 32)
-    window_size = args.window_size or m.get("window_size", 16)
-    k           = args.k           or m.get("k", 1)
+    steps       = args.steps       if args.steps is not None else b.get("steps", 500)
+    d_model     = args.d_model     if args.d_model is not None else m.get("d_model", 64)
+    num_heads   = args.num_heads   if args.num_heads is not None else m.get("num_heads", 4)
+    seq_len     = args.seq_len     if args.seq_len is not None else m.get("seq_len", 32)
+    window_size = args.window_size if args.window_size is not None else m.get("window_size", 16)
+    k           = args.k           if args.k is not None else m.get("k", 1)
     memory_rule = args.memory_rule or m.get("memory_rule", "delta")
     composition = args.composition or m.get("composition", "mag")
-    lr          = args.lr          or b.get("lr", 0.01)
+    lr          = args.lr          if args.lr is not None else b.get("lr", 0.01)
     seed        = args.seed        if args.seed is not None else b.get("seed", 42)
     save_path   = args.save_path   or b.get("save_path", "checkpoints/model.json")
     save_every  = args.save_every  if args.save_every is not None else b.get("save_every", 0)
     log_every   = args.log_every   if args.log_every is not None else b.get("log_every", 10)
 
     # chunk_sizes: CLI string "1,8" > config list [1, 8] > default [1]*k
-    if args.chunk_sizes:
-        chunk_sizes = [int(x) for x in args.chunk_sizes.split(",")]
+    if args.chunk_sizes is not None:
+        chunk_sizes = [int(x) for x in args.chunk_sizes.split(",") if x]
     elif "chunk_sizes" in m:
         chunk_sizes = m["chunk_sizes"]
     else:
         chunk_sizes = [1] * k
+
+    if len(chunk_sizes) != k:
+        print(f"Error: chunk_sizes length {len(chunk_sizes)} must match k={k}")
+        return
 
     # ── Load data ────────────────────────────────────────────────────
     if data_path:

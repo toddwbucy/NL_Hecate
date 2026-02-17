@@ -720,10 +720,13 @@ pub(crate) fn cms_mac_check_weight_gradient(
 mod tests {
     use super::*;
 
-    /// Force Rust reference for all gradient tests when CUDA is available.
+    /// Force Rust reference for MAL gradient tests when CUDA is available.
+    /// Called at the start of specific tests (not globally for all gradient tests).
     /// FD gradient checking requires both analytical and numerical paths to use
     /// identical arithmetic. cuBLAS rounding differs from Rust, which can flip
     /// marginal gradient signs (especially in MAL's residual connection path).
+    /// Only MAL tests need this — other rules' gradients are large enough to
+    /// tolerate cuBLAS rounding differences.
     #[cfg(feature = "cuda")]
     fn ensure_rust_reference() {
         crate::dispatch::force_rust_reference(true);
