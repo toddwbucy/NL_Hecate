@@ -12,6 +12,7 @@ All math stays in Rust. This script is pure orchestration (CS-18).
 import argparse
 import math
 import os
+from pathlib import Path
 import time
 
 import nl_hecate
@@ -158,7 +159,8 @@ def main():
 
         # Periodic checkpoint
         if args.save_every > 0 and step > 0 and step % args.save_every == 0:
-            ckpt_path = args.save_path.replace(".json", f"_step{step}.json")
+            p = Path(args.save_path)
+            ckpt_path = str(p.with_stem(f"{p.stem}_step{step}"))
             os.makedirs(os.path.dirname(ckpt_path) or ".", exist_ok=True)
             nl_hecate.save_checkpoint(ckpt_path, params, cfg)
             print(f"  [checkpoint saved: {ckpt_path}]")
