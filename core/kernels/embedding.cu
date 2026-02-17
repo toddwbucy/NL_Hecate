@@ -67,4 +67,28 @@ void embedding_scatter_add_cuda(
     embedding_scatter_add_kernel<<<seq_len, block>>>(d_embedded, input_ids, d_embed, seq_len, d);
 }
 
+// Weight tying: copy w_unembed^T → w_embed on device.
+// w_embed[v, i] = w_unembed[i, v]  (transpose copy)
+// w_embed layout: [vocab, d_model] row-major  →  w_embed[v*d + i]
+// w_unembed layout: [d_model, vocab] row-major → w_unembed[i*vocab + v]
+__global__ void transpose_copy_kernel(
+    const float* __restrict__ src,   // [rows, cols]
+    float*       __restrict__ dst,   // [cols, rows]
+    int rows, int cols)
+{
+    int v = blockIdx.x;
+    if (v >= cols) return;
+    for (int i = threadIdx.x; i < rows; i += blockDim.x) {
+        dst[v * rows + i] = src[i * cols + v];
+    }
+}
+
+void transpose_copy_cuda(
+    const float* src, float* dst,
+    int rows, int cols)
+{
+    int block = (rows < 1024) ? rows : 1024;
+    transpose_copy_kernel<<<cols, block>>>(src, dst, rows, cols);
+}
+
 } // extern "C"

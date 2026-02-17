@@ -21,6 +21,55 @@ import time
 import nl_hecate
 
 
+# ── AdamW optimizer (Python-side, operates on flat weight arrays) ────
+
+class AdamW:
+    """Decoupled weight decay optimizer (Loshchilov & Hutter, 2019).
+
+    Maintains first/second moment estimates per parameter. Works on flat
+    weight arrays from MAGParams.get_weights() / set_weights().
+    """
+
+    def __init__(self, num_params: int, lr: float = 4e-4,
+                 beta1: float = 0.9, beta2: float = 0.999,
+                 eps: float = 1e-8, weight_decay: float = 0.1):
+        self.lr = lr
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.eps = eps
+        self.weight_decay = weight_decay
+        self.m = [0.0] * num_params  # first moment
+        self.v = [0.0] * num_params  # second moment
+        self.t = 0  # step counter for bias correction
+
+    def step(self, params: list[float], grads: list[float], lr: float) -> list[float]:
+        """One AdamW update. Returns updated params."""
+        self.t += 1
+        b1, b2, eps, wd = self.beta1, self.beta2, self.eps, self.weight_decay
+        bc1 = 1.0 - b1 ** self.t
+        bc2 = 1.0 - b2 ** self.t
+
+        for i in range(len(params)):
+            g = grads[i]
+            self.m[i] = b1 * self.m[i] + (1 - b1) * g
+            self.v[i] = b2 * self.v[i] + (1 - b2) * g * g
+            m_hat = self.m[i] / bc1
+            v_hat = self.v[i] / bc2
+            # AdamW: decoupled weight decay applied to param directly
+            params[i] -= lr * (m_hat / (math.sqrt(v_hat) + eps) + wd * params[i])
+        return params
+
+
+def cosine_lr(step: int, warmup_steps: int, total_steps: int, lr_peak: float,
+              lr_min: float = 0.0) -> float:
+    """Cosine annealing with linear warmup."""
+    if step < warmup_steps:
+        return lr_peak * step / max(warmup_steps, 1)
+    progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+    progress = min(progress, 1.0)
+    return lr_min + 0.5 * (lr_peak - lr_min) * (1 + math.cos(math.pi * progress))
+
+
 # ── Byte-level tokenizer ────────────────────────────────────────────
 
 def encode(text: str) -> list[int]:
@@ -89,6 +138,14 @@ def main():
                         help="Resume from a build checkpoint (saved with --save_every)")
     parser.add_argument("--gpu", action="store_true",
                         help="Use GPU-resident model (all math on GPU)")
+    parser.add_argument("--optimizer", type=str, default=None,
+                        help="Optimizer: 'sgd' or 'adamw' (default: sgd)")
+    parser.add_argument("--warmup_steps", type=int, default=None,
+                        help="LR warmup steps (0 = no warmup)")
+    parser.add_argument("--weight_decay", type=float, default=None,
+                        help="AdamW weight decay")
+    parser.add_argument("--beta1", type=float, default=None, help="AdamW beta1")
+    parser.add_argument("--beta2", type=float, default=None, help="AdamW beta2")
     args = parser.parse_args()
 
     # ── Merge config file + CLI args ─────────────────────────────────
@@ -117,6 +174,11 @@ def main():
     save_path   = args.save_path   or b.get("save_path", "checkpoints/model.json")
     save_every  = args.save_every  if args.save_every is not None else b.get("save_every", 0)
     log_every   = args.log_every   if args.log_every is not None else b.get("log_every", 10)
+    optimizer   = args.optimizer   or b.get("optimizer", "sgd")
+    warmup_steps = args.warmup_steps if args.warmup_steps is not None else b.get("warmup_steps", 0)
+    weight_decay = args.weight_decay if args.weight_decay is not None else b.get("weight_decay", 0.1)
+    beta1       = args.beta1       if args.beta1 is not None else b.get("beta1", 0.9)
+    beta2       = args.beta2       if args.beta2 is not None else b.get("beta2", 0.999)
 
     # chunk_sizes: CLI string "1,8" > config list [1, 8] > default [1]*k
     if args.chunk_sizes is not None:
@@ -198,6 +260,9 @@ def main():
     print(f"  Data:     {len(token_ids):,} tokens")
     use_gpu = args.gpu and hasattr(nl_hecate, "GpuModel")
     print(f"  Build:    {steps} steps (from step {resume_step}), lr={lr}")
+    print(f"  Optimizer: {optimizer}" +
+          (f" (β1={beta1}, β2={beta2}, wd={weight_decay}, warmup={warmup_steps})"
+           if optimizer == "adamw" else ""))
     print(f"  Device:   {'GPU' if use_gpu else 'CPU'}")
     print(f"{'=' * 60}\n")
 
@@ -222,6 +287,14 @@ def main():
 
     error_buffers = nl_hecate.ErrorBufferList(k, d_model)
 
+    # Initialize optimizer
+    adamw_opt = None
+    if optimizer == "adamw":
+        adamw_opt = AdamW(
+            num_params=params.num_params(), lr=lr,
+            beta1=beta1, beta2=beta2, weight_decay=weight_decay,
+        )
+
     losses = []
     t_start = time.perf_counter()
     end_step = resume_step + steps
@@ -237,17 +310,35 @@ def main():
             conductor.advance()
             continue
 
-        if gpu_model is not None:
-            # GPU path: forward + backward + update in one call
-            loss = gpu_model.step(input_ids, target_ids, pulse, lr)
+        # Compute current learning rate
+        current_lr = cosine_lr(step, warmup_steps, end_step, lr) if adamw_opt else lr
+
+        if gpu_model is not None and adamw_opt is None:
+            # GPU path with SGD: forward + backward + update in one call
+            loss = gpu_model.step(input_ids, target_ids, pulse, current_lr)
+        elif gpu_model is not None and adamw_opt is not None:
+            # Hybrid GPU+AdamW: GPU forward+backward, Python optimizer
+            loss, grad_params = gpu_model.backward_only(input_ids, target_ids, pulse)
+            p_flat = params.get_flat_weights()
+            g_flat = grad_params.get_flat_weights()
+            p_flat = adamw_opt.step(p_flat, g_flat, current_lr)
+            params.set_flat_weights(p_flat)
+            gpu_model.upload_params(params)
+            error_buffers.apply_for_active(params, pulse, current_lr)
         else:
             # CPU path: forward + backward + update separately
             loss, cache = nl_hecate.cms_forward(
                 params, cfg, input_ids, target_ids, pulse, context)
             grads = nl_hecate.cms_backward(
                 params, cfg, cache, input_ids, target_ids, error_buffers)
-            nl_hecate.mag_apply_weight_gradients(params, grads, lr)
-            error_buffers.apply_for_active(params, pulse, lr)
+            if adamw_opt:
+                p_flat = params.get_flat_weights()
+                g_flat = grads.get_flat_weights()
+                p_flat = adamw_opt.step(p_flat, g_flat, current_lr)
+                params.set_flat_weights(p_flat)
+            else:
+                nl_hecate.mag_apply_weight_gradients(params, grads, current_lr)
+            error_buffers.apply_for_active(params, pulse, current_lr)
 
         # NaN/Inf guard
         if math.isnan(loss) or math.isinf(loss):

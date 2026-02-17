@@ -192,6 +192,15 @@ extern "C" {
         d: i32,
     );
 
+    /// Transpose copy: dst[col * rows + row] = src[row * cols + col].
+    /// Used for weight tying: w_embed = w_unembed^T.
+    pub(crate) fn transpose_copy_cuda(
+        src: *const f32,   // [rows, cols] = w_unembed [d, vocab]
+        dst: *mut f32,     // [cols, rows] = w_embed [vocab, d]
+        rows: i32,         // d_model
+        cols: i32,         // vocab_size
+    );
+
     // ── Elementwise kernels ───────────────────────────────────────────
 
     /// Element-wise sigmoid: out[i] = 1/(1+exp(-x[i])).

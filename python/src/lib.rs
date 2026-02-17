@@ -490,6 +490,70 @@ impl MAGParams {
         dict.set_item("b_theta", self.inner.levels[0].b_theta.clone())?;
         Ok(dict)
     }
+
+    /// Flatten all params into a single Vec<f32> for Python-side optimizers.
+    /// Order: SWA(embed,q,k,v,o,unembed) then per-level(k_mem,v_mem,q_mem,alpha,b_alpha,theta,b_theta,eta,b_eta,omega,freq,b_freq).
+    fn get_flat_weights(&self) -> Vec<f32> {
+        let mut flat = Vec::with_capacity(self.inner.num_params());
+        flat.extend_from_slice(&self.inner.swa.w_embed);
+        flat.extend_from_slice(&self.inner.swa.w_q);
+        flat.extend_from_slice(&self.inner.swa.w_k);
+        flat.extend_from_slice(&self.inner.swa.w_v);
+        flat.extend_from_slice(&self.inner.swa.w_o);
+        flat.extend_from_slice(&self.inner.swa.w_unembed);
+        for level in &self.inner.levels {
+            flat.extend_from_slice(&level.w_k_mem);
+            flat.extend_from_slice(&level.w_v_mem);
+            flat.extend_from_slice(&level.w_q_mem);
+            flat.extend_from_slice(&level.w_alpha);
+            flat.extend_from_slice(&level.b_alpha);
+            flat.extend_from_slice(&level.w_theta);
+            flat.extend_from_slice(&level.b_theta);
+            flat.extend_from_slice(&level.w_eta);
+            flat.extend_from_slice(&level.b_eta);
+            flat.extend_from_slice(&level.w_omega);
+            flat.extend_from_slice(&level.w_freq);
+            flat.extend_from_slice(&level.b_freq);
+        }
+        flat
+    }
+
+    /// Restore params from a flat Vec<f32> (inverse of get_flat_weights).
+    fn set_flat_weights(&mut self, flat: Vec<f32>) -> PyResult<()> {
+        if flat.len() != self.inner.num_params() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("flat weights length {} != num_params {}", flat.len(), self.inner.num_params())));
+        }
+        let mut offset = 0usize;
+        macro_rules! copy_slice {
+            ($dst:expr) => {{
+                let n = $dst.len();
+                $dst.copy_from_slice(&flat[offset..offset + n]);
+                offset += n;
+            }};
+        }
+        copy_slice!(self.inner.swa.w_embed);
+        copy_slice!(self.inner.swa.w_q);
+        copy_slice!(self.inner.swa.w_k);
+        copy_slice!(self.inner.swa.w_v);
+        copy_slice!(self.inner.swa.w_o);
+        copy_slice!(self.inner.swa.w_unembed);
+        for level in &mut self.inner.levels {
+            copy_slice!(level.w_k_mem);
+            copy_slice!(level.w_v_mem);
+            copy_slice!(level.w_q_mem);
+            copy_slice!(level.w_alpha);
+            copy_slice!(level.b_alpha);
+            copy_slice!(level.w_theta);
+            copy_slice!(level.b_theta);
+            copy_slice!(level.w_eta);
+            copy_slice!(level.b_eta);
+            copy_slice!(level.w_omega);
+            copy_slice!(level.w_freq);
+            copy_slice!(level.b_freq);
+        }
+        Ok(())
+    }
 }
 
 // ── MAGForwardCache ────────────────────────────────────────────────
@@ -623,6 +687,8 @@ fn mag_compute_gradients(
 #[pyfunction]
 fn mag_apply_weight_gradients(params: &mut MAGParams, grads: &MAGParams, lr: f32) {
     params.inner.apply_weight_gradients(&grads.inner, lr);
+    // Weight tying: sync w_unembed^T → w_embed (CPU path)
+    params.inner.sync_embed_from_unembed();
 }
 
 // ── MultiBlockConfig ──────────────────────────────────────────────────
@@ -1209,6 +1275,14 @@ impl GpuModel {
             &mut self.params, &grads, lr,
         );
 
+        // Weight tying: sync w_unembed^T → w_embed after each update.
+        // Compensates for vanishing embedding gradient in deep models.
+        nl_hecate_core::gpu_backward::gpu_sync_embed_weights(
+            &mut self.params,
+            self.cfg.swa.d_model,
+            self.cfg.swa.vocab_size,
+        );
+
         Ok(loss)
     }
 
@@ -1222,6 +1296,34 @@ impl GpuModel {
     fn to_host_context(&self) -> PyResult<ContextState> {
         let host = self.context.to_host(self.cfg.k);
         Ok(ContextState { inner: host })
+    }
+
+    /// GPU forward + backward only (no weight update). Returns (loss, grad_params).
+    /// Used for hybrid GPU+AdamW: Python applies optimizer, then calls upload_params().
+    fn backward_only(&mut self, input_ids: Vec<usize>, target_ids: Vec<usize>,
+                     pulse: &Pulse) -> PyResult<(f32, MAGParams)> {
+        let s = self.cfg.swa.seq_len;
+        let v = self.cfg.swa.vocab_size;
+        if input_ids.len() != s || target_ids.len() != s {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("input/target length must be seq_len {}", s)));
+        }
+        let (loss, cache) = nl_hecate_core::gpu_forward::gpu_cms_forward(
+            &self.params, &self.cfg, &input_ids, &target_ids,
+            &pulse.inner, &mut self.context,
+        );
+        let grads = nl_hecate_core::gpu_backward::gpu_cms_backward(
+            &self.params, &self.cfg, &cache,
+        );
+        // Download gradients to host as MAGParams
+        let host_grads = grads.to_host(&self.cfg);
+        Ok((loss, MAGParams { inner: host_grads }))
+    }
+
+    /// Upload host params to GPU (after Python-side optimizer update).
+    fn upload_params(&mut self, params: &MAGParams) -> PyResult<()> {
+        self.params = nl_hecate_core::gpu_params::GpuMAGParams::from_host(&params.inner);
+        Ok(())
     }
 
     /// Forward-only pass: returns (loss, logits_flat).

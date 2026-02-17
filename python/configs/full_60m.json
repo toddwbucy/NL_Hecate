@@ -1,0 +1,45 @@
+{
+    "description": "Full training: 60M params, AdamW + cosine LR, 100M-byte FineWeb data",
+
+    "model": {
+        "d_model": 2048,
+        "num_heads": 16,
+        "head_dim": 128,
+        "seq_len": 512,
+        "window_size": 256,
+        "vocab_size": 256,
+        "memory_rule": "titans",
+        "composition": "mag",
+        "k": 2,
+        "chunk_sizes": [1, 8]
+    },
+
+    "build": {
+        "lr": 0.0004,
+        "optimizer": "adamw",
+        "weight_decay": 0.1,
+        "beta1": 0.9,
+        "beta2": 0.999,
+        "warmup_steps": 200,
+        "steps": 10000,
+        "save_every": 2500,
+        "log_every": 50,
+        "seed": 42,
+        "save_path": "checkpoints/full_60m.json"
+    },
+
+    "data": {
+        "path": "data/fineweb_100m.bin",
+        "format": "binary"
+    },
+
+    "notes": {
+        "rationale": {
+            "adamw": "HOPE Section 9.2: outer-loop optimizer is AdamW with cosine annealing",
+            "lr_4e-4": "Paper standard for 60M-760M scale (HOPE/Titans)",
+            "warmup_200": "Prevents early divergence, standard practice",
+            "wd_0.1": "Decoupled weight decay, paper standard",
+            "steps_10k": "~5M tokens exposure, sufficient to validate pipeline"
+        }
+    }
+}

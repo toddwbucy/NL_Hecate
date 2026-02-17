@@ -1232,6 +1232,10 @@ impl MAGParams {
         }
 
         MAGParams { swa, levels }
+        // NOTE: No weight tying at init — both w_embed and w_unembed keep their
+        // independent Kaiming initialization. Weight tying (sync_embed_from_unembed)
+        // is applied after each weight update during training, in the Python tier
+        // (per CS-18: orchestration belongs in Python).
     }
 
     /// Create zero-initialized shadow for gradient accumulation.
@@ -1263,6 +1267,39 @@ impl MAGParams {
         self.swa.apply_weight_gradients(&grads.swa, lr);
         for (level, level_grads) in self.levels.iter_mut().zip(grads.levels.iter()) {
             level.apply_weight_gradients(level_grads, lr);
+        }
+    }
+
+    /// Weight tying at init: copy w_embed^T → w_unembed.
+    /// At initialization, w_embed has proper variance — make w_unembed match.
+    /// During training, sync goes the other direction (unembed→embed) since
+    /// unembedding gets stronger gradients through the loss.
+    pub fn sync_unembed_from_embed(&mut self) {
+        let dd = self.swa.w_q.len();
+        let d = (dd as f64).sqrt() as usize;
+        if d * d != dd || self.swa.w_embed.len() % d != 0 { return; }
+        let vocab = self.swa.w_embed.len() / d;
+        // w_unembed[i*vocab + v] = w_embed[v*d + i]
+        for v in 0..vocab {
+            for i in 0..d {
+                self.swa.w_unembed[i * vocab + v] = self.swa.w_embed[v * d + i];
+            }
+        }
+    }
+
+    /// Weight tying: copy w_unembed^T → w_embed (CPU path).
+    /// Called after each weight update to keep embeddings in sync.
+    /// Infers d from w_q.len() = d*d, vocab from w_embed.len() / d.
+    pub fn sync_embed_from_unembed(&mut self) {
+        let dd = self.swa.w_q.len();
+        let d = (dd as f64).sqrt() as usize;
+        if d * d != dd || self.swa.w_embed.len() % d != 0 { return; }
+        let vocab = self.swa.w_embed.len() / d;
+        // w_embed[v*d + i] = w_unembed[i*vocab + v]
+        for v in 0..vocab {
+            for i in 0..d {
+                self.swa.w_embed[v * d + i] = self.swa.w_unembed[i * vocab + v];
+            }
         }
     }
 
