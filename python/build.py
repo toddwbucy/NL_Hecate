@@ -69,7 +69,7 @@ def main():
 
     # ── Load data ────────────────────────────────────────────────────
     if args.data:
-        with open(args.data, "r") as f:
+        with open(args.data, "r", encoding="utf-8") as f:
             text = f.read()
         print(f"Loaded {len(text):,} chars from {args.data}")
     else:
@@ -101,7 +101,7 @@ def main():
     params = nl_hecate.mag_init_params(cfg, args.seed)
 
     print(f"\n{'=' * 60}")
-    print(f"NL-Hecate Build")
+    print("NL-Hecate Build")
     print(f"{'=' * 60}")
     print(f"  Model:    d={args.d_model}, heads={args.num_heads}, "
           f"seq_len={args.seq_len}, vocab=256")
@@ -171,7 +171,7 @@ def main():
 
     # ── Summary ──────────────────────────────────────────────────────
     print(f"\n{'=' * 60}")
-    print(f"Build complete")
+    print("Build complete")
     print(f"{'=' * 60}")
     print(f"  Steps:     {len(losses)}")
     print(f"  Time:      {elapsed:.2f}s")

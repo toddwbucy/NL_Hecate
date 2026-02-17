@@ -73,15 +73,15 @@ def generate(
         ctx = seq[-seq_len:]
         # Pad if shorter than seq_len
         while len(ctx) < seq_len:
-            ctx = [0] + ctx
+            ctx = [0, *ctx]
 
         # Forward pass — target_ids unused for generation, use ctx as dummy
         if use_cms:
             pulse = conductor.pulse()
-            loss, cache = nl_hecate.cms_forward(params, cfg, ctx, ctx, pulse, context)
+            _loss, cache = nl_hecate.cms_forward(params, cfg, ctx, ctx, pulse, context)
             conductor.advance()
         else:
-            loss, cache = nl_hecate.mag_forward(params, cfg, ctx, ctx)
+            _loss, cache = nl_hecate.mag_forward(params, cfg, ctx, ctx)
 
         # Get logits for last position
         logits = cache.get_logits()
@@ -94,7 +94,7 @@ def generate(
         else:
             # Temperature-scaled softmax sampling
             max_l = max(last_logits)
-            exps = [math.exp((l - max_l) / temperature) for l in last_logits]
+            exps = [math.exp((logit - max_l) / temperature) for logit in last_logits]
             total = sum(exps)
             probs = [e / total for e in exps]
             r = random.random()
