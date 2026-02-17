@@ -25,12 +25,13 @@
         "save_every": 2500,
         "log_every": 50,
         "seed": 42,
-        "save_path": "checkpoints/full_60m.json"
+        "save_path": "checkpoints/full_60m.json",
+        "max_grad_norm": 1.0,
+        "log_file": "runs/full_60m.jsonl"
     },
 
     "data": {
-        "path": "data/fineweb_100m.bin",
-        "format": "binary"
+        "path": "data/fineweb_100m.bin"
     },
 
     "notes": {
