@@ -23,7 +23,8 @@ use nl_hecate_core::gradient::compute_gradients as rust_compute_gradients;
 use nl_hecate_core::mag::{mag_forward as rust_mag_forward, MAGForwardCache as RustMAGCache, mag_backward as rust_mag_backward};
 use nl_hecate_core::gradient::mag_compute_gradients as rust_mag_compute_gradients;
 use nl_hecate_core::mag::{cms_forward as rust_cms_forward, cms_backward as rust_cms_backward, CMSForwardCache as RustCMSCache};
-use nl_hecate_core::conductor::{Conductor as RustConductor, Pulse as RustPulse, ContextState as RustContextState, ErrorBuffer as RustErrorBuffer};
+use nl_hecate_core::conductor::{Conductor as RustConductor, Pulse as RustPulse, ContextState as RustContextState, ErrorBuffer as RustErrorBuffer, Checkpoint as RustCheckpoint, ConductorState as RustConductorState};
+use nl_hecate_core::context_stream::StreamCursor;
 use nl_hecate_core::context_stream::VecStream as RustVecStream;
 use nl_hecate_core::model::{
     save_checkpoint as rust_save_checkpoint,
@@ -451,6 +452,8 @@ impl MAGConfig {
     }
     #[getter]
     fn k(&self) -> usize { self.inner.k }
+    #[getter]
+    fn chunk_sizes(&self) -> Vec<usize> { self.inner.chunk_sizes.clone() }
 }
 
 // ── MAGParams ──────────────────────────────────────────────────────
@@ -853,6 +856,41 @@ impl Conductor {
         }
     }
 
+    /// Restore conductor state from a build checkpoint dict.
+    fn restore_from_dict(&mut self, state: &Bound<'_, PyDict>) -> PyResult<()> {
+        let conductor_step: usize = state.get_item("conductor_step")?
+            .ok_or_else(|| PyValueError::new_err("missing conductor_step"))?.extract()?;
+        let stream_position: u64 = state.get_item("stream_position")?
+            .ok_or_else(|| PyValueError::new_err("missing stream_position"))?.extract()?;
+        let stream_chunk_id: u64 = state.get_item("stream_chunk_id")?
+            .ok_or_else(|| PyValueError::new_err("missing stream_chunk_id"))?.extract()?;
+        let stream_pulse_id: u64 = state.get_item("stream_pulse_id")?
+            .ok_or_else(|| PyValueError::new_err("missing stream_pulse_id"))?.extract()?;
+        let stream_content_hash: u64 = state.get_item("stream_content_hash")?
+            .ok_or_else(|| PyValueError::new_err("missing stream_content_hash"))?.extract()?;
+        let stream_rng_state: Option<u64> = match state.get_item("stream_rng_state")? {
+            Some(v) if !v.is_none() => Some(v.extract()?),
+            _ => None,
+        };
+        let checkpoint = RustCheckpoint {
+            conductor: RustConductorState {
+                k: self.inner.k,
+                chunk_sizes: self.inner.chunk_sizes.clone(),
+                step: conductor_step,
+            },
+            stream: StreamCursor {
+                position: stream_position,
+                chunk_id: stream_chunk_id,
+                pulse_id: stream_pulse_id,
+                rng_state: stream_rng_state,
+                content_hash: stream_content_hash,
+            },
+        };
+        self.inner.restore(&checkpoint)
+            .map_err(|e| PyValueError::new_err(format!("restore failed: {e:?}")))?;
+        Ok(())
+    }
+
     #[getter]
     fn step(&self) -> usize { self.inner.step() }
 
@@ -893,6 +931,17 @@ impl ContextState {
     /// Per-level M matrices as list of flat f32 lists.
     #[getter]
     fn memory(&self) -> Vec<Vec<f32>> { self.inner.memory.clone() }
+
+    /// Restore memory from a saved state (list of flat f32 lists, one per level).
+    fn set_memory(&mut self, memory: Vec<Vec<f32>>) -> PyResult<()> {
+        if memory.len() != self.inner.memory.len() {
+            return Err(PyValueError::new_err(format!(
+                "memory length ({}) must equal k ({})", memory.len(), self.inner.memory.len()
+            )));
+        }
+        self.inner.memory = memory;
+        Ok(())
+    }
 
     #[getter]
     fn d(&self) -> usize { self.inner.d }
@@ -1068,6 +1117,8 @@ fn load_build_checkpoint(py: Python<'_>, path: &str) -> PyResult<(MAGParams, MAG
             dict.set_item("stream_position", bs.stream_cursor.position)?;
             dict.set_item("stream_chunk_id", bs.stream_cursor.chunk_id)?;
             dict.set_item("stream_pulse_id", bs.stream_cursor.pulse_id)?;
+            dict.set_item("stream_content_hash", bs.stream_cursor.content_hash)?;
+            dict.set_item("stream_rng_state", bs.stream_cursor.rng_state)?;
             dict.set_item("context_d", bs.context.d)?;
             dict.set_item("context_memory", bs.context.memory)?;
             dict.into_any().unbind()
@@ -1083,7 +1134,7 @@ fn load_build_checkpoint(py: Python<'_>, path: &str) -> PyResult<(MAGParams, MAG
 /// Forward/backward/update happen entirely on device.
 /// Only input_ids, target_ids, and loss cross PCIe.
 #[cfg(feature = "cuda")]
-#[pyclass]
+#[pyclass(unsendable)]
 struct GpuModel {
     #[allow(dead_code)]
     params: nl_hecate_core::gpu_params::GpuMAGParams,
@@ -1159,6 +1210,29 @@ impl GpuModel {
         );
 
         Ok(loss)
+    }
+
+    /// Forward-only pass on GPU. Returns (loss, logits) where logits is
+    /// flat [seq_len * vocab_size]. Used for inference/generation.
+    fn forward_only(&mut self, input_ids: Vec<usize>, target_ids: Vec<usize>,
+                    pulse: &Pulse) -> PyResult<(f32, Vec<f32>)> {
+        let s = self.cfg.swa.seq_len;
+        let v = self.cfg.swa.vocab_size;
+        if input_ids.len() != s {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("input_ids length {} != seq_len {}", input_ids.len(), s)));
+        }
+        if target_ids.len() != s {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("target_ids length {} != seq_len {}", target_ids.len(), s)));
+        }
+        let (loss, cache) = nl_hecate_core::gpu_forward::gpu_cms_forward(
+            &self.params, &self.cfg, &input_ids, &target_ids,
+            &pulse.inner, &mut self.context,
+        );
+        let mut logits = vec![0.0f32; s * v];
+        cache.logits.copy_to_host(&mut logits);
+        Ok((loss, logits))
     }
 
     /// Download parameters to host for checkpointing.

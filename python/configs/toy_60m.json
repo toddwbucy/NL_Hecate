@@ -15,7 +15,7 @@
     },
 
     "build": {
-        "lr": 0.001,
+        "lr": 1.0,
         "steps": 5000,
         "save_every": 500,
         "log_every": 10,

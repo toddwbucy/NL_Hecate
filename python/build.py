@@ -85,6 +85,10 @@ def main():
     parser.add_argument("--save_every", type=int, default=None,
                         help="Save checkpoint every N steps (0 = only at end)")
     parser.add_argument("--log_every", type=int, default=None, help="Log every N steps")
+    parser.add_argument("--load", type=str, default=None,
+                        help="Resume from a build checkpoint (saved with --save_every)")
+    parser.add_argument("--gpu", action="store_true",
+                        help="Use GPU-resident model (all math on GPU)")
     args = parser.parse_args()
 
     # ── Merge config file + CLI args ─────────────────────────────────
@@ -151,44 +155,78 @@ def main():
         return
     head_dim = d_model // num_heads
 
-    cfg = nl_hecate.MAGConfig(
-        d_model=d_model,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        seq_len=seq_len,
-        window_size=window_size,
-        vocab_size=256,
-        memory_enabled=True,
-        k=k,
-        chunk_sizes=chunk_sizes,
-        memory_rule=memory_rule,
-        composition=composition,
-    )
-    params = nl_hecate.mag_init_params(cfg, seed)
+    # ── Resume from checkpoint or init fresh ─────────────────────────
+    resume_step = 0
+    if args.load:
+        print(f"Loading build checkpoint: {args.load}")
+        params, cfg, build_state = nl_hecate.load_build_checkpoint(args.load)
+        if build_state is None:
+            print("Error: checkpoint has no build state (not a build checkpoint)")
+            return
+        resume_step = build_state["global_step"] + 1
+        d_model = cfg.d_model
+        num_heads = cfg.num_heads
+        k = cfg.k
+        chunk_sizes = list(cfg.chunk_sizes)
+        seq_len = cfg.seq_len
+        print(f"  Resuming from step {resume_step}")
+        print(f"  Stream position: {build_state['stream_position']}")
+    else:
+        cfg = nl_hecate.MAGConfig(
+            d_model=d_model,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            seq_len=seq_len,
+            window_size=window_size,
+            vocab_size=256,
+            memory_enabled=True,
+            k=k,
+            chunk_sizes=chunk_sizes,
+            memory_rule=memory_rule,
+            composition=composition,
+        )
+        params = nl_hecate.mag_init_params(cfg, seed)
 
     print(f"\n{'=' * 60}")
     print("NL-Hecate Build")
     print(f"{'=' * 60}")
     print(f"  Model:    d={d_model}, heads={num_heads}, "
           f"seq_len={seq_len}, vocab=256")
-    print(f"  Memory:   rule={memory_rule}, composition={composition}, k={k}")
+    print(f"  Memory:   rule={cfg.memory_rule}, composition={cfg.composition}, k={k}")
     print(f"  CMS:      chunk_sizes={chunk_sizes}")
     print(f"  Params:   {params.num_params():,}")
     print(f"  Data:     {len(token_ids):,} tokens")
-    print(f"  Build:    {steps} steps, lr={lr}")
+    use_gpu = args.gpu and hasattr(nl_hecate, "GpuModel")
+    print(f"  Build:    {steps} steps (from step {resume_step}), lr={lr}")
+    print(f"  Device:   {'GPU' if use_gpu else 'CPU'}")
     print(f"{'=' * 60}\n")
 
     # ── Stateful CMS build loop ──────────────────────────────────────
-    conductor = nl_hecate.Conductor(k, chunk_sizes)
-    stream = nl_hecate.VecStream(token_ids)
-    conductor.attach_stream(stream)
-    context = nl_hecate.ContextState(k, d_model)
+    if args.load:
+        conductor = nl_hecate.Conductor(k, chunk_sizes)
+        stream = nl_hecate.VecStream(token_ids)
+        conductor.attach_stream(stream)
+        conductor.restore_from_dict(build_state)
+        context = nl_hecate.ContextState(k, d_model)
+        context.set_memory(build_state["context_memory"])
+    else:
+        conductor = nl_hecate.Conductor(k, chunk_sizes)
+        stream = nl_hecate.VecStream(token_ids)
+        conductor.attach_stream(stream)
+        context = nl_hecate.ContextState(k, d_model)
+
+    # GPU-resident model: upload params once, all math on device
+    gpu_model = None
+    if use_gpu:
+        gpu_model = nl_hecate.GpuModel.from_params(params, cfg)
+
     error_buffers = nl_hecate.ErrorBufferList(k, d_model)
 
     losses = []
     t_start = time.perf_counter()
+    end_step = resume_step + steps
 
-    for step in range(steps):
+    for step in range(resume_step, end_step):
         result = conductor.next_chunk(seq_len)
         if result is None:
             break
@@ -199,28 +237,37 @@ def main():
             conductor.advance()
             continue
 
-        # Forward + backward (all math in Rust)
-        loss, cache = nl_hecate.cms_forward(
-            params, cfg, input_ids, target_ids, pulse, context)
-        grads = nl_hecate.cms_backward(
-            params, cfg, cache, input_ids, target_ids, error_buffers)
+        if gpu_model is not None:
+            # GPU path: forward + backward + update in one call
+            loss = gpu_model.step(input_ids, target_ids, pulse, lr)
+        else:
+            # CPU path: forward + backward + update separately
+            loss, cache = nl_hecate.cms_forward(
+                params, cfg, input_ids, target_ids, pulse, context)
+            grads = nl_hecate.cms_backward(
+                params, cfg, cache, input_ids, target_ids, error_buffers)
+            nl_hecate.mag_apply_weight_gradients(params, grads, lr)
+            error_buffers.apply_for_active(params, pulse, lr)
 
-        # Outer-loop weight update
-        nl_hecate.mag_apply_weight_gradients(params, grads, lr)
-
-        # Apply frozen-level error buffers when levels activate
-        error_buffers.apply_for_active(params, pulse, lr)
+        # NaN/Inf guard
+        if math.isnan(loss) or math.isinf(loss):
+            print(f"  step {step:5d}  loss={loss} — ABORTING (NaN/Inf detected)")
+            break
 
         # Advance conductor (CS-32: observe-then-advance)
         conductor.advance()
         losses.append(loss)
 
         # Logging
-        if step % log_every == 0 or step == steps - 1:
+        if step % log_every == 0 or step == end_step - 1:
             print(f"  step {step:5d}  loss={loss:.4f}")
 
         # Periodic checkpoint (resumable — includes build state)
         if save_every > 0 and step > 0 and step % save_every == 0:
+            # Download from GPU if needed
+            if gpu_model is not None:
+                params = gpu_model.to_host_params()
+                context = gpu_model.to_host_context()
             p = Path(save_path)
             ckpt_path = str(p.with_stem(f"{p.stem}_step{step}"))
             os.makedirs(os.path.dirname(ckpt_path) or ".", exist_ok=True)
@@ -233,6 +280,8 @@ def main():
     tok_per_sec = total_tokens / elapsed if elapsed > 0 else 0
 
     # ── Final checkpoint ─────────────────────────────────────────────
+    if gpu_model is not None:
+        params = gpu_model.to_host_params()
     os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
     nl_hecate.save_checkpoint(save_path, params, cfg)
 

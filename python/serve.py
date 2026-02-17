@@ -47,6 +47,7 @@ def generate(
     max_tokens: int = 64,
     temperature: float = 0.8,
     use_cms: bool = False,
+    gpu_model=None,
 ) -> list[int]:
     """
     Autoregressive byte generation.
@@ -58,14 +59,15 @@ def generate(
         max_tokens: tokens to generate
         temperature: 0 = greedy, >0 = softmax sampling
         use_cms: if True, use stateful cms_forward with persistent memory
+        gpu_model: if set, use GPU forward_only for fast inference
     """
     seq = list(prompt_tokens)
     vocab = cfg.vocab_size
     seq_len = cfg.seq_len
 
-    # Optional: stateful CMS for memory-augmented generation
-    if use_cms:
-        conductor = nl_hecate.Conductor(cfg.k, [1] * cfg.k)
+    # CMS conductor (used for both GPU and CPU CMS paths)
+    conductor = nl_hecate.Conductor(cfg.k, [1] * cfg.k)
+    if not gpu_model and use_cms:
         context = nl_hecate.ContextState(cfg.k, cfg.d_model)
 
     for _ in range(max_tokens):
@@ -76,15 +78,20 @@ def generate(
             ctx = [0, *ctx]
 
         # Forward pass — target_ids unused for generation, use ctx as dummy
-        if use_cms:
+        if gpu_model is not None:
+            pulse = conductor.pulse()
+            _loss, logits = gpu_model.forward_only(ctx, ctx, pulse)
+            conductor.advance()
+        elif use_cms:
             pulse = conductor.pulse()
             _loss, cache = nl_hecate.cms_forward(params, cfg, ctx, ctx, pulse, context)
             conductor.advance()
+            logits = cache.get_logits()
         else:
             _loss, cache = nl_hecate.mag_forward(params, cfg, ctx, ctx)
+            logits = cache.get_logits()
 
         # Get logits for last position
-        logits = cache.get_logits()
         last_logits = logits[(seq_len - 1) * vocab: seq_len * vocab]
 
         # Sample next token
@@ -125,6 +132,8 @@ def main():
                         help="Use stateful CMS forward (memory-augmented generation)")
     parser.add_argument("--interactive", action="store_true",
                         help="Interactive REPL mode")
+    parser.add_argument("--gpu", action="store_true",
+                        help="Use GPU for fast inference")
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed for reproducible generation")
     args = parser.parse_args()
@@ -139,6 +148,14 @@ def main():
           f"seq_len={cfg.seq_len}, vocab={cfg.vocab_size}")
     print(f"  Memory: rule={cfg.memory_rule}, composition={cfg.composition}, k={cfg.k}")
     print(f"  Params: {params.num_params():,}")
+    # GPU model for fast inference
+    gpu_model = None
+    use_gpu = args.gpu and hasattr(nl_hecate, "GpuModel")
+    if use_gpu:
+        gpu_model = nl_hecate.GpuModel.from_params(params, cfg)
+        print("  Device: GPU")
+    else:
+        print("  Device: CPU")
     mode = "CMS (memory-augmented)" if args.use_cms else "stateless"
     print(f"  Generation mode: {mode}")
 
@@ -163,7 +180,8 @@ def main():
             prompt_tokens = encode(prompt)
             t0 = time.perf_counter()
             output = generate(params, cfg, prompt_tokens,
-                              args.max_tokens, args.temperature, args.use_cms)
+                              args.max_tokens, args.temperature, args.use_cms,
+                              gpu_model)
             t1 = time.perf_counter()
 
             text = decode(output)
@@ -179,7 +197,8 @@ def main():
 
         t0 = time.perf_counter()
         output = generate(params, cfg, prompt_tokens,
-                          args.max_tokens, args.temperature, args.use_cms)
+                          args.max_tokens, args.temperature, args.use_cms,
+                          gpu_model)
         t1 = time.perf_counter()
 
         text = decode(output)
