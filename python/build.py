@@ -82,6 +82,9 @@ def main():
         return
 
     # ── Config ───────────────────────────────────────────────────────
+    if args.d_model % args.num_heads != 0:
+        print(f"Error: d_model ({args.d_model}) must be divisible by num_heads ({args.num_heads})")
+        return
     head_dim = args.d_model // args.num_heads
     chunk_sizes = [1] * args.k  # level 0 fires every step
 
