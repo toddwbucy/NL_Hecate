@@ -11,6 +11,7 @@ Stage 0: Foundation       — Toolchain, spike, pipeline validation
 Stage 1: Algorithm Core   — Memory rules, compositions, scheduling, parallelization
 Stage 2: Production Infra — Multi-GPU, serving, compilation, deployment
 Stage 3: Extensions       — Pluggable retention, M3 optimizer, CMS variants
+Stage 4: MVP              — Build a model, serve it locally
 ```
 
 ---
@@ -311,6 +312,61 @@ CMS frequencies were hardcoded `[1, 8, 64, 512]` with pure modular arithmetic. T
 
 ---
 
+## Stage 4: MVP — Build & Serve (IN PROGRESS)
+
+Build a model and serve it locally. Not production-scale — just the primitives working end-to-end.
+
+### S4-M1: Weight Serialization ✅
+
+Serde JSON serialization for MAGParams + MAGConfig. `save_checkpoint()` / `load_checkpoint()` in `core/src/model.rs`.
+
+**PR**: #37
+
+---
+
+### S4-M2: Stateful PyO3 Bindings ✅
+
+Expose the stateful CMS build loop API to Python. Without this, Python can't do real builds with persistent memory — each `mag_forward()` created a fresh `ContextState`.
+
+**What was delivered**: 6 new pyclass types (Conductor, Pulse, ContextState, ErrorBufferList, VecStream, CMSForwardCache) + 4 new pyfunctions (cms_forward, cms_backward, save_checkpoint, load_checkpoint). ~180 lines added to `python/src/lib.rs`.
+
+**PR**: #38
+
+---
+
+### S4-M3: Build Script ✅
+
+Python-tier orchestration (CS-18) for building a model on text data. Byte-level tokenizer (vocab=256), stateful CMS loop via Conductor + VecStream, periodic and final checkpoint saving.
+
+**File**: `python/build.py` (~150 lines)
+**PR**: #38
+
+---
+
+### S4-M4: Serve Script ✅
+
+Load a checkpoint and interactively generate text. Autoregressive byte generation with temperature-controlled sampling. `--use_cms` for memory-augmented generation, `--interactive` for REPL mode.
+
+**File**: `python/serve.py` (~150 lines)
+**PR**: #38
+
+---
+
+### S4-M5: Declared Checkpoint Format (PLANNED)
+
+Current checkpoint serialization is serde default (JSON dump of raw structs). Post-MVP, add a declared format with:
+- Schema version for forward-compatible migration
+- Optional ContextState persistence (for resuming builds mid-stream)
+- Optional Conductor state (step counter, stream cursor) for exact resume
+- Binary format option (the JSON checkpoint for a real model will be large)
+
+Outer-loop params only is correct for serving (memory reconstructs at test time). But build resume and model distribution need a versioned, documented format.
+
+**Dependencies**: S4-M1 through S4-M4 (MVP must work first)
+**Status**: NOT STARTED
+
+---
+
 ## Dependency Graph
 
 ```
@@ -335,10 +391,20 @@ Stage 1: Algorithm Core ──────────────────�
     │
     ├─► S3-M4: Atlas Omega Rule ────────────── COMPLETE (PR #35)
     │
-    └─► S3-M5: Dynamic Frequency ───────────── COMPLETE (PR #36)
+    ├─► S3-M5: Dynamic Frequency ───────────── COMPLETE (PR #36)
+    │
+    └─► S4-M1: Weight Serialization ────────── COMPLETE (PR #37)
+            │
+            └─► S4-M2: Stateful PyO3 ────────── COMPLETE (PR #38)
+                    │
+                    ├─► S4-M3: Build Script ──── COMPLETE (PR #38)
+                    │
+                    ├─► S4-M4: Serve Script ──── COMPLETE (PR #38)
+                    │
+                    └─► S4-M5: Declared Ckpt ─── PLANNED
 ```
 
-Stage 2 milestones are sequential (each builds on the last). Stage 3 milestones are independent of each other and can be done in any order. Stage 3 does not block Stage 2.
+Stage 2 milestones are sequential (each builds on the last). Stage 3 milestones are independent of each other and can be done in any order. Stage 3 does not block Stage 2. Stage 4 depends on S4-M1 (serialization) for the full build→save→load→serve pipeline.
 
 ---
 
@@ -351,4 +417,6 @@ Stage 2 milestones are sequential (each builds on the last). Stage 3 milestones 
 | Stage 2: Production Infra | 4 | 29 CUDA + 13 dispatch + 20 edge + 18 serving + 18 distributed | COMPLETE |
 | Stage 3: Extensions | 5 | 22 retention + 35 M3/variants + 26 Atlas + 22 dynamic freq = 105 | COMPLETE |
 
-**Current position**: All stages complete. S0 through S3 fully delivered. Total test count: 940 Rust + 27 Python = **967 tests**.
+| Stage 4: MVP Build & Serve | 5 (4 done, 1 planned) | 27 Python (existing, no regressions) | IN PROGRESS |
+
+**Current position**: S0–S3 complete. S4 MVP delivered (M1–M4): can build a model on text and serve it locally. S4-M5 (declared checkpoint format) planned for post-MVP. Total test count: 940 Rust + 27 Python = **967 tests**.
