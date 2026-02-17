@@ -8,6 +8,10 @@ publish = false
 name = "nl_hecate"
 crate-type = ["cdylib"]
 
+[features]
+default = ["cuda"]
+cuda = ["nl-hecate-core/cuda"]
+
 [dependencies]
 pyo3 = { version = "0.23", features = ["extension-module"] }
 nl-hecate-core = { path = "../core", features = ["internal"] }

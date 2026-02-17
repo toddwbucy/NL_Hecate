@@ -171,4 +171,78 @@ extern "C" {
         seq_len: i32,
         d: i32,
     );
+
+    // ── Embedding kernels ─────────────────────────────────────────────
+
+    /// Gather rows from embedding table by token ID.
+    pub(crate) fn embedding_gather_cuda(
+        w_embed: *const f32,
+        input_ids: *const i32,
+        output: *mut f32,
+        seq_len: i32,
+        d: i32,
+    );
+
+    /// Scatter-add gradients back to embedding table rows (atomicAdd).
+    pub(crate) fn embedding_scatter_add_cuda(
+        d_embedded: *const f32,
+        input_ids: *const i32,
+        d_embed: *mut f32,
+        seq_len: i32,
+        d: i32,
+    );
+
+    // ── Elementwise kernels ───────────────────────────────────────────
+
+    /// Element-wise sigmoid: out[i] = 1/(1+exp(-x[i])).
+    pub(crate) fn sigmoid_cuda(x: *const f32, out: *mut f32, n: i32);
+
+    /// Element-wise softplus: out[i] = log(1+exp(x[i])).
+    pub(crate) fn softplus_cuda(x: *const f32, out: *mut f32, n: i32);
+
+    /// Element-wise multiply: out[i] = a[i] * b[i].
+    pub(crate) fn elemwise_mul_cuda(a: *const f32, b: *const f32, out: *mut f32, n: i32);
+
+    /// Gating backward: d_a[i] = d_out[i]*b[i], d_b[i] = d_out[i]*a[i].
+    pub(crate) fn gating_backward_cuda(
+        d_out: *const f32, a: *const f32, b: *const f32,
+        d_a: *mut f32, d_b: *mut f32, n: i32,
+    );
+
+    /// Sigmoid backward: d_x[i] = d_gate[i] * gate[i] * (1-gate[i]).
+    pub(crate) fn sigmoid_backward_cuda(
+        d_gate: *const f32, gate: *const f32, d_x: *mut f32, n: i32,
+    );
+
+    /// f32 → bf16 conversion on GPU.
+    pub(crate) fn f32_to_bf16_cuda(src: *const f32, dst: *mut u16, n: i32);
+
+    /// bf16 → f32 conversion on GPU.
+    pub(crate) fn bf16_to_f32_cuda(src: *const u16, dst: *mut f32, n: i32);
+
+    /// Per-token gate computation: dot(concat(k,v), w) + bias → activation.
+    /// activation: 0=sigmoid, 1=softplus.
+    pub(crate) fn gate_compute_cuda(
+        k_mem: *const f32, v_mem: *const f32, w_gate: *const f32,
+        bias: f32, gate_out: *mut f32,
+        seq_len: i32, d: i32, activation: i32,
+    );
+
+    /// Simple SAXPY: y[i] += alpha * x[i]. For small buffers.
+    pub(crate) fn saxpy_cuda(alpha: f32, x: *const f32, y: *mut f32, n: i32);
+
+    // ── Cross-entropy kernels ─────────────────────────────────────────
+
+    /// Fused softmax + NLL forward. Produces scalar loss via atomicAdd.
+    /// loss_out must be pre-zeroed (kernel zeros it internally).
+    pub(crate) fn cross_entropy_forward_cuda(
+        logits: *const f32, target_ids: *const i32, loss_out: *mut f32,
+        seq_len: i32, vocab: i32,
+    );
+
+    /// Cross-entropy backward: d_logits = (softmax - one_hot) / count.
+    pub(crate) fn cross_entropy_backward_cuda(
+        logits: *const f32, target_ids: *const i32, d_logits: *mut f32,
+        seq_len: i32, vocab: i32, inv_count: f32,
+    );
 }

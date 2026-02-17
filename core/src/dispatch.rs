@@ -162,7 +162,189 @@ pub fn is_rust_forced() -> bool {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// Dispatch functions
+// cuBLAS matmul dispatch
+// ══════════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "cuda")]
+const CUBLAS_OP_N: i32 = 0;
+#[cfg(feature = "cuda")]
+const CUBLAS_OP_T: i32 = 1;
+
+#[cfg(feature = "cuda")]
+extern "C" {
+    fn cublasCreate_v2(handle: *mut *mut std::ffi::c_void) -> i32;
+    #[allow(dead_code)]
+    fn cublasDestroy_v2(handle: *mut std::ffi::c_void) -> i32;
+    fn cublasSgemm_v2(
+        handle: *mut std::ffi::c_void,
+        transa: i32, transb: i32,
+        m: i32, n: i32, k: i32,
+        alpha: *const f32,
+        a: *const f32, lda: i32,
+        b: *const f32, ldb: i32,
+        beta: *const f32,
+        c: *mut f32, ldc: i32,
+    ) -> i32;
+}
+
+/// Thread-safe wrapper for cuBLAS handle (raw pointer).
+///
+/// cuBLAS handles are safe for concurrent sgemm calls — the CUDA runtime
+/// serializes kernel launches on the default stream.
+#[cfg(feature = "cuda")]
+struct SafeCublasHandle(*mut std::ffi::c_void);
+
+#[cfg(feature = "cuda")]
+unsafe impl Send for SafeCublasHandle {}
+#[cfg(feature = "cuda")]
+unsafe impl Sync for SafeCublasHandle {}
+
+#[cfg(feature = "cuda")]
+static CUBLAS_HANDLE: std::sync::OnceLock<SafeCublasHandle> = std::sync::OnceLock::new();
+
+/// Get the global cuBLAS handle, creating it on first use (public accessor).
+#[cfg(feature = "cuda")]
+pub fn cublas_handle_pub() -> *mut std::ffi::c_void {
+    cublas_handle()
+}
+
+/// Get the global cuBLAS handle, creating it on first use.
+#[cfg(feature = "cuda")]
+fn cublas_handle() -> *mut std::ffi::c_void {
+    CUBLAS_HANDLE.get_or_init(|| {
+        let mut handle: *mut std::ffi::c_void = std::ptr::null_mut();
+        let rc = unsafe { cublasCreate_v2(&mut handle) };
+        assert_eq!(rc, 0, "cublasCreate_v2 failed with error code {rc}");
+        SafeCublasHandle(handle)
+    }).0
+}
+
+/// cuBLAS sgemm: C = alpha * A[m,k] @ B[k,n] + beta * C.
+///
+/// Uses the row-major→column-major trick: to compute C = A @ B in row-major,
+/// call sgemm(N, N, n, m, k, alpha, B, n, A, k, beta, C, n), which computes
+/// C^T = B^T @ A^T in column-major — reading back as row-major gives C = A @ B.
+#[cfg(feature = "cuda")]
+fn cublas_matmul(a: &[f32], b: &[f32], out: &mut [f32], m: usize, k: usize, n: usize, beta: f32) {
+    let d_a = DevBuf::new(m * k);
+    let d_b = DevBuf::new(k * n);
+    let d_c = DevBuf::new(m * n);
+
+    d_a.copy_from_host(a);
+    d_b.copy_from_host(b);
+    if beta != 0.0 {
+        d_c.copy_from_host(out);
+    }
+
+    let alpha_val: f32 = 1.0;
+    let beta_val: f32 = beta;
+
+    let rc = unsafe {
+        cublasSgemm_v2(
+            cublas_handle(),
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            n as i32, m as i32, k as i32,
+            &alpha_val,
+            d_b.ptr as *const f32, n as i32,
+            d_a.ptr as *const f32, k as i32,
+            &beta_val,
+            d_c.ptr, n as i32,
+        )
+    };
+    assert_eq!(rc, 0, "cublasSgemm_v2 failed with error code {rc}");
+
+    unsafe {
+        let rc = cudaDeviceSynchronize();
+        assert_eq!(rc, 0, "cudaDeviceSynchronize failed after cuBLAS sgemm (error {rc})");
+    }
+
+    d_c.copy_to_host(out);
+}
+
+/// cuBLAS fused transpose-B sgemm: C = A[m,k] @ B^T where B is stored as [n,k].
+///
+/// Row-major trick with OP_T on first argument: sgemm(T, N, n, m, k, ..., B, k, A, k, ..., C, n)
+/// computes C^T = B @ A^T in column-major, which read as row-major gives C = A @ B^T.
+#[cfg(feature = "cuda")]
+fn cublas_matmul_transb(a: &[f32], b: &[f32], out: &mut [f32], m: usize, k: usize, n: usize, beta: f32) {
+    let d_a = DevBuf::new(m * k);
+    let d_b = DevBuf::new(n * k);
+    let d_c = DevBuf::new(m * n);
+
+    d_a.copy_from_host(a);
+    d_b.copy_from_host(b);
+    if beta != 0.0 {
+        d_c.copy_from_host(out);
+    }
+
+    let alpha_val: f32 = 1.0;
+    let beta_val: f32 = beta;
+
+    let rc = unsafe {
+        cublasSgemm_v2(
+            cublas_handle(),
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            n as i32, m as i32, k as i32,
+            &alpha_val,
+            d_b.ptr as *const f32, k as i32,
+            d_a.ptr as *const f32, k as i32,
+            &beta_val,
+            d_c.ptr, n as i32,
+        )
+    };
+    assert_eq!(rc, 0, "cublasSgemm_v2 (transB) failed with error code {rc}");
+
+    unsafe {
+        let rc = cudaDeviceSynchronize();
+        assert_eq!(rc, 0, "cudaDeviceSynchronize failed after cuBLAS transB sgemm (error {rc})");
+    }
+
+    d_c.copy_to_host(out);
+}
+
+/// C[m,n] = A[m,k] @ B[k,n]. cuBLAS on GPU if available, Rust fallback otherwise.
+pub fn matmul_dispatch(a: &[f32], b: &[f32], out: &mut [f32], m: usize, k: usize, n: usize) {
+    #[cfg(feature = "cuda")]
+    {
+        if !is_rust_forced() {
+            cublas_matmul(a, b, out, m, k, n, 0.0);
+            return;
+        }
+    }
+    crate::tensor::matmul_f32(a, b, out, m, k, n);
+}
+
+/// C[m,n] += A[m,k] @ B[k,n]. cuBLAS on GPU if available, Rust fallback otherwise.
+pub fn matmul_acc_dispatch(a: &[f32], b: &[f32], out: &mut [f32], m: usize, k: usize, n: usize) {
+    #[cfg(feature = "cuda")]
+    {
+        if !is_rust_forced() {
+            cublas_matmul(a, b, out, m, k, n, 1.0);
+            return;
+        }
+    }
+    crate::tensor::matmul_acc_f32(a, b, out, m, k, n);
+}
+
+/// C[m,n] = A[m,k] @ B^T where B is stored as [n,k].
+/// Fused transpose-matmul: cuBLAS uses OP_T to avoid a separate transpose allocation.
+/// Eliminates the need for `transpose_f32(W) + matmul_f32(X, W_t)` on weight matrices.
+pub fn matmul_transb_dispatch(a: &[f32], b: &[f32], out: &mut [f32], m: usize, k: usize, n: usize) {
+    #[cfg(feature = "cuda")]
+    {
+        if !is_rust_forced() {
+            cublas_matmul_transb(a, b, out, m, k, n, 0.0);
+            return;
+        }
+    }
+    // Fallback: explicit transpose + matmul
+    let mut bt = vec![0.0f32; k * n];
+    crate::tensor::transpose_f32(b, &mut bt, n, k);
+    crate::tensor::matmul_f32(a, &bt, out, m, k, n);
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Dispatch functions — SWA + Memory rule inner loops
 // ══════════════════════════════════════════════════════════════════════
 
 /// SWA forward dispatch.
@@ -1435,4 +1617,240 @@ fn cuda_hebbian_backward(
     dev_dqm.copy_to_host(d_q_mem);
     dev_dalpha.copy_to_host(d_alpha);
     dev_dm_init.copy_to_host(d_m_initial);
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Device-to-device dispatch variants (_dd)
+//
+// These accept GpuBuf<f32>/GpuBuf<u16> pointers and call the same CUDA
+// kernels WITHOUT any H2D/D2H copies. Used by the GPU-resident forward
+// and backward passes (gpu_forward.rs, gpu_backward.rs).
+// ══════════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "cuda")]
+use crate::gpu_buf::{GpuBuf, GpuSlice, GpuSliceMut};
+
+/// cuBLAS sgemm on device buffers: C = alpha * A[m,k] @ B[k,n] + beta * C.
+/// Row-major trick: call sgemm(N, N, n, m, k, alpha, B, n, A, k, beta, C, n).
+#[cfg(feature = "cuda")]
+pub fn cublas_matmul_dd(
+    a: &GpuBuf<f32>, b: &GpuBuf<f32>, out: &mut GpuBuf<f32>,
+    m: usize, k: usize, n: usize, beta: f32,
+) {
+    let alpha_val: f32 = 1.0;
+    let beta_val: f32 = beta;
+    let rc = unsafe {
+        cublasSgemm_v2(
+            cublas_handle(),
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            n as i32, m as i32, k as i32,
+            &alpha_val,
+            b.as_ptr(), n as i32,
+            a.as_ptr(), k as i32,
+            &beta_val,
+            out.ptr(), n as i32,
+        )
+    };
+    assert_eq!(rc, 0, "cublasSgemm_v2 (dd) failed: error code {rc}");
+}
+
+/// cuBLAS fused transpose-B on device buffers: C = A[m,k] @ B^T where B is [n,k].
+#[cfg(feature = "cuda")]
+pub fn cublas_matmul_transb_dd(
+    a: &GpuBuf<f32>, b: &GpuBuf<f32>, out: &mut GpuBuf<f32>,
+    m: usize, k: usize, n: usize, beta: f32,
+) {
+    let alpha_val: f32 = 1.0;
+    let beta_val: f32 = beta;
+    let rc = unsafe {
+        cublasSgemm_v2(
+            cublas_handle(),
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            n as i32, m as i32, k as i32,
+            &alpha_val,
+            b.as_ptr(), k as i32,
+            a.as_ptr(), k as i32,
+            &beta_val,
+            out.ptr(), n as i32,
+        )
+    };
+    assert_eq!(rc, 0, "cublasSgemm_v2 transB (dd) failed: error code {rc}");
+}
+
+/// cuBLAS accumulate on device buffers: C[m,n] += A[m,k] @ B[k,n].
+#[cfg(feature = "cuda")]
+pub fn cublas_matmul_acc_dd(
+    a: &GpuBuf<f32>, b: &GpuBuf<f32>, out: &mut GpuBuf<f32>,
+    m: usize, k: usize, n: usize,
+) {
+    cublas_matmul_dd(a, b, out, m, k, n, 1.0);
+}
+
+/// SWA forward on device bf16 buffers. No H2D/D2H.
+#[cfg(feature = "cuda")]
+pub fn swa_forward_dd(
+    q: &GpuBuf<u16>, k: &GpuBuf<u16>, v: &GpuBuf<u16>,
+    out: &mut GpuBuf<u16>, attn_weights: &mut GpuBuf<u16>,
+    seq_len: usize, num_heads: usize, head_dim: usize, window_size: usize,
+) {
+    unsafe {
+        crate::cuda_ffi::swa_forward_f32_cuda(
+            q.as_ptr(), k.as_ptr(), v.as_ptr(),
+            out.ptr(), attn_weights.ptr(),
+            seq_len as i32, num_heads as i32, head_dim as i32, window_size as i32,
+        );
+    }
+}
+
+/// SWA backward on device buffers. Q/K/V/aw are bf16, gradients are f32.
+#[cfg(feature = "cuda")]
+pub fn swa_backward_dd(
+    q: &GpuBuf<u16>, k: &GpuBuf<u16>, v: &GpuBuf<u16>,
+    attn_weights: &GpuBuf<u16>, d_attn_out: &GpuBuf<f32>,
+    d_q: &mut GpuBuf<f32>, d_k: &mut GpuBuf<f32>, d_v: &mut GpuBuf<f32>,
+    seq_len: usize, num_heads: usize, head_dim: usize, window_size: usize,
+) {
+    unsafe {
+        crate::cuda_ffi::swa_backward_f32_cuda(
+            q.as_ptr(), k.as_ptr(), v.as_ptr(),
+            attn_weights.as_ptr(), d_attn_out.as_ptr(),
+            d_q.ptr(), d_k.ptr(), d_v.ptr(),
+            seq_len as i32, num_heads as i32, head_dim as i32, window_size as i32,
+        );
+    }
+}
+
+/// Delta forward on device buffers.
+#[cfg(feature = "cuda")]
+pub fn delta_forward_dd(
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>,
+    m_initial: &GpuSlice<f32>,
+    m_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
+    seq_len: usize, d: usize,
+) {
+    unsafe {
+        crate::cuda_ffi::delta_forward_f32_cuda(
+            k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
+            alpha.as_ptr(), theta.as_ptr(),
+            m_initial.as_ptr(),
+            m_states.ptr(), y.ptr(),
+            seq_len as i32, d as i32,
+        );
+    }
+}
+
+/// Delta backward on device buffers.
+#[cfg(feature = "cuda")]
+pub fn delta_backward_dd(
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>,
+    m_states: &GpuBuf<f32>, d_y: &GpuBuf<f32>,
+    d_k_mem: &mut GpuBuf<f32>, d_v_mem: &mut GpuBuf<f32>, d_q_mem: &mut GpuBuf<f32>,
+    d_alpha: &mut GpuBuf<f32>, d_theta: &mut GpuBuf<f32>, d_m_initial: &mut GpuBuf<f32>,
+    seq_len: usize, d: usize,
+) {
+    unsafe {
+        crate::cuda_ffi::delta_backward_f32_cuda(
+            k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
+            alpha.as_ptr(), theta.as_ptr(), m_states.as_ptr(),
+            d_y.as_ptr(),
+            d_k_mem.ptr(), d_v_mem.ptr(), d_q_mem.ptr(),
+            d_alpha.ptr(), d_theta.ptr(), d_m_initial.ptr(),
+            seq_len as i32, d as i32,
+        );
+    }
+}
+
+/// Titans forward on device buffers.
+#[cfg(feature = "cuda")]
+pub fn titans_forward_dd(
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>, eta: &GpuBuf<f32>,
+    m_initial: &GpuSlice<f32>, s_initial: &GpuSlice<f32>,
+    m_states: &mut GpuBuf<f32>, s_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
+    seq_len: usize, d: usize,
+) {
+    unsafe {
+        crate::cuda_ffi::titans_forward_f32_cuda(
+            k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
+            alpha.as_ptr(), theta.as_ptr(), eta.as_ptr(),
+            m_initial.as_ptr(), s_initial.as_ptr(),
+            m_states.ptr(), s_states.ptr(), y.ptr(),
+            seq_len as i32, d as i32,
+        );
+    }
+}
+
+/// Titans backward on device buffers.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn titans_backward_dd(
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>, eta: &GpuBuf<f32>,
+    m_states: &GpuBuf<f32>, s_states: &GpuBuf<f32>, d_y: &GpuBuf<f32>,
+    d_k_mem: &mut GpuBuf<f32>, d_v_mem: &mut GpuBuf<f32>, d_q_mem: &mut GpuBuf<f32>,
+    d_alpha: &mut GpuBuf<f32>, d_theta: &mut GpuBuf<f32>, d_eta: &mut GpuBuf<f32>,
+    d_m_initial: &mut GpuBuf<f32>, d_s_initial: &mut GpuBuf<f32>,
+    seq_len: usize, d: usize,
+) {
+    unsafe {
+        crate::cuda_ffi::titans_backward_f32_cuda(
+            k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
+            alpha.as_ptr(), theta.as_ptr(), eta.as_ptr(),
+            m_states.as_ptr(), s_states.as_ptr(),
+            d_y.as_ptr(),
+            d_k_mem.ptr(), d_v_mem.ptr(), d_q_mem.ptr(),
+            d_alpha.ptr(), d_theta.ptr(), d_eta.ptr(),
+            d_m_initial.ptr(), d_s_initial.ptr(),
+            seq_len as i32, d as i32,
+        );
+    }
+}
+
+/// Hebbian forward on device buffers.
+#[cfg(feature = "cuda")]
+pub fn hebbian_forward_dd(
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    alpha: &GpuBuf<f32>,
+    m_initial: &GpuSlice<f32>,
+    m_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
+    seq_len: usize, d: usize,
+) {
+    unsafe {
+        crate::cuda_ffi::hebbian_forward_f32_cuda(
+            k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
+            alpha.as_ptr(), m_initial.as_ptr(),
+            m_states.ptr(), y.ptr(),
+            seq_len as i32, d as i32,
+        );
+    }
+}
+
+/// Hebbian backward on device buffers.
+#[cfg(feature = "cuda")]
+pub fn hebbian_backward_dd(
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    alpha: &GpuBuf<f32>, m_states: &GpuBuf<f32>, d_y: &GpuBuf<f32>,
+    d_k_mem: &mut GpuBuf<f32>, d_v_mem: &mut GpuBuf<f32>, d_q_mem: &mut GpuBuf<f32>,
+    d_alpha: &mut GpuBuf<f32>, d_m_initial: &mut GpuBuf<f32>,
+    seq_len: usize, d: usize,
+) {
+    unsafe {
+        crate::cuda_ffi::hebbian_backward_f32_cuda(
+            k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
+            alpha.as_ptr(), m_states.as_ptr(),
+            d_y.as_ptr(),
+            d_k_mem.ptr(), d_v_mem.ptr(), d_q_mem.ptr(),
+            d_alpha.ptr(), d_m_initial.ptr(),
+            seq_len as i32, d as i32,
+        );
+    }
+}
+
+/// Synchronize the CUDA device (wait for all pending kernel launches).
+#[cfg(feature = "cuda")]
+pub fn cuda_sync() {
+    let rc = unsafe { cudaDeviceSynchronize() };
+    assert_eq!(rc, 0, "cudaDeviceSynchronize failed: error code {rc}");
 }

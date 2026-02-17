@@ -37,10 +37,14 @@ fn main() {
             .file("kernels/titans_backward.cu")
             .file("kernels/hebbian_forward.cu")
             .file("kernels/hebbian_backward.cu")
+            .file("kernels/embedding.cu")
+            .file("kernels/elementwise.cu")
+            .file("kernels/cross_entropy.cu")
             .compile("nl_hecate_cuda_kernels");
 
         println!("cargo:rustc-link-search=native={}/lib64", cuda_path);
         println!("cargo:rustc-link-lib=dylib=cudart");
+        println!("cargo:rustc-link-lib=dylib=cublas");
         println!("cargo:rerun-if-changed=kernels/swa_forward.cu");
         println!("cargo:rerun-if-changed=kernels/swa_backward.cu");
         println!("cargo:rerun-if-changed=kernels/delta_forward.cu");
@@ -49,5 +53,8 @@ fn main() {
         println!("cargo:rerun-if-changed=kernels/titans_backward.cu");
         println!("cargo:rerun-if-changed=kernels/hebbian_forward.cu");
         println!("cargo:rerun-if-changed=kernels/hebbian_backward.cu");
+        println!("cargo:rerun-if-changed=kernels/embedding.cu");
+        println!("cargo:rerun-if-changed=kernels/elementwise.cu");
+        println!("cargo:rerun-if-changed=kernels/cross_entropy.cu");
     }
 }

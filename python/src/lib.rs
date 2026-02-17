@@ -1077,6 +1077,103 @@ fn load_build_checkpoint(py: Python<'_>, path: &str) -> PyResult<(MAGParams, MAG
     Ok((MAGParams { inner: params }, MAGConfig { inner: config }, bs_obj))
 }
 
+// ── GPU-Resident Model ───────────────────────────────────────────────
+
+/// GPU-resident model: all parameters live on GPU.
+/// Forward/backward/update happen entirely on device.
+/// Only input_ids, target_ids, and loss cross PCIe.
+#[cfg(feature = "cuda")]
+#[pyclass]
+struct GpuModel {
+    #[allow(dead_code)]
+    params: nl_hecate_core::gpu_params::GpuMAGParams,
+    context: nl_hecate_core::gpu_params::GpuContextState,
+    cfg: nl_hecate_core::model::MAGConfig,
+}
+
+#[cfg(feature = "cuda")]
+#[pymethods]
+impl GpuModel {
+    /// Create a GPU-resident model from a MAGConfig and random seed.
+    /// All parameters are uploaded to GPU once.
+    #[new]
+    fn new(cfg: &MAGConfig, seed: u64) -> PyResult<Self> {
+        let host_params = nl_hecate_core::model::MAGParams::init(&cfg.inner, seed);
+        let gpu_params = nl_hecate_core::gpu_params::GpuMAGParams::from_host(&host_params);
+        let gpu_context = nl_hecate_core::gpu_params::GpuContextState::new(cfg.inner.k, cfg.inner.swa.d_model);
+        Ok(GpuModel {
+            params: gpu_params,
+            context: gpu_context,
+            cfg: cfg.inner.clone(),
+        })
+    }
+
+    /// Create from existing host params (e.g., loaded from checkpoint).
+    #[staticmethod]
+    fn from_params(params: &MAGParams, cfg: &MAGConfig) -> PyResult<Self> {
+        let gpu_params = nl_hecate_core::gpu_params::GpuMAGParams::from_host(&params.inner);
+        let gpu_context = nl_hecate_core::gpu_params::GpuContextState::new(cfg.inner.k, cfg.inner.swa.d_model);
+        Ok(GpuModel {
+            params: gpu_params,
+            context: gpu_context,
+            cfg: cfg.inner.clone(),
+        })
+    }
+
+    /// One build step: forward + backward + weight update. Returns loss.
+    fn step(&mut self, input_ids: Vec<usize>, target_ids: Vec<usize>,
+            pulse: &Pulse, lr: f32) -> PyResult<f32> {
+        let s = self.cfg.swa.seq_len;
+        let v = self.cfg.swa.vocab_size;
+        if input_ids.len() != s {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("input_ids length {} != seq_len {}", input_ids.len(), s)));
+        }
+        if target_ids.len() != s {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("target_ids length {} != seq_len {}", target_ids.len(), s)));
+        }
+        if let Some(&max_id) = input_ids.iter().max() {
+            if max_id >= v {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("input_ids contains {} >= vocab_size {}", max_id, v)));
+            }
+        }
+        if let Some(&max_id) = target_ids.iter().max() {
+            if max_id >= v {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("target_ids contains {} >= vocab_size {}", max_id, v)));
+            }
+        }
+        let (loss, cache) = nl_hecate_core::gpu_forward::gpu_cms_forward(
+            &self.params, &self.cfg, &input_ids, &target_ids,
+            &pulse.inner, &mut self.context,
+        );
+
+        let grads = nl_hecate_core::gpu_backward::gpu_cms_backward(
+            &self.params, &self.cfg, &cache,
+        );
+
+        nl_hecate_core::gpu_backward::gpu_weight_update(
+            &mut self.params, &grads, lr,
+        );
+
+        Ok(loss)
+    }
+
+    /// Download parameters to host for checkpointing.
+    fn to_host_params(&self) -> PyResult<MAGParams> {
+        let host = self.params.to_host(&self.cfg);
+        Ok(MAGParams { inner: host })
+    }
+
+    /// Download context state to host for checkpointing.
+    fn to_host_context(&self) -> PyResult<ContextState> {
+        let host = self.context.to_host(self.cfg.k);
+        Ok(ContextState { inner: host })
+    }
+}
+
 // ── Module ───────────────────────────────────────────────────────────
 
 #[pymodule]
@@ -1115,5 +1212,8 @@ fn nl_hecate(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(save_build_checkpoint, m)?)?;
     m.add_function(wrap_pyfunction!(load_checkpoint, m)?)?;
     m.add_function(wrap_pyfunction!(load_build_checkpoint, m)?)?;
+    // GPU-resident model
+    #[cfg(feature = "cuda")]
+    m.add_class::<GpuModel>()?;
     Ok(())
 }
