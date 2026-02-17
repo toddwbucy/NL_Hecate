@@ -104,9 +104,21 @@ impl GpuAdamWState {
             v_b_eta: GpuBuf::zeros(lp.b_eta.len()),
         }).collect();
 
-        // Max buffer for norm reduction: largest single param is w_embed or w_unembed
-        // ceil(max_param_len / 256) partials needed. Over-allocate to be safe.
-        let max_partials = (params.swa.w_embed.len() / 256 + 1).max(4096);
+        // Max buffer for norm reduction: find largest param buffer across all weights.
+        // ceil(max_param_len / 256) partials needed.
+        let mut max_len = params.swa.w_embed.len();
+        for buf in [&params.swa.w_q, &params.swa.w_k, &params.swa.w_v,
+                     &params.swa.w_o, &params.swa.w_unembed] {
+            max_len = max_len.max(buf.len());
+        }
+        for lp in &params.levels {
+            for buf in [&lp.w_k_mem, &lp.w_v_mem, &lp.w_q_mem,
+                         &lp.w_alpha, &lp.b_alpha, &lp.w_theta, &lp.b_theta,
+                         &lp.w_eta, &lp.b_eta] {
+                max_len = max_len.max(buf.len());
+            }
+        }
+        let max_partials = max_len / 256 + 1;
 
         GpuAdamWState {
             swa,
