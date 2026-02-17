@@ -404,6 +404,10 @@ def main():
     print(f"  Params:   {params.num_params():,}")
     print(f"  Data:     {len(token_ids):,} tokens")
     use_gpu = bcfg.gpu and hasattr(nl_hecate, "GpuModel")
+    if bcfg.optimizer == "adamw_gpu" and not use_gpu:
+        raise RuntimeError(
+            "optimizer=adamw_gpu requires --gpu and a CUDA-enabled build"
+        )
     if bcfg.load and use_gpu:
         raise RuntimeError(
             "GPU resume with context restore is not yet implemented. "
@@ -412,7 +416,7 @@ def main():
     print(f"  Build:    {bcfg.steps} steps (from step {resume_step}), lr={bcfg.lr}")
     print(f"  Optimizer: {bcfg.optimizer}" +
           (f" (b1={bcfg.beta1}, b2={bcfg.beta2}, wd={bcfg.weight_decay}, warmup={bcfg.warmup_steps})"
-           if bcfg.optimizer == "adamw" else ""))
+           if bcfg.optimizer in ("adamw", "adamw_gpu") else ""))
     if bcfg.max_grad_norm > 0:
         print(f"  Grad clip: max_norm={bcfg.max_grad_norm}")
     print(f"  Device:   {'GPU' if use_gpu else 'CPU'}")
@@ -421,16 +425,20 @@ def main():
     print(f"{'=' * 60}\n")
 
     # ── Stateful CMS build loop ───────────────────────────────────────
+    # VecStream needs a Rust Vec<usize>, so mmap must be materialized.
+    # Materializing here frees the mmap backing after handoff to Rust.
+    if isinstance(token_ids, MmapTokenStream):
+        token_ids = list(token_ids)
     if bcfg.load:
         conductor = nl_hecate.Conductor(bcfg.k, bcfg.chunk_sizes)
-        stream = nl_hecate.VecStream(list(token_ids) if isinstance(token_ids, MmapTokenStream) else token_ids)
+        stream = nl_hecate.VecStream(token_ids)
         conductor.attach_stream(stream)
         conductor.restore_from_dict(build_state)
         context = nl_hecate.ContextState(bcfg.k, bcfg.d_model)
         context.set_memory(build_state["context_memory"])
     else:
         conductor = nl_hecate.Conductor(bcfg.k, bcfg.chunk_sizes)
-        stream = nl_hecate.VecStream(list(token_ids) if isinstance(token_ids, MmapTokenStream) else token_ids)
+        stream = nl_hecate.VecStream(token_ids)
         conductor.attach_stream(stream)
         context = nl_hecate.ContextState(bcfg.k, bcfg.d_model)
 
@@ -504,6 +512,8 @@ def main():
                 g_norm = grad_norm(g_flat)
             p_flat = adamw_opt.step(p_flat, g_flat, current_lr)
             params.set_flat_weights(p_flat)
+            # Weight tying: sync w_unembed^T → w_embed (same as SGD path)
+            nl_hecate.mag_apply_weight_gradients(params, grad_params, 0.0)
             gpu_model.upload_params(params)
             error_buffers.apply_for_active(params, pulse, current_lr)
         else:
@@ -521,6 +531,8 @@ def main():
                     g_norm = grad_norm(g_flat)
                 p_flat = adamw_opt.step(p_flat, g_flat, current_lr)
                 params.set_flat_weights(p_flat)
+                # Weight tying: sync w_unembed^T → w_embed
+                nl_hecate.mag_apply_weight_gradients(params, grads, 0.0)
             else:
                 nl_hecate.mag_apply_weight_gradients(params, grads, current_lr)
             error_buffers.apply_for_active(params, pulse, current_lr)
