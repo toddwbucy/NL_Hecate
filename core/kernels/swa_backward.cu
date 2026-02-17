@@ -48,9 +48,11 @@ __global__ void swa_backward_kernel(
     // Shared memory layout:
     //   d_attn_w[window_size]   — per-window-position gradient of attention weights
     //   d_scores[window_size]   — gradient of pre-softmax scores
+    //   reduce[head_dim]        — tree-reduction buffer for dot products
     extern __shared__ float smem[];
     float* s_d_attn_w = smem;                     // [window_size]
     float* s_d_scores = smem + window_size;        // [window_size]
+    float* reduce = smem + 2 * window_size;        // [head_dim]
 
     float scale = rsqrtf((float)head_dim);
 
@@ -63,15 +65,20 @@ __global__ void swa_backward_kernel(
                     * __bfloat162float(v[k_pos * total_dim + h_offset + d]);
         }
 
-        // Warp-level reduction (head_dim <= 32 fits in one warp)
-        unsigned mask = __activemask();
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            partial += __shfl_down_sync(mask, partial, offset);
+        // Shared-memory tree reduction (works for any power-of-two head_dim up to 1024)
+        reduce[d] = partial;
+        __syncthreads();
+        for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+            if (d < s) {
+                reduce[d] += reduce[d + s];
+            }
+            __syncthreads();
         }
 
         if (d == 0) {
-            s_d_attn_w[w] = partial;
+            s_d_attn_w[w] = reduce[0];
         }
+        __syncthreads();
     }
     // Zero unused slots
     if (d == 0) {
@@ -136,8 +143,8 @@ extern "C" void swa_backward_f32_cuda(
     dim3 grid(num_heads, seq_len);
     dim3 block(head_dim);
 
-    // Shared memory: d_attn_w[window_size] + d_scores[window_size]
-    int smem_bytes = 2 * window_size * sizeof(float);
+    // Shared memory: d_attn_w[window_size] + d_scores[window_size] + reduce[head_dim]
+    int smem_bytes = (2 * window_size + head_dim) * sizeof(float);
 
     swa_backward_kernel<<<grid, block, smem_bytes>>>(
         q, k, v, attn_weights, d_attn_out,
