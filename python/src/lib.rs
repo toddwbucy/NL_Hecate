@@ -1082,6 +1082,7 @@ fn load_build_checkpoint(py: Python<'_>, path: &str) -> PyResult<(MAGParams, MAG
 /// GPU-resident model: all parameters live on GPU.
 /// Forward/backward/update happen entirely on device.
 /// Only input_ids, target_ids, and loss cross PCIe.
+#[cfg(feature = "cuda")]
 #[pyclass]
 struct GpuModel {
     #[allow(dead_code)]
@@ -1090,6 +1091,7 @@ struct GpuModel {
     cfg: nl_hecate_core::model::MAGConfig,
 }
 
+#[cfg(feature = "cuda")]
 #[pymethods]
 impl GpuModel {
     /// Create a GPU-resident model from a MAGConfig and random seed.
@@ -1121,6 +1123,28 @@ impl GpuModel {
     /// One build step: forward + backward + weight update. Returns loss.
     fn step(&mut self, input_ids: Vec<usize>, target_ids: Vec<usize>,
             pulse: &Pulse, lr: f32) -> PyResult<f32> {
+        let s = self.cfg.swa.seq_len;
+        let v = self.cfg.swa.vocab_size;
+        if input_ids.len() != s {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("input_ids length {} != seq_len {}", input_ids.len(), s)));
+        }
+        if target_ids.len() != s {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("target_ids length {} != seq_len {}", target_ids.len(), s)));
+        }
+        if let Some(&max_id) = input_ids.iter().max() {
+            if max_id >= v {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("input_ids contains {} >= vocab_size {}", max_id, v)));
+            }
+        }
+        if let Some(&max_id) = target_ids.iter().max() {
+            if max_id >= v {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("target_ids contains {} >= vocab_size {}", max_id, v)));
+            }
+        }
         let (loss, cache) = nl_hecate_core::gpu_forward::gpu_cms_forward(
             &self.params, &self.cfg, &input_ids, &target_ids,
             &pulse.inner, &mut self.context,
@@ -1189,6 +1213,7 @@ fn nl_hecate(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(load_checkpoint, m)?)?;
     m.add_function(wrap_pyfunction!(load_build_checkpoint, m)?)?;
     // GPU-resident model
+    #[cfg(feature = "cuda")]
     m.add_class::<GpuModel>()?;
     Ok(())
 }

@@ -64,6 +64,7 @@ impl GpuElement for u16 {
 pub struct GpuBuf<T: GpuElement> {
     ptr: *mut T,
     len: usize,
+    _not_send_sync: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 #[cfg(feature = "cuda")]
@@ -75,7 +76,7 @@ impl<T: GpuElement> GpuBuf<T> {
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         let rc = unsafe { cudaMalloc(&mut ptr, bytes) };
         assert_eq!(rc, 0, "cudaMalloc failed: error code {rc} (requested {bytes} bytes)");
-        GpuBuf { ptr: ptr as *mut T, len }
+        GpuBuf { ptr: ptr as *mut T, len, _not_send_sync: std::marker::PhantomData }
     }
 
     /// Allocate and zero-initialize `len` elements.
@@ -146,6 +147,7 @@ impl<T: GpuElement> GpuBuf<T> {
         GpuSlice {
             ptr: unsafe { self.ptr.add(offset) },
             len,
+            _not_send_sync: std::marker::PhantomData,
         }
     }
 
@@ -156,6 +158,7 @@ impl<T: GpuElement> GpuBuf<T> {
         GpuSliceMut {
             ptr: unsafe { self.ptr.add(offset) },
             len,
+            _not_send_sync: std::marker::PhantomData,
         }
     }
 
@@ -193,6 +196,7 @@ impl<T: GpuElement> Drop for GpuBuf<T> {
 pub struct GpuSlice<T: GpuElement> {
     ptr: *mut T,
     len: usize,
+    _not_send_sync: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 #[cfg(feature = "cuda")]
@@ -226,6 +230,7 @@ impl<T: GpuElement> GpuSlice<T> {
 pub struct GpuSliceMut<T: GpuElement> {
     ptr: *mut T,
     len: usize,
+    _not_send_sync: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 #[cfg(feature = "cuda")]

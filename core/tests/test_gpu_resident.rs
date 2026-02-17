@@ -12,6 +12,7 @@ use nl_hecate_core::dispatch;
 use nl_hecate_core::mag::cms_forward;
 use nl_hecate_core::gpu_forward::gpu_cms_forward;
 use nl_hecate_core::gpu_params::{GpuMAGParams, GpuContextState};
+use serial_test::serial;
 
 fn make_test_config(rule: MemoryRuleKind) -> MAGConfig {
     MAGConfig {
@@ -74,16 +75,19 @@ fn test_forward_parity(rule: MemoryRuleKind) {
 }
 
 #[test]
+#[serial]
 fn test_delta_forward_parity() {
     test_forward_parity(MemoryRuleKind::DeltaRule);
 }
 
 #[test]
+#[serial]
 fn test_titans_forward_parity() {
     test_forward_parity(MemoryRuleKind::TitansLMM);
 }
 
 #[test]
+#[serial]
 fn test_hebbian_forward_parity() {
     test_forward_parity(MemoryRuleKind::HebbianRule);
 }
