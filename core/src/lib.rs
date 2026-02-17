@@ -33,6 +33,14 @@ pub mod m3;
 pub mod cms_variants;
 #[cfg(feature = "cuda")]
 pub(crate) mod cuda_ffi;
+#[cfg(feature = "cuda")]
+pub mod gpu_buf;
+#[cfg(feature = "cuda")]
+pub mod gpu_params;
+#[cfg(feature = "cuda")]
+pub mod gpu_forward;
+#[cfg(feature = "cuda")]
+pub mod gpu_backward;
 pub mod dynamic_freq;
 pub mod conductor;
 pub mod context_stream;
