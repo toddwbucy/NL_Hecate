@@ -59,16 +59,19 @@ def generate(
         max_tokens: tokens to generate
         temperature: 0 = greedy, >0 = softmax sampling
         use_cms: if True, use stateful cms_forward with persistent memory
-        gpu_model: if set, use GPU forward_only for fast inference
+        gpu_model: optional GpuModel for GPU-accelerated generation
     """
     seq = list(prompt_tokens)
     vocab = cfg.vocab_size
     seq_len = cfg.seq_len
 
-    # CMS conductor (used for both GPU and CPU CMS paths)
-    conductor = nl_hecate.Conductor(cfg.k, [1] * cfg.k)
-    if not gpu_model and use_cms:
-        context = nl_hecate.ContextState(cfg.k, cfg.d_model)
+    # CMS conductor for pulse generation (needed for both CPU CMS and GPU paths)
+    conductor = None
+    context = None
+    if use_cms or gpu_model is not None:
+        conductor = nl_hecate.Conductor(cfg.k, [1] * cfg.k)
+        if not gpu_model:
+            context = nl_hecate.ContextState(cfg.k, cfg.d_model)
 
     for _ in range(max_tokens):
         # Take last seq_len tokens as context window
@@ -80,19 +83,19 @@ def generate(
         # Forward pass — target_ids unused for generation, use ctx as dummy
         if gpu_model is not None:
             pulse = conductor.pulse()
-            _loss, logits = gpu_model.forward_only(ctx, ctx, pulse)
+            _loss, logits = gpu_model.forward(ctx, ctx, pulse)
             conductor.advance()
+            last_logits = logits[(seq_len - 1) * vocab: seq_len * vocab]
         elif use_cms:
             pulse = conductor.pulse()
             _loss, cache = nl_hecate.cms_forward(params, cfg, ctx, ctx, pulse, context)
             conductor.advance()
             logits = cache.get_logits()
+            last_logits = logits[(seq_len - 1) * vocab: seq_len * vocab]
         else:
             _loss, cache = nl_hecate.mag_forward(params, cfg, ctx, ctx)
             logits = cache.get_logits()
-
-        # Get logits for last position
-        last_logits = logits[(seq_len - 1) * vocab: seq_len * vocab]
+            last_logits = logits[(seq_len - 1) * vocab: seq_len * vocab]
 
         # Sample next token
         if temperature <= 0:
@@ -133,7 +136,7 @@ def main():
     parser.add_argument("--interactive", action="store_true",
                         help="Interactive REPL mode")
     parser.add_argument("--gpu", action="store_true",
-                        help="Use GPU for fast inference")
+                        help="Use GPU-resident model for fast generation")
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed for reproducible generation")
     args = parser.parse_args()
@@ -148,15 +151,17 @@ def main():
           f"seq_len={cfg.seq_len}, vocab={cfg.vocab_size}")
     print(f"  Memory: rule={cfg.memory_rule}, composition={cfg.composition}, k={cfg.k}")
     print(f"  Params: {params.num_params():,}")
-    # GPU model for fast inference
+
     gpu_model = None
-    use_gpu = args.gpu and hasattr(nl_hecate, "GpuModel")
-    if use_gpu:
+    if args.gpu and hasattr(nl_hecate, "GpuModel"):
         gpu_model = nl_hecate.GpuModel.from_params(params, cfg)
-        print("  Device: GPU")
+        print(f"  Device: GPU")
     else:
-        print("  Device: CPU")
+        print(f"  Device: CPU")
+
     mode = "CMS (memory-augmented)" if args.use_cms else "stateless"
+    if gpu_model:
+        mode = "GPU (CMS)"
     print(f"  Generation mode: {mode}")
 
     # ── Generate ─────────────────────────────────────────────────────
@@ -181,7 +186,7 @@ def main():
             t0 = time.perf_counter()
             output = generate(params, cfg, prompt_tokens,
                               args.max_tokens, args.temperature, args.use_cms,
-                              gpu_model)
+                              gpu_model=gpu_model)
             t1 = time.perf_counter()
 
             text = decode(output)
@@ -198,7 +203,7 @@ def main():
         t0 = time.perf_counter()
         output = generate(params, cfg, prompt_tokens,
                           args.max_tokens, args.temperature, args.use_cms,
-                          gpu_model)
+                          gpu_model=gpu_model)
         t1 = time.perf_counter()
 
         text = decode(output)

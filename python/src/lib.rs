@@ -1212,29 +1212,6 @@ impl GpuModel {
         Ok(loss)
     }
 
-    /// Forward-only pass on GPU. Returns (loss, logits) where logits is
-    /// flat [seq_len * vocab_size]. Used for inference/generation.
-    fn forward_only(&mut self, input_ids: Vec<usize>, target_ids: Vec<usize>,
-                    pulse: &Pulse) -> PyResult<(f32, Vec<f32>)> {
-        let s = self.cfg.swa.seq_len;
-        let v = self.cfg.swa.vocab_size;
-        if input_ids.len() != s {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("input_ids length {} != seq_len {}", input_ids.len(), s)));
-        }
-        if target_ids.len() != s {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("target_ids length {} != seq_len {}", target_ids.len(), s)));
-        }
-        let (loss, cache) = nl_hecate_core::gpu_forward::gpu_cms_forward(
-            &self.params, &self.cfg, &input_ids, &target_ids,
-            &pulse.inner, &mut self.context,
-        );
-        let mut logits = vec![0.0f32; s * v];
-        cache.logits.copy_to_host(&mut logits);
-        Ok((loss, logits))
-    }
-
     /// Download parameters to host for checkpointing.
     fn to_host_params(&self) -> PyResult<MAGParams> {
         let host = self.params.to_host(&self.cfg);
@@ -1245,6 +1222,25 @@ impl GpuModel {
     fn to_host_context(&self) -> PyResult<ContextState> {
         let host = self.context.to_host(self.cfg.k);
         Ok(ContextState { inner: host })
+    }
+
+    /// Forward-only pass: returns (loss, logits_flat).
+    /// logits_flat is [seq_len * vocab_size] in row-major order.
+    fn forward(&mut self, input_ids: Vec<usize>, target_ids: Vec<usize>,
+               pulse: &Pulse) -> PyResult<(f32, Vec<f32>)> {
+        let s = self.cfg.swa.seq_len;
+        let v = self.cfg.swa.vocab_size;
+        if input_ids.len() != s || target_ids.len() != s {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("input/target length must be seq_len {}", s)));
+        }
+        let (loss, cache) = nl_hecate_core::gpu_forward::gpu_cms_forward(
+            &self.params, &self.cfg, &input_ids, &target_ids,
+            &pulse.inner, &mut self.context,
+        );
+        let mut logits = vec![0.0f32; s * v];
+        cache.logits.copy_to_host(&mut logits);
+        Ok((loss, logits))
     }
 }
 
