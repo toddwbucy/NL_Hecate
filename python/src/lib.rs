@@ -924,6 +924,24 @@ impl Conductor {
 
     /// Restore conductor state from a build checkpoint dict.
     fn restore_from_dict(&mut self, state: &Bound<'_, PyDict>) -> PyResult<()> {
+        // Validate that checkpoint k and chunk_sizes match current Conductor
+        if let Some(ck) = state.get_item("conductor_k")? {
+            let ck_val: usize = ck.extract()?;
+            if ck_val != self.inner.k {
+                return Err(PyValueError::new_err(format!(
+                    "checkpoint conductor_k ({}) != current k ({})", ck_val, self.inner.k
+                )));
+            }
+        }
+        if let Some(ccs) = state.get_item("conductor_chunk_sizes")? {
+            let ccs_val: Vec<usize> = ccs.extract()?;
+            if ccs_val != self.inner.chunk_sizes {
+                return Err(PyValueError::new_err(format!(
+                    "checkpoint conductor_chunk_sizes ({:?}) != current ({:?})",
+                    ccs_val, self.inner.chunk_sizes
+                )));
+            }
+        }
         let conductor_step: usize = state.get_item("conductor_step")?
             .ok_or_else(|| PyValueError::new_err("missing conductor_step"))?.extract()?;
         let stream_position: u64 = state.get_item("stream_position")?
@@ -1004,6 +1022,14 @@ impl ContextState {
             return Err(PyValueError::new_err(format!(
                 "memory length ({}) must equal k ({})", memory.len(), self.inner.memory.len()
             )));
+        }
+        for (i, (new, old)) in memory.iter().zip(self.inner.memory.iter()).enumerate() {
+            if new.len() != old.len() {
+                return Err(PyValueError::new_err(format!(
+                    "memory[{}] length ({}) must equal existing shape ({})",
+                    i, new.len(), old.len()
+                )));
+            }
         }
         self.inner.memory = memory;
         Ok(())
@@ -1311,6 +1337,18 @@ impl GpuModel {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 format!("input/target length must be seq_len {}", s)));
         }
+        if let Some(&max_id) = input_ids.iter().max() {
+            if max_id >= v {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("input_ids contains {} >= vocab_size {}", max_id, v)));
+            }
+        }
+        if let Some(&max_id) = target_ids.iter().max() {
+            if max_id >= v {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("target_ids contains {} >= vocab_size {}", max_id, v)));
+            }
+        }
         let (loss, cache) = nl_hecate_core::gpu_forward::gpu_cms_forward(
             &self.params, &self.cfg, &input_ids, &target_ids,
             &pulse.inner, &mut self.context,
@@ -1338,6 +1376,18 @@ impl GpuModel {
         if input_ids.len() != s || target_ids.len() != s {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 format!("input/target length must be seq_len {}", s)));
+        }
+        if let Some(&max_id) = input_ids.iter().max() {
+            if max_id >= v {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("input_ids contains {} >= vocab_size {}", max_id, v)));
+            }
+        }
+        if let Some(&max_id) = target_ids.iter().max() {
+            if max_id >= v {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("target_ids contains {} >= vocab_size {}", max_id, v)));
+            }
         }
         let (loss, cache) = nl_hecate_core::gpu_forward::gpu_cms_forward(
             &self.params, &self.cfg, &input_ids, &target_ids,
@@ -1381,7 +1431,7 @@ impl GpuModel {
         );
 
         // Backward
-        let grads = nl_hecate_core::gpu_backward::gpu_cms_backward(
+        let mut grads = nl_hecate_core::gpu_backward::gpu_cms_backward(
             &self.params, &self.cfg, &cache,
         );
 
@@ -1395,7 +1445,7 @@ impl GpuModel {
 
         // AdamW update (with grad clipping)
         let grad_norm = nl_hecate_core::gpu_optimizer::gpu_adamw_update(
-            &mut self.params, &grads, state,
+            &mut self.params, &mut grads, state,
             lr, beta1, beta2, eps, weight_decay, max_grad_norm,
         );
 

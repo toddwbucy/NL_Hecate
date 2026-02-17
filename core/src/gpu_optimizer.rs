@@ -150,7 +150,7 @@ fn adamw_one(
 #[cfg(feature = "cuda")]
 pub fn gpu_adamw_update(
     params: &mut GpuMAGParams,
-    grads: &GpuMAGGrads,
+    grads: &mut GpuMAGGrads,
     state: &mut GpuAdamWState,
     lr: f32,
     beta1: f32,
@@ -212,6 +212,7 @@ pub fn gpu_adamw_update(
                   lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
         adamw_one(&mut lp.b_theta, &lg.d_b_theta, &mut ml.m_b_theta, &mut ml.v_b_theta,
                   lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
+        // TODO(CS-39): clamp b_theta after update to prevent decay divergence
         adamw_one(&mut lp.w_eta, &lg.d_w_eta, &mut ml.m_w_eta, &mut ml.v_w_eta,
                   lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
         adamw_one(&mut lp.b_eta, &lg.d_b_eta, &mut ml.m_b_eta, &mut ml.v_b_eta,
@@ -278,35 +279,32 @@ fn gpu_grad_norm(grads: &GpuMAGGrads, state: &mut GpuAdamWState) -> f32 {
 
 /// Scale all gradient buffers by a constant factor (for clipping).
 #[cfg(feature = "cuda")]
-fn gpu_scale_grads(grads: &GpuMAGGrads, scale: f32) {
-    let scale_buf = |g: &GpuBuf<f32>| {
+fn gpu_scale_grads(grads: &mut GpuMAGGrads, scale: f32) {
+    let scale_buf = |g: &mut GpuBuf<f32>| {
         let n = g.len() as i32;
         if n == 0 { return; }
-        // grad_scale_cuda takes *mut but only scales in-place;
-        // GpuMAGGrads fields are not mut — we cast (safe because
-        // the kernel only writes to the same memory it reads).
         unsafe {
-            crate::cuda_ffi::grad_scale_cuda(g.as_ptr() as *mut f32, scale, n);
+            crate::cuda_ffi::grad_scale_cuda(g.ptr(), scale, n);
         }
     };
 
-    scale_buf(&grads.d_w_embed);
-    scale_buf(&grads.d_w_q);
-    scale_buf(&grads.d_w_k);
-    scale_buf(&grads.d_w_v);
-    scale_buf(&grads.d_w_o);
-    scale_buf(&grads.d_w_unembed);
+    scale_buf(&mut grads.d_w_embed);
+    scale_buf(&mut grads.d_w_q);
+    scale_buf(&mut grads.d_w_k);
+    scale_buf(&mut grads.d_w_v);
+    scale_buf(&mut grads.d_w_o);
+    scale_buf(&mut grads.d_w_unembed);
 
-    for lg in &grads.levels {
-        scale_buf(&lg.d_w_k_mem);
-        scale_buf(&lg.d_w_v_mem);
-        scale_buf(&lg.d_w_q_mem);
-        scale_buf(&lg.d_w_alpha);
-        scale_buf(&lg.d_b_alpha);
-        scale_buf(&lg.d_w_theta);
-        scale_buf(&lg.d_b_theta);
-        scale_buf(&lg.d_w_eta);
-        scale_buf(&lg.d_b_eta);
+    for lg in &mut grads.levels {
+        scale_buf(&mut lg.d_w_k_mem);
+        scale_buf(&mut lg.d_w_v_mem);
+        scale_buf(&mut lg.d_w_q_mem);
+        scale_buf(&mut lg.d_w_alpha);
+        scale_buf(&mut lg.d_b_alpha);
+        scale_buf(&mut lg.d_w_theta);
+        scale_buf(&mut lg.d_b_theta);
+        scale_buf(&mut lg.d_w_eta);
+        scale_buf(&mut lg.d_b_eta);
     }
 
     crate::dispatch::cuda_sync();

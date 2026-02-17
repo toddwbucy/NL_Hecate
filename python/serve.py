@@ -69,7 +69,7 @@ def generate(
     conductor = None
     context = None
     if use_cms or gpu_model is not None:
-        conductor = nl_hecate.Conductor(cfg.k, [1] * cfg.k)
+        conductor = nl_hecate.Conductor(cfg.k, list(cfg.chunk_sizes) if hasattr(cfg, 'chunk_sizes') else [1] * cfg.k)
         if not gpu_model:
             context = nl_hecate.ContextState(cfg.k, cfg.d_model)
 
@@ -155,9 +155,9 @@ def main():
     gpu_model = None
     if args.gpu and hasattr(nl_hecate, "GpuModel"):
         gpu_model = nl_hecate.GpuModel.from_params(params, cfg)
-        print(f"  Device: GPU")
+        print("  Device: GPU")
     else:
-        print(f"  Device: CPU")
+        print("  Device: CPU")
 
     mode = "CMS (memory-augmented)" if args.use_cms else "stateless"
     if gpu_model:

@@ -370,7 +370,7 @@ def main():
         if build_state is None:
             print("Error: checkpoint has no build state (not a build checkpoint)")
             return
-        resume_step = build_state["global_step"] + 1
+        resume_step = build_state["global_step"]
         bcfg.d_model = cfg.d_model
         bcfg.num_heads = cfg.num_heads
         bcfg.k = cfg.k
@@ -404,6 +404,11 @@ def main():
     print(f"  Params:   {params.num_params():,}")
     print(f"  Data:     {len(token_ids):,} tokens")
     use_gpu = bcfg.gpu and hasattr(nl_hecate, "GpuModel")
+    if bcfg.load and use_gpu:
+        raise RuntimeError(
+            "GPU resume with context restore is not yet implemented. "
+            "Use CPU resume (--gpu omitted) or start a fresh GPU build."
+        )
     print(f"  Build:    {bcfg.steps} steps (from step {resume_step}), lr={bcfg.lr}")
     print(f"  Optimizer: {bcfg.optimizer}" +
           (f" (b1={bcfg.beta1}, b2={bcfg.beta2}, wd={bcfg.weight_decay}, warmup={bcfg.warmup_steps})"
