@@ -212,8 +212,8 @@ fn test_save_load_checkpoint() {
 
 #[test]
 fn test_load_nonexistent_file() {
-    let path = std::path::Path::new("/tmp/nl_hecate_nonexistent_checkpoint_abc123.json");
-    let result = load_checkpoint(path);
+    let path = std::env::temp_dir().join("nl_hecate_nonexistent_checkpoint_abc123.json");
+    let result = load_checkpoint(&path);
     assert!(result.is_err());
     let err = result.err().unwrap();
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
