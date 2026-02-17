@@ -12,12 +12,13 @@
 /// Source: NL_Hecate extension (no paper equation). Design follows existing
 /// gate patterns from Titans (Eqs 12-15) and HOPE.
 
+use serde::{Serialize, Deserialize};
 use crate::model::MemoryLevelParams;
 
 // ── Configuration ─────────────────────────────────────────────────────
 
 /// Which frequency scheduling strategy to use.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum FrequencySchedule {
     /// Current default: level fires when step % chunk_size == 0.
     Fixed,
@@ -26,7 +27,7 @@ pub enum FrequencySchedule {
 }
 
 /// Configuration for learned frequency gates.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LearnedFreqConfig {
     /// Hard gate threshold: level fires when sigmoid output > threshold.
     /// Default: 0.5.

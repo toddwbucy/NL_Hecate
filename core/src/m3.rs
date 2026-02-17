@@ -7,12 +7,13 @@
 /// Source: HOPE (2512.24695) Section 7, Eq 71 applied to optimizer.
 /// Spec: specs/algorithms/optimization_machinery/02_m3.md
 
+use serde::{Serialize, Deserialize};
 use crate::model::{MAGParams, SWAParams, MemoryLevelParams};
 
 // ── Configuration ─────────────────────────────────────────────────────
 
 /// M3 optimizer configuration: one momentum accumulator per frequency level.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct M3Config {
     /// Number of optimizer frequency levels.
     pub k: usize,

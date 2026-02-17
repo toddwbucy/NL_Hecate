@@ -9,10 +9,11 @@
 /// orthogonal: CMS controls *which* levels fire, parallelization controls *how*
 /// each level processes its sequence.
 
+use serde::{Serialize, Deserialize};
 use crate::model::MemoryRuleKind;
 
 /// Which parallelization strategy to use for memory processing.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ParallelStrategy {
     /// C=1, exact (existing behavior). Every rule supports this.
     Sequential,
@@ -34,7 +35,7 @@ pub enum ParallelStrategy {
 }
 
 /// Configuration for parallelized memory processing.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ParallelConfig {
     /// Which strategy to use.
     pub strategy: ParallelStrategy,

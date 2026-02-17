@@ -3,6 +3,7 @@
 /// Track Zero-A: single-block SWA with no memory, no CMS, no inner loop.
 /// All weight matrices are flat Vec<f32> in row-major layout.
 
+use serde::{Serialize, Deserialize};
 use crate::tensor::SimpleRng;
 use crate::parallel::ParallelConfig;
 use crate::retention::{RetentionKind, default_retention};
@@ -15,7 +16,7 @@ use crate::dynamic_freq::{FrequencySchedule, default_b_freq};
 /// - MAG: Memory gates attention output via sigmoid (parallel branches)
 /// - MAL: Memory preprocesses input, attention processes memory output (simplest)
 /// - MAC: Memory provides context, attention processes assembled input (most expressive)
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum CompositionKind {
     MAG,
     MAL,
@@ -27,7 +28,7 @@ pub enum CompositionKind {
 /// MIRAS Algorithm knob: selects the optimizer for memory updates.
 /// - DeltaRule: GD without momentum (Titans Eq 34)
 /// - TitansLMM: GD + momentum accumulator S (Titans Eqs 12-15, 32-33)
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum MemoryRuleKind {
     DeltaRule,
     TitansLMM,
@@ -41,7 +42,7 @@ pub enum MemoryRuleKind {
 }
 
 /// Model configuration — immutable after construction.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SWAConfig {
     pub d_model: usize,
     pub num_heads: usize,
@@ -74,7 +75,7 @@ impl SWAConfig {
 ///   w_v:      [d_model, d_model]
 ///   w_o:      [d_model, d_model]
 ///   w_unembed:[d_model, vocab_size]
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SWAParams {
     pub w_embed: Vec<f32>,
     pub w_q: Vec<f32>,
@@ -171,7 +172,7 @@ impl SWAParams {
 ///   w_eta:    [2*d]  momentum gate weights (TitansLMM only; zero-init for DeltaRule)
 ///   b_eta:    [1]    momentum gate bias (TitansLMM only)
 ///   w_omega:  [d, 2*d] Atlas Omega projection (AtlasOmega only; zero-init for others)
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct MemoryLevelParams {
     pub w_k_mem: Vec<f32>,
     pub w_v_mem: Vec<f32>,
@@ -356,7 +357,7 @@ impl MemoryLevelParams {
 
 /// MAG (Memory-Attention-Gate) configuration.
 /// Wraps SWAConfig and adds CMS parameters.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MAGConfig {
     pub swa: SWAConfig,
     pub memory_enabled: bool,
@@ -1191,7 +1192,7 @@ impl MAGConfig {
 ///
 /// `levels` has length `k` — one MemoryLevelParams per CMS frequency level.
 /// For backward compatibility, existing k=1 code accesses `params.levels[0]`.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct MAGParams {
     pub swa: SWAParams,
     pub levels: Vec<MemoryLevelParams>,
@@ -1278,6 +1279,34 @@ impl MAGParams {
         // Apply: param -= update (m3_step already scaled by theta)
         self.apply_weight_gradients(&update_as_grads, 1.0);
     }
+}
+
+// ── Checkpoint Serialization ─────────────────────────────────────────
+
+/// Internal wrapper for JSON checkpoint format.
+#[derive(Serialize, Deserialize)]
+struct ParamCheckpoint {
+    config: MAGConfig,
+    params: MAGParams,
+}
+
+/// Save MAGParams + MAGConfig to a JSON file.
+pub fn save_checkpoint(path: &std::path::Path, params: &MAGParams, config: &MAGConfig) -> std::io::Result<()> {
+    let checkpoint = ParamCheckpoint {
+        config: config.clone(),
+        params: params.clone(),
+    };
+    let json = serde_json::to_string(&checkpoint)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::write(path, json)
+}
+
+/// Load MAGParams + MAGConfig from a JSON file.
+pub fn load_checkpoint(path: &std::path::Path) -> std::io::Result<(MAGParams, MAGConfig)> {
+    let json = std::fs::read_to_string(path)?;
+    let checkpoint: ParamCheckpoint = serde_json::from_str(&json)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    Ok((checkpoint.params, checkpoint.config))
 }
 
 #[cfg(test)]
