@@ -16,7 +16,7 @@
 #include <math.h>
 
 // Maximum window size supported by shared memory allocation.
-// Shared memory per block: head_dim + 2*MAX_WINDOW floats.
+// Shared memory per block: head_dim + 2*MAX_WINDOW + head_dim floats.
 #define MAX_WINDOW 64
 
 __global__ void swa_forward_kernel(
@@ -42,10 +42,12 @@ __global__ void swa_forward_kernel(
     //   q_row[head_dim]          — cached Q row for this position (f32)
     //   scores[window_size]      — raw attention scores (f32)
     //   weights[window_size]     — softmax weights (f32)
+    //   reduce[head_dim]         — tree-reduction buffer for dot products
     extern __shared__ float smem[];
-    float* q_row  = smem;                        // [head_dim]
-    float* scores = smem + head_dim;              // [window_size]
-    float* weights = smem + head_dim + window_size; // [window_size]
+    float* q_row   = smem;                                         // [head_dim]
+    float* scores  = smem + head_dim;                              // [window_size]
+    float* weights = smem + head_dim + window_size;                // [window_size]
+    float* reduce  = smem + head_dim + window_size + window_size;  // [head_dim]
 
     // Load Q row into shared memory (bf16 → f32)
     if (d < head_dim) {
@@ -66,20 +68,25 @@ __global__ void swa_forward_kernel(
             partial = q_row[d] * __bfloat162float(k[k_pos * total_dim + h_offset + d]);
         }
 
-        // Warp-level reduction (head_dim <= 32 fits in one warp)
-        unsigned mask = __activemask();
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            partial += __shfl_down_sync(mask, partial, offset);
+        // Shared-memory tree reduction (works for any head_dim up to 1024)
+        reduce[d] = partial;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (d < s) {
+                reduce[d] += reduce[d + s];
+            }
+            __syncthreads();
         }
 
         // Thread 0 writes the score
         if (d == 0) {
             if (w < win_len) {
-                scores[w] = partial * scale;
+                scores[w] = reduce[0] * scale;
             } else {
                 scores[w] = -FLT_MAX;
             }
         }
+        __syncthreads();
     }
     __syncthreads();
 
@@ -129,8 +136,8 @@ extern "C" void swa_forward_f32_cuda(
     dim3 grid(num_heads, seq_len);
     dim3 block(head_dim);
 
-    // Shared memory: q_row[head_dim] + scores[window_size] + weights[window_size]
-    int smem_bytes = (head_dim + 2 * window_size) * sizeof(float);
+    // Shared memory: q_row[head_dim] + scores[window_size] + weights[window_size] + reduce[head_dim]
+    int smem_bytes = (2 * head_dim + 2 * window_size) * sizeof(float);
 
     swa_forward_kernel<<<grid, block, smem_bytes>>>(
         q, k, v, out, attn_weights,

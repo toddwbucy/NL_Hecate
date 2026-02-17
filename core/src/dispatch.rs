@@ -184,8 +184,8 @@ pub fn swa_forward_dispatch(
     {
         if !is_rust_forced() {
             assert!(
-                head_dim <= 32,
-                "CUDA SWA kernels require head_dim <= 32 (one warp), got head_dim={head_dim}"
+                head_dim <= 1024,
+                "CUDA SWA kernels require head_dim <= 1024, got head_dim={head_dim}"
             );
             cuda_forward(q, k, v, out, attn_weights, seq_len, num_heads, head_dim, window_size);
             return;
@@ -217,8 +217,8 @@ pub fn swa_backward_dispatch(
     {
         if !is_rust_forced() {
             assert!(
-                head_dim <= 32,
-                "CUDA SWA kernels require head_dim <= 32 (one warp), got head_dim={head_dim}"
+                head_dim <= 1024,
+                "CUDA SWA kernels require head_dim <= 1024, got head_dim={head_dim}"
             );
             cuda_backward(q, k, v, attn_weights, d_attn_out, d_q, d_k, d_v,
                           seq_len, num_heads, head_dim, window_size);
