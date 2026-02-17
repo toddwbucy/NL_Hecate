@@ -10,6 +10,7 @@
 /// is provided externally (benchmarks, serving module).
 
 use crate::model::{MAGConfig, MAGParams, CompositionKind, MemoryRuleKind};
+use crate::dynamic_freq::FrequencySchedule;
 use crate::retention::default_retention;
 use crate::conductor::{Conductor, ContextState, ErrorBuffer};
 use crate::mag::{cms_forward, cms_backward};
@@ -67,6 +68,7 @@ impl EdgeConfig {
             parallel: None,
             retention: default_retention(self.memory_rule),
             m3: None,
+            frequency_schedule: FrequencySchedule::Fixed,
         }
     }
 

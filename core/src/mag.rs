@@ -19,6 +19,11 @@ use crate::lattice_osr::{LatticeOSR, LatticeCache, lattice_read_only, lattice_re
 use crate::trellis::{Trellis, TrellisCache, trellis_read_only, trellis_read_only_backward};
 use crate::atlas_omega::{AtlasOmega, AtlasOmegaCache};
 use crate::conductor::{Pulse, ContextState, ErrorBuffer};
+use crate::dynamic_freq::{
+    FrequencySchedule, FreqGateCache,
+    mean_pool, compute_freq_gates, apply_threshold, should_anneal,
+    freq_gate_backward, compute_gate_surrogate,
+};
 
 /// Memory cache enum for static dispatch across memory rule variants.
 /// Preserves monomorphization (Enzyme requires no vtable indirection).
@@ -372,6 +377,8 @@ pub struct CMSForwardCache {
     pub logits: Vec<f32>,
     /// Which levels were active this step.
     pub pulse: Pulse,
+    /// Frequency gate cache for backward (None if Fixed schedule).
+    pub freq_cache: Option<FreqGateCache>,
 }
 
 /// CMS forward pass. Like mag_forward but with k frequency levels.
@@ -418,6 +425,24 @@ pub fn cms_forward(
         assert!(tok < v, "cms_forward: input_ids[{t}]={tok} >= vocab_size {v}");
         embedded[t * d..(t + 1) * d].copy_from_slice(&params.swa.w_embed[tok * d..(tok + 1) * d]);
     }
+
+    // Dynamic frequency gate: override pulse active_levels if Learned schedule.
+    let (effective_pulse, freq_cache) = match &cfg.frequency_schedule {
+        FrequencySchedule::Learned(learned_cfg)
+            if !should_anneal(pulse.global_step, learned_cfg.anneal_steps) =>
+        {
+            let embedded_mean = mean_pool(&embedded, s, d);
+            let fc = compute_freq_gates(&embedded_mean, &params.levels, cfg.k, d);
+            let active = apply_threshold(&fc, learned_cfg.threshold);
+            let new_pulse = Pulse {
+                global_step: pulse.global_step,
+                active_levels: active,
+            };
+            (new_pulse, Some(fc))
+        }
+        _ => (pulse.clone(), None),
+    };
+    let pulse = &effective_pulse;
 
     // Stage 2a: Attention branch — QKV projections
     let mut w_q_t = vec![0.0f32; d * d];
@@ -629,6 +654,7 @@ pub fn cms_forward(
         y_per_level, y_combined,
         gate, gated_out, projected, logits,
         pulse: pulse.clone(),
+        freq_cache,
     };
 
     (loss, cache)
@@ -808,6 +834,37 @@ pub fn cms_backward(
             error_buffers[level].accumulate(&mem_grads);
             for i in 0..(s * d) {
                 d_embedded_mem_total[i] += d_embedded_mem[i];
+            }
+        }
+    }
+
+    // ── Frequency gate backward (straight-through estimator) ────────
+    if let Some(ref fc) = cache.freq_cache {
+        // Compute surrogate gradient signal for frequency gates
+        let d_gate_values = compute_gate_surrogate(
+            &cache.y_per_level, &d_y_combined, &cache.pulse.active_levels, cfg.k, s * d,
+        );
+        let (freq_grads, d_embedded_mean) = freq_gate_backward(
+            &d_gate_values, fc, &params.levels, cfg.k, d,
+        );
+
+        // Accumulate w_freq/b_freq gradients into level grads
+        for (l, fg) in freq_grads.into_iter().enumerate() {
+            if !grads.levels[l].w_freq.is_empty() {
+                for j in 0..d {
+                    grads.levels[l].w_freq[j] += fg.d_w_freq[j];
+                }
+                grads.levels[l].b_freq[0] += fg.d_b_freq[0];
+            }
+        }
+
+        // d_embedded_mean contributes to d_embedded via mean-pool backward:
+        // d_embedded[t, j] += d_embedded_mean[j] / seq_len for all t
+        let inv_s = 1.0 / s as f32;
+        for t in 0..s {
+            let base = t * d;
+            for j in 0..d {
+                d_embedded_mem_total[base + j] += d_embedded_mean[j] * inv_s;
             }
         }
     }

@@ -9,6 +9,7 @@
 use nl_hecate_core::model::{
     MAGConfig, MAGParams, SWAConfig, CompositionKind, MemoryRuleKind,
 };
+use nl_hecate_core::dynamic_freq::FrequencySchedule;
 use nl_hecate_core::retention::{
     RetentionKind, RetentionConfig, default_retention,
     l2_apply_retention, l2_retention_gradient, l2_decoupled_gradient,
@@ -48,6 +49,7 @@ fn tiny_config(rule: MemoryRuleKind, retention: RetentionKind) -> MAGConfig {
         parallel: None,
         retention,
         m3: None,
+        frequency_schedule: FrequencySchedule::Fixed,
     }
 }
 

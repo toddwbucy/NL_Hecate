@@ -11,6 +11,7 @@ use nl_hecate_core::model::{SWAConfig as RustConfig, SWAParams as RustParams};
 use nl_hecate_core::model::{MAGConfig as RustMAGConfig, MAGParams as RustMAGParams, MemoryRuleKind, CompositionKind};
 use nl_hecate_core::retention::{RetentionKind, default_retention};
 use nl_hecate_core::m3::M3Config as RustM3Config;
+use nl_hecate_core::dynamic_freq::{FrequencySchedule, LearnedFreqConfig};
 use nl_hecate_core::cms_variants::{
     CMSVariant as RustCMSVariant,
     BlockConfig as RustBlockConfig,
@@ -259,7 +260,7 @@ impl MAGConfig {
         k=1, chunk_sizes=None, memory_rule="delta", composition="mag",
         d_hidden=None, lp_p=None, lq_q=None, lambda_local=None, lambda_2=None,
         delta=None, m_slots=None, d_compress=None, lambda_k=None, lambda_v=None,
-        retention=None, m3=None,
+        retention=None, m3=None, frequency_schedule=None,
     ))]
     fn new(
         d_model: usize,
@@ -285,6 +286,7 @@ impl MAGConfig {
         lambda_v: Option<f32>,
         retention: Option<&str>,
         m3: Option<&Bound<'_, PyDict>>,
+        frequency_schedule: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         if d_model != num_heads * head_dim {
             return Err(PyValueError::new_err(format!(
@@ -345,6 +347,30 @@ impl MAGConfig {
             Some(d) => Some(parse_m3_config(d)?),
             None => None,
         };
+        let freq_sched = match frequency_schedule {
+            None => FrequencySchedule::Fixed,
+            Some(val) => {
+                if let Ok(s) = val.extract::<String>() {
+                    match s.to_lowercase().as_str() {
+                        "fixed" => FrequencySchedule::Fixed,
+                        "learned" => FrequencySchedule::Learned(LearnedFreqConfig::default()),
+                        _ => return Err(PyValueError::new_err(format!(
+                            "Unknown frequency_schedule '{}'. Expected: 'fixed', 'learned', or dict", s
+                        ))),
+                    }
+                } else if let Ok(d) = val.downcast::<PyDict>() {
+                    let threshold: f32 = d.get_item("threshold")?
+                        .map(|v| v.extract()).transpose()?.unwrap_or(0.5);
+                    let anneal_steps: usize = d.get_item("anneal_steps")?
+                        .map(|v| v.extract()).transpose()?.unwrap_or(0);
+                    FrequencySchedule::Learned(LearnedFreqConfig { threshold, anneal_steps })
+                } else {
+                    return Err(PyValueError::new_err(
+                        "frequency_schedule must be a string ('fixed'/'learned') or dict"
+                    ));
+                }
+            }
+        };
         Ok(MAGConfig {
             inner: RustMAGConfig {
                 swa: RustConfig {
@@ -373,6 +399,7 @@ impl MAGConfig {
                 parallel: None,
                 retention: ret_kind,
                 m3: m3_cfg,
+                frequency_schedule: freq_sched,
             },
         })
     }
@@ -476,7 +503,7 @@ impl MAGForwardCache {
     k=1, chunk_sizes=None, memory_rule="delta", composition="mag",
     d_hidden=None, lp_p=None, lq_q=None, lambda_local=None, lambda_2=None,
     delta=None, m_slots=None, d_compress=None, lambda_k=None, lambda_v=None,
-    retention=None, m3=None,
+    retention=None, m3=None, frequency_schedule=None,
 ))]
 fn mag_create_config(
     d_model: usize,
@@ -502,12 +529,13 @@ fn mag_create_config(
     lambda_v: Option<f32>,
     retention: Option<&str>,
     m3: Option<&Bound<'_, PyDict>>,
+    frequency_schedule: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<MAGConfig> {
     MAGConfig::new(
         d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled,
         k, chunk_sizes, memory_rule, composition,
         d_hidden, lp_p, lq_q, lambda_local, lambda_2, delta, m_slots, d_compress, lambda_k, lambda_v,
-        retention, m3,
+        retention, m3, frequency_schedule,
     )
 }
 
