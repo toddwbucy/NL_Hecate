@@ -84,8 +84,8 @@ class BuildConfig:
         assert self.seq_len > 0, "seq_len must be positive"
         assert self.window_size > 0, "window_size must be positive"
         assert self.k >= 1, "k must be >= 1"
-        assert self.optimizer in ("sgd", "adamw"), \
-            f"optimizer must be 'sgd' or 'adamw', got '{self.optimizer}'"
+        assert self.optimizer in ("sgd", "adamw", "adamw_gpu"), \
+            f"optimizer must be 'sgd', 'adamw', or 'adamw_gpu', got '{self.optimizer}'"
         assert self.lr > 0, "lr must be positive"
         assert self.max_grad_norm >= 0, "max_grad_norm must be >= 0"
         if self.chunk_sizes is None:
@@ -438,6 +438,7 @@ def main():
 
     # Initialize optimizer
     adamw_opt = None
+    use_adamw_gpu = (bcfg.optimizer == "adamw_gpu")
     if bcfg.optimizer == "adamw":
         adamw_opt = AdamW(
             num_params=params.num_params(), lr=bcfg.lr,
@@ -471,11 +472,20 @@ def main():
             continue
 
         # Compute current learning rate
-        current_lr = cosine_lr(step, bcfg.warmup_steps, end_step, bcfg.lr) if adamw_opt else bcfg.lr
+        use_cosine = (adamw_opt is not None or use_adamw_gpu)
+        current_lr = cosine_lr(step, bcfg.warmup_steps, end_step, bcfg.lr) if use_cosine else bcfg.lr
 
         g_norm = 0.0
 
-        if gpu_model is not None and adamw_opt is None:
+        if gpu_model is not None and use_adamw_gpu:
+            # Full GPU AdamW: forward + backward + optimizer all on device
+            loss, g_norm = gpu_model.step_adamw(
+                input_ids, target_ids, pulse, current_lr,
+                beta1=bcfg.beta1, beta2=bcfg.beta2, eps=1e-8,
+                weight_decay=bcfg.weight_decay,
+                max_grad_norm=bcfg.max_grad_norm,
+            )
+        elif gpu_model is not None and adamw_opt is None:
             # GPU path with SGD: forward + backward + update in one call
             loss = gpu_model.step(input_ids, target_ids, pulse, current_lr)
         elif gpu_model is not None and adamw_opt is not None:
@@ -526,7 +536,7 @@ def main():
             msg = f"  step {step:5d}  loss={loss:.4f}"
             if g_norm > 0:
                 msg += f"  gnorm={g_norm:.4f}"
-            if adamw_opt:
+            if adamw_opt or use_adamw_gpu:
                 msg += f"  lr={current_lr:.6f}"
             print(msg)
 

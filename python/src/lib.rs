@@ -1206,6 +1206,7 @@ struct GpuModel {
     params: nl_hecate_core::gpu_params::GpuMAGParams,
     context: nl_hecate_core::gpu_params::GpuContextState,
     cfg: nl_hecate_core::model::MAGConfig,
+    adamw_state: Option<nl_hecate_core::gpu_optimizer::GpuAdamWState>,
 }
 
 #[cfg(feature = "cuda")]
@@ -1222,6 +1223,7 @@ impl GpuModel {
             params: gpu_params,
             context: gpu_context,
             cfg: cfg.inner.clone(),
+            adamw_state: None,
         })
     }
 
@@ -1234,6 +1236,7 @@ impl GpuModel {
             params: gpu_params,
             context: gpu_context,
             cfg: cfg.inner.clone(),
+            adamw_state: None,
         })
     }
 
@@ -1343,6 +1346,73 @@ impl GpuModel {
         let mut logits = vec![0.0f32; s * v];
         cache.logits.copy_to_host(&mut logits);
         Ok((loss, logits))
+    }
+
+    /// Full GPU build step with AdamW optimizer. Returns (loss, grad_norm).
+    /// Zero PCIe traffic for weights — only input_ids, target_ids, and loss cross the bus.
+    /// AdamW state is lazily created on first call.
+    #[pyo3(signature = (input_ids, target_ids, pulse, lr, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.1, max_grad_norm=1.0))]
+    fn step_adamw(&mut self, input_ids: Vec<usize>, target_ids: Vec<usize>,
+                  pulse: &Pulse, lr: f32, beta1: f32, beta2: f32,
+                  eps: f32, weight_decay: f32, max_grad_norm: f32) -> PyResult<(f32, f32)> {
+        let s = self.cfg.swa.seq_len;
+        let v = self.cfg.swa.vocab_size;
+        if input_ids.len() != s || target_ids.len() != s {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("input/target length must be seq_len {}", s)));
+        }
+        if let Some(&max_id) = input_ids.iter().max() {
+            if max_id >= v {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("input_ids contains {} >= vocab_size {}", max_id, v)));
+            }
+        }
+        if let Some(&max_id) = target_ids.iter().max() {
+            if max_id >= v {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("target_ids contains {} >= vocab_size {}", max_id, v)));
+            }
+        }
+
+        // Forward
+        let (loss, cache) = nl_hecate_core::gpu_forward::gpu_cms_forward(
+            &self.params, &self.cfg, &input_ids, &target_ids,
+            &pulse.inner, &mut self.context,
+        );
+
+        // Backward
+        let grads = nl_hecate_core::gpu_backward::gpu_cms_backward(
+            &self.params, &self.cfg, &cache,
+        );
+
+        // Lazy-init AdamW state
+        if self.adamw_state.is_none() {
+            self.adamw_state = Some(
+                nl_hecate_core::gpu_optimizer::GpuAdamWState::from_params(&self.params)
+            );
+        }
+        let state = self.adamw_state.as_mut().unwrap();
+
+        // AdamW update (with grad clipping)
+        let grad_norm = nl_hecate_core::gpu_optimizer::gpu_adamw_update(
+            &mut self.params, &grads, state,
+            lr, beta1, beta2, eps, weight_decay, max_grad_norm,
+        );
+
+        // Weight tying: sync w_unembed^T → w_embed
+        nl_hecate_core::gpu_backward::gpu_sync_embed_weights(
+            &mut self.params,
+            self.cfg.swa.d_model,
+            self.cfg.swa.vocab_size,
+        );
+
+        Ok((loss, grad_norm))
+    }
+
+    /// Get current AdamW optimizer step count.
+    #[getter]
+    fn adamw_step(&self) -> u32 {
+        self.adamw_state.as_ref().map_or(0, |s| s.step)
     }
 }
 

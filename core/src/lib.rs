@@ -41,6 +41,8 @@ pub mod gpu_params;
 pub mod gpu_forward;
 #[cfg(feature = "cuda")]
 pub mod gpu_backward;
+#[cfg(feature = "cuda")]
+pub mod gpu_optimizer;
 pub mod dynamic_freq;
 pub mod conductor;
 pub mod context_stream;
