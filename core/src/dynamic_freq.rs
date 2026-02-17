@@ -63,6 +63,9 @@ pub struct FreqGateCache {
 /// Input: [seq_len * d], Output: [d].
 pub fn mean_pool(embedded: &[f32], seq_len: usize, d: usize) -> Vec<f32> {
     assert_eq!(embedded.len(), seq_len * d);
+    if seq_len == 0 {
+        return vec![0.0f32; d];
+    }
     let mut mean = vec![0.0f32; d];
     let inv_s = 1.0 / seq_len as f32;
     for t in 0..seq_len {
@@ -218,8 +221,13 @@ pub fn freq_gate_backward(
 /// encourages the gate to stay open. If inactive (gate < threshold), the
 /// gradient encourages the gate to open if it would have helped.
 ///
-/// For active levels: d_gate = +||d_y ⊙ y_level|| (positive = keep firing)
-/// For inactive levels: d_gate = +small_positive (encourage exploration)
+/// For active levels: d_gate = -dot(d_y_combined, y_level).
+///   Positive dot means the level's output aligns with the loss gradient,
+///   i.e. this level *increased* loss. The negative sign pushes the gate
+///   toward closing (reducing that level's contribution).
+///   Conversely, negative dot means the level reduced loss, so -dot is
+///   positive, pushing the gate toward staying open.
+/// For inactive levels: d_gate = +small_positive (encourage exploration).
 pub fn compute_gate_surrogate(
     y_per_level: &[Vec<f32>],
     d_y_combined: &[f32],
@@ -230,15 +238,16 @@ pub fn compute_gate_surrogate(
     let mut d_gate = vec![0.0f32; k];
     for l in 0..k {
         if active_levels[l] {
-            // Dot product of d_y_combined and y_per_level[l] — measures how much
-            // this level's output aligns with the loss gradient direction.
+            // Dot product of d_y_combined (= d_loss/d_y) and y_per_level[l].
+            // Positive dot → this level's output increased loss.
             let mut dot = 0.0f32;
             for i in 0..s_d {
                 dot += d_y_combined[i] * y_per_level[l][i];
             }
-            // Positive dot means this level helped reduce loss → keep gate open.
-            // We want gradient that pushes gate toward 1 when helpful.
-            d_gate[l] = -dot; // negative because d_loss/d_gate: more gate = less loss → negative
+            // Negate: positive dot (level increased loss) → negative d_gate
+            // (push gate toward closing). Negative dot (level reduced loss) →
+            // positive d_gate (push gate toward staying open).
+            d_gate[l] = -dot;
         } else {
             // Inactive level: small positive gradient to encourage exploration.
             // This is deliberately small — we don't want to force levels to fire
