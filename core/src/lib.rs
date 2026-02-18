@@ -1,6 +1,7 @@
 #![cfg_attr(feature = "enzyme", feature(autodiff))]
 
 pub mod tensor;
+pub mod tape;
 pub mod swa;
 pub mod model;
 pub mod forward;
