@@ -136,7 +136,12 @@ pub fn gpu_cms_backward(
 
     // ── Stage 7: Cross-entropy backward ──────────────────────────────
     let mut d_logits = GpuBuf::zeros(s * v);
-    let count = s as f32; // all tokens valid for byte-level vocab
+    // Count valid targets (masked targets with id < 0 or >= vocab are skipped
+    // by the kernel — we must normalize by the same count as forward).
+    let valid_count = cache.target_ids_i32.iter()
+        .filter(|&&t| t >= 0 && (t as usize) < v)
+        .count() as f32;
+    let count = if valid_count > 0.0 { valid_count } else { 1.0 };
     unsafe {
         crate::cuda_ffi::cross_entropy_backward_cuda(
             cache.logits.as_ptr(),

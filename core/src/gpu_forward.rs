@@ -276,7 +276,12 @@ pub fn gpu_cms_forward(
     // Download scalar loss (4 bytes D2H)
     let mut loss_host = [0.0f32; 1];
     loss_gpu.copy_to_host(&mut loss_host);
-    let loss = loss_host[0] / s as f32; // mean over tokens
+    // Mean over VALID tokens only (masked targets with id < 0 or >= vocab are
+    // skipped by the cross-entropy kernel, so we must divide by the actual count).
+    let valid_count = target_ids_i32.iter()
+        .filter(|&&t| t >= 0 && (t as usize) < v)
+        .count() as f32;
+    let loss = if valid_count > 0.0 { loss_host[0] / valid_count } else { 0.0 };
 
     let cache = GpuCMSCache {
         input_ids_gpu: d_input_ids,
