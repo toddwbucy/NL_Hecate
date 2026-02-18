@@ -91,6 +91,64 @@ pub fn swa_forward(
     }
 }
 
+/// Single-token SWA forward — Rust reference for KV cache decode.
+///
+/// Computes attention for 1 query position over a K/V cache of arbitrary length.
+/// q is [1, d], k_cache/v_cache are [cache_len, d], out is [1, d].
+/// No attn_weights output (inference only, no backward needed).
+pub fn swa_single_token_forward(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    out: &mut [f32],
+    cache_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    window_size: usize,
+) {
+    let total_dim = num_heads * head_dim;
+    debug_assert_eq!(q.len(), total_dim);
+    debug_assert_eq!(k_cache.len(), cache_len * total_dim);
+    debug_assert_eq!(v_cache.len(), cache_len * total_dim);
+    debug_assert_eq!(out.len(), total_dim);
+
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    for x in out.iter_mut() { *x = 0.0; }
+
+    for h in 0..num_heads {
+        let h_offset = h * head_dim;
+
+        // Window covers [max(0, cache_len - window_size), cache_len)
+        let win_start = if cache_len > window_size { cache_len - window_size } else { 0 };
+        let win_len = cache_len - win_start;
+
+        // Compute scores
+        let mut scores = vec![f32::NEG_INFINITY; window_size];
+        for w in 0..win_len {
+            let k_pos = win_start + w;
+            let mut dot = 0.0f32;
+            for d in 0..head_dim {
+                dot += q[h_offset + d] * k_cache[k_pos * total_dim + h_offset + d];
+            }
+            scores[w] = dot * scale;
+        }
+
+        // Softmax
+        let mut weights = vec![0.0f32; window_size];
+        softmax_f32(&scores, &mut weights, 1, window_size);
+
+        // Weighted sum
+        for w in 0..win_len {
+            let k_pos = win_start + w;
+            let weight = weights[w];
+            for d in 0..head_dim {
+                out[h_offset + d] += weight * v_cache[k_pos * total_dim + h_offset + d];
+            }
+        }
+    }
+}
+
 /// SWA backward pass — Rust reference implementation.
 ///
 /// Computes dQ, dK, dV from d_attn_out and cached attn_weights/Q/K/V.

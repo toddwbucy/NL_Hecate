@@ -17,6 +17,7 @@ import math
 import mmap
 import os
 from pathlib import Path
+import random
 import struct
 import time
 from typing import Any, Optional
@@ -63,6 +64,10 @@ class BuildConfig:
     # Data
     data_path: str | None = None
     data_format: str = "byte"  # "byte" or "sharegpt"
+
+    # Eval
+    eval_every: int = 0  # 0 = disabled; evaluate on val set every N steps
+    eval_max_chunks: int = 100  # max chunks per eval pass
 
     # Runtime
     gpu: bool = False
@@ -142,6 +147,7 @@ class BuildConfig:
             "warmup_steps": "warmup_steps", "weight_decay": "weight_decay",
             "beta1": "beta1", "beta2": "beta2", "max_grad_norm": "max_grad_norm",
             "load": "load", "log_file": "log_file",
+            "eval_every": "eval_every", "eval_max_chunks": "eval_max_chunks",
         }
         for cli_name, cfg_name in mapping.items():
             val = getattr(args, cli_name, None)
@@ -351,6 +357,92 @@ def load_binary_tokens(path: str) -> list[int]:
         return list(f.read())
 
 
+def evaluate(gpu_model, bcfg: BuildConfig, val_loader: "BpeDataLoader",
+             max_chunks: int) -> tuple[float, float]:
+    """Run forward-only eval on val set. Returns (avg_loss, perplexity).
+
+    Uses a fresh Conductor per eval (independent CMS state) so eval
+    doesn't corrupt training context. No backward pass, no weight update.
+    """
+    conductor = nl_hecate.Conductor(bcfg.k, bcfg.chunk_sizes)
+    context = nl_hecate.ContextState(bcfg.k, bcfg.d_model)
+
+    # Reset val loader position for deterministic eval
+    val_loader.position = 0
+
+    total_loss = 0.0
+    n_chunks = 0
+
+    for _ in range(max_chunks):
+        chunk = val_loader.next_chunk(bcfg.seq_len)
+        if chunk is None:
+            break
+        input_ids, target_ids = chunk
+        pulse = conductor.pulse()
+
+        if gpu_model is not None:
+            loss, _ = gpu_model.forward(input_ids, target_ids, pulse)
+        else:
+            # CPU eval path
+            params_ref = None  # caller must handle CPU case separately
+            raise NotImplementedError("CPU eval not yet implemented for BPE")
+
+        if math.isnan(loss) or math.isinf(loss):
+            continue
+
+        total_loss += loss
+        n_chunks += 1
+        conductor.advance()
+
+    if n_chunks == 0:
+        return 0.0, 1.0
+
+    avg_loss = total_loss / n_chunks
+    ppl = math.exp(min(avg_loss, 20.0))
+    return avg_loss, ppl
+
+
+# Fixed prompts for sampling at checkpoints (tests different capabilities)
+SAMPLE_PROMPTS = [
+    "What is the capital of France?",
+    "Explain how a neural network learns in simple terms.",
+    "Write a short poem about the ocean.",
+]
+
+
+def generate_samples(gpu_model, cfg, tokenizer, step: int,
+                     temperature: float = 0.7,
+                     max_tokens: int = 128) -> list[dict]:
+    """Generate sample completions at checkpoint time.
+
+    Uses serve.generate() for autoregressive decoding. Returns list of
+    dicts with prompt, completion, and token count for JSONL logging.
+    """
+    from serve import generate
+
+    samples = []
+    for prompt_text in SAMPLE_PROMPTS:
+        prompt_tokens = tokenizer.encode(prompt_text)
+        output_tokens = generate(
+            params=None,  # not needed when gpu_model is provided
+            cfg=cfg,
+            prompt_tokens=prompt_tokens,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            use_cms=True,
+            gpu_model=gpu_model,
+        )
+        # Decode only the generated portion
+        gen_tokens = output_tokens[len(prompt_tokens):]
+        completion = tokenizer.decode(gen_tokens)
+        samples.append({
+            "prompt": prompt_text,
+            "completion": completion,
+            "gen_tokens": len(gen_tokens),
+        })
+    return samples
+
+
 def main():
     parser = argparse.ArgumentParser(description="NL-Hecate build script")
     parser.add_argument("--config", type=str, default=None,
@@ -389,6 +481,10 @@ def main():
                         help="Max gradient L2 norm for clipping (0 = disabled)")
     parser.add_argument("--log_file", type=str, default=None,
                         help="Path for structured JSONL log (e.g. runs/build.jsonl)")
+    parser.add_argument("--eval_every", type=int, default=None,
+                        help="Evaluate on val set every N steps (0 = disabled)")
+    parser.add_argument("--eval_max_chunks", type=int, default=None,
+                        help="Max chunks per eval pass (default: 100)")
     args = parser.parse_args()
 
     # ── Build config: file → defaults, then CLI overrides ─────────────
@@ -404,6 +500,8 @@ def main():
     bpe_loader: BpeDataLoader | None = None
     token_ids: list[int] | MmapTokenStream | None = None
 
+    val_loader: BpeDataLoader | None = None
+
     if use_bpe:
         bpe_loader = BpeDataLoader(bcfg.data_path, split="train")
         print(f"Loaded ShareGPT BPE data: {len(bpe_loader):,} tokens, "
@@ -411,6 +509,15 @@ def main():
         if len(bpe_loader) < bcfg.seq_len:
             print(f"Error: data too short ({len(bpe_loader)} tokens < seq_len={bcfg.seq_len})")
             return
+        # Load val set if eval is enabled
+        if bcfg.eval_every > 0:
+            val_path = Path(bcfg.data_path) / "val_tokens.npy"
+            if val_path.exists():
+                val_loader = BpeDataLoader(bcfg.data_path, split="val")
+                print(f"Loaded val set: {len(val_loader):,} tokens")
+            else:
+                print("Warning: eval_every set but no val data found, disabling eval")
+                bcfg.eval_every = 0
     elif bcfg.data_path:
         if bcfg.data_path.endswith(".bin"):
             fsize = os.path.getsize(bcfg.data_path)
@@ -433,6 +540,14 @@ def main():
     if not use_bpe and token_ids is not None and len(token_ids) < bcfg.seq_len + 1:
         print(f"Error: text too short ({len(token_ids)} tokens < seq_len+1={bcfg.seq_len + 1})")
         return
+
+    # ── Load tokenizer for sample generation ──────────────────────────
+    tokenizer = None
+    if use_bpe and bcfg.save_every > 0:
+        from serve import load_tokenizer, BpeTokenizer
+        tokenizer = load_tokenizer(data_dir=bcfg.data_path)
+        tok_type = "BPE" if isinstance(tokenizer, BpeTokenizer) else "byte-level"
+        print(f"Tokenizer for samples: {tok_type}")
 
     # ── Resume from checkpoint or init fresh ──────────────────────────
     resume_step = 0
@@ -494,6 +609,8 @@ def main():
     if bcfg.max_grad_norm > 0:
         print(f"  Grad clip: max_norm={bcfg.max_grad_norm}")
     print(f"  Device:   {'GPU' if use_gpu else 'CPU'}")
+    if bcfg.eval_every > 0:
+        print(f"  Eval:     every {bcfg.eval_every} steps, {bcfg.eval_max_chunks} max chunks")
     if bcfg.log_file:
         print(f"  Log:      {bcfg.log_file}")
     print(f"{'=' * 60}\n")
@@ -638,9 +755,12 @@ def main():
         conductor.advance()
         losses.append(loss)
 
+        # Compute perplexity
+        ppl = math.exp(min(loss, 20.0))
+
         # Logging
         if step % bcfg.log_every == 0 or step == end_step - 1:
-            msg = f"  step {step:5d}  loss={loss:.4f}"
+            msg = f"  step {step:5d}  loss={loss:.4f}  ppl={ppl:.1f}"
             if g_norm > 0:
                 msg += f"  gnorm={g_norm:.4f}"
             if adamw_opt or use_adamw_gpu:
@@ -649,9 +769,30 @@ def main():
 
         # Structured JSONL log
         if jsonl and (step % bcfg.log_every == 0 or step == end_step - 1):
-            jsonl.log(event="step", step=step, loss=loss,
-                      grad_norm=g_norm, lr=current_lr,
-                      elapsed=time.perf_counter() - t_start)
+            log_fields: dict[str, Any] = dict(
+                event="step", step=step, loss=loss, ppl=ppl,
+                grad_norm=g_norm, lr=current_lr,
+                elapsed=time.perf_counter() - t_start,
+                active_levels=pulse.active_levels,
+            )
+            # Masked token ratio (BPE only — byte-level has no masking)
+            if use_bpe:
+                n_masked = sum(1 for t in target_ids if t >= bcfg.vocab_size)
+                log_fields["masked_ratio"] = n_masked / len(target_ids)
+            # Gate biases from GPU (small D2H: 3 floats per level)
+            if gpu_model is not None and hasattr(gpu_model, "gate_biases"):
+                log_fields["gate_biases"] = gpu_model.gate_biases()
+            jsonl.log(**log_fields)
+
+        # Periodic eval on val set
+        if (bcfg.eval_every > 0 and val_loader is not None
+                and step > 0 and step % bcfg.eval_every == 0):
+            eval_loss, eval_ppl = evaluate(
+                gpu_model, bcfg, val_loader, bcfg.eval_max_chunks)
+            print(f"  [eval] step {step:5d}  loss={eval_loss:.4f}  ppl={eval_ppl:.1f}")
+            if jsonl:
+                jsonl.log(event="eval", step=step, eval_loss=eval_loss,
+                          eval_ppl=eval_ppl, eval_chunks=bcfg.eval_max_chunks)
 
         # Periodic checkpoint
         if bcfg.save_every > 0 and step > 0 and step % bcfg.save_every == 0:
@@ -669,6 +810,18 @@ def main():
                 # Byte-level: resumable checkpoint with build state
                 nl_hecate.save_build_checkpoint(ckpt_path, params, cfg, conductor, context)
             print(f"  [checkpoint saved: {ckpt_path}]")
+
+            # Generate samples at checkpoint time
+            if tokenizer is not None and gpu_model is not None:
+                try:
+                    samples = generate_samples(gpu_model, cfg, tokenizer, step)
+                    for s in samples:
+                        preview = s["completion"][:80].replace("\n", " ")
+                        print(f"  [sample] {s['prompt'][:40]}... → {preview}...")
+                    if jsonl:
+                        jsonl.log(event="sample", step=step, samples=samples)
+                except Exception as e:
+                    print(f"  [sample generation failed: {e}]")
 
     t_end = time.perf_counter()
     elapsed = t_end - t_start
