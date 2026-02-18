@@ -35,6 +35,21 @@ extern "C" {
     /// Layout matches `swa::swa_backward_rust()`.
     /// Q/K/V/attn_weights are bf16; d_attn_out/dQ/dK/dV are f32.
     /// dQ, dK, dV must be pre-zeroed by the caller.
+    /// CUDA SWA single-token attention for KV cache decode (bf16 storage, f32 compute).
+    ///
+    /// Q is [1, total_dim], K/V cache are [cache_len, total_dim], out is [1, total_dim].
+    /// All bf16. No attn_weights output (inference only).
+    pub(crate) fn swa_single_token_cuda(
+        q: *const u16,
+        k_cache: *const u16,
+        v_cache: *const u16,
+        out: *mut u16,
+        cache_len: i32,
+        num_heads: i32,
+        head_dim: i32,
+        window_size: i32,
+    );
+
     pub(crate) fn swa_backward_f32_cuda(
         q: *const u16,
         k: *const u16,
@@ -260,6 +275,11 @@ extern "C" {
         g: *const f32, partial_sums: *mut f32,
         n: i32, out_num_blocks: *mut i32,
     );
+
+    /// Iterative GPU-side reduction of partial sums to a single scalar.
+    /// Uses ping-pong between buf_a and buf_b. Result in buf_a[0].
+    /// buf_b must be at least ceil(n/256) elements.
+    pub(crate) fn reduce_sum_cuda(buf_a: *mut f32, buf_b: *mut f32, n: i32);
 
     /// Scale gradient buffer in-place: g[i] *= scale.
     pub(crate) fn grad_scale_cuda(g: *mut f32, scale: f32, n: i32);

@@ -1230,6 +1230,7 @@ struct GpuModel {
     context: nl_hecate_core::gpu_params::GpuContextState,
     cfg: nl_hecate_core::model::MAGConfig,
     adamw_state: Option<nl_hecate_core::gpu_optimizer::GpuAdamWState>,
+    kv_cache: Option<nl_hecate_core::gpu_forward::GpuKVCache>,
 }
 
 #[cfg(feature = "cuda")]
@@ -1247,6 +1248,7 @@ impl GpuModel {
             context: gpu_context,
             cfg: cfg.inner.clone(),
             adamw_state: None,
+            kv_cache: None,
         })
     }
 
@@ -1260,6 +1262,7 @@ impl GpuModel {
             context: gpu_context,
             cfg: cfg.inner.clone(),
             adamw_state: None,
+            kv_cache: None,
         })
     }
 
@@ -1440,6 +1443,52 @@ impl GpuModel {
     #[getter]
     fn adamw_step(&self) -> u32 {
         self.adamw_state.as_ref().map_or(0, |s| s.step)
+    }
+
+    /// Prefill: process full prompt, populate KV cache, return last-position logits.
+    /// input_ids must have length == seq_len. Returns logits [vocab_size].
+    fn prefill(&mut self, input_ids: Vec<usize>, pulse: &Pulse) -> PyResult<Vec<f32>> {
+        let s = self.cfg.swa.seq_len;
+        let v = self.cfg.swa.vocab_size;
+        if input_ids.len() != s {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("input_ids length {} != seq_len {}", input_ids.len(), s)));
+        }
+        if let Some(&max_id) = input_ids.iter().max() {
+            if max_id >= v {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("input_ids contains {} >= vocab_size {}", max_id, v)));
+            }
+        }
+        let (logits, kv_cache) = nl_hecate_core::gpu_forward::gpu_prefill_forward(
+            &self.params, &self.cfg, &input_ids,
+            &pulse.inner, &mut self.context,
+        );
+        self.kv_cache = Some(kv_cache);
+        Ok(logits)
+    }
+
+    /// Decode one token using the KV cache. Returns logits [vocab_size].
+    /// Must call prefill() first to populate the cache.
+    fn decode_token(&mut self, token_id: usize, pulse: &Pulse) -> PyResult<Vec<f32>> {
+        let v = self.cfg.swa.vocab_size;
+        if token_id >= v {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("token_id {} >= vocab_size {}", token_id, v)));
+        }
+        let kv_cache = self.kv_cache.as_mut().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("KV cache not initialized — call prefill() first")
+        })?;
+        let logits = nl_hecate_core::gpu_forward::gpu_single_token_forward(
+            &self.params, &self.cfg, token_id,
+            &pulse.inner, &mut self.context, kv_cache,
+        );
+        Ok(logits)
+    }
+
+    /// Clear the KV cache. Call between generation sequences.
+    fn reset_cache(&mut self) {
+        self.kv_cache = None;
     }
 
     /// Read gate biases from GPU: returns Vec of (b_alpha, b_theta, b_eta) per level.

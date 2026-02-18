@@ -1702,6 +1702,23 @@ pub fn swa_forward_dd(
     }
 }
 
+/// SWA single-token attention on device bf16 buffers (KV cache decode).
+/// Q is [1, d], K/V cache are [cache_len, d], out is [1, d]. No attn_weights.
+#[cfg(feature = "cuda")]
+pub fn swa_single_token_dd(
+    q: &GpuBuf<u16>, k_cache: &GpuBuf<u16>, v_cache: &GpuBuf<u16>,
+    out: &mut GpuBuf<u16>,
+    cache_len: usize, num_heads: usize, head_dim: usize, window_size: usize,
+) {
+    unsafe {
+        crate::cuda_ffi::swa_single_token_cuda(
+            q.as_ptr(), k_cache.as_ptr(), v_cache.as_ptr(),
+            out.ptr(),
+            cache_len as i32, num_heads as i32, head_dim as i32, window_size as i32,
+        );
+    }
+}
+
 /// SWA backward on device buffers. Q/K/V/aw are bf16, gradients are f32.
 #[cfg(feature = "cuda")]
 pub fn swa_backward_dd(

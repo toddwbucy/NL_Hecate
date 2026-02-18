@@ -143,3 +143,122 @@ extern "C" void swa_forward_f32_cuda(
         q, k, v, out, attn_weights,
         seq_len, num_heads, head_dim, window_size);
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// Single-token SWA kernel for KV cache decode
+// ══════════════════════════════════════════════════════════════════════
+//
+// For autoregressive generation: 1 query position attending over a
+// K/V cache of arbitrary length. Grid=(num_heads), Block=(head_dim).
+// No attn_weights output (inference only, no backward needed).
+
+__global__ void swa_single_token_kernel(
+    const __nv_bfloat16* __restrict__ q,        // [1, total_dim]
+    const __nv_bfloat16* __restrict__ k_cache,  // [cache_len, total_dim]
+    const __nv_bfloat16* __restrict__ v_cache,  // [cache_len, total_dim]
+    __nv_bfloat16* __restrict__ out,            // [1, total_dim]
+    int cache_len, int num_heads, int head_dim, int window_size)
+{
+    int h = blockIdx.x;       // head index
+    int d = threadIdx.x;      // dimension within head
+
+    int total_dim = num_heads * head_dim;
+    int h_offset = h * head_dim;
+
+    // Causal window: the query is at position (cache_len - 1).
+    // Window covers [max(0, cache_len - window_size), cache_len).
+    int win_start = (cache_len > window_size) ? (cache_len - window_size) : 0;
+    int win_len = cache_len - win_start;
+
+    // Shared memory layout (same as full kernel):
+    //   q_row[head_dim]    — cached Q row (f32)
+    //   scores[MAX_WINDOW] — raw attention scores (f32)
+    //   weights[MAX_WINDOW] — softmax weights (f32)
+    //   reduce[head_dim]   — tree-reduction buffer
+    extern __shared__ float smem[];
+    float* q_row   = smem;
+    float* scores  = smem + head_dim;
+    float* weights = smem + head_dim + window_size;
+    float* reduce  = smem + head_dim + window_size + window_size;
+
+    // Load Q row into shared memory (bf16 → f32)
+    if (d < head_dim) {
+        q_row[d] = __bfloat162float(q[h_offset + d]);
+    }
+    __syncthreads();
+
+    // ── Phase 1: Compute scores ─────────────────────────────────────
+    float scale = rsqrtf((float)head_dim);
+
+    for (int w = 0; w < window_size; w++) {
+        float partial = 0.0f;
+        if (w < win_len && d < head_dim) {
+            int k_pos = win_start + w;
+            partial = q_row[d] * __bfloat162float(k_cache[k_pos * total_dim + h_offset + d]);
+        }
+
+        reduce[d] = partial;
+        __syncthreads();
+        for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+            if (d < s) {
+                reduce[d] += reduce[d + s];
+            }
+            __syncthreads();
+        }
+
+        if (d == 0) {
+            if (w < win_len) {
+                scores[w] = reduce[0] * scale;
+            } else {
+                scores[w] = -FLT_MAX;
+            }
+        }
+        __syncthreads();
+    }
+    __syncthreads();
+
+    // ── Phase 2: Softmax (thread 0 only) ────────────────────────────
+    if (d == 0) {
+        float max_val = -FLT_MAX;
+        for (int w = 0; w < window_size; w++) {
+            if (scores[w] > max_val) max_val = scores[w];
+        }
+
+        float sum_exp = 0.0f;
+        for (int w = 0; w < window_size; w++) {
+            float e = expf(scores[w] - max_val);
+            weights[w] = e;
+            sum_exp += e;
+        }
+
+        for (int w = 0; w < window_size; w++) {
+            weights[w] /= sum_exp;
+        }
+    }
+    __syncthreads();
+
+    // ── Phase 3: Weighted sum of values ─────────────────────────────
+    if (d < head_dim) {
+        float acc = 0.0f;
+        for (int w = 0; w < win_len; w++) {
+            int k_pos = win_start + w;
+            acc += weights[w] * __bfloat162float(v_cache[k_pos * total_dim + h_offset + d]);
+        }
+        out[h_offset + d] = __float2bfloat16(acc);
+    }
+}
+
+extern "C" void swa_single_token_cuda(
+    const __nv_bfloat16* q, const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
+    __nv_bfloat16* out,
+    int cache_len, int num_heads, int head_dim, int window_size)
+{
+    dim3 grid(num_heads);
+    dim3 block(head_dim);
+
+    int smem_bytes = (2 * head_dim + 2 * window_size) * sizeof(float);
+
+    swa_single_token_kernel<<<grid, block, smem_bytes>>>(
+        q, k_cache, v_cache, out,
+        cache_len, num_heads, head_dim, window_size);
+}

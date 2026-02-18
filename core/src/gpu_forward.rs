@@ -491,6 +491,387 @@ pub(crate) unsafe fn gpu_buf_memcpy_h2d(
     cudaMemcpy(dst, src, bytes, 1) // 1 = H2D
 }
 
+// ══════════════════════════════════════════════════════════════════════
+// GpuKVCache — KV cache for autoregressive decode
+// ══════════════════════════════════════════════════════════════════════
+
+/// GPU-resident KV cache for autoregressive generation.
+///
+/// Stores K and V projections in bf16 on device. Filled during prefill,
+/// extended one token at a time during decode. Avoids re-projecting
+/// the entire sequence each step.
+#[cfg(feature = "cuda")]
+pub struct GpuKVCache {
+    /// K cache: [max_len, d] bf16 on device.
+    pub k_cache_bf16: GpuBuf<u16>,
+    /// V cache: [max_len, d] bf16 on device.
+    pub v_cache_bf16: GpuBuf<u16>,
+    /// Current number of filled positions.
+    pub len: usize,
+    /// Maximum cache capacity.
+    pub max_len: usize,
+    /// Model dimension (num_heads * head_dim).
+    pub d: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl GpuKVCache {
+    /// Allocate a new empty KV cache.
+    pub fn new(max_len: usize, d: usize) -> Self {
+        GpuKVCache {
+            k_cache_bf16: GpuBuf::<u16>::zeros(max_len * d),
+            v_cache_bf16: GpuBuf::<u16>::zeros(max_len * d),
+            len: 0,
+            max_len,
+            d,
+        }
+    }
+
+    /// Append n_tokens of K/V data (f32 on GPU) to the cache.
+    /// Converts f32 → bf16 and copies into the cache at the current offset.
+    pub fn append_f32(&mut self, k_f32: &GpuBuf<f32>, v_f32: &GpuBuf<f32>, n_tokens: usize) {
+        assert!(self.len + n_tokens <= self.max_len,
+            "KV cache overflow: {} + {} > {}", self.len, n_tokens, self.max_len);
+
+        let total = n_tokens * self.d;
+
+        // Convert f32 → bf16 into temporary buffers
+        let mut k_bf16_tmp = GpuBuf::<u16>::zeros(total);
+        let mut v_bf16_tmp = GpuBuf::<u16>::zeros(total);
+        unsafe {
+            crate::cuda_ffi::f32_to_bf16_cuda(k_f32.as_ptr(), k_bf16_tmp.ptr(), total as i32);
+            crate::cuda_ffi::f32_to_bf16_cuda(v_f32.as_ptr(), v_bf16_tmp.ptr(), total as i32);
+        }
+
+        // D2D copy into cache at offset
+        let offset_bytes = self.len * self.d * 2; // u16 = 2 bytes
+        let copy_bytes = total * 2;
+        unsafe {
+            let rc = gpu_buf_memcpy_d2d(
+                (self.k_cache_bf16.ptr() as *mut u8).add(offset_bytes) as *mut std::ffi::c_void,
+                k_bf16_tmp.as_ptr() as *const std::ffi::c_void,
+                copy_bytes,
+            );
+            assert_eq!(rc, 0);
+            let rc = gpu_buf_memcpy_d2d(
+                (self.v_cache_bf16.ptr() as *mut u8).add(offset_bytes) as *mut std::ffi::c_void,
+                v_bf16_tmp.as_ptr() as *const std::ffi::c_void,
+                copy_bytes,
+            );
+            assert_eq!(rc, 0);
+        }
+
+        self.len += n_tokens;
+    }
+
+    /// Reset the cache (set len=0, no dealloc).
+    pub fn reset(&mut self) {
+        self.len = 0;
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// GPU prefill forward — process full prompt, populate KV cache
+// ══════════════════════════════════════════════════════════════════════
+
+/// Prefill: run full forward on prompt, populate KV cache, return last-position logits.
+///
+/// This is the "prompt processing" phase of cached generation.
+/// Runs the same stages as gpu_cms_forward but:
+/// - Populates a KV cache with the K/V projections
+/// - Skips cross-entropy loss
+/// - Downloads only last-position logits (vocab-sized, not seq_len*vocab)
+#[cfg(feature = "cuda")]
+pub fn gpu_prefill_forward(
+    params: &GpuMAGParams,
+    cfg: &MAGConfig,
+    input_ids: &[usize],
+    pulse: &Pulse,
+    context: &mut GpuContextState,
+) -> (Vec<f32>, GpuKVCache) {
+    let s = cfg.swa.seq_len;
+    let d = cfg.swa.d_model;
+    let v = cfg.swa.vocab_size;
+    let nh = cfg.swa.num_heads;
+    let hd = cfg.swa.head_dim;
+    let ws = cfg.swa.window_size;
+
+    assert_eq!(d, nh * hd);
+    assert!(input_ids.len() >= s);
+
+    // Upload input_ids
+    let input_ids_i32: Vec<i32> = input_ids[..s].iter().map(|&x| x as i32).collect();
+    let d_input_ids = GpuBuf::<f32>::new(s);
+    unsafe {
+        let rc = gpu_buf_memcpy_h2d(
+            d_input_ids.ptr() as *mut std::ffi::c_void,
+            input_ids_i32.as_ptr() as *const std::ffi::c_void,
+            s * 4,
+        );
+        assert_eq!(rc, 0);
+    }
+
+    // ── Stage 1: Embedding gather ──────────────────────────────────
+    let mut embedded = GpuBuf::<f32>::zeros(s * d);
+    unsafe {
+        crate::cuda_ffi::embedding_gather_cuda(
+            params.swa.w_embed.as_ptr(),
+            d_input_ids.ptr() as *const i32,
+            embedded.ptr(),
+            s as i32, d as i32,
+        );
+    }
+
+    // ── Stage 2a: QKV projections ──────────────────────────────────
+    let mut q_f32 = GpuBuf::zeros(s * d);
+    let mut k_f32 = GpuBuf::zeros(s * d);
+    let mut v_f32 = GpuBuf::zeros(s * d);
+    crate::dispatch::cublas_matmul_transb_dd(&embedded, &params.swa.w_q, &mut q_f32, s, d, d, 0.0);
+    crate::dispatch::cublas_matmul_transb_dd(&embedded, &params.swa.w_k, &mut k_f32, s, d, d, 0.0);
+    crate::dispatch::cublas_matmul_transb_dd(&embedded, &params.swa.w_v, &mut v_f32, s, d, d, 0.0);
+
+    // ── Populate KV cache ──────────────────────────────────────────
+    let mut kv_cache = GpuKVCache::new(cfg.swa.seq_len + 2048, d); // prompt + up to 2048 decode tokens
+    kv_cache.append_f32(&k_f32, &v_f32, s);
+
+    // ── Stage 3a: SWA attention (bf16) ─────────────────────────────
+    let total = s * d;
+    let aw_total = nh * s * ws;
+    let mut q_bf16 = GpuBuf::<u16>::zeros(total);
+    let mut k_bf16 = GpuBuf::<u16>::zeros(total);
+    let mut v_bf16 = GpuBuf::<u16>::zeros(total);
+    let mut attn_out_bf16 = GpuBuf::<u16>::zeros(total);
+    let mut attn_weights_bf16 = GpuBuf::<u16>::zeros(aw_total);
+
+    unsafe {
+        crate::cuda_ffi::f32_to_bf16_cuda(q_f32.as_ptr(), q_bf16.ptr(), total as i32);
+        crate::cuda_ffi::f32_to_bf16_cuda(k_f32.as_ptr(), k_bf16.ptr(), total as i32);
+        crate::cuda_ffi::f32_to_bf16_cuda(v_f32.as_ptr(), v_bf16.ptr(), total as i32);
+    }
+
+    crate::dispatch::swa_forward_dd(
+        &q_bf16, &k_bf16, &v_bf16,
+        &mut attn_out_bf16, &mut attn_weights_bf16,
+        s, nh, hd, ws,
+    );
+
+    let mut attn_out = GpuBuf::<f32>::zeros(total);
+    unsafe {
+        crate::cuda_ffi::bf16_to_f32_cuda(attn_out_bf16.as_ptr(), attn_out.ptr(), total as i32);
+    }
+
+    // ── Stage 2b+3b: Memory branch per level ───────────────────────
+    let mut y_per_level = Vec::with_capacity(cfg.k);
+    for level in 0..cfg.k {
+        if pulse.active_levels[level] {
+            let (y_level, _mem_cache) = gpu_memory_forward(
+                &params.levels[level], cfg, &embedded,
+                &mut context.memory[level],
+                s, d,
+            );
+            y_per_level.push(y_level);
+        } else {
+            let y_level = gpu_memory_read_only(
+                &params.levels[level], &embedded,
+                &context.memory[level],
+                s, d,
+            );
+            y_per_level.push(y_level);
+        }
+    }
+
+    // ── Combine levels ─────────────────────────────────────────────
+    let mut y_combined = GpuBuf::<f32>::zeros(s * d);
+    for y_level in &y_per_level {
+        unsafe {
+            crate::cuda_ffi::saxpy_cuda(1.0, y_level.as_ptr(), y_combined.ptr(), (s * d) as i32);
+        }
+    }
+    if cfg.k > 2 {
+        let scale = 1.0 / (cfg.k as f32).sqrt();
+        unsafe {
+            crate::cuda_ffi::saxpy_cuda(scale - 1.0, y_combined.as_ptr(), y_combined.ptr(), (s * d) as i32);
+        }
+    }
+
+    // ── Stage 4: Gating ────────────────────────────────────────────
+    let mut gate = GpuBuf::<f32>::zeros(s * d);
+    let mut gated_out = GpuBuf::<f32>::zeros(s * d);
+    unsafe {
+        crate::cuda_ffi::sigmoid_cuda(y_combined.as_ptr(), gate.ptr(), (s * d) as i32);
+        crate::cuda_ffi::elemwise_mul_cuda(attn_out.as_ptr(), gate.as_ptr(), gated_out.ptr(), (s * d) as i32);
+    }
+
+    // ── Stage 5: Output projection ─────────────────────────────────
+    let mut projected = GpuBuf::<f32>::zeros(s * d);
+    crate::dispatch::cublas_matmul_transb_dd(&gated_out, &params.swa.w_o, &mut projected, s, d, d, 0.0);
+
+    // ── Stage 6: Unembed (only last position) ──────────────────────
+    // Extract last position projected[s-1] as [1, d] and unembed to [1, v]
+    let mut last_projected = GpuBuf::<f32>::zeros(d);
+    unsafe {
+        let rc = gpu_buf_memcpy_d2d(
+            last_projected.ptr() as *mut std::ffi::c_void,
+            (projected.as_ptr() as *const u8).add((s - 1) * d * 4) as *const std::ffi::c_void,
+            d * 4,
+        );
+        assert_eq!(rc, 0);
+    }
+    let mut last_logits_gpu = GpuBuf::<f32>::zeros(v);
+    crate::dispatch::cublas_matmul_dd(&last_projected, &params.swa.w_unembed, &mut last_logits_gpu, 1, d, v, 0.0);
+    crate::dispatch::cuda_sync();
+
+    // Download last-position logits
+    let mut last_logits = vec![0.0f32; v];
+    last_logits_gpu.copy_to_host(&mut last_logits);
+
+    (last_logits, kv_cache)
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// GPU single-token forward — decode one token using KV cache
+// ══════════════════════════════════════════════════════════════════════
+
+/// Decode one token using KV cache. Returns logits [vocab].
+///
+/// Per-token path (all s=1):
+/// 1. Embed 1 token
+/// 2. QKV project (3 cuBLAS: [1,d] @ [d,d]^T)
+/// 3. Append K, V to cache
+/// 4. SWA single-token attention (new kernel)
+/// 5. Memory branch per level (existing kernels with s=1)
+/// 6. Combine levels, gate, output project, unembed
+/// 7. Download logits [vocab]
+#[cfg(feature = "cuda")]
+pub fn gpu_single_token_forward(
+    params: &GpuMAGParams,
+    cfg: &MAGConfig,
+    token_id: usize,
+    pulse: &Pulse,
+    context: &mut GpuContextState,
+    kv_cache: &mut GpuKVCache,
+) -> Vec<f32> {
+    let d = cfg.swa.d_model;
+    let v = cfg.swa.vocab_size;
+    let nh = cfg.swa.num_heads;
+    let hd = cfg.swa.head_dim;
+    let ws = cfg.swa.window_size;
+
+    assert!(token_id < v, "token_id {} >= vocab_size {}", token_id, v);
+    assert!(kv_cache.len > 0, "KV cache must be populated via prefill first");
+    assert!(kv_cache.len < kv_cache.max_len, "KV cache full: {} >= {}", kv_cache.len, kv_cache.max_len);
+
+    // ── Stage 1: Embed 1 token ─────────────────────────────────────
+    let input_i32 = [token_id as i32];
+    let d_input = GpuBuf::<f32>::new(1);
+    unsafe {
+        let rc = gpu_buf_memcpy_h2d(
+            d_input.ptr() as *mut std::ffi::c_void,
+            input_i32.as_ptr() as *const std::ffi::c_void,
+            4,
+        );
+        assert_eq!(rc, 0);
+    }
+    let mut embedded = GpuBuf::<f32>::zeros(d);
+    unsafe {
+        crate::cuda_ffi::embedding_gather_cuda(
+            params.swa.w_embed.as_ptr(),
+            d_input.ptr() as *const i32,
+            embedded.ptr(),
+            1, d as i32,
+        );
+    }
+
+    // ── Stage 2a: QKV projections [1,d] @ [d,d]^T ─────────────────
+    let mut q_f32 = GpuBuf::zeros(d);
+    let mut k_f32 = GpuBuf::zeros(d);
+    let mut v_f32 = GpuBuf::zeros(d);
+    crate::dispatch::cublas_matmul_transb_dd(&embedded, &params.swa.w_q, &mut q_f32, 1, d, d, 0.0);
+    crate::dispatch::cublas_matmul_transb_dd(&embedded, &params.swa.w_k, &mut k_f32, 1, d, d, 0.0);
+    crate::dispatch::cublas_matmul_transb_dd(&embedded, &params.swa.w_v, &mut v_f32, 1, d, d, 0.0);
+
+    // ── Stage 3a-prep: Append K, V to cache ────────────────────────
+    kv_cache.append_f32(&k_f32, &v_f32, 1);
+
+    // ── Stage 3a: SWA single-token attention ───────────────────────
+    let mut q_bf16 = GpuBuf::<u16>::zeros(d);
+    unsafe {
+        crate::cuda_ffi::f32_to_bf16_cuda(q_f32.as_ptr(), q_bf16.ptr(), d as i32);
+    }
+
+    let mut attn_out_bf16 = GpuBuf::<u16>::zeros(d);
+    crate::dispatch::swa_single_token_dd(
+        &q_bf16, &kv_cache.k_cache_bf16, &kv_cache.v_cache_bf16,
+        &mut attn_out_bf16,
+        kv_cache.len, nh, hd, ws,
+    );
+
+    let mut attn_out = GpuBuf::<f32>::zeros(d);
+    unsafe {
+        crate::cuda_ffi::bf16_to_f32_cuda(attn_out_bf16.as_ptr(), attn_out.ptr(), d as i32);
+    }
+
+    // ── Stage 2b+3b: Memory branch per level (s=1) ────────────────
+    let mut y_per_level = Vec::with_capacity(cfg.k);
+    for level in 0..cfg.k {
+        if pulse.active_levels[level] {
+            let (y_level, _mem_cache) = gpu_memory_forward(
+                &params.levels[level], cfg, &embedded,
+                &mut context.memory[level],
+                1, d,
+            );
+            y_per_level.push(y_level);
+        } else {
+            let y_level = gpu_memory_read_only(
+                &params.levels[level], &embedded,
+                &context.memory[level],
+                1, d,
+            );
+            y_per_level.push(y_level);
+        }
+    }
+
+    // ── Combine levels ─────────────────────────────────────────────
+    let mut y_combined = GpuBuf::<f32>::zeros(d);
+    for y_level in &y_per_level {
+        unsafe {
+            crate::cuda_ffi::saxpy_cuda(1.0, y_level.as_ptr(), y_combined.ptr(), d as i32);
+        }
+    }
+    if cfg.k > 2 {
+        let scale = 1.0 / (cfg.k as f32).sqrt();
+        unsafe {
+            crate::cuda_ffi::saxpy_cuda(scale - 1.0, y_combined.as_ptr(), y_combined.ptr(), d as i32);
+        }
+    }
+
+    // ── Stage 4: Gating ────────────────────────────────────────────
+    let mut gate = GpuBuf::<f32>::zeros(d);
+    let mut gated_out = GpuBuf::<f32>::zeros(d);
+    unsafe {
+        crate::cuda_ffi::sigmoid_cuda(y_combined.as_ptr(), gate.ptr(), d as i32);
+        crate::cuda_ffi::elemwise_mul_cuda(attn_out.as_ptr(), gate.as_ptr(), gated_out.ptr(), d as i32);
+    }
+
+    // ── Stage 5: Output projection ─────────────────────────────────
+    let mut projected = GpuBuf::<f32>::zeros(d);
+    crate::dispatch::cublas_matmul_transb_dd(&gated_out, &params.swa.w_o, &mut projected, 1, d, d, 0.0);
+
+    // ── Stage 6: Unembed ───────────────────────────────────────────
+    let mut logits_gpu = GpuBuf::<f32>::zeros(v);
+    crate::dispatch::cublas_matmul_dd(&projected, &params.swa.w_unembed, &mut logits_gpu, 1, d, v, 0.0);
+    crate::dispatch::cuda_sync();
+
+    // Download logits
+    let mut logits = vec![0.0f32; v];
+    logits_gpu.copy_to_host(&mut logits);
+    logits
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Helper: raw memcpy wrappers (used for D2D and H2D of i32 data)
+// ══════════════════════════════════════════════════════════════════════
+
 /// Raw cudaMemcpy D2D wrapper.
 #[cfg(feature = "cuda")]
 pub(crate) unsafe fn gpu_buf_memcpy_d2d(
