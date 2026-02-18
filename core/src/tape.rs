@@ -10,7 +10,7 @@
 // CS-42: All intermediates stored in arena — no recomputation.
 // CS-47: Parameters are snapshotted at registration — immune to later mutation.
 
-use std::cell::RefCell;
+use std::cell::Cell;
 use std::collections::HashMap;
 
 // ── Buffer management ────────────────────────────────────────────────
@@ -776,22 +776,28 @@ impl Tape {
 // ── Thread-local tape access (CS-40: opt-in) ─────────────────────────
 
 thread_local! {
-    static TAPE: RefCell<Option<Tape>> = const { RefCell::new(None) };
+    static TAPE_ACTIVE: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Execute a closure with an active tape. The tape is created before `f`
-/// runs and dropped after `f` returns. This is the sole entry point for
-/// AD — nothing is recorded unless this is called (CS-40).
+/// Execute a closure with an active tape. Sets the thread-local active flag
+/// for the duration of `f`, making `is_tape_active()` return true. After `f`
+/// returns the flag is cleared. This is the sole entry point for AD — nothing
+/// is recorded unless this is called (CS-40).
 pub fn with_tape<F, R>(registry: HashMap<OpaqueKey, OpaqueBackwardFn>, f: F) -> R
 where
     F: FnOnce(&mut Tape) -> R,
 {
-    TAPE.with(|_cell| {
-        let mut tape = Tape::new(registry);
-        let result = f(&mut tape);
-        // Tape is dropped here — no persistent state.
-        result
-    })
+    TAPE_ACTIVE.with(|flag| {
+        debug_assert!(!flag.get(), "nested with_tape() calls are not supported");
+        flag.set(true);
+    });
+
+    let mut tape = Tape::new(registry);
+    let result = f(&mut tape);
+
+    TAPE_ACTIVE.with(|flag| flag.set(false));
+    // Tape is dropped here — no persistent state.
+    result
 }
 
 /// Execute with an empty opaque registry (for testing standard ops only).
@@ -802,12 +808,11 @@ where
     with_tape(HashMap::new(), f)
 }
 
-/// Check if a tape is conceptually "active". This is a helper for
-/// traced wrappers: if no tape, skip recording.
-/// NOTE: Since we pass &mut Tape explicitly, this is mainly for documentation.
-/// The traced wrappers receive Option<&mut Tape> and check is_some().
+/// Check if a tape is currently active on this thread. Returns true only
+/// while inside a `with_tape()` closure. Traced wrappers can use this to
+/// decide whether to record operations.
 pub fn is_tape_active() -> bool {
-    TAPE.with(|cell| cell.borrow().is_some())
+    TAPE_ACTIVE.with(|flag| flag.get())
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -977,7 +982,13 @@ mod tests {
 
     #[test]
     fn test_with_tape_empty() {
+        // is_tape_active() should be false before with_tape.
+        assert!(!is_tape_active());
+
         let result = with_tape_empty(|tape| {
+            // is_tape_active() should be true inside with_tape.
+            assert!(is_tape_active());
+
             let a = tape.alloc(vec![1.0, 2.0], vec![2]);
             let b = tape.alloc(vec![3.0, 4.0], vec![2]);
             let out = tape.alloc(vec![4.0, 6.0], vec![2]);
@@ -987,6 +998,9 @@ mod tests {
             tape.get_grad(a).unwrap().to_vec()
         });
         assert_eq!(result, vec![1.0, 1.0]);
+
+        // is_tape_active() should be false after with_tape.
+        assert!(!is_tape_active());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Wengert Tape: Reverse-Mode AD via Operation Recording
 
-```
+```text
 CONTRACT
   Purpose:    Defines Mechanism 1 (automatic differentiation) as a Rust-native
               Wengert tape that records operations during the forward pass and
@@ -38,7 +38,7 @@ CONTRACT
 
 ## What Changes vs What Stays
 
-```
+```text
 CHANGES:
   Mechanism 1: Enzyme AD on Rust LLVM IR  →  Wengert tape recording in Rust
     - #[autodiff]      → tape records ops during forward, replays in reverse
@@ -68,7 +68,7 @@ STAYS:
 
 ## Tape Architecture
 
-```
+```text
 struct Tape {
     ops: Vec<TapeOp>,           // Recorded operations in forward order
     bufs: Vec<TapeBuf>,         // Arena of tensor buffers
@@ -112,7 +112,7 @@ where F: FnOnce(&mut Tape) -> R
 
 ## TapeOp Enum
 
-```
+```text
 enum TapeOp {
     // ── Standard ops (~20) ──────────────────────────────────────────
 
@@ -176,7 +176,7 @@ processes ops in reverse order, propagating `d_out` (the upstream gradient of
 the loss with respect to this op's output) back to `d_input` (the gradient
 with respect to this op's inputs).
 
-```
+```text
 -- Notation:
 --   d_X means d(loss)/d(X)  (the gradient of the scalar loss w.r.t. tensor X)
 --   @ means matrix multiply
@@ -268,7 +268,7 @@ SLICE:  out = input[offset..offset+len]
 
 ## NL-Specific Op VJPs
 
-```
+```text
 NORMALIZED_SILU (Trellis):
   -- Forward: y = x * σ(x), norm = ||y||, out = y / max(norm, eps)
   -- VJP: Chain through normalization, then through SiLU.
@@ -309,7 +309,7 @@ Opaque blocks wrap existing `step_backward()` methods from each memory rule.
 The tape records inputs/outputs/saved tensors during forward and calls the
 registered backward function during reverse-mode replay.
 
-```
+```text
 -- All memory rules + SWA + frozen read-only variants.
 enum OpaqueKey {
     // Active memory rules (full write + read cycle)
@@ -373,7 +373,7 @@ fn register_opaque_vjps() -> HashMap<OpaqueKey, OpaqueBackwardFn> {
 
 ### Example Adapter: DeltaRule
 
-```
+```text
 -- Wraps DeltaRule::step_backward() into the opaque VJP interface.
 -- The adapter translates between tape buffer layout and the existing
 -- step_backward() signature.
@@ -407,7 +407,7 @@ fn delta_rule_opaque_backward(
 
 ### Frozen Read-Only Backward
 
-```
+```text
 -- Frozen levels do M @ q_t only (no memory write).
 -- Gradient flows through the read path: d_q = M^T @ d_out.
 -- No gradient to M itself (frozen = not updated this step).
@@ -434,7 +434,7 @@ fn frozen_delta_rule_backward(
 
 ## Trait System Changes
 
-```
+```text
 -- RENAME: EnzymeOpaque → OpaqueVjp
 -- The marker trait now signals that the type provides an opaque VJP
 -- via the tape registry, not via Enzyme's #[enzyme_opaque] attribute.
@@ -484,7 +484,7 @@ trait MemoryRule: OpaqueVjp {
 
 ### MAG Composition (Single CMS Level, Active)
 
-```
+```text
 Forward (tape recording):
 
   input_ids
@@ -562,7 +562,7 @@ Backward (tape reverse replay):
 
 ### CMS Multi-Level (k=4, Mixed Active/Frozen)
 
-```
+```text
 -- At step t, pulse.active_levels = [true, false, true, false]
 -- Level 0: ACTIVE  → full forward + backward (TapeOp::Opaque with active key)
 -- Level 1: FROZEN  → read-only M @ q_t (TapeOp::Opaque with frozen key)
@@ -600,7 +600,7 @@ Backward:
 
 ### Dynamic Frequency Gate
 
-```
+```text
 -- When cfg.frequency_schedule == Learned, the active_levels are
 -- determined by a learnable gate, not the static pulse.
 
@@ -621,7 +621,7 @@ Backward:
 
 ## CMS Integration
 
-```
+```text
 -- The Conductor creates the tape at the start of each chunk during Build phase.
 -- During Test/Stream phases, no tape is created — forward-only (CS-10).
 -- The tape lives for exactly one chunk: create → forward → backward → drop.
@@ -668,7 +668,7 @@ fn build_chunk(
 
 ### Test Class 1: Tape Isolation (Opaque Block Integrity)
 
-```
+```text
 -- Verifies that the opaque block is the SOLE gradient source through its region.
 -- No gradient leaks from the tape through the opaque boundary.
 -- Replaces the Enzyme barrier tests from 00_enzyme_integration.md.
@@ -708,7 +708,7 @@ fn test_tape_isolation<R: MemoryRule>() {
 
 ### Test Class 2: Analytical Correctness (Tape vs Finite Differences)
 
-```
+```text
 -- Verifies that the tape's end-to-end gradient matches numerical ground truth.
 -- Uses the EXISTING finite-difference infrastructure from gradient.rs.
 
@@ -741,7 +741,7 @@ fn test_tape_fd_correctness() {
 
 ### Test Class 3: Integration (Tape vs Hand-Written Backward)
 
-```
+```text
 -- Verifies that the tape produces IDENTICAL gradients to the existing
 -- hand-written cms_backward(). This is the critical validation that
 -- the tape correctly composes all VJPs through the actual execution path.
@@ -780,7 +780,7 @@ fn test_tape_matches_handwritten() {
 
 ## Migration Path
 
-```
+```text
 Phase 1: tape.rs core + VJP rules + opaque registrations + unit tests
   -- New files: core/src/tape.rs
   -- Implements: Tape, TapeOp, TapeBuf, BufId, with_tape()
@@ -828,7 +828,7 @@ Phase 5: Cleanup
 
 ## Relationship to Existing Specs
 
-```
+```text
 00_enzyme_integration.md:
   -- Mechanism 1 SUPERSEDED by this spec (Enzyme → tape)
   -- Mechanism 2 UNCHANGED (kernel pairs, hand-written backward)
