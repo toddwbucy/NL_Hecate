@@ -1441,6 +1441,20 @@ impl GpuModel {
     fn adamw_step(&self) -> u32 {
         self.adamw_state.as_ref().map_or(0, |s| s.step)
     }
+
+    /// Read gate biases from GPU: returns Vec of (b_alpha, b_theta, b_eta) per level.
+    /// Small D2H transfer: 3 floats per level. Used for monitoring gate behavior.
+    fn gate_biases(&self) -> Vec<(f32, f32, f32)> {
+        self.params.levels.iter().map(|level| {
+            let mut ba = [0.0f32; 1];
+            let mut bt = [0.0f32; 1];
+            let mut be = [0.0f32; 1];
+            level.b_alpha.copy_to_host(&mut ba);
+            level.b_theta.copy_to_host(&mut bt);
+            level.b_eta.copy_to_host(&mut be);
+            (ba[0], bt[0], be[0])
+        }).collect()
+    }
 }
 
 // ── Module ───────────────────────────────────────────────────────────

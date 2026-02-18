@@ -22,7 +22,9 @@
         "max_grad_norm": 1.0,
         "weight_decay": 0.1,
         "save_path": "checkpoints/sharegpt_32k.json",
-        "log_file": "runs/sharegpt_32k.jsonl"
+        "log_file": "runs/sharegpt_32k.jsonl",
+        "eval_every": 1000,
+        "eval_max_chunks": 100
     },
     "data": {
         "path": "data/sharegpt",
