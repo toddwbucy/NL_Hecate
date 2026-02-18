@@ -78,6 +78,9 @@ pub fn level_params_from_flat(flat: &[f32], d: usize) -> MemoryLevelParams {
     // w_freq/b_freq: consume remaining (0 if Fixed schedule, d+1 if Learned)
     let remaining = flat.len() - offset;
     let (w_freq, b_freq) = if remaining > 0 {
+        debug_assert_eq!(remaining, d + 1,
+            "malformed level_params buffer: expected 0 or {} trailing elements, got {}",
+            d + 1, remaining);
         (take(&mut offset, d), take(&mut offset, 1))
     } else {
         (vec![], vec![])
