@@ -1038,4 +1038,433 @@ mod tests {
         let grad = tape.get_grad(a).unwrap();
         assert!((grad[0] - 5.0).abs() < 1e-6, "d_a={} expected 5", grad[0]);
     }
+
+    // ── P1.5: Standard op VJP tests ──────────────────────────────────
+
+    fn assert_close(actual: &[f32], expected: &[f32], tol: f32, msg: &str) {
+        assert_eq!(actual.len(), expected.len(), "{msg}: length mismatch");
+        for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert!((a - e).abs() < tol,
+                    "{msg}[{i}]: actual={a} expected={e} diff={}",
+                    (a - e).abs());
+        }
+    }
+
+    #[test]
+    fn test_backward_sub() {
+        // out = a - b, d_a = d_out, d_b = -d_out
+        let mut tape = Tape::new_empty();
+        let a = tape.alloc(vec![5.0, 3.0], vec![2]);
+        let b = tape.alloc(vec![2.0, 1.0], vec![2]);
+        let out = tape.alloc(vec![3.0, 2.0], vec![2]);
+        tape.record(TapeOp::Sub { a, b, out });
+        tape.seed_grad(out, vec![1.0, 2.0]);
+        tape.backward(out);
+        assert_close(tape.get_grad(a).unwrap(), &[1.0, 2.0], 1e-6, "d_a");
+        assert_close(tape.get_grad(b).unwrap(), &[-1.0, -2.0], 1e-6, "d_b");
+    }
+
+    #[test]
+    fn test_backward_negate() {
+        let mut tape = Tape::new_empty();
+        let input = tape.alloc(vec![3.0, -2.0], vec![2]);
+        let out = tape.alloc(vec![-3.0, 2.0], vec![2]);
+        tape.record(TapeOp::Negate { input, out });
+        tape.seed_grad(out, vec![1.0, 1.0]);
+        tape.backward(out);
+        assert_close(tape.get_grad(input).unwrap(), &[-1.0, -1.0], 1e-6, "d_input");
+    }
+
+    #[test]
+    fn test_backward_softplus() {
+        // softplus(x) = log(1 + exp(x)), d_x = d_out * sigmoid(x)
+        let x_vals = vec![0.0, 1.0, -1.0];
+        let out_vals: Vec<f32> = x_vals.iter().map(|&x: &f32| (1.0 + x.exp()).ln()).collect();
+        let mut tape = Tape::new_empty();
+        let input = tape.alloc(x_vals.clone(), vec![3]);
+        let out = tape.alloc(out_vals, vec![3]);
+        tape.record(TapeOp::Softplus { input, out });
+        tape.seed_grad(out, vec![1.0, 1.0, 1.0]);
+        tape.backward(out);
+        let expected: Vec<f32> = x_vals.iter()
+            .map(|&x| tensor::sigmoid_f32(x)).collect();
+        assert_close(tape.get_grad(input).unwrap(), &expected, 1e-5, "softplus_grad");
+    }
+
+    #[test]
+    fn test_backward_silu() {
+        // silu(x) = x * sigmoid(x), d_x = sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))
+        let x_vals = vec![0.0, 1.0, -1.0, 2.0];
+        let out_vals: Vec<f32> = x_vals.iter()
+            .map(|&x| x * tensor::sigmoid_f32(x)).collect();
+        let mut tape = Tape::new_empty();
+        let input = tape.alloc(x_vals.clone(), vec![4]);
+        let out = tape.alloc(out_vals, vec![4]);
+        tape.record(TapeOp::SiLU { input, out });
+        tape.seed_grad(out, vec![1.0; 4]);
+        tape.backward(out);
+        let expected: Vec<f32> = x_vals.iter().map(|&x| {
+            let s = tensor::sigmoid_f32(x);
+            s + x * s * (1.0 - s)
+        }).collect();
+        assert_close(tape.get_grad(input).unwrap(), &expected, 1e-5, "silu_grad");
+    }
+
+    #[test]
+    fn test_backward_softmax() {
+        // 1 row, 3 cols. softmax([1, 2, 3])
+        let x = vec![1.0, 2.0, 3.0];
+        let max_x = 3.0f32;
+        let exps: Vec<f32> = x.iter().map(|v| (v - max_x).exp()).collect();
+        let sum: f32 = exps.iter().sum();
+        let sm: Vec<f32> = exps.iter().map(|e| e / sum).collect();
+        let mut tape = Tape::new_empty();
+        let input = tape.alloc(x, vec![1, 3]);
+        let out = tape.alloc(sm.clone(), vec![1, 3]);
+        tape.record(TapeOp::Softmax { input, out, rows: 1, cols: 3 });
+        // Seed with [1, 0, 0] → asking d_loss/d_input when loss = softmax[0]
+        tape.seed_grad(out, vec![1.0, 0.0, 0.0]);
+        tape.backward(out);
+        let grad = tape.get_grad(input).unwrap();
+        // d_x[i] = sm[i] * (d_out[i] - sum(d_out * sm))
+        let dot: f32 = sm[0]; // d_out=[1,0,0], sm[0]*1
+        let expected: Vec<f32> = sm.iter().enumerate()
+            .map(|(i, &s)| s * (if i == 0 { 1.0 } else { 0.0 } - dot)).collect();
+        assert_close(grad, &expected, 1e-5, "softmax_grad");
+    }
+
+    #[test]
+    fn test_backward_cross_entropy() {
+        // 2 tokens, vocab=3. logits=[[1,2,3],[2,1,0]], targets=[2,0]
+        let logits = vec![1.0, 2.0, 3.0, 2.0, 1.0, 0.0];
+        let targets = vec![2usize, 0];
+        // Compute loss manually
+        let mut loss = 0.0f32;
+        for t in 0..2 {
+            let base = t * 3;
+            let row = &logits[base..base + 3];
+            let max_v = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let sum_e: f32 = row.iter().map(|v| (v - max_v).exp()).sum();
+            loss -= ((row[targets[t]] - max_v).exp() / sum_e).ln();
+        }
+        loss /= 2.0; // mean over 2 tokens
+
+        let mut tape = Tape::new_empty();
+        let logit_buf = tape.alloc(logits, vec![2, 3]);
+        let out = tape.alloc(vec![loss], vec![1]);
+        tape.record(TapeOp::CrossEntropy {
+            logits: logit_buf, targets: targets.clone(), out, vocab_size: 3,
+        });
+        tape.backward(out);
+        let grad = tape.get_grad(logit_buf).unwrap();
+
+        // Verify via FD
+        let logits_orig = vec![1.0, 2.0, 3.0, 2.0, 1.0, 0.0];
+        let eps = 1e-3;
+        for idx in 0..6 {
+            let mut logits_p = logits_orig.clone();
+            logits_p[idx] += eps;
+            let mut logits_m = logits_orig.clone();
+            logits_m[idx] -= eps;
+            let loss_fn = |lg: &[f32]| -> f32 {
+                let mut l = 0.0f32;
+                for t in 0..2 {
+                    let base = t * 3;
+                    let row = &lg[base..base + 3];
+                    let max_v = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let sum_e: f32 = row.iter().map(|v| (v - max_v).exp()).sum();
+                    l -= ((row[targets[t]] - max_v).exp() / sum_e).ln();
+                }
+                l / 2.0
+            };
+            let fd = (loss_fn(&logits_p) - loss_fn(&logits_m)) / (2.0 * eps);
+            assert!((grad[idx] - fd).abs() < 1e-3,
+                    "cross_entropy_grad[{idx}]: tape={} fd={}", grad[idx], fd);
+        }
+    }
+
+    #[test]
+    fn test_backward_embed_lookup() {
+        // vocab=3, d=2. indices=[0, 2, 0]. table=[[1,2],[3,4],[5,6]]
+        let table = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let indices = vec![0usize, 2, 0];
+        // out = [[1,2],[5,6],[1,2]]
+        let out_data = vec![1.0, 2.0, 5.0, 6.0, 1.0, 2.0];
+        let mut tape = Tape::new_empty();
+        let table_buf = tape.alloc(table, vec![3, 2]);
+        let out = tape.alloc(out_data, vec![3, 2]);
+        tape.record(TapeOp::EmbedLookup {
+            table: table_buf, indices, out, vocab_size: 3, d: 2,
+        });
+        // d_out = ones → scatter-add
+        tape.seed_grad(out, vec![1.0; 6]);
+        tape.backward(out);
+        let grad = tape.get_grad(table_buf).unwrap();
+        // tok 0 appears at t=0 and t=2 → d_table[0] = [2, 2]
+        // tok 1 never appears → d_table[1] = [0, 0]
+        // tok 2 appears at t=1 → d_table[2] = [1, 1]
+        assert_close(grad, &[2.0, 2.0, 0.0, 0.0, 1.0, 1.0], 1e-6, "embed_grad");
+    }
+
+    #[test]
+    fn test_backward_l2_norm() {
+        // x = [3, 4], norm = 5, d_x = d_out * x / norm
+        let mut tape = Tape::new_empty();
+        let input = tape.alloc(vec![3.0, 4.0], vec![2]);
+        let out = tape.alloc(vec![5.0], vec![1]);
+        tape.record(TapeOp::L2Norm { input, out });
+        tape.seed_grad(out, vec![1.0]);
+        tape.backward(out);
+        assert_close(tape.get_grad(input).unwrap(), &[0.6, 0.8], 1e-6, "l2norm_grad");
+    }
+
+    #[test]
+    fn test_backward_l2_norm_zero() {
+        // Near-zero input: gradient should be zero (not NaN/Inf)
+        let mut tape = Tape::new_empty();
+        let input = tape.alloc(vec![0.0, 0.0], vec![2]);
+        let out = tape.alloc(vec![0.0], vec![1]);
+        tape.record(TapeOp::L2Norm { input, out });
+        tape.seed_grad(out, vec![1.0]);
+        tape.backward(out);
+        let grad = tape.get_grad(input).unwrap();
+        assert_close(grad, &[0.0, 0.0], 1e-6, "l2norm_zero_grad");
+    }
+
+    #[test]
+    fn test_backward_l2_retention() {
+        // out = lambda * input, d_input = lambda * d_out
+        let mut tape = Tape::new_empty();
+        let input = tape.alloc(vec![1.0, 2.0, 3.0], vec![3]);
+        let out = tape.alloc(vec![0.9, 1.8, 2.7], vec![3]);
+        tape.record(TapeOp::L2Retention { input, lambda: 0.9, out });
+        tape.seed_grad(out, vec![1.0, 1.0, 1.0]);
+        tape.backward(out);
+        assert_close(tape.get_grad(input).unwrap(), &[0.9, 0.9, 0.9], 1e-6, "l2ret_grad");
+    }
+
+    #[test]
+    fn test_backward_transpose() {
+        // A = [[1,2,3],[4,5,6]] (2x3), out = A^T (3x2)
+        let mut tape = Tape::new_empty();
+        let input = tape.alloc(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
+        let out = tape.alloc(vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0], vec![3, 2]);
+        tape.record(TapeOp::Transpose { input, out, rows: 2, cols: 3 });
+        // d_out (3x2) = [[1,2],[3,4],[5,6]]
+        tape.seed_grad(out, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        tape.backward(out);
+        // d_input = d_out^T (2x3) = [[1,3,5],[2,4,6]]
+        assert_close(tape.get_grad(input).unwrap(),
+                     &[1.0, 3.0, 5.0, 2.0, 4.0, 6.0], 1e-6, "transpose_grad");
+    }
+
+    #[test]
+    fn test_backward_outer_product() {
+        // a = [1, 2], b = [3, 4, 5], out = a ⊗ b (2x3)
+        // out = [[3,4,5],[6,8,10]]
+        let mut tape = Tape::new_empty();
+        let a = tape.alloc(vec![1.0, 2.0], vec![2]);
+        let b = tape.alloc(vec![3.0, 4.0, 5.0], vec![3]);
+        let out = tape.alloc(vec![3.0, 4.0, 5.0, 6.0, 8.0, 10.0], vec![2, 3]);
+        tape.record(TapeOp::OuterProduct { a, b, out });
+        // d_out = ones(2x3)
+        tape.seed_grad(out, vec![1.0; 6]);
+        tape.backward(out);
+        // d_a[i] = sum_j(b[j]) = 12
+        // d_b[j] = sum_i(a[i]) = 3
+        assert_close(tape.get_grad(a).unwrap(), &[12.0, 12.0], 1e-6, "d_a");
+        assert_close(tape.get_grad(b).unwrap(), &[3.0, 3.0, 3.0], 1e-6, "d_b");
+    }
+
+    #[test]
+    fn test_backward_frobenius_dot() {
+        // out = sum(A * B) (scalar). A=[1,2,3], B=[4,5,6]. out=32
+        let mut tape = Tape::new_empty();
+        let a = tape.alloc(vec![1.0, 2.0, 3.0], vec![3]);
+        let b = tape.alloc(vec![4.0, 5.0, 6.0], vec![3]);
+        let out = tape.alloc(vec![32.0], vec![1]);
+        tape.record(TapeOp::FrobeniusDot { a, b, out });
+        tape.seed_grad(out, vec![1.0]);
+        tape.backward(out);
+        // d_A = d_out * B = B, d_B = d_out * A = A
+        assert_close(tape.get_grad(a).unwrap(), &[4.0, 5.0, 6.0], 1e-6, "d_a");
+        assert_close(tape.get_grad(b).unwrap(), &[1.0, 2.0, 3.0], 1e-6, "d_b");
+    }
+
+    #[test]
+    fn test_backward_concat() {
+        // Concat [a(2), b(3)] → out(5)
+        let mut tape = Tape::new_empty();
+        let a = tape.alloc(vec![1.0, 2.0], vec![2]);
+        let b = tape.alloc(vec![3.0, 4.0, 5.0], vec![3]);
+        let out = tape.alloc(vec![1.0, 2.0, 3.0, 4.0, 5.0], vec![5]);
+        tape.record(TapeOp::Concat { inputs: vec![a, b], out, axis: 0, sizes: vec![2, 3] });
+        tape.seed_grad(out, vec![10.0, 20.0, 30.0, 40.0, 50.0]);
+        tape.backward(out);
+        assert_close(tape.get_grad(a).unwrap(), &[10.0, 20.0], 1e-6, "d_a");
+        assert_close(tape.get_grad(b).unwrap(), &[30.0, 40.0, 50.0], 1e-6, "d_b");
+    }
+
+    #[test]
+    fn test_backward_slice() {
+        // input(5) → slice at offset=1, len=3 → out(3)
+        let mut tape = Tape::new_empty();
+        let input = tape.alloc(vec![1.0, 2.0, 3.0, 4.0, 5.0], vec![5]);
+        let out = tape.alloc(vec![2.0, 3.0, 4.0], vec![3]);
+        tape.record(TapeOp::Slice { input, out, offset: 1, len: 3, input_len: 5 });
+        tape.seed_grad(out, vec![10.0, 20.0, 30.0]);
+        tape.backward(out);
+        assert_close(tape.get_grad(input).unwrap(),
+                     &[0.0, 10.0, 20.0, 30.0, 0.0], 1e-6, "slice_grad");
+    }
+
+    // ── P1.6: NL-specific op VJP tests ───────────────────────────────
+
+    #[test]
+    fn test_backward_normalized_silu() {
+        // NormalizedSiLU: y = silu(x), out = y / ||y||
+        // Verify via FD
+        let x_vals = vec![1.0, -0.5, 2.0];
+        let silu = |x: f32| -> f32 { x * tensor::sigmoid_f32(x) };
+        let normalized_silu = |x: &[f32]| -> Vec<f32> {
+            let y: Vec<f32> = x.iter().map(|&v| silu(v)).collect();
+            let norm = y.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-8);
+            y.iter().map(|v| v / norm).collect()
+        };
+        let out_vals = normalized_silu(&x_vals);
+
+        let mut tape = Tape::new_empty();
+        let input = tape.alloc(x_vals.clone(), vec![3]);
+        let out = tape.alloc(out_vals, vec![3]);
+        tape.record(TapeOp::NormalizedSiLU { input, out });
+        tape.seed_grad(out, vec![1.0, 0.0, 0.0]); // gradient only on first element
+        tape.backward(out);
+        let grad = tape.get_grad(input).unwrap();
+
+        // FD check
+        let eps = 1e-3;
+        // Loss = normalized_silu(x)[0]
+        let loss = |x: &[f32]| -> f32 { normalized_silu(x)[0] };
+        for i in 0..3 {
+            let mut x_p = x_vals.clone();
+            x_p[i] += eps;
+            let mut x_m = x_vals.clone();
+            x_m[i] -= eps;
+            let fd = (loss(&x_p) - loss(&x_m)) / (2.0 * eps);
+            assert!((grad[i] - fd).abs() < 1e-3,
+                    "normalized_silu_grad[{i}]: tape={} fd={}", grad[i], fd);
+        }
+    }
+
+    #[test]
+    fn test_backward_sphere_project_normalize() {
+        // 2 slots of dim 2: input = [3, 4, 0, 5]
+        // slot0: [3,4] → norm=5 → [0.6, 0.8]
+        // slot1: [0,5] → norm=5 → [0.0, 1.0]
+        let x = vec![3.0, 4.0, 0.0, 5.0];
+        let out_vals = vec![0.6, 0.8, 0.0, 1.0];
+        let mut tape = Tape::new_empty();
+        let input = tape.alloc(x.clone(), vec![4]);
+        let out = tape.alloc(out_vals, vec![4]);
+        tape.record(TapeOp::SphereProjectNormalize { input, out, d: 2, m_slots: 2 });
+        tape.seed_grad(out, vec![1.0, 0.0, 0.0, 1.0]);
+        tape.backward(out);
+        let grad = tape.get_grad(input).unwrap();
+
+        // FD check
+        let sphere_proj = |x: &[f32]| -> Vec<f32> {
+            let mut out = vec![0.0f32; 4];
+            for slot in 0..2 {
+                let base = slot * 2;
+                let norm = (x[base] * x[base] + x[base + 1] * x[base + 1]).sqrt().max(1e-8);
+                out[base] = x[base] / norm;
+                out[base + 1] = x[base + 1] / norm;
+            }
+            out
+        };
+        // loss = sphere_proj(x)[0] + sphere_proj(x)[3]
+        let loss = |x: &[f32]| -> f32 {
+            let sp = sphere_proj(x);
+            sp[0] + sp[3]
+        };
+        let eps = 1e-3;
+        for i in 0..4 {
+            let mut x_p = x.clone();
+            x_p[i] += eps;
+            let mut x_m = x.clone();
+            x_m[i] -= eps;
+            let fd = (loss(&x_p) - loss(&x_m)) / (2.0 * eps);
+            assert!((grad[i] - fd).abs() < 1e-3,
+                    "sphere_proj_grad[{i}]: tape={} fd={}", grad[i], fd);
+        }
+    }
+
+    #[test]
+    fn test_backward_kl_retention() {
+        // Single-row: z = alpha * log(prior) - theta * input, out = softmax(z)
+        let input = vec![0.1, 0.2, 0.3];
+        let prior = vec![0.5, 0.3, 0.2];
+        let alpha = 1.0f32;
+        let theta = 0.5f32;
+        // z_j = alpha * ln(prior_j) - theta * input_j
+        let z: Vec<f32> = prior.iter().zip(input.iter())
+            .map(|(&p, &g): (&f32, &f32)| alpha * p.max(1e-8).ln() - theta * g).collect();
+        let max_z = z.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = z.iter().map(|v| (v - max_z).exp()).collect();
+        let sum: f32 = exps.iter().sum();
+        let out_vals: Vec<f32> = exps.iter().map(|e| e / sum).collect();
+
+        let mut tape = Tape::new_empty();
+        let input_buf = tape.alloc(input.clone(), vec![3]);
+        let prior_buf = tape.alloc(prior.clone(), vec![3]);
+        let out_buf = tape.alloc(out_vals, vec![3]);
+        tape.record(TapeOp::KLRetention {
+            input: input_buf, prior: prior_buf, alpha, theta, out: out_buf,
+        });
+        tape.seed_grad(out_buf, vec![1.0, 0.0, 0.0]);
+        tape.backward(out_buf);
+        let grad_input = tape.get_grad(input_buf).unwrap();
+        let grad_prior = tape.get_grad(prior_buf).unwrap();
+
+        // FD check
+        let kl_ret = |inp: &[f32], pr: &[f32]| -> Vec<f32> {
+            let z: Vec<f32> = pr.iter().zip(inp.iter())
+                .map(|(&p, &g): (&f32, &f32)| alpha * p.max(1e-8).ln() - theta * g).collect();
+            let max_z = z.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = z.iter().map(|v| (v - max_z).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            exps.iter().map(|e| e / sum).collect()
+        };
+        let loss = |inp: &[f32], pr: &[f32]| -> f32 { kl_ret(inp, pr)[0] };
+        let eps = 1e-3;
+        for i in 0..3 {
+            let mut inp_p = input.clone(); inp_p[i] += eps;
+            let mut inp_m = input.clone(); inp_m[i] -= eps;
+            let fd = (loss(&inp_p, &prior) - loss(&inp_m, &prior)) / (2.0 * eps);
+            assert!((grad_input[i] - fd).abs() < 1e-3,
+                    "kl_ret_d_input[{i}]: tape={} fd={}", grad_input[i], fd);
+
+            let mut pr_p = prior.clone(); pr_p[i] += eps;
+            let mut pr_m = prior.clone(); pr_m[i] -= eps;
+            let fd = (loss(&input, &pr_p) - loss(&input, &pr_m)) / (2.0 * eps);
+            assert!((grad_prior[i] - fd).abs() < 1e-3,
+                    "kl_ret_d_prior[{i}]: tape={} fd={}", grad_prior[i], fd);
+        }
+    }
+
+    #[test]
+    fn test_backward_straight_through_bool() {
+        // Forward: out = (x > 0.5) as f32. Backward: d_input = d_out (straight-through).
+        let x = vec![0.2, 0.7, 0.4, 0.9];
+        let out_vals = vec![0.0, 1.0, 0.0, 1.0];
+        let mut tape = Tape::new_empty();
+        let input = tape.alloc(x, vec![4]);
+        let out = tape.alloc(out_vals, vec![4]);
+        tape.record(TapeOp::StraightThroughBool { input, threshold: 0.5, out });
+        tape.seed_grad(out, vec![1.0, 2.0, 3.0, 4.0]);
+        tape.backward(out);
+        // Straight-through: gradient passes unchanged
+        assert_close(tape.get_grad(input).unwrap(), &[1.0, 2.0, 3.0, 4.0],
+                     1e-6, "st_bool_grad");
+    }
 }
