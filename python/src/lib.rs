@@ -637,8 +637,8 @@ fn validate_mag_seq_lens(cfg: &MAGConfig, input_ids: &[usize], target_ids: &[usi
     }
     // Validate input_ids bounds (OOB embedding reads are unsafe memory access).
     // target_ids are NOT validated: the CUDA cross-entropy kernel safely skips
-    // target < 0 or target >= vocab (zeros grad, skips loss). This allows
-    // masked targets (vocab_size sentinel) for loss masking on user turns.
+    // target >= vocab (zeros grad, skips loss). This allows masked targets
+    // (vocab_size sentinel) for loss masking on user turns.
     for (i, &tok) in input_ids.iter().enumerate() {
         if tok >= vocab {
             return Err(PyValueError::new_err(format!(
@@ -1231,6 +1231,7 @@ struct GpuModel {
     cfg: nl_hecate_core::model::MAGConfig,
     adamw_state: Option<nl_hecate_core::gpu_optimizer::GpuAdamWState>,
     kv_cache: Option<nl_hecate_core::gpu_forward::GpuKVCache>,
+    decode_workspace: Option<nl_hecate_core::gpu_forward::DecodeWorkspace>,
 }
 
 #[cfg(feature = "cuda")]
@@ -1249,6 +1250,7 @@ impl GpuModel {
             cfg: cfg.inner.clone(),
             adamw_state: None,
             kv_cache: None,
+            decode_workspace: None,
         })
     }
 
@@ -1263,6 +1265,7 @@ impl GpuModel {
             cfg: cfg.inner.clone(),
             adamw_state: None,
             kv_cache: None,
+            decode_workspace: None,
         })
     }
 
@@ -1465,6 +1468,9 @@ impl GpuModel {
             &pulse.inner, &mut self.context,
         );
         self.kv_cache = Some(kv_cache);
+        // Create decode workspace once (reused for every decode_token call)
+        let d = self.cfg.swa.d_model;
+        self.decode_workspace = Some(nl_hecate_core::gpu_forward::DecodeWorkspace::new(d, v));
         Ok(logits)
     }
 
@@ -1479,16 +1485,20 @@ impl GpuModel {
         let kv_cache = self.kv_cache.as_mut().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err("KV cache not initialized — call prefill() first")
         })?;
+        let workspace = self.decode_workspace.as_mut().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("Decode workspace not initialized — call prefill() first")
+        })?;
         let logits = nl_hecate_core::gpu_forward::gpu_single_token_forward(
             &self.params, &self.cfg, token_id,
-            &pulse.inner, &mut self.context, kv_cache,
+            &pulse.inner, &mut self.context, kv_cache, workspace,
         );
         Ok(logits)
     }
 
-    /// Clear the KV cache. Call between generation sequences.
+    /// Clear the KV cache and decode workspace. Call between generation sequences.
     fn reset_cache(&mut self) {
         self.kv_cache = None;
+        self.decode_workspace = None;
     }
 
     /// Read gate biases from GPU: returns Vec of (b_alpha, b_theta, b_eta) per level.

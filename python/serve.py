@@ -119,11 +119,9 @@ def generate_cached(
     vocab = cfg.vocab_size
     seq_len = cfg.seq_len
 
-    owns_conductor = False
     if conductor is None:
         conductor = nl_hecate.Conductor(
             cfg.k, list(cfg.chunk_sizes) if hasattr(cfg, 'chunk_sizes') else [1] * cfg.k)
-        owns_conductor = True
 
     try:
         # Pad/truncate prompt to seq_len for prefill
@@ -200,7 +198,6 @@ def generate(
     seq_len = cfg.seq_len
 
     # CMS conductor for pulse generation — use external if provided
-    owns_conductor = False
     if conductor is None and use_cms:
         conductor = nl_hecate.Conductor(cfg.k, list(cfg.chunk_sizes) if hasattr(cfg, 'chunk_sizes') else [1] * cfg.k)
         owns_conductor = True
@@ -252,11 +249,11 @@ def _sample_token(logits: list[float], vocab: int, temperature: float,
         indexed = indexed[:top_k]
 
     # Temperature-scaled softmax
-    max_l = max(l for _, l in indexed)
-    weighted = [(idx, math.exp((l - max_l) / temperature)) for idx, l in indexed]
+    max_logit = max(logit for _, logit in indexed)
+    weighted = [(idx, math.exp((logit - max_logit) / temperature)) for idx, logit in indexed]
     total = sum(w for _, w in weighted)
 
-    r = random.random() * total
+    r = random.random() * total  # noqa: S311
     cumsum = 0.0
     for idx, w in weighted:
         cumsum += w
@@ -268,14 +265,24 @@ def _sample_token(logits: list[float], vocab: int, temperature: float,
 # ── ChatML helpers ────────────────────────────────────────────────
 
 def chatml_encode_turn(tokenizer, role: str, content: str) -> list[int]:
-    """Encode a single ChatML turn: <|im_start|>role\ncontent<|im_end|>\n"""
-    text = f"<|im_start|>{role}\n{content}<|im_end|>\n"
-    return tokenizer.encode(text)
+    """Encode a single ChatML turn using explicit special token IDs.
+
+    Mirrors prepare_sharegpt.py's format_chatml() to avoid BPE splitting
+    special token strings into sub-tokens.
+    """
+    ids = [IM_START]
+    ids.extend(tokenizer.encode(f"{role}\n"))
+    ids.extend(tokenizer.encode(content))
+    ids.append(IM_END)
+    ids.extend(tokenizer.encode("\n"))
+    return ids
 
 
 def chatml_encode_prompt(tokenizer, role: str) -> list[int]:
-    """Encode the start of a turn (no content, no end): <|im_start|>role\n"""
-    return tokenizer.encode(f"<|im_start|>{role}\n")
+    """Encode the start of a turn (no content, no end): <|im_start|>role\\n"""
+    ids = [IM_START]
+    ids.extend(tokenizer.encode(f"{role}\n"))
+    return ids
 
 
 # ── Chat mode ─────────────────────────────────────────────────────
