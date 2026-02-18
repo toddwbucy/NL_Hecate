@@ -1202,4 +1202,262 @@ mod tests {
         assert_eq!((Trellis { d_k: 3, lambda_k: 0.01, lambda_v: 0.01 }).opaque_key(), OpaqueKey::Trellis);
         assert_eq!(AtlasOmega.opaque_key(), OpaqueKey::AtlasOmega);
     }
+
+    // ── Class 1: Tape Isolation Tests (P1.9) ────────────────────────
+    //
+    // Spec §Testing Strategy, Class 1: "Opaque block is sole gradient source."
+    // For each opaque key: forward with tape, seed backward, verify tape
+    // gradient matches the analytical backward EXACTLY (tight tolerance).
+    // Any mismatch = tape leaked through barrier or adapter is wrong.
+    //
+    // Tighter tolerance than P1.8 round-trip tests: rtol=1e-6, atol=1e-8.
+
+    fn assert_close(tape_v: f32, direct_v: f32, label: &str, idx: usize) {
+        let diff = (tape_v - direct_v).abs();
+        let rtol = 1e-6 * direct_v.abs();
+        let atol = 1e-8;
+        assert!(diff < rtol.max(atol),
+            "Class 1 isolation failure at {}[{}]: tape={:.8e} direct={:.8e} diff={:.8e}",
+            label, idx, tape_v, direct_v, diff);
+    }
+
+    /// Class 1: tight-tolerance isolation test for active memory rules.
+    fn assert_class1_isolation<R: MemoryRule>(
+        rule: &R, d: usize, seq_len: usize,
+    ) {
+        let params = make_test_params(d);
+        let embedded = make_test_embedded(seq_len, d);
+
+        // Direct path
+        let (y_direct, cache) = rule.step(&params, &embedded, seq_len, d, None);
+        let d_y = vec![1.0f32; seq_len * d];
+        let (param_grads_direct, d_embedded_direct) =
+            rule.step_backward(&params, &cache, &d_y, &embedded);
+
+        // Tape path
+        let registry = register_opaque_vjps();
+        let y_tape = crate::tape::with_tape(registry, |tape| {
+            let (y, y_id, emb_in, lp_in) =
+                rule.record_on_tape(tape, &params, &embedded, seq_len, d, None);
+
+            tape.seed_grad(y_id, d_y.clone());
+            tape.backward(y_id);
+
+            let d_emb_tape = tape.get_grad(emb_in)
+                .expect("embedded should have gradient");
+            let d_lp_tape = tape.get_grad(lp_in)
+                .expect("level_params should have gradient");
+
+            // Tight tolerance comparison
+            assert_eq!(d_emb_tape.len(), d_embedded_direct.len());
+            for (i, (&tv, &dv)) in d_emb_tape.iter().zip(d_embedded_direct.iter()).enumerate() {
+                assert_close(tv, dv, "d_embedded", i);
+            }
+
+            let lp_grads_direct = level_params_grads_to_flat(&param_grads_direct);
+            assert_eq!(d_lp_tape.len(), lp_grads_direct.len());
+            for (i, (&tv, &dv)) in d_lp_tape.iter().zip(lp_grads_direct.iter()).enumerate() {
+                assert_close(tv, dv, "d_level_params", i);
+            }
+
+            // Isolation check: only input buffers (emb_in, lp_in) should have gradients.
+            // All other non-output buffers should have None (no leakage).
+            for buf_id in 0..tape.num_bufs() {
+                if buf_id == emb_in || buf_id == lp_in || buf_id == y_id {
+                    continue;
+                }
+                // Saved buffers and metadata should NOT accumulate gradient
+                if let Some(grad) = tape.get_grad(buf_id) {
+                    let nonzero = grad.iter().any(|&g| g.abs() > 1e-30);
+                    assert!(!nonzero,
+                        "Gradient leaked to non-input buf {}: norm={}",
+                        buf_id, grad.iter().map(|g| g * g).sum::<f32>().sqrt());
+                }
+            }
+
+            y
+        });
+
+        // Forward identical
+        for (i, (&a, &b)) in y_tape.iter().zip(y_direct.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-7, "y[{}]: tape={} direct={}", i, a, b);
+        }
+    }
+
+    #[test]
+    fn test_class1_delta_rule() { assert_class1_isolation(&DeltaRule, 4, 3); }
+    #[test]
+    fn test_class1_titans_lmm() { assert_class1_isolation(&TitansLMM, 4, 3); }
+    #[test]
+    fn test_class1_hebbian() { assert_class1_isolation(&HebbianRule, 4, 3); }
+    #[test]
+    fn test_class1_moneta() { assert_class1_isolation(&Moneta { d_hidden: 8, lp_p: 2.0, lambda_2: 0.01 }, 4, 3); }
+    #[test]
+    fn test_class1_yaad() { assert_class1_isolation(&YAAD { d_hidden: 8, delta: 0.9, lambda_local: 0.1, lambda_2: 0.01 }, 4, 3); }
+    #[test]
+    fn test_class1_memora() { assert_class1_isolation(&MEMORA { d_hidden: 8 }, 4, 3); }
+    #[test]
+    fn test_class1_lattice_osr() { assert_class1_isolation(&LatticeOSR { m_slots: 3 }, 4, 3); }
+    #[test]
+    fn test_class1_trellis() { assert_class1_isolation(&Trellis { d_k: 3, lambda_k: 0.01, lambda_v: 0.01 }, 4, 3); }
+    #[test]
+    fn test_class1_atlas_omega() { assert_class1_isolation(&AtlasOmega, 4, 3); }
+
+    // ── Class 1: SWA isolation ──────────────────────────────────────
+
+    #[test]
+    fn test_class1_swa() {
+        use crate::tensor::SimpleRng;
+        let seq_len = 4;
+        let num_heads = 2;
+        let head_dim = 3;
+        let window_size = 3;
+        let full_dim = seq_len * num_heads * head_dim;
+
+        let mut rng = SimpleRng::new(77);
+        let mut q = vec![0.0f32; full_dim];
+        let mut k = vec![0.0f32; full_dim];
+        let mut v = vec![0.0f32; full_dim];
+        rng.fill_uniform(&mut q, 0.5);
+        rng.fill_uniform(&mut k, 0.5);
+        rng.fill_uniform(&mut v, 0.5);
+
+        // Direct forward + backward
+        let mut attn_out = vec![0.0f32; full_dim];
+        let mut attn_weights = vec![0.0f32; num_heads * seq_len * window_size];
+        crate::swa::swa_forward(
+            &q, &k, &v, &mut attn_out, &mut attn_weights,
+            seq_len, num_heads, head_dim, window_size,
+        );
+
+        let d_attn_out = vec![1.0f32; full_dim];
+        let mut d_q_direct = vec![0.0f32; full_dim];
+        let mut d_k_direct = vec![0.0f32; full_dim];
+        let mut d_v_direct = vec![0.0f32; full_dim];
+        crate::swa::swa_backward_rust(
+            &q, &k, &v, &attn_weights, &d_attn_out,
+            &mut d_q_direct, &mut d_k_direct, &mut d_v_direct,
+            seq_len, num_heads, head_dim, window_size,
+        );
+
+        // Tape path: manually record SWA opaque op
+        let registry = register_opaque_vjps();
+        crate::tape::with_tape(registry, |tape| {
+            let q_in = tape.register_input(&q, vec![seq_len, num_heads * head_dim]);
+            let k_in = tape.register_input(&k, vec![seq_len, num_heads * head_dim]);
+            let v_in = tape.register_input(&v, vec![seq_len, num_heads * head_dim]);
+
+            let meta = vec![seq_len as f32, num_heads as f32, head_dim as f32, window_size as f32];
+            let meta_id = tape.alloc(meta, vec![]);
+            let q_saved = tape.alloc(q.clone(), vec![]);
+            let k_saved = tape.alloc(k.clone(), vec![]);
+            let v_saved = tape.alloc(v.clone(), vec![]);
+            let aw_saved = tape.alloc(attn_weights.clone(), vec![]);
+            let out_id = tape.alloc(attn_out.clone(), vec![seq_len, num_heads * head_dim]);
+
+            tape.record_opaque(OpaqueKey::SWA,
+                vec![q_in, k_in, v_in],
+                vec![out_id],
+                vec![meta_id, q_saved, k_saved, v_saved, aw_saved]);
+
+            tape.seed_grad(out_id, d_attn_out.clone());
+            tape.backward(out_id);
+
+            let d_q_tape = tape.get_grad(q_in).expect("q should have gradient");
+            let d_k_tape = tape.get_grad(k_in).expect("k should have gradient");
+            let d_v_tape = tape.get_grad(v_in).expect("v should have gradient");
+
+            for (i, (&tv, &dv)) in d_q_tape.iter().zip(d_q_direct.iter()).enumerate() {
+                assert_close(tv, dv, "d_q", i);
+            }
+            for (i, (&tv, &dv)) in d_k_tape.iter().zip(d_k_direct.iter()).enumerate() {
+                assert_close(tv, dv, "d_k", i);
+            }
+            for (i, (&tv, &dv)) in d_v_tape.iter().zip(d_v_direct.iter()).enumerate() {
+                assert_close(tv, dv, "d_v", i);
+            }
+        });
+    }
+
+    // ── Class 1: Frozen variant isolation ───────────────────────────
+    //
+    // Frozen read: y[t] = M @ q[t]. Backward: d_q[t] = M^T @ d_y[t].
+    // Verify tape produces same d_q as direct M^T @ d_y computation.
+
+    fn assert_frozen_isolation(key: OpaqueKey) {
+        let seq_len = 3;
+        let d = 4;
+        let mut rng = crate::tensor::SimpleRng::new(123);
+        let mut m_frozen = vec![0.0f32; d * d];
+        rng.fill_uniform(&mut m_frozen, 1.0);
+
+        let mut q = vec![0.0f32; seq_len * d];
+        rng.fill_uniform(&mut q, 0.5);
+
+        // Direct: y[t] = M @ q[t]
+        let mut y = vec![0.0f32; seq_len * d];
+        for t in 0..seq_len {
+            for i in 0..d {
+                let mut sum = 0.0f32;
+                for j in 0..d {
+                    sum += m_frozen[i * d + j] * q[t * d + j];
+                }
+                y[t * d + i] = sum;
+            }
+        }
+
+        // Direct backward: d_q[t] = M^T @ d_y[t]
+        let d_y = vec![1.0f32; seq_len * d];
+        let mut d_q_direct = vec![0.0f32; seq_len * d];
+        for t in 0..seq_len {
+            for i in 0..d {
+                let mut sum = 0.0f32;
+                for j in 0..d {
+                    sum += m_frozen[j * d + i] * d_y[t * d + j]; // M^T
+                }
+                d_q_direct[t * d + i] = sum;
+            }
+        }
+
+        // Tape path
+        let registry = register_opaque_vjps();
+        crate::tape::with_tape(registry, |tape| {
+            let q_in = tape.register_input(&q, vec![seq_len, d]);
+
+            let meta = vec![seq_len as f32, d as f32];
+            let meta_id = tape.alloc(meta, vec![]);
+            let m_saved = tape.alloc(m_frozen.clone(), vec![]);
+            let y_id = tape.alloc(y.clone(), vec![seq_len, d]);
+
+            tape.record_opaque(key,
+                vec![q_in], vec![y_id], vec![meta_id, m_saved]);
+
+            tape.seed_grad(y_id, d_y.clone());
+            tape.backward(y_id);
+
+            let d_q_tape = tape.get_grad(q_in).expect("q should have gradient");
+            for (i, (&tv, &dv)) in d_q_tape.iter().zip(d_q_direct.iter()).enumerate() {
+                assert_close(tv, dv, "frozen_d_q", i);
+            }
+        });
+    }
+
+    #[test]
+    fn test_class1_frozen_delta_rule() { assert_frozen_isolation(OpaqueKey::FrozenDeltaRule); }
+    #[test]
+    fn test_class1_frozen_titans_lmm() { assert_frozen_isolation(OpaqueKey::FrozenTitansLMM); }
+    #[test]
+    fn test_class1_frozen_hebbian() { assert_frozen_isolation(OpaqueKey::FrozenHebbianRule); }
+    #[test]
+    fn test_class1_frozen_moneta() { assert_frozen_isolation(OpaqueKey::FrozenMoneta); }
+    #[test]
+    fn test_class1_frozen_yaad() { assert_frozen_isolation(OpaqueKey::FrozenYAAD); }
+    #[test]
+    fn test_class1_frozen_memora() { assert_frozen_isolation(OpaqueKey::FrozenMEMORA); }
+    #[test]
+    fn test_class1_frozen_lattice_osr() { assert_frozen_isolation(OpaqueKey::FrozenLatticeOSR); }
+    #[test]
+    fn test_class1_frozen_trellis() { assert_frozen_isolation(OpaqueKey::FrozenTrellis); }
+    #[test]
+    fn test_class1_frozen_atlas_omega() { assert_frozen_isolation(OpaqueKey::FrozenAtlasOmega); }
 }
