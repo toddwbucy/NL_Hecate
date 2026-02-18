@@ -78,7 +78,7 @@ pub fn level_params_from_flat(flat: &[f32], d: usize) -> MemoryLevelParams {
     // w_freq/b_freq: consume remaining (0 if Fixed schedule, d+1 if Learned)
     let remaining = flat.len() - offset;
     let (w_freq, b_freq) = if remaining > 0 {
-        debug_assert_eq!(remaining, d + 1,
+        assert!(remaining == d + 1,
             "malformed level_params buffer: expected 0 or {} trailing elements, got {}",
             d + 1, remaining);
         (take(&mut offset, d), take(&mut offset, 1))
@@ -608,7 +608,7 @@ impl OpaqueVjp for DeltaRule {
     fn record_on_tape(
         &self, tape: &mut Tape, level_params: &MemoryLevelParams,
         embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
-    ) -> (Vec<f32>, BufId) {
+    ) -> (Vec<f32>, BufId, BufId, BufId) {
         let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
             record_common_inputs(tape, level_params, embedded, seq_len, d, &[]);
 
@@ -635,7 +635,7 @@ impl OpaqueVjp for DeltaRule {
         saved.extend(cache_ids);
         tape.record_opaque(OpaqueKey::DeltaRule,
             vec![emb_in, lp_in], vec![y_id], saved);
-        (y, y_id)
+        (y, y_id, emb_in, lp_in)
     }
 }
 
@@ -645,7 +645,7 @@ impl OpaqueVjp for TitansLMM {
     fn record_on_tape(
         &self, tape: &mut Tape, level_params: &MemoryLevelParams,
         embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
-    ) -> (Vec<f32>, BufId) {
+    ) -> (Vec<f32>, BufId, BufId, BufId) {
         let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
             record_common_inputs(tape, level_params, embedded, seq_len, d, &[]);
 
@@ -674,7 +674,7 @@ impl OpaqueVjp for TitansLMM {
         saved.extend(cache_ids);
         tape.record_opaque(OpaqueKey::TitansLMM,
             vec![emb_in, lp_in], vec![y_id], saved);
-        (y, y_id)
+        (y, y_id, emb_in, lp_in)
     }
 }
 
@@ -684,7 +684,7 @@ impl OpaqueVjp for HebbianRule {
     fn record_on_tape(
         &self, tape: &mut Tape, level_params: &MemoryLevelParams,
         embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
-    ) -> (Vec<f32>, BufId) {
+    ) -> (Vec<f32>, BufId, BufId, BufId) {
         let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
             record_common_inputs(tape, level_params, embedded, seq_len, d, &[]);
 
@@ -706,7 +706,7 @@ impl OpaqueVjp for HebbianRule {
         saved.extend(cache_ids);
         tape.record_opaque(OpaqueKey::HebbianRule,
             vec![emb_in, lp_in], vec![y_id], saved);
-        (y, y_id)
+        (y, y_id, emb_in, lp_in)
     }
 }
 
@@ -716,7 +716,7 @@ impl OpaqueVjp for Moneta {
     fn record_on_tape(
         &self, tape: &mut Tape, level_params: &MemoryLevelParams,
         embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
-    ) -> (Vec<f32>, BufId) {
+    ) -> (Vec<f32>, BufId, BufId, BufId) {
         let extra_meta = [self.d_hidden as f32, self.lp_p, self.lambda_2];
         let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
             record_common_inputs(tape, level_params, embedded, seq_len, d, &extra_meta);
@@ -746,7 +746,7 @@ impl OpaqueVjp for Moneta {
         saved.extend(cache_ids);
         tape.record_opaque(OpaqueKey::Moneta,
             vec![emb_in, lp_in], vec![y_id], saved);
-        (y, y_id)
+        (y, y_id, emb_in, lp_in)
     }
 }
 
@@ -756,7 +756,7 @@ impl OpaqueVjp for YAAD {
     fn record_on_tape(
         &self, tape: &mut Tape, level_params: &MemoryLevelParams,
         embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
-    ) -> (Vec<f32>, BufId) {
+    ) -> (Vec<f32>, BufId, BufId, BufId) {
         let extra_meta = [self.d_hidden as f32, self.delta, self.lambda_local, self.lambda_2];
         let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
             record_common_inputs(tape, level_params, embedded, seq_len, d, &extra_meta);
@@ -788,7 +788,7 @@ impl OpaqueVjp for YAAD {
         saved.extend(cache_ids);
         tape.record_opaque(OpaqueKey::YAAD,
             vec![emb_in, lp_in], vec![y_id], saved);
-        (y, y_id)
+        (y, y_id, emb_in, lp_in)
     }
 }
 
@@ -798,7 +798,7 @@ impl OpaqueVjp for MEMORA {
     fn record_on_tape(
         &self, tape: &mut Tape, level_params: &MemoryLevelParams,
         embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
-    ) -> (Vec<f32>, BufId) {
+    ) -> (Vec<f32>, BufId, BufId, BufId) {
         let extra_meta = [self.d_hidden as f32];
         let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
             record_common_inputs(tape, level_params, embedded, seq_len, d, &extra_meta);
@@ -830,7 +830,7 @@ impl OpaqueVjp for MEMORA {
         saved.extend(cache_ids);
         tape.record_opaque(OpaqueKey::MEMORA,
             vec![emb_in, lp_in], vec![y_id], saved);
-        (y, y_id)
+        (y, y_id, emb_in, lp_in)
     }
 }
 
@@ -840,7 +840,7 @@ impl OpaqueVjp for LatticeOSR {
     fn record_on_tape(
         &self, tape: &mut Tape, level_params: &MemoryLevelParams,
         embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
-    ) -> (Vec<f32>, BufId) {
+    ) -> (Vec<f32>, BufId, BufId, BufId) {
         let extra_meta = [self.m_slots as f32];
         let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
             record_common_inputs(tape, level_params, embedded, seq_len, d, &extra_meta);
@@ -866,7 +866,7 @@ impl OpaqueVjp for LatticeOSR {
         saved.extend(cache_ids);
         tape.record_opaque(OpaqueKey::LatticeOSR,
             vec![emb_in, lp_in], vec![y_id], saved);
-        (y, y_id)
+        (y, y_id, emb_in, lp_in)
     }
 }
 
@@ -876,7 +876,7 @@ impl OpaqueVjp for Trellis {
     fn record_on_tape(
         &self, tape: &mut Tape, level_params: &MemoryLevelParams,
         embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
-    ) -> (Vec<f32>, BufId) {
+    ) -> (Vec<f32>, BufId, BufId, BufId) {
         let extra_meta = [self.d_k as f32, self.lambda_k, self.lambda_v];
         let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
             record_common_inputs(tape, level_params, embedded, seq_len, d, &extra_meta);
@@ -913,7 +913,7 @@ impl OpaqueVjp for Trellis {
         saved.extend(cache_ids);
         tape.record_opaque(OpaqueKey::Trellis,
             vec![emb_in, lp_in], vec![y_id], saved);
-        (y, y_id)
+        (y, y_id, emb_in, lp_in)
     }
 }
 
@@ -923,7 +923,7 @@ impl OpaqueVjp for AtlasOmega {
     fn record_on_tape(
         &self, tape: &mut Tape, level_params: &MemoryLevelParams,
         embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
-    ) -> (Vec<f32>, BufId) {
+    ) -> (Vec<f32>, BufId, BufId, BufId) {
         let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
             record_common_inputs(tape, level_params, embedded, seq_len, d, &[]);
 
@@ -953,7 +953,7 @@ impl OpaqueVjp for AtlasOmega {
         saved.extend(cache_ids);
         tape.record_opaque(OpaqueKey::AtlasOmega,
             vec![emb_in, lp_in], vec![y_id], saved);
-        (y, y_id)
+        (y, y_id, emb_in, lp_in)
     }
 }
 
@@ -1103,14 +1103,10 @@ mod tests {
             rule.step_backward(&params, &cache, &d_y, &embedded);
 
         // --- Tape path: record_on_tape + backward ---
-        // record_on_tape allocates BufIds 0=embedded_input, 1=level_params_input,
-        // then metadata/saved/cache/output IDs. We capture the input IDs directly.
         let registry = register_opaque_vjps();
         let y_tape = crate::tape::with_tape(registry, |tape| {
-            // BufId 0 = embedded_input, BufId 1 = level_params_input (from record_common_inputs)
-            let (y, y_id) = rule.record_on_tape(tape, &params, &embedded, seq_len, d, None);
-            let emb_in: BufId = 0;
-            let lp_in: BufId = 1;
+            let (y, y_id, emb_in, lp_in) =
+                rule.record_on_tape(tape, &params, &embedded, seq_len, d, None);
 
             // Seed y_id with unit upstream gradient and run backward.
             // backward() processes all ops in reverse; loss_id only controls auto-seeding.

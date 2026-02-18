@@ -106,7 +106,7 @@ pub trait OpaqueVjp {
     /// - Flattens the rule-specific cache into saved buffers matching the
     ///   adapter's expected layout in `opaque_adapters.rs`
     /// - Pushes `TapeOp::Opaque` with the correct key, inputs, outputs, saved
-    /// - Returns (output Vec<f32>, output BufId) for downstream tape ops
+    /// - Returns (output data, output BufId, embedded input BufId, level_params input BufId)
     ///
     /// `initial_m`: Optional initial memory state (from CMS context_memory).
     fn record_on_tape(
@@ -117,7 +117,7 @@ pub trait OpaqueVjp {
         seq_len: usize,
         d: usize,
         initial_m: Option<Vec<f32>>,
-    ) -> (Vec<f32>, BufId);
+    ) -> (Vec<f32>, BufId, BufId, BufId);
 }
 
 // ── Tape operations ──────────────────────────────────────────────────
