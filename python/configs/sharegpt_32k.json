@@ -1,0 +1,31 @@
+{
+    "description": "ShareGPT conversational training — 32K BPE, Titans MAG k=4",
+    "model": {
+        "d_model": 1024,
+        "num_heads": 16,
+        "head_dim": 64,
+        "seq_len": 512,
+        "window_size": 256,
+        "vocab_size": 32000,
+        "memory_rule": "titans",
+        "composition": "mag",
+        "k": 4,
+        "chunk_sizes": [1, 8, 64, 512]
+    },
+    "build": {
+        "lr": 0.0003,
+        "optimizer": "adamw_gpu",
+        "warmup_steps": 500,
+        "steps": 100000,
+        "save_every": 5000,
+        "log_every": 50,
+        "max_grad_norm": 1.0,
+        "weight_decay": 0.1,
+        "save_path": "checkpoints/sharegpt_32k.json",
+        "log_file": "runs/sharegpt_32k.jsonl"
+    },
+    "data": {
+        "path": "data/sharegpt",
+        "format": "sharegpt"
+    }
+}

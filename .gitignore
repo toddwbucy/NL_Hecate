@@ -26,6 +26,8 @@ conveyance_hypothesis_context_amplification_v4.md
 
 # Training data (binary token files, too large for git)
 python/data/*.bin
+python/data/sharegpt/*.npy
+python/data/sharegpt/tokenizer.json
 
 # Checkpoints (model weights)
 python/checkpoints/
