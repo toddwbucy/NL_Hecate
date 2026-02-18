@@ -24,6 +24,7 @@ use crate::tensor::{
 };
 use crate::retention::l2_apply_retention;
 use crate::model::MemoryLevelParams;
+use crate::tape::OpaqueVjp;
 
 // ── Memory rule trait ────────────────────────────────────────────────
 
@@ -67,7 +68,7 @@ impl std::fmt::Display for MemoryError {
 /// Every named memory variant (Delta Rule, Titans LMM, MONETA, etc.)
 /// implements this trait. Static dispatch only — Enzyme requires
 /// monomorphization, not vtable indirection.
-pub trait MemoryRule {
+pub trait MemoryRule: OpaqueVjp {
     /// Cache type for backward pass.
     type Cache;
 

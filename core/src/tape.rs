@@ -85,6 +85,41 @@ pub type OpaqueBackwardFn = fn(
     d_inputs: &mut [Vec<f32>],
 );
 
+// ── OpaqueVjp trait ──────────────────────────────────────────────────
+
+/// Marker + recording trait for types whose forward pass is opaque to the tape.
+///
+/// Replaces the spec's `EnzymeOpaque` marker. Any type implementing this trait
+/// can register its forward execution on the tape as an opaque block with a
+/// known backward function (looked up by `opaque_key()` in the registry).
+///
+/// Implementations live in `opaque_adapters.rs` alongside the backward adapters.
+pub trait OpaqueVjp {
+    /// Which registry key maps to this type's backward adapter.
+    fn opaque_key(&self) -> OpaqueKey;
+
+    /// Execute the forward pass and record it on the tape.
+    ///
+    /// Contract:
+    /// - Snapshots `level_params` and `embedded` into tape arena (CS-47)
+    /// - Calls `step()` to execute the forward pass
+    /// - Flattens the rule-specific cache into saved buffers matching the
+    ///   adapter's expected layout in `opaque_adapters.rs`
+    /// - Pushes `TapeOp::Opaque` with the correct key, inputs, outputs, saved
+    /// - Returns (output data, output BufId, embedded input BufId, level_params input BufId)
+    ///
+    /// `initial_m`: Optional initial memory state (from CMS context_memory).
+    fn record_on_tape(
+        &self,
+        tape: &mut Tape,
+        level_params: &crate::model::MemoryLevelParams,
+        embedded: &[f32],
+        seq_len: usize,
+        d: usize,
+        initial_m: Option<Vec<f32>>,
+    ) -> (Vec<f32>, BufId, BufId, BufId);
+}
+
 // ── Tape operations ──────────────────────────────────────────────────
 
 /// A single recorded operation on the tape.
