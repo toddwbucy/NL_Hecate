@@ -635,17 +635,14 @@ fn validate_mag_seq_lens(cfg: &MAGConfig, input_ids: &[usize], target_ids: &[usi
             "target_ids length ({}) must equal seq_len ({expected})", target_ids.len()
         )));
     }
+    // Validate input_ids bounds (OOB embedding reads are unsafe memory access).
+    // target_ids are NOT validated: the CUDA cross-entropy kernel safely skips
+    // target < 0 or target >= vocab (zeros grad, skips loss). This allows
+    // masked targets (vocab_size sentinel) for loss masking on user turns.
     for (i, &tok) in input_ids.iter().enumerate() {
         if tok >= vocab {
             return Err(PyValueError::new_err(format!(
                 "input_ids[{i}]={tok} must be < vocab_size ({vocab})"
-            )));
-        }
-    }
-    for (i, &tok) in target_ids.iter().enumerate() {
-        if tok >= vocab {
-            return Err(PyValueError::new_err(format!(
-                "target_ids[{i}]={tok} must be < vocab_size ({vocab})"
             )));
         }
     }
@@ -1285,12 +1282,7 @@ impl GpuModel {
                     format!("input_ids contains {} >= vocab_size {}", max_id, v)));
             }
         }
-        if let Some(&max_id) = target_ids.iter().max() {
-            if max_id >= v {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    format!("target_ids contains {} >= vocab_size {}", max_id, v)));
-            }
-        }
+        // target_ids not validated: kernel safely skips target >= vocab (masking)
         let (loss, cache) = nl_hecate_core::gpu_forward::gpu_cms_forward(
             &self.params, &self.cfg, &input_ids, &target_ids,
             &pulse.inner, &mut self.context,
@@ -1343,12 +1335,7 @@ impl GpuModel {
                     format!("input_ids contains {} >= vocab_size {}", max_id, v)));
             }
         }
-        if let Some(&max_id) = target_ids.iter().max() {
-            if max_id >= v {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    format!("target_ids contains {} >= vocab_size {}", max_id, v)));
-            }
-        }
+        // target_ids not validated: kernel safely skips target >= vocab (masking)
         let (loss, cache) = nl_hecate_core::gpu_forward::gpu_cms_forward(
             &self.params, &self.cfg, &input_ids, &target_ids,
             &pulse.inner, &mut self.context,
@@ -1383,12 +1370,7 @@ impl GpuModel {
                     format!("input_ids contains {} >= vocab_size {}", max_id, v)));
             }
         }
-        if let Some(&max_id) = target_ids.iter().max() {
-            if max_id >= v {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    format!("target_ids contains {} >= vocab_size {}", max_id, v)));
-            }
-        }
+        // target_ids not validated: kernel safely skips target >= vocab (masking)
         let (loss, cache) = nl_hecate_core::gpu_forward::gpu_cms_forward(
             &self.params, &self.cfg, &input_ids, &target_ids,
             &pulse.inner, &mut self.context,
@@ -1417,12 +1399,7 @@ impl GpuModel {
                     format!("input_ids contains {} >= vocab_size {}", max_id, v)));
             }
         }
-        if let Some(&max_id) = target_ids.iter().max() {
-            if max_id >= v {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    format!("target_ids contains {} >= vocab_size {}", max_id, v)));
-            }
-        }
+        // target_ids not validated: kernel safely skips target >= vocab (masking)
 
         // Forward
         let (loss, cache) = nl_hecate_core::gpu_forward::gpu_cms_forward(

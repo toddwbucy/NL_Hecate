@@ -62,6 +62,7 @@ class BuildConfig:
 
     # Data
     data_path: str | None = None
+    data_format: str = "byte"  # "byte" or "sharegpt"
 
     # Runtime
     gpu: bool = False
@@ -109,6 +110,8 @@ class BuildConfig:
                 if section == "data":
                     if "path" in sub:
                         flat["data_path"] = sub["path"]
+                    if "format" in sub:
+                        flat["data_format"] = sub["format"]
                 else:
                     flat.update(sub)
         # Top-level overrides (for flat configs)
@@ -118,6 +121,13 @@ class BuildConfig:
         # Rename head_dim if present (derived, not stored)
         flat.pop("head_dim", None)
         flat.pop("format", None)
+        # Auto-load vocab_size from meta.json for sharegpt format
+        if flat.get("data_format") == "sharegpt" and "data_path" in flat:
+            meta_path = Path(flat["data_path"]) / "meta.json"
+            if meta_path.exists() and "vocab_size" not in flat:
+                with open(meta_path) as f:
+                    meta = json.load(f)
+                flat["vocab_size"] = meta["vocab_size"]
         return cls(**flat)
 
     def apply_cli(self, args: argparse.Namespace):
@@ -255,6 +265,58 @@ class MmapTokenStream:
         self._f.close()
 
 
+# ── BPE data loader for ShareGPT format ────────────────────────────
+
+class BpeDataLoader:
+    """Load pre-tokenized ShareGPT data (numpy arrays) and serve chunks.
+
+    Manages a position cursor into the flat token/target arrays.
+    Returns (input_ids, target_ids) per chunk, wrapping at corpus end.
+    Masked targets: -1 in numpy → vocab_size as Python int (triggers
+    kernel skip via target >= vocab).
+    """
+
+    def __init__(self, data_dir: str, split: str = "train"):
+        import numpy as np
+        data_path = Path(data_dir)
+        self.tokens = np.load(data_path / f"{split}_tokens.npy")
+        self.targets = np.load(data_path / f"{split}_targets.npy")
+        assert len(self.tokens) == len(self.targets), \
+            f"tokens ({len(self.tokens)}) != targets ({len(self.targets)})"
+
+        with open(data_path / "meta.json") as f:
+            self.meta = json.load(f)
+        self.vocab_size = self.meta["vocab_size"]
+        self.position = 0
+        self.total_tokens = len(self.tokens)
+
+    def next_chunk(self, seq_len: int) -> tuple[list[int], list[int]] | None:
+        """Get next chunk of (input_ids, target_ids).
+
+        Returns None if remaining tokens < seq_len (wraps on next call).
+        Masked targets (-1) are converted to vocab_size for the kernel.
+        """
+        if self.position + seq_len > self.total_tokens:
+            self.position = 0  # wrap
+        if self.total_tokens < seq_len:
+            return None
+
+        end = self.position + seq_len
+        input_ids = self.tokens[self.position:end].tolist()
+        raw_targets = self.targets[self.position:end]
+
+        # Convert -1 (masked) → vocab_size (kernel skip sentinel)
+        target_ids = []
+        for t in raw_targets:
+            target_ids.append(int(t) if t >= 0 else self.vocab_size)
+
+        self.position = end
+        return input_ids, target_ids
+
+    def __len__(self) -> int:
+        return self.total_tokens
+
+
 # ── JSONL logger ────────────────────────────────────────────────────
 
 class JSONLLogger:
@@ -338,8 +400,18 @@ def main():
     bcfg.apply_cli(args)
 
     # ── Load data ─────────────────────────────────────────────────────
-    token_ids: list[int] | MmapTokenStream
-    if bcfg.data_path:
+    use_bpe = (bcfg.data_format == "sharegpt")
+    bpe_loader: BpeDataLoader | None = None
+    token_ids: list[int] | MmapTokenStream | None = None
+
+    if use_bpe:
+        bpe_loader = BpeDataLoader(bcfg.data_path, split="train")
+        print(f"Loaded ShareGPT BPE data: {len(bpe_loader):,} tokens, "
+              f"vocab={bpe_loader.vocab_size}")
+        if len(bpe_loader) < bcfg.seq_len:
+            print(f"Error: data too short ({len(bpe_loader)} tokens < seq_len={bcfg.seq_len})")
+            return
+    elif bcfg.data_path:
         if bcfg.data_path.endswith(".bin"):
             fsize = os.path.getsize(bcfg.data_path)
             if fsize > 500_000_000:  # >500MB: use mmap
@@ -358,7 +430,7 @@ def main():
         print(f"Using built-in demo text ({len(text):,} chars)")
         token_ids = encode(text)
 
-    if len(token_ids) < bcfg.seq_len + 1:
+    if not use_bpe and token_ids is not None and len(token_ids) < bcfg.seq_len + 1:
         print(f"Error: text too short ({len(token_ids)} tokens < seq_len+1={bcfg.seq_len + 1})")
         return
 
@@ -402,7 +474,9 @@ def main():
     print(f"  Memory:   rule={cfg.memory_rule}, composition={cfg.composition}, k={bcfg.k}")
     print(f"  CMS:      chunk_sizes={bcfg.chunk_sizes}")
     print(f"  Params:   {params.num_params():,}")
-    print(f"  Data:     {len(token_ids):,} tokens")
+    data_len = len(bpe_loader) if use_bpe else len(token_ids)
+    print(f"  Data:     {data_len:,} tokens" +
+          (f" (ShareGPT BPE, {bcfg.data_format})" if use_bpe else ""))
     use_gpu = bcfg.gpu and hasattr(nl_hecate, "GpuModel")
     if bcfg.optimizer == "adamw_gpu" and not use_gpu:
         raise RuntimeError(
@@ -425,24 +499,29 @@ def main():
     print(f"{'=' * 60}\n")
 
     # ── Stateful CMS build loop ───────────────────────────────────────
-    # VecStream needs a Rust Vec<usize>, so mmap must be materialized.
-    # Materializing here frees the mmap backing after handoff to Rust.
-    if isinstance(token_ids, MmapTokenStream):
-        mm = token_ids
-        token_ids = list(mm)
-        mm.close()
-    if bcfg.load:
+    if use_bpe:
+        # ShareGPT BPE: Conductor in pulse-only mode (no VecStream).
+        # BpeDataLoader handles data; Conductor only generates CMS pulses.
         conductor = nl_hecate.Conductor(bcfg.k, bcfg.chunk_sizes)
-        stream = nl_hecate.VecStream(token_ids)
-        conductor.attach_stream(stream)
-        conductor.restore_from_dict(build_state)
         context = nl_hecate.ContextState(bcfg.k, bcfg.d_model)
-        context.set_memory(build_state["context_memory"])
     else:
-        conductor = nl_hecate.Conductor(bcfg.k, bcfg.chunk_sizes)
-        stream = nl_hecate.VecStream(token_ids)
-        conductor.attach_stream(stream)
-        context = nl_hecate.ContextState(bcfg.k, bcfg.d_model)
+        # Byte-level: VecStream + Conductor for integrated data + pulse.
+        if isinstance(token_ids, MmapTokenStream):
+            mm = token_ids
+            token_ids = list(mm)
+            mm.close()
+        if bcfg.load:
+            conductor = nl_hecate.Conductor(bcfg.k, bcfg.chunk_sizes)
+            stream = nl_hecate.VecStream(token_ids)
+            conductor.attach_stream(stream)
+            conductor.restore_from_dict(build_state)
+            context = nl_hecate.ContextState(bcfg.k, bcfg.d_model)
+            context.set_memory(build_state["context_memory"])
+        else:
+            conductor = nl_hecate.Conductor(bcfg.k, bcfg.chunk_sizes)
+            stream = nl_hecate.VecStream(token_ids)
+            conductor.attach_stream(stream)
+            context = nl_hecate.ContextState(bcfg.k, bcfg.d_model)
 
     # GPU-resident model: upload params once, all math on device
     gpu_model = None
@@ -476,15 +555,24 @@ def main():
     end_step = resume_step + bcfg.steps
 
     for step in range(resume_step, end_step):
-        result = conductor.next_chunk(bcfg.seq_len)
-        if result is None:
-            break
-        input_ids, target_ids, pulse = result
+        if use_bpe:
+            # ShareGPT BPE path: data from BpeDataLoader, pulse from Conductor
+            chunk = bpe_loader.next_chunk(bcfg.seq_len)
+            if chunk is None:
+                break
+            input_ids, target_ids = chunk
+            pulse = conductor.pulse()
+        else:
+            # Byte-level path: integrated data + pulse from Conductor+VecStream
+            result = conductor.next_chunk(bcfg.seq_len)
+            if result is None:
+                break
+            input_ids, target_ids, pulse = result
 
-        # Skip truncated chunks at corpus boundary
-        if len(input_ids) != bcfg.seq_len:
-            conductor.advance()
-            continue
+            # Skip truncated chunks at corpus boundary
+            if len(input_ids) != bcfg.seq_len:
+                conductor.advance()
+                continue
 
         # Compute current learning rate
         use_cosine = (adamw_opt is not None or use_adamw_gpu)
@@ -565,7 +653,7 @@ def main():
                       grad_norm=g_norm, lr=current_lr,
                       elapsed=time.perf_counter() - t_start)
 
-        # Periodic checkpoint (resumable — includes build state)
+        # Periodic checkpoint
         if bcfg.save_every > 0 and step > 0 and step % bcfg.save_every == 0:
             # Download from GPU if needed
             if gpu_model is not None:
@@ -574,8 +662,13 @@ def main():
             p = Path(bcfg.save_path)
             ckpt_path = str(p.with_stem(f"{p.stem}_step{step}"))
             os.makedirs(os.path.dirname(ckpt_path) or ".", exist_ok=True)
-            nl_hecate.save_build_checkpoint(ckpt_path, params, cfg, conductor, context)
-            print(f"  [build checkpoint saved: {ckpt_path}]")
+            if use_bpe:
+                # BPE mode: no VecStream, save params-only checkpoint
+                nl_hecate.save_checkpoint(ckpt_path, params, cfg)
+            else:
+                # Byte-level: resumable checkpoint with build state
+                nl_hecate.save_build_checkpoint(ckpt_path, params, cfg, conductor, context)
+            print(f"  [checkpoint saved: {ckpt_path}]")
 
     t_end = time.perf_counter()
     elapsed = t_end - t_start
