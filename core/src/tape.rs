@@ -1807,7 +1807,7 @@ mod tests {
             let mut out = vec![0.0f32; xp.len()];
             for s in 0..m_slots {
                 let slot = &xp[s * d..(s + 1) * d];
-                let norm = slot.iter().map(|v| v * v).sum::<f32>().sqrt().max(1.0);
+                let norm = slot.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-8);
                 for i in 0..d {
                     out[s * d + i] = slot[i] / norm;
                 }
