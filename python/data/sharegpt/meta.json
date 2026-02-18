@@ -1,0 +1,30 @@
+{
+  "vocab_size": 32000,
+  "tokenizer": "tokenizer.json",
+  "special_tokens": {
+    "<|im_start|>": 0,
+    "<|im_end|>": 1,
+    "<|pad|>": 2
+  },
+  "train": {
+    "split": "train",
+    "conversations": 79162,
+    "skipped": 0,
+    "total_tokens": 373886250,
+    "valid_targets": 310413200,
+    "masked_targets": 63473050,
+    "mask_ratio": 0.16976567070867143
+  },
+  "val": {
+    "split": "val",
+    "conversations": 8795,
+    "skipped": 0,
+    "total_tokens": 41982092,
+    "valid_targets": 34908320,
+    "masked_targets": 7073772,
+    "mask_ratio": 0.16849498590970646
+  },
+  "seed": 42,
+  "val_ratio": 0.1,
+  "source": "RyokoAI/ShareGPT52K"
+}
