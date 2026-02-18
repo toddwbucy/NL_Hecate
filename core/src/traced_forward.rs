@@ -292,9 +292,14 @@ pub fn traced_cms_forward(
     let embedded = tape.buf_data(emb_id).to_vec();
 
     // ── Dynamic frequency gate ─────────────────────────────────────
+    // Learned frequency schedule requires traced gate ops (Stage 3 scope).
+    // Fixed schedules pass through unchanged — no gate computation needed.
     let (effective_pulse, freq_cache) = match &cfg.frequency_schedule {
         FrequencySchedule::Learned(_) => {
-            todo!("Traced path for Learned frequency schedule not yet implemented");
+            unimplemented!(
+                "Traced path for Learned frequency schedule \
+                 is Stage 3 scope (pluggable retention / CMS variants)"
+            );
         }
         _ => (pulse.clone(), None),
     };
