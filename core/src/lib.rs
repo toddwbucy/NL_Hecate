@@ -49,6 +49,7 @@ pub mod dynamic_freq;
 pub mod conductor;
 pub mod context_stream;
 pub mod dispatch;
+pub mod traced_forward;
 #[cfg(feature = "distributed")]
 pub mod distributed;
 #[cfg(feature = "serving")]
