@@ -779,10 +779,20 @@ thread_local! {
     static TAPE_ACTIVE: Cell<bool> = const { Cell::new(false) };
 }
 
+/// Drop guard that clears the TAPE_ACTIVE flag when scope exits, including
+/// on panic. Ensures `is_tape_active()` is never left stale.
+struct TapeGuard;
+
+impl Drop for TapeGuard {
+    fn drop(&mut self) {
+        TAPE_ACTIVE.with(|flag| flag.set(false));
+    }
+}
+
 /// Execute a closure with an active tape. Sets the thread-local active flag
 /// for the duration of `f`, making `is_tape_active()` return true. After `f`
-/// returns the flag is cleared. This is the sole entry point for AD — nothing
-/// is recorded unless this is called (CS-40).
+/// returns (or panics) the flag is cleared via a drop guard. This is the sole
+/// entry point for AD — nothing is recorded unless this is called (CS-40).
 pub fn with_tape<F, R>(registry: HashMap<OpaqueKey, OpaqueBackwardFn>, f: F) -> R
 where
     F: FnOnce(&mut Tape) -> R,
@@ -792,12 +802,10 @@ where
         flag.set(true);
     });
 
+    let _guard = TapeGuard;
     let mut tape = Tape::new(registry);
-    let result = f(&mut tape);
-
-    TAPE_ACTIVE.with(|flag| flag.set(false));
-    // Tape is dropped here — no persistent state.
-    result
+    f(&mut tape)
+    // _guard dropped here, resetting flag even on panic.
 }
 
 /// Execute with an empty opaque registry (for testing standard ops only).

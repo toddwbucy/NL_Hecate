@@ -72,7 +72,7 @@ STAYS:
 struct Tape {
     ops: Vec<TapeOp>,           // Recorded operations in forward order
     bufs: Vec<TapeBuf>,         // Arena of tensor buffers
-    grad_accum: Vec<Vec<f32>>,  // Gradient accumulators, indexed by BufId
+    grad_accum: Vec<Option<Vec<f32>>>,  // Gradient accumulators (lazy init), indexed by BufId
     recording: bool,            // Whether ops are being recorded (CS-40: opt-in)
 }
 
@@ -85,16 +85,19 @@ struct TapeBuf {
     is_param: bool,         // True for outer-loop parameters (W_K, W_V, etc.)
 }
 
--- Thread-local tape access. Only one tape per thread.
+-- Thread-local active flag. Only one tape per thread.
 -- with_tape() is the sole entry point — enforces CS-40 opt-in.
+-- A Cell<bool> flag tracks whether a tape is active, with a drop guard
+-- ensuring the flag is cleared even on panic.
 thread_local! {
-    static TAPE: RefCell<Option<Tape>> = RefCell::new(None);
+    static TAPE_ACTIVE: Cell<bool> = Cell::new(false);
 }
 
-fn with_tape<F, R>(f: F) -> R
+fn with_tape<F, R>(registry: HashMap<OpaqueKey, OpaqueBackwardFn>, f: F) -> R
 where F: FnOnce(&mut Tape) -> R
 {
-    // Creates tape, runs f, returns result.
+    // Sets TAPE_ACTIVE=true, creates tape, runs f, returns result.
+    // Drop guard clears TAPE_ACTIVE on scope exit (including panic).
     // Tape is dropped after f completes — no persistent state.
 }
 
@@ -148,13 +151,13 @@ enum TapeOp {
 
     // Concat / reshape
     Concat { inputs: Vec<BufId>, out: BufId, axis: usize },
-    Slice { input: BufId, out: BufId, offset: usize, len: usize },
+    Slice { input: BufId, out: BufId, offset: usize, len: usize, input_len: usize },
 
     // ── NL-specific ops ─────────────────────────────────────────────
 
     NormalizedSiLU { input: BufId, out: BufId },
     SphereProjectNormalize { input: BufId, out: BufId, d: usize, m_slots: usize },
-    KLRetention { input: BufId, prior: BufId, alpha: f32, out: BufId },
+    KLRetention { input: BufId, prior: BufId, alpha: f32, theta: f32, out: BufId },
     StraightThroughBool { input: BufId, threshold: f32, out: BufId },
 
     // ── Opaque blocks ───────────────────────────────────────────────
