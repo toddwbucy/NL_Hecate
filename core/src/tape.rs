@@ -166,6 +166,8 @@ pub enum TapeOp {
     EmbedLookup { table: BufId, indices: Vec<usize>, out: BufId, vocab_size: usize, d: usize },
     /// out = ||x||_2
     L2Norm { input: BufId, out: BufId },
+    /// out (scalar) = sum of all elements of input
+    SumReduce { input: BufId, out: BufId },
 
     // ── Retention ───────────────────────────────────────────────
     /// out = lambda * input
@@ -588,6 +590,16 @@ impl Tape {
                     let inv_norm = if norm > 1e-8 { 1.0 / norm } else { 0.0 };
                     let scalar = d_out[0];
                     let d_input: Vec<f32> = x.iter().map(|xi| scalar * xi * inv_norm).collect();
+                    self.accumulate_grad(*input, &d_input);
+                }
+            }
+
+            // ── SumReduce: out = sum(input) ─────────────────────
+            TapeOp::SumReduce { input, out } => {
+                if let Some(d_out) = self.grad_accum[*out].clone() {
+                    let scalar = d_out[0];
+                    let n = self.bufs[*input].data.len();
+                    let d_input = vec![scalar; n];
                     self.accumulate_grad(*input, &d_input);
                 }
             }
@@ -1501,5 +1513,679 @@ mod tests {
         // Straight-through: gradient passes unchanged
         assert_close(tape.get_grad(input).unwrap(), &[1.0, 2.0, 3.0, 4.0],
                      1e-6, "st_bool_grad");
+    }
+
+    // ── Class 2: Finite Difference Correctness Tests (P1.10) ────────
+    //
+    // Spec §Testing Strategy, Class 2: VJP rules match finite differences.
+    // Central differences: (f(x+eps) - f(x-eps)) / (2*eps)
+    // eps=1e-2, rel_tol=10%, abs_threshold=5e-4 (auto-pass tiny gradients).
+    //
+    // For each op: build a scalar loss = sum(op(input)), compute tape gradient,
+    // compare against FD gradient element-by-element.
+
+    const FD_EPS: f32 = 1e-2;
+    const FD_REL_TOL: f32 = 0.10;
+    const FD_ABS_THRESHOLD: f32 = 5e-4;
+
+    /// Check that `tape_grad` matches finite differences for a function
+    /// `f: &[f32] -> f32` (scalar loss). Only checks elements where
+    /// |fd_grad| > abs_threshold.
+    fn fd_check(
+        tape_grad: &[f32],
+        f: impl Fn(&[f32]) -> f32,
+        x: &[f32],
+        label: &str,
+    ) {
+        let mut x_buf = x.to_vec();
+        for i in 0..x.len() {
+            let orig = x_buf[i];
+            x_buf[i] = orig + FD_EPS;
+            let f_plus = f(&x_buf);
+            x_buf[i] = orig - FD_EPS;
+            let f_minus = f(&x_buf);
+            x_buf[i] = orig;
+
+            let fd = (f_plus - f_minus) / (2.0 * FD_EPS);
+            let tg = tape_grad[i];
+
+            // Skip tiny gradients
+            if fd.abs() < FD_ABS_THRESHOLD && tg.abs() < FD_ABS_THRESHOLD {
+                continue;
+            }
+
+            let denom = fd.abs().max(tg.abs()).max(1e-8);
+            let rel_err = (tg - fd).abs() / denom;
+            assert!(rel_err < FD_REL_TOL,
+                "FD mismatch {label}[{i}]: tape={tg:.6e} fd={fd:.6e} rel_err={rel_err:.4}");
+        }
+    }
+
+    #[test]
+    fn test_fd_matmul() {
+        // loss = sum(A @ B) where A:[2,3], B:[3,2]
+        let a = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let b = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
+        let (m, k, n) = (2, 3, 2);
+
+        let mut tape = Tape::new_empty();
+        let a_id = tape.alloc(a.clone(), vec![m, k]);
+        let b_id = tape.alloc(b.clone(), vec![k, n]);
+        let mut out = vec![0.0f32; m * n];
+        crate::tensor::matmul_f32(&a, &b, &mut out, m, k, n);
+        let out_id = tape.alloc(out.clone(), vec![m, n]);
+        tape.record(TapeOp::Matmul { a: a_id, b: b_id, out: out_id, m, k, n });
+        let loss_val = out.iter().sum::<f32>();
+        let loss_id = tape.alloc(vec![loss_val], vec![1]);
+        tape.record(TapeOp::SumReduce { input: out_id, out: loss_id });
+        tape.backward(loss_id);
+
+        let grad_a = tape.get_grad(a_id).unwrap();
+        fd_check(grad_a, |a_perturbed| {
+            let mut o = vec![0.0f32; m * n];
+            crate::tensor::matmul_f32(a_perturbed, &b, &mut o, m, k, n);
+            o.iter().sum()
+        }, &a, "matmul_A");
+
+        let grad_b = tape.get_grad(b_id).unwrap();
+        fd_check(grad_b, |b_perturbed| {
+            let mut o = vec![0.0f32; m * n];
+            crate::tensor::matmul_f32(&a, b_perturbed, &mut o, m, k, n);
+            o.iter().sum()
+        }, &b, "matmul_B");
+    }
+
+    #[test]
+    fn test_fd_sigmoid() {
+        let x = vec![-1.0, 0.0, 0.5, 2.0];
+        let sig: Vec<f32> = x.iter().map(|&v: &f32| 1.0 / (1.0 + (-v).exp())).collect();
+
+        let mut tape = Tape::new_empty();
+        let x_id = tape.alloc(x.clone(), vec![4]);
+        let out_id = tape.alloc(sig.clone(), vec![4]);
+        tape.record(TapeOp::Sigmoid { input: x_id, out: out_id });
+        let loss_val = sig.iter().sum::<f32>();
+        let loss_id = tape.alloc(vec![loss_val], vec![1]);
+        tape.record(TapeOp::SumReduce { input: out_id, out: loss_id });
+        tape.backward(loss_id);
+
+        fd_check(tape.get_grad(x_id).unwrap(), |xp| {
+            xp.iter().map(|&v: &f32| 1.0 / (1.0 + (-v).exp())).sum()
+        }, &x, "sigmoid");
+    }
+
+    #[test]
+    fn test_fd_softplus() {
+        let x = vec![-2.0, -0.5, 0.0, 1.0, 3.0];
+        let sp: Vec<f32> = x.iter().map(|&v: &f32| (1.0 + v.exp()).ln()).collect();
+
+        let mut tape = Tape::new_empty();
+        let x_id = tape.alloc(x.clone(), vec![5]);
+        let out_id = tape.alloc(sp.clone(), vec![5]);
+        tape.record(TapeOp::Softplus { input: x_id, out: out_id });
+        let loss_val = sp.iter().sum::<f32>();
+        let loss_id = tape.alloc(vec![loss_val], vec![1]);
+        tape.record(TapeOp::SumReduce { input: out_id, out: loss_id });
+        tape.backward(loss_id);
+
+        fd_check(tape.get_grad(x_id).unwrap(), |xp| {
+            xp.iter().map(|&v: &f32| (1.0 + v.exp()).ln()).sum()
+        }, &x, "softplus");
+    }
+
+    #[test]
+    fn test_fd_silu() {
+        let x = vec![-1.0, 0.0, 0.5, 2.0];
+        let silu: Vec<f32> = x.iter().map(|&v: &f32| v / (1.0 + (-v).exp())).collect();
+
+        let mut tape = Tape::new_empty();
+        let x_id = tape.alloc(x.clone(), vec![4]);
+        let out_id = tape.alloc(silu.clone(), vec![4]);
+        tape.record(TapeOp::SiLU { input: x_id, out: out_id });
+        let loss_val = silu.iter().sum::<f32>();
+        let loss_id = tape.alloc(vec![loss_val], vec![1]);
+        tape.record(TapeOp::SumReduce { input: out_id, out: loss_id });
+        tape.backward(loss_id);
+
+        fd_check(tape.get_grad(x_id).unwrap(), |xp| {
+            xp.iter().map(|&v: &f32| v / (1.0 + (-v).exp())).sum()
+        }, &x, "silu");
+    }
+
+    #[test]
+    fn test_fd_softmax() {
+        let x = vec![1.0, 2.0, 3.0, 0.5];
+        let max_x = x.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = x.iter().map(|&v| (v - max_x).exp()).collect();
+        let sum_exp: f32 = exps.iter().sum();
+        let sm: Vec<f32> = exps.iter().map(|&e| e / sum_exp).collect();
+
+        let mut tape = Tape::new_empty();
+        let x_id = tape.alloc(x.clone(), vec![4]);
+        let out_id = tape.alloc(sm.clone(), vec![4]);
+        tape.record(TapeOp::Softmax { input: x_id, out: out_id, rows: 1, cols: 4 });
+        let loss_val = sm.iter().sum::<f32>();
+        let loss_id = tape.alloc(vec![loss_val], vec![1]);
+        tape.record(TapeOp::SumReduce { input: out_id, out: loss_id });
+        tape.backward(loss_id);
+
+        fd_check(tape.get_grad(x_id).unwrap(), |xp| {
+            let mx = xp.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let es: Vec<f32> = xp.iter().map(|&v| (v - mx).exp()).collect();
+            let s: f32 = es.iter().sum();
+            es.iter().map(|&e| e / s).sum()
+        }, &x, "softmax");
+    }
+
+    #[test]
+    fn test_fd_cross_entropy() {
+        let logits = vec![2.0, 1.0, 0.1];
+        let target = 0usize;
+        let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = logits.iter().map(|&v| (v - max_l).exp()).collect();
+        let sum_e: f32 = exps.iter().sum();
+        let loss_val = -((exps[target] / sum_e).ln());
+
+        let mut tape = Tape::new_empty();
+        let logits_id = tape.alloc(logits.clone(), vec![3]);
+        let loss_id = tape.alloc(vec![loss_val], vec![1]);
+        tape.record(TapeOp::CrossEntropy { logits: logits_id, targets: vec![target], out: loss_id, vocab_size: 3 });
+        tape.backward(loss_id);
+
+        fd_check(tape.get_grad(logits_id).unwrap(), |lp| {
+            let mx = lp.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let es: Vec<f32> = lp.iter().map(|&v| (v - mx).exp()).collect();
+            let s: f32 = es.iter().sum();
+            -((es[target] / s).ln())
+        }, &logits, "cross_entropy");
+    }
+
+    #[test]
+    fn test_fd_outer_product() {
+        let a = vec![1.0, 2.0, 3.0];
+        let b = vec![0.5, 1.5];
+        let d1 = 3; let d2 = 2;
+        let mut out = vec![0.0f32; d1 * d2];
+        for i in 0..d1 { for j in 0..d2 { out[i * d2 + j] = a[i] * b[j]; } }
+
+        let mut tape = Tape::new_empty();
+        let a_id = tape.alloc(a.clone(), vec![d1]);
+        let b_id = tape.alloc(b.clone(), vec![d2]);
+        let out_id = tape.alloc(out.clone(), vec![d1, d2]);
+        tape.record(TapeOp::OuterProduct { a: a_id, b: b_id, out: out_id });
+        let loss_val = out.iter().sum::<f32>();
+        let loss_id = tape.alloc(vec![loss_val], vec![1]);
+        tape.record(TapeOp::SumReduce { input: out_id, out: loss_id });
+        tape.backward(loss_id);
+
+        fd_check(tape.get_grad(a_id).unwrap(), |ap| {
+            let mut s = 0.0f32;
+            for i in 0..d1 { for j in 0..d2 { s += ap[i] * b[j]; } }
+            s
+        }, &a, "outer_product_a");
+
+        fd_check(tape.get_grad(b_id).unwrap(), |bp| {
+            let mut s = 0.0f32;
+            for i in 0..d1 { for j in 0..d2 { s += a[i] * bp[j]; } }
+            s
+        }, &b, "outer_product_b");
+    }
+
+    #[test]
+    fn test_fd_frobenius_dot() {
+        let a = vec![1.0, 2.0, 3.0, 4.0];
+        let b = vec![0.5, 1.5, 0.1, 0.2];
+        let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+
+        let mut tape = Tape::new_empty();
+        let a_id = tape.alloc(a.clone(), vec![2, 2]);
+        let b_id = tape.alloc(b.clone(), vec![2, 2]);
+        let out_id = tape.alloc(vec![dot], vec![1]);
+        tape.record(TapeOp::FrobeniusDot { a: a_id, b: b_id, out: out_id });
+        tape.backward(out_id);
+
+        fd_check(tape.get_grad(a_id).unwrap(), |ap| {
+            ap.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+        }, &a, "frob_dot_a");
+
+        fd_check(tape.get_grad(b_id).unwrap(), |bp| {
+            a.iter().zip(bp.iter()).map(|(x, y)| x * y).sum()
+        }, &b, "frob_dot_b");
+    }
+
+    #[test]
+    fn test_fd_l2_norm() {
+        let x = vec![3.0, 4.0]; // norm = 5
+        let norm = (x.iter().map(|v| v * v).sum::<f32>()).sqrt();
+
+        let mut tape = Tape::new_empty();
+        let x_id = tape.alloc(x.clone(), vec![2]);
+        let out_id = tape.alloc(vec![norm], vec![1]);
+        tape.record(TapeOp::L2Norm { input: x_id, out: out_id });
+        tape.backward(out_id);
+
+        fd_check(tape.get_grad(x_id).unwrap(), |xp| {
+            (xp.iter().map(|v| v * v).sum::<f32>()).sqrt()
+        }, &x, "l2_norm");
+    }
+
+    #[test]
+    fn test_fd_normalized_silu() {
+        // NormalizedSiLU: out = silu(x) / max(||silu(x)||, eps)
+        let x = vec![0.5, 1.0, -0.3, 2.0];
+        let eps = 1e-6f32;
+        let silu_fn = |v: f32| v / (1.0 + (-v).exp());
+        let nsilu = |xp: &[f32]| -> Vec<f32> {
+            let s: Vec<f32> = xp.iter().map(|&v| silu_fn(v)).collect();
+            let norm = s.iter().map(|v| v * v).sum::<f32>().sqrt().max(eps);
+            s.iter().map(|v| v / norm).collect()
+        };
+        let out = nsilu(&x);
+
+        let mut tape = Tape::new_empty();
+        let x_id = tape.alloc(x.clone(), vec![4]);
+        let out_id = tape.alloc(out.clone(), vec![4]);
+        tape.record(TapeOp::NormalizedSiLU { input: x_id, out: out_id });
+        let loss_val = out.iter().sum::<f32>();
+        let loss_id = tape.alloc(vec![loss_val], vec![1]);
+        tape.record(TapeOp::SumReduce { input: out_id, out: loss_id });
+        tape.backward(loss_id);
+
+        fd_check(tape.get_grad(x_id).unwrap(), |xp| {
+            nsilu(xp).iter().sum()
+        }, &x, "normalized_silu");
+    }
+
+    #[test]
+    fn test_fd_sphere_project_normalize() {
+        // SphereProjectNormalize: project each of m_slots vectors of length d to unit sphere
+        // x: [m_slots * d] = [2 * 2] = 4 elements, 2 slots of dim 2
+        let x = vec![2.0, 1.0, 0.5, 1.5];
+        let d = 2usize;
+        let m_slots = 2usize;
+        let spn = |xp: &[f32]| -> Vec<f32> {
+            let mut out = vec![0.0f32; xp.len()];
+            for s in 0..m_slots {
+                let slot = &xp[s * d..(s + 1) * d];
+                let norm = slot.iter().map(|v| v * v).sum::<f32>().sqrt().max(1.0);
+                for i in 0..d {
+                    out[s * d + i] = slot[i] / norm;
+                }
+            }
+            out
+        };
+        let out = spn(&x);
+
+        let mut tape = Tape::new_empty();
+        let x_id = tape.alloc(x.clone(), vec![4]);
+        let out_id = tape.alloc(out.clone(), vec![4]);
+        tape.record(TapeOp::SphereProjectNormalize { input: x_id, out: out_id, d: 2, m_slots: 2 });
+        let loss_val = out.iter().sum::<f32>();
+        let loss_id = tape.alloc(vec![loss_val], vec![1]);
+        tape.record(TapeOp::SumReduce { input: out_id, out: loss_id });
+        tape.backward(loss_id);
+
+        fd_check(tape.get_grad(x_id).unwrap(), |xp| {
+            spn(xp).iter().sum()
+        }, &x, "sphere_project_normalize");
+    }
+
+    #[test]
+    fn test_fd_kl_retention() {
+        // KLRetention: out = softmax(alpha * log(prior) - theta * input)
+        let input = vec![0.3, 0.5, 0.2];
+        let prior = vec![0.25, 0.5, 0.25];
+        let alpha = 1.0f32;
+        let theta = 0.1f32;
+        let kl_ret = |inp: &[f32], pr: &[f32]| -> Vec<f32> {
+            let z: Vec<f32> = pr.iter().zip(inp.iter())
+                .map(|(&p, &g): (&f32, &f32)| alpha * p.max(1e-8).ln() - theta * g).collect();
+            let max_z = z.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = z.iter().map(|v| (v - max_z).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            exps.iter().map(|e| e / sum).collect()
+        };
+        let out = kl_ret(&input, &prior);
+
+        let mut tape = Tape::new_empty();
+        let inp_id = tape.alloc(input.clone(), vec![3]);
+        let pr_id = tape.alloc(prior.clone(), vec![3]);
+        let out_id = tape.alloc(out.clone(), vec![3]);
+        tape.record(TapeOp::KLRetention { input: inp_id, prior: pr_id, alpha, theta, out: out_id });
+        let loss_val: f32 = out.iter().sum();
+        let loss_id = tape.alloc(vec![loss_val], vec![1]);
+        tape.record(TapeOp::SumReduce { input: out_id, out: loss_id });
+        tape.backward(loss_id);
+
+        fd_check(tape.get_grad(inp_id).unwrap(), |ip| {
+            kl_ret(ip, &prior).iter().sum()
+        }, &input, "kl_ret_input");
+
+        fd_check(tape.get_grad(pr_id).unwrap(), |pp| {
+            kl_ret(&input, pp).iter().sum()
+        }, &prior, "kl_ret_prior");
+    }
+
+    #[test]
+    fn test_fd_embed_lookup() {
+        // Embedding table: 4 tokens, dim 3
+        let table = vec![
+            0.1, 0.2, 0.3,  // token 0
+            0.4, 0.5, 0.6,  // token 1
+            0.7, 0.8, 0.9,  // token 2
+            1.0, 1.1, 1.2,  // token 3
+        ];
+        let indices = vec![1, 3, 0]; // lookup tokens 1, 3, 0
+        let vocab = 4; let dim = 3;
+        let out: Vec<f32> = indices.iter().flat_map(|&i| table[i * dim..(i + 1) * dim].to_vec()).collect();
+
+        let mut tape = Tape::new_empty();
+        let table_id = tape.alloc(table.clone(), vec![vocab, dim]);
+        let out_id = tape.alloc(out.clone(), vec![indices.len(), dim]);
+        tape.record(TapeOp::EmbedLookup {
+            table: table_id, indices: indices.clone(), out: out_id, vocab_size: vocab, d: dim,
+        });
+        let loss_val = out.iter().sum::<f32>();
+        let loss_id = tape.alloc(vec![loss_val], vec![1]);
+        tape.record(TapeOp::SumReduce { input: out_id, out: loss_id });
+        tape.backward(loss_id);
+
+        // FD on embedding table
+        fd_check(tape.get_grad(table_id).unwrap(), |tp| {
+            indices.iter().flat_map(|&i| tp[i * dim..(i + 1) * dim].iter().copied()).sum()
+        }, &table, "embed_lookup");
+    }
+
+    #[test]
+    fn test_fd_l2_retention() {
+        let x = vec![1.0, 2.0, 3.0, 4.0];
+        let lambda = 0.9f32;
+        let retained: Vec<f32> = x.iter().map(|&v| lambda * v).collect();
+
+        let mut tape = Tape::new_empty();
+        let x_id = tape.alloc(x.clone(), vec![4]);
+        let out_id = tape.alloc(retained.clone(), vec![4]);
+        tape.record(TapeOp::L2Retention { input: x_id, lambda, out: out_id });
+        let loss_val = retained.iter().sum::<f32>();
+        let loss_id = tape.alloc(vec![loss_val], vec![1]);
+        tape.record(TapeOp::SumReduce { input: out_id, out: loss_id });
+        tape.backward(loss_id);
+
+        fd_check(tape.get_grad(x_id).unwrap(), |xp| {
+            xp.iter().map(|&v| lambda * v).sum()
+        }, &x, "l2_retention");
+    }
+
+    #[test]
+    fn test_fd_matmul_transpose_b() {
+        // out = A @ B^T, A:[2,3], B:[2,3] → out:[2,2]
+        let a = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let b = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
+        let (m, k, n) = (2, 3, 2); // A:m×k, B:n×k, out:m×n
+
+        fn matmul_bt(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+            // out[i,j] = sum_p a[i,p] * b[j,p]
+            let mut out = vec![0.0f32; m * n];
+            for i in 0..m {
+                for j in 0..n {
+                    for p in 0..k {
+                        out[i * n + j] += a[i * k + p] * b[j * k + p];
+                    }
+                }
+            }
+            out
+        }
+
+        let out_data = matmul_bt(&a, &b, m, k, n);
+
+        let mut tape = Tape::new_empty();
+        let a_id = tape.alloc(a.clone(), vec![m, k]);
+        let b_id = tape.alloc(b.clone(), vec![n, k]);
+        let out_id = tape.alloc(out_data.clone(), vec![m, n]);
+        tape.record(TapeOp::MatmulTransposeB { a: a_id, b: b_id, out: out_id, m, k, n });
+        let loss_val = out_data.iter().sum::<f32>();
+        let loss_id = tape.alloc(vec![loss_val], vec![1]);
+        tape.record(TapeOp::SumReduce { input: out_id, out: loss_id });
+        tape.backward(loss_id);
+
+        fd_check(tape.get_grad(a_id).unwrap(), |ap| {
+            matmul_bt(ap, &b, m, k, n).iter().sum()
+        }, &a, "matmul_bt_A");
+
+        fd_check(tape.get_grad(b_id).unwrap(), |bp| {
+            matmul_bt(&a, bp, m, k, n).iter().sum()
+        }, &b, "matmul_bt_B");
+    }
+
+    #[test]
+    fn test_fd_transpose() {
+        let x = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // 2×3
+        let (rows, cols) = (2, 3);
+        let mut out_data = vec![0.0f32; rows * cols];
+        crate::tensor::transpose_f32(&x, &mut out_data, rows, cols);
+
+        let mut tape = Tape::new_empty();
+        let x_id = tape.alloc(x.clone(), vec![rows, cols]);
+        let out_id = tape.alloc(out_data.clone(), vec![cols, rows]);
+        tape.record(TapeOp::Transpose { input: x_id, out: out_id, rows, cols });
+        let loss_val = out_data.iter().sum::<f32>();
+        let loss_id = tape.alloc(vec![loss_val], vec![1]);
+        tape.record(TapeOp::SumReduce { input: out_id, out: loss_id });
+        tape.backward(loss_id);
+
+        fd_check(tape.get_grad(x_id).unwrap(), |xp| {
+            // sum(transpose(x)) == sum(x), but FD validates element routing
+            let mut o = vec![0.0f32; rows * cols];
+            crate::tensor::transpose_f32(xp, &mut o, rows, cols);
+            o.iter().sum()
+        }, &x, "transpose");
+    }
+
+    #[test]
+    fn test_fd_add() {
+        let a = vec![1.0, -2.0, 3.0, 0.5];
+        let b = vec![0.5, 1.5, -1.0, 2.0];
+        let out_data: Vec<f32> = a.iter().zip(b.iter()).map(|(x, y)| x + y).collect();
+
+        let mut tape = Tape::new_empty();
+        let a_id = tape.alloc(a.clone(), vec![4]);
+        let b_id = tape.alloc(b.clone(), vec![4]);
+        let out_id = tape.alloc(out_data.clone(), vec![4]);
+        tape.record(TapeOp::Add { a: a_id, b: b_id, out: out_id });
+        let loss_val = out_data.iter().sum::<f32>();
+        let loss_id = tape.alloc(vec![loss_val], vec![1]);
+        tape.record(TapeOp::SumReduce { input: out_id, out: loss_id });
+        tape.backward(loss_id);
+
+        fd_check(tape.get_grad(a_id).unwrap(), |ap| {
+            ap.iter().zip(b.iter()).map(|(x, y)| x + y).sum()
+        }, &a, "add_A");
+
+        fd_check(tape.get_grad(b_id).unwrap(), |bp| {
+            a.iter().zip(bp.iter()).map(|(x, y)| x + y).sum()
+        }, &b, "add_B");
+    }
+
+    #[test]
+    fn test_fd_sub() {
+        let a = vec![1.0, -2.0, 3.0, 0.5];
+        let b = vec![0.5, 1.5, -1.0, 2.0];
+        let out_data: Vec<f32> = a.iter().zip(b.iter()).map(|(x, y)| x - y).collect();
+
+        let mut tape = Tape::new_empty();
+        let a_id = tape.alloc(a.clone(), vec![4]);
+        let b_id = tape.alloc(b.clone(), vec![4]);
+        let out_id = tape.alloc(out_data.clone(), vec![4]);
+        tape.record(TapeOp::Sub { a: a_id, b: b_id, out: out_id });
+        let loss_val = out_data.iter().sum::<f32>();
+        let loss_id = tape.alloc(vec![loss_val], vec![1]);
+        tape.record(TapeOp::SumReduce { input: out_id, out: loss_id });
+        tape.backward(loss_id);
+
+        fd_check(tape.get_grad(a_id).unwrap(), |ap| {
+            ap.iter().zip(b.iter()).map(|(x, y)| x - y).sum()
+        }, &a, "sub_A");
+
+        fd_check(tape.get_grad(b_id).unwrap(), |bp| {
+            a.iter().zip(bp.iter()).map(|(x, y)| x - y).sum()
+        }, &b, "sub_B");
+    }
+
+    #[test]
+    fn test_fd_mul() {
+        let a = vec![1.0, -2.0, 3.0, 0.5];
+        let b = vec![0.5, 1.5, -1.0, 2.0];
+        let out_data: Vec<f32> = a.iter().zip(b.iter()).map(|(x, y)| x * y).collect();
+
+        let mut tape = Tape::new_empty();
+        let a_id = tape.alloc(a.clone(), vec![4]);
+        let b_id = tape.alloc(b.clone(), vec![4]);
+        let out_id = tape.alloc(out_data.clone(), vec![4]);
+        tape.record(TapeOp::Mul { a: a_id, b: b_id, out: out_id });
+        let loss_val = out_data.iter().sum::<f32>();
+        let loss_id = tape.alloc(vec![loss_val], vec![1]);
+        tape.record(TapeOp::SumReduce { input: out_id, out: loss_id });
+        tape.backward(loss_id);
+
+        fd_check(tape.get_grad(a_id).unwrap(), |ap| {
+            ap.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+        }, &a, "mul_A");
+
+        fd_check(tape.get_grad(b_id).unwrap(), |bp| {
+            a.iter().zip(bp.iter()).map(|(x, y)| x * y).sum()
+        }, &b, "mul_B");
+    }
+
+    #[test]
+    fn test_fd_scale() {
+        let x = vec![1.0, -2.0, 3.0, 0.5];
+        let scalar = 2.5f32;
+        let out_data: Vec<f32> = x.iter().map(|&v| scalar * v).collect();
+
+        let mut tape = Tape::new_empty();
+        let x_id = tape.alloc(x.clone(), vec![4]);
+        let out_id = tape.alloc(out_data.clone(), vec![4]);
+        tape.record(TapeOp::Scale { input: x_id, scalar, out: out_id });
+        let loss_val = out_data.iter().sum::<f32>();
+        let loss_id = tape.alloc(vec![loss_val], vec![1]);
+        tape.record(TapeOp::SumReduce { input: out_id, out: loss_id });
+        tape.backward(loss_id);
+
+        fd_check(tape.get_grad(x_id).unwrap(), |xp| {
+            xp.iter().map(|&v| scalar * v).sum()
+        }, &x, "scale");
+    }
+
+    #[test]
+    fn test_fd_negate() {
+        let x = vec![1.0, -2.0, 3.0, 0.5];
+        let out_data: Vec<f32> = x.iter().map(|&v| -v).collect();
+
+        let mut tape = Tape::new_empty();
+        let x_id = tape.alloc(x.clone(), vec![4]);
+        let out_id = tape.alloc(out_data.clone(), vec![4]);
+        tape.record(TapeOp::Negate { input: x_id, out: out_id });
+        let loss_val = out_data.iter().sum::<f32>();
+        let loss_id = tape.alloc(vec![loss_val], vec![1]);
+        tape.record(TapeOp::SumReduce { input: out_id, out: loss_id });
+        tape.backward(loss_id);
+
+        fd_check(tape.get_grad(x_id).unwrap(), |xp| {
+            xp.iter().map(|&v| -v).sum()
+        }, &x, "negate");
+    }
+
+    #[test]
+    fn test_fd_sum_reduce() {
+        let x = vec![1.0, -2.0, 3.0, 0.5, -1.5];
+        let loss_val = x.iter().sum::<f32>();
+
+        let mut tape = Tape::new_empty();
+        let x_id = tape.alloc(x.clone(), vec![5]);
+        let out_id = tape.alloc(vec![loss_val], vec![1]);
+        tape.record(TapeOp::SumReduce { input: x_id, out: out_id });
+        tape.backward(out_id);
+
+        fd_check(tape.get_grad(x_id).unwrap(), |xp| {
+            xp.iter().sum()
+        }, &x, "sum_reduce");
+    }
+
+    #[test]
+    fn test_fd_concat() {
+        let a = vec![1.0, 2.0, 3.0];
+        let b = vec![4.0, 5.0];
+        let out_data: Vec<f32> = a.iter().chain(b.iter()).copied().collect();
+
+        let mut tape = Tape::new_empty();
+        let a_id = tape.alloc(a.clone(), vec![3]);
+        let b_id = tape.alloc(b.clone(), vec![2]);
+        let out_id = tape.alloc(out_data.clone(), vec![5]);
+        tape.record(TapeOp::Concat {
+            inputs: vec![a_id, b_id], out: out_id, axis: 0, sizes: vec![3, 2],
+        });
+        let loss_val = out_data.iter().sum::<f32>();
+        let loss_id = tape.alloc(vec![loss_val], vec![1]);
+        tape.record(TapeOp::SumReduce { input: out_id, out: loss_id });
+        tape.backward(loss_id);
+
+        fd_check(tape.get_grad(a_id).unwrap(), |ap| {
+            let cat: Vec<f32> = ap.iter().chain(b.iter()).copied().collect();
+            cat.iter().sum()
+        }, &a, "concat_A");
+
+        fd_check(tape.get_grad(b_id).unwrap(), |bp| {
+            let cat: Vec<f32> = a.iter().chain(bp.iter()).copied().collect();
+            cat.iter().sum()
+        }, &b, "concat_B");
+    }
+
+    #[test]
+    fn test_fd_slice() {
+        let x = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let offset = 1;
+        let len = 3;
+        let out_data = x[offset..offset + len].to_vec();
+
+        let mut tape = Tape::new_empty();
+        let x_id = tape.alloc(x.clone(), vec![5]);
+        let out_id = tape.alloc(out_data.clone(), vec![len]);
+        tape.record(TapeOp::Slice { input: x_id, out: out_id, offset, len, input_len: 5 });
+        let loss_val = out_data.iter().sum::<f32>();
+        let loss_id = tape.alloc(vec![loss_val], vec![1]);
+        tape.record(TapeOp::SumReduce { input: out_id, out: loss_id });
+        tape.backward(loss_id);
+
+        fd_check(tape.get_grad(x_id).unwrap(), |xp| {
+            xp[offset..offset + len].iter().sum()
+        }, &x, "slice");
+    }
+
+    #[test]
+    fn test_fd_straight_through_bool() {
+        // STE: forward = threshold to 0/1, backward = pass-through.
+        // FD of the forward is 0 everywhere (step function), but STE
+        // intentionally passes d_out through unchanged. We verify the
+        // STE property: tape gradient == 1.0 for each element (since
+        // d_loss/d_out = 1 from SumReduce and STE copies it through).
+        let x = vec![0.1, 0.6, 0.4, 0.9];
+        let threshold = 0.5f32;
+        let out_data: Vec<f32> = x.iter().map(|&v| if v >= threshold { 1.0 } else { 0.0 }).collect();
+
+        let mut tape = Tape::new_empty();
+        let x_id = tape.alloc(x.clone(), vec![4]);
+        let out_id = tape.alloc(out_data.clone(), vec![4]);
+        tape.record(TapeOp::StraightThroughBool { input: x_id, threshold, out: out_id });
+        let loss_val = out_data.iter().sum::<f32>();
+        let loss_id = tape.alloc(vec![loss_val], vec![1]);
+        tape.record(TapeOp::SumReduce { input: out_id, out: loss_id });
+        tape.backward(loss_id);
+
+        // STE: gradient is passed straight through, so d_loss/d_x = 1.0 for all
+        let grad = tape.get_grad(x_id).unwrap();
+        for (i, &g) in grad.iter().enumerate() {
+            assert!((g - 1.0).abs() < 1e-6,
+                "STE grad[{i}]: expected 1.0, got {g}");
+        }
     }
 }
