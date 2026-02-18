@@ -1,5 +1,12 @@
 # Enzyme AD Integration + Kernel-Pair Pattern
 
+> **NOTE (2026-02-18):** Mechanism 1 (Enzyme AD) is superseded by
+> `01_wengert_tape.md` — a Rust-native Wengert tape that replaces Enzyme's
+> LLVM-level AD pass. Mechanism 2 (hand-written backward kernels / kernel pairs)
+> and the four annotation levels concept remain valid — adapted to tape-based
+> registration via the `OpaqueVjp` trait and `Tape::record_opaque()`. See
+> `01_wengert_tape.md` for the current differentiation architecture.
+
 ```
 CONTRACT
   Purpose:    Defines how differentiation works across the entire system.
