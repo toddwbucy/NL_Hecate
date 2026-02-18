@@ -179,6 +179,19 @@ processes ops in reverse order, propagating `d_out` (the upstream gradient of
 the loss with respect to this op's output) back to `d_input` (the gradient
 with respect to this op's inputs).
 
+**Sources**: Standard VJP rules derive from matrix calculus and reverse-mode AD:
+- Matmul, Transpose, OuterProduct, FrobeniusDot, element-wise ops, Scale, Negate:
+  Griewank & Walther, "Evaluating Derivatives" (2008), Ch. 3-4; Magnus & Neudecker,
+  "Matrix Differential Calculus" (2019), Ch. 5.
+- Sigmoid, Softplus, SiLU: Baydin et al., "Automatic Differentiation in Machine
+  Learning: A Survey" (2018), Table 1.
+- Softmax VJP: Blondel et al., "Efficient and Modular Implicit Differentiation"
+  (2022), Appendix A.
+- CrossEntropy (combined softmax+CE): Goodfellow, Bengio & Courville, "Deep
+  Learning" (2016), §6.2.2.3.
+- EmbedLookup (scatter-add): standard embedding gradient; PyTorch nn.Embedding.
+- L2Norm, L2Retention, Concat, Slice: elementary chain rule applications.
+
 ```text
 -- Notation:
 --   d_X means d(loss)/d(X)  (the gradient of the scalar loss w.r.t. tensor X)
