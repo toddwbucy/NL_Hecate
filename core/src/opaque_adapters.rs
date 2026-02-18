@@ -1267,8 +1267,7 @@ mod tests {
                     continue;
                 }
                 // Saved buffers and metadata should NOT accumulate gradient
-                if tape.get_grad(buf_id).is_some() {
-                    let grad = tape.get_grad(buf_id).unwrap();
+                if let Some(grad) = tape.get_grad(buf_id) {
                     let nonzero = grad.iter().any(|&g| g.abs() > 1e-30);
                     assert!(!nonzero,
                         "Gradient leaked to non-input buf {}: norm={}",
