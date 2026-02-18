@@ -8,11 +8,11 @@
 //   2. Call the existing step_backward()
 //   3. Flatten (MemoryLevelParams grads, d_embedded) back into d_inputs
 //
-// The saved buffer layout is defined by record_on_tape() (Phase 2).
-// Convention: saved[0] = embedded, saved[1] = level_params_flat, saved[2..] = cache fields.
+// The saved buffer layout is defined by record_on_tape() implementations below.
+// Convention: saved[0] = metadata, saved[1] = level_params_flat, saved[2] = embedded, saved[3..] = cache fields.
 
 use std::collections::HashMap;
-use crate::tape::{OpaqueKey, OpaqueBackwardFn};
+use crate::tape::{OpaqueKey, OpaqueBackwardFn, OpaqueVjp, Tape, BufId};
 use crate::model::MemoryLevelParams;
 use crate::delta_rule::{DeltaRule, DeltaRuleCache, MemoryRule};
 use crate::titans_lmm::{TitansLMM, TitansLMMCache};
@@ -567,6 +567,396 @@ pub fn frozen_lattice_osr_backward(d: &[&[f32]], s: &[&[f32]], di: &mut [Vec<f32
 pub fn frozen_trellis_backward(d: &[&[f32]], s: &[&[f32]], di: &mut [Vec<f32>]) { frozen_read_backward(d, s, di) }
 pub fn frozen_atlas_omega_backward(d: &[&[f32]], s: &[&[f32]], di: &mut [Vec<f32>]) { frozen_read_backward(d, s, di) }
 
+// ── OpaqueVjp implementations ────────────────────────────────────────
+//
+// Each impl produces saved buffers in the exact order the corresponding
+// backward adapter expects to reconstruct them. The layout is:
+//   inputs[0] = embedded_buf, inputs[1] = level_params_buf
+//   outputs[0] = y_buf
+//   saved[0] = metadata, saved[1] = level_params_flat, saved[2] = embedded,
+//   saved[3..] = cache fields in adapter-expected order
+
+/// Helper: register metadata, level_params, and embedded as saved BufIds.
+/// Returns (embedded_input_id, level_params_input_id, metadata_saved_id,
+///          level_params_saved_id, embedded_saved_id).
+fn record_common_inputs(
+    tape: &mut Tape,
+    level_params: &MemoryLevelParams,
+    embedded: &[f32],
+    seq_len: usize,
+    d: usize,
+    extra_meta: &[f32],
+) -> (BufId, BufId, BufId, BufId, BufId) {
+    // Input BufIds (for gradient flow)
+    let embedded_input = tape.register_input(embedded, vec![seq_len, d]);
+    let lp_flat = level_params_grads_to_flat(level_params);
+    let lp_input = tape.register_param(&lp_flat, vec![lp_flat.len()]);
+
+    // Saved BufIds (for backward reconstruction)
+    let mut meta = vec![seq_len as f32, d as f32];
+    meta.extend_from_slice(extra_meta);
+    let meta_id = tape.alloc(meta, vec![]);
+    let lp_saved = tape.alloc(lp_flat, vec![]);
+    let emb_saved = tape.alloc(embedded.to_vec(), vec![seq_len, d]);
+
+    (embedded_input, lp_input, meta_id, lp_saved, emb_saved)
+}
+
+impl OpaqueVjp for DeltaRule {
+    fn opaque_key(&self) -> OpaqueKey { OpaqueKey::DeltaRule }
+
+    fn record_on_tape(
+        &self, tape: &mut Tape, level_params: &MemoryLevelParams,
+        embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
+    ) -> (Vec<f32>, BufId) {
+        let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
+            record_common_inputs(tape, level_params, embedded, seq_len, d, &[]);
+
+        let (y, cache) = self.step(level_params, embedded, seq_len, d, initial_m);
+
+        // Saved cache fields: same order as delta_rule_opaque_backward reads them
+        let cache_ids: Vec<BufId> = vec![
+            tape.alloc(cache.m_states, vec![]),
+            tape.alloc(cache.k_mem, vec![]),
+            tape.alloc(cache.v_mem, vec![]),
+            tape.alloc(cache.q_mem, vec![]),
+            tape.alloc(cache.concat_kv, vec![]),
+            tape.alloc(cache.alpha_pre, vec![]),
+            tape.alloc(cache.alpha, vec![]),
+            tape.alloc(cache.theta_pre, vec![]),
+            tape.alloc(cache.theta, vec![]),
+            tape.alloc(cache.error, vec![]),
+            tape.alloc(cache.grad_outer, vec![]),
+            tape.alloc(cache.y, vec![]),
+        ];
+
+        let y_id = tape.alloc(y.clone(), vec![seq_len, d]);
+        let mut saved = vec![meta_id, lp_saved, emb_saved];
+        saved.extend(cache_ids);
+        tape.record_opaque(OpaqueKey::DeltaRule,
+            vec![emb_in, lp_in], vec![y_id], saved);
+        (y, y_id)
+    }
+}
+
+impl OpaqueVjp for TitansLMM {
+    fn opaque_key(&self) -> OpaqueKey { OpaqueKey::TitansLMM }
+
+    fn record_on_tape(
+        &self, tape: &mut Tape, level_params: &MemoryLevelParams,
+        embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
+    ) -> (Vec<f32>, BufId) {
+        let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
+            record_common_inputs(tape, level_params, embedded, seq_len, d, &[]);
+
+        let (y, cache) = self.step(level_params, embedded, seq_len, d, initial_m);
+
+        let cache_ids: Vec<BufId> = vec![
+            tape.alloc(cache.m_states, vec![]),
+            tape.alloc(cache.s_states, vec![]),
+            tape.alloc(cache.k_mem, vec![]),
+            tape.alloc(cache.v_mem, vec![]),
+            tape.alloc(cache.q_mem, vec![]),
+            tape.alloc(cache.concat_kv, vec![]),
+            tape.alloc(cache.alpha_pre, vec![]),
+            tape.alloc(cache.alpha, vec![]),
+            tape.alloc(cache.theta_pre, vec![]),
+            tape.alloc(cache.theta, vec![]),
+            tape.alloc(cache.eta_pre, vec![]),
+            tape.alloc(cache.eta, vec![]),
+            tape.alloc(cache.error, vec![]),
+            tape.alloc(cache.grad_outer, vec![]),
+            tape.alloc(cache.y, vec![]),
+        ];
+
+        let y_id = tape.alloc(y.clone(), vec![seq_len, d]);
+        let mut saved = vec![meta_id, lp_saved, emb_saved];
+        saved.extend(cache_ids);
+        tape.record_opaque(OpaqueKey::TitansLMM,
+            vec![emb_in, lp_in], vec![y_id], saved);
+        (y, y_id)
+    }
+}
+
+impl OpaqueVjp for HebbianRule {
+    fn opaque_key(&self) -> OpaqueKey { OpaqueKey::HebbianRule }
+
+    fn record_on_tape(
+        &self, tape: &mut Tape, level_params: &MemoryLevelParams,
+        embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
+    ) -> (Vec<f32>, BufId) {
+        let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
+            record_common_inputs(tape, level_params, embedded, seq_len, d, &[]);
+
+        let (y, cache) = self.step(level_params, embedded, seq_len, d, initial_m);
+
+        let cache_ids: Vec<BufId> = vec![
+            tape.alloc(cache.m_states, vec![]),
+            tape.alloc(cache.k_mem, vec![]),
+            tape.alloc(cache.v_mem, vec![]),
+            tape.alloc(cache.q_mem, vec![]),
+            tape.alloc(cache.concat_kv, vec![]),
+            tape.alloc(cache.alpha_pre, vec![]),
+            tape.alloc(cache.alpha, vec![]),
+            tape.alloc(cache.y, vec![]),
+        ];
+
+        let y_id = tape.alloc(y.clone(), vec![seq_len, d]);
+        let mut saved = vec![meta_id, lp_saved, emb_saved];
+        saved.extend(cache_ids);
+        tape.record_opaque(OpaqueKey::HebbianRule,
+            vec![emb_in, lp_in], vec![y_id], saved);
+        (y, y_id)
+    }
+}
+
+impl OpaqueVjp for Moneta {
+    fn opaque_key(&self) -> OpaqueKey { OpaqueKey::Moneta }
+
+    fn record_on_tape(
+        &self, tape: &mut Tape, level_params: &MemoryLevelParams,
+        embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
+    ) -> (Vec<f32>, BufId) {
+        let extra_meta = [self.d_hidden as f32, self.lp_p, self.lambda_2];
+        let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
+            record_common_inputs(tape, level_params, embedded, seq_len, d, &extra_meta);
+
+        let (y, cache) = self.step(level_params, embedded, seq_len, d, initial_m);
+
+        let cache_ids: Vec<BufId> = vec![
+            tape.alloc(cache.w1_states, vec![]),
+            tape.alloc(cache.w2_states, vec![]),
+            tape.alloc(cache.k_mem, vec![]),
+            tape.alloc(cache.v_mem, vec![]),
+            tape.alloc(cache.q_mem, vec![]),
+            tape.alloc(cache.concat_kv, vec![]),
+            tape.alloc(cache.alpha_pre, vec![]),
+            tape.alloc(cache.alpha, vec![]),
+            tape.alloc(cache.theta_pre, vec![]),
+            tape.alloc(cache.theta, vec![]),
+            tape.alloc(cache.pre_act, vec![]),
+            tape.alloc(cache.hidden, vec![]),
+            tape.alloc(cache.prediction, vec![]),
+            tape.alloc(cache.error, vec![]),
+            tape.alloc(cache.y, vec![]),
+        ];
+
+        let y_id = tape.alloc(y.clone(), vec![seq_len, d]);
+        let mut saved = vec![meta_id, lp_saved, emb_saved];
+        saved.extend(cache_ids);
+        tape.record_opaque(OpaqueKey::Moneta,
+            vec![emb_in, lp_in], vec![y_id], saved);
+        (y, y_id)
+    }
+}
+
+impl OpaqueVjp for YAAD {
+    fn opaque_key(&self) -> OpaqueKey { OpaqueKey::YAAD }
+
+    fn record_on_tape(
+        &self, tape: &mut Tape, level_params: &MemoryLevelParams,
+        embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
+    ) -> (Vec<f32>, BufId) {
+        let extra_meta = [self.d_hidden as f32, self.delta, self.lambda_local, self.lambda_2];
+        let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
+            record_common_inputs(tape, level_params, embedded, seq_len, d, &extra_meta);
+
+        let (y, cache) = self.step(level_params, embedded, seq_len, d, initial_m);
+
+        let cache_ids: Vec<BufId> = vec![
+            tape.alloc(cache.w1_states, vec![]),
+            tape.alloc(cache.w2_states, vec![]),
+            tape.alloc(cache.w1_boundary, vec![]),
+            tape.alloc(cache.w2_boundary, vec![]),
+            tape.alloc(cache.k_mem, vec![]),
+            tape.alloc(cache.v_mem, vec![]),
+            tape.alloc(cache.q_mem, vec![]),
+            tape.alloc(cache.concat_kv, vec![]),
+            tape.alloc(cache.alpha_pre, vec![]),
+            tape.alloc(cache.alpha, vec![]),
+            tape.alloc(cache.theta_pre, vec![]),
+            tape.alloc(cache.theta, vec![]),
+            tape.alloc(cache.pre_act, vec![]),
+            tape.alloc(cache.hidden, vec![]),
+            tape.alloc(cache.prediction, vec![]),
+            tape.alloc(cache.error, vec![]),
+            tape.alloc(cache.y, vec![]),
+        ];
+
+        let y_id = tape.alloc(y.clone(), vec![seq_len, d]);
+        let mut saved = vec![meta_id, lp_saved, emb_saved];
+        saved.extend(cache_ids);
+        tape.record_opaque(OpaqueKey::YAAD,
+            vec![emb_in, lp_in], vec![y_id], saved);
+        (y, y_id)
+    }
+}
+
+impl OpaqueVjp for MEMORA {
+    fn opaque_key(&self) -> OpaqueKey { OpaqueKey::MEMORA }
+
+    fn record_on_tape(
+        &self, tape: &mut Tape, level_params: &MemoryLevelParams,
+        embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
+    ) -> (Vec<f32>, BufId) {
+        let extra_meta = [self.d_hidden as f32];
+        let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
+            record_common_inputs(tape, level_params, embedded, seq_len, d, &extra_meta);
+
+        let (y, cache) = self.step(level_params, embedded, seq_len, d, initial_m);
+
+        let cache_ids: Vec<BufId> = vec![
+            tape.alloc(cache.w1_states, vec![]),
+            tape.alloc(cache.w2_states, vec![]),
+            tape.alloc(cache.k_mem, vec![]),
+            tape.alloc(cache.v_mem, vec![]),
+            tape.alloc(cache.q_mem, vec![]),
+            tape.alloc(cache.concat_kv, vec![]),
+            tape.alloc(cache.alpha_pre, vec![]),
+            tape.alloc(cache.alpha, vec![]),
+            tape.alloc(cache.theta_pre, vec![]),
+            tape.alloc(cache.theta, vec![]),
+            tape.alloc(cache.pre_act, vec![]),
+            tape.alloc(cache.hidden, vec![]),
+            tape.alloc(cache.prediction, vec![]),
+            tape.alloc(cache.error, vec![]),
+            tape.alloc(cache.y, vec![]),
+            tape.alloc(cache.log_w1_prev, vec![]),
+            tape.alloc(cache.log_w2_prev, vec![]),
+        ];
+
+        let y_id = tape.alloc(y.clone(), vec![seq_len, d]);
+        let mut saved = vec![meta_id, lp_saved, emb_saved];
+        saved.extend(cache_ids);
+        tape.record_opaque(OpaqueKey::MEMORA,
+            vec![emb_in, lp_in], vec![y_id], saved);
+        (y, y_id)
+    }
+}
+
+impl OpaqueVjp for LatticeOSR {
+    fn opaque_key(&self) -> OpaqueKey { OpaqueKey::LatticeOSR }
+
+    fn record_on_tape(
+        &self, tape: &mut Tape, level_params: &MemoryLevelParams,
+        embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
+    ) -> (Vec<f32>, BufId) {
+        let extra_meta = [self.m_slots as f32];
+        let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
+            record_common_inputs(tape, level_params, embedded, seq_len, d, &extra_meta);
+
+        let (y, cache) = self.step(level_params, embedded, seq_len, d, initial_m);
+
+        let cache_ids: Vec<BufId> = vec![
+            tape.alloc(cache.s_states, vec![]),
+            tape.alloc(cache.k_mem, vec![]),
+            tape.alloc(cache.v_mem, vec![]),
+            tape.alloc(cache.q_mem, vec![]),
+            tape.alloc(cache.concat_kv, vec![]),
+            tape.alloc(cache.alpha_pre, vec![]),
+            tape.alloc(cache.alpha, vec![]),
+            tape.alloc(cache.scores, vec![]),
+            tape.alloc(cache.slot_gates, vec![]),
+            tape.alloc(cache.read_weights, vec![]),
+            tape.alloc(cache.s_unnorm_norms, vec![]),
+        ];
+
+        let y_id = tape.alloc(y.clone(), vec![seq_len, d]);
+        let mut saved = vec![meta_id, lp_saved, emb_saved];
+        saved.extend(cache_ids);
+        tape.record_opaque(OpaqueKey::LatticeOSR,
+            vec![emb_in, lp_in], vec![y_id], saved);
+        (y, y_id)
+    }
+}
+
+impl OpaqueVjp for Trellis {
+    fn opaque_key(&self) -> OpaqueKey { OpaqueKey::Trellis }
+
+    fn record_on_tape(
+        &self, tape: &mut Tape, level_params: &MemoryLevelParams,
+        embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
+    ) -> (Vec<f32>, BufId) {
+        let extra_meta = [self.d_k as f32, self.lambda_k, self.lambda_v];
+        let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
+            record_common_inputs(tape, level_params, embedded, seq_len, d, &extra_meta);
+
+        let (y, cache) = self.step(level_params, embedded, seq_len, d, initial_m);
+
+        let cache_ids: Vec<BufId> = vec![
+            tape.alloc(cache.sk_states, vec![]),
+            tape.alloc(cache.sv_states, vec![]),
+            tape.alloc(cache.k_mem, vec![]),
+            tape.alloc(cache.v_mem, vec![]),
+            tape.alloc(cache.q_mem, vec![]),
+            tape.alloc(cache.concat_kv, vec![]),
+            tape.alloc(cache.alpha_pre, vec![]),
+            tape.alloc(cache.alpha, vec![]),
+            tape.alloc(cache.theta_pre, vec![]),
+            tape.alloc(cache.theta, vec![]),
+            tape.alloc(cache.pred_k, vec![]),
+            tape.alloc(cache.error_k, vec![]),
+            tape.alloc(cache.compressed_k_pre, vec![]),
+            tape.alloc(cache.compressed_k, vec![]),
+            tape.alloc(cache.compressed_k_silu, vec![]),
+            tape.alloc(cache.compressed_k_silu_norm, vec![]),
+            tape.alloc(cache.read_compressed_q_pre, vec![]),
+            tape.alloc(cache.read_compressed_q, vec![]),
+            tape.alloc(cache.read_compressed_q_silu, vec![]),
+            tape.alloc(cache.read_compressed_q_silu_norm, vec![]),
+            tape.alloc(cache.pred_v, vec![]),
+            tape.alloc(cache.error_v, vec![]),
+        ];
+
+        let y_id = tape.alloc(y.clone(), vec![seq_len, d]);
+        let mut saved = vec![meta_id, lp_saved, emb_saved];
+        saved.extend(cache_ids);
+        tape.record_opaque(OpaqueKey::Trellis,
+            vec![emb_in, lp_in], vec![y_id], saved);
+        (y, y_id)
+    }
+}
+
+impl OpaqueVjp for AtlasOmega {
+    fn opaque_key(&self) -> OpaqueKey { OpaqueKey::AtlasOmega }
+
+    fn record_on_tape(
+        &self, tape: &mut Tape, level_params: &MemoryLevelParams,
+        embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
+    ) -> (Vec<f32>, BufId) {
+        let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
+            record_common_inputs(tape, level_params, embedded, seq_len, d, &[]);
+
+        let (y, cache) = self.step(level_params, embedded, seq_len, d, initial_m);
+
+        let cache_ids: Vec<BufId> = vec![
+            tape.alloc(cache.m_states, vec![]),
+            tape.alloc(cache.s_states, vec![]),
+            tape.alloc(cache.k_mem, vec![]),
+            tape.alloc(cache.v_mem, vec![]),
+            tape.alloc(cache.q_mem, vec![]),
+            tape.alloc(cache.concat_kv, vec![]),
+            tape.alloc(cache.alpha_pre, vec![]),
+            tape.alloc(cache.alpha, vec![]),
+            tape.alloc(cache.theta_pre, vec![]),
+            tape.alloc(cache.theta, vec![]),
+            tape.alloc(cache.eta_pre, vec![]),
+            tape.alloc(cache.eta, vec![]),
+            tape.alloc(cache.silu_kv, vec![]),
+            tape.alloc(cache.omega_vecs, vec![]),
+            tape.alloc(cache.omega_mats, vec![]),
+            tape.alloc(cache.y, vec![]),
+        ];
+
+        let y_id = tape.alloc(y.clone(), vec![seq_len, d]);
+        let mut saved = vec![meta_id, lp_saved, emb_saved];
+        saved.extend(cache_ids);
+        tape.record_opaque(OpaqueKey::AtlasOmega,
+            vec![emb_in, lp_in], vec![y_id], saved);
+        (y, y_id)
+    }
+}
+
 // ── Registry builder ──────────────────────────────────────────────────
 
 /// Build the complete opaque VJP registry mapping every OpaqueKey to its
@@ -677,5 +1067,143 @@ mod tests {
         assert!((d_inputs[0][1] - 0.0).abs() < 1e-6); // d_q[0][1]
         assert!((d_inputs[0][2] - 0.0).abs() < 1e-6); // d_q[1][0]
         assert!((d_inputs[0][3] - 2.0).abs() < 1e-6); // d_q[1][1]
+    }
+
+    // ── OpaqueVjp round-trip tests ──────────────────────────────────
+    //
+    // Pattern: record forward on tape → seed unit gradient → backward →
+    // compare tape-computed gradients against direct step_backward().
+
+    fn make_test_params(d: usize) -> MemoryLevelParams {
+        use crate::tensor::SimpleRng;
+        let mut rng = SimpleRng::new(42);
+        MemoryLevelParams::init(d, &mut rng, 3.0, -4.6, -1.0)
+    }
+
+    fn make_test_embedded(seq_len: usize, d: usize) -> Vec<f32> {
+        use crate::tensor::SimpleRng;
+        let mut rng = SimpleRng::new(99);
+        let mut embedded = vec![0.0f32; seq_len * d];
+        rng.fill_uniform(&mut embedded, 0.5);
+        embedded
+    }
+
+    /// Test that record_on_tape + tape.backward produces the same
+    /// d_embedded and d_level_params as calling step + step_backward directly.
+    fn assert_opaque_roundtrip<R: MemoryRule>(
+        rule: &R, d: usize, seq_len: usize,
+    ) {
+        let params = make_test_params(d);
+        let embedded = make_test_embedded(seq_len, d);
+
+        // --- Direct path: step + step_backward ---
+        let (y_direct, cache) = rule.step(&params, &embedded, seq_len, d, None);
+        let d_y = vec![1.0f32; seq_len * d]; // unit upstream gradient
+        let (param_grads_direct, d_embedded_direct) =
+            rule.step_backward(&params, &cache, &d_y, &embedded);
+
+        // --- Tape path: record_on_tape + backward ---
+        // record_on_tape allocates BufIds 0=embedded_input, 1=level_params_input,
+        // then metadata/saved/cache/output IDs. We capture the input IDs directly.
+        let registry = register_opaque_vjps();
+        let y_tape = crate::tape::with_tape(registry, |tape| {
+            // BufId 0 = embedded_input, BufId 1 = level_params_input (from record_common_inputs)
+            let (y, y_id) = rule.record_on_tape(tape, &params, &embedded, seq_len, d, None);
+            let emb_in: BufId = 0;
+            let lp_in: BufId = 1;
+
+            // Seed y_id with unit upstream gradient and run backward.
+            // backward() processes all ops in reverse; loss_id only controls auto-seeding.
+            tape.seed_grad(y_id, d_y.clone());
+            tape.backward(y_id);
+
+            let d_emb_tape = tape.get_grad(emb_in)
+                .expect("embedded should have gradient");
+            let d_lp_tape = tape.get_grad(lp_in)
+                .expect("level_params should have gradient");
+
+            // Compare d_embedded
+            assert_eq!(d_emb_tape.len(), d_embedded_direct.len(),
+                "d_embedded length mismatch");
+            for (i, (&tape_v, &direct_v)) in d_emb_tape.iter().zip(d_embedded_direct.iter()).enumerate() {
+                assert!((tape_v - direct_v).abs() < 1e-5,
+                    "d_embedded[{}]: tape={} direct={}", i, tape_v, direct_v);
+            }
+
+            // Compare d_level_params
+            let lp_grads_direct = level_params_grads_to_flat(&param_grads_direct);
+            assert_eq!(d_lp_tape.len(), lp_grads_direct.len(),
+                "d_level_params length mismatch");
+            for (i, (&tape_v, &direct_v)) in d_lp_tape.iter().zip(lp_grads_direct.iter()).enumerate() {
+                assert!((tape_v - direct_v).abs() < 1e-5,
+                    "d_level_params[{}]: tape={} direct={}", i, tape_v, direct_v);
+            }
+
+            y
+        });
+
+        // Verify forward output is identical
+        assert_eq!(y_tape.len(), y_direct.len());
+        for (i, (&a, &b)) in y_tape.iter().zip(y_direct.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-7, "y[{}]: tape={} direct={}", i, a, b);
+        }
+    }
+
+    #[test]
+    fn test_opaque_vjp_delta_rule() {
+        assert_opaque_roundtrip(&DeltaRule, 4, 3);
+    }
+
+    #[test]
+    fn test_opaque_vjp_titans_lmm() {
+        assert_opaque_roundtrip(&TitansLMM, 4, 3);
+    }
+
+    #[test]
+    fn test_opaque_vjp_hebbian() {
+        assert_opaque_roundtrip(&HebbianRule, 4, 3);
+    }
+
+    #[test]
+    fn test_opaque_vjp_moneta() {
+        assert_opaque_roundtrip(&Moneta { d_hidden: 8, lp_p: 2.0, lambda_2: 0.01 }, 4, 3);
+    }
+
+    #[test]
+    fn test_opaque_vjp_yaad() {
+        assert_opaque_roundtrip(&YAAD { d_hidden: 8, delta: 0.9, lambda_local: 0.1, lambda_2: 0.01 }, 4, 3);
+    }
+
+    #[test]
+    fn test_opaque_vjp_memora() {
+        assert_opaque_roundtrip(&MEMORA { d_hidden: 8 }, 4, 3);
+    }
+
+    #[test]
+    fn test_opaque_vjp_lattice_osr() {
+        assert_opaque_roundtrip(&LatticeOSR { m_slots: 3 }, 4, 3);
+    }
+
+    #[test]
+    fn test_opaque_vjp_trellis() {
+        assert_opaque_roundtrip(&Trellis { d_k: 3, lambda_k: 0.01, lambda_v: 0.01 }, 4, 3);
+    }
+
+    #[test]
+    fn test_opaque_vjp_atlas_omega() {
+        assert_opaque_roundtrip(&AtlasOmega, 4, 3);
+    }
+
+    #[test]
+    fn test_opaque_key_correct() {
+        assert_eq!(DeltaRule.opaque_key(), OpaqueKey::DeltaRule);
+        assert_eq!(TitansLMM.opaque_key(), OpaqueKey::TitansLMM);
+        assert_eq!(HebbianRule.opaque_key(), OpaqueKey::HebbianRule);
+        assert_eq!((Moneta { d_hidden: 8, lp_p: 2.0, lambda_2: 0.01 }).opaque_key(), OpaqueKey::Moneta);
+        assert_eq!((YAAD { d_hidden: 8, delta: 0.9, lambda_local: 0.1, lambda_2: 0.01 }).opaque_key(), OpaqueKey::YAAD);
+        assert_eq!((MEMORA { d_hidden: 8 }).opaque_key(), OpaqueKey::MEMORA);
+        assert_eq!((LatticeOSR { m_slots: 3 }).opaque_key(), OpaqueKey::LatticeOSR);
+        assert_eq!((Trellis { d_k: 3, lambda_k: 0.01, lambda_v: 0.01 }).opaque_key(), OpaqueKey::Trellis);
+        assert_eq!(AtlasOmega.opaque_key(), OpaqueKey::AtlasOmega);
     }
 }
