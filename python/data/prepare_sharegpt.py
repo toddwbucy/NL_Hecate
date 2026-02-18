@@ -271,9 +271,6 @@ def run_tests(tokenizer=None):
     # Test 4: All user tokens are masked, assistant tokens are valid
     # Check that the "4" content token has a valid target
     # and "What is 2+2?" content tokens have masked targets
-    user_msg_ids = tokenizer.encode("What is 2+2?").ids
-    asst_msg_ids = tokenizer.encode("4").ids
-
     # The assistant content should appear in the token stream
     # and its next-token targets should be valid (>= 0)
     check("non-empty token stream",
@@ -303,7 +300,7 @@ def run_tests(tokenizer=None):
 
     # Test 7: Conversation with only user (no assistant)
     conv_user_only = [{"from": "human", "value": "Hello"}]
-    toks_u, tgts_u = format_chatml(conv_user_only, tokenizer)
+    _toks_u, tgts_u = format_chatml(conv_user_only, tokenizer)
     if len(tgts_u) > 0:
         check("user-only: all targets masked",
               all(t == -1 for t in tgts_u))
@@ -365,7 +362,7 @@ def main():
         try:
             ds = load_dataset("RyokoAI/ShareGPT52K", split="train")
             raw_data = list(ds)
-        except Exception:
+        except (ValueError, KeyError, OSError, ImportError):
             # Fallback: download files only and load JSON directly
             from huggingface_hub import snapshot_download
             path = snapshot_download("RyokoAI/ShareGPT52K", repo_type="dataset")
@@ -464,7 +461,7 @@ def main():
     meta_path = out_dir / "meta.json"
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
-    print(f"  meta.json saved")
+    print("  meta.json saved")
 
     # ── Summary ───────────────────────────────────────────────────────
     total_tokens = train_stats["total_tokens"] + val_stats["total_tokens"]
