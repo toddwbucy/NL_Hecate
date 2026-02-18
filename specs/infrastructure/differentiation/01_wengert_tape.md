@@ -150,7 +150,7 @@ enum TapeOp {
     L2Retention { input: BufId, lambda: f32, out: BufId },
 
     // Concat / reshape
-    Concat { inputs: Vec<BufId>, out: BufId, axis: usize },
+    Concat { inputs: Vec<BufId>, out: BufId, axis: usize, sizes: Vec<usize> },
     Slice { input: BufId, out: BufId, offset: usize, len: usize, input_len: usize },
 
     // ── NL-specific ops ─────────────────────────────────────────────
@@ -252,7 +252,7 @@ EMBED_LOOKUP:  out[t] = table[indices[t]]
 
 L2_NORM:  out = ||x||_2 = sqrt(sum(x[i]^2))
   d_x[i] = d_out * x[i] / out
-  -- Undefined at x=0; clamp denominator to eps=1e-8.
+  -- Undefined at x=0; gradient is zero when ||x|| < eps=1e-8 to avoid explosion.
 
 L2_RETENTION:  out = lambda * input
   d_input = lambda * d_out
