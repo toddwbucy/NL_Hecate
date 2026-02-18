@@ -17,6 +17,7 @@ import math
 import mmap
 import os
 from pathlib import Path
+import random
 import struct
 import time
 from typing import Any, Optional
@@ -401,6 +402,47 @@ def evaluate(gpu_model, bcfg: BuildConfig, val_loader: "BpeDataLoader",
     return avg_loss, ppl
 
 
+# Fixed prompts for sampling at checkpoints (tests different capabilities)
+SAMPLE_PROMPTS = [
+    "What is the capital of France?",
+    "Explain how a neural network learns in simple terms.",
+    "Write a short poem about the ocean.",
+]
+
+
+def generate_samples(gpu_model, cfg, tokenizer, step: int,
+                     temperature: float = 0.7,
+                     max_tokens: int = 128) -> list[dict]:
+    """Generate sample completions at checkpoint time.
+
+    Uses serve.generate() for autoregressive decoding. Returns list of
+    dicts with prompt, completion, and token count for JSONL logging.
+    """
+    from serve import generate
+
+    samples = []
+    for prompt_text in SAMPLE_PROMPTS:
+        prompt_tokens = tokenizer.encode(prompt_text)
+        output_tokens = generate(
+            params=None,  # not needed when gpu_model is provided
+            cfg=cfg,
+            prompt_tokens=prompt_tokens,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            use_cms=True,
+            gpu_model=gpu_model,
+        )
+        # Decode only the generated portion
+        gen_tokens = output_tokens[len(prompt_tokens):]
+        completion = tokenizer.decode(gen_tokens)
+        samples.append({
+            "prompt": prompt_text,
+            "completion": completion,
+            "gen_tokens": len(gen_tokens),
+        })
+    return samples
+
+
 def main():
     parser = argparse.ArgumentParser(description="NL-Hecate build script")
     parser.add_argument("--config", type=str, default=None,
@@ -498,6 +540,14 @@ def main():
     if not use_bpe and token_ids is not None and len(token_ids) < bcfg.seq_len + 1:
         print(f"Error: text too short ({len(token_ids)} tokens < seq_len+1={bcfg.seq_len + 1})")
         return
+
+    # ── Load tokenizer for sample generation ──────────────────────────
+    tokenizer = None
+    if use_bpe and bcfg.save_every > 0:
+        from serve import load_tokenizer, BpeTokenizer
+        tokenizer = load_tokenizer(data_dir=bcfg.data_path)
+        tok_type = "BPE" if isinstance(tokenizer, BpeTokenizer) else "byte-level"
+        print(f"Tokenizer for samples: {tok_type}")
 
     # ── Resume from checkpoint or init fresh ──────────────────────────
     resume_step = 0
@@ -760,6 +810,18 @@ def main():
                 # Byte-level: resumable checkpoint with build state
                 nl_hecate.save_build_checkpoint(ckpt_path, params, cfg, conductor, context)
             print(f"  [checkpoint saved: {ckpt_path}]")
+
+            # Generate samples at checkpoint time
+            if tokenizer is not None and gpu_model is not None:
+                try:
+                    samples = generate_samples(gpu_model, cfg, tokenizer, step)
+                    for s in samples:
+                        preview = s["completion"][:80].replace("\n", " ")
+                        print(f"  [sample] {s['prompt'][:40]}... → {preview}...")
+                    if jsonl:
+                        jsonl.log(event="sample", step=step, samples=samples)
+                except Exception as e:
+                    print(f"  [sample generation failed: {e}]")
 
     t_end = time.perf_counter()
     elapsed = t_end - t_start
