@@ -6369,6 +6369,8 @@ mod tests {
                 .chain(level.w_eta.iter())
                 .chain(level.b_eta.iter())
                 .chain(level.w_omega.iter())
+                .chain(level.w_freq.iter())
+                .chain(level.b_freq.iter())
             {
                 sum += g * g;
             }
