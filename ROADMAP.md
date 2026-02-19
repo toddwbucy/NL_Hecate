@@ -396,6 +396,39 @@ Run the toy_60m config end-to-end. Validate all success criteria:
 
 ---
 
+### S4-M8: Wengert Tape Integration ✅
+
+Replace the hand-written `cms_backward()` gradient path with the Wengert tape-based `tape_compute_gradients()`. This eliminates the maintenance burden of hand-written backward functions while preserving identical numerical output.
+
+**What was delivered**: Five phases (P1–P5) over PRs #58–65:
+
+| Phase | Description | PR | Tests | Status |
+|-------|-------------|-----|-------|--------|
+| P1–P1.9 | Wengert tape core (57 ops, arena allocator, opaque VJP blocks, backward replay) | #58 | 57 | COMPLETE |
+| P2 | Traced forward wrappers (`traced_cms_forward()`, bitwise-equivalent to `cms_forward()`) | #55 | 23 | COMPLETE |
+| P3.1 | `tape_compute_gradients()` — runs tape forward + backward, returns parameter gradients | #59 | — | COMPLETE |
+| P3.2 | Error buffer routing for frozen CMS levels through tape path | #60 | — | COMPLETE |
+| P3.3 | Dynamic frequency gate (`FrequencySchedule::Learned`) traced on tape | #61 | — | COMPLETE |
+| P3.4 | Class 3 tests: tape vs hand-written backward for all 9 rules × k=1,2,4 | #62 | 39 | COMPLETE |
+| P3.5 | Finite-difference gradient checks on tape path | #62 | — | COMPLETE |
+| P4.1 | **Switchover**: `cms_compute_gradients()` now delegates to tape path. Hand-written path preserved as `_handwritten()` test oracle. | #63 | — | COMPLETE |
+| P4.2 | 10-step build loop regression test (tape vs hand-written trajectory) | #64 | 1 | COMPLETE |
+| P4.3 | PyO3 binding updated: Python `cms_compute_gradients()` routes through tape | #65 | — | COMPLETE |
+| P5.1 | Enzyme feature flag removal (already done in PR #57) | — | — | COMPLETE |
+| P5.3 | Documentation update (contract.md, ROADMAP.md) | — | — | COMPLETE |
+| P5.4 | Final validation (full test suite) | — | — | COMPLETE |
+
+**Key design decisions**:
+- Tape records during `traced_cms_forward()`, replays in reverse via `tape.backward(loss_id)`
+- `TracedParamIds` struct maps each parameter to its `BufId` for gradient extraction after backward
+- Memory rules + CUDA kernels register as opaque VJP blocks via `OpaqueVjp` trait
+- `cms_compute_gradients_handwritten()` preserved as test oracle (Class 3 tests verify tape ≡ hand-written)
+- Build loop regression test catches accumulation errors that single-step tests miss
+
+**Dependencies**: S0-M1 (tape core), S3-M5 (dynamic frequency for P3.3)
+
+---
+
 ## Dependency Graph
 
 ```
@@ -403,6 +436,9 @@ Stage 0: Foundation ────────────────────
     │
     ▼
 Stage 1: Algorithm Core ─────────────────────── COMPLETE (805 tests)
+    │
+    ├─► S4-M8: Wengert Tape Integration ──────── COMPLETE (PRs #55–65)
+    │       (tape replaces hand-written backward)
     │
     ├─► S2-M1: Compilation Strategy ─────────── COMPLETE
     │       │
@@ -454,6 +490,6 @@ Stage 2 milestones are sequential (each builds on the last). Stage 3 milestones 
 | Stage 2: Production Infra | 4 (+M1a, +M1b) | 33 CUDA + 13 dispatch + 6 GPU-resident + 20 edge + 18 serving + 18 distributed | COMPLETE |
 | Stage 3: Extensions | 5 | 22 retention + 35 M3/variants + 26 Atlas + 22 dynamic freq = 105 | COMPLETE |
 
-| Stage 4: MVP Build & Serve | 7 (6 done, 1 planned) | 27 Python (existing, no regressions) | IN PROGRESS |
+| Stage 4: MVP Build & Serve | 8 (7 done, 1 planned) | 27 Python + 120 tape/traced/class3 Rust | IN PROGRESS |
 
-**Current position**: S0–S3 complete. S4 MVP pipeline delivered (M1–M6): can build a model on real text data and serve it locally. S4-M7 (build hardening) is next — run the 60M toy model end-to-end. Total test count: 950 Rust + 27 Python = **977 tests**.
+**Current position**: S0–S3 complete. S4 MVP pipeline delivered (M1–M6, M8): can build a model on real text data and serve it locally. Wengert tape is the production gradient path (M8, PRs #55–65). S4-M7 (build hardening) is next — run the 60M toy model end-to-end. Total test count: 834 Rust lib + 27 Python = **861 tests** (lib only; full `cargo test` is higher).
