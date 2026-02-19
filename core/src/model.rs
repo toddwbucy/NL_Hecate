@@ -66,7 +66,7 @@ impl SWAConfig {
     }
 }
 
-/// All learnable parameters — flat Vec<f32> for Enzyme compatibility.
+/// All learnable parameters — flat Vec<f32> for AD compatibility.
 ///
 /// Layout (row-major):
 ///   w_embed:  [vocab_size, d_model]

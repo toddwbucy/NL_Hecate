@@ -372,7 +372,7 @@ mod tests {
 
     #[test]
     fn test_lattice_gla_outer_loop_weight_descent() {
-        // Validates outer-loop gradient flow: Enzyme-computed gradients on
+        // Validates outer-loop gradient flow: tape-computed gradients on
         // projection weights (W_K, W_V, W_Q) decrease a proxy loss when applied
         // as weight updates. This is the outer loop — distinct from the inner loop
         // (memory updates inside the forward pass, which has no external optimizer).

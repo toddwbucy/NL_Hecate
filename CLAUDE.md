@@ -14,19 +14,17 @@ NL_Hecate is a specification-first implementation of the Nested Learning (NL) re
 
 ```text
 Layer 3: Python — PyO3 bindings, orchestration, configuration. No math.
-Layer 2: Rust   — All math, control flow, Enzyme AD. Trait system enforces valid compositions.
-Layer 1: CUDA   — Kernel pairs (forward + backward). Opaque to Enzyme. Hardware-specific.
+Layer 2: Rust   — All math, control flow, Wengert tape AD. Trait system enforces valid compositions.
+Layer 1: CUDA   — Kernel pairs (forward + backward). Opaque to AD. Hardware-specific.
 ```
 
-**Kernel-Pair Pattern**: Every hot operation has three implementations: (1) Rust reference (portable, Enzyme-compatible), (2) CUDA forward kernel, (3) CUDA backward kernel with analytical gradients from papers. The spec envisions Enzyme chaining through pairs via `#[custom_vjp]` and `#[enzyme_opaque]`, but these annotations are **not yet exposed** in the Rust-Enzyme wrapper (they exist internally in Enzyme but are not surfaced). Currently the Rust integration only exposes `#[autodiff]` (expands to internal `#[rustc_autodiff]`) and `#[no_autodiff]`. The Phase 0 spike validates a workaround: manual chain-rule composition at kernel boundaries using FFI barriers as opaque regions, with Enzyme differentiating the Rust portions and hand-written backward kernels providing analytical gradients for the opaque CUDA portions. `#[custom_vjp]` and `#[enzyme_opaque]` remain planned future features — the architecture is designed for them but does not depend on them.
-
-**Toolchain dependency chain**: LLVM version → Rust nightly → CUDA toolkit (all interdependent via Enzyme).
+**Kernel-Pair Pattern**: Every hot operation has three implementations: (1) Rust reference (portable, AD-compatible), (2) CUDA forward kernel, (3) CUDA backward kernel with analytical gradients from papers. The Wengert tape (`core/src/tape.rs`) records operations during forward and replays in reverse for gradients. CUDA kernels are registered as opaque VJP blocks — the tape calls their hand-written backward kernels for gradient computation. This replaced the earlier Enzyme-based approach (archived to `Acheron/enzyme-archive/`).
 
 ## Repository Structure
 
 - `specs/contract.md` — Top-level v0.4.0 specification (read this first)
 - `specs/algorithms/` — Memory update rules (MIRAS 4-knob framework), composition patterns, retention, parallelization, optimization, frequency scheduling
-- `specs/infrastructure/` — Enzyme AD, scheduling (Conductor/Pulse), state lifecycle, context stream, distribution, attention, serving, compilation, precision, Track Zero
+- `specs/infrastructure/` — Differentiation (Wengert tape AD), scheduling (Conductor/Pulse), state lifecycle, context stream, distribution, attention, serving, compilation, precision, Track Zero
 - `specs/constraints/` — 48 code smells (CS-01 through CS-48) and trait system safety
 - `core/src/` — Rust core (stub, awaiting implementation)
 - `core/kernels/` — CUDA kernels (stub)
@@ -54,16 +52,17 @@ Three ways to combine memory with attention: MAC (memory-attention-memory, seque
 
 ### State Lifetimes (Rust ownership enforced)
 
-- **outer_loop_param**: W_K, W_V, W_Q, gates — persists across build, modified by Enzyme, serialized
+- **outer_loop_param**: W_K, W_V, W_Q, gates — persists across build, modified by AD, serialized
 - **inner_loop_state**: M (memory), S (momentum) — scoped to forward pass, NOT serialized
 - **context_memory**: chunk boundary state — persists across forward calls, moved
 
-### Differentiation (Two mechanisms composing via chain rule)
+### Differentiation (Wengert tape + opaque VJP blocks)
 
-- **Enzyme AD**: Differentiates Rust code at LLVM IR level. Currently supported annotations: `#[autodiff]` (reverse/forward mode, expands to `#[rustc_autodiff]`), `#[no_autodiff]`. Planned but not yet available in Rust wrapper: `#[custom_vjp]`, `#[enzyme_opaque]`.
-- **Hand-written backward kernels**: Analytical gradients from papers, opaque to Enzyme
-- **Phase 0 strategy**: Since `#[custom_vjp]` is not yet available, the spike validates manual chain-rule composition — Enzyme differentiates Rust code on either side of a kernel boundary (FFI barrier), and hand-written backward kernels provide gradients for the opaque middle. The upstream gradient is passed as the seed to Enzyme's reverse-mode call, composing the full gradient in one shot.
-- **Critical**: Inner-loop operations must allow outer-loop gradients to flow THROUGH them (the spec's `#[custom_vjp]` intent) — currently achieved via manual composition rather than annotation
+- **Wengert tape** (`core/src/tape.rs`): Records operations during forward pass, replays in reverse for gradients. Opt-in via `with_tape()` (CS-40). All intermediates stored in arena (CS-42).
+- **Opaque VJP blocks**: CUDA kernel pairs and memory rules register as opaque blocks on the tape. Each provides a hand-written backward function with analytical gradients from the papers.
+- **OpaqueVjp trait** (`core/src/tape.rs`): All memory rules implement this trait, connecting the tape to their backward adapters via `opaque_key()` registry lookup.
+- **Critical**: Inner-loop operations allow outer-loop gradients to flow THROUGH them via the opaque VJP mechanism — the tape orchestrates the chain rule across opaque boundaries.
+- **History**: Originally designed around Enzyme (LLVM-level AD). Enzyme was archived to `Acheron/enzyme-archive/` after the Wengert tape proved more practical (no custom toolchain, no ICE crashes).
 
 ### Numerical Precision
 
@@ -117,7 +116,7 @@ Each core paper is decomposed into `{prefix}_equations`, `{prefix}_definitions`,
 - `nl_code_smells` (48) — all code smell constraints (CS-01 through CS-48)
 - `nl_reframings` (33) — PyTorch→NL concept mappings
 - `nl_optimizers` (14) — optimizer catalog
-- `nl_toolchain` (15) — Enzyme/Rust/CUDA toolchain notes
+- `nl_toolchain` (15) — Rust/CUDA toolchain notes (includes historical Enzyme notes)
 - `hecate_specs` (48) — mirror of spec files
 - `paper_edges` (94) — graph edges connecting papers
 

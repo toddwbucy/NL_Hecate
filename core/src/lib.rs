@@ -1,4 +1,3 @@
-#![cfg_attr(feature = "enzyme", feature(autodiff))]
 
 pub mod tensor;
 pub mod tape;

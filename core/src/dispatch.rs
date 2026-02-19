@@ -19,12 +19,12 @@ use std::sync::atomic::{AtomicU8, Ordering};
 /// GPU compute backend.
 ///
 /// Describes which code path actually runs kernels:
-/// - `RustReference`: pure Rust (always available, Enzyme-compatible)
+/// - `RustReference`: pure Rust (always available, AD-compatible)
 /// - `CudaNative`: architecture-specific SASS (sm_86/89/90)
 /// - `CudaPtx`: JIT-compiled PTX for architectures without explicit SASS
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
-    /// Pure Rust reference implementation (always available, Enzyme-compatible).
+    /// Pure Rust reference implementation (always available, AD-compatible).
     RustReference,
     /// CUDA with architecture-specific SASS (native performance).
     CudaNative,

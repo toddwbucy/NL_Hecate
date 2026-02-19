@@ -1,8 +1,8 @@
 /// Edge deployment module for micro models (d <= 128).
 ///
 /// Three deployment profiles:
-///   Profile 1: Inner-loop only (no Enzyme on target, frozen outer-loop weights)
-///   Profile 2: Full NL (Enzyme on target for fine-tuning)
+///   Profile 1: Inner-loop only (no AD on target, frozen outer-loop weights)
+///   Profile 2: Full NL (AD on target for fine-tuning)
 ///   Profile 3: WASM (browser deployment)
 ///
 /// This module provides a zero-dependency wrapper around the existing

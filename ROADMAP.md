@@ -22,11 +22,11 @@ Validate that the toolchain works before adding NL complexity.
 
 | Milestone | Description | Tests | Status |
 |-----------|-------------|-------|--------|
-| **S0-M1: Enzyme Spike** | Prove Enzyme differentiates through Rust trait dispatch. Pin toolchain. | 57 | COMPLETE |
-| **S0-M2: SWA Pipeline** | Pure SWA attention, no memory. Rust + Enzyme + CUDA + Python end-to-end. | 47 | COMPLETE |
+| **S0-M1: AD Spike** | Validated AD through Rust trait dispatch. Originally Enzyme, now archived to Acheron (Wengert tape superseded). | 57 | COMPLETE (archived) |
+| **S0-M2: SWA Pipeline** | Pure SWA attention, no memory. Rust + CUDA + Python end-to-end. | 47 | COMPLETE |
 | **S0-M3: Memory Intro** | Delta Rule + MAG. Gradient flow through memory validated. PyO3 bindings. | 98 | COMPLETE |
 
-**Toolchain pinned**: rustc `d7daac06` (1.95.0-nightly), fat LTO, `RUSTFLAGS="-Zautodiff=Enable"`.
+**Note**: Originally pinned to Enzyme toolchain (rustc d7daac06). Enzyme archived Feb 2026 — Wengert tape AD superseded it. No custom toolchain required.
 
 ---
 
@@ -100,12 +100,12 @@ Move from validated algorithms to deployable system. Each milestone maps to a sp
 **Spec**: `specs/infrastructure/compilation/00_compilation.md`
 
 Formalize the two-domain compilation boundary that already exists in practice:
-- Enzyme handles Rust code (via `#[autodiff_reverse]`)
+- Wengert tape handles Rust code (operation recording + reverse replay)
 - Hand-written CUDA backward kernels handle opaque GPU operations
 - No whole-model graph tracing (torch.compile cannot trace NL's inner loop)
 - Multi-architecture fat binary (sm_86/89/90 SASS + PTX fallback)
 
-**What was delivered**: CUDA kernel pairs for all 3 matrix-based memory rules (DeltaRule, TitansLMM, HebbianRule). Each has forward + backward kernels with analytical gradients from the papers. All fp32. Single-block design (Grid=1, Block=min(d², 1024)) with shared memory for M recurrence. Projections and gates remain in Rust (Enzyme-differentiable); only the sequential inner loop is CUDA. Multi-architecture fat binary via `-gencode` flags covers sm_86/89/90 with PTX fallback for future GPUs. Runtime `Backend` enum + `detect_gpu()` for diagnostics. `force_rust_reference()` override for testing.
+**What was delivered**: CUDA kernel pairs for all 3 matrix-based memory rules (DeltaRule, TitansLMM, HebbianRule). Each has forward + backward kernels with analytical gradients from the papers. All fp32. Single-block design (Grid=1, Block=min(d², 1024)) with shared memory for M recurrence. Projections and gates remain in Rust (tape-differentiable); only the sequential inner loop is CUDA. Multi-architecture fat binary via `-gencode` flags covers sm_86/89/90 with PTX fallback for future GPUs. Runtime `Backend` enum + `detect_gpu()` for diagnostics. `force_rust_reference()` override for testing.
 
 | Phase | Kernels | Tests | Status |
 |-------|---------|-------|--------|
@@ -179,12 +179,12 @@ NL models self-modify during inference (inner loop runs at test time). Serving m
 Deploy micro models (d <= 128) on CPU with zero external dependencies. The inner loop enables on-device adaptation without retraining.
 
 **Deliverables**:
-- [x] Profile 1: Inner-loop only (no Enzyme on target, pre-computed outer-loop weights)
+- [x] Profile 1: Inner-loop only (no AD on target, pre-computed outer-loop weights)
 - [x] Profile 2: Full NL (forward + backward + gradient apply on x86_64)
 - [x] Profile 3: WASM (wasm32-unknown-unknown cross-compilation validated)
 - [x] Target matrix validation: x86_64 native + wasm32 cross-compile
 - [x] Benchmark: ~34k tok/s on x86_64 for d=64 (exceeds 18k target)
-- [x] `#![feature(autodiff)]` gated behind `enzyme` feature (edge/wasm builds don't need nightly autodiff)
+- [x] Edge/wasm builds require no special toolchain features
 
 **Implementation**: `core/src/edge.rs` (feature-gated: `edge`), `core/benches/edge_bench.rs` (Criterion)
 - EdgeConfig + EdgeModel: zero-dependency wrapper around cms_forward/cms_backward

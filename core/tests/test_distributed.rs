@@ -1,9 +1,7 @@
 //! Tests for CMS-aware multi-GPU gradient synchronization.
 //!
 //! All tests use MockProcessGroup — no real multi-GPU hardware needed.
-//! Run: RUSTFLAGS="-Zautodiff=Enable" cargo +enzyme test --release --features distributed --test test_distributed
-
-#![feature(autodiff)]
+//! Run: cargo test --features distributed --test test_distributed
 
 #[cfg(feature = "distributed")]
 mod tests {

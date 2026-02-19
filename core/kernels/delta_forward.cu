@@ -16,7 +16,7 @@
 //   store M to m_states[(t+1)*d*d..]
 //   y_t[i] = sum_j M[i,j] * q_t[j]
 //
-// This file is compiled by nvcc into machine code (opaque to Enzyme).
+// This file is compiled by nvcc into machine code (opaque to AD).
 
 #include <cuda_runtime.h>
 #include <float.h>

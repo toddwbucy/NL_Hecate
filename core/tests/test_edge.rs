@@ -5,7 +5,7 @@
 ///   Profile 2: Full NL (forward + backward + gradient apply)
 ///   Profile 3: WASM (validated via cross-compilation, not runtime)
 ///
-/// Run: cargo +enzyme test --release --features edge --test test_edge
+/// Run: cargo test --features edge --test test_edge
 
 use nl_hecate_core::edge::{EdgeConfig, EdgeModel, estimate_model_size_bytes};
 use nl_hecate_core::model::{CompositionKind, MemoryRuleKind};

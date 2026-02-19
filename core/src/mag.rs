@@ -26,7 +26,7 @@ use crate::dynamic_freq::{
 };
 
 /// Memory cache enum for static dispatch across memory rule variants.
-/// Preserves monomorphization (Enzyme requires no vtable indirection).
+/// Preserves monomorphization (AD requires no vtable indirection).
 pub enum MemoryCache {
     Delta(DeltaRuleCache),
     Titans(TitansLMMCache),

@@ -5,17 +5,9 @@ edition = "2021"
 publish = false
 
 # Track Zero-A: SWA Transformer pipeline
-# Pure Rust forward + backward with Enzyme AD for gradient computation.
-
-# Fat LTO is MANDATORY for Enzyme.
-# Enzyme operates at LLVM IR level and must see all function bodies
-# in a single compilation unit. Without fat LTO, cross-module calls
-# are opaque and Enzyme cannot differentiate through them.
-[profile.dev]
-lto = "fat"
+# Pure Rust forward + backward with Wengert tape AD for gradient computation.
 
 [profile.release]
-lto = "fat"
 opt-level = 2
 
 [features]
@@ -24,7 +16,6 @@ distributed = []
 serving = []
 internal = []
 edge = []
-enzyme = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

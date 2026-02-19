@@ -14,7 +14,7 @@
 //   4. d_Q[q,h,d] += d_scores[w] * K[k,h,d] * scale     (direct write)
 //   5. d_K[k,h,d] += d_scores[w] * Q[q,h,d] * scale     (atomicAdd)
 //
-// This file is compiled by nvcc into machine code (opaque to Enzyme).
+// This file is compiled by nvcc into machine code (opaque to AD).
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>

@@ -1032,7 +1032,7 @@ mod tests {
     }
 
     /// Outer-loop weight descent: loss decreases as projection weights are updated
-    /// via Enzyme-computed gradients. This validates the outer loop — the inner loop
+    /// via tape-computed gradients. This validates the outer loop — the inner loop
     /// (memory self-modification inside the forward pass) runs without any external
     /// optimizer. See CS-10 through CS-17 for the no-epochs/no-external-optimizer
     /// constraints, which apply to the inner loop.
