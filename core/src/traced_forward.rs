@@ -404,6 +404,15 @@ pub fn traced_cms_forward(
                 ),
             };
 
+            // Verify traced q_mem matches read_only q_mem (guards against
+            // CUDA/CPU dispatch divergence in matmul_transb).
+            debug_assert_eq!(
+                tape.buf_data(q_mem_id),
+                q_mem_data.as_slice(),
+                "Frozen level {level} ({:?}): traced q_mem diverged from read_only q_mem",
+                cfg.memory_rule,
+            );
+
             // Record frozen opaque block: input = q_mem_id, saved = [meta, m_frozen]
             let fk = frozen_opaque_key(cfg.memory_rule);
             let meta = vec![s as f32, d as f32];
