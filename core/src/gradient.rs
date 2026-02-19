@@ -16,6 +16,7 @@ use crate::conductor::{Pulse, ContextState, ErrorBuffer};
 use crate::tape::with_tape;
 use crate::traced_forward::traced_cms_forward;
 use crate::opaque_adapters::{register_opaque_vjps, level_params_from_flat};
+use crate::dynamic_freq::{compute_gate_surrogate, freq_gate_backward};
 
 /// Create a ContextState with the correct memory size per level for the given config.
 /// MONETA uses W1+W2 (d_hidden*d + d*d_hidden), other rules use d*d.
@@ -298,7 +299,7 @@ pub fn tape_compute_gradients(
     let registry = register_opaque_vjps();
     with_tape(registry, |tape| {
         // ── Forward: record everything on tape ──────────────────
-        let (loss, _cache, loss_id, param_ids) =
+        let (loss, cache, loss_id, param_ids) =
             traced_cms_forward(tape, params, cfg, input_ids, target_ids, pulse, context);
 
         // ── Backward: replay tape in reverse ────────────────────
@@ -331,7 +332,7 @@ pub fn tape_compute_gradients(
                 lp_grad.w_q_mem = w_q_mem_grad;
             }
 
-            if pulse.active_levels[level] {
+            if cache.pulse.active_levels[level] {
                 // Active level: return gradient directly.
                 level_grads.push(lp_grad);
             } else {
@@ -340,6 +341,38 @@ pub fn tape_compute_gradients(
                 // when FrequencySchedule::Learned is active).
                 error_buffers[level].accumulate(&lp_grad);
                 level_grads.push(MemoryLevelParams::zeros_like_from(&lp_grad, d));
+            }
+        }
+
+        // ── Frequency gate surrogate gradient ──────────────────────
+        // The frequency gate controls a discrete decision (active vs frozen),
+        // so the tape can't differentiate through it via chain rule. Use the
+        // same surrogate mechanism as cms_backward: compute how much each
+        // level's output affected the loss, then backprop through sigmoid.
+        if let Some(ref fc) = cache.freq_cache {
+            let s = cfg.swa.seq_len;
+            let combined_y_id = param_ids.combined_y.unwrap();
+            let zero_fallback;
+            let d_y_combined: &[f32] = match tape.get_grad(combined_y_id) {
+                Some(g) => g,
+                None => { zero_fallback = vec![0.0f32; s * d]; &zero_fallback },
+            };
+            let d_gate_values = compute_gate_surrogate(
+                &cache.y_per_level, d_y_combined, &cache.pulse.active_levels, cfg.k, s * d,
+            );
+            // d_embedded_mean is intentionally discarded: the tape already recorded
+            // the mean-pool matmul (ones_row @ embedded), so backward through
+            // that op accumulates d_embedded via the chain rule automatically.
+            let (freq_grads, _d_embedded_mean) = freq_gate_backward(
+                &d_gate_values, fc, &params.levels, cfg.k, d,
+            );
+            for (l, fg) in freq_grads.into_iter().enumerate() {
+                if !level_grads[l].w_freq.is_empty() {
+                    for j in 0..d {
+                        level_grads[l].w_freq[j] += fg.d_w_freq[j];
+                    }
+                    level_grads[l].b_freq[0] += fg.d_b_freq[0];
+                }
             }
         }
 
@@ -5615,5 +5648,77 @@ mod tests {
             .map(|x| x * x).sum::<f32>().sqrt();
         assert_eq!(ref_l1_norm, 0.0,
             "Reference level 1 grads should also be zero (routed to ebuf)");
+    }
+
+    // ── P3.3: Learned frequency gate gradients ──────────────────────
+
+    #[test]
+    fn test_tape_learned_freq_gate_gradients() {
+        use crate::dynamic_freq::{FrequencySchedule, LearnedFreqConfig};
+
+        // k=2 DeltaRule with learned frequency gates.
+        let mut cfg = MAGConfig::test_config_k2();
+        cfg.frequency_schedule = FrequencySchedule::Learned(LearnedFreqConfig::default());
+
+        let params = MAGParams::init(&cfg, 42);
+        let d = cfg.swa.d_model;
+        let s = cfg.swa.seq_len;
+        let v = cfg.swa.vocab_size;
+        let input_ids: Vec<usize> = (0..s).map(|t| t % v).collect();
+        let target_ids: Vec<usize> = (1..=s).map(|t| t % v).collect();
+        let pulse = Pulse { global_step: 0, active_levels: vec![true, true] };
+
+        // Reference path
+        let mut ctx_ref = make_context_state(&cfg);
+        let mut ebufs_ref: Vec<ErrorBuffer> = (0..cfg.k)
+            .map(|_| ErrorBuffer::new(d))
+            .collect();
+        let (loss_ref, grads_ref) = cms_compute_gradients(
+            &params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx_ref, &mut ebufs_ref,
+        );
+
+        // Tape path
+        let mut ctx_tape = make_context_state(&cfg);
+        let mut ebufs_tape: Vec<ErrorBuffer> = (0..cfg.k)
+            .map(|_| ErrorBuffer::new(d))
+            .collect();
+        let (loss_tape, grads_tape) = tape_compute_gradients(
+            &params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx_tape, &mut ebufs_tape,
+        );
+
+        // Loss must match.
+        assert_eq!(loss_ref.to_bits(), loss_tape.to_bits(),
+            "Learned freq gate: loss mismatch ref={loss_ref} tape={loss_tape}");
+
+        // w_freq/b_freq gradients should be present and nonzero for at least one level.
+        let mut any_freq_nonzero = false;
+        for l in 0..cfg.k {
+            assert_eq!(grads_tape.levels[l].w_freq.len(), d,
+                "level {l}: w_freq grad should have length d={d}");
+            assert_eq!(grads_tape.levels[l].b_freq.len(), 1,
+                "level {l}: b_freq grad should have length 1");
+            let wf_norm: f32 = grads_tape.levels[l].w_freq.iter()
+                .map(|x| x * x).sum::<f32>().sqrt();
+            let bf_norm: f32 = grads_tape.levels[l].b_freq.iter()
+                .map(|x| x * x).sum::<f32>().sqrt();
+            if wf_norm > 0.0 || bf_norm > 0.0 {
+                any_freq_nonzero = true;
+            }
+        }
+        assert!(any_freq_nonzero,
+            "At least one level should have nonzero w_freq/b_freq gradient");
+
+        // Reference path should also have freq gradients (from cms_backward).
+        for l in 0..cfg.k {
+            let ref_wf_norm: f32 = grads_ref.levels[l].w_freq.iter()
+                .map(|x| x * x).sum::<f32>().sqrt();
+            let tape_wf_norm: f32 = grads_tape.levels[l].w_freq.iter()
+                .map(|x| x * x).sum::<f32>().sqrt();
+            // Both should be nonzero or both zero.
+            if ref_wf_norm > 1e-10 || tape_wf_norm > 1e-10 {
+                assert!(ref_wf_norm > 1e-10 && tape_wf_norm > 1e-10,
+                    "level {l}: ref w_freq norm={ref_wf_norm:.4e} tape={tape_wf_norm:.4e} — one is zero");
+            }
+        }
     }
 }
