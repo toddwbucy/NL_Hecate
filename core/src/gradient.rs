@@ -13,6 +13,9 @@ use crate::mag::{mag_forward, mag_backward, cms_forward, cms_backward};
 use crate::mal::{mal_forward, mal_backward, cms_mal_forward, cms_mal_backward};
 use crate::mac::{mac_forward, mac_backward, cms_mac_forward, cms_mac_backward};
 use crate::conductor::{Pulse, ContextState, ErrorBuffer};
+use crate::tape::with_tape;
+use crate::traced_forward::traced_cms_forward;
+use crate::opaque_adapters::{register_opaque_vjps, level_params_from_flat};
 
 /// Create a ContextState with the correct memory size per level for the given config.
 /// MONETA uses W1+W2 (d_hidden*d + d*d_hidden), other rules use d*d.
@@ -267,6 +270,69 @@ pub fn cms_compute_gradients(
     let (loss, cache) = cms_forward(params, cfg, input_ids, target_ids, pulse, context);
     let grads = cms_backward(params, cfg, &cache, input_ids, target_ids, error_buffers);
     (loss, grads)
+}
+
+/// Compute gradients via the Wengert tape (traced forward + automatic backward).
+///
+/// Runs `traced_cms_forward()` to record every operation on the tape,
+/// then calls `tape.backward()` to replay in reverse and accumulate gradients.
+/// Returns the same (loss, grad_params) shape as `cms_compute_gradients()`.
+///
+/// The `_error_buffers` parameter is accepted for API compatibility but unused
+/// (frozen-level error buffer routing is P3.2 scope).
+#[allow(dead_code)]
+pub fn tape_compute_gradients(
+    params: &MAGParams,
+    cfg: &MAGConfig,
+    input_ids: &[usize],
+    target_ids: &[usize],
+    pulse: &Pulse,
+    context: &mut ContextState,
+    _error_buffers: &mut [ErrorBuffer],
+) -> (f32, MAGParams) {
+    let d = cfg.swa.d_model;
+
+    let registry = register_opaque_vjps();
+    with_tape(registry, |tape| {
+        // ── Forward: record everything on tape ──────────────────
+        let (loss, _cache, loss_id, param_ids) =
+            traced_cms_forward(tape, params, cfg, input_ids, target_ids, pulse, context);
+
+        // ── Backward: replay tape in reverse ────────────────────
+        tape.backward(loss_id);
+
+        // ── Extract SWA parameter gradients ─────────────────────
+        let swa_grads = SWAParams {
+            w_embed: tape.get_param_grad(param_ids.w_embed),
+            w_q: tape.get_param_grad(param_ids.w_q),
+            w_k: tape.get_param_grad(param_ids.w_k),
+            w_v: tape.get_param_grad(param_ids.w_v),
+            w_o: tape.get_param_grad(param_ids.w_o),
+            w_unembed: tape.get_param_grad(param_ids.w_unembed),
+        };
+
+        // ── Extract per-level parameter gradients ───────────────
+        let mut level_grads = Vec::with_capacity(cfg.k);
+        for level in 0..cfg.k {
+            let lp_grad_flat = tape.get_param_grad(param_ids.level_params[level]);
+            let mut lp_grad = level_params_from_flat(&lp_grad_flat, d);
+
+            // For frozen levels, the w_q_mem was registered as a separate param.
+            // Add its gradient into the level's w_q_mem field.
+            if let Some(w_q_mem_id) = param_ids.frozen_w_q_mem[level] {
+                let w_q_mem_grad = tape.get_param_grad(w_q_mem_id);
+                // The lp_flat already contains w_q_mem at its offset, but the
+                // frozen path registered w_q_mem separately. The lp_flat's
+                // w_q_mem slice received no gradient (the tape routed through
+                // the separate w_q_mem_id). So replace rather than add.
+                lp_grad.w_q_mem = w_q_mem_grad;
+            }
+
+            level_grads.push(lp_grad);
+        }
+
+        (loss, MAGParams { swa: swa_grads, levels: level_grads })
+    })
 }
 
 /// Finite-difference gradient for a single weight element using CMS forward.
@@ -5370,5 +5436,76 @@ mod tests {
         );
         eprintln!("MAC CMS l1_b_theta: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
         assert!(passed == checked, "MAC l1_b_theta: {passed}/{checked} passed");
+    }
+
+    // ── P3.1: tape_compute_gradients smoke test ─────────────────────
+
+    #[test]
+    fn test_tape_compute_gradients_delta_k1_loss_match() {
+        // Verify tape path produces identical loss and finite nonzero gradients.
+        let cfg = MAGConfig::test_config(); // k=1, DeltaRule
+        let d = cfg.swa.d_model;
+        let s = cfg.swa.seq_len;
+        let v = cfg.swa.vocab_size;
+        let params = MAGParams::init(&cfg, 42);
+        let input_ids: Vec<usize> = (0..s).map(|t| t % v).collect();
+        let target_ids: Vec<usize> = (1..=s).map(|t| t % v).collect();
+        let pulse = Pulse { global_step: 0, active_levels: vec![true] };
+
+        // Hand-written backward path
+        let mut ctx_ref = make_context_state(&cfg);
+        let mut ebufs_ref: Vec<ErrorBuffer> = (0..cfg.k)
+            .map(|_| ErrorBuffer::new(d))
+            .collect();
+        let (loss_ref, _grads_ref) = cms_compute_gradients(
+            &params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx_ref, &mut ebufs_ref,
+        );
+
+        // Tape backward path
+        let mut ctx_tape = make_context_state(&cfg);
+        let mut ebufs_tape: Vec<ErrorBuffer> = (0..cfg.k)
+            .map(|_| ErrorBuffer::new(d))
+            .collect();
+        let (loss_tape, grads_tape) = tape_compute_gradients(
+            &params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx_tape, &mut ebufs_tape,
+        );
+
+        // Loss must be bitwise identical (tape forward is bitwise equiv).
+        assert_eq!(loss_ref.to_bits(), loss_tape.to_bits(),
+            "loss mismatch: ref={loss_ref} tape={loss_tape}");
+
+        // SWA gradients: finite and nonzero
+        let swa_fields: Vec<(&str, &[f32])> = vec![
+            ("w_embed", &grads_tape.swa.w_embed),
+            ("w_q", &grads_tape.swa.w_q),
+            ("w_k", &grads_tape.swa.w_k),
+            ("w_v", &grads_tape.swa.w_v),
+            ("w_o", &grads_tape.swa.w_o),
+            ("w_unembed", &grads_tape.swa.w_unembed),
+        ];
+        for (name, grad) in &swa_fields {
+            assert!(grad.iter().all(|x| x.is_finite()),
+                "tape grad swa.{name} has non-finite values");
+            let norm: f32 = grad.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!(norm > 0.0, "tape grad swa.{name} is all zeros");
+            eprintln!("tape swa.{name}: norm={norm:.4e}, len={}", grad.len());
+        }
+
+        // Level 0 gradients: finite and nonzero for key fields
+        let lp = &grads_tape.levels[0];
+        let level_fields: Vec<(&str, &[f32])> = vec![
+            ("w_k_mem", &lp.w_k_mem),
+            ("w_v_mem", &lp.w_v_mem),
+            ("w_q_mem", &lp.w_q_mem),
+            ("w_alpha", &lp.w_alpha),
+            ("b_alpha", &lp.b_alpha),
+        ];
+        for (name, grad) in &level_fields {
+            assert!(grad.iter().all(|x| x.is_finite()),
+                "tape grad level[0].{name} has non-finite values");
+            let norm: f32 = grad.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!(norm > 0.0, "tape grad level[0].{name} is all zeros");
+            eprintln!("tape level[0].{name}: norm={norm:.4e}, len={}", grad.len());
+        }
     }
 }

@@ -28,6 +28,24 @@ use crate::trellis::{Trellis, trellis_read_only};
 use crate::atlas_omega::AtlasOmega;
 use crate::dynamic_freq::FrequencySchedule;
 
+// ── TracedParamIds: map tape BufIds back to MAGParams fields ────────
+
+/// Maps each parameter registered on the tape back to its BufId.
+/// Returned by `traced_cms_forward()` so callers can extract gradients
+/// via `tape.get_param_grad(id)` after `tape.backward()`.
+pub struct TracedParamIds {
+    pub w_embed: BufId,
+    pub w_q: BufId,
+    pub w_k: BufId,
+    pub w_v: BufId,
+    pub w_o: BufId,
+    pub w_unembed: BufId,
+    /// lp_flat BufId per level (all levels, active and frozen).
+    pub level_params: Vec<BufId>,
+    /// Extra w_q_mem param BufId for frozen levels (None for active levels).
+    pub frozen_w_q_mem: Vec<Option<BufId>>,
+}
+
 // ── P2.1: Traced Standard Op Wrappers ───────────────────────────────
 
 /// Embedding lookup: out[t] = table[indices[t]].
@@ -251,7 +269,7 @@ fn frozen_opaque_key(rule: MemoryRuleKind) -> OpaqueKey {
 /// Traced CMS forward pass. Mirrors `cms_forward()` stage-by-stage,
 /// recording every operation on the tape for backward differentiation.
 ///
-/// Returns (loss, CMSForwardCache, loss_buf_id).
+/// Returns (loss, CMSForwardCache, loss_buf_id, TracedParamIds).
 /// The loss is bitwise-identical to `cms_forward()`.
 pub fn traced_cms_forward(
     tape: &mut Tape,
@@ -261,7 +279,7 @@ pub fn traced_cms_forward(
     target_ids: &[usize],
     pulse: &Pulse,
     context: &mut ContextState,
-) -> (f32, CMSForwardCache, BufId) {
+) -> (f32, CMSForwardCache, BufId, TracedParamIds) {
     let swa_cfg = &cfg.swa;
     let s = swa_cfg.seq_len;
     let d = swa_cfg.d_model;
@@ -329,10 +347,14 @@ pub fn traced_cms_forward(
     let mut frozen_memories: Vec<Option<Vec<f32>>> = Vec::with_capacity(cfg.k);
     let mut y_per_level_data: Vec<Vec<f32>> = Vec::with_capacity(cfg.k);
     let mut y_ids: Vec<BufId> = Vec::with_capacity(cfg.k);
+    let mut level_param_ids: Vec<BufId> = Vec::with_capacity(cfg.k);
+    let mut frozen_w_q_mem_ids: Vec<Option<BufId>> = Vec::with_capacity(cfg.k);
 
     for level in 0..cfg.k {
         let lp_flat = level_params_grads_to_flat(&params.levels[level]);
         let lp_id = tape.register_param(&lp_flat, vec![lp_flat.len()]);
+
+        level_param_ids.push(lp_id);
 
         if pulse.active_levels[level] {
             // Active level: run rule.step(), record opaque, extract final M.
@@ -349,6 +371,7 @@ pub fn traced_cms_forward(
             memory_caches.push(Some(mem_cache));
             q_mem_per_level.push(None);
             frozen_memories.push(None);
+            frozen_w_q_mem_ids.push(None);
         } else {
             // Frozen level: compute q_mem as traced op (for gradient flow),
             // then call rule-specific read_only (for bitwise-identical forward).
@@ -394,6 +417,7 @@ pub fn traced_cms_forward(
             memory_caches.push(None);
             q_mem_per_level.push(Some(q_mem_data));
             frozen_memories.push(Some(frozen_ref.clone()));
+            frozen_w_q_mem_ids.push(Some(w_q_mem_id));
         }
     }
 
@@ -449,7 +473,18 @@ pub fn traced_cms_forward(
         freq_cache,
     };
 
-    (loss, cache, loss_id)
+    let param_ids = TracedParamIds {
+        w_embed: w_embed_id,
+        w_q: w_q_id,
+        w_k: w_k_id,
+        w_v: w_v_id,
+        w_o: w_o_id,
+        w_unembed: w_unembed_id,
+        level_params: level_param_ids,
+        frozen_w_q_mem: frozen_w_q_mem_ids,
+    };
+
+    (loss, cache, loss_id, param_ids)
 }
 
 /// Run an active memory rule, record on tape, return (y_data, MemoryCache, final_m, y_buf_id).
@@ -978,7 +1013,7 @@ mod tests {
         // Traced path
         let registry = register_opaque_vjps();
         let mut ctx_traced = context_for_rule(&cfg);
-        let (loss_traced, _cache_traced, _loss_id) = with_tape(registry, |tape| {
+        let (loss_traced, _cache_traced, _loss_id, _param_ids) = with_tape(registry, |tape| {
             traced_cms_forward(tape, &params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx_traced)
         });
 
@@ -1008,7 +1043,7 @@ mod tests {
         // Traced path
         let registry = register_opaque_vjps();
         let mut ctx_traced = context_for_rule(&cfg);
-        let (loss_traced, _, _) = with_tape(registry, |tape| {
+        let (loss_traced, _, _, _) = with_tape(registry, |tape| {
             traced_cms_forward(tape, &params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx_traced)
         });
 
