@@ -724,11 +724,10 @@ def main():
             gpu_model.upload_params(params)
             error_buffers.apply_for_active(params, pulse, current_lr)
         else:
-            # CPU path: forward + backward + update separately
-            loss, cache = nl_hecate.cms_forward(
-                params, cfg, input_ids, target_ids, pulse, context)
-            grads = nl_hecate.cms_backward(
-                params, cfg, cache, input_ids, target_ids, error_buffers)
+            # CPU path: tape-based forward + backward (single call)
+            loss, grads = nl_hecate.cms_compute_gradients(
+                params, cfg, input_ids, target_ids, pulse, context,
+                error_buffers)
             if adamw_opt:
                 p_flat = params.get_flat_weights()
                 g_flat = grads.get_flat_weights()
