@@ -337,10 +337,11 @@ pub fn traced_cms_forward(
             let mut active_levels = Vec::with_capacity(cfg.k);
 
             for l in 0..cfg.k {
-                let w_freq_id = tape.register_param(&params.levels[l].w_freq, vec![1, d]);
-                let b_freq_id = tape.register_param(&params.levels[l].b_freq, vec![1]);
-                freq_w_freq_ids[l] = Some(w_freq_id);
-                freq_b_freq_ids[l] = Some(b_freq_id);
+                // Allocate (not register_param) — w_freq/b_freq are already inside
+                // lp_flat as params. The surrogate gradient in tape_compute_gradients
+                // handles their grads via freq_gate_backward(), not get_param_grad().
+                let w_freq_id = tape.alloc(params.levels[l].w_freq.clone(), vec![1, d]);
+                let b_freq_id = tape.alloc(params.levels[l].b_freq.clone(), vec![1]);
 
                 // pre = mean @ w_freq^T → [1, 1]
                 let dot_id = traced_matmul_transb(tape, mean_id, w_freq_id, 1, d, 1);
@@ -1187,12 +1188,15 @@ mod tests {
         assert_eq!(loss_ref.to_bits(), loss_traced.to_bits(),
             "Learned freq gate k=2: loss_ref={loss_ref} loss_traced={loss_traced}");
 
-        // Verify freq gate param IDs are populated.
+        // freq_w_freq/freq_b_freq are None — w_freq/b_freq are allocated (not
+        // registered as params) because their gradients come from the surrogate
+        // mechanism in tape_compute_gradients, not from get_param_grad. The
+        // actual param data lives inside lp_flat.
         for l in 0..cfg.k {
-            assert!(param_ids.freq_w_freq[l].is_some(),
-                "freq_w_freq[{l}] should be Some for Learned schedule");
-            assert!(param_ids.freq_b_freq[l].is_some(),
-                "freq_b_freq[{l}] should be Some for Learned schedule");
+            assert!(param_ids.freq_w_freq[l].is_none(),
+                "freq_w_freq[{l}] should be None (allocated, not registered)");
+            assert!(param_ids.freq_b_freq[l].is_none(),
+                "freq_b_freq[{l}] should be None (allocated, not registered)");
         }
 
         // Context memory must match.

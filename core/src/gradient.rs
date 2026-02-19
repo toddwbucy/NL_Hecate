@@ -352,12 +352,16 @@ pub fn tape_compute_gradients(
         if let Some(ref fc) = cache.freq_cache {
             let s = cfg.swa.seq_len;
             let combined_y_id = param_ids.combined_y.unwrap();
+            let zero_buf = vec![0.0f32; s * d];
             let d_y_combined = tape.get_grad(combined_y_id)
-                .unwrap_or(&vec![0.0f32; s * d])
+                .unwrap_or(&zero_buf)
                 .to_vec();
             let d_gate_values = compute_gate_surrogate(
                 &cache.y_per_level, &d_y_combined, &cache.pulse.active_levels, cfg.k, s * d,
             );
+            // d_embedded_mean is intentionally discarded: the tape already recorded
+            // the mean-pool matmul (ones_row @ embedded), so backward through
+            // that op accumulates d_embedded via the chain rule automatically.
             let (freq_grads, _d_embedded_mean) = freq_gate_backward(
                 &d_gate_values, fc, &params.levels, cfg.k, d,
             );
