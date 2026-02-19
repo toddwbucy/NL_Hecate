@@ -336,8 +336,10 @@ pub fn tape_compute_gradients(
                 level_grads.push(lp_grad);
             } else {
                 // Frozen level: route gradient into error buffer, return zeros.
+                // Use zeros_like_from to match lp_grad's shape (includes w_freq/b_freq
+                // when FrequencySchedule::Learned is active).
                 error_buffers[level].accumulate(&lp_grad);
-                level_grads.push(MemoryLevelParams::zeros_like(d));
+                level_grads.push(MemoryLevelParams::zeros_like_from(&lp_grad, d));
             }
         }
 
