@@ -5762,6 +5762,7 @@ mod tests {
     /// Run tape_compute_gradients and cms_compute_gradients on the same config,
     /// assert loss is bitwise equal and all parameter gradients match within tolerance.
     fn class3_tape_vs_handwritten(cfg: &MAGConfig, label: &str) {
+        ensure_rust_reference();
         let d = cfg.swa.d_model;
         let s = cfg.swa.seq_len;
         let v = cfg.swa.vocab_size;
@@ -5963,6 +5964,7 @@ mod tests {
 
     #[test]
     fn test_class3_delta_k2_frozen() {
+        ensure_rust_reference();
         let cfg = MAGConfig::test_config_k2();
         let d = cfg.swa.d_model;
         let s = cfg.swa.seq_len;
