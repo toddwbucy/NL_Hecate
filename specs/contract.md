@@ -422,11 +422,13 @@ Four findings from external review, integrated into this contract:
 ```
 FINDING 1: Differentiation Barrier Enforcement
   Problem:  The #[custom_vjp] mechanism was "hope-based engineering."
-            No compiler enforcement prevented Enzyme from tracing into kernels.
-  Fix:      #[enzyme_opaque] attribute is MANDATORY on all inner-loop kernels.
-            EnzymeOpaque marker trait is a required bound on MemoryUpdateRule.
-            Barrier verification tests assert zero autodiff contribution.
-  Updated:  Section 4 (Differentiation), differentiation/00_enzyme_integration.md,
+            No compiler enforcement prevented AD from tracing into kernels.
+  Fix:      OpaqueVjp trait is a required bound on MemoryUpdateRule.
+            All inner-loop kernels (CUDA + memory rules) register as opaque
+            blocks on the Wengert tape via opaque_key() registry lookup.
+            Barrier verification: Class 3 tests (tape vs hand-written backward)
+            confirm identical gradients for all 9 rules × k=1,2,4.
+  Updated:  Section 4 (Differentiation), differentiation/01_wengert_tape.md,
             memory_update_rules/00_interface.md
 
 FINDING 2: Pulse Reconciliation Protocol (DEFERRED TO PHASE 2)
@@ -461,32 +463,21 @@ FINDING 4: Stream-State Coupling
 ### 11. Toolchain Constraints (v0.4.0)
 
 ```
-Enzyme pins the LLVM version. The LLVM version pins the Rust nightly.
-The Rust nightly constrains which language features and libraries are available.
-This is an ARCHITECTURAL constraint, not a build detail.
+> Updated 2026-02-19: Enzyme was archived (Acheron/enzyme-archive/) after the
+> Wengert tape superseded it. The LLVM-pinning constraint chain below is HISTORICAL.
+> Standard Rust stable/nightly compiles the full codebase. CUDA Toolkit 12.8+ is
+> required only for the cuda feature gate.
 
-CONSTRAINT CHAIN:
-  Enzyme requires LLVM version X
-  → Rust nightly Y targets LLVM X (not all nightlies do)
-  → Language features available in nightly Y constrain the trait system design
-  → CUDA toolkit Z must link with the same LLVM version
-  → PyO3 version must support nightly Y
+HISTORICAL (Enzyme era):
+  Enzyme pinned LLVM → pinned Rust nightly → constrained language features.
+  This was an architectural constraint, not a build detail.
+  Eliminated Feb 2026 by switching to Wengert tape AD (core/src/tape.rs).
 
-RULE: The Enzyme→LLVM→Rust compatibility matrix MUST be resolved in Phase 0
-      (the Enzyme spike), BEFORE any production code is written.
-      If the trait system design (marker traits, associated types, builder
-      pattern with generic bounds) requires features unavailable in the
-      Enzyme-compatible nightly, the trait system adapts, not the toolchain.
-
-RULE: Phase 0 produces a pinned toolchain document:
-      - Exact Rust nightly version
-      - Exact LLVM version (Enzyme requirement)
-      - Exact CUDA toolkit version
-      - List of Rust features AVAILABLE under this toolchain
-      - List of Rust features UNAVAILABLE (and workarounds if needed)
-      - Verified: trait system patterns compile under pinned toolchain
-
-See: infrastructure/track_zero/00_track_zero.md for Phase 0 spike definition.
+CURRENT:
+  - Rust: any stable or nightly (no custom toolchain)
+  - CUDA Toolkit 12.8+: only for #[cfg(feature = "cuda")] kernel compilation
+  - PyO3: compatible with standard Rust releases
+  - No LLVM version coupling — tape is pure Rust
 ```
 
 ### 12. Implementation Sequence (v0.4.0)
