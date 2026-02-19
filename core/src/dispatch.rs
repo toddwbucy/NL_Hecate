@@ -1940,6 +1940,9 @@ pub fn delta_backward_dd_segment(
     d_alpha: &mut GpuBuf<f32>, d_theta: &mut GpuBuf<f32>, d_m_out: &mut GpuBuf<f32>,
     t_start: usize, t_end: usize, d: usize,
 ) {
+    debug_assert!(t_start < t_end, "segment t_start={t_start} must be < t_end={t_end}");
+    debug_assert!(d > 0, "d must be > 0");
+    debug_assert!(d_m_seed.len() >= d * d, "d_m_seed too small");
     unsafe {
         crate::cuda_ffi::delta_backward_segment_f32_cuda(
             k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
@@ -1966,6 +1969,9 @@ pub fn titans_backward_dd_segment(
     d_m_out: &mut GpuBuf<f32>, d_s_out: &mut GpuBuf<f32>,
     t_start: usize, t_end: usize, d: usize,
 ) {
+    debug_assert!(t_start < t_end, "segment t_start={t_start} must be < t_end={t_end}");
+    debug_assert!(d > 0, "d must be > 0");
+    debug_assert!(d_m_seed.len() >= d * d, "d_m_seed too small");
     unsafe {
         crate::cuda_ffi::titans_backward_segment_f32_cuda(
             k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
@@ -1990,6 +1996,9 @@ pub fn hebbian_backward_dd_segment(
     d_alpha: &mut GpuBuf<f32>, d_m_out: &mut GpuBuf<f32>,
     t_start: usize, t_end: usize, d: usize,
 ) {
+    debug_assert!(t_start < t_end, "segment t_start={t_start} must be < t_end={t_end}");
+    debug_assert!(d > 0, "d must be > 0");
+    debug_assert!(d_m_seed.len() >= d * d, "d_m_seed too small");
     unsafe {
         crate::cuda_ffi::hebbian_backward_segment_f32_cuda(
             k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),

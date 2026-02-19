@@ -271,7 +271,7 @@ impl MAGConfig {
         k=1, chunk_sizes=None, memory_rule="delta", composition="mag",
         d_hidden=None, lp_p=None, lq_q=None, lambda_local=None, lambda_2=None,
         delta=None, m_slots=None, d_compress=None, lambda_k=None, lambda_v=None,
-        retention=None, m3=None, frequency_schedule=None,
+        retention=None, m3=None, frequency_schedule=None, checkpoint_interval=None,
     ))]
     fn new(
         d_model: usize,
@@ -298,6 +298,7 @@ impl MAGConfig {
         retention: Option<&str>,
         m3: Option<&Bound<'_, PyDict>>,
         frequency_schedule: Option<&Bound<'_, PyAny>>,
+        checkpoint_interval: Option<usize>,
     ) -> PyResult<Self> {
         if d_model != num_heads * head_dim {
             return Err(PyValueError::new_err(format!(
@@ -411,7 +412,7 @@ impl MAGConfig {
                 retention: ret_kind,
                 m3: m3_cfg,
                 frequency_schedule: freq_sched,
-                checkpoint_interval: None,
+                checkpoint_interval,
             },
         })
     }
@@ -581,7 +582,7 @@ impl MAGForwardCache {
     k=1, chunk_sizes=None, memory_rule="delta", composition="mag",
     d_hidden=None, lp_p=None, lq_q=None, lambda_local=None, lambda_2=None,
     delta=None, m_slots=None, d_compress=None, lambda_k=None, lambda_v=None,
-    retention=None, m3=None, frequency_schedule=None,
+    retention=None, m3=None, frequency_schedule=None, checkpoint_interval=None,
 ))]
 fn mag_create_config(
     d_model: usize,
@@ -608,12 +609,13 @@ fn mag_create_config(
     retention: Option<&str>,
     m3: Option<&Bound<'_, PyDict>>,
     frequency_schedule: Option<&Bound<'_, PyAny>>,
+    checkpoint_interval: Option<usize>,
 ) -> PyResult<MAGConfig> {
     MAGConfig::new(
         d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled,
         k, chunk_sizes, memory_rule, composition,
         d_hidden, lp_p, lq_q, lambda_local, lambda_2, delta, m_slots, d_compress, lambda_k, lambda_v,
-        retention, m3, frequency_schedule,
+        retention, m3, frequency_schedule, checkpoint_interval,
     )
 }
 
@@ -1557,9 +1559,16 @@ impl GpuModel {
         self.context.reset();
     }
 
-    /// Upload context state from host (e.g., to restore after eval).
-    fn upload_context(&mut self, ctx: &ContextState) {
+    /// Upload context state from host (e.g., to restore after a read-only run).
+    fn upload_context(&mut self, ctx: &ContextState) -> PyResult<()> {
+        if ctx.inner.d != self.cfg.swa.d_model || ctx.inner.memory.len() != self.cfg.k {
+            return Err(PyValueError::new_err(format!(
+                "context shape mismatch: got k={} d={}, expected k={} d={}",
+                ctx.inner.memory.len(), ctx.inner.d, self.cfg.k, self.cfg.swa.d_model
+            )));
+        }
         self.context = nl_hecate_core::gpu_params::GpuContextState::from_host_context(&ctx.inner);
+        Ok(())
     }
 
     /// Read gate biases from GPU: returns Vec of (b_alpha, b_theta, b_eta) per level.

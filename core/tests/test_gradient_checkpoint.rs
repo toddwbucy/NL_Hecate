@@ -51,7 +51,7 @@ fn single_level_pulse() -> Pulse {
 
 /// Run forward+backward with given config, return gradients downloaded to host.
 fn run_fwd_bwd(cfg: &MAGConfig) -> (f32, nl_hecate_core::model::MAGParams) {
-    let params = MAGParams::random(cfg);
+    let params = MAGParams::init(cfg, 42);
     let gpu_params = GpuMAGParams::from_host(&params, cfg);
     let mut context = GpuContextState::zeros(cfg);
     let pulse = single_level_pulse();

@@ -505,6 +505,7 @@ fn compute_eta(
 /// Number of checkpoints stored: M_0, then one per C-step boundary, plus final state.
 /// Not gated by `cuda` feature — pure arithmetic, usable in tests.
 pub fn checkpoint_count(seq_len: usize, c: usize) -> usize {
+    assert!(c > 0, "checkpoint_interval must be > 0");
     // Checkpoints at t=0 (initial), then at each C boundary or final step.
     // The kernel increments ckpt_idx after storing initial, then for each
     // t where (t+1) % C == 0 OR t+1 == seq_len.
