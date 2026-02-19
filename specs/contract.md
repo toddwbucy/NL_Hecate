@@ -1,5 +1,14 @@
 # nl.Module Contract
 
+CONTRACT
+Purpose: Top-level architectural specification for NL_Hecate — defines the three-tier structure, differentiation strategy, state lifetimes, CMS scheduling, and composition patterns.
+Expects: Familiarity with the NL paper corpus (Titans, MIRAS, HOPE, Lattice, Atlas, TNT, Trellis).
+Guarantees: Every component traces to a paper equation; every constraint traces to a code smell or axiom.
+Cost: N/A (specification document, no runtime cost).
+Trade-off: Breadth over depth — individual specs in specs/algorithms/ and specs/infrastructure/ provide detailed contracts per component.
+Position: Root of the spec tree — all other specs refine sections of this contract.
+Source: Mirrokni/Behrouz research group (Google Research): arxiv 2501.00663, 2504.13173, 2512.24695, 2504.05646, 2505.23735, 2511.07343, 2512.23852.
+
 **Version**: 0.4.0
 **Repository**: NL_Hecate
 **Language Target**: Rust + CUDA (core), Python + PyO3 (orchestration bindings)
@@ -211,7 +220,7 @@ The system uses two differentiation mechanisms that compose via the chain rule:
 AD never differentiates through raw CUDA. This is a deliberate design choice
 that matches every production ML framework (PyTorch, JAX, FlashAttention, cuDNN).
 
-```
+```text
 RULE: The differentiation barrier is TRAIT-ENFORCED, not convention-based.
 
       Every implementation of MemoryUpdateRule MUST implement the OpaqueVjp trait.
@@ -253,7 +262,7 @@ CRITICAL DISTINCTION:
 
 The gradient flow through the full system:
 
-```
+```text
 Forward pass:
   x → [W_K projection]  → k     (Rust, tape-traced)
     → [gate computation] → gates (Rust, tape-traced)
