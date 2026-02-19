@@ -50,6 +50,7 @@ fn tiny_config(rule: MemoryRuleKind, retention: RetentionKind) -> MAGConfig {
         retention,
         m3: None,
         frequency_schedule: FrequencySchedule::Fixed,
+        checkpoint_interval: None,
     }
 }
 

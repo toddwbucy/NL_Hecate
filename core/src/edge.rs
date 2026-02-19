@@ -69,6 +69,7 @@ impl EdgeConfig {
             retention: default_retention(self.memory_rule),
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
         }
     }
 

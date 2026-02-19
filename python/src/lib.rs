@@ -271,7 +271,7 @@ impl MAGConfig {
         k=1, chunk_sizes=None, memory_rule="delta", composition="mag",
         d_hidden=None, lp_p=None, lq_q=None, lambda_local=None, lambda_2=None,
         delta=None, m_slots=None, d_compress=None, lambda_k=None, lambda_v=None,
-        retention=None, m3=None, frequency_schedule=None,
+        retention=None, m3=None, frequency_schedule=None, checkpoint_interval=None,
     ))]
     fn new(
         d_model: usize,
@@ -298,6 +298,7 @@ impl MAGConfig {
         retention: Option<&str>,
         m3: Option<&Bound<'_, PyDict>>,
         frequency_schedule: Option<&Bound<'_, PyAny>>,
+        checkpoint_interval: Option<usize>,
     ) -> PyResult<Self> {
         if d_model != num_heads * head_dim {
             return Err(PyValueError::new_err(format!(
@@ -411,6 +412,7 @@ impl MAGConfig {
                 retention: ret_kind,
                 m3: m3_cfg,
                 frequency_schedule: freq_sched,
+                checkpoint_interval,
             },
         })
     }
@@ -580,7 +582,7 @@ impl MAGForwardCache {
     k=1, chunk_sizes=None, memory_rule="delta", composition="mag",
     d_hidden=None, lp_p=None, lq_q=None, lambda_local=None, lambda_2=None,
     delta=None, m_slots=None, d_compress=None, lambda_k=None, lambda_v=None,
-    retention=None, m3=None, frequency_schedule=None,
+    retention=None, m3=None, frequency_schedule=None, checkpoint_interval=None,
 ))]
 fn mag_create_config(
     d_model: usize,
@@ -607,12 +609,13 @@ fn mag_create_config(
     retention: Option<&str>,
     m3: Option<&Bound<'_, PyDict>>,
     frequency_schedule: Option<&Bound<'_, PyAny>>,
+    checkpoint_interval: Option<usize>,
 ) -> PyResult<MAGConfig> {
     MAGConfig::new(
         d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled,
         k, chunk_sizes, memory_rule, composition,
         d_hidden, lp_p, lq_q, lambda_local, lambda_2, delta, m_slots, d_compress, lambda_k, lambda_v,
-        retention, m3, frequency_schedule,
+        retention, m3, frequency_schedule, checkpoint_interval,
     )
 }
 
@@ -1033,6 +1036,11 @@ impl ContextState {
         Ok(())
     }
 
+    /// Zero all memory matrices in-place. Used at document boundaries.
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+
     #[getter]
     fn d(&self) -> usize { self.inner.d }
 }
@@ -1042,6 +1050,7 @@ impl ContextState {
 #[pyclass]
 struct ErrorBufferList {
     inner: Vec<RustErrorBuffer>,
+    d: usize,
 }
 
 #[pymethods]
@@ -1049,7 +1058,14 @@ impl ErrorBufferList {
     #[new]
     fn new(k: usize, d: usize) -> Self {
         let inner = (0..k).map(|_| RustErrorBuffer::new(d)).collect();
-        ErrorBufferList { inner }
+        ErrorBufferList { inner, d }
+    }
+
+    /// Reset all error buffers (recreate with zero gradients).
+    /// Used at document boundaries alongside ContextState::reset().
+    fn reset(&mut self) {
+        let d = self.d;
+        self.inner = (0..self.inner.len()).map(|_| RustErrorBuffer::new(d)).collect();
     }
 
     /// Number of accumulated gradient steps for a given level.
@@ -1101,6 +1117,17 @@ impl VecStream {
         if corpus.len() < 2 {
             return Err(PyValueError::new_err("corpus must have at least 2 tokens"));
         }
+        Ok(VecStream { inner: Some(RustVecStream::new(corpus)) })
+    }
+
+    /// Create from raw bytes (each byte is a token ID 0-255).
+    /// Much faster than converting a billion-element Python list.
+    #[staticmethod]
+    fn from_bytes(data: &[u8]) -> PyResult<Self> {
+        if data.len() < 2 {
+            return Err(PyValueError::new_err("data must have at least 2 bytes"));
+        }
+        let corpus: Vec<usize> = data.iter().map(|&b| b as usize).collect();
         Ok(VecStream { inner: Some(RustVecStream::new(corpus)) })
     }
 }
@@ -1524,6 +1551,24 @@ impl GpuModel {
     fn reset_cache(&mut self) {
         self.kv_cache = None;
         self.decode_workspace = None;
+    }
+
+    /// Zero all GPU memory matrices in-place (cudaMemset).
+    /// Used at document boundaries to prevent stale state across documents.
+    fn reset_context(&mut self) {
+        self.context.reset();
+    }
+
+    /// Upload context state from host (e.g., to restore after a read-only run).
+    fn upload_context(&mut self, ctx: &ContextState) -> PyResult<()> {
+        if ctx.inner.d != self.cfg.swa.d_model || ctx.inner.memory.len() != self.cfg.k {
+            return Err(PyValueError::new_err(format!(
+                "context shape mismatch: got k={} d={}, expected k={} d={}",
+                ctx.inner.memory.len(), ctx.inner.d, self.cfg.k, self.cfg.swa.d_model
+            )));
+        }
+        self.context = nl_hecate_core::gpu_params::GpuContextState::from_host_context(&ctx.inner);
+        Ok(())
     }
 
     /// Read gate biases from GPU: returns Vec of (b_alpha, b_theta, b_eta) per level.

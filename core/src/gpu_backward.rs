@@ -381,7 +381,282 @@ fn gpu_memory_backward(
                 level_grads, s, d,
             )
         }
+        // ── Checkpointed variants: segment-based backward ──────────
+        GpuMemoryCache::DeltaCkpt { k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, checkpoint_interval } => {
+            let c = *checkpoint_interval;
+            let (d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta) =
+                delta_backward_checkpointed(k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, d_y, s, d, c);
+            accumulate_projection_grads(
+                level_params, embedded,
+                &d_k_mem, &d_v_mem, &d_q_mem,
+                &d_alpha, &d_theta, None,
+                level_grads, s, d,
+            )
+        }
+        GpuMemoryCache::TitansCkpt { k_mem, v_mem, q_mem, alpha, theta, eta, m_checkpoints, s_checkpoints, checkpoint_interval } => {
+            let c = *checkpoint_interval;
+            let (d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta, d_eta) =
+                titans_backward_checkpointed(k_mem, v_mem, q_mem, alpha, theta, eta, m_checkpoints, s_checkpoints, d_y, s, d, c);
+            accumulate_projection_grads(
+                level_params, embedded,
+                &d_k_mem, &d_v_mem, &d_q_mem,
+                &d_alpha, &d_theta, Some(&d_eta),
+                level_grads, s, d,
+            )
+        }
+        GpuMemoryCache::HebbianCkpt { k_mem, v_mem, q_mem, alpha, m_checkpoints, checkpoint_interval } => {
+            let c = *checkpoint_interval;
+            let (d_k_mem, d_v_mem, d_q_mem, d_alpha) =
+                hebbian_backward_checkpointed(k_mem, v_mem, q_mem, alpha, m_checkpoints, d_y, s, d, c);
+            accumulate_projection_grads(
+                level_params, embedded,
+                &d_k_mem, &d_v_mem, &d_q_mem,
+                &d_alpha, &GpuBuf::zeros(s), None,
+                level_grads, s, d,
+            )
+        }
     }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Checkpointed backward: segment-based replay + backward
+// ══════════════════════════════════════════════════════════════════════
+
+/// Build a list of segment boundaries from checkpoint_interval and seq_len.
+/// Returns Vec<(t_start, t_end, ckpt_idx)> in forward order.
+/// ckpt_idx is the index into m_checkpoints for the segment's initial state.
+#[cfg(feature = "cuda")]
+fn segment_boundaries(seq_len: usize, c: usize) -> Vec<(usize, usize, usize)> {
+    assert!(c > 0, "checkpoint_interval must be > 0");
+    let mut segments = Vec::new();
+    let mut t = 0;
+    let mut ckpt_idx = 0;
+    while t < seq_len {
+        let t_end = (t + c).min(seq_len);
+        segments.push((t, t_end, ckpt_idx));
+        ckpt_idx += 1;
+        t = t_end;
+    }
+    segments
+}
+
+/// Delta Rule checkpointed backward.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn delta_backward_checkpointed(
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>,
+    m_checkpoints: &GpuBuf<f32>, d_y: &GpuBuf<f32>,
+    s: usize, d: usize, c: usize,
+) -> (GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>) {
+    let dd = d * d;
+    let sd = s * d;
+    let segments = segment_boundaries(s, c);
+
+    // Accumulation buffers (full sequence)
+    let mut d_k_mem = GpuBuf::zeros(sd);
+    let mut d_v_mem = GpuBuf::zeros(sd);
+    let mut d_q_mem = GpuBuf::zeros(sd);
+    let mut d_alpha = GpuBuf::zeros(s);
+    let mut d_theta = GpuBuf::zeros(s);
+
+    // d_M seed: starts as zeros for the last segment
+    let mut d_m_seed = GpuBuf::zeros(dd);
+
+    // Pre-allocate scratch buffers sized for max segment (CS-42: no per-segment cudaMalloc)
+    let max_seg = c.min(s);
+    let mut local_m_states = GpuBuf::zeros((max_seg + 1) * dd);
+    let mut local_y = GpuBuf::zeros(max_seg * d);
+    let mut seg_d_m_out = GpuBuf::zeros(dd);
+
+    // Process segments in reverse
+    for &(t_start, t_end, ckpt_idx) in segments.iter().rev() {
+        let seg_len = t_end - t_start;
+
+        // 1. Replay forward from checkpoint to reconstruct local m_states
+        let ckpt_m = m_checkpoints.slice(ckpt_idx * dd, dd);
+        local_m_states.zero();
+        local_y.zero();
+
+        // Replay forward: pass offset pointers into full-sequence buffers.
+        // Works because the forward kernel is purely sequential.
+        unsafe {
+            crate::cuda_ffi::delta_forward_f32_cuda(
+                (k_mem.as_ptr()).add(t_start * d),
+                (v_mem.as_ptr()).add(t_start * d),
+                (q_mem.as_ptr()).add(t_start * d),
+                (alpha.as_ptr()).add(t_start),
+                (theta.as_ptr()).add(t_start),
+                ckpt_m.as_ptr(),
+                local_m_states.ptr(),
+                local_y.ptr(),
+                seg_len as i32, d as i32,
+            );
+        }
+        crate::dispatch::cuda_sync();
+
+        // 2. Segment backward with d_m_seed
+        seg_d_m_out.zero();
+        crate::dispatch::delta_backward_dd_segment(
+            k_mem, v_mem, q_mem, alpha, theta,
+            &local_m_states, d_y,
+            &d_m_seed,
+            &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
+            &mut d_alpha, &mut d_theta, &mut seg_d_m_out,
+            t_start, t_end, d,
+        );
+        crate::dispatch::cuda_sync();
+
+        // 3. Propagate d_M seed to earlier segment
+        d_m_seed.copy_from_device(&seg_d_m_out);
+    }
+
+    (d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta)
+}
+
+/// Titans checkpointed backward.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn titans_backward_checkpointed(
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>, eta: &GpuBuf<f32>,
+    m_checkpoints: &GpuBuf<f32>, s_checkpoints: &GpuBuf<f32>,
+    d_y: &GpuBuf<f32>,
+    s: usize, d: usize, c: usize,
+) -> (GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>) {
+    let dd = d * d;
+    let sd = s * d;
+    let segments = segment_boundaries(s, c);
+
+    let mut d_k_mem = GpuBuf::zeros(sd);
+    let mut d_v_mem = GpuBuf::zeros(sd);
+    let mut d_q_mem = GpuBuf::zeros(sd);
+    let mut d_alpha = GpuBuf::zeros(s);
+    let mut d_theta = GpuBuf::zeros(s);
+    let mut d_eta = GpuBuf::zeros(s);
+    let mut d_m_seed = GpuBuf::zeros(dd);
+    let mut d_s_seed = GpuBuf::zeros(dd);
+
+    // Pre-allocate scratch buffers sized for max segment (CS-42: no per-segment cudaMalloc)
+    let max_seg = c.min(s);
+    let mut local_m_states = GpuBuf::zeros((max_seg + 1) * dd);
+    let mut local_s_states = GpuBuf::zeros((max_seg + 1) * dd);
+    let mut local_y = GpuBuf::zeros(max_seg * d);
+    let mut seg_d_m_out = GpuBuf::zeros(dd);
+    let mut seg_d_s_out = GpuBuf::zeros(dd);
+
+    for &(t_start, t_end, ckpt_idx) in segments.iter().rev() {
+        let seg_len = t_end - t_start;
+
+        // Replay forward
+        let ckpt_m = m_checkpoints.slice(ckpt_idx * dd, dd);
+        let ckpt_s = s_checkpoints.slice(ckpt_idx * dd, dd);
+        local_m_states.zero();
+        local_s_states.zero();
+        local_y.zero();
+
+        unsafe {
+            crate::cuda_ffi::titans_forward_f32_cuda(
+                (k_mem.as_ptr()).add(t_start * d),
+                (v_mem.as_ptr()).add(t_start * d),
+                (q_mem.as_ptr()).add(t_start * d),
+                (alpha.as_ptr()).add(t_start),
+                (theta.as_ptr()).add(t_start),
+                (eta.as_ptr()).add(t_start),
+                ckpt_m.as_ptr(),
+                ckpt_s.as_ptr(),
+                local_m_states.ptr(),
+                local_s_states.ptr(),
+                local_y.ptr(),
+                seg_len as i32, d as i32,
+            );
+        }
+        crate::dispatch::cuda_sync();
+
+        // Segment backward
+        seg_d_m_out.zero();
+        seg_d_s_out.zero();
+        crate::dispatch::titans_backward_dd_segment(
+            k_mem, v_mem, q_mem, alpha, theta, eta,
+            &local_m_states, &local_s_states, d_y,
+            &d_m_seed, &d_s_seed,
+            &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
+            &mut d_alpha, &mut d_theta, &mut d_eta,
+            &mut seg_d_m_out, &mut seg_d_s_out,
+            t_start, t_end, d,
+        );
+        crate::dispatch::cuda_sync();
+
+        d_m_seed.copy_from_device(&seg_d_m_out);
+        d_s_seed.copy_from_device(&seg_d_s_out);
+    }
+
+    (d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta, d_eta)
+}
+
+/// Hebbian checkpointed backward.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn hebbian_backward_checkpointed(
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    alpha: &GpuBuf<f32>,
+    m_checkpoints: &GpuBuf<f32>, d_y: &GpuBuf<f32>,
+    s: usize, d: usize, c: usize,
+) -> (GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>) {
+    let dd = d * d;
+    let sd = s * d;
+    let segments = segment_boundaries(s, c);
+
+    let mut d_k_mem = GpuBuf::zeros(sd);
+    let mut d_v_mem = GpuBuf::zeros(sd);
+    let mut d_q_mem = GpuBuf::zeros(sd);
+    let mut d_alpha = GpuBuf::zeros(s);
+    let mut d_m_seed = GpuBuf::zeros(dd);
+
+    // Pre-allocate scratch buffers sized for max segment (CS-42: no per-segment cudaMalloc)
+    let max_seg = c.min(s);
+    let mut local_m_states = GpuBuf::zeros((max_seg + 1) * dd);
+    let mut local_y = GpuBuf::zeros(max_seg * d);
+    let mut seg_d_m_out = GpuBuf::zeros(dd);
+
+    for &(t_start, t_end, ckpt_idx) in segments.iter().rev() {
+        let seg_len = t_end - t_start;
+
+        // Replay forward
+        let ckpt_m = m_checkpoints.slice(ckpt_idx * dd, dd);
+        local_m_states.zero();
+        local_y.zero();
+
+        unsafe {
+            crate::cuda_ffi::hebbian_forward_f32_cuda(
+                (k_mem.as_ptr()).add(t_start * d),
+                (v_mem.as_ptr()).add(t_start * d),
+                (q_mem.as_ptr()).add(t_start * d),
+                (alpha.as_ptr()).add(t_start),
+                ckpt_m.as_ptr(),
+                local_m_states.ptr(),
+                local_y.ptr(),
+                seg_len as i32, d as i32,
+            );
+        }
+        crate::dispatch::cuda_sync();
+
+        // Segment backward
+        seg_d_m_out.zero();
+        crate::dispatch::hebbian_backward_dd_segment(
+            k_mem, v_mem, q_mem, alpha,
+            &local_m_states, d_y,
+            &d_m_seed,
+            &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
+            &mut d_alpha, &mut seg_d_m_out,
+            t_start, t_end, d,
+        );
+        crate::dispatch::cuda_sync();
+
+        d_m_seed.copy_from_device(&seg_d_m_out);
+    }
+
+    (d_k_mem, d_v_mem, d_q_mem, d_alpha)
 }
 
 /// Accumulate projection weight gradients from inner loop gradients.

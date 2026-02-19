@@ -35,6 +35,7 @@ fn make_test_config(rule: MemoryRuleKind) -> MAGConfig {
         retention: nl_hecate_core::retention::default_retention(rule),
         m3: None,
         frequency_schedule: nl_hecate_core::dynamic_freq::FrequencySchedule::Fixed,
+        checkpoint_interval: None,
     }
 }
 

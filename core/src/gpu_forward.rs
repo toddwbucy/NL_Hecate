@@ -101,6 +101,35 @@ pub enum GpuMemoryCache {
         alpha: GpuBuf<f32>,
         m_states: GpuBuf<f32>,
     },
+    // ── Checkpointed variants (gradient checkpointing) ──────────────
+    DeltaCkpt {
+        k_mem: GpuBuf<f32>,
+        v_mem: GpuBuf<f32>,
+        q_mem: GpuBuf<f32>,
+        alpha: GpuBuf<f32>,
+        theta: GpuBuf<f32>,
+        m_checkpoints: GpuBuf<f32>,  // [num_ckpt * d*d]
+        checkpoint_interval: usize,
+    },
+    TitansCkpt {
+        k_mem: GpuBuf<f32>,
+        v_mem: GpuBuf<f32>,
+        q_mem: GpuBuf<f32>,
+        alpha: GpuBuf<f32>,
+        theta: GpuBuf<f32>,
+        eta: GpuBuf<f32>,
+        m_checkpoints: GpuBuf<f32>,
+        s_checkpoints: GpuBuf<f32>,
+        checkpoint_interval: usize,
+    },
+    HebbianCkpt {
+        k_mem: GpuBuf<f32>,
+        v_mem: GpuBuf<f32>,
+        q_mem: GpuBuf<f32>,
+        alpha: GpuBuf<f32>,
+        m_checkpoints: GpuBuf<f32>,
+        checkpoint_interval: usize,
+    },
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -354,8 +383,9 @@ fn gpu_memory_forward(
 
     let m_initial = context_m.slice(0, dd);
 
-    match cfg.memory_rule {
-        MemoryRuleKind::DeltaRule => {
+    match (cfg.checkpoint_interval, cfg.memory_rule) {
+        // ── Full-trajectory paths (checkpoint_interval=None, current behavior) ──
+        (None, MemoryRuleKind::DeltaRule) => {
             let mut m_states = GpuBuf::zeros((s + 1) * dd);
             let mut y = GpuBuf::zeros(s * d);
             crate::dispatch::delta_forward_dd(
@@ -363,67 +393,25 @@ fn gpu_memory_forward(
                 &m_initial, &mut m_states, &mut y, s, d,
             );
             crate::dispatch::cuda_sync();
-
-            // Update context: copy final M back to context buffer
-            let m_final_slice = m_states.slice(s * dd, dd);
-            unsafe {
-                let bytes = dd * 4;
-                let rc = gpu_buf_memcpy_d2d(
-                    context_m.ptr() as *mut std::ffi::c_void,
-                    m_final_slice.as_ptr() as *const std::ffi::c_void,
-                    bytes,
-                );
-                assert_eq!(rc, 0);
-            }
-
-            let cache = GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states };
-            (y, cache)
+            copy_final_m(&m_states, context_m, s * dd, dd);
+            (y, GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states })
         }
-        MemoryRuleKind::TitansLMM => {
-            let mut eta = GpuBuf::zeros(s);
-            let mut b_eta_host = [0.0f32];
-            level_params.b_eta.copy_to_host(&mut b_eta_host);
-            unsafe {
-                crate::cuda_ffi::gate_compute_cuda(
-                    k_mem.as_ptr(), v_mem.as_ptr(), level_params.w_eta.as_ptr(),
-                    b_eta_host[0], eta.ptr(),
-                    s as i32, d as i32, 0, // sigmoid for eta
-                );
-            }
-
-            // Titans needs both M and S initial states. For simplicity,
-            // S_initial is zero (per-chunk reset as noted in memory).
+        (None, MemoryRuleKind::TitansLMM) => {
+            let eta = compute_eta(level_params, &k_mem, &v_mem, s, d);
             let s_initial_buf = GpuBuf::zeros(dd);
-            let s_initial_slice = s_initial_buf.slice(0, dd);
-
             let mut m_states = GpuBuf::zeros((s + 1) * dd);
             let mut s_states = GpuBuf::zeros((s + 1) * dd);
             let mut y = GpuBuf::zeros(s * d);
-
             crate::dispatch::titans_forward_dd(
                 &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
-                &m_initial, &s_initial_slice,
+                &m_initial, &s_initial_buf.slice(0, dd),
                 &mut m_states, &mut s_states, &mut y, s, d,
             );
             crate::dispatch::cuda_sync();
-
-            // Update context with final M
-            let m_final_slice = m_states.slice(s * dd, dd);
-            unsafe {
-                let rc = gpu_buf_memcpy_d2d(
-                    context_m.ptr() as *mut std::ffi::c_void,
-                    m_final_slice.as_ptr() as *const std::ffi::c_void,
-                    dd * 4,
-                );
-                assert_eq!(rc, 0);
-            }
-
-            let cache = GpuMemoryCache::Titans {
-                k_mem, v_mem, q_mem, alpha, theta, eta, m_states, s_states,
-            };
-            (y, cache)
+            copy_final_m(&m_states, context_m, s * dd, dd);
+            (y, GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states, s_states })
         }
-        MemoryRuleKind::HebbianRule => {
+        (None, MemoryRuleKind::HebbianRule) => {
             let mut m_states = GpuBuf::zeros((s + 1) * dd);
             let mut y = GpuBuf::zeros(s * d);
             crate::dispatch::hebbian_forward_dd(
@@ -431,24 +419,105 @@ fn gpu_memory_forward(
                 &m_initial, &mut m_states, &mut y, s, d,
             );
             crate::dispatch::cuda_sync();
-
-            // Update context with final M
-            let m_final_slice = m_states.slice(s * dd, dd);
-            unsafe {
-                let rc = gpu_buf_memcpy_d2d(
-                    context_m.ptr() as *mut std::ffi::c_void,
-                    m_final_slice.as_ptr() as *const std::ffi::c_void,
-                    dd * 4,
-                );
-                assert_eq!(rc, 0);
-            }
-
-            let cache = GpuMemoryCache::Hebbian { k_mem, v_mem, q_mem, alpha, m_states };
-            (y, cache)
+            copy_final_m(&m_states, context_m, s * dd, dd);
+            (y, GpuMemoryCache::Hebbian { k_mem, v_mem, q_mem, alpha, m_states })
+        }
+        // ── Checkpointed paths (checkpoint_interval=Some(c)) ──
+        (Some(c), MemoryRuleKind::DeltaRule) => {
+            let num_ckpt = checkpoint_count(s, c);
+            let mut m_checkpoints = GpuBuf::zeros(num_ckpt * dd);
+            let mut y = GpuBuf::zeros(s * d);
+            crate::dispatch::delta_forward_dd_ckpt(
+                &k_mem, &v_mem, &q_mem, &alpha, &theta,
+                &m_initial, &mut m_checkpoints, &mut y, s, d, c,
+            );
+            crate::dispatch::cuda_sync();
+            copy_final_m(&m_checkpoints, context_m, (num_ckpt - 1) * dd, dd);
+            (y, GpuMemoryCache::DeltaCkpt { k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, checkpoint_interval: c })
+        }
+        (Some(c), MemoryRuleKind::TitansLMM) => {
+            let eta = compute_eta(level_params, &k_mem, &v_mem, s, d);
+            let s_initial_buf = GpuBuf::zeros(dd);
+            let num_ckpt = checkpoint_count(s, c);
+            let mut m_checkpoints = GpuBuf::zeros(num_ckpt * dd);
+            let mut s_checkpoints = GpuBuf::zeros(num_ckpt * dd);
+            let mut y = GpuBuf::zeros(s * d);
+            crate::dispatch::titans_forward_dd_ckpt(
+                &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
+                &m_initial, &s_initial_buf.slice(0, dd),
+                &mut m_checkpoints, &mut s_checkpoints, &mut y, s, d, c,
+            );
+            crate::dispatch::cuda_sync();
+            copy_final_m(&m_checkpoints, context_m, (num_ckpt - 1) * dd, dd);
+            (y, GpuMemoryCache::TitansCkpt { k_mem, v_mem, q_mem, alpha, theta, eta, m_checkpoints, s_checkpoints, checkpoint_interval: c })
+        }
+        (Some(c), MemoryRuleKind::HebbianRule) => {
+            let num_ckpt = checkpoint_count(s, c);
+            let mut m_checkpoints = GpuBuf::zeros(num_ckpt * dd);
+            let mut y = GpuBuf::zeros(s * d);
+            crate::dispatch::hebbian_forward_dd_ckpt(
+                &k_mem, &v_mem, &q_mem, &alpha,
+                &m_initial, &mut m_checkpoints, &mut y, s, d, c,
+            );
+            crate::dispatch::cuda_sync();
+            copy_final_m(&m_checkpoints, context_m, (num_ckpt - 1) * dd, dd);
+            (y, GpuMemoryCache::HebbianCkpt { k_mem, v_mem, q_mem, alpha, m_checkpoints, checkpoint_interval: c })
         }
         _ => panic!("GPU-resident forward only supports DeltaRule, TitansLMM, HebbianRule. Got {:?}", cfg.memory_rule),
     }
 }
+
+/// Copy final M state from states buffer to context (D2D).
+#[cfg(feature = "cuda")]
+#[inline]
+fn copy_final_m(states: &GpuBuf<f32>, context_m: &mut GpuBuf<f32>, offset: usize, dd: usize) {
+    let m_final = states.slice(offset, dd);
+    unsafe {
+        let rc = gpu_buf_memcpy_d2d(
+            context_m.ptr() as *mut std::ffi::c_void,
+            m_final.as_ptr() as *const std::ffi::c_void,
+            dd * 4,
+        );
+        assert_eq!(rc, 0);
+    }
+}
+
+/// Compute eta gate for Titans (shared between full and checkpointed paths).
+#[cfg(feature = "cuda")]
+fn compute_eta(
+    level_params: &crate::gpu_params::GpuMemoryLevelParams,
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>,
+    s: usize, d: usize,
+) -> GpuBuf<f32> {
+    let mut eta = GpuBuf::zeros(s);
+    let mut b_eta_host = [0.0f32];
+    level_params.b_eta.copy_to_host(&mut b_eta_host);
+    unsafe {
+        crate::cuda_ffi::gate_compute_cuda(
+            k_mem.as_ptr(), v_mem.as_ptr(), level_params.w_eta.as_ptr(),
+            b_eta_host[0], eta.ptr(),
+            s as i32, d as i32, 0,
+        );
+    }
+    eta
+}
+
+/// Number of checkpoints stored: M_0, then one per C-step boundary, plus final state.
+/// Not gated by `cuda` feature — pure arithmetic, usable in tests.
+pub fn checkpoint_count(seq_len: usize, c: usize) -> usize {
+    assert!(c > 0, "checkpoint_interval must be > 0");
+    // Checkpoints at t=0 (initial), then at each C boundary or final step.
+    // The kernel increments ckpt_idx after storing initial, then for each
+    // t where (t+1) % C == 0 OR t+1 == seq_len.
+    let mut count = 1; // initial M_0
+    for t in 0..seq_len {
+        if ((t + 1) % c == 0) || (t + 1 == seq_len) {
+            count += 1;
+        }
+    }
+    count
+}
+
 
 /// Frozen level: read-only y = M @ q_mem (all on GPU).
 #[cfg(feature = "cuda")]

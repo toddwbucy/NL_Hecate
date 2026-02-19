@@ -422,6 +422,7 @@ fn test_k1_learned_is_noop() {
         retention: default_retention(MemoryRuleKind::DeltaRule),
         m3: None,
         frequency_schedule: FrequencySchedule::Learned(LearnedFreqConfig::default()),
+        checkpoint_interval: None,
     };
     let params = MAGParams::init(&cfg, 42);
     let d = cfg.swa.d_model;
@@ -541,6 +542,7 @@ fn test_anneal_uses_fixed_schedule() {
             threshold: 0.5,
             anneal_steps: 1000, // Long annealing — step 0 should use fixed
         }),
+        checkpoint_interval: None,
     };
 
     let params = MAGParams::init(&cfg, 42);

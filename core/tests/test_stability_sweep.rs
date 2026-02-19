@@ -97,6 +97,7 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
         },
         m3: None,
         frequency_schedule: FrequencySchedule::Fixed,
+        checkpoint_interval: None,
     }
 }
 

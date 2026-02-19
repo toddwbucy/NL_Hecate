@@ -210,6 +210,7 @@ fn test_k2_beats_k1() {
         retention: RetentionKind::L2WeightDecay,
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
 
         };
     // k=2 config
@@ -224,6 +225,7 @@ fn test_k2_beats_k1() {
         retention: RetentionKind::L2WeightDecay,
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
 
         };
 
@@ -403,6 +405,7 @@ fn test_k4_vs_k2_multiscale() {
         retention: RetentionKind::L2WeightDecay,
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
 
         };
     let cfg_k4 = MAGConfig {
@@ -416,6 +419,7 @@ fn test_k4_vs_k2_multiscale() {
         retention: RetentionKind::L2WeightDecay,
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
 
         };
 
@@ -506,6 +510,7 @@ fn test_k4_diagnostics() {
         retention: RetentionKind::L2WeightDecay,
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
 
         };
 
@@ -774,6 +779,7 @@ fn test_cms_stability_boundary() {
         retention: RetentionKind::L2WeightDecay,
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
 
         };
     let cfg_k2 = MAGConfig {
@@ -787,6 +793,7 @@ fn test_cms_stability_boundary() {
         retention: RetentionKind::L2WeightDecay,
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
 
         };
 
@@ -974,6 +981,7 @@ fn test_k4_normalization_magnitude() {
         retention: RetentionKind::L2WeightDecay,
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
 
         };
     let params_k4 = MAGParams::init(&cfg_k4, 42);
@@ -1040,6 +1048,7 @@ fn test_k4_uniform_init_stable() {
         retention: RetentionKind::L2WeightDecay,
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
 
         };
 
@@ -1092,6 +1101,7 @@ fn test_k4_normalized_stable() {
         retention: RetentionKind::L2WeightDecay,
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
 
         };
 

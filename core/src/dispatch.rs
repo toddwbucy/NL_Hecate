@@ -1865,6 +1865,152 @@ pub fn hebbian_backward_dd(
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════
+// Gradient checkpointing dispatch wrappers
+// ══════════════════════════════════════════════════════════════════════
+
+/// Delta checkpointed forward on device buffers.
+#[cfg(feature = "cuda")]
+pub fn delta_forward_dd_ckpt(
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>,
+    m_initial: &GpuSlice<f32>,
+    m_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
+    seq_len: usize, d: usize, checkpoint_interval: usize,
+) {
+    unsafe {
+        crate::cuda_ffi::delta_forward_ckpt_f32_cuda(
+            k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
+            alpha.as_ptr(), theta.as_ptr(),
+            m_initial.as_ptr(),
+            m_states.ptr(), y.ptr(),
+            seq_len as i32, d as i32, checkpoint_interval as i32,
+        );
+    }
+}
+
+/// Titans checkpointed forward on device buffers.
+#[cfg(feature = "cuda")]
+pub fn titans_forward_dd_ckpt(
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>, eta: &GpuBuf<f32>,
+    m_initial: &GpuSlice<f32>, s_initial: &GpuSlice<f32>,
+    m_states: &mut GpuBuf<f32>, s_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
+    seq_len: usize, d: usize, checkpoint_interval: usize,
+) {
+    unsafe {
+        crate::cuda_ffi::titans_forward_ckpt_f32_cuda(
+            k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
+            alpha.as_ptr(), theta.as_ptr(), eta.as_ptr(),
+            m_initial.as_ptr(), s_initial.as_ptr(),
+            m_states.ptr(), s_states.ptr(), y.ptr(),
+            seq_len as i32, d as i32, checkpoint_interval as i32,
+        );
+    }
+}
+
+/// Hebbian checkpointed forward on device buffers.
+#[cfg(feature = "cuda")]
+pub fn hebbian_forward_dd_ckpt(
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    alpha: &GpuBuf<f32>,
+    m_initial: &GpuSlice<f32>,
+    m_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
+    seq_len: usize, d: usize, checkpoint_interval: usize,
+) {
+    unsafe {
+        crate::cuda_ffi::hebbian_forward_ckpt_f32_cuda(
+            k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
+            alpha.as_ptr(), m_initial.as_ptr(),
+            m_states.ptr(), y.ptr(),
+            seq_len as i32, d as i32, checkpoint_interval as i32,
+        );
+    }
+}
+
+/// Delta segment backward on device buffers.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn delta_backward_dd_segment(
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>,
+    m_states: &GpuBuf<f32>, d_y: &GpuBuf<f32>,
+    d_m_seed: &GpuBuf<f32>,
+    d_k_mem: &mut GpuBuf<f32>, d_v_mem: &mut GpuBuf<f32>, d_q_mem: &mut GpuBuf<f32>,
+    d_alpha: &mut GpuBuf<f32>, d_theta: &mut GpuBuf<f32>, d_m_out: &mut GpuBuf<f32>,
+    t_start: usize, t_end: usize, d: usize,
+) {
+    debug_assert!(t_start < t_end, "segment t_start={t_start} must be < t_end={t_end}");
+    debug_assert!(d > 0, "d must be > 0");
+    debug_assert!(d_m_seed.len() >= d * d, "d_m_seed too small");
+    unsafe {
+        crate::cuda_ffi::delta_backward_segment_f32_cuda(
+            k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
+            alpha.as_ptr(), theta.as_ptr(),
+            m_states.as_ptr(), d_y.as_ptr(),
+            d_m_seed.as_ptr(),
+            d_k_mem.ptr(), d_v_mem.ptr(), d_q_mem.ptr(),
+            d_alpha.ptr(), d_theta.ptr(), d_m_out.ptr(),
+            t_start as i32, t_end as i32, d as i32,
+        );
+    }
+}
+
+/// Titans segment backward on device buffers.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn titans_backward_dd_segment(
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>, eta: &GpuBuf<f32>,
+    m_states: &GpuBuf<f32>, s_states: &GpuBuf<f32>, d_y: &GpuBuf<f32>,
+    d_m_seed: &GpuBuf<f32>, d_s_seed: &GpuBuf<f32>,
+    d_k_mem: &mut GpuBuf<f32>, d_v_mem: &mut GpuBuf<f32>, d_q_mem: &mut GpuBuf<f32>,
+    d_alpha: &mut GpuBuf<f32>, d_theta: &mut GpuBuf<f32>, d_eta: &mut GpuBuf<f32>,
+    d_m_out: &mut GpuBuf<f32>, d_s_out: &mut GpuBuf<f32>,
+    t_start: usize, t_end: usize, d: usize,
+) {
+    debug_assert!(t_start < t_end, "segment t_start={t_start} must be < t_end={t_end}");
+    debug_assert!(d > 0, "d must be > 0");
+    debug_assert!(d_m_seed.len() >= d * d, "d_m_seed too small");
+    unsafe {
+        crate::cuda_ffi::titans_backward_segment_f32_cuda(
+            k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
+            alpha.as_ptr(), theta.as_ptr(), eta.as_ptr(),
+            m_states.as_ptr(), s_states.as_ptr(), d_y.as_ptr(),
+            d_m_seed.as_ptr(), d_s_seed.as_ptr(),
+            d_k_mem.ptr(), d_v_mem.ptr(), d_q_mem.ptr(),
+            d_alpha.ptr(), d_theta.ptr(), d_eta.ptr(),
+            d_m_out.ptr(), d_s_out.ptr(),
+            t_start as i32, t_end as i32, d as i32,
+        );
+    }
+}
+
+/// Hebbian segment backward on device buffers.
+#[cfg(feature = "cuda")]
+pub fn hebbian_backward_dd_segment(
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    alpha: &GpuBuf<f32>, m_states: &GpuBuf<f32>, d_y: &GpuBuf<f32>,
+    d_m_seed: &GpuBuf<f32>,
+    d_k_mem: &mut GpuBuf<f32>, d_v_mem: &mut GpuBuf<f32>, d_q_mem: &mut GpuBuf<f32>,
+    d_alpha: &mut GpuBuf<f32>, d_m_out: &mut GpuBuf<f32>,
+    t_start: usize, t_end: usize, d: usize,
+) {
+    debug_assert!(t_start < t_end, "segment t_start={t_start} must be < t_end={t_end}");
+    debug_assert!(d > 0, "d must be > 0");
+    debug_assert!(d_m_seed.len() >= d * d, "d_m_seed too small");
+    unsafe {
+        crate::cuda_ffi::hebbian_backward_segment_f32_cuda(
+            k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
+            alpha.as_ptr(), m_states.as_ptr(), d_y.as_ptr(),
+            d_m_seed.as_ptr(),
+            d_k_mem.ptr(), d_v_mem.ptr(), d_q_mem.ptr(),
+            d_alpha.ptr(), d_m_out.ptr(),
+            t_start as i32, t_end as i32, d as i32,
+        );
+    }
+}
+
 /// Synchronize the CUDA device (wait for all pending kernel launches).
 #[cfg(feature = "cuda")]
 pub fn cuda_sync() {
