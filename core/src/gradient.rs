@@ -5721,4 +5721,312 @@ mod tests {
             }
         }
     }
+
+    // ── P3.4: Class 3 tests — tape vs hand-written backward ─────────
+
+    /// Compare two gradient slices element-wise. Returns (max_rel_err, num_mismatches).
+    /// Uses relative tolerance for large values, absolute tolerance for small values.
+    fn compare_grad_slices(
+        name: &str,
+        ref_grad: &[f32],
+        tape_grad: &[f32],
+        rtol: f32,
+        atol: f32,
+    ) -> (f32, usize) {
+        assert_eq!(ref_grad.len(), tape_grad.len(),
+            "{name}: length mismatch ref={} tape={}", ref_grad.len(), tape_grad.len());
+        let mut max_rel_err = 0.0f32;
+        let mut mismatches = 0;
+        for (i, (&r, &t)) in ref_grad.iter().zip(tape_grad.iter()).enumerate() {
+            assert!(r.is_finite(), "{name}[{i}]: ref grad is not finite ({r})");
+            assert!(t.is_finite(), "{name}[{i}]: tape grad is not finite ({t})");
+            let abs_diff = (r - t).abs();
+            if abs_diff <= atol {
+                continue; // absolute difference within tolerance
+            }
+            let denom = r.abs().max(t.abs());
+            let rel_err = abs_diff / denom;
+            if rel_err > max_rel_err {
+                max_rel_err = rel_err;
+            }
+            if rel_err > rtol {
+                if mismatches < 5 {
+                    eprintln!("  {name}[{i}]: ref={r:.6e} tape={t:.6e} rel_err={rel_err:.4e}");
+                }
+                mismatches += 1;
+            }
+        }
+        (max_rel_err, mismatches)
+    }
+
+    /// Run tape_compute_gradients and cms_compute_gradients on the same config,
+    /// assert loss is bitwise equal and all parameter gradients match within tolerance.
+    fn class3_tape_vs_handwritten(cfg: &MAGConfig, label: &str) {
+        ensure_rust_reference();
+        let d = cfg.swa.d_model;
+        let s = cfg.swa.seq_len;
+        let v = cfg.swa.vocab_size;
+        let params = MAGParams::init(cfg, 42);
+        let input_ids: Vec<usize> = (0..s).map(|t| t % v).collect();
+        let target_ids: Vec<usize> = (1..=s).map(|t| t % v).collect();
+        let pulse = Pulse { global_step: 0, active_levels: vec![true; cfg.k] };
+
+        // Hand-written backward
+        let mut ctx_ref = make_context_state(cfg);
+        let mut ebufs_ref: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(d)).collect();
+        let (loss_ref, grads_ref) = cms_compute_gradients(
+            &params, cfg, &input_ids, &target_ids, &pulse, &mut ctx_ref, &mut ebufs_ref,
+        );
+
+        // Tape backward
+        let mut ctx_tape = make_context_state(cfg);
+        let mut ebufs_tape: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(d)).collect();
+        let (loss_tape, grads_tape) = tape_compute_gradients(
+            &params, cfg, &input_ids, &target_ids, &pulse, &mut ctx_tape, &mut ebufs_tape,
+        );
+
+        // Loss: bitwise identical.
+        assert_eq!(loss_ref.to_bits(), loss_tape.to_bits(),
+            "{label}: loss mismatch ref={loss_ref} tape={loss_tape}");
+
+        let rtol = 1e-5;
+        let atol = 1e-6;
+        let mut total_mismatches = 0;
+
+        // SWA gradients.
+        let swa_fields: Vec<(&str, &[f32], &[f32])> = vec![
+            ("w_embed", &grads_ref.swa.w_embed, &grads_tape.swa.w_embed),
+            ("w_q", &grads_ref.swa.w_q, &grads_tape.swa.w_q),
+            ("w_k", &grads_ref.swa.w_k, &grads_tape.swa.w_k),
+            ("w_v", &grads_ref.swa.w_v, &grads_tape.swa.w_v),
+            ("w_o", &grads_ref.swa.w_o, &grads_tape.swa.w_o),
+            ("w_unembed", &grads_ref.swa.w_unembed, &grads_tape.swa.w_unembed),
+        ];
+        for (name, ref_g, tape_g) in &swa_fields {
+            let full_name = format!("{label}/swa.{name}");
+            let (max_err, mm) = compare_grad_slices(&full_name, ref_g, tape_g, rtol, atol);
+            if mm > 0 {
+                eprintln!("{full_name}: {mm} mismatches, max_rel_err={max_err:.4e}");
+            }
+            total_mismatches += mm;
+        }
+
+        // Per-level gradients.
+        for level in 0..cfg.k {
+            let rl = &grads_ref.levels[level];
+            let tl = &grads_tape.levels[level];
+            let level_fields: Vec<(&str, &[f32], &[f32])> = vec![
+                ("w_k_mem", &rl.w_k_mem, &tl.w_k_mem),
+                ("w_v_mem", &rl.w_v_mem, &tl.w_v_mem),
+                ("w_q_mem", &rl.w_q_mem, &tl.w_q_mem),
+                ("w_alpha", &rl.w_alpha, &tl.w_alpha),
+                ("b_alpha", &rl.b_alpha, &tl.b_alpha),
+                ("w_theta", &rl.w_theta, &tl.w_theta),
+                ("b_theta", &rl.b_theta, &tl.b_theta),
+                ("w_eta", &rl.w_eta, &tl.w_eta),
+                ("b_eta", &rl.b_eta, &tl.b_eta),
+                ("w_omega", &rl.w_omega, &tl.w_omega),
+            ];
+            for (name, ref_g, tape_g) in &level_fields {
+                if ref_g.is_empty() && tape_g.is_empty() {
+                    continue; // field not used by this rule
+                }
+                let full_name = format!("{label}/level[{level}].{name}");
+                let (max_err, mm) = compare_grad_slices(&full_name, ref_g, tape_g, rtol, atol);
+                if mm > 0 {
+                    eprintln!("{full_name}: {mm} mismatches, max_rel_err={max_err:.4e}");
+                }
+                total_mismatches += mm;
+            }
+        }
+
+        assert_eq!(total_mismatches, 0,
+            "{label}: {total_mismatches} gradient element mismatches (rtol={rtol}, atol={atol})");
+        eprintln!("{label}: all gradients match (loss={loss_ref:.4e})");
+    }
+
+    // ── DeltaRule ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_class3_delta_k1() {
+        class3_tape_vs_handwritten(&MAGConfig::test_config(), "delta_k1");
+    }
+
+    #[test]
+    fn test_class3_delta_k2() {
+        class3_tape_vs_handwritten(&MAGConfig::test_config_k2(), "delta_k2");
+    }
+
+    // ── Titans LMM ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_class3_titans_k1() {
+        class3_tape_vs_handwritten(&MAGConfig::titans_test_config(), "titans_k1");
+    }
+
+    #[test]
+    fn test_class3_titans_k2() {
+        class3_tape_vs_handwritten(&MAGConfig::titans_test_config_k2(), "titans_k2");
+    }
+
+    // ── Hebbian ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_class3_hebbian_k1() {
+        class3_tape_vs_handwritten(&MAGConfig::hebbian_test_config(), "hebbian_k1");
+    }
+
+    #[test]
+    fn test_class3_hebbian_k2() {
+        class3_tape_vs_handwritten(&MAGConfig::hebbian_test_config_k2(), "hebbian_k2");
+    }
+
+    // ── MONETA ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_class3_moneta_k1() {
+        class3_tape_vs_handwritten(&MAGConfig::moneta_test_config(), "moneta_k1");
+    }
+
+    #[test]
+    fn test_class3_moneta_k2() {
+        class3_tape_vs_handwritten(&MAGConfig::moneta_test_config_k2(), "moneta_k2");
+    }
+
+    // ── YAAD ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_class3_yaad_k1() {
+        class3_tape_vs_handwritten(&MAGConfig::yaad_test_config(), "yaad_k1");
+    }
+
+    #[test]
+    fn test_class3_yaad_k2() {
+        class3_tape_vs_handwritten(&MAGConfig::yaad_test_config_k2(), "yaad_k2");
+    }
+
+    // ── MEMORA ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_class3_memora_k1() {
+        class3_tape_vs_handwritten(&MAGConfig::memora_test_config(), "memora_k1");
+    }
+
+    #[test]
+    fn test_class3_memora_k2() {
+        class3_tape_vs_handwritten(&MAGConfig::memora_test_config_k2(), "memora_k2");
+    }
+
+    // ── Lattice OSR ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_class3_lattice_k1() {
+        class3_tape_vs_handwritten(&MAGConfig::lattice_test_config(), "lattice_k1");
+    }
+
+    #[test]
+    fn test_class3_lattice_k2() {
+        class3_tape_vs_handwritten(&MAGConfig::lattice_test_config_k2(), "lattice_k2");
+    }
+
+    // ── Trellis ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_class3_trellis_k1() {
+        class3_tape_vs_handwritten(&MAGConfig::trellis_test_config(), "trellis_k1");
+    }
+
+    #[test]
+    fn test_class3_trellis_k2() {
+        class3_tape_vs_handwritten(&MAGConfig::trellis_test_config_k2(), "trellis_k2");
+    }
+
+    // ── Atlas Omega ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_class3_atlas_k1() {
+        class3_tape_vs_handwritten(&MAGConfig::atlas_test_config(), "atlas_k1");
+    }
+
+    #[test]
+    fn test_class3_atlas_k2() {
+        class3_tape_vs_handwritten(&MAGConfig::atlas_test_config_k2(), "atlas_k2");
+    }
+
+    // ── k=4 DeltaRule ───────────────────────────────────────────────
+
+    #[test]
+    fn test_class3_delta_k4() {
+        class3_tape_vs_handwritten(&MAGConfig::test_config_k4(), "delta_k4");
+    }
+
+    // ── Mixed active/frozen (k=2, level 1 frozen) ───────────────────
+
+    #[test]
+    fn test_class3_delta_k2_frozen() {
+        ensure_rust_reference();
+        let cfg = MAGConfig::test_config_k2();
+        let d = cfg.swa.d_model;
+        let s = cfg.swa.seq_len;
+        let v = cfg.swa.vocab_size;
+        let params = MAGParams::init(&cfg, 42);
+        let input_ids: Vec<usize> = (0..s).map(|t| t % v).collect();
+        let target_ids: Vec<usize> = (1..=s).map(|t| t % v).collect();
+
+        // Warm up: all-active forward to populate memory.
+        let warm_pulse = Pulse { global_step: 0, active_levels: vec![true, true] };
+        let mut ctx_ref = make_context_state(&cfg);
+        let mut ebufs_ref: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(d)).collect();
+        let _ = cms_compute_gradients(
+            &params, &cfg, &input_ids, &target_ids, &warm_pulse, &mut ctx_ref, &mut ebufs_ref,
+        );
+        let mut ctx_tape = ctx_ref.clone();
+        let mut ebufs_tape: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(d)).collect();
+
+        // Reset error buffers for the actual test.
+        ebufs_ref = (0..cfg.k).map(|_| ErrorBuffer::new(d)).collect();
+
+        // Frozen pulse: level 0 active, level 1 frozen.
+        let frozen_pulse = Pulse { global_step: 1, active_levels: vec![true, false] };
+
+        let (loss_ref, grads_ref) = cms_compute_gradients(
+            &params, &cfg, &input_ids, &target_ids, &frozen_pulse, &mut ctx_ref, &mut ebufs_ref,
+        );
+        let (loss_tape, grads_tape) = tape_compute_gradients(
+            &params, &cfg, &input_ids, &target_ids, &frozen_pulse, &mut ctx_tape, &mut ebufs_tape,
+        );
+
+        assert_eq!(loss_ref.to_bits(), loss_tape.to_bits(),
+            "frozen: loss mismatch ref={loss_ref} tape={loss_tape}");
+
+        // Level 0 (active): gradients should match.
+        let rtol = 1e-5;
+        let atol = 1e-6;
+        let (_, mm) = compare_grad_slices(
+            "frozen/level[0].w_k_mem",
+            &grads_ref.levels[0].w_k_mem, &grads_tape.levels[0].w_k_mem,
+            rtol, atol,
+        );
+        assert_eq!(mm, 0, "frozen/level[0] gradient mismatch");
+
+        // Level 1 (frozen): returned grads should be zero in both paths.
+        let ref_l1_norm: f32 = grads_ref.levels[1].w_k_mem.iter()
+            .map(|x| x * x).sum::<f32>().sqrt();
+        let tape_l1_norm: f32 = grads_tape.levels[1].w_k_mem.iter()
+            .map(|x| x * x).sum::<f32>().sqrt();
+        assert!(ref_l1_norm < 1e-10,
+            "frozen/level[1]: ref grads should be zero (routed to ebuf), norm={ref_l1_norm}");
+        assert!(tape_l1_norm < 1e-10,
+            "frozen/level[1]: tape grads should be zero (routed to ebuf), norm={tape_l1_norm}");
+
+        // Error buffers should match: both routed level 1 grads there.
+        let ref_ebuf_norm = ebufs_ref[1].grads.norm();
+        let tape_ebuf_norm = ebufs_tape[1].grads.norm();
+        assert!(ref_ebuf_norm > 1e-10,
+            "frozen: ref error_buffer[1] should be nonzero, norm={ref_ebuf_norm}");
+        assert!((ref_ebuf_norm - tape_ebuf_norm).abs() / ref_ebuf_norm < 1e-4,
+            "frozen: error_buffer[1] norm mismatch ref={ref_ebuf_norm:.6e} tape={tape_ebuf_norm:.6e}");
+
+        eprintln!("delta_k2_frozen: all checks pass (loss={loss_ref:.4e}, ebuf_norm={ref_ebuf_norm:.4e})");
+    }
 }
