@@ -23,6 +23,7 @@ use nl_hecate_core::gradient::compute_gradients as rust_compute_gradients;
 use nl_hecate_core::mag::{mag_forward as rust_mag_forward, MAGForwardCache as RustMAGCache, mag_backward as rust_mag_backward};
 use nl_hecate_core::gradient::mag_compute_gradients as rust_mag_compute_gradients;
 use nl_hecate_core::mag::{cms_forward as rust_cms_forward, cms_backward as rust_cms_backward, CMSForwardCache as RustCMSCache};
+use nl_hecate_core::gradient::cms_compute_gradients as rust_cms_compute_gradients;
 use nl_hecate_core::conductor::{Conductor as RustConductor, Pulse as RustPulse, ContextState as RustContextState, ErrorBuffer as RustErrorBuffer, Checkpoint as RustCheckpoint, ConductorState as RustConductorState};
 use nl_hecate_core::context_stream::StreamCursor;
 use nl_hecate_core::context_stream::VecStream as RustVecStream;
@@ -1155,6 +1156,30 @@ fn cms_backward(
     Ok(MAGParams { inner: grads })
 }
 
+/// Compute CMS gradients via the Wengert tape (traced forward + automatic backward).
+///
+/// Combined forward+backward in one call. Equivalent to `cms_forward` + `cms_backward`
+/// but uses the tape-based gradient path for correctness parity with the Rust core.
+/// Frozen-level gradients are routed into `error_buffers`; active-level gradients
+/// are returned in the gradient params.
+#[pyfunction]
+fn cms_compute_gradients(
+    params: &MAGParams,
+    cfg: &MAGConfig,
+    input_ids: Vec<usize>,
+    target_ids: Vec<usize>,
+    pulse: &Pulse,
+    context: &mut ContextState,
+    error_buffers: &mut ErrorBufferList,
+) -> PyResult<(f32, MAGParams)> {
+    validate_mag_seq_lens(cfg, &input_ids, &target_ids)?;
+    let (loss, grads) = rust_cms_compute_gradients(
+        &params.inner, &cfg.inner, &input_ids, &target_ids,
+        &pulse.inner, &mut context.inner, &mut error_buffers.inner,
+    );
+    Ok((loss, MAGParams { inner: grads }))
+}
+
 #[pyfunction]
 fn save_checkpoint(path: &str, params: &MAGParams, cfg: &MAGConfig) -> PyResult<()> {
     rust_save_checkpoint(std::path::Path::new(path), &params.inner, &cfg.inner)
@@ -1550,6 +1575,7 @@ fn nl_hecate(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CMSForwardCache>()?;
     m.add_function(wrap_pyfunction!(cms_forward, m)?)?;
     m.add_function(wrap_pyfunction!(cms_backward, m)?)?;
+    m.add_function(wrap_pyfunction!(cms_compute_gradients, m)?)?;
     m.add_function(wrap_pyfunction!(save_checkpoint, m)?)?;
     m.add_function(wrap_pyfunction!(save_build_checkpoint, m)?)?;
     m.add_function(wrap_pyfunction!(load_checkpoint, m)?)?;
