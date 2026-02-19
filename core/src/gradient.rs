@@ -291,6 +291,8 @@ pub fn tape_compute_gradients(
     context: &mut ContextState,
     error_buffers: &mut [ErrorBuffer],
 ) -> (f32, MAGParams) {
+    debug_assert_eq!(error_buffers.len(), cfg.k,
+        "error_buffers length ({}) must equal cfg.k ({})", error_buffers.len(), cfg.k);
     let d = cfg.swa.d_model;
 
     let registry = register_opaque_vjps();
