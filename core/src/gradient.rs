@@ -5741,10 +5741,10 @@ mod tests {
             assert!(r.is_finite(), "{name}[{i}]: ref grad is not finite ({r})");
             assert!(t.is_finite(), "{name}[{i}]: tape grad is not finite ({t})");
             let abs_diff = (r - t).abs();
-            let denom = r.abs().max(t.abs());
-            if denom < atol {
-                continue; // both near zero — skip
+            if abs_diff <= atol {
+                continue; // absolute difference within tolerance
             }
+            let denom = r.abs().max(t.abs());
             let rel_err = abs_diff / denom;
             if rel_err > max_rel_err {
                 max_rel_err = rel_err;
