@@ -402,6 +402,11 @@ pub struct MAGConfig {
     /// Frequency scheduling strategy. Fixed = modular arithmetic (default).
     /// Learned = sigmoid gate per level based on input embeddings.
     pub frequency_schedule: FrequencySchedule,
+    /// Gradient checkpointing interval for memory rules.
+    /// None = store full M trajectory (no overhead, current behavior).
+    /// Some(C) = store M every C steps, recompute during backward.
+    #[serde(default)]
+    pub checkpoint_interval: Option<usize>,
 }
 
 /// Default gate bias init values per level index.
@@ -413,6 +418,8 @@ fn default_b_alpha(level: usize) -> f32 {
         1 => 4.0,    // sigmoid(4.0) ≈ 0.98
         2 => 4.5,    // sigmoid(4.5) ≈ 0.989
         3 => 5.0,    // sigmoid(5.0) ≈ 0.993
+        4 => 5.5,    // sigmoid(5.5) ≈ 0.996
+        5 => 6.0,    // sigmoid(6.0) ≈ 0.998
         _ => 3.0,
     }
 }
@@ -426,6 +433,8 @@ fn default_b_theta(level: usize) -> f32 {
         1 => -5.6,   // softplus(-5.6) ≈ 0.004
         2 => -6.6,   // softplus(-6.6) ≈ 0.0014
         3 => -7.6,   // softplus(-7.6) ≈ 0.0005
+        4 => -8.6,   // softplus(-8.6) ≈ 0.00018
+        5 => -9.6,   // softplus(-9.6) ≈ 0.00007
         _ => -4.6,
     }
 }
@@ -438,6 +447,8 @@ pub fn default_b_eta(level: usize) -> f32 {
         1 => 2.0,    // sigmoid(2.0) ≈ 0.88
         2 => 2.5,    // sigmoid(2.5) ≈ 0.92
         3 => 3.0,    // sigmoid(3.0) ≈ 0.95 (very persistent)
+        4 => 3.5,    // sigmoid(3.5) ≈ 0.97
+        5 => 4.0,    // sigmoid(4.0) ≈ 0.98
         _ => 2.0,
     }
 }
@@ -464,6 +475,7 @@ impl MAGConfig {
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
         }
     }
 
@@ -488,6 +500,7 @@ impl MAGConfig {
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
         }
     }
 
@@ -512,6 +525,7 @@ impl MAGConfig {
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
         }
     }
 
@@ -537,6 +551,7 @@ impl MAGConfig {
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
         }
     }
 
@@ -562,6 +577,7 @@ impl MAGConfig {
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
         }
     }
 
@@ -587,6 +603,7 @@ impl MAGConfig {
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
         }
     }
 
@@ -611,6 +628,7 @@ impl MAGConfig {
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
         }
     }
 
@@ -635,6 +653,7 @@ impl MAGConfig {
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
         }
     }
 
@@ -659,6 +678,7 @@ impl MAGConfig {
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
         }
     }
 
@@ -683,6 +703,7 @@ impl MAGConfig {
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
         }
     }
 
@@ -716,6 +737,7 @@ impl MAGConfig {
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
         }
     }
 
@@ -749,6 +771,7 @@ impl MAGConfig {
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
         }
     }
 
@@ -782,6 +805,7 @@ impl MAGConfig {
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
         }
     }
 
@@ -815,6 +839,7 @@ impl MAGConfig {
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
         }
     }
 
@@ -848,6 +873,7 @@ impl MAGConfig {
             retention: default_retention(MemoryRuleKind::MEMORA),
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
         }
     }
 
@@ -881,6 +907,7 @@ impl MAGConfig {
             retention: default_retention(MemoryRuleKind::MEMORA),
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
         }
     }
 
@@ -906,6 +933,7 @@ impl MAGConfig {
             retention: default_retention(MemoryRuleKind::LatticeOSR),
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
         }
     }
 
@@ -931,6 +959,7 @@ impl MAGConfig {
             retention: default_retention(MemoryRuleKind::LatticeOSR),
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
         }
     }
 
@@ -959,6 +988,7 @@ impl MAGConfig {
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
         }
     }
 
@@ -987,6 +1017,7 @@ impl MAGConfig {
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
         }
     }
 
@@ -1011,6 +1042,7 @@ impl MAGConfig {
             retention: default_retention(MemoryRuleKind::AtlasOmega),
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
         }
     }
 
@@ -1035,6 +1067,7 @@ impl MAGConfig {
             retention: default_retention(MemoryRuleKind::AtlasOmega),
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
         }
     }
 
@@ -1059,6 +1092,7 @@ impl MAGConfig {
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
         }
     }
 
@@ -1083,6 +1117,7 @@ impl MAGConfig {
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
         }
     }
 
@@ -1108,6 +1143,7 @@ impl MAGConfig {
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
         }
     }
 
@@ -1132,6 +1168,7 @@ impl MAGConfig {
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
         }
     }
 
@@ -1157,6 +1194,7 @@ impl MAGConfig {
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
             frequency_schedule: FrequencySchedule::Learned(LearnedFreqConfig::default()),
+            checkpoint_interval: None,
         }
     }
 
@@ -1182,6 +1220,7 @@ impl MAGConfig {
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
             frequency_schedule: FrequencySchedule::Learned(LearnedFreqConfig::default()),
+            checkpoint_interval: None,
         }
     }
 }
@@ -1678,7 +1717,9 @@ mod tests {
         assert!((default_b_eta(1) - 2.0).abs() < 1e-6);
         assert!((default_b_eta(2) - 2.5).abs() < 1e-6);
         assert!((default_b_eta(3) - 3.0).abs() < 1e-6);
-        assert!((default_b_eta(4) - 2.0).abs() < 1e-6); // fallback
+        assert!((default_b_eta(4) - 3.5).abs() < 1e-6);
+        assert!((default_b_eta(5) - 4.0).abs() < 1e-6);
+        assert!((default_b_eta(6) - 2.0).abs() < 1e-6); // fallback
     }
 
     // ── Declared Checkpoint tests ────────────────────────────────────

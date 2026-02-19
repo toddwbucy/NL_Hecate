@@ -191,6 +191,7 @@ fn test_mal_vs_mag() {
         retention: RetentionKind::L2WeightDecay,
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
     };
     let cfg_mal = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
@@ -202,6 +203,7 @@ fn test_mal_vs_mag() {
         retention: RetentionKind::L2WeightDecay,
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
     };
 
     let input_ids: Vec<usize> = (0..swa.seq_len).map(|t| t % swa.vocab_size).collect();

@@ -204,6 +204,235 @@ __global__ void titans_backward_kernel(
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════
+// Segment backward: operates on [t_start, t_end) with d_m_seed/d_s_seed.
+// m_states/s_states are segment-local: [(seg_len+1)*d*d].
+// ══════════════════════════════════════════════════════════════════════
+
+__global__ void titans_backward_segment_kernel(
+    const float* __restrict__ k_mem,
+    const float* __restrict__ v_mem,
+    const float* __restrict__ q_mem,
+    const float* __restrict__ alpha,
+    const float* __restrict__ theta,
+    const float* __restrict__ eta,
+    const float* __restrict__ m_states,
+    const float* __restrict__ s_states,
+    const float* __restrict__ d_y,
+    const float* __restrict__ d_m_seed,
+    const float* __restrict__ d_s_seed,
+    float* __restrict__ d_k_mem,
+    float* __restrict__ d_v_mem,
+    float* __restrict__ d_q_mem,
+    float* __restrict__ d_alpha,
+    float* __restrict__ d_theta,
+    float* __restrict__ d_eta,
+    float* __restrict__ d_m_out,
+    float* __restrict__ d_s_out,
+    int t_start, int t_end, int d)
+{
+    int tid = threadIdx.x;
+    int dd = d * d;
+
+    extern __shared__ float smem[];
+    float* d_M = smem;
+    float* d_S = smem + dd;
+    float* prediction = smem + 2 * dd;
+    float* error_buf = smem + 2 * dd + d;
+    float* d_error = smem + 2 * dd + 2 * d;
+    float* reduce_buf = smem + 2 * dd + 3 * d;
+
+    // Init from seeds
+    for (int idx = tid; idx < dd; idx += blockDim.x) {
+        d_M[idx] = d_m_seed[idx];
+        d_S[idx] = d_s_seed[idx];
+    }
+    __syncthreads();
+
+    for (int t = t_end - 1; t >= t_start; t--) {
+        int seg_t = t - t_start;
+        const float* k_t = k_mem + t * d;
+        const float* v_t = v_mem + t * d;
+        const float* q_t = q_mem + t * d;
+        const float* d_y_t = d_y + t * d;
+        const float* m_t = m_states + seg_t * dd;
+        const float* m_next = m_states + (seg_t + 1) * dd;
+        const float* s_t = s_states + seg_t * dd;
+        float alpha_t = alpha[t];
+        float theta_t = theta[t];
+        float eta_t = eta[t];
+
+        // d_M += outer(d_y_t, q_t)
+        for (int idx = tid; idx < dd; idx += blockDim.x) {
+            int i = idx / d;
+            int j = idx % d;
+            d_M[idx] += d_y_t[i] * q_t[j];
+        }
+        __syncthreads();
+
+        // d_q_t
+        if (tid < d) {
+            float sum = 0.0f;
+            for (int i = 0; i < d; i++) {
+                sum += m_next[i * d + tid] * d_y_t[i];
+            }
+            d_q_mem[t * d + tid] = sum;
+        }
+        __syncthreads();
+
+        // d_S += d_M
+        for (int idx = tid; idx < dd; idx += blockDim.x) {
+            d_S[idx] += d_M[idx];
+        }
+        __syncthreads();
+
+        // d_alpha
+        {
+            float local_sum = 0.0f;
+            for (int idx = tid; idx < dd; idx += blockDim.x) {
+                local_sum += m_t[idx] * d_M[idx];
+            }
+            reduce_buf[tid] = local_sum;
+            __syncthreads();
+            for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+                if (tid < s) reduce_buf[tid] += reduce_buf[tid + s];
+                __syncthreads();
+            }
+            if (tid == 0) d_alpha[t] = -reduce_buf[0];
+            __syncthreads();
+        }
+
+        float retention = 1.0f - alpha_t;
+
+        // d_eta
+        {
+            float local_sum = 0.0f;
+            for (int idx = tid; idx < dd; idx += blockDim.x) {
+                local_sum += s_t[idx] * d_S[idx];
+            }
+            reduce_buf[tid] = local_sum;
+            __syncthreads();
+            for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+                if (tid < s) reduce_buf[tid] += reduce_buf[tid + s];
+                __syncthreads();
+            }
+            if (tid == 0) d_eta[t] = reduce_buf[0];
+            __syncthreads();
+        }
+
+        // Recompute prediction/error
+        if (tid < d) {
+            float sum = 0.0f;
+            for (int j = 0; j < d; j++) sum += m_t[tid * d + j] * k_t[j];
+            prediction[tid] = sum;
+        }
+        __syncthreads();
+        if (tid < d) {
+            error_buf[tid] = prediction[tid] - v_t[tid];
+        }
+        __syncthreads();
+
+        // d_theta
+        {
+            float local_sum = 0.0f;
+            for (int idx = tid; idx < dd; idx += blockDim.x) {
+                int i = idx / d;
+                int j = idx % d;
+                local_sum += error_buf[i] * k_t[j] * d_S[idx];
+            }
+            reduce_buf[tid] = local_sum;
+            __syncthreads();
+            for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+                if (tid < s) reduce_buf[tid] += reduce_buf[tid + s];
+                __syncthreads();
+            }
+            if (tid == 0) d_theta[t] = -reduce_buf[0];
+            __syncthreads();
+        }
+
+        // d_error
+        if (tid < d) {
+            float sum = 0.0f;
+            for (int j = 0; j < d; j++) {
+                sum += (-theta_t * d_S[tid * d + j]) * k_t[j];
+            }
+            d_error[tid] = sum;
+        }
+        __syncthreads();
+
+        // d_k_mem
+        if (tid < d) {
+            float sum = 0.0f;
+            for (int i = 0; i < d; i++) {
+                sum += (-theta_t * d_S[i * d + tid]) * error_buf[i];
+            }
+            d_k_mem[t * d + tid] = sum;
+        }
+        __syncthreads();
+        if (tid < d) {
+            float sum = 0.0f;
+            for (int i = 0; i < d; i++) {
+                sum += m_t[i * d + tid] * d_error[i];
+            }
+            d_k_mem[t * d + tid] += sum;
+        }
+
+        // d_v_mem
+        if (tid < d) {
+            d_v_mem[t * d + tid] = -d_error[tid];
+        }
+        __syncthreads();
+
+        // Propagate d_S and d_M
+        for (int idx = tid; idx < dd; idx += blockDim.x) {
+            int i = idx / d;
+            int j = idx % d;
+            d_S[idx] = eta_t * d_S[idx];
+            d_M[idx] = retention * d_M[idx] + d_error[i] * k_t[j];
+        }
+        __syncthreads();
+    }
+
+    // Store outputs
+    for (int idx = tid; idx < dd; idx += blockDim.x) {
+        d_m_out[idx] = d_M[idx];
+        d_s_out[idx] = d_S[idx];
+    }
+}
+
+extern "C" void titans_backward_segment_f32_cuda(
+    const float* k_mem, const float* v_mem, const float* q_mem,
+    const float* alpha, const float* theta, const float* eta,
+    const float* m_states, const float* s_states, const float* d_y,
+    const float* d_m_seed, const float* d_s_seed,
+    float* d_k_mem, float* d_v_mem, float* d_q_mem,
+    float* d_alpha, float* d_theta, float* d_eta,
+    float* d_m_out, float* d_s_out,
+    int t_start, int t_end, int d)
+{
+    int dd = d * d;
+    int block_size = (dd < 1024) ? dd : 1024;
+    if (block_size < d) block_size = d;
+    int rounded = 1;
+    while (rounded < block_size) rounded <<= 1;
+    if (rounded > 1024) rounded = 1024;
+    block_size = rounded;
+
+    dim3 grid(1);
+    dim3 block(block_size);
+
+    int smem_bytes = (2 * dd + 3 * d + block_size) * sizeof(float);
+
+    titans_backward_segment_kernel<<<grid, block, smem_bytes>>>(
+        k_mem, v_mem, q_mem, alpha, theta, eta,
+        m_states, s_states, d_y,
+        d_m_seed, d_s_seed,
+        d_k_mem, d_v_mem, d_q_mem,
+        d_alpha, d_theta, d_eta,
+        d_m_out, d_s_out,
+        t_start, t_end, d);
+}
+
 extern "C" void titans_backward_f32_cuda(
     const float* k_mem, const float* v_mem, const float* q_mem,
     const float* alpha, const float* theta, const float* eta,

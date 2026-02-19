@@ -62,6 +62,7 @@ fn spike_config_a() -> MAGConfig {
         retention: RetentionKind::L2WeightDecay,
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
     }
 }
 
@@ -88,6 +89,7 @@ fn spike_config_b() -> MAGConfig {
         retention: RetentionKind::L2WeightDecay,
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
     }
 }
 
@@ -114,6 +116,7 @@ fn spike_config_c() -> MAGConfig {
         retention: RetentionKind::L2WeightDecay,
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
     }
 }
 
@@ -702,6 +705,7 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
         },
         m3: None,
         frequency_schedule: FrequencySchedule::Fixed,
+        checkpoint_interval: None,
     }
 }
 

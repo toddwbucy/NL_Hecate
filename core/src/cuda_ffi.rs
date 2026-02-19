@@ -187,6 +187,68 @@ extern "C" {
         d: i32,
     );
 
+    // ── Checkpointed forward kernels (gradient checkpointing) ─────────
+
+    /// DeltaRule forward with checkpoint_interval — stores M every C steps.
+    pub(crate) fn delta_forward_ckpt_f32_cuda(
+        k_mem: *const f32, v_mem: *const f32, q_mem: *const f32,
+        alpha: *const f32, theta: *const f32, m_initial: *const f32,
+        m_states: *mut f32, y: *mut f32,
+        seq_len: i32, d: i32, checkpoint_interval: i32,
+    );
+
+    /// TitansLMM forward with checkpoint_interval — stores M/S every C steps.
+    pub(crate) fn titans_forward_ckpt_f32_cuda(
+        k_mem: *const f32, v_mem: *const f32, q_mem: *const f32,
+        alpha: *const f32, theta: *const f32, eta: *const f32,
+        m_initial: *const f32, s_initial: *const f32,
+        m_states: *mut f32, s_states: *mut f32, y: *mut f32,
+        seq_len: i32, d: i32, checkpoint_interval: i32,
+    );
+
+    /// HebbianRule forward with checkpoint_interval — stores M every C steps.
+    pub(crate) fn hebbian_forward_ckpt_f32_cuda(
+        k_mem: *const f32, v_mem: *const f32, q_mem: *const f32,
+        alpha: *const f32, m_initial: *const f32,
+        m_states: *mut f32, y: *mut f32,
+        seq_len: i32, d: i32, checkpoint_interval: i32,
+    );
+
+    // ── Segment backward kernels (gradient checkpointing) ───────────
+
+    /// DeltaRule segment backward — operates on [t_start, t_end) with d_m_seed.
+    pub(crate) fn delta_backward_segment_f32_cuda(
+        k_mem: *const f32, v_mem: *const f32, q_mem: *const f32,
+        alpha: *const f32, theta: *const f32,
+        m_states: *const f32, d_y: *const f32,
+        d_m_seed: *const f32,
+        d_k_mem: *mut f32, d_v_mem: *mut f32, d_q_mem: *mut f32,
+        d_alpha: *mut f32, d_theta: *mut f32, d_m_out: *mut f32,
+        t_start: i32, t_end: i32, d: i32,
+    );
+
+    /// TitansLMM segment backward — operates on [t_start, t_end) with d_m_seed/d_s_seed.
+    pub(crate) fn titans_backward_segment_f32_cuda(
+        k_mem: *const f32, v_mem: *const f32, q_mem: *const f32,
+        alpha: *const f32, theta: *const f32, eta: *const f32,
+        m_states: *const f32, s_states: *const f32, d_y: *const f32,
+        d_m_seed: *const f32, d_s_seed: *const f32,
+        d_k_mem: *mut f32, d_v_mem: *mut f32, d_q_mem: *mut f32,
+        d_alpha: *mut f32, d_theta: *mut f32, d_eta: *mut f32,
+        d_m_out: *mut f32, d_s_out: *mut f32,
+        t_start: i32, t_end: i32, d: i32,
+    );
+
+    /// HebbianRule segment backward — operates on [t_start, t_end) with d_m_seed.
+    pub(crate) fn hebbian_backward_segment_f32_cuda(
+        k_mem: *const f32, v_mem: *const f32, q_mem: *const f32,
+        alpha: *const f32, m_states: *const f32, d_y: *const f32,
+        d_m_seed: *const f32,
+        d_k_mem: *mut f32, d_v_mem: *mut f32, d_q_mem: *mut f32,
+        d_alpha: *mut f32, d_m_out: *mut f32,
+        t_start: i32, t_end: i32, d: i32,
+    );
+
     // ── Embedding kernels ─────────────────────────────────────────────
 
     /// Gather rows from embedding table by token ID.

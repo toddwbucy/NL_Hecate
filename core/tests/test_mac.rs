@@ -205,6 +205,7 @@ fn test_mac_vs_mag() {
         retention: RetentionKind::L2WeightDecay,
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
     };
     let cfg_mac = MAGConfig {
         swa: swa_mac, memory_enabled: true,
@@ -216,6 +217,7 @@ fn test_mac_vs_mag() {
         retention: RetentionKind::L2WeightDecay,
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
+            checkpoint_interval: None,
     };
 
     let seq_len = 8;

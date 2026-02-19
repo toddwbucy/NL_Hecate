@@ -411,6 +411,7 @@ impl MAGConfig {
                 retention: ret_kind,
                 m3: m3_cfg,
                 frequency_schedule: freq_sched,
+                checkpoint_interval: None,
             },
         })
     }
@@ -1033,6 +1034,11 @@ impl ContextState {
         Ok(())
     }
 
+    /// Zero all memory matrices in-place. Used at document boundaries.
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+
     #[getter]
     fn d(&self) -> usize { self.inner.d }
 }
@@ -1042,6 +1048,7 @@ impl ContextState {
 #[pyclass]
 struct ErrorBufferList {
     inner: Vec<RustErrorBuffer>,
+    d: usize,
 }
 
 #[pymethods]
@@ -1049,7 +1056,14 @@ impl ErrorBufferList {
     #[new]
     fn new(k: usize, d: usize) -> Self {
         let inner = (0..k).map(|_| RustErrorBuffer::new(d)).collect();
-        ErrorBufferList { inner }
+        ErrorBufferList { inner, d }
+    }
+
+    /// Reset all error buffers (recreate with zero gradients).
+    /// Used at document boundaries alongside ContextState::reset().
+    fn reset(&mut self) {
+        let d = self.d;
+        self.inner = (0..self.inner.len()).map(|_| RustErrorBuffer::new(d)).collect();
     }
 
     /// Number of accumulated gradient steps for a given level.
@@ -1101,6 +1115,17 @@ impl VecStream {
         if corpus.len() < 2 {
             return Err(PyValueError::new_err("corpus must have at least 2 tokens"));
         }
+        Ok(VecStream { inner: Some(RustVecStream::new(corpus)) })
+    }
+
+    /// Create from raw bytes (each byte is a token ID 0-255).
+    /// Much faster than converting a billion-element Python list.
+    #[staticmethod]
+    fn from_bytes(data: &[u8]) -> PyResult<Self> {
+        if data.len() < 2 {
+            return Err(PyValueError::new_err("data must have at least 2 bytes"));
+        }
+        let corpus: Vec<usize> = data.iter().map(|&b| b as usize).collect();
         Ok(VecStream { inner: Some(RustVecStream::new(corpus)) })
     }
 }
@@ -1524,6 +1549,17 @@ impl GpuModel {
     fn reset_cache(&mut self) {
         self.kv_cache = None;
         self.decode_workspace = None;
+    }
+
+    /// Zero all GPU memory matrices in-place (cudaMemset).
+    /// Used at document boundaries to prevent stale state across documents.
+    fn reset_context(&mut self) {
+        self.context.reset();
+    }
+
+    /// Upload context state from host (e.g., to restore after eval).
+    fn upload_context(&mut self, ctx: &ContextState) {
+        self.context = nl_hecate_core::gpu_params::GpuContextState::from_host_context(&ctx.inner);
     }
 
     /// Read gate biases from GPU: returns Vec of (b_alpha, b_theta, b_eta) per level.
