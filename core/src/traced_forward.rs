@@ -33,6 +33,7 @@ use crate::dynamic_freq::FrequencySchedule;
 /// Maps each parameter registered on the tape back to its BufId.
 /// Returned by `traced_cms_forward()` so callers can extract gradients
 /// via `tape.get_param_grad(id)` after `tape.backward()`.
+#[derive(Debug, Clone)]
 pub struct TracedParamIds {
     pub w_embed: BufId,
     pub w_q: BufId,
