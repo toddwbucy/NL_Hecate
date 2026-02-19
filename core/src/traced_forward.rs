@@ -26,7 +26,7 @@ use crate::memora::{MEMORA, memora_read_only};
 use crate::lattice_osr::{LatticeOSR, lattice_read_only};
 use crate::trellis::{Trellis, trellis_read_only};
 use crate::atlas_omega::AtlasOmega;
-use crate::dynamic_freq::FrequencySchedule;
+use crate::dynamic_freq::{FrequencySchedule, FreqGateCache, should_anneal};
 
 // ── TracedParamIds: map tape BufIds back to MAGParams fields ────────
 
@@ -45,6 +45,12 @@ pub struct TracedParamIds {
     pub level_params: Vec<BufId>,
     /// Extra w_q_mem param BufId for frozen levels (None for active levels).
     pub frozen_w_q_mem: Vec<Option<BufId>>,
+    /// Per-level w_freq BufId for learned frequency gates (None if Fixed schedule).
+    pub freq_w_freq: Vec<Option<BufId>>,
+    /// Per-level b_freq BufId for learned frequency gates (None if Fixed schedule).
+    pub freq_b_freq: Vec<Option<BufId>>,
+    /// Combined y buffer ID (pre-sigmoid). Used for freq gate surrogate gradient.
+    pub combined_y: Option<BufId>,
 }
 
 // ── P2.1: Traced Standard Op Wrappers ───────────────────────────────
@@ -311,14 +317,72 @@ pub fn traced_cms_forward(
     let embedded = tape.buf_data(emb_id).to_vec();
 
     // ── Dynamic frequency gate ─────────────────────────────────────
-    // Learned frequency schedule requires traced gate ops (Stage 3 scope).
-    // Fixed schedules pass through unchanged — no gate computation needed.
+    // Learned schedule: tape-recorded gate ops so gradients flow to w_freq/b_freq.
+    // Fixed schedule: pass through unchanged.
+    let mut freq_w_freq_ids: Vec<Option<BufId>> = vec![None; cfg.k];
+    let mut freq_b_freq_ids: Vec<Option<BufId>> = vec![None; cfg.k];
     let (effective_pulse, freq_cache) = match &cfg.frequency_schedule {
-        FrequencySchedule::Learned(_) => {
-            unimplemented!(
-                "Traced path for Learned frequency schedule \
-                 is Stage 3 scope (pluggable retention / CMS variants)"
-            );
+        FrequencySchedule::Learned(learned_cfg)
+            if !should_anneal(pulse.global_step, learned_cfg.anneal_steps) =>
+        {
+            // Mean-pool embedded tokens: ones_row [1, s] @ embedded [s, d] → [1, d]
+            let ones_data: Vec<f32> = vec![1.0 / s as f32; s];
+            let ones_id = tape.alloc(ones_data, vec![1, s]);
+            let mean_id = traced_matmul(tape, ones_id, emb_id, 1, s, d);
+            let embedded_mean = tape.buf_data(mean_id).to_vec();
+
+            // Per-level: pre = dot(mean, w_freq) + b_freq, gate = sigmoid(pre)
+            let mut gate_values = Vec::with_capacity(cfg.k);
+            let mut gate_pre = Vec::with_capacity(cfg.k);
+            let mut active_levels = Vec::with_capacity(cfg.k);
+
+            for l in 0..cfg.k {
+                let w_freq_id = tape.register_param(&params.levels[l].w_freq, vec![1, d]);
+                let b_freq_id = tape.register_param(&params.levels[l].b_freq, vec![1]);
+                freq_w_freq_ids[l] = Some(w_freq_id);
+                freq_b_freq_ids[l] = Some(b_freq_id);
+
+                // pre = mean @ w_freq^T → [1, 1]
+                let dot_id = traced_matmul_transb(tape, mean_id, w_freq_id, 1, d, 1);
+                // pre + b_freq → [1]
+                let pre_id = traced_add(tape, dot_id, b_freq_id);
+                let pre_val = tape.buf_data(pre_id)[0];
+                gate_pre.push(pre_val);
+
+                // gate = sigmoid(pre)
+                let gate_id = traced_sigmoid(tape, pre_id);
+                let gate_val = tape.buf_data(gate_id)[0];
+                gate_values.push(gate_val);
+
+                // Hard threshold with straight-through estimator
+                if l == 0 {
+                    // Level 0 always active (spec invariant), but still record
+                    // the gate for gradient flow.
+                    active_levels.push(true);
+                } else {
+                    let out_id = tape.alloc(
+                        vec![if gate_val > learned_cfg.threshold { 1.0 } else { 0.0 }],
+                        vec![1],
+                    );
+                    tape.record(TapeOp::StraightThroughBool {
+                        input: gate_id,
+                        threshold: learned_cfg.threshold,
+                        out: out_id,
+                    });
+                    active_levels.push(gate_val > learned_cfg.threshold);
+                }
+            }
+
+            let new_pulse = Pulse {
+                global_step: pulse.global_step,
+                active_levels,
+            };
+            let fc = FreqGateCache {
+                gate_values,
+                gate_pre,
+                embedded_mean,
+            };
+            (new_pulse, Some(fc))
         }
         _ => (pulse.clone(), None),
     };
@@ -492,6 +556,9 @@ pub fn traced_cms_forward(
         w_unembed: w_unembed_id,
         level_params: level_param_ids,
         frozen_w_q_mem: frozen_w_q_mem_ids,
+        freq_w_freq: freq_w_freq_ids,
+        freq_b_freq: freq_b_freq_ids,
+        combined_y: Some(combined_id),
     };
 
     (loss, cache, loss_id, param_ids)
@@ -1087,4 +1154,51 @@ mod tests {
     #[test] fn test_bitwise_k2_lattice_osr() { assert_bitwise_identity_k2(MemoryRuleKind::LatticeOSR); }
     #[test] fn test_bitwise_k2_trellis() { assert_bitwise_identity_k2(MemoryRuleKind::Trellis); }
     #[test] fn test_bitwise_k2_atlas_omega() { assert_bitwise_identity_k2(MemoryRuleKind::AtlasOmega); }
+
+    // ── Learned frequency gate: bitwise identity ────────────────────
+
+    #[test]
+    fn test_bitwise_learned_freq_gate_k2() {
+        use crate::dynamic_freq::LearnedFreqConfig;
+
+        // k=2 DeltaRule with learned frequency gates.
+        let mut cfg = MAGConfig::test_config_k2();
+        cfg.frequency_schedule = FrequencySchedule::Learned(LearnedFreqConfig::default());
+
+        let params = MAGParams::init(&cfg, 42);
+        let s = cfg.swa.seq_len;
+        let v = cfg.swa.vocab_size;
+        let (input_ids, target_ids) = make_input(s, v, 123);
+
+        // Both levels active (the gate decides dynamically).
+        let pulse = Pulse { global_step: 0, active_levels: vec![true, true] };
+
+        // Reference path
+        let mut ctx_ref = ContextState::new(cfg.k, cfg.swa.d_model);
+        let (loss_ref, _) = cms_forward(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx_ref);
+
+        // Traced path
+        let registry = register_opaque_vjps();
+        let mut ctx_traced = ContextState::new(cfg.k, cfg.swa.d_model);
+        let (loss_traced, _, _loss_id, param_ids) = with_tape(registry, |tape| {
+            traced_cms_forward(tape, &params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx_traced)
+        });
+
+        assert_eq!(loss_ref.to_bits(), loss_traced.to_bits(),
+            "Learned freq gate k=2: loss_ref={loss_ref} loss_traced={loss_traced}");
+
+        // Verify freq gate param IDs are populated.
+        for l in 0..cfg.k {
+            assert!(param_ids.freq_w_freq[l].is_some(),
+                "freq_w_freq[{l}] should be Some for Learned schedule");
+            assert!(param_ids.freq_b_freq[l].is_some(),
+                "freq_b_freq[{l}] should be Some for Learned schedule");
+        }
+
+        // Context memory must match.
+        for level in 0..cfg.k {
+            assert_eq!(ctx_ref.memory[level], ctx_traced.memory[level],
+                "Learned freq gate: context.memory[{level}] mismatch");
+        }
+    }
 }

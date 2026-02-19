@@ -98,6 +98,15 @@ pub fn level_params_grads_to_flat(g: &MemoryLevelParams) -> Vec<f32> {
     out
 }
 
+/// Flatten MemoryLevelParams gradient, padded to `target_len` with zeros.
+/// Used when the lp_flat buffer includes w_freq/b_freq (Learned frequency
+/// schedule) but the memory rule backward only produces core-field gradients.
+pub fn level_params_grads_to_flat_padded(g: &MemoryLevelParams, target_len: usize) -> Vec<f32> {
+    let mut out = level_params_grads_to_flat(g);
+    out.resize(target_len, 0.0);
+    out
+}
+
 // ── Metadata encoding ─────────────────────────────────────────────────
 
 // The first saved buffer (saved[0]) encodes metadata as a small f32 vec:
@@ -155,7 +164,7 @@ pub fn delta_rule_opaque_backward(
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
     d_inputs[0] = d_embedded;
-    d_inputs[1] = level_params_grads_to_flat(&param_grads);
+    d_inputs[1] = level_params_grads_to_flat_padded(&param_grads, d_inputs[1].len());
 }
 
 /// Titans LMM opaque backward adapter.
@@ -192,7 +201,7 @@ pub fn titans_lmm_opaque_backward(
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
     d_inputs[0] = d_embedded;
-    d_inputs[1] = level_params_grads_to_flat(&param_grads);
+    d_inputs[1] = level_params_grads_to_flat_padded(&param_grads, d_inputs[1].len());
 }
 
 /// Hebbian rule opaque backward adapter.
@@ -222,7 +231,7 @@ pub fn hebbian_opaque_backward(
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
     d_inputs[0] = d_embedded;
-    d_inputs[1] = level_params_grads_to_flat(&param_grads);
+    d_inputs[1] = level_params_grads_to_flat_padded(&param_grads, d_inputs[1].len());
 }
 
 /// Moneta opaque backward adapter.
@@ -263,7 +272,7 @@ pub fn moneta_opaque_backward(
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
     d_inputs[0] = d_embedded;
-    d_inputs[1] = level_params_grads_to_flat(&param_grads);
+    d_inputs[1] = level_params_grads_to_flat_padded(&param_grads, d_inputs[1].len());
 }
 
 /// YAAD opaque backward adapter.
@@ -308,7 +317,7 @@ pub fn yaad_opaque_backward(
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
     d_inputs[0] = d_embedded;
-    d_inputs[1] = level_params_grads_to_flat(&param_grads);
+    d_inputs[1] = level_params_grads_to_flat_padded(&param_grads, d_inputs[1].len());
 }
 
 /// MEMORA opaque backward adapter.
@@ -347,7 +356,7 @@ pub fn memora_opaque_backward(
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
     d_inputs[0] = d_embedded;
-    d_inputs[1] = level_params_grads_to_flat(&param_grads);
+    d_inputs[1] = level_params_grads_to_flat_padded(&param_grads, d_inputs[1].len());
 }
 
 /// Lattice OSR opaque backward adapter.
@@ -381,7 +390,7 @@ pub fn lattice_osr_opaque_backward(
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
     d_inputs[0] = d_embedded;
-    d_inputs[1] = level_params_grads_to_flat(&param_grads);
+    d_inputs[1] = level_params_grads_to_flat_padded(&param_grads, d_inputs[1].len());
 }
 
 /// Trellis opaque backward adapter.
@@ -427,7 +436,7 @@ pub fn trellis_opaque_backward(
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
     d_inputs[0] = d_embedded;
-    d_inputs[1] = level_params_grads_to_flat(&param_grads);
+    d_inputs[1] = level_params_grads_to_flat_padded(&param_grads, d_inputs[1].len());
 }
 
 /// Atlas Omega opaque backward adapter.
@@ -465,7 +474,7 @@ pub fn atlas_omega_opaque_backward(
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
     d_inputs[0] = d_embedded;
-    d_inputs[1] = level_params_grads_to_flat(&param_grads);
+    d_inputs[1] = level_params_grads_to_flat_padded(&param_grads, d_inputs[1].len());
 }
 
 // ── SWA adapter ───────────────────────────────────────────────────────
