@@ -6,7 +6,7 @@
 /// - `finite_diff_gradient`: central finite differences for verification
 /// - Gradient checking utilities
 
-use crate::model::{SWAConfig, SWAParams, MAGConfig, MAGParams, MemoryRuleKind};
+use crate::model::{SWAConfig, SWAParams, MAGConfig, MAGParams, MemoryRuleKind, MemoryLevelParams};
 use crate::forward::forward;
 use crate::backward::backward_full;
 use crate::mag::{mag_forward, mag_backward, cms_forward, cms_backward};
@@ -278,8 +278,9 @@ pub fn cms_compute_gradients(
 /// then calls `tape.backward()` to replay in reverse and accumulate gradients.
 /// Returns the same (loss, grad_params) shape as `cms_compute_gradients()`.
 ///
-/// The `_error_buffers` parameter is accepted for API compatibility but unused
-/// (frozen-level error buffer routing is P3.2 scope).
+/// Frozen-level gradients are routed into `error_buffers` (not returned in
+/// the gradient struct). Active-level gradients go directly into the returned
+/// `MAGParams`. This matches `cms_backward()` semantics.
 #[allow(dead_code)]
 pub fn tape_compute_gradients(
     params: &MAGParams,
@@ -288,8 +289,10 @@ pub fn tape_compute_gradients(
     target_ids: &[usize],
     pulse: &Pulse,
     context: &mut ContextState,
-    _error_buffers: &mut [ErrorBuffer],
+    error_buffers: &mut [ErrorBuffer],
 ) -> (f32, MAGParams) {
+    debug_assert_eq!(error_buffers.len(), cfg.k,
+        "error_buffers length ({}) must equal cfg.k ({})", error_buffers.len(), cfg.k);
     let d = cfg.swa.d_model;
 
     let registry = register_opaque_vjps();
@@ -318,7 +321,7 @@ pub fn tape_compute_gradients(
             let mut lp_grad = level_params_from_flat(&lp_grad_flat, d);
 
             // For frozen levels, the w_q_mem was registered as a separate param.
-            // Add its gradient into the level's w_q_mem field.
+            // Merge its gradient into the level's w_q_mem field.
             if let Some(w_q_mem_id) = param_ids.frozen_w_q_mem[level] {
                 let w_q_mem_grad = tape.get_param_grad(w_q_mem_id);
                 // The lp_flat already contains w_q_mem at its offset, but the
@@ -328,7 +331,16 @@ pub fn tape_compute_gradients(
                 lp_grad.w_q_mem = w_q_mem_grad;
             }
 
-            level_grads.push(lp_grad);
+            if pulse.active_levels[level] {
+                // Active level: return gradient directly.
+                level_grads.push(lp_grad);
+            } else {
+                // Frozen level: route gradient into error buffer, return zeros.
+                // Use zeros_like_from to match lp_grad's shape (includes w_freq/b_freq
+                // when FrequencySchedule::Learned is active).
+                error_buffers[level].accumulate(&lp_grad);
+                level_grads.push(MemoryLevelParams::zeros_like_from(&lp_grad, d));
+            }
         }
 
         (loss, MAGParams { swa: swa_grads, levels: level_grads })
@@ -5507,5 +5519,101 @@ mod tests {
             assert!(norm > 0.0, "tape grad level[0].{name} is all zeros");
             eprintln!("tape level[0].{name}: norm={norm:.4e}, len={}", grad.len());
         }
+    }
+
+    // ── P3.2: Frozen-level error buffer routing ─────────────────────
+
+    #[test]
+    fn test_tape_frozen_level_routes_to_error_buffer() {
+        // k=2: level 0 active, level 1 frozen.
+        // Tape path should route level 1 grads into error_buffers[1],
+        // and return zeros for level 1 in the gradient struct.
+        //
+        // Critical: must warm up memory with an all-active forward pass first,
+        // otherwise M=0 → d_q = M^T @ d_y = 0 (mathematically correct but trivial).
+        let cfg = MAGConfig::test_config_k2(); // k=2, DeltaRule
+        let d = cfg.swa.d_model;
+        let s = cfg.swa.seq_len;
+        let v = cfg.swa.vocab_size;
+        let params = MAGParams::init(&cfg, 42);
+        let input_ids: Vec<usize> = (0..s).map(|t| t % v).collect();
+        let target_ids: Vec<usize> = (1..=s).map(|t| t % v).collect();
+
+        // Step 0: warm up with both levels active to populate memory.
+        let pulse0 = Pulse { global_step: 0, active_levels: vec![true, true] };
+        let mut ctx_ref = make_context_state(&cfg);
+        let mut ctx_tape = make_context_state(&cfg);
+        cms_forward(&params, &cfg, &input_ids, &target_ids, &pulse0, &mut ctx_ref);
+        cms_forward(&params, &cfg, &input_ids, &target_ids, &pulse0, &mut ctx_tape);
+
+        // Step 1: level 1 frozen (memory is now non-zero).
+        let pulse1 = Pulse { global_step: 1, active_levels: vec![true, false] };
+
+        // Hand-written backward path (reference)
+        let mut ebufs_ref: Vec<ErrorBuffer> = (0..cfg.k)
+            .map(|_| ErrorBuffer::new(d))
+            .collect();
+        let (loss_ref, grads_ref) = cms_compute_gradients(
+            &params, &cfg, &input_ids, &target_ids, &pulse1, &mut ctx_ref, &mut ebufs_ref,
+        );
+
+        // Tape backward path
+        let mut ebufs_tape: Vec<ErrorBuffer> = (0..cfg.k)
+            .map(|_| ErrorBuffer::new(d))
+            .collect();
+        let (loss_tape, grads_tape) = tape_compute_gradients(
+            &params, &cfg, &input_ids, &target_ids, &pulse1, &mut ctx_tape, &mut ebufs_tape,
+        );
+
+        // Loss must be bitwise identical.
+        assert_eq!(loss_ref.to_bits(), loss_tape.to_bits(),
+            "loss mismatch: ref={loss_ref} tape={loss_tape}");
+
+        // Level 0 (active): grads should be nonzero.
+        let l0_norm: f32 = grads_tape.levels[0].w_k_mem.iter()
+            .map(|x| x * x).sum::<f32>().sqrt();
+        assert!(l0_norm > 0.0, "Active level 0 grads should be nonzero");
+
+        // Level 1 (frozen): returned grads should be all zeros.
+        let l1_fields: Vec<(&str, &[f32])> = vec![
+            ("w_k_mem", &grads_tape.levels[1].w_k_mem),
+            ("w_v_mem", &grads_tape.levels[1].w_v_mem),
+            ("w_q_mem", &grads_tape.levels[1].w_q_mem),
+            ("w_alpha", &grads_tape.levels[1].w_alpha),
+            ("b_alpha", &grads_tape.levels[1].b_alpha),
+        ];
+        for (name, grad) in &l1_fields {
+            let norm: f32 = grad.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert_eq!(norm, 0.0,
+                "Frozen level 1 grad {name} should be zero, got norm={norm:.4e}");
+        }
+
+        // Error buffer[1] should have accumulated frozen grads (nonzero).
+        // The read-only backward flows d_y through M^T to get d_q_mem,
+        // then through the matmul to get d_W_Q_mem.
+        assert_eq!(ebufs_tape[1].steps_accumulated, 1,
+            "error_buffers[1] should have 1 step accumulated");
+        let ebuf_wqm_norm: f32 = ebufs_tape[1].grads.w_q_mem.iter()
+            .map(|x| x * x).sum::<f32>().sqrt();
+        assert!(ebuf_wqm_norm > 0.0,
+            "error_buffers[1].grads.w_q_mem should be nonzero");
+
+        // Error buffer[0] should be untouched (active level).
+        assert_eq!(ebufs_tape[0].steps_accumulated, 0,
+            "error_buffers[0] should be untouched for active level");
+
+        // Reference error buffer should match tape error buffer.
+        assert_eq!(ebufs_ref[1].steps_accumulated, ebufs_tape[1].steps_accumulated,
+            "steps_accumulated mismatch");
+        let ref_wqm_norm: f32 = ebufs_ref[1].grads.w_q_mem.iter()
+            .map(|x| x * x).sum::<f32>().sqrt();
+        assert!(ref_wqm_norm > 0.0,
+            "Reference error_buffers[1].grads.w_q_mem should also be nonzero");
+
+        // Reference grads for level 1 should also be zero (cms_backward routes to ebuf).
+        let ref_l1_norm: f32 = grads_ref.levels[1].w_q_mem.iter()
+            .map(|x| x * x).sum::<f32>().sqrt();
+        assert_eq!(ref_l1_norm, 0.0,
+            "Reference level 1 grads should also be zero (routed to ebuf)");
     }
 }
