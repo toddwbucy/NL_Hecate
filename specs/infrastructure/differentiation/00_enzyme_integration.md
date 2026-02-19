@@ -1,11 +1,17 @@
 # Enzyme AD Integration + Kernel-Pair Pattern
 
-> **NOTE (2026-02-18):** Mechanism 1 (Enzyme AD) is superseded by
-> `01_wengert_tape.md` — a Rust-native Wengert tape that replaces Enzyme's
-> LLVM-level AD pass. Mechanism 2 (hand-written backward kernels / kernel pairs)
-> and the four annotation levels concept remain valid — adapted to tape-based
-> registration via the `OpaqueVjp` trait and `Tape::record_opaque()`. See
-> `01_wengert_tape.md` for the current differentiation architecture.
+> **ARCHIVED (2026-02-18)** — This spec describes the original Enzyme-based
+> differentiation design. Enzyme AD has been fully superseded by the Wengert
+> tape system (`01_wengert_tape.md`). The Enzyme spike and related code have
+> been archived to `Acheron/enzyme-archive/`. This file is preserved as
+> design history — it documents the kernel-pair concept and differentiation
+> boundary pattern that the tape system inherits.
+>
+> Key changes:
+> - Mechanism 1 (Enzyme LLVM-level AD) → replaced by Wengert tape
+> - Mechanism 2 (hand-written backward kernels) → preserved, registered as opaque VJP blocks
+> - `#[enzyme_opaque]` / `#[custom_vjp]` → replaced by `OpaqueVjp` trait + `Tape::record_opaque()`
+> - Custom nightly toolchain → no longer required
 
 ```
 CONTRACT

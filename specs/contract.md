@@ -1,9 +1,18 @@
 # nl.Module Contract
 
+CONTRACT
+Purpose: Top-level architectural specification for NL_Hecate — defines the three-tier structure, differentiation strategy, state lifetimes, CMS scheduling, and composition patterns.
+Expects: Familiarity with the NL paper corpus (Titans, MIRAS, HOPE, Lattice, Atlas, TNT, Trellis).
+Guarantees: Every component traces to a paper equation; every constraint traces to a code smell or axiom.
+Cost: N/A (specification document, no runtime cost).
+Trade-off: Breadth over depth — individual specs in specs/algorithms/ and specs/infrastructure/ provide detailed contracts per component.
+Position: Root of the spec tree — all other specs refine sections of this contract.
+Source: Mirrokni/Behrouz research group (Google Research): arxiv 2501.00663, 2504.13173, 2512.24695, 2504.05646, 2505.23735, 2511.07343, 2512.23852.
+
 **Version**: 0.4.0
 **Repository**: NL_Hecate
 **Language Target**: Rust + CUDA (core), Python + PyO3 (orchestration bindings)
-**Differentiation**: Enzyme (LLVM-level AD on Rust) + hand-written kernel pairs (CUDA)
+**Differentiation**: Wengert tape AD (Rust) + hand-written kernel pairs (CUDA)
 **Source**: The complete output of the Mirrokni/Behrouz research group at Google Research
 
 ## What This Is
@@ -21,11 +30,11 @@ Layer 3: Python (orchestration)
   - No math here — just orchestration, configuration, data feeding
   - "So easy, even a developer can extend it"
 
-Layer 2: Rust (mathematics + control flow + Enzyme AD)
+Layer 2: Rust (mathematics + control flow + Wengert tape AD)
   - All memory update rules, composition patterns, scheduling
-  - Enzyme provides automatic differentiation at LLVM IR level
-  - Enzyme differentiates ONLY Rust code — never raw CUDA
-  - Enzyme chains through CUDA kernel pairs via #[custom_vjp]
+  - Wengert tape provides automatic differentiation via operation recording
+  - AD operates ONLY on Rust code — never raw CUDA
+  - Tape chains through CUDA kernel pairs via OpaqueVjp trait
   - Trait system enforces valid compositions at compile time
   - Ownership model enforces state lifecycle (outer vs inner loop)
   - Reference implementations of ALL kernels live here (portable, correct)
@@ -33,7 +42,7 @@ Layer 2: Rust (mathematics + control flow + Enzyme AD)
 Layer 1: CUDA (kernel pairs — forward + backward)
   - Each kernel ships as a (forward, backward) pair
   - Backward kernels ARE the analytical gradients from the papers
-  - Enzyme does NOT look inside kernels — it chains between them
+  - AD does NOT look inside kernels — it chains between them
   - Hardware-specific: optimized per GPU architecture
   - Dispatched at runtime based on detected hardware
   - Optional: Rust reference implementation is the fallback
@@ -51,21 +60,21 @@ NL_Hecate follows this established pattern:
 ```
 -- Each hot operation has THREE implementations:
 
-1. Rust reference (portable, Enzyme-compatible, correct-by-construction)
+1. Rust reference (portable, AD-compatible, correct-by-construction)
    - Used for: development, testing, correctness oracle, CPU fallback
-   - Enzyme CAN differentiate through this directly
+   - The tape CAN differentiate through this directly
 
 2. CUDA forward kernel (hardware-optimized)
    - Uses shared memory, tensor cores, warp-level primitives freely
-   - Opaque to Enzyme — Enzyme never sees inside
+   - Opaque to AD — compiled to SASS by nvcc
 
 3. CUDA backward kernel (hand-derived from paper equations)
    - The analytical gradients from the papers become code here
-   - Also opaque to Enzyme — also hardware-optimized
+   - Also opaque to AD — also hardware-optimized
    - Correctness verified against Rust reference backward
 
--- Enzyme sees:
-   [Rust code] → [opaque kernel pair] → [Rust code] → [opaque kernel pair] → loss
+-- The tape sees:
+   [Rust code] → [opaque VJP block] → [Rust code] → [opaque VJP block] → loss
 
    It differentiates the Rust parts directly.
    It chains through kernel pairs using their provided backward kernels.
@@ -176,7 +185,7 @@ Every piece of state has exactly one of three lifetimes:
 ```
 outer_loop_param:
   - Persists across the entire build process
-  - Modified by backprop (Enzyme AD through outer loop)
+  - Modified by backprop (tape AD through outer loop)
   - Serialized in checkpoints
   - Examples: W_K, W_V, W_Q, gate parameters, persistent memory tokens
   - Rust: owned by the model struct, &mut access
@@ -198,103 +207,78 @@ context_memory:
 
 ### 4. Differentiation
 
+> **Updated 2026-02-18**: Originally designed around Enzyme (LLVM-level AD).
+> Now implemented via Wengert tape (`core/src/tape.rs`). The original Enzyme
+> spec is preserved at `differentiation/00_enzyme_integration.md` (ARCHIVED).
+> The current spec is `differentiation/01_wengert_tape.md`.
+
 The system uses two differentiation mechanisms that compose via the chain rule:
 
-1. **Enzyme AD** — differentiates Rust code at the LLVM IR level
-2. **Hand-written backward kernels** — provide gradients for CUDA operations
+1. **Wengert tape** — records Rust operations during forward, replays in reverse for gradients
+2. **Hand-written backward kernels** — provide gradients for CUDA and memory rule operations
 
-Enzyme NEVER differentiates through raw CUDA. This is a deliberate design choice
+AD never differentiates through raw CUDA. This is a deliberate design choice
 that matches every production ML framework (PyTorch, JAX, FlashAttention, cuDNN).
 
-```
-RULE: The differentiation barrier is COMPILER-ENFORCED, not convention-based.
-      (Committee Finding 1: "Hope-based engineering" is not engineering.)
+```text
+RULE: The differentiation barrier is TRAIT-ENFORCED, not convention-based.
 
-      Every implementation of MemoryUpdateRule MUST wrap its inner-loop
-      kernel with the #[enzyme_opaque] attribute. This attribute:
-        (a) Prevents Enzyme from tracing into the function at LLVM IR level
-        (b) Forces the developer to provide an explicit backward via #[custom_vjp]
-        (c) Is a MANDATORY trait bound — code that omits it does not compile
-
-      Without this barrier, Enzyme may:
-        - Segfault (best case: hard crash, obvious error)
-        - Generate garbage gradients by tracing pointer operations (worst case:
-          silent corruption, model appears to build but learns nothing)
-        - Double-count by tracing the Rust wrapper AND the kernel backward
-
-      The #[enzyme_opaque] + #[custom_vjp] pairing is the enforcement mechanism.
-      It is not optional. It is not a convention. It is a compiler requirement.
-
-RULE: The barrier must be TESTED, not just declared.
-      Every kernel pair requires a barrier verification test:
-
-      TEST: enzyme_barrier_holds(kernel_pair)
-        1. Run forward pass through the kernel pair
-        2. Run Enzyme backward — should produce ZERO autodiff contribution
-           from the opaque kernel (only the #[custom_vjp] backward contributes)
-        3. Assert: autodiff_gradient == 0 for the opaque region
-        4. Assert: custom_vjp_gradient == analytical_gradient (from paper)
-        5. Assert: total_gradient == custom_vjp_gradient (no double-counting)
-
-      This test closes the loop: the compiler forbids the behavior,
-      the test verifies the barrier is holding.
+      Every implementation of MemoryUpdateRule MUST implement the OpaqueVjp trait.
+      This trait:
+        (a) Prevents the tape from tracing into the operation's internals
+        (b) Forces the developer to provide an explicit backward adapter
+        (c) Is a MANDATORY supertrait bound — code that omits it does not compile
 
 RULE: Inner-loop gradients are ANALYTICAL (hand-derived from paper equations).
       These analytical gradients serve TWO purposes:
         (a) They ARE the inner-loop update (gradient descent in the forward pass)
-        (b) They BECOME the backward CUDA kernels (for outer-loop chain rule)
+        (b) They BECOME the backward functions (for outer-loop chain rule)
 
       The paper equations are not documentation — they are the backward pass.
 
-RULE: Enzyme handles Rust-level composition and outer-loop gradient flow.
-      When Enzyme encounters a CUDA kernel pair, it uses the provided
-      backward kernel to continue the chain rule. It does not trace inside.
+RULE: The tape handles Rust-level composition and outer-loop gradient flow.
+      When the tape encounters an opaque block (memory rule or CUDA kernel),
+      it uses the registered backward function to continue the chain rule.
 
 RULE: Differentiation is OPT-IN, not opt-out. (CS-40)
-      Three annotation levels control what participates in AD:
+      Two participation levels:
 
-      #[autodiff]      — Enzyme differentiates through this function directly.
+      Tape-traced      — The tape records operations for this code path.
                          Used for: Rust code in the outer-loop gradient path.
                          (gate computations, projections, loss, composition logic)
+                         Activated by with_tape().
 
-      #[custom_vjp]    — Opaque to Enzyme but provides its own backward.
-                         Used for: CUDA kernel pairs. Enzyme chains through
-                         these using the provided backward kernel.
+      OpaqueVjp        — Opaque to the tape, provides its own backward adapter.
+                         Used for: memory rules and CUDA kernel pairs.
                          The outer-loop gradient DOES flow through these —
-                         via the hand-written backward, not via Enzyme tracing.
-
-      #[no_autodiff]   — Completely severed from the gradient chain.
-                         Used for: debug logging, metrics, visualization.
-                         Nothing that affects the output should carry this.
+                         via the registered backward function.
 
 CRITICAL DISTINCTION:
-      Inner-loop operations are #[custom_vjp], NOT #[no_autodiff].
+      Inner-loop operations are OpaqueVjp, NOT severed from the gradient chain.
       They DO participate in the outer-loop gradient chain — through their
-      hand-written backward kernels. Marking them #[no_autodiff] would sever
-      the chain and outer-loop parameters (W_K, W_V, W_Q) would receive
-      zero gradient. That is a bug, not a feature.
+      registered backward adapters. Omitting OpaqueVjp would sever the chain
+      and outer-loop parameters (W_K, W_V, W_Q) would receive zero gradient.
 ```
 
 The gradient flow through the full system:
 
-```
+```text
 Forward pass:
-  x → [W_K projection]  → k     (Rust, #[autodiff])
-    → [gate computation] → gates (Rust, #[autodiff])
-    → [inner loop kernel] → y    (CUDA, #[custom_vjp])
-    → [loss computation]  → loss (Rust, #[autodiff])
+  x → [W_K projection]  → k     (Rust, tape-traced)
+    → [gate computation] → gates (Rust, tape-traced)
+    → [inner loop kernel] → y    (opaque VJP block)
+    → [loss computation]  → loss (Rust, tape-traced)
 
 Backward pass (outer-loop gradient for W_K):
   d(loss)/d(W_K) = d(loss)/d(y) * d(y)/d(k) * d(k)/d(W_K)
                    ^^^^^^^^^^^    ^^^^^^^^^    ^^^^^^^^^^^
-                   Enzyme (Rust)  backward     Enzyme (Rust)
-                                  kernel
-                                  (CUDA)
+                   tape (Rust)    backward     tape (Rust)
+                                  adapter
+                                  (opaque)
 
-  Enzyme computes d(loss)/d(y) and d(k)/d(W_K) — these are Rust code.
-  The backward kernel computes d(y)/d(k) — this is the CUDA kernel pair.
-  Enzyme chains them together via the chain rule.
-  No part of this requires Enzyme to trace through CUDA.
+  The tape computes d(loss)/d(y) and d(k)/d(W_K) — these are Rust code.
+  The backward adapter computes d(y)/d(k) — registered as opaque VJP.
+  The tape chains them together via the chain rule.
 ```
 
 ### 5. Pulse (Timing Context)
@@ -310,9 +294,9 @@ struct Pulse {
 }
 
 -- Note: there is no "train" or "eval" phase. The forward pass runs the
--- SAME CODE in all phases. The ONLY difference: in Build phase, Enzyme's
+-- SAME CODE in all phases. The ONLY difference: in Build phase, the tape's
 -- AD graph is live downstream of the forward pass (computing outer-loop
--- gradients). In Test/Stream, Enzyme is inactive. The model itself never
+-- gradients). In Test/Stream, the tape is inactive. The model itself never
 -- checks what phase it's in — the Conductor owns that decision.
 -- This is "same forward code, different computational context."
 
@@ -586,7 +570,7 @@ specs/                              <- root node
       01_frequency_scheduler.md
       02_cms_variants.md
   infrastructure/                   <- PyTorch replacement tooling
-    differentiation/                <- Enzyme AD integration
+    differentiation/                <- AD integration (Wengert tape + kernel pairs)
     state_lifecycle/                <- Outer/inner/context state management
     scheduling/                     <- Conductor + Pulse
     attention/                      <- SWA + full causal (non-NL component)

@@ -1,7 +1,7 @@
 /// Minimal tensor utilities for Track Zero-A.
 ///
 /// All operations are free functions on flat f32 slices with explicit dimensions.
-/// No generics, no traits on Tensor — keeps Enzyme compatibility straightforward.
+/// No generics, no traits on Tensor — keeps AD compatibility straightforward.
 /// Row-major layout throughout.
 
 /// Flat f32 tensor with shape metadata.
@@ -55,7 +55,7 @@ pub fn truncate_to_bf16(buf: &mut [f32]) {
 //   Each Rust reference impl below may have a CUDA forward + backward kernel.
 //   Backward kernels compute correct analytical gradients matching the
 //   Rust signatures and row-major memory layout. See specs/infrastructure/
-//   00_enzyme_integration.md for the kernel-pair contract.
+//   differentiation spec for the kernel-pair contract.
 //
 //   | Rust reference         | GPU dispatch                | Status       |
 //   |------------------------|-----------------------------|--------------|
@@ -275,9 +275,9 @@ pub fn frobenius_dot_f32(a: &[f32], b: &[f32]) -> f32 {
 /// Returns (output, silu_values, silu_norm) for backward.
 ///
 /// # Autodiff
-/// Must NOT be traversed by Enzyme — intermediates are cached in TrellisCache
+/// Must NOT be traversed by AD — intermediates are cached in TrellisCache
 /// and consumed by the hand-written `normalized_silu_backward()`. Safe because
-/// Enzyme only differentiates functions explicitly marked with `#[autodiff_reverse]`.
+/// the tape only differentiates operations explicitly registered as opaque VJP blocks.
 pub fn normalized_silu_f32(x: &[f32]) -> (Vec<f32>, Vec<f32>, f32) {
     let d = x.len();
     let mut silu_vals = vec![0.0f32; d];

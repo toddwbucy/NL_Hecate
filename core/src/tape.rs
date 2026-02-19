@@ -89,7 +89,7 @@ pub type OpaqueBackwardFn = fn(
 
 /// Marker + recording trait for types whose forward pass is opaque to the tape.
 ///
-/// Replaces the spec's `EnzymeOpaque` marker. Any type implementing this trait
+/// Replaces the original Enzyme-based opaque marker. Any type implementing this trait
 /// can register its forward execution on the tape as an opaque block with a
 /// known backward function (looked up by `opaque_key()` in the registry).
 ///

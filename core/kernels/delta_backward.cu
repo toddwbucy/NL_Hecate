@@ -22,7 +22,7 @@
 //   d_v_t[i] = -d_error[i]
 //   d_M = (1-alpha_t) * d_M   (propagate to M_t)
 //
-// This file is compiled by nvcc into machine code (opaque to Enzyme).
+// This file is compiled by nvcc into machine code (opaque to AD).
 
 #include <cuda_runtime.h>
 #include <float.h>

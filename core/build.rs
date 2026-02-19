@@ -2,8 +2,8 @@
 ///
 /// The cc crate invokes nvcc to compile .cu files into .o object files,
 /// then links them into the final binary. These object files contain machine
-/// code (PTX/SASS), NOT LLVM IR — making them opaque to Enzyme's AD pass.
-/// This is the barrier pattern from Phase 0 Finding #3.
+/// code (PTX/SASS), NOT LLVM IR — making them opaque to AD (compiled machine code).
+/// Analytical backward kernels provide gradients for these opaque regions.
 ///
 /// Multi-architecture support: nvcc embeds SASS for sm_86/89/90 plus PTX
 /// for compute_86 as a forward-compatible fallback. The CUDA runtime

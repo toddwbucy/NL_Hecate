@@ -560,7 +560,7 @@ mod tests {
     #[test]
     fn test_tnt_outer_loop_weight_descent() {
         // Validates outer-loop gradient flow through TNT hierarchical parallelization.
-        // The outer loop updates projection weights (W_K, W_V, W_Q) via Enzyme AD.
+        // The outer loop updates projection weights (W_K, W_V, W_Q) via tape AD.
         // The inner loop (memory updates inside the forward pass) runs without any
         // external optimizer — it IS the forward pass. See CS-10 through CS-17.
         let cfg = MAGConfig::test_config();

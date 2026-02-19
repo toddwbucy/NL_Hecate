@@ -8,7 +8,7 @@
 // all arithmetic in float. This matches production transformer precision
 // (FlashAttention-style) while keeping gradient-checkable accuracy.
 //
-// This file is compiled by nvcc into machine code (opaque to Enzyme).
+// This file is compiled by nvcc into machine code (opaque to AD).
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>

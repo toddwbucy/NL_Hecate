@@ -649,7 +649,7 @@ mod tests {
 
                 #[test]
                 fn [<test_ $test_prefix _outer_loop_weight_descent>]() {
-                    // Validates outer-loop gradient flow: Enzyme-computed gradients on
+                    // Validates outer-loop gradient flow: tape-computed gradients on
                     // projection weights decrease a proxy loss when applied as weight
                     // updates. This is the outer loop — distinct from the inner loop
                     // (memory updates inside the forward pass, which has no external

@@ -1,8 +1,6 @@
 //! Tests for NL serving abstraction (non-stationary models).
 //!
-//! Run: RUSTFLAGS="-Zautodiff=Enable" cargo +enzyme test --release --features serving --test test_serving -- --nocapture
-
-#![feature(autodiff)]
+//! Run: cargo test --features serving --test test_serving -- --nocapture
 
 #[cfg(feature = "serving")]
 mod tests {

@@ -1,13 +1,13 @@
 # NL_Hecate Progress Report
 
-**Project**: NL_Hecate — Nested Learning implementation in Rust + Enzyme AD + CUDA
+**Project**: NL_Hecate — Nested Learning implementation in Rust + Wengert tape AD + CUDA
 **Status**: All stages COMPLETE (S0-S3). 5/5 Stage 3 milestones delivered.
 
 ---
 
 ## Executive Summary
 
-NL_Hecate implements the Nested Learning research program (Mirrokni/Behrouz, Google Research) in Rust with Enzyme AD and CUDA kernels. The project built the essential forward/backward/optimize pipeline — 8 memory rules, 3 composition patterns, 5 parallelization strategies, CUDA kernel pairs, multi-GPU sync, serving, and edge deployment — that replaces PyTorch's training/inference stack with a unified self-modifying forward pass.
+NL_Hecate implements the Nested Learning research program (Mirrokni/Behrouz, Google Research) in Rust with Wengert tape AD and CUDA kernels. The project built the essential forward/backward/optimize pipeline — 8 memory rules, 3 composition patterns, 5 parallelization strategies, CUDA kernel pairs, multi-GPU sync, serving, and edge deployment — that replaces PyTorch's training/inference stack with a unified self-modifying forward pass.
 
 An integration spike (17 tests) validates the thesis end-to-end: the full VecStream -> Conductor -> cms_forward -> cms_backward -> apply pipeline learns a repeating token pattern, achieving 100% prediction accuracy across 3 representative configs. The serving path (Session::process_chunk) produces identical behavior to the raw loop.
 
@@ -21,10 +21,10 @@ An integration spike (17 tests) validates the thesis end-to-end: the full VecStr
 
 ### Stage 0: Foundation (COMPLETE)
 
-**Phase 0: Enzyme Spike** (57/57 tests)
-- Proved Enzyme differentiates through Rust trait dispatch
-- Manual chain-rule composition at kernel boundaries works
-- Toolchain pinned at SHA d7daac06 (rustc 1.95.0-nightly)
+**Phase 0: AD Spike** (57/57 tests, archived to Acheron)
+- Originally proved Enzyme differentiates through Rust trait dispatch
+- Superseded by Wengert tape AD (no custom toolchain, no ICE crashes)
+- Spike archived to `Acheron/enzyme-archive/`
 
 **Track Zero-A: Pure SWA Attention** (67 tests)
 - Rust core: forward/backward, 6 weight matrices gradient-checked vs FD
@@ -99,7 +99,7 @@ All 22 milestones delivered. This is the mathematical heart of the system — ev
 - Zero-dependency micro models (d <= 128) on CPU
 - Three profiles: inner-loop only, full NL, WASM (wasm32-unknown-unknown validated)
 - ~34k tok/s on x86_64 for d=64 (exceeds 18k target)
-- `#![feature(autodiff)]` gated behind `enzyme` feature for portability
+- No custom toolchain required — compiles on standard Rust
 
 ### Stage 3: Extensions (COMPLETE — 5/5 milestones)
 
@@ -197,7 +197,7 @@ core/src/                          (~28,000 lines, 33 modules)
   swa.rs           — Sliding Window Attention forward/backward
   model.rs         — SWAConfig/Params, MAGConfig/Params, MemoryLevelParams
   forward.rs       — SWA forward pass
-  backward.rs      — SWA backward pass (Enzyme AD)
+  backward.rs      — SWA backward pass
   gradient.rs      — FD gradient checking, MAG/CMS/MAL/MAC gradient computation
   delta_rule.rs    — MemoryRule trait + DeltaRule (GD, matrix, L2)
   titans_lmm.rs    — TitansLMM (GD+momentum, eta gate)

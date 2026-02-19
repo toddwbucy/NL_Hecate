@@ -1,8 +1,8 @@
 // FFI declarations for CUDA kernels.
 //
 // These functions are compiled by nvcc into machine code (.o files),
-// linked by the `cc` crate at build time. They are opaque to Enzyme
-// because nvcc produces SASS/PTX, not LLVM IR.
+// linked by the `cc` crate at build time. They are opaque to AD
+// because nvcc produces SASS/PTX (compiled machine code).
 //
 // SWA kernels use bf16 storage (*const u16 / *mut u16).
 // Memory rule kernels (Delta, Titans, Hebbian) use all-f32.

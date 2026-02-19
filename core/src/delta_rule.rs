@@ -66,7 +66,7 @@ impl std::fmt::Display for MemoryError {
 /// The core abstraction from the MIRAS framework (spec 00_interface.md).
 ///
 /// Every named memory variant (Delta Rule, Titans LMM, MONETA, etc.)
-/// implements this trait. Static dispatch only — Enzyme requires
+/// implements this trait. Static dispatch only — AD requires
 /// monomorphization, not vtable indirection.
 pub trait MemoryRule: OpaqueVjp {
     /// Cache type for backward pass.

@@ -3,7 +3,7 @@
 /// Measures throughput (tok/s), adaptation cost, and forward latency
 /// across d=64, d=128, d=256 dimension sweep.
 ///
-/// Run: cargo +enzyme bench --features edge --bench edge_bench
+/// Run: cargo bench --features edge --bench edge_bench
 /// Reports saved to: target/criterion/
 
 use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};

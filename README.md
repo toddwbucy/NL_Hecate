@@ -21,17 +21,17 @@ This is a **specification-first** implementation: every component traces to a pa
 │  Python Tier   PyO3 bindings, orchestration, config     │
 │                No math. Forward→backward→sync→apply.    │
 ├─────────────────────────────────────────────────────────┤
-│  Rust Tier     All math, control flow, Enzyme AD        │
+│  Rust Tier     All math, control flow, Wengert tape AD   │
 │                Trait system enforces valid compositions  │
 ├─────────────────────────────────────────────────────────┤
 │  CUDA Tier     Kernel pairs (forward + backward)        │
-│                Opaque to Enzyme. Hand-written gradients. │
+│                Opaque to AD. Hand-written gradients.    │
 └─────────────────────────────────────────────────────────┘
 ```
 
-**Kernel-pair pattern**: Every hot operation has three implementations — (1) Rust reference (portable, Enzyme-differentiable), (2) CUDA forward kernel, (3) CUDA backward kernel with analytical gradients from the papers. Enzyme differentiates the Rust code; CUDA kernels are opaque (compiled to SASS by nvcc). Gradients compose via manual chain rule at the FFI boundary.
+**Kernel-pair pattern**: Every hot operation has three implementations — (1) Rust reference (portable, AD-compatible), (2) CUDA forward kernel, (3) CUDA backward kernel with analytical gradients from the papers. The Wengert tape (`core/src/tape.rs`) records operations during forward and replays in reverse for gradients. CUDA kernels are registered as opaque VJP blocks with hand-written backward functions.
 
-**Differentiation**: [Enzyme](https://enzyme.mit.edu/) operates at the LLVM IR level, differentiating Rust code through trait dispatch, closures, and dynamic indexing. The `enzyme` toolchain is a custom nightly Rust compiler built with `llvm.enzyme = true`.
+**Differentiation**: Wengert tape AD records operations during the forward pass and replays them in reverse for gradient computation. Memory rules and CUDA kernels register as opaque VJP blocks on the tape. No custom toolchain required — compiles on standard Rust.
 
 ## Key Concepts
 
@@ -64,7 +64,7 @@ Eight named variants implement specific knob combinations: **Titans LMM**, **Del
 
 | Lifetime | Examples | Scope |
 |----------|----------|-------|
-| `outer_loop_param` | W_K, W_V, W_Q, gates | Persists across build, modified by Enzyme, serialized |
+| `outer_loop_param` | W_K, W_V, W_Q, gates | Persists across build, modified by AD, serialized |
 | `inner_loop_state` | M (memory), S (momentum) | Scoped to forward pass, NOT serialized |
 | `context_memory` | Chunk boundary state | Persists across forward calls, moved |
 
@@ -72,7 +72,7 @@ Eight named variants implement specific knob combinations: **Titans LMM**, **Del
 
 | Stage | Description | Tests | Status |
 |-------|-------------|-------|--------|
-| **Stage 0** | Foundation — Enzyme spike, SWA pipeline, Delta Rule + MAG | 202 | Complete |
+| **Stage 0** | Foundation — AD spike, SWA pipeline, Delta Rule + MAG | 202 | Complete |
 | **Stage 1** | Algorithm Core — all 8 Miras rules, 3 compositions, CMS k=1/2/4, 5 parallelization strategies, ContextStream, 100K stability sweep, PyO3 bindings | 805 | Complete |
 | **Stage 2** | Production Infra — CUDA kernel pairs, multi-GPU sync, serving, edge deployment, architecture dispatch | ~131 | Complete |
 | **Stage 3** | Extensions — pluggable retention (done), M3 optimizer, CMS variants | 22 | In progress (1/5) |
@@ -85,33 +85,28 @@ See [ROADMAP.md](ROADMAP.md) for per-milestone detail and [PROGRESS_REPORT.md](P
 
 | Component | Version | Notes |
 |-----------|---------|-------|
-| Rust toolchain | `enzyme` (nightly, rustc d7daac06) | Custom-built with `llvm.enzyme = true` |
-| LLVM | 20.0+ (built from source with Enzyme) | Ships with the `enzyme` toolchain |
+| Rust | stable or nightly | No custom toolchain needed |
 | CUDA Toolkit | 12.8+ | Required for `cuda` feature only |
 
 ### Build Commands
 
 ```bash
-# Rust reference only (no GPU, no Enzyme)
-cargo +enzyme build --release
-cargo +enzyme test --release --lib --tests
+# Rust reference only (no GPU)
+cargo build --release
+cargo test --release --lib --tests
 
 # CUDA build (requires GPU + CUDA Toolkit)
-cargo +enzyme build --release --features cuda
-cargo +enzyme test --release --features cuda --lib --tests
-
-# Enzyme AD build (gradient tests)
-RUSTFLAGS="-Zautodiff=Enable" cargo +enzyme build --release --features enzyme
-RUSTFLAGS="-Zautodiff=Enable" cargo +enzyme test --release --features enzyme --lib --tests
+cargo build --release --features cuda
+cargo test --release --features cuda --lib --tests
 
 # Full build (all features)
-RUSTFLAGS="-Zautodiff=Enable" cargo +enzyme test --release \
-  --features "cuda,distributed,serving,edge,enzyme" \
+cargo test --release \
+  --features "cuda,distributed,serving,edge" \
   --lib --tests
 
 # Edge / WASM
-cargo +enzyme build --release --features edge
-cargo +enzyme build --release --features edge --target wasm32-unknown-unknown --lib
+cargo build --release --features edge
+cargo build --release --features edge --target wasm32-unknown-unknown --lib
 ```
 
 ### Feature Flags
@@ -119,7 +114,6 @@ cargo +enzyme build --release --features edge --target wasm32-unknown-unknown --
 | Feature | What it enables |
 |---------|----------------|
 | `cuda` | GPU kernel dispatch (sm_86/89/90 + PTX fallback) |
-| `enzyme` | Enzyme AD (`#[autodiff_reverse]` annotations) |
 | `distributed` | CMS-aware multi-GPU gradient sync |
 | `serving` | Session management, latency tracking, checkpoint/restore |
 | `edge` | Zero-dependency micro model deployment (~34k tok/s at d=64) |
@@ -134,7 +128,7 @@ NL_Hecate/
 ├── specs/                    # Specification suite (read specs/contract.md first)
 │   ├── contract.md           #   Top-level architecture contract
 │   ├── algorithms/           #   Memory rules, composition, retention, parallelization
-│   ├── infrastructure/       #   Enzyme AD, scheduling, distribution, serving
+│   ├── infrastructure/       #   Differentiation, scheduling, distribution, serving
 │   └── constraints/          #   48 code smell constraints (CS-01 through CS-48)
 ├── core/                     # Rust core crate (nl-hecate-core)
 │   ├── src/                  #   31 modules: rules, compositions, retention, CMS, dispatch, ...
@@ -144,7 +138,6 @@ NL_Hecate/
 ├── python/                   # PyO3 bindings (nl_hecate Python package, Maturin build)
 │   ├── src/lib.rs            #   PyO3 module: all 8 rules + 3 compositions
 │   └── tests/                #   27 Python tests
-├── spike/                    # Phase 0 Enzyme spike (57 tests, preserved)
 ├── docs/                     # Build matrix, architecture dispatch docs
 ├── ROADMAP.md                # Milestone-level progress tracking
 ├── PROGRESS_REPORT.md        # Executive summary with key discoveries
