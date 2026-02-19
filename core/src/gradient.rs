@@ -286,6 +286,8 @@ pub fn cms_compute_gradients_handwritten(
     context: &mut ContextState,
     error_buffers: &mut [ErrorBuffer],
 ) -> (f32, MAGParams) {
+    debug_assert_eq!(error_buffers.len(), cfg.k,
+        "error_buffers length ({}) must equal cfg.k ({})", error_buffers.len(), cfg.k);
     let (loss, cache) = cms_forward(params, cfg, input_ids, target_ids, pulse, context);
     let grads = cms_backward(params, cfg, &cache, input_ids, target_ids, error_buffers);
     (loss, grads)
