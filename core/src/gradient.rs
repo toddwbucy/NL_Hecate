@@ -6236,4 +6236,145 @@ mod tests {
         tape_fd_check(&cfg, "delta_k2/l1_b_alpha",
             |p| &p.levels[1].b_alpha, |p, i, v| p.levels[1].b_alpha[i] = v, |g| &g.levels[1].b_alpha);
     }
+
+    // ── P4.2: Build loop regression — 10-step trajectory ──────────
+
+    /// Run a 10-step build loop comparing tape path vs hand-written path.
+    ///
+    /// Both paths start from identical params and context. A Conductor
+    /// generates pulses so CMS frequency scheduling varies across steps
+    /// (Level 1 fires at step 0, 8, etc.). Loss must match within f32
+    /// tolerance at every step. Gradient norms must also match, catching
+    /// accumulation errors that single-step tests miss.
+    #[test]
+    fn test_build_loop_regression_delta_k2() {
+        use crate::conductor::Conductor;
+        ensure_rust_reference();
+
+        let cfg = MAGConfig::test_config_k2();
+        let d = cfg.swa.d_model;
+        let s = cfg.swa.seq_len;
+        let v = cfg.swa.vocab_size;
+        let lr = 0.01f32;
+        let num_steps = 10;
+
+        let input_ids: Vec<usize> = (0..s).map(|t| t % v).collect();
+        let target_ids: Vec<usize> = (1..=s).map(|t| t % v).collect();
+
+        // Identical starting state for both paths
+        let params_init = MAGParams::init(&cfg, 42);
+
+        // ── Tape path ──
+        let mut params_tape = params_init.clone();
+        let mut ctx_tape = make_context_state(&cfg);
+        let mut ebufs_tape: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(d)).collect();
+        let mut conductor_tape = Conductor::new(cfg.k, cfg.chunk_sizes.clone());
+        let mut losses_tape = Vec::with_capacity(num_steps);
+        let mut grad_norms_tape = Vec::with_capacity(num_steps);
+
+        for step in 0..num_steps {
+            let pulse = conductor_tape.pulse();
+            let (loss, grads) = tape_compute_gradients(
+                &params_tape, &cfg, &input_ids, &target_ids,
+                &pulse, &mut ctx_tape, &mut ebufs_tape,
+            );
+            let gnorm = grad_l2_norm(&grads);
+            losses_tape.push(loss);
+            grad_norms_tape.push(gnorm);
+            params_tape.apply_weight_gradients(&grads, lr);
+            conductor_tape.advance();
+            eprintln!("tape   step {step:2}: loss={loss:.6e}  gnorm={gnorm:.6e}");
+        }
+
+        // ── Hand-written path ──
+        let mut params_hw = params_init.clone();
+        let mut ctx_hw = make_context_state(&cfg);
+        let mut ebufs_hw: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(d)).collect();
+        let mut conductor_hw = Conductor::new(cfg.k, cfg.chunk_sizes.clone());
+        let mut losses_hw = Vec::with_capacity(num_steps);
+        let mut grad_norms_hw = Vec::with_capacity(num_steps);
+
+        for step in 0..num_steps {
+            let pulse = conductor_hw.pulse();
+            let (loss, grads) = cms_compute_gradients_handwritten(
+                &params_hw, &cfg, &input_ids, &target_ids,
+                &pulse, &mut ctx_hw, &mut ebufs_hw,
+            );
+            let gnorm = grad_l2_norm(&grads);
+            losses_hw.push(loss);
+            grad_norms_hw.push(gnorm);
+            params_hw.apply_weight_gradients(&grads, lr);
+            conductor_hw.advance();
+            eprintln!("hw     step {step:2}: loss={loss:.6e}  gnorm={gnorm:.6e}");
+        }
+
+        // ── Compare trajectories ──
+        let rtol = 1e-5f32;
+        for step in 0..num_steps {
+            let lt = losses_tape[step];
+            let lh = losses_hw[step];
+            // Loss: bitwise identical at step 0 (same code path for forward).
+            // After weight updates accumulate, f32 rounding may differ slightly.
+            if step == 0 {
+                assert_eq!(lt.to_bits(), lh.to_bits(),
+                    "step 0: loss must be bitwise identical, tape={lt} hw={lh}");
+            } else {
+                let abs_diff = (lt - lh).abs();
+                let denom = lt.abs().max(lh.abs()).max(1e-8);
+                let rel_err = abs_diff / denom;
+                assert!(rel_err <= rtol,
+                    "step {step}: loss diverged rel_err={rel_err:.4e} (tape={lt:.6e} hw={lh:.6e})");
+            }
+
+            // Gradient norms: should track closely
+            let gt = grad_norms_tape[step];
+            let gh = grad_norms_hw[step];
+            let gabs = (gt - gh).abs();
+            let gdenom = gt.abs().max(gh.abs()).max(1e-8);
+            let grel = gabs / gdenom;
+            assert!(grel <= rtol,
+                "step {step}: grad norm diverged rel_err={grel:.4e} (tape={gt:.6e} hw={gh:.6e})");
+        }
+
+        // Loss should decrease over the trajectory (outer loop is working)
+        assert!(losses_tape[num_steps - 1] < losses_tape[0],
+            "tape: loss should decrease, initial={:.4e} final={:.4e}",
+            losses_tape[0], losses_tape[num_steps - 1]);
+
+        eprintln!("build_loop_regression: {num_steps} steps, all losses and grad norms match");
+    }
+
+    /// L2 norm of all gradient parameters (flat).
+    fn grad_l2_norm(grads: &MAGParams) -> f32 {
+        let mut sum = 0.0f32;
+        // SWA
+        for &g in grads.swa.w_embed.iter()
+            .chain(grads.swa.w_q.iter())
+            .chain(grads.swa.w_k.iter())
+            .chain(grads.swa.w_v.iter())
+            .chain(grads.swa.w_o.iter())
+            .chain(grads.swa.w_unembed.iter())
+        {
+            sum += g * g;
+        }
+        // Levels
+        for level in &grads.levels {
+            for &g in level.w_k_mem.iter()
+                .chain(level.w_v_mem.iter())
+                .chain(level.w_q_mem.iter())
+                .chain(level.w_alpha.iter())
+                .chain(level.b_alpha.iter())
+                .chain(level.w_theta.iter())
+                .chain(level.b_theta.iter())
+                .chain(level.w_eta.iter())
+                .chain(level.b_eta.iter())
+                .chain(level.w_omega.iter())
+                .chain(level.w_freq.iter())
+                .chain(level.b_freq.iter())
+            {
+                sum += g * g;
+            }
+        }
+        sum.sqrt()
+    }
 }
