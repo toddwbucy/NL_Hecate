@@ -6029,4 +6029,193 @@ mod tests {
 
         eprintln!("delta_k2_frozen: all checks pass (loss={loss_ref:.4e}, ebuf_norm={ref_ebuf_norm:.4e})");
     }
+
+    // ── P3.5: Class 2 FD tests — tape gradients vs finite differences ──
+
+    /// Compute tape gradients and check a specific weight against FD.
+    /// Reuses cms_check_weight_gradient (FD via cms_forward) but compares
+    /// against gradients from tape_compute_gradients.
+    fn tape_fd_check(
+        cfg: &MAGConfig,
+        name: &str,
+        get_weight: impl Fn(&MAGParams) -> &Vec<f32>,
+        set_weight: impl Fn(&mut MAGParams, usize, f32),
+        get_grad: impl Fn(&MAGParams) -> &Vec<f32>,
+    ) {
+        ensure_rust_reference();
+        let params = cms_params_for_grad_check(cfg, 42);
+        let (input_ids, target_ids) = cms_make_test_data(cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let d = cfg.swa.d_model;
+
+        let mut ctx = make_context_state(cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(d)).collect();
+        let (_loss, grads) = tape_compute_gradients(
+            &params, cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs,
+        );
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, cfg, &input_ids, &target_ids, &grads, name, &pulse,
+            get_weight, set_weight, get_grad,
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("tape FD {name}: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked,
+            "tape FD {name}: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    // ── DeltaRule k=1: SWA params ───────────────────────────────────
+
+    #[test]
+    fn test_tape_fd_delta_k1_w_embed() {
+        let cfg = MAGConfig::test_config();
+        tape_fd_check(&cfg, "delta_k1/w_embed",
+            |p| &p.swa.w_embed, |p, i, v| p.swa.w_embed[i] = v, |g| &g.swa.w_embed);
+    }
+
+    #[test]
+    fn test_tape_fd_delta_k1_w_q() {
+        let cfg = MAGConfig::test_config();
+        tape_fd_check(&cfg, "delta_k1/w_q",
+            |p| &p.swa.w_q, |p, i, v| p.swa.w_q[i] = v, |g| &g.swa.w_q);
+    }
+
+    #[test]
+    fn test_tape_fd_delta_k1_w_k() {
+        let cfg = MAGConfig::test_config();
+        tape_fd_check(&cfg, "delta_k1/w_k",
+            |p| &p.swa.w_k, |p, i, v| p.swa.w_k[i] = v, |g| &g.swa.w_k);
+    }
+
+    #[test]
+    fn test_tape_fd_delta_k1_w_v() {
+        let cfg = MAGConfig::test_config();
+        tape_fd_check(&cfg, "delta_k1/w_v",
+            |p| &p.swa.w_v, |p, i, v| p.swa.w_v[i] = v, |g| &g.swa.w_v);
+    }
+
+    #[test]
+    fn test_tape_fd_delta_k1_w_o() {
+        let cfg = MAGConfig::test_config();
+        tape_fd_check(&cfg, "delta_k1/w_o",
+            |p| &p.swa.w_o, |p, i, v| p.swa.w_o[i] = v, |g| &g.swa.w_o);
+    }
+
+    #[test]
+    fn test_tape_fd_delta_k1_w_unembed() {
+        let cfg = MAGConfig::test_config();
+        tape_fd_check(&cfg, "delta_k1/w_unembed",
+            |p| &p.swa.w_unembed, |p, i, v| p.swa.w_unembed[i] = v, |g| &g.swa.w_unembed);
+    }
+
+    // ── DeltaRule k=1: level 0 params ───────────────────────────────
+
+    #[test]
+    fn test_tape_fd_delta_k1_l0_w_k_mem() {
+        let cfg = MAGConfig::test_config();
+        tape_fd_check(&cfg, "delta_k1/l0_w_k_mem",
+            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem);
+    }
+
+    #[test]
+    fn test_tape_fd_delta_k1_l0_w_v_mem() {
+        let cfg = MAGConfig::test_config();
+        tape_fd_check(&cfg, "delta_k1/l0_w_v_mem",
+            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem);
+    }
+
+    #[test]
+    fn test_tape_fd_delta_k1_l0_w_q_mem() {
+        let cfg = MAGConfig::test_config();
+        tape_fd_check(&cfg, "delta_k1/l0_w_q_mem",
+            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem);
+    }
+
+    #[test]
+    fn test_tape_fd_delta_k1_l0_w_alpha() {
+        let cfg = MAGConfig::test_config();
+        tape_fd_check(&cfg, "delta_k1/l0_w_alpha",
+            |p| &p.levels[0].w_alpha, |p, i, v| p.levels[0].w_alpha[i] = v, |g| &g.levels[0].w_alpha);
+    }
+
+    #[test]
+    fn test_tape_fd_delta_k1_l0_b_alpha() {
+        let cfg = MAGConfig::test_config();
+        tape_fd_check(&cfg, "delta_k1/l0_b_alpha",
+            |p| &p.levels[0].b_alpha, |p, i, v| p.levels[0].b_alpha[i] = v, |g| &g.levels[0].b_alpha);
+    }
+
+    // ── DeltaRule k=2: SWA params ───────────────────────────────────
+
+    #[test]
+    fn test_tape_fd_delta_k2_w_embed() {
+        let cfg = MAGConfig::test_config_k2();
+        tape_fd_check(&cfg, "delta_k2/w_embed",
+            |p| &p.swa.w_embed, |p, i, v| p.swa.w_embed[i] = v, |g| &g.swa.w_embed);
+    }
+
+    #[test]
+    fn test_tape_fd_delta_k2_w_unembed() {
+        let cfg = MAGConfig::test_config_k2();
+        tape_fd_check(&cfg, "delta_k2/w_unembed",
+            |p| &p.swa.w_unembed, |p, i, v| p.swa.w_unembed[i] = v, |g| &g.swa.w_unembed);
+    }
+
+    // ── DeltaRule k=2: level 0 + level 1 params ────────────────────
+
+    #[test]
+    fn test_tape_fd_delta_k2_l0_w_k_mem() {
+        let cfg = MAGConfig::test_config_k2();
+        tape_fd_check(&cfg, "delta_k2/l0_w_k_mem",
+            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem);
+    }
+
+    #[test]
+    fn test_tape_fd_delta_k2_l0_w_v_mem() {
+        let cfg = MAGConfig::test_config_k2();
+        tape_fd_check(&cfg, "delta_k2/l0_w_v_mem",
+            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem);
+    }
+
+    #[test]
+    fn test_tape_fd_delta_k2_l0_b_alpha() {
+        let cfg = MAGConfig::test_config_k2();
+        tape_fd_check(&cfg, "delta_k2/l0_b_alpha",
+            |p| &p.levels[0].b_alpha, |p, i, v| p.levels[0].b_alpha[i] = v, |g| &g.levels[0].b_alpha);
+    }
+
+    #[test]
+    fn test_tape_fd_delta_k2_l1_w_k_mem() {
+        let cfg = MAGConfig::test_config_k2();
+        tape_fd_check(&cfg, "delta_k2/l1_w_k_mem",
+            |p| &p.levels[1].w_k_mem, |p, i, v| p.levels[1].w_k_mem[i] = v, |g| &g.levels[1].w_k_mem);
+    }
+
+    #[test]
+    fn test_tape_fd_delta_k2_l1_w_v_mem() {
+        let cfg = MAGConfig::test_config_k2();
+        tape_fd_check(&cfg, "delta_k2/l1_w_v_mem",
+            |p| &p.levels[1].w_v_mem, |p, i, v| p.levels[1].w_v_mem[i] = v, |g| &g.levels[1].w_v_mem);
+    }
+
+    #[test]
+    fn test_tape_fd_delta_k2_l1_w_q_mem() {
+        let cfg = MAGConfig::test_config_k2();
+        tape_fd_check(&cfg, "delta_k2/l1_w_q_mem",
+            |p| &p.levels[1].w_q_mem, |p, i, v| p.levels[1].w_q_mem[i] = v, |g| &g.levels[1].w_q_mem);
+    }
+
+    #[test]
+    fn test_tape_fd_delta_k2_l1_w_alpha() {
+        let cfg = MAGConfig::test_config_k2();
+        tape_fd_check(&cfg, "delta_k2/l1_w_alpha",
+            |p| &p.levels[1].w_alpha, |p, i, v| p.levels[1].w_alpha[i] = v, |g| &g.levels[1].w_alpha);
+    }
+
+    #[test]
+    fn test_tape_fd_delta_k2_l1_b_alpha() {
+        let cfg = MAGConfig::test_config_k2();
+        tape_fd_check(&cfg, "delta_k2/l1_b_alpha",
+            |p| &p.levels[1].b_alpha, |p, i, v| p.levels[1].b_alpha[i] = v, |g| &g.levels[1].b_alpha);
+    }
 }
