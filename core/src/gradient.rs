@@ -332,7 +332,7 @@ pub fn tape_compute_gradients(
                 lp_grad.w_q_mem = w_q_mem_grad;
             }
 
-            if pulse.active_levels[level] {
+            if cache.pulse.active_levels[level] {
                 // Active level: return gradient directly.
                 level_grads.push(lp_grad);
             } else {
@@ -352,10 +352,10 @@ pub fn tape_compute_gradients(
         if let Some(ref fc) = cache.freq_cache {
             let s = cfg.swa.seq_len;
             let combined_y_id = param_ids.combined_y.unwrap();
-            let zero_buf = vec![0.0f32; s * d];
-            let d_y_combined = tape.get_grad(combined_y_id)
-                .unwrap_or(&zero_buf)
-                .to_vec();
+            let d_y_combined = match tape.get_grad(combined_y_id) {
+                Some(g) => g.to_vec(),
+                None => vec![0.0f32; s * d],
+            };
             let d_gate_values = compute_gate_surrogate(
                 &cache.y_per_level, &d_y_combined, &cache.pulse.active_levels, cfg.k, s * d,
             );
