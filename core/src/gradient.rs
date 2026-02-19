@@ -257,7 +257,10 @@ pub(crate) fn mag_check_weight_gradient(
 }
 
 /// Compute gradients of loss with respect to all CMS parameters.
-/// Both forward and backward operate in CMS mode with pulse/context/error_buffers.
+/// Delegates to `tape_compute_gradients()` (Wengert tape path).
+///
+/// The hand-written backward path is preserved as `cms_compute_gradients_handwritten()`
+/// for use as a test oracle.
 #[allow(dead_code)]
 pub fn cms_compute_gradients(
     params: &MAGParams,
@@ -268,6 +271,23 @@ pub fn cms_compute_gradients(
     context: &mut ContextState,
     error_buffers: &mut [ErrorBuffer],
 ) -> (f32, MAGParams) {
+    tape_compute_gradients(params, cfg, input_ids, target_ids, pulse, context, error_buffers)
+}
+
+/// Hand-written backward path (cms_forward + cms_backward).
+/// Preserved as test oracle for Class 3 comparisons.
+#[allow(dead_code)]
+pub fn cms_compute_gradients_handwritten(
+    params: &MAGParams,
+    cfg: &MAGConfig,
+    input_ids: &[usize],
+    target_ids: &[usize],
+    pulse: &Pulse,
+    context: &mut ContextState,
+    error_buffers: &mut [ErrorBuffer],
+) -> (f32, MAGParams) {
+    debug_assert_eq!(error_buffers.len(), cfg.k,
+        "error_buffers length ({}) must equal cfg.k ({})", error_buffers.len(), cfg.k);
     let (loss, cache) = cms_forward(params, cfg, input_ids, target_ids, pulse, context);
     let grads = cms_backward(params, cfg, &cache, input_ids, target_ids, error_buffers);
     (loss, grads)
@@ -277,12 +297,10 @@ pub fn cms_compute_gradients(
 ///
 /// Runs `traced_cms_forward()` to record every operation on the tape,
 /// then calls `tape.backward()` to replay in reverse and accumulate gradients.
-/// Returns the same (loss, grad_params) shape as `cms_compute_gradients()`.
 ///
 /// Frozen-level gradients are routed into `error_buffers` (not returned in
 /// the gradient struct). Active-level gradients go directly into the returned
-/// `MAGParams`. This matches `cms_backward()` semantics.
-#[allow(dead_code)]
+/// `MAGParams`. This matches the hand-written backward semantics.
 pub fn tape_compute_gradients(
     params: &MAGParams,
     cfg: &MAGConfig,
@@ -5502,7 +5520,7 @@ mod tests {
         let mut ebufs_ref: Vec<ErrorBuffer> = (0..cfg.k)
             .map(|_| ErrorBuffer::new(d))
             .collect();
-        let (loss_ref, _grads_ref) = cms_compute_gradients(
+        let (loss_ref, _grads_ref) = cms_compute_gradients_handwritten(
             &params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx_ref, &mut ebufs_ref,
         );
 
@@ -5586,7 +5604,7 @@ mod tests {
         let mut ebufs_ref: Vec<ErrorBuffer> = (0..cfg.k)
             .map(|_| ErrorBuffer::new(d))
             .collect();
-        let (loss_ref, grads_ref) = cms_compute_gradients(
+        let (loss_ref, grads_ref) = cms_compute_gradients_handwritten(
             &params, &cfg, &input_ids, &target_ids, &pulse1, &mut ctx_ref, &mut ebufs_ref,
         );
 
@@ -5668,12 +5686,12 @@ mod tests {
         let target_ids: Vec<usize> = (1..=s).map(|t| t % v).collect();
         let pulse = Pulse { global_step: 0, active_levels: vec![true, true] };
 
-        // Reference path
+        // Hand-written backward path (reference)
         let mut ctx_ref = make_context_state(&cfg);
         let mut ebufs_ref: Vec<ErrorBuffer> = (0..cfg.k)
             .map(|_| ErrorBuffer::new(d))
             .collect();
-        let (loss_ref, grads_ref) = cms_compute_gradients(
+        let (loss_ref, grads_ref) = cms_compute_gradients_handwritten(
             &params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx_ref, &mut ebufs_ref,
         );
 
@@ -5774,7 +5792,7 @@ mod tests {
         // Hand-written backward
         let mut ctx_ref = make_context_state(cfg);
         let mut ebufs_ref: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(d)).collect();
-        let (loss_ref, grads_ref) = cms_compute_gradients(
+        let (loss_ref, grads_ref) = cms_compute_gradients_handwritten(
             &params, cfg, &input_ids, &target_ids, &pulse, &mut ctx_ref, &mut ebufs_ref,
         );
 
@@ -5977,7 +5995,7 @@ mod tests {
         let warm_pulse = Pulse { global_step: 0, active_levels: vec![true, true] };
         let mut ctx_ref = make_context_state(&cfg);
         let mut ebufs_ref: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(d)).collect();
-        let _ = cms_compute_gradients(
+        let _ = cms_compute_gradients_handwritten(
             &params, &cfg, &input_ids, &target_ids, &warm_pulse, &mut ctx_ref, &mut ebufs_ref,
         );
         let mut ctx_tape = ctx_ref.clone();
@@ -5989,7 +6007,7 @@ mod tests {
         // Frozen pulse: level 0 active, level 1 frozen.
         let frozen_pulse = Pulse { global_step: 1, active_levels: vec![true, false] };
 
-        let (loss_ref, grads_ref) = cms_compute_gradients(
+        let (loss_ref, grads_ref) = cms_compute_gradients_handwritten(
             &params, &cfg, &input_ids, &target_ids, &frozen_pulse, &mut ctx_ref, &mut ebufs_ref,
         );
         let (loss_tape, grads_tape) = tape_compute_gradients(
