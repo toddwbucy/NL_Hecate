@@ -61,7 +61,7 @@ Different values of q shape the memory's magnitude distribution differently:
 --
 -- q = 1:  |W|     → constant gradient sign(W). Drives to sparsity (L1).
 -- q = 2:  |W|^2   → gradient 2W. Uniform decay. Standard L2.
--- q = 4:  |W|^4   → gradient 4|W|^3 sign(W). Large entries penalized cubically.
+-- q = 4:  |W|^4   → gradient 4 |W|^3 sign(W). Large entries penalized cubically.
 -- q → ∞: max|W|   → only the largest entry is penalized (L_inf limit).
 --
 -- MONETA default: q = 4
@@ -136,8 +136,8 @@ L_q norm retention is a special case of the Bregman divergence framework
 phi(W) = (1/q) * ||W||_q^q = (1/q) * sum |W_{jl}|^q
 
 -- Bregman divergence induced by phi:
-D_phi(W, W') = (1/q) * sum (|W_{jl}|^q - |W'_{jl}|^q
-               - q * |W'_{jl}|^{q-2} * W'_{jl} * (W_{jl} - W'_{jl}))
+D_phi(W, W') = (1/q) * sum_{j,l} (|W_{jl}|^q - |W'_{jl}|^q
+                                  - q * |W'_{jl}|^{q-2} * W'_{jl} * (W_{jl} - W'_{jl}))
 
 -- At q = 2: phi = (1/2)||W||^2_F → D_phi = (1/2)||W - W'||^2_F
 --   Recovers standard L2 Bregman divergence.
@@ -184,14 +184,14 @@ D_phi(W, W') = (1/q) * sum (|W_{jl}|^q - |W'_{jl}|^q
 -- Step 1: Backward through normalization W = A / norm_q^{q-2}
 --   Let s = norm_q^{q-2} (scalar)
 --   dL/dA_t (partial, through W) = dL/dW_t / s
---            - (q-2) * norm_q^{q-3} * (d(norm_q)/dA_t) * (A_t / s^2) . dL/dW_t
+--            - (q-2) * norm_q^{q-3} * (d(norm_q)/dA_t) * (A_t / s^2) ⊙ dL/dW_t  (⊙ = element-wise)
 --
 --   d(norm_q)/dA_{jl} = |A_{jl}|^{q-1} * sign(A_{jl}) / norm_q^{q-1}
 --
 --   Simplification for q = 4 (MONETA default):
 --     s = norm_4^2
 --     dL/dA_t = dL/dW_t / norm_4^2
---             - 2 * (sum dL/dW_t . A_t . |A_t|^2) / norm_4^6 * |A_t|^2 * sign(A_t)
+--             - 2 * (sum dL/dW_t ⊙ A_t ⊙ |A_t|^2) / norm_4^6 * |A_t|^2 * sign(A_t)
 
 -- Step 2: Backward through accumulation A_t = alpha * A_{t-1} - eta * grad
 dL/dA_{t-1} = alpha_t * dL/dA_t
@@ -224,10 +224,12 @@ Sign(x) ≈ tanh(a * x)
 
 ## Implementation Notes
 
-1. **MONETA already exists**: The MONETA variant in `core/src/moneta.rs` already
-   implements (p,q) = (3,4). This spec documents the L_q retention mechanism
-   in isolation from the MONETA variant, enabling other rules to use L_q
-   retention with different attentional biases.
+1. **MONETA current state**: The MONETA variant in `core/src/moneta.rs` currently
+   uses L2 retention with `lp_p` defaulting to 2.0 (standard L2 loss). The
+   `lq_q` field exists in the configuration struct but is not yet wired into
+   the retention step. This spec documents the L_q retention mechanism that
+   MONETA will use once (p,q) parametrization is implemented, and enables
+   other rules to adopt L_q retention independently.
 
 2. **Accumulator lifetime**: A is an `inner_loop_state` (same as momentum S).
    It persists within a forward pass but is NOT serialized with checkpoints.
@@ -247,7 +249,7 @@ Sign(x) ≈ tanh(a * x)
    variant. The q parameter is part of the variant configuration, not a
    runtime gate.
 
-6. **Interaction with CMS**: At higher CMS levels (slower frequencies), the
+6. **Interaction with CMS (Continuous Memory System)**: At higher CMS levels (slower frequencies; see `specs/infrastructure/scheduling/00_conductor.md`), the
    accumulator A has more steps between normalizations. The L_q constraint
    becomes relatively weaker per-step at slow levels, allowing slow memories
    to accumulate larger magnitudes before normalization clips them.
