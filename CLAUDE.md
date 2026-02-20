@@ -139,6 +139,30 @@ hades --database NL db aql "FOR doc IN nl_code_smells FILTER doc.id == 'CS-32' R
 hades --database NL db graph neighbors --start "arxiv_metadata/2504.13173" --graph paper_graph
 ```
 
+## Graph Maintenance (HADES Spec Ingestion)
+
+When writing or modifying a spec file in `specs/`, the corresponding HADES graph node and trace edges must be maintained at the same time — not as a batch cleanup afterward.
+
+**On spec creation** (e.g., new S3b spec):
+1. Insert a document into `hecate_specs` with schema: `_key, title, category, version, path, purpose, paper_source, traced_to_equations, traced_to_axioms, status`
+2. Insert edge documents into `nl_hecate_trace_edges` for each equation the spec references: `_from: hecate_specs/<key>, _to: <equation_collection>/<eq-key>, rel: "implements"|"cites"`
+3. Use `rel: "implements"` when the spec is the primary implementation contract for that equation, `rel: "cites"` for secondary references
+
+**On spec modification** (e.g., adding equation references):
+- Add new trace edges for newly referenced equations
+- Update the `hecate_specs` node if `traced_to_equations` or `paper_source` changed
+
+**Equation collection mapping** (arxiv ID → collection prefix):
+- Titans (2501.00663) → `titans_equations`
+- MIRAS (2504.13173) → `miras_equations`
+- HOPE (2512.24695) → `hope_equations`
+- Lattice (2504.05646) → `lattice_equations`
+- Atlas (2505.23735) → `atlas_equations`
+- TNT (2511.07343) → `tnt_equations`
+- Trellis (2512.23852) → `trellis_equations`
+
+**Verification**: `hades --db NL db aql "FOR s IN hecate_specs LET edges = (FOR e IN nl_hecate_trace_edges FILTER e._from == CONCAT('hecate_specs/', s._key) RETURN 1) FILTER LENGTH(edges) == 0 RETURN s._key"` should return an empty array.
+
 ## When Working in This Repo
 
 - **Read `specs/contract.md` first** — it's the architectural overview and entry point
