@@ -9,6 +9,7 @@ CONTRACT
               large entries (bounding peaks), low q spreads penalty more evenly
               (bounding total mass). MONETA uses (p,q) = (3,4) — the L_4 global
               penalty prevents any single memory entry from dominating.
+              (MONETA currently uses L2; the (p,q) parametrization is planned.)
   Expects:    Memory state W (matrix or MLP), previous state W_{t-1}, gates
               (alpha_t, eta_t), norm order q >= 1.
   Guarantees: Local retention D_t(W, W') = ||W - W'||^2_F keeps updates small.
@@ -64,7 +65,7 @@ Different values of q shape the memory's magnitude distribution differently:
 -- q = 4:  |W|^4   → gradient 4 |W|^3 sign(W). Large entries penalized cubically.
 -- q → ∞: max|W|   → only the largest entry is penalized (L_inf limit).
 --
--- MONETA default: q = 4
+-- MONETA design target: q = 4
 --   Large entries face 4x steeper penalty gradient than L2.
 --   Small entries face gentler penalty than L2.
 --   Net effect: bounded peaks, preserved fine structure.
@@ -113,7 +114,7 @@ grad_lp = p * (Sign(W k_t - v_t) * |W k_t - v_t|^{p-1}) @ k_t^T
 
 -- At p = 2: recovers standard Delta rule gradient 2*(W k - v) @ k^T
 -- At p = 1: reduces to Sign(W k - v) @ k^T (value-less memory)
--- At p = 3 (MONETA default): uses quadratic error scaling
+-- At p = 3 (MONETA design target): uses quadratic error scaling
 
 -- Smooth approximators (MIRAS Eq 25):
 --   Sign(x) ≈ tanh(a * x)        (a controls sharpness)
@@ -123,7 +124,7 @@ grad_lp = p * (Sign(W k_t - v_t) * |W k_t - v_t|^{p-1}) @ k_t^T
 The (p, q) pair is a joint design choice:
 - p controls the **loss geometry** (how errors are measured)
 - q controls the **retention geometry** (how memory magnitude is constrained)
-- MONETA default: (p, q) = (3, 4)
+- MONETA design target: (p, q) = (3, 4)
 
 ## Bregman Divergence Connection
 
