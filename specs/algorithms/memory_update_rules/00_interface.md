@@ -76,12 +76,12 @@ TRAIT: MemoryUpdateRule
     The k and q inputs to WRITE/READ are post-convolution outputs — already
     preprocessed by the short causal Conv1D (see specs/infrastructure/attention/02_short_conv.md).
     Convenience method. Equivalent to:
-      k_raw = x @ outer.W_K^T
-      q_raw = x @ outer.W_Q^T
-      k = causal_conv1d(k_raw, outer.w_k_conv)   -- short conv preprocessing
-      q = causal_conv1d(q_raw, outer.w_q_conv)   -- short conv preprocessing
-      v = x @ outer.W_V^T                         -- values NOT convolved
-      gates = compute_gates(k, v, outer.gate_params)
+      k_raw = x @ outer.W_K^T                     -- HADES: miras_equations/eq-008-hebbian-rule (key projection)
+      q_raw = x @ outer.W_Q^T                     -- HADES: miras_equations/eq-008-hebbian-rule (query projection)
+      k = causal_conv1d(k_raw, outer.w_k_conv)   -- HADES: specs/infrastructure/attention/02_short_conv.md
+      q = causal_conv1d(q_raw, outer.w_q_conv)   -- HADES: specs/infrastructure/attention/02_short_conv.md
+      v = x @ outer.W_V^T                         -- HADES: miras_equations/eq-008-hebbian-rule (value projection)
+      gates = compute_gates(k, v, outer.gate_params)  -- HADES: titans_equations/eq-012-titans-update (gate computation)
       IF pulse.is_active(self.level()):
         WRITE(state, k, v, gates, pulse)
       y = READ(state, q)
@@ -134,9 +134,10 @@ FUNCTION: compute_inner_gradient(state: &State, k: &Tensor, v: &Tensor, bias: &d
 ## State Lifecycle
 
 ```
-outer_loop_param:   W_K, W_V, W_Q, gate_params, persistent_memory
-                    Owned by the model struct. Enzyme differentiates through these.
-                    Serialized in checkpoints.
+outer_loop_param:   W_K, W_V, W_Q, w_k_conv, w_q_conv, gate_params, persistent_memory
+                    Owned by the model struct. Differentiated by the Wengert tape.
+                    Serialized in checkpoints. Conv weights (w_k_conv, w_q_conv) follow
+                    the same lifecycle as projection matrices — per-level, frequency-gated.
 
 inner_loop_state:   M (memory matrix), S (momentum accumulator)
                     Scoped to the forward pass or context stream.
