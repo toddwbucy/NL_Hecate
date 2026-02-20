@@ -118,8 +118,8 @@ AGGREGATION (two sites, same mechanism):
 
   -- Both alpha vectors: [k] f32, outer_loop_param lifetime, init zeros
   -- Zeros → uniform 1/k weighting at init (softmax of equal values)
-  -- The Wengert tape differentiates through softmax and the weighted sum
-  -- (TapeOp::WeightedSum), so both alpha vectors learn from the training signal.
+  -- Hand-written backward computes full softmax Jacobian for both alpha vectors.
+  -- Tape registration (TapeOp::WeightedSum) is a future Stage 3 task.
   --
   -- When k=1: softmax([alpha_0]) = [1.0], reduces to identity.
   -- No special-casing needed for any value of k.
