@@ -57,6 +57,7 @@ Ret_t(W, W_{t-1}) = (1/eta_t) * D_t(W, W_{t-1})  +  (1/alpha_t) * G_t(W)
 
 Different values of q shape the memory's magnitude distribution differently:
 
+<!-- HADES: Derived from miras_equations/eq-024-025-moneta-spec (§5.3 Eqs 24-25), penalty gradient by q -->
 ```text
 -- Penalty per element: |W_{jl}|^q
 --
@@ -150,6 +151,7 @@ D_phi(W, W') = (1/q) * sum_{j,l} (|W_{jl}|^q - |W'_{jl}|^q
 
 ## Properties
 
+<!-- HADES: Derived from miras_equations/eq-024-025-moneta-spec (§5.3 Eqs 24-25), normalization properties -->
 ```text
 -- Magnitude bounding:
 --   After normalization: ||W||_q^q = ||A||_q^q / ||A||_q^{q(q-2)/q}
@@ -189,7 +191,7 @@ D_phi(W, W') = (1/q) * sum_{j,l} (|W_{jl}|^q - |W'_{jl}|^q
 --
 --   d(norm_q)/dA_{jl} = |A_{jl}|^{q-1} * sign(A_{jl}) / norm_q^{q-1}
 --
---   Simplification for q = 4 (MONETA default):
+--   Simplification for q = 4 (MONETA design target):
 --     s = norm_4^2
 --     dL/dA_t = dL/dW_t / norm_4^2
 --             - 2 * (sum dL/dW_t ⊙ A_t ⊙ |A_t|^2) / norm_4^6 * |A_t|^2 * sign(A_t)
@@ -207,6 +209,7 @@ dL/deta_t = -trace(grad_lp_t^T @ dL/dA_t)    -- scalar gate gradient
 The l_p gradient (Eq 11) requires Sign and absolute value, which are
 non-differentiable at zero. MIRAS Eq 25 specifies smooth approximators:
 
+<!-- HADES: miras_equations/eq-024-025-moneta-spec (§5.3 Eq 25, smooth approximators) -->
 ```text
 -- Sign approximator:
 Sign(x) ≈ tanh(a * x)
