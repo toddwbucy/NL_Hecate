@@ -16,7 +16,7 @@ CONTRACT
               The iteration is purely matrix multiplications — no eigendecomposition.
   Cost:       Per iteration: O(d^3) — three matrix multiplications.
               k=5 iterations: 15 matmuls total. For d=64 (inner loop), this is
-              ~0.8M FLOPs per NS call. For d=2048 (outer loop), ~130G FLOPs.
+              ~4M FLOPs per NS call. For d=2048 (outer loop), ~130G FLOPs.
   Trade-off:  Better gradient geometry (locally optimal updates) at the cost of
               k extra matmul passes per step. The Atlas ablation shows this is
               worth it: Muon is the defining feature of Atlas vs OmegaNet.
@@ -171,6 +171,7 @@ M^(2)_t = M^(2)_t - beta_2 * sum_{i=t-C}^t g_i   -- slow: every C steps
 The backward pass through Newton-Schulz requires differentiating the
 iterative process:
 
+<!-- HADES: Derived from hope_equations/eq-044-newton-schulz-iteration (§4.2 Eq 44), backward through unrolled iteration -->
 ```text
 -- Forward: O_k = NS_k(G)  (k iterations of the NS recurrence)
 -- The iteration is a composition of differentiable matrix operations.
@@ -222,6 +223,6 @@ iterative process:
 
 ## Axiom Compliance
 
-- **NL IS #6** (optimizers are associative memory): NS orthogonalizes the memory write, making the update geometrically optimal.
-- **NL IS #7** (self-modifying): The NS output depends on the accumulated momentum state, adapting the update direction to gradient history.
-- **NL IS #9** (principled not ad hoc): NS is the exact solution to a well-defined orthogonalization objective (Eq 43), not a heuristic.
+- **NL IS #6** (optimizers are associative memory): Orthogonalizes the memory write, making the update geometrically optimal.
+- **NL IS #7** (self-modifying): Output depends on accumulated momentum state, adapting the update direction to gradient history.
+- **NL IS #9** (principled not ad hoc): Exact solution to a well-defined orthogonalization objective (Eq 43), not a heuristic.
