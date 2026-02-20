@@ -1,5 +1,6 @@
 # Sigmoid-Bounded Retention (Box-Constrained Memory)
 
+<!-- HADES: Derived from miras_equations/eq-018-f-divergence-update (§5.2 Eq 18), log-barrier specialization of Bregman framework -->
 ```text
 CONTRACT
   Purpose:    Sigmoid-bounded retention constrains memory entries to the interval
@@ -34,6 +35,7 @@ CONTRACT
 
 Several memory use cases require bounded entries:
 
+<!-- HADES: Derived from miras_equations/eq-018-f-divergence-update (§5.2 Eq 18), motivation for box constraint -->
 ```text
 -- Gate memories: alpha_t, theta_t are sigmoid outputs in [0, 1].
 --   If a memory stores learned gate patterns, entries must stay bounded.
@@ -208,6 +210,8 @@ dL/deta_t = -trace(g_logit^T @ dL/dZ_t)
 ```
 
 ## Implementation Notes
+
+<!-- HADES: Derived from miras_equations/eq-018-f-divergence-update (§5.2 Eq 18), implementation guidance for log-barrier specialization -->
 
 1. **Novel retention mechanism**: Sigmoid-bounded retention does not correspond
    to a named variant in the MIRAS paper. It is derived from the Bregman
