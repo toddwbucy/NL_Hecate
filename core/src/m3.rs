@@ -318,6 +318,10 @@ pub fn flatten_mag_params(params: &MAGParams) -> Vec<f32> {
         flat.extend_from_slice(&level.b_freq);
     }
 
+    // CMS aggregation weights
+    flat.extend_from_slice(&params.alpha_mem);
+    flat.extend_from_slice(&params.alpha_refl);
+
     flat
 }
 
@@ -364,10 +368,13 @@ pub fn unflatten_to_mag_grads(flat: &[f32], template: &MAGParams) -> MAGParams {
         });
     }
 
+    let alpha_mem = take(flat, &mut offset, template.alpha_mem.len());
+    let alpha_refl = take(flat, &mut offset, template.alpha_refl.len());
+
     assert_eq!(offset, flat.len(),
         "unflatten consumed {} of {} elements", offset, flat.len());
 
-    MAGParams { swa, levels }
+    MAGParams { swa, levels, alpha_mem, alpha_refl }
 }
 
 /// Total parameter count for a MAGParams instance.

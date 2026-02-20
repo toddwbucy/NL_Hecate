@@ -1235,6 +1235,12 @@ impl MAGConfig {
 pub struct MAGParams {
     pub swa: SWAParams,
     pub levels: Vec<MemoryLevelParams>,
+    /// Learnable CMS aggregation logits for memory output combination.
+    /// [k] f32, init zeros → softmax produces uniform 1/k at init.
+    pub alpha_mem: Vec<f32>,
+    /// Learnable CMS aggregation logits for reflective gate signal combination.
+    /// [k] f32, init zeros → softmax over active subset at init.
+    pub alpha_refl: Vec<f32>,
 }
 
 impl MAGParams {
@@ -1270,7 +1276,9 @@ impl MAGParams {
             levels.push(level_params);
         }
 
-        MAGParams { swa, levels }
+        let alpha_mem = vec![0.0f32; cfg.k];
+        let alpha_refl = vec![0.0f32; cfg.k];
+        MAGParams { swa, levels, alpha_mem, alpha_refl }
         // NOTE: No weight tying at init — both w_embed and w_unembed keep their
         // independent Kaiming initialization. Weight tying (sync_embed_from_unembed)
         // is applied after each weight update during training, in the Python tier
@@ -1292,6 +1300,8 @@ impl MAGParams {
         MAGParams {
             swa: SWAParams::zeros_like(&cfg.swa),
             levels,
+            alpha_mem: vec![0.0f32; cfg.k],
+            alpha_refl: vec![0.0f32; cfg.k],
         }
     }
 
@@ -1299,6 +1309,8 @@ impl MAGParams {
     pub fn num_params(&self) -> usize {
         self.swa.num_params()
             + self.levels.iter().map(|l| l.num_params()).sum::<usize>()
+            + self.alpha_mem.len()
+            + self.alpha_refl.len()
     }
 
     /// Outer-loop weight update: param -= lr * grad for all projection weights across all levels.
@@ -1306,6 +1318,12 @@ impl MAGParams {
         self.swa.apply_weight_gradients(&grads.swa, lr);
         for (level, level_grads) in self.levels.iter_mut().zip(grads.levels.iter()) {
             level.apply_weight_gradients(level_grads, lr);
+        }
+        for (a, &da) in self.alpha_mem.iter_mut().zip(grads.alpha_mem.iter()) {
+            *a -= lr * da;
+        }
+        for (a, &da) in self.alpha_refl.iter_mut().zip(grads.alpha_refl.iter()) {
+            *a -= lr * da;
         }
     }
 

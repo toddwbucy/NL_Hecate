@@ -118,8 +118,8 @@ AGGREGATION (two sites, same mechanism):
 
   -- Both alpha vectors: [k] f32, outer_loop_param lifetime, init zeros
   -- Zeros → uniform 1/k weighting at init (softmax of equal values)
-  -- The Wengert tape differentiates through softmax and the weighted sum
-  -- (TapeOp::WeightedSum), so both alpha vectors learn from the training signal.
+  -- Hand-written backward computes full softmax Jacobian for both alpha vectors.
+  -- Tape registration (TapeOp::WeightedSum) is a future Stage 3 task.
   --
   -- When k=1: softmax([alpha_0]) = [1.0], reduces to identity.
   -- No special-casing needed for any value of k.
@@ -135,24 +135,20 @@ PHASE 2 EXTENSION (future, requires self-referential infrastructure S3b-S12):
   -- Uses ProjectionKind::Adaptive(rule) from self_referential/00_interface.md.
   -- See composition_patterns/04_hope.md Variant 2 and task_44105a.
 
-IMPLEMENTATION SITES (core/src/mac.rs, task_44105a):
+IMPLEMENTATION (core/src/mac.rs, task_44105a — COMPLETE):
   -- Two aggregation points, each with forward + backward:
   --
   -- 1. Memory output aggregation (h_t_combined):
-  --    Forward  L552-564: sum h_t_per_level[l], then scale by 1/sqrt(k) if k>2
-  --    Backward L817-824: chain rule scales d_h_t_per_level by same 1/sqrt(k)
+  --    Forward:  w_mem = softmax(alpha_mem), h_t_combined = sum_l w_mem[l] * h_t_per_level[l]
+  --    Backward: d_h_level[l] = w_mem[l] * d_h_t_combined (per-level chain rule)
+  --              d_alpha_mem[l] = w_mem[l] * (dot_l - sum_j w_mem[j]*dot_j)  (full softmax Jacobian)
   --
   -- 2. Reflective gate signal aggregation (reflective_y_combined):
-  --    Forward  L625-631: sum active reflective outputs, scale by 1/sqrt(active) if >2
-  --    Backward L749-756: chain rule scales d_reflective_y by same 1/sqrt(active)
+  --    Forward:  w_refl = masked_softmax(alpha_refl, active_mask), weighted sum of active levels
+  --    Backward: same softmax Jacobian pattern, only active levels participate
   --
-  -- Both sites follow the same pattern:
-  --    OLD: sum then conditionally scale by 1/sqrt(count)
-  --    NEW: softmax(alpha) weighted sum — tape records WeightedSum op
-  --
-  -- Note: Site 2 (reflective) uses active_count not k — frozen levels don't
-  -- contribute reflective signal. alpha_reflective may need separate weights
-  -- or reuse the same alpha with masking for inactive levels.
+  -- Site 2 uses masked_softmax: inactive (frozen) levels get zero weight,
+  -- softmax computed over active subset only. Separate alpha_refl vector.
 ```
 
 ## Configuration Interface

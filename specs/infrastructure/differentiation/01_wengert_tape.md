@@ -594,10 +594,12 @@ Forward:
       ├──> Level 3: Opaque(FrozenDelta)   → y_3   (read-only from persisted M)
       |
       v
-  [WeightedSum alpha_l * y_l] → combined_mem ──── TapeOp::WeightedSum (learnable alpha)
+  [WeightedSum alpha_l * y_l] → combined_mem ──── softmax-weighted aggregation
       |
       v
   -- alpha_l: softmax-normalized per-level weights (outer_loop_param, HOPE Eq 74)
+  -- Hand-written backward computes full softmax Jacobian for d_alpha
+  -- Tape registration as TapeOp::WeightedSum is a future Stage 3 task
       |
       v
   [Sigmoid] → gate ────────────────────────────── TapeOp::Sigmoid
