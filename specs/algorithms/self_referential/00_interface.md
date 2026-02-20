@@ -413,7 +413,7 @@ dL/dM_v = ... (through all downstream uses of v_t)
    alongside the existing `ProjectionKind::Static` (Phase 1). The rule
    parameter specifies which MemoryRule type the projection memory uses.
 
-8. **Phase 2 adaptive CMS aggregation**: The same Phase 1 → Phase 2 progression
+8. **Phase-2 adaptive CMS aggregation**: The same Phase-1 → Phase-2 progression
    applies to CMS level aggregation weights. Phase 1: learnable `alpha_l` scalars
    (outer_loop_param, softmax-normalized) replace the prior ad hoc `1/sqrt(k)`
    normalization. Phase 2: `alpha_l` becomes an adaptive memory `M_agg(x_t)` that

@@ -93,7 +93,7 @@ CONTRACT
 --   - All levels see a TRANSFORMED input (level l sees level l-1's output)
 --   - Information flows from fast → slow: Level 0 processes first, Level 3 last
 --   - Sequential: cannot parallelize across levels
---   - The conventional Transformer with k=1, frequency=0 is a special case
+--   - The conventional Transformer with k=1, frequency=1 is a special case
 --
 -- When to use:
 --   When slow levels should process ABSTRACT features (post-processed by fast levels).

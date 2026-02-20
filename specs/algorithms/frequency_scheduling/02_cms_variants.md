@@ -101,7 +101,7 @@ Mix CMS blocks with non-CMS blocks.
 
 ## Output Aggregation
 
-```
+```text
 -- When k > 1, CMS produces one output per active level per step.
 -- These must be combined into a single output tensor.
 --
@@ -157,7 +157,7 @@ IMPLEMENTATION SITES (core/src/mac.rs, task_44105a):
 
 ## Configuration Interface
 
-```
+```text
 STRUCT: CMSConfig
   n_levels: usize                -- k: number of frequency levels
   frequencies: Vec<u64>          -- [1, 8, 64, 512] typically
