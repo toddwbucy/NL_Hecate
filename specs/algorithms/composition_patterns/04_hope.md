@@ -115,7 +115,7 @@ CONTRACT
 --     y_l = levels[l].memory_read(x)       -- ALL levels read every token
 --     outputs.push(y_l)
 --
---   -- Combine outputs (weighted sum with 1/sqrt(k) normalization for k>2)
+--   -- Combine outputs (weighted sum with 1/sqrt(k) normalization, NL_Hecate convention)
 --   y = aggregate(outputs, k)
 --
 --   -- Parameter updates happen only at active frequencies:
@@ -137,7 +137,7 @@ CONTRACT
 --   - The Conductor generates Pulses that gate level activity
 --   - All levels read every token (inner-loop M@q always runs)
 --   - Only active levels get outer-loop gradient updates
---   - Output normalization: 1/sqrt(k) for k > 2 (see CMS implementation)
+--   - Output normalization: 1/sqrt(k) (NL_Hecate implementation detail, not from HOPE)
 --
 -- Why this is the default:
 --   Simplest multi-scale behavior. No inter-level data dependencies.
@@ -249,7 +249,7 @@ CONTRACT
 --   Simple: learnable weighted sum  y = sum_l alpha_l * y_l  (alpha > 0, outer_loop_param)
 --   This is the "simple design choice" recommended by HOPE.
 --   Alternatives: attention over level outputs, gated combination, concatenation + projection.
---   Default: weighted sum with 1/sqrt(k) normalization.
+--   Default: weighted sum with 1/sqrt(k) normalization (NL_Hecate convention).
 --
 -- Properties:
 --   - Each level sees the SAME raw input x (no inter-level transformation)
@@ -441,7 +441,7 @@ each phase changes what the composition pattern must support.
 1. **Variant 2 is already implemented**: The Conductor + Pulse system in NL_Hecate
    implements Variant 2 (Freq-Gated). The `pulse.is_active(level)` check gates
    both inner-loop writes and outer-loop gradient accumulation. Output aggregation
-   uses the weighted sum with `1/sqrt(k)` normalization for k>2.
+   uses the weighted sum with `1/sqrt(k)` normalization (NL_Hecate implementation detail).
 
 2. **Variant 5 is nearly identical to Variant 2**: In the NL_Hecate implementation,
    Variant 2 and Variant 5 are the same — each level independently processes the
