@@ -1,5 +1,6 @@
 # Self-Referential Projections (M_k, M_v, M_q)
 
+<!-- HADES: hope_equations/eq-076-phase1-projections (§8.1 Eq 76, static); hope_equations/eq-079-phase2-adaptive-projections (§8.1 Eq 79, adaptive); hope_equations/eq-084-phase3-self-generated-values (§8.1 Eq 84, self-modifying) -->
 ```text
 CONTRACT
   Purpose:    Self-referential projections replace static linear projections
