@@ -594,10 +594,10 @@ Forward:
       ├──> Level 3: Opaque(FrozenDelta)   → y_3   (read-only from persisted M)
       |
       v
-  [Add y_0 + y_1 + y_2 + y_3] → combined_mem ──── TapeOp::Add (4-way)
+  [WeightedSum alpha_l * y_l] → combined_mem ──── TapeOp::WeightedSum (learnable alpha)
       |
       v
-  [Scale 1/sqrt(k)] → mem_out ─────────────────── TapeOp::Scale (k>2 normalization)
+  -- alpha_l: softmax-normalized per-level weights (outer_loop_param, HOPE Eq 74)
       |
       v
   [Sigmoid] → gate ────────────────────────────── TapeOp::Sigmoid

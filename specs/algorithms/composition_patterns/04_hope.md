@@ -115,8 +115,11 @@ CONTRACT
 --     y_l = levels[l].memory_read(x)       -- ALL levels read every token
 --     outputs.push(y_l)
 --
---   -- Combine outputs (weighted sum with 1/sqrt(k) normalization, NL_Hecate convention)
---   y = aggregate(outputs, k)
+--   -- Combine outputs via learnable weighted sum (HOPE Eq 74)
+--   -- alpha_l: per-level aggregation weights (outer_loop_param, learned via tape)
+--   -- Softmax ensures weights sum to 1, preventing output magnitude dependence on k.
+--   weights = softmax(alpha)             -- alpha: [k] raw logits, outer_loop_param
+--   y = sum_l weights[l] * outputs[l]
 --
 --   -- Parameter updates happen only at active frequencies:
 --   FOR l in 0..k:
@@ -137,7 +140,10 @@ CONTRACT
 --   - The Conductor generates Pulses that gate level activity
 --   - All levels read every token (inner-loop M@q always runs)
 --   - Only active levels get outer-loop gradient updates
---   - Output normalization: 1/sqrt(k) (NL_Hecate implementation detail, not from HOPE)
+--   - Output aggregation: learnable softmax weights per level (HOPE Eq 74)
+--     Phase 1: static alpha_l (outer_loop_param, learned during build)
+--     Phase 2: adaptive M_agg(x_t) produces context-dependent level weights
+--     (see self_referential/00_interface.md for Phase 2 progression)
 --
 -- Why this is the default:
 --   Simplest multi-scale behavior. No inter-level data dependencies.
@@ -249,7 +255,10 @@ CONTRACT
 --   Simple: learnable weighted sum  y = sum_l alpha_l * y_l  (alpha > 0, outer_loop_param)
 --   This is the "simple design choice" recommended by HOPE.
 --   Alternatives: attention over level outputs, gated combination, concatenation + projection.
---   Default: weighted sum with 1/sqrt(k) normalization (NL_Hecate convention).
+--   Default: learnable weighted sum with softmax normalization (HOPE Eq 74).
+--   Phase 1: alpha_l are static outer_loop_params (learned during build).
+--   Phase 2 extension: alpha_l replaced by adaptive M_agg(x_t) that weights
+--   levels based on context (self-referential progression, see 00_interface.md).
 --
 -- Properties:
 --   - Each level sees the SAME raw input x (no inter-level transformation)
@@ -441,7 +450,9 @@ each phase changes what the composition pattern must support.
 1. **Variant 2 is already implemented**: The Conductor + Pulse system in NL_Hecate
    implements Variant 2 (Freq-Gated). The `pulse.is_active(level)` check gates
    both inner-loop writes and outer-loop gradient accumulation. Output aggregation
-   uses the weighted sum with `1/sqrt(k)` normalization (NL_Hecate implementation detail).
+   uses learnable softmax-normalized weights per level (HOPE Eq 74). **Note**: the
+   prior `1/sqrt(k)` fixed normalization violated NL IS #9 (principled not ad hoc)
+   and has been replaced with learnable weights — see task_44105a for implementation.
 
 2. **Variant 5 is nearly identical to Variant 2**: In the NL_Hecate implementation,
    Variant 2 and Variant 5 are the same — each level independently processes the

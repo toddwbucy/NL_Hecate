@@ -413,6 +413,15 @@ dL/dM_v = ... (through all downstream uses of v_t)
    alongside the existing `ProjectionKind::Static` (Phase 1). The rule
    parameter specifies which MemoryRule type the projection memory uses.
 
+8. **Phase 2 adaptive CMS aggregation**: The same Phase 1 → Phase 2 progression
+   applies to CMS level aggregation weights. Phase 1: learnable `alpha_l` scalars
+   (outer_loop_param, softmax-normalized) replace the prior ad hoc `1/sqrt(k)`
+   normalization. Phase 2: `alpha_l` becomes an adaptive memory `M_agg(x_t)` that
+   produces context-dependent level weights — a sentence about long-range context
+   weights Level 3 higher, local patterns weight Level 0 higher. This reuses the
+   same `ProjectionKind::Adaptive(rule)` infrastructure. See
+   `composition_patterns/04_hope.md` Variant 2/5 aggregation and task_44105a.
+
 ## Axiom Compliance
 
 - **NL IS #4** (compressing context): Adaptive projections compress context into the projection itself — the key/value/query transformations adapt to what has been seen, not just what was pre-trained.
