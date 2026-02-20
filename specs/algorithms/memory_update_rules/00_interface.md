@@ -50,7 +50,10 @@ TRAIT: MemoryUpdateRule
   TYPES:
     State          -- opaque, rule-specific internal state
     Config         -- the four knobs plus hyperparameters
-    OuterParams    -- projection matrices, gate parameters (outer_loop_param lifetime)
+    OuterParams    -- projection matrices, gate parameters, conv weights (outer_loop_param lifetime)
+                   -- Includes: W_K, W_V, W_Q, gate weights (W_alpha, W_eta, W_theta),
+                   --   w_k_conv [d_model, kernel_size], w_q_conv [d_model, kernel_size]
+                   --   (short causal conv preprocessing, see 02_short_conv.md)
 
   INIT(config: Config) -> (State, OuterParams)
     Create initial memory state and outer-loop parameters from configuration.

@@ -151,7 +151,7 @@ MAL (Memory As Layer):
 
 ## Key/Query Preprocessing
 
-```
+```text
 -- Before entering attention (or memory), keys and queries are preprocessed
 -- by a short causal depthwise Conv1D (kernel_size=4, SiLU activation).
 -- This injects local token interactions that pointwise projections alone
