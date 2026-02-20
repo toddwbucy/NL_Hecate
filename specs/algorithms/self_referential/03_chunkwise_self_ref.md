@@ -16,9 +16,10 @@ CONTRACT
               M_k, M_v, M_q, M_eta, M_alpha, M_mem. Self-generated values
               v_hat per component (Phase 3) or shared v_t (Phase 2).
   Guarantees: Within each chunk, all tokens compute gradients w.r.t. the SAME
-              memory state M_{square, C*ceil(t/C)}. This enables parallel
-              gradient computation across the C tokens in each chunk.
-              At chunk boundaries, the memory state advances sequentially.
+              memory state at the chunk boundary M_{square, C*ceil(t/C)} (paper
+              notation, Eq 90). This enables parallel gradient computation
+              across the C tokens in each chunk. At chunk boundaries, the
+              memory state advances sequentially.
               The chunkwise approximation error is bounded by O(C * eta)
               and converges to the exact sequential update as C → 1.
   Cost:       O(C * d^2) per chunk per component (C parallel gradient evals).
@@ -48,11 +49,11 @@ FUNCTION: chunkwise_self_ref_step(M_square: &mut Tensor, k: &Tensor,
                                    v_hat: &Tensor, alpha_t: f32, eta_t: f32,
                                    M_chunk_start: &Tensor) -> ()
   -- M_square: component memory [d, d] (will be updated)
-  -- M_chunk_start: memory state at START of this chunk (frozen for gradient)
+  -- M_chunk_start: memory state at chunk boundary C*ceil(t/C) (frozen for gradient)
   -- k: key vector [d, 1]
   -- v_hat: self-generated value [d, 1]
 
-  -- Gradient computed w.r.t. CHUNK START state (not current state)
+  -- Gradient computed w.r.t. CHUNK BOUNDARY state (not current state)
   grad = grad_L(M_chunk_start; k, v_hat)
 
   -- DGD-style retention + update (same as Eq 88)
@@ -62,7 +63,7 @@ FUNCTION: chunkwise_self_ref_step(M_square: &mut Tensor, k: &Tensor,
 
   -- Key difference from sequential (Eq 88):
   --   Sequential: grad_L(M_{square,t-1}; ...)  — uses CURRENT state
-  --   Chunkwise:  grad_L(M_{square,chunk_start}; ...) — uses STALE state
+  --   Chunkwise:  grad_L(M_{square,C*ceil(t/C)}; ...) — uses FROZEN state
   --   Within a chunk, all tokens see the same M for gradient computation.
   --   M still updates sequentially through the DGD recurrence,
   --   but the gradient is computed from a frozen snapshot.
