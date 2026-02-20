@@ -84,6 +84,7 @@ Adam's two moments are two such memories:
 
 The standard decoupled weight decay formulation:
 
+<!-- HADES: Derived from nl_optimizers/opt-adam (§4.2); Loshchilov & Hutter 2019 (decoupled weight decay) -->
 ```text
 FUNCTION: adamw_step(theta: &mut [f32], grad: &[f32],
                      m: &mut [f32], v: &mut [f32],
@@ -185,6 +186,7 @@ FUNCTION: frequency_gated_step(opt: &mut FrequencyAwareAdamW,
 A subtle but critical detail: bias correction must use the level's own step
 count, not the global step.
 
+<!-- HADES: Derived from hope_equations/eq-013-momentum-argmin (§4.1 Eq 13), bias correction with level-local step count -->
 ```text
 -- Why level-local step count matters:
 --
@@ -208,6 +210,7 @@ count, not the global step.
 
 HOPE §9.2 and TNT experiments use cosine annealing with linear warmup:
 
+<!-- HADES: Derived from HOPE (2512.24695) §9.2 experimental setup; TNT (2511.07343) experimental setup -->
 ```text
 FUNCTION: cosine_lr(step: u32, warmup_steps: u32, total_steps: u32,
                     lr_peak: f32, lr_min: f32) -> f32
