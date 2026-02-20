@@ -186,7 +186,7 @@ FUNCTION: frequency_gated_step(opt: &mut FrequencyAwareAdamW,
 A subtle but critical detail: bias correction must use the level's own step
 count, not the global step.
 
-<!-- HADES: Derived from hope_equations/eq-013-momentum-argmin (§4.1 Eq 13), bias correction with level-local step count -->
+<!-- HADES: Derived from nl_optimizers/opt-adam (§4.2, bias correction); hope_equations/eq-071-arch-variant2 (§6 Eq 71, per-level gating) -->
 ```text
 -- Why level-local step count matters:
 --
@@ -242,6 +242,7 @@ When a CMS level is frozen, gradients accumulate in an error buffer managed
 by the Conductor. When the level fires, the accumulated gradient is passed
 to AdamW as a single batch:
 
+<!-- HADES: Derived from hope_equations/eq-071-arch-variant2 (§6 Eq 71, error accumulation for frozen levels) -->
 ```text
 -- Frozen level gradient handling:
 --
