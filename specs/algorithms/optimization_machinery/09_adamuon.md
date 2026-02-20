@@ -1,6 +1,6 @@
 # AdaMuon (Adam + Muon)
 
-<!-- HADES: atlas_equations/eq-032-atlas-memory-muon (Atlas Eq 32); atlas_equations/eq-033-atlas-momentum (Atlas Eq 33); hope_equations/eq-042-muon-optimizer (§4.3 Eq 42); hope_equations/eq-044-newton-schulz-iteration (§4.3 Eq 44) -->
+<!-- HADES: atlas_equations/eq-032-atlas-memory-muon (Atlas Eq 32); atlas_equations/eq-033-atlas-momentum (Atlas Eq 33); hope_equations/eq-042-muon-optimizer (§4.3 Eq 42); hope_equations/eq-044-newton-schulz-iteration (§4.3 Eq 44, cost: k_ns matrix multiplies of d×d) -->
 ```text
 CONTRACT
   Purpose:    AdaMuon combines Adam's per-element second-moment estimate with
@@ -63,7 +63,7 @@ FUNCTION: newton_schulz_k(S: &Tensor, k: usize) -> Tensor
   -- Maps momentum matrix to nearest orthogonal matrix
   -- Solves: min_X ||X^T X - I||_F  subject to column space of X = column space of S
   X = S / max(frobenius_norm(S), eps)   -- initial normalization
-  FOR iter in 0..k:
+  FOR iter = 0 to k-1:
     X = 0.5 * X @ (3 * I - X^T @ X)
   return X
 
