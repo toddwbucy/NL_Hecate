@@ -263,6 +263,6 @@ structure (sparsity from L1, bounded norms from constraints), or
 
 ## Axiom Compliance
 
-- **NL IS #4** (compressing context): FTRL compresses the full gradient history into a regularized optimum.
-- **NL IS #6** (optimizers are associative memory): FTRL makes explicit that the memory update is an optimization problem, not just a heuristic.
-- **NL IS #9** (principled not ad hoc): FTRL provides regret bounds — the memory rule has provable online learning guarantees.
+- **NL IS #4** (compressing context): Compresses the full gradient history into a regularized optimum.
+- **NL IS #6** (optimizers are associative memory): Makes explicit that the memory update is an optimization problem, not just a heuristic.
+- **NL IS #9** (principled not ad hoc): Provides regret bounds — the memory rule has provable online learning guarantees.
