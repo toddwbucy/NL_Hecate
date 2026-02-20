@@ -50,12 +50,15 @@ TRAIT: MemoryUpdateRule
   TYPES:
     State          -- opaque, rule-specific internal state
     Config         -- the four knobs plus hyperparameters
-    OuterParams    -- projection matrices, gate parameters (outer_loop_param lifetime)
+    OuterParams    -- projection matrices, gate parameters, conv weights (outer_loop_param lifetime)
+                   -- Includes: W_K, W_V, W_Q, gate weights (W_alpha, W_eta, W_theta),
+                   --   w_k_conv [d_model, kernel_size], w_q_conv [d_model, kernel_size]
+                   --   (short causal conv preprocessing, see 02_short_conv.md)
 
   INIT(config: Config) -> (State, OuterParams)
     Create initial memory state and outer-loop parameters from configuration.
     State includes: memory weights, momentum (if any).
-    OuterParams includes: W_K, W_V, W_Q, gate weights.
+    OuterParams includes: W_K, W_V, W_Q, w_k_conv, w_q_conv, gate weights.
 
   WRITE(state: &mut State, k: &Tensor, v: &Tensor, gates: &Gates, pulse: &Pulse)
     Update memory given a key-value pair.
@@ -67,13 +70,18 @@ TRAIT: MemoryUpdateRule
     Query memory with q, return output.
     Does NOT mutate state. Pure function.
 
+  <!-- HADES: Derived from miras_equations/eq-008-hebbian-rule (MIRAS Eq 8, k/v/q projections); H3 (Fu et al. 2023, arXiv 2212.14052, short conv convention); specs/infrastructure/attention/02_short_conv.md -->
   STEP(state: &mut State, x: &Tensor, outer: &OuterParams, pulse: &Pulse) -> Tensor
-    Combined operation: project x to k,v,q; compute gates; WRITE; READ.
+    Combined operation: project x to k,v,q; apply short conv; compute gates; WRITE; READ.
+    The k and q inputs to WRITE/READ are post-convolution outputs — already
+    preprocessed by the short causal Conv1D (see specs/infrastructure/attention/02_short_conv.md).
     Convenience method. Equivalent to:
-      k = x @ outer.W_K^T
-      v = x @ outer.W_V^T
-      q = x @ outer.W_Q^T
-      gates = compute_gates(k, v, outer.gate_params)
+      k_raw = x @ outer.W_K^T                     -- HADES: miras_equations/eq-008-hebbian-rule (key projection)
+      q_raw = x @ outer.W_Q^T                     -- HADES: miras_equations/eq-008-hebbian-rule (query projection)
+      k = causal_conv1d(k_raw, outer.w_k_conv)   -- HADES: specs/infrastructure/attention/02_short_conv.md
+      q = causal_conv1d(q_raw, outer.w_q_conv)   -- HADES: specs/infrastructure/attention/02_short_conv.md
+      v = x @ outer.W_V^T                         -- HADES: miras_equations/eq-008-hebbian-rule (value projection)
+      gates = compute_gates(k, v, outer.gate_params)  -- HADES: titans_equations/eq-012-titans-update (gate computation)
       IF pulse.is_active(self.level()):
         WRITE(state, k, v, gates, pulse)
       y = READ(state, q)
@@ -126,9 +134,10 @@ FUNCTION: compute_inner_gradient(state: &State, k: &Tensor, v: &Tensor, bias: &d
 ## State Lifecycle
 
 ```
-outer_loop_param:   W_K, W_V, W_Q, gate_params, persistent_memory
-                    Owned by the model struct. Enzyme differentiates through these.
-                    Serialized in checkpoints.
+outer_loop_param:   W_K, W_V, W_Q, w_k_conv, w_q_conv, gate_params, persistent_memory
+                    Owned by the model struct. Differentiated by the Wengert tape.
+                    Serialized in checkpoints. Conv weights (w_k_conv, w_q_conv) follow
+                    the same lifecycle as projection matrices — per-level, frequency-gated.
 
 inner_loop_state:   M (memory matrix), S (momentum accumulator)
                     Scoped to the forward pass or context stream.
