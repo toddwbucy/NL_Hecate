@@ -1,6 +1,6 @@
 # Deep Momentum Gradient Descent (DMGD)
 
-```
+```text
 CONTRACT
   Purpose:    DMGD upgrades the momentum accumulator from a linear EMA to a
               state-dependent memory. Standard momentum compresses gradients via
@@ -30,7 +30,7 @@ CONTRACT
 Standard EMA momentum uses a dot-product (Hebbian) objective:
 
 <!-- HADES: hope_equations/eq-034-momentum-hebbian-obj (§4.2 Eq 34) -->
-```
+```text
 -- Standard momentum objective (HOPE Eq 34):
 L_momentum(m; g_t) = -<m, g_t>
 
@@ -49,7 +49,7 @@ gradient information.
 Replace the Hebbian objective with L2 regression for the momentum memory:
 
 <!-- HADES: hope_equations/eq-046-expressive-association (§4.4 Eq 46) -->
-```
+```text
 -- Delta Momentum objective (HOPE Eq 46):
 L_momentum(m; g_t, P_t) = ||m @ g_t - P_t||^2_2
 
@@ -60,7 +60,7 @@ L_momentum(m; g_t, P_t) = ||m @ g_t - P_t||^2_2
 The gradient of this objective **depends on m_t**:
 
 <!-- HADES: hope_equations/eq-049-l2-momentum-update (§4.4 Eq 49) -->
-```
+```text
 -- Delta Momentum update (HOPE Eq 49):
 m_{t+1} = m_t * (alpha_{t+1} - g_t^T @ g_t) - eta_t * P_t @ g_t
 
@@ -72,7 +72,7 @@ m_{t+1} = m_t * (alpha_{t+1} - g_t^T @ g_t) - eta_t * P_t @ g_t
 Combined with the weight update:
 
 <!-- HADES: hope_equations/eq-048-l2-momentum-weight (§4.4 Eq 48) -->
-```
+```text
 -- Weight update with Delta Momentum (HOPE Eqs 48-49):
 FUNCTION: delta_momentum_step(W: &mut Tensor, m: &mut Tensor,
                                g: &Tensor, P: &Tensor,
@@ -93,7 +93,7 @@ FUNCTION: delta_momentum_step(W: &mut Tensor, m: &mut Tensor,
 DMGD goes further — replace the linear momentum memory with an MLP:
 
 <!-- HADES: hope_equations/eq-050-dmgd (§4.4 Eq 50) -->
-```
+```text
 -- DMGD (HOPE Eq 50):
 W_{t+1} = W_t + m_{t+1}(u_t)
 
@@ -116,7 +116,7 @@ Two additional knobs enhance DMGD:
 ### Higher-Order Feature Maps
 
 <!-- HADES: hope_equations/eq-051-higher-order-features (§4.4 Eq 51) -->
-```
+```text
 -- Feature-mapped momentum (HOPE Eq 51):
 m_{t+1} = alpha * m_t - eta * P_t @ phi(g_t)
 
@@ -128,7 +128,7 @@ m_{t+1} = alpha * m_t - eta * P_t @ phi(g_t)
 ### Nonlinear Outputs (Newton-Schulz → Muon)
 
 <!-- HADES: hope_equations/eq-052-nonlinear-outputs (§4.4 Eq 52) -->
-```
+```text
 -- Nonlinear output momentum (HOPE Eq 52):
 W_{t+1} = W_t + sigma(m_{t+1}(u_t))
 
@@ -142,7 +142,7 @@ m_{t+1} = alpha * m_t - eta * nabla L^(2)(m_t; u_t, I)
 ## The Momentum Expressiveness Hierarchy
 
 <!-- HADES: hope_equations/eq-033-ema-momentum through eq-052-nonlinear-outputs (§4.2–4.4) -->
-```
+```text
 | Level | Momentum Type        | Objective     | State-Dep | Cost     | HOPE Eq |
 |-------|---------------------|---------------|-----------|----------|---------|
 | 0     | None (plain GD)     | —             | —         | O(1)     | Eq 32   |
@@ -160,7 +160,7 @@ mirrors the memory rule upgrade: Hebbian → Delta → Titans (MLP).
 
 DMGD and DGD operate at different levels:
 
-```
+```text
 -- DGD: upgrades the MEMORY update (inner loop)
 --   M_{t+1} = (1-alpha) * M - theta * (M@k - v) @ k^T
 --   The M@k term makes it state-dependent
@@ -176,7 +176,7 @@ DMGD and DGD operate at different levels:
 
 When DGD composes with Delta Momentum (the combination used in practice):
 
-```
+```text
 FUNCTION: dgd_with_delta_momentum(M: &mut Tensor, S: &mut Tensor,
                                    k: &Tensor, v: &Tensor,
                                    alpha_t: f32, theta_t: f32,
@@ -198,7 +198,7 @@ The backward pass through Delta Momentum requires gradients w.r.t. the
 outer-loop parameters that produce g, P, alpha, eta.
 
 <!-- HADES: Derived from hope_equations/eq-049-l2-momentum-update (§4.4 Eq 49), analytical VJP -->
-```
+```text
 -- Forward: S_{t+1} = S_t * (alpha_t - g_t^T g_t) - eta_t * P_t @ g_t
 -- Let D_t = alpha_t - g_t^T g_t (the gradient-dependent decay scalar)
 
@@ -230,7 +230,7 @@ the linear scan trick from Titans Eq 18 is inapplicable. Use the same
 chunkwise strategy as DGD:
 
 <!-- HADES: hope_equations/eq-090-chunk-wise-update (§8.2 Eq 90, applied to momentum) -->
-```
+```text
 -- Split sequence into chunks of size C
 -- For each chunk:
 --   1. Freeze S at chunk boundary (S_chunk_start)
@@ -248,7 +248,7 @@ require chunkwise.
 The HOPE paper (Table 6) shows momentum's impact:
 
 <!-- HADES: HOPE (2512.24695) Table 6 ablation study -->
-```
+```text
 | Configuration          | Perplexity | Delta vs Full |
 |------------------------|-----------|---------------|
 | Hope (full, with DMGD) | 12.24     | baseline      |
@@ -286,7 +286,7 @@ impact after weight decay (+1.47 ppl) and larger than DGD (+1.17 ppl).
 
 ## Axiom Compliance
 
-- **NL IS #4** (compressing context): DMGD compresses gradient history with state awareness.
-- **NL IS #6** (optimizers are associative memory): DMGD makes explicit that momentum IS memory.
+- **NL IS #4** (compressing context): Compresses gradient history with state awareness.
+- **NL IS #6** (optimizers are associative memory): Makes explicit that momentum IS memory.
 - **NL IS #7** (self-modifying): The S-dependent decay means momentum adapts based on its own state.
-- **NL IS #10** (nested optimization): DMGD is literally a nested optimizer — it optimizes within the optimizer.
+- **NL IS #10** (nested optimization): A nested optimizer — optimizes within the optimizer.
