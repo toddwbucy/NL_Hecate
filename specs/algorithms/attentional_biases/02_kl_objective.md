@@ -26,8 +26,11 @@ CONTRACT
               as a distribution (or be converted via softmax(v_t / tau)).
   Position:   specs/algorithms/attentional_biases/02_kl_objective.md
               Sibling of: 01_l1_sign.md (L1 bias), L2 (standard, in variants)
-  Source:     Derived from MIRAS (2504.13173) §5.1 general framework +
-              §5.2 Eq 18 (f-divergence machinery applied as attentional bias)
+  Source:     Novel extension of MIRAS (2504.13173) §5.1 attentional bias
+              framework. MIRAS documents L2, L1, Huber, l_p as bias choices;
+              this spec extends to KL divergence (cross-entropy) by analogy.
+              Note: MIRAS §5.2 Eq 18 applies f-divergence to RETENTION, not
+              attentional bias — this spec applies KL to the BIAS knob instead.
 ```
 
 ## Motivation: Why KL as Attentional Bias?
@@ -43,10 +46,11 @@ CONTRACT
 --    Using KL as the inner-loop bias aligns the memory's objective with
 --    the model's objective — both optimize the same quantity.
 --
--- 2. Softmax attention (standard) already uses a KL-like objective:
---    softmax(Q K^T / sqrt(d)) V computes attention weights that
---    minimize KL divergence between the query and key distributions.
---    KL bias makes this connection explicit for recurrent memory.
+-- 2. Softmax attention produces a probability distribution over keys:
+--    softmax(Q K^T / sqrt(d)) normalizes dot products into weights
+--    that sum to 1 — a categorical distribution over positions.
+--    KL bias makes memory output a distribution too, aligning the
+--    representational form of recurrent memory with attention.
 --
 -- 3. When memory stores next-token predictions (common in LM heads),
 --    KL is the natural loss — it measures how many bits of information
@@ -249,6 +253,6 @@ dL/deta_t = -trace(grad_W_t^T @ dL/dW_t)
 
 ## Axiom Compliance
 
-- **NL IS #4** (compressing context): KL bias compresses context into a probability distribution — the most information-efficient representation for categorical data.
-- **NL IS #6** (optimizers are associative memory): The memory learns a distribution over values, making the connection to probabilistic memory explicit.
-- **NL IS #9** (principled not ad hoc): KL divergence is the unique loss function satisfying the axioms of information theory (Gibbs' inequality). Using it as the bias is maximally principled.
+- **#4** (compressing context): KL bias compresses context into a probability distribution — the most information-efficient representation for categorical data.
+- **#6** (optimizers are associative memory): Memory learns a distribution over values, making the connection to probabilistic associative memory explicit.
+- **#9** (principled not ad hoc): KL divergence is the unique loss satisfying the axioms of information theory (Gibbs' inequality), making it maximally principled as a bias choice.
