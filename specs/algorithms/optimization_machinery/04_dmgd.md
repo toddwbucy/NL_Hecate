@@ -160,6 +160,7 @@ mirrors the memory rule upgrade: Hebbian → Delta → Titans (MLP).
 
 DMGD and DGD operate at different levels:
 
+<!-- HADES: hope_equations/eq-088-practical-dgd-update (§8.1 Eq 88, DGD); hope_equations/eq-049-l2-momentum-update (§4.4 Eq 49, Delta Momentum) -->
 ```text
 -- DGD: upgrades the MEMORY update (inner loop)
 --   M_{t+1} = (1-alpha) * M - theta * (M@k - v) @ k^T
@@ -176,6 +177,7 @@ DMGD and DGD operate at different levels:
 
 When DGD composes with Delta Momentum (the combination used in practice):
 
+<!-- HADES: Composite of hope_equations/eq-121-delta-gd-final (Appendix C Eq 121) + hope_equations/eq-049-l2-momentum-update (§4.4 Eq 49) -->
 ```text
 FUNCTION: dgd_with_delta_momentum(M: &mut Tensor, S: &mut Tensor,
                                    k: &Tensor, v: &Tensor,
