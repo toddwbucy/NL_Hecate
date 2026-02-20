@@ -108,21 +108,22 @@ FUNCTION: sigmoid_bounded_step(W: &mut Tensor, grad: &Tensor,
   -- Step 1: Map to logit space (unconstrained)
   Z = logit(W)                    -- Z = log(W / (1 - W)), Z in (-inf, +inf)
 
-  -- Step 2: Decay + gradient step in logit space
-  Z = (1 - lambda_t) * Z - eta_prime * grad_logit
+  -- Step 2: Compute logit-space gradient (chain rule: dL/dZ = dL/dW * dW/dZ)
+  grad_logit = grad * W * (1 - W)   -- dW/dZ = sigmoid(Z)*(1-sigmoid(Z)) = W*(1-W)
 
-  -- where:
-  --   lambda_t = barrier strength parameter
-  --   eta_prime = effective learning rate
-  --   grad_logit = grad * W * (1 - W)   -- chain rule: dL/dZ = dL/dW * dW/dZ
-  --   dW/dZ = sigmoid(Z) * (1 - sigmoid(Z)) = W * (1 - W)
+  -- Step 3: Decay + gradient step in logit space
+  Z = (1 - alpha_t) * Z - eta_t * grad_logit
 
-  -- Step 3: Map back to (0, 1)
+  -- alpha_t: retention gate (same as L2 decay). Controls logit-space decay.
+  --   alpha_t → 0: full retention (Z unchanged). alpha_t → 1: full decay (Z → 0).
+  -- eta_t: learning rate gate. Scales the logit-space gradient.
+
+  -- Step 4: Map back to (0, 1)
   W = sigmoid(Z)                  -- W = 1 / (1 + exp(-Z))
 
   -- Properties:
   --   sigmoid maps R → (0, 1), so W stays bounded regardless of Z.
-  --   Decay in logit space: (1-lambda) * Z shrinks logits toward 0,
+  --   Decay in logit space: (1-alpha_t) * Z shrinks logits toward 0,
   --   which maps to W → 0.5 (the maximum-entropy point).
   --   This is analogous to how L2 decay shrinks W toward 0,
   --   but here the "zero" of logit space is W = 0.5.
@@ -157,18 +158,19 @@ FUNCTION: sigmoid_bounded_step(W: &mut Tensor, grad: &Tensor,
 ```text
 -- Forward:
 --   Z_t = logit(W_{t-1})                          -- to logit space
---   Z_t = (1 - lambda_t) * Z_t - eta_t * grad_t * W_{t-1} * (1 - W_{t-1})
+--   grad_logit_t = grad_t ⊙ W_{t-1} ⊙ (1 - W_{t-1})
+--   Z_t = (1 - alpha_t) * Z_t - eta_t * grad_logit_t
 --   W_t = sigmoid(Z_t)                            -- back to [0,1]
 
 -- Given: dL/dW_t (upstream gradient)
--- Need: dL/dW_{t-1}, dL/dgrad_t, dL/dlambda_t, dL/deta_t
+-- Need: dL/dW_{t-1}, dL/dgrad_t, dL/dalpha_t, dL/deta_t
 
 -- Step 1: Backward through sigmoid
 --   dL/dZ_t = dL/dW_t ⊙ W_t ⊙ (1 - W_t)        (⊙ = element-wise product)
 
 -- Step 2: Backward through logit-space update
 --   Let g_logit = grad_t ⊙ W_{t-1} ⊙ (1 - W_{t-1})  (the logit-space gradient)
---   dL/dZ_{prev} = (1 - lambda_t) * dL/dZ_t      (through decay)
+--   dL/dZ_{prev} = (1 - alpha_t) * dL/dZ_t        (through decay)
 --   dL/dg_logit = -eta_t * dL/dZ_t               (through gradient step)
 
 -- Step 3: Backward through logit
@@ -177,7 +179,7 @@ FUNCTION: sigmoid_bounded_step(W: &mut Tensor, grad: &Tensor,
 --   dL/dW_{t-1} = sum of both terms
 
 -- Gate gradients (scalars):
-dL/dlambda_t = -trace(Z_{prev}^T @ dL/dZ_t)
+dL/dalpha_t = -trace(Z_{prev}^T @ dL/dZ_t)
 dL/deta_t = -trace(g_logit^T @ dL/dZ_t)
 ```
 
