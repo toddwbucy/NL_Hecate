@@ -117,7 +117,7 @@ Each core paper is decomposed into `{prefix}_equations`, `{prefix}_definitions`,
 - `nl_reframings` (33) — PyTorch→NL concept mappings
 - `nl_optimizers` (14) — optimizer catalog
 - `nl_toolchain` (15) — Rust/CUDA toolchain notes (includes historical Enzyme notes)
-- `hecate_specs` (48) — mirror of spec files
+- `hecate_specs` (70) — mirror of spec files
 - `paper_edges` (94) — graph edges connecting papers
 
 ### Common Queries
@@ -137,6 +137,66 @@ hades --database NL db aql "FOR doc IN nl_code_smells FILTER doc.id == 'CS-32' R
 
 # Graph traversal — find what a paper connects to
 hades --database NL db graph neighbors --start "arxiv_metadata/2504.13173" --graph paper_graph
+```
+
+## Graph Maintenance (HADES Spec Ingestion)
+
+When writing or modifying a spec file in `specs/`, the corresponding HADES graph node and trace edges must be maintained at the same time — not as a batch cleanup afterward.
+
+**On spec creation** (e.g., new S3b spec):
+1. Insert a document into `hecate_specs` with schema: `_key, title, category, version, path, purpose, paper_source, traced_to_equations, traced_to_axioms, status`
+2. Insert edge documents into `nl_hecate_trace_edges` for each equation the spec references: `_from: hecate_specs/<key>, _to: <equation_collection>/<eq-key>, rel: "implements"|"cites"`
+3. Use `rel: "implements"` when the spec is the primary implementation contract for that equation, `rel: "cites"` for secondary references
+
+**Example** (inserting a new spec + edge):
+```json
+// hecate_specs document
+{
+  "_key": "dgd",
+  "title": "Delta Gradient Descent (DGD)",
+  "category": "algorithm",
+  "version": "0.4.0",
+  "path": "algorithms/optimization_machinery/03_dgd.md",
+  "purpose": "State-dependent inner-loop optimizer via L2 regression",
+  "paper_source": ["2512.24695"],
+  "traced_to_equations": ["hope_equations/eq-088-practical-dgd-update"],
+  "traced_to_axioms": ["nl_axioms/NL_IS"],
+  "status": "v0.4.0"
+}
+
+// nl_hecate_trace_edges document
+{
+  "_from": "hecate_specs/dgd",
+  "_to": "hope_equations/eq-088-practical-dgd-update",
+  "rel": "implements"
+}
+```
+
+**On spec modification** (e.g., adding equation references):
+- Add new trace edges for newly referenced equations
+- Update the `hecate_specs` node if `traced_to_equations` or `paper_source` changed
+
+**Equation collection mapping** (arxiv ID → collection prefix):
+- Titans (2501.00663) → `titans_equations`
+- MIRAS (2504.13173) → `miras_equations`
+- HOPE (2512.24695) → `hope_equations`
+- Lattice (2504.05646) → `lattice_equations`
+- Atlas (2505.23735) → `atlas_equations`
+- TNT (2511.07343) → `tnt_equations`
+- Trellis (2512.23852) → `trellis_equations`
+
+**Verification** (should return only infra-only specs like `edge_deployment`, `wengert_tape`):
+```bash
+hades --database NL db aql "
+  FOR s IN hecate_specs
+    LET edges = (
+      FOR e IN nl_hecate_trace_edges
+        FILTER e._from == CONCAT('hecate_specs/', s._key)
+        RETURN 1
+    )
+    FILTER LENGTH(edges) == 0
+    RETURN s._key
+"
 ```
 
 ## When Working in This Repo
