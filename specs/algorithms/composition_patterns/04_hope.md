@@ -55,13 +55,14 @@ CONTRACT
 --   MAG: memory gates attention output
 --   MAL: memory preprocesses attention input
 
--- Axis 2: Level-Level Composition (HOPE Variants 1-5)
+-- Axis 2: Level-Level Composition (HOPE Variants 1-6)
 --   Answers: "How do CMS levels interact with EACH OTHER?"
 --   Chained: output flows through all levels serially
 --   Freq-Gated: each level updates at its frequency, idle otherwise
 --   Nested: slow level meta-learns fast level's initial state
 --   Sequential: level s output feeds level s+1
 --   Independent: levels process input in parallel, outputs aggregated
+--   M3 optimizer: CMS applied to the optimizer (orthogonal to architecture variants 1-5)
 
 -- These are orthogonal. Example configurations:
 --   MAG + Freq-Gated (k=4): default NL_Hecate — 4 levels, each MAG,
@@ -193,6 +194,12 @@ CONTRACT
 --   shared context flow.
 --
 -- FUNCTION: sequential_cms_forward(x: &Tensor, levels: &[Level; k], pulse: &Pulse) -> Tensor
+--   -- Initialize all levels from slowest level's meta-learned state
+--   IF pulse.is_reinit_boundary(k - 1):
+--     base_state = levels[k - 1].compress_context()
+--     FOR l in 0..k:
+--       levels[l].state = meta_learn_from(base_state, l)
+--
 --   h = x
 --   FOR l in 0..k:
 --     IF pulse.is_active(l):
