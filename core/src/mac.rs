@@ -22,6 +22,44 @@ use crate::atlas_omega::AtlasOmega;
 use crate::conductor::{Pulse, ContextState, ErrorBuffer};
 use crate::mag::MemoryCache;
 
+/// Softmax over logits: w[i] = exp(a[i]) / sum_j exp(a[j]).
+/// Numerically stable (max-subtraction).
+fn softmax(logits: &[f32]) -> Vec<f32> {
+    if logits.is_empty() {
+        return vec![];
+    }
+    let max_val = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut out = vec![0.0f32; logits.len()];
+    let mut sum_exp = 0.0f32;
+    for (i, &a) in logits.iter().enumerate() {
+        let e = (a - max_val).exp();
+        out[i] = e;
+        sum_exp += e;
+    }
+    for w in &mut out {
+        *w /= sum_exp;
+    }
+    out
+}
+
+/// Softmax over active subset only; masked positions get weight 0.
+fn masked_softmax(logits: &[f32], mask: &[bool]) -> Vec<f32> {
+    assert_eq!(logits.len(), mask.len());
+    let active: Vec<f32> = logits.iter().zip(mask.iter())
+        .filter_map(|(&a, &m)| if m { Some(a) } else { None })
+        .collect();
+    let w_active = softmax(&active);
+    let mut out = vec![0.0f32; logits.len()];
+    let mut ai = 0;
+    for (i, &m) in mask.iter().enumerate() {
+        if m {
+            out[i] = w_active[ai];
+            ai += 1;
+        }
+    }
+    out
+}
+
 /// Cache for MAC forward pass.
 pub struct MACForwardCache {
     pub embedded: Vec<f32>,       // (s, d)
@@ -463,6 +501,7 @@ pub struct CMSMACForwardCache {
     pub embedded: Vec<f32>,
     // Per-level read-only context
     pub read_caches: Vec<ReadOnlyCacheLevel>,
+    pub h_t_per_level: Vec<Vec<f32>>,
     pub h_t_combined: Vec<f32>,
     // Assembled and attention
     pub assembled: Vec<f32>,
@@ -549,17 +588,12 @@ pub fn cms_mac_forward(
         });
     }
 
-    // Combine h_t with 1/sqrt(k) for k>2
+    // Combine h_t via learnable softmax-weighted sum
+    let w_mem = softmax(&params.alpha_mem);
     let mut h_t_combined = vec![0.0f32; s * d];
-    for h in &h_t_per_level {
+    for (l, h) in h_t_per_level.iter().enumerate() {
         for i in 0..(s * d) {
-            h_t_combined[i] += h[i];
-        }
-    }
-    if cfg.k > 2 {
-        let scale = 1.0 / (cfg.k as f32).sqrt();
-        for i in 0..(s * d) {
-            h_t_combined[i] *= scale;
+            h_t_combined[i] += w_mem[l] * h[i];
         }
     }
 
@@ -611,22 +645,15 @@ pub fn cms_mac_forward(
         }
     }
 
-    // Combine reflective outputs (active levels only)
+    // Combine reflective outputs via learnable masked softmax
+    let active_mask: Vec<bool> = reflective_per_level.iter().map(|r| r.is_some()).collect();
+    let w_refl = masked_softmax(&params.alpha_refl, &active_mask);
     let mut reflective_y_combined = vec![0.0f32; s * d];
-    let mut active_count = 0usize;
-    for refl in &reflective_per_level {
+    for (l, refl) in reflective_per_level.iter().enumerate() {
         if let Some(r) = refl {
             for i in 0..(s * d) {
-                reflective_y_combined[i] += r[i];
+                reflective_y_combined[i] += w_refl[l] * r[i];
             }
-            active_count += 1;
-        }
-    }
-    // Normalize if multiple active levels contribute to reflective signal
-    if active_count > 2 {
-        let scale = 1.0 / (active_count as f32).sqrt();
-        for i in 0..(s * d) {
-            reflective_y_combined[i] *= scale;
         }
     }
 
@@ -652,7 +679,7 @@ pub fn cms_mac_forward(
     let loss = cross_entropy_loss(&logits, target_ids, s, v);
 
     let cache = CMSMACForwardCache {
-        embedded, read_caches, h_t_combined,
+        embedded, read_caches, h_t_per_level, h_t_combined,
         assembled, q, k, v: vv, attn_out, attn_weights, y_t,
         step_caches, reflective_per_level, reflective_y_combined,
         reflective_gate, gated_out,
@@ -746,26 +773,39 @@ pub fn cms_mac_backward(
             * (1.0 - cache.reflective_gate[i]);
     }
 
-    // Normalize reflective gradient if multiple active levels
-    let active_count = cache.step_caches.iter().filter(|c| c.is_some()).count();
-    if active_count > 2 {
-        let scale = 1.0 / (active_count as f32).sqrt();
-        for i in 0..(s * d) {
-            d_reflective_y_combined[i] *= scale;
-        }
-    }
+    // Learnable reflective aggregation backward: per-level gradient + d_alpha_refl
+    let active_mask: Vec<bool> = cache.step_caches.iter().map(|c| c.is_some()).collect();
+    let w_refl = masked_softmax(&params.alpha_refl, &active_mask);
 
     // ── Stage 7: Per-level step backward (active levels only) ────────
     let mut d_y_t_mem_total = vec![0.0f32; s * d];
     for level in 0..cfg.k {
         if let Some(ref step_cache) = cache.step_caches[level] {
+            // Each active level gets d_refl_level = w_refl[l] * d_reflective_y_combined
+            let d_refl_level: Vec<f32> = d_reflective_y_combined.iter()
+                .map(|&dy| dy * w_refl[level]).collect();
             let (mem_grads, d_y_t_mem) = step_backward_dispatch(
-                cfg, &params.levels[level], step_cache, &d_reflective_y_combined, &cache.y_t,
+                cfg, &params.levels[level], step_cache, &d_refl_level, &cache.y_t,
             );
             grads.levels[level].accumulate(&mem_grads);
             for i in 0..(s * d) {
                 d_y_t_mem_total[i] += d_y_t_mem[i];
             }
+        }
+    }
+
+    // d_alpha_refl: full softmax Jacobian (active subset only)
+    let dots_refl: Vec<f32> = (0..cfg.k).map(|l| {
+        if let Some(ref r) = cache.reflective_per_level[l] {
+            (0..s * d).map(|i| d_reflective_y_combined[i] * r[i]).sum::<f32>()
+        } else {
+            0.0
+        }
+    }).collect();
+    let weighted_dot_sum_refl: f32 = (0..cfg.k).map(|j| w_refl[j] * dots_refl[j]).sum();
+    for level in 0..cfg.k {
+        if active_mask[level] {
+            grads.alpha_refl[level] = w_refl[level] * (dots_refl[level] - weighted_dot_sum_refl);
         }
     }
 
@@ -814,22 +854,30 @@ pub fn cms_mac_backward(
     let d_h_t_combined = &d_assembled[..s * d];
     let d_embedded_attn = &d_assembled[s * d..];
 
-    // 1/sqrt(k) chain rule for h_t normalization
-    let mut d_h_t_per_level = d_h_t_combined.to_vec();
-    if cfg.k > 2 {
-        let scale = 1.0 / (cfg.k as f32).sqrt();
-        for i in 0..(s * d) {
-            d_h_t_per_level[i] *= scale;
-        }
+    // Learnable memory aggregation backward: per-level gradient + d_alpha_mem
+    let w_mem = softmax(&params.alpha_mem);
+
+    // d_alpha_mem: full softmax Jacobian
+    // d_alpha[l] = w[l] * (dot_l - sum_j(w[j] * dot_j))
+    // where dot_l = sum_i(d_y[i] * y_l[i])
+    let dots_mem: Vec<f32> = (0..cfg.k).map(|l| {
+        (0..s * d).map(|i| d_h_t_combined[i] * cache.h_t_per_level[l][i]).sum::<f32>()
+    }).collect();
+    let weighted_dot_sum: f32 = (0..cfg.k).map(|j| w_mem[j] * dots_mem[j]).sum();
+    for level in 0..cfg.k {
+        grads.alpha_mem[level] = w_mem[level] * (dots_mem[level] - weighted_dot_sum);
     }
 
     // ── Stage 2: Per-level read-only backward ────────────────────────
     let mut d_embedded_read_total = vec![0.0f32; s * d];
     for level in 0..cfg.k {
+        // Each level gets d_h_level = w_mem[l] * d_h_t_combined
+        let d_h_t_level: Vec<f32> = d_h_t_combined.iter()
+            .map(|&dy| dy * w_mem[level]).collect();
         let rc = &cache.read_caches[level];
         let (mem_grads_read, d_embedded_read) = read_only_backward_dispatch(
             cfg, &params.levels[level], &rc.frozen_m, &rc.q_mem,
-            &d_h_t_per_level, &cache.embedded, s, d,
+            &d_h_t_level, &cache.embedded, s, d,
         );
         // Read-only grads go to error buffers for frozen levels, direct grads for active
         if cache.pulse.active_levels[level] {

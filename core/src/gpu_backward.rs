@@ -78,7 +78,7 @@ impl GpuMAGGrads {
             lp
         }).collect();
 
-        crate::model::MAGParams { swa, levels }
+        crate::model::MAGParams { swa, levels, alpha_mem: vec![0.0f32; cfg.k], alpha_refl: vec![0.0f32; cfg.k] }
     }
 }
 

@@ -165,6 +165,8 @@ impl GpuMAGParams {
         MAGParams {
             swa: self.swa.to_host(d, v),
             levels: self.levels.iter().map(|l| l.to_host(d)).collect(),
+            alpha_mem: vec![0.0f32; cfg.k],
+            alpha_refl: vec![0.0f32; cfg.k],
         }
     }
 }
@@ -197,6 +199,14 @@ impl GpuContextState {
             gpu_mem.copy_to_host(&mut ctx.memory[i]);
         }
         ctx
+    }
+
+    /// Zero all memory matrices on GPU in-place (cudaMemset).
+    /// Used at document boundaries — same semantics as ContextState::reset().
+    pub fn reset(&mut self) {
+        for buf in &self.memory {
+            buf.zero();
+        }
     }
 
     /// Upload from host ContextState (for restore).

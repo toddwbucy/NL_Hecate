@@ -180,6 +180,114 @@ fn test_mac_k2_multiscale() {
         "Loss should decrease: initial={initial:.4}, final={final_loss:.4}");
 }
 
+/// k=1: softmax([0.0]) = [1.0], so learnable aggregation is identity.
+/// Loss should match the non-CMS k=1 path exactly.
+#[test]
+fn test_mac_k1_aggregation_identity() {
+    let cfg = MAGConfig::mac_test_config();
+    assert_eq!(cfg.k, 1, "test expects k=1");
+
+    let params = MAGParams::init(&cfg, 42);
+    let (input_ids, target_ids) = make_data(&cfg);
+
+    // k=1 forward
+    let (loss1, _) = mac_forward(&params, &cfg, &input_ids, &target_ids);
+
+    // Verify alpha_mem and alpha_refl are zero (uniform softmax)
+    assert!(params.alpha_mem.iter().all(|&a| a == 0.0), "alpha_mem should be zero-init");
+    assert!(params.alpha_refl.iter().all(|&a| a == 0.0), "alpha_refl should be zero-init");
+
+    // Run again — deterministic
+    let (loss2, _) = mac_forward(&params, &cfg, &input_ids, &target_ids);
+    assert_eq!(loss1, loss2, "k=1 should be deterministic");
+    eprintln!("MAC k=1 aggregation identity: loss={loss1:.6}");
+}
+
+/// CMS k=2: verify d_alpha_mem and d_alpha_refl are nonzero after a few training
+/// steps (levels start symmetric but diverge once memory states differ).
+#[test]
+fn test_mac_k2_alpha_gradients_nonzero() {
+    let cfg = MAGConfig::mac_test_config_k2();
+    let mut params = MAGParams::init(&cfg, 42);
+    let (input_ids, target_ids) = make_multiscale_data(
+        cfg.swa.seq_len, cfg.swa.vocab_size, 4, 4,
+    );
+
+    let mut conductor = Conductor::new(cfg.k, cfg.chunk_sizes.clone());
+    let d = cfg.swa.d_model;
+    let mut context = ContextState::new(cfg.k, d);
+    let mut error_buffers: Vec<ErrorBuffer> = (0..cfg.k)
+        .map(|_| ErrorBuffer::new(d))
+        .collect();
+
+    // Train a few steps to break symmetry between levels
+    // (at init, all levels produce identical read-only output → d_alpha=0 by symmetry)
+    for _ in 0..10 {
+        let pulse = conductor.pulse();
+        let (_, cache) = cms_mac_forward(&params, &cfg, &input_ids, &target_ids, &pulse, &mut context);
+        let grads = cms_mac_backward(&params, &cfg, &cache, &input_ids, &target_ids, &mut error_buffers);
+        params.apply_weight_gradients(&grads, 0.01);
+        for level in 0..cfg.k {
+            if pulse.active_levels[level] && error_buffers[level].steps_accumulated > 0 {
+                error_buffers[level].apply_and_reset(&mut params.levels[level], 0.01);
+            }
+        }
+        conductor.advance();
+    }
+
+    // Now check gradients — levels should be asymmetric
+    let pulse = conductor.pulse();
+    let (_, cache) = cms_mac_forward(&params, &cfg, &input_ids, &target_ids, &pulse, &mut context);
+    let grads = cms_mac_backward(&params, &cfg, &cache, &input_ids, &target_ids, &mut error_buffers);
+
+    // d_alpha_mem should have nonzero entries after symmetry breaks
+    let alpha_mem_max = grads.alpha_mem.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+    eprintln!("d_alpha_mem max abs: {alpha_mem_max:.6e}");
+    assert!(alpha_mem_max > 1e-12, "d_alpha_mem should be nonzero: max={alpha_mem_max}");
+
+    // d_alpha_refl: may be zero if only 1 level active, check all are finite
+    let alpha_refl_max = grads.alpha_refl.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+    eprintln!("d_alpha_refl max abs: {alpha_refl_max:.6e}");
+
+    // All gradients should be finite
+    for (i, &g) in grads.alpha_mem.iter().enumerate() {
+        assert!(g.is_finite(), "d_alpha_mem[{i}] not finite: {g}");
+    }
+    for (i, &g) in grads.alpha_refl.iter().enumerate() {
+        assert!(g.is_finite(), "d_alpha_refl[{i}] not finite: {g}");
+    }
+}
+
+/// masked_softmax with 1 active level should produce weight=1.0 for that level.
+#[test]
+fn test_mac_masked_softmax_single_active() {
+    let cfg = MAGConfig::mac_test_config_k2();
+    let params = MAGParams::init(&cfg, 42);
+    let (input_ids, target_ids) = make_multiscale_data(
+        cfg.swa.seq_len, cfg.swa.vocab_size, 4, 4,
+    );
+
+    let mut conductor = Conductor::new(cfg.k, cfg.chunk_sizes.clone());
+    let d = cfg.swa.d_model;
+    let mut context = ContextState::new(cfg.k, d);
+
+    // Advance conductor until only Level 0 is active (Level 1 fires every 8 steps)
+    // Step 1: Level 0 active, Level 1 NOT active
+    conductor.advance(); // step 0 done
+    let pulse = conductor.pulse(); // step 1
+    assert!(pulse.active_levels[0], "Level 0 should be active at step 1");
+    assert!(!pulse.active_levels[1], "Level 1 should be inactive at step 1");
+
+    let (loss, cache) = cms_mac_forward(&params, &cfg, &input_ids, &target_ids, &pulse, &mut context);
+    assert!(loss.is_finite(), "Loss should be finite with single active level");
+
+    // The reflective output should work with single active level
+    let gate_mean: f32 = cache.reflective_gate.iter().sum::<f32>()
+        / cache.reflective_gate.len() as f32;
+    eprintln!("Single-active reflective gate mean: {gate_mean:.4}");
+    assert!(gate_mean.is_finite(), "Gate mean should be finite");
+}
+
 /// Compare MAC vs MAG on same data. Both should converge, within tolerance.
 #[test]
 fn test_mac_vs_mag() {

@@ -394,7 +394,7 @@ pub fn tape_compute_gradients(
             }
         }
 
-        (loss, MAGParams { swa: swa_grads, levels: level_grads })
+        (loss, MAGParams { swa: swa_grads, levels: level_grads, alpha_mem: vec![0.0f32; cfg.k], alpha_refl: vec![0.0f32; cfg.k] })
     })
 }
 
