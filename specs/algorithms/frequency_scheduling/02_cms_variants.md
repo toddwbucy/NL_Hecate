@@ -99,13 +99,71 @@ Mix CMS blocks with non-CMS blocks.
 -- others are standard attention-only blocks.
 ```
 
+## Output Aggregation
+
+```text
+-- When k > 1, CMS produces one output per active level per step.
+-- These must be combined into a single output tensor.
+--
+-- HADES: hope_equations/eq-074-frequency-gated (learnable combination weights)
+
+AGGREGATION (two sites, same mechanism):
+  -- Site 1: Memory output (h_t_combined)
+  w_mem  = softmax(alpha_mem)          -- [k] normalized weights
+  h_t    = sum_l w_mem[l] * h_t_l      -- weighted memory output
+
+  -- Site 2: Reflective gate signal (reflective_y_combined)
+  w_refl = softmax(alpha_refl[active]) -- only active levels contribute
+  r_t    = sum_l w_refl[l] * r_t_l     -- weighted reflective signal
+
+  -- Both alpha vectors: [k] f32, outer_loop_param lifetime, init zeros
+  -- Zeros → uniform 1/k weighting at init (softmax of equal values)
+  -- The Wengert tape differentiates through softmax and the weighted sum
+  -- (TapeOp::WeightedSum), so both alpha vectors learn from the training signal.
+  --
+  -- When k=1: softmax([alpha_0]) = [1.0], reduces to identity.
+  -- No special-casing needed for any value of k.
+
+WHY LEARNABLE (not fixed):
+  -- Fixed 1/k or 1/sqrt(k) normalization violates NL IS #9 (principled, not ad hoc).
+  -- Different levels contribute differently depending on the task.
+  -- Learnable weights let the model discover the right balance.
+  -- Cost: k additional f32 parameters per CMS block — negligible.
+
+PHASE 2 EXTENSION (future, requires self-referential infrastructure S3b-S12):
+  -- alpha_l becomes context-dependent: M_agg(x_t) produces per-token weights.
+  -- Uses ProjectionKind::Adaptive(rule) from self_referential/00_interface.md.
+  -- See composition_patterns/04_hope.md Variant 2 and task_44105a.
+
+IMPLEMENTATION SITES (core/src/mac.rs, task_44105a):
+  -- Two aggregation points, each with forward + backward:
+  --
+  -- 1. Memory output aggregation (h_t_combined):
+  --    Forward  L552-564: sum h_t_per_level[l], then scale by 1/sqrt(k) if k>2
+  --    Backward L817-824: chain rule scales d_h_t_per_level by same 1/sqrt(k)
+  --
+  -- 2. Reflective gate signal aggregation (reflective_y_combined):
+  --    Forward  L625-631: sum active reflective outputs, scale by 1/sqrt(active) if >2
+  --    Backward L749-756: chain rule scales d_reflective_y by same 1/sqrt(active)
+  --
+  -- Both sites follow the same pattern:
+  --    OLD: sum then conditionally scale by 1/sqrt(count)
+  --    NEW: softmax(alpha) weighted sum — tape records WeightedSum op
+  --
+  -- Note: Site 2 (reflective) uses active_count not k — frozen levels don't
+  -- contribute reflective signal. alpha_reflective may need separate weights
+  -- or reuse the same alpha with masking for inactive levels.
+```
+
 ## Configuration Interface
 
-```
+```text
 STRUCT: CMSConfig
   n_levels: usize                -- k: number of frequency levels
   frequencies: Vec<u64>          -- [1, 8, 64, 512] typically
   level_dims: Vec<usize>         -- parameter count per level
+  alpha_mem: Vec<f32>            -- [k] memory output aggregation logits (outer_loop_param, init zeros)
+  alpha_refl: Vec<f32>           -- [k] reflective signal aggregation logits (outer_loop_param, init zeros)
   variant: CMSVariant            -- Basic, Nested, Sequential, Independent, Hybrid
   blocks: Vec<BlockConfig>       -- per-block configuration
 
@@ -123,6 +181,7 @@ When k=1 with frequency=[1], CMS reduces to a standard Transformer block:
 - No error accumulation
 - No multi-scale behavior
 - Standard MLP with standard optimizer
+- Aggregation: softmax([alpha_0]) = [1.0] — identity, no combination needed
 
 This is important: CMS is a STRICT GENERALIZATION of the Transformer.
 Every Transformer is a CMS model with k=1. The papers prove this formally.
