@@ -99,6 +99,38 @@ Mix CMS blocks with non-CMS blocks.
 -- others are standard attention-only blocks.
 ```
 
+## Output Aggregation
+
+```
+-- When k > 1, CMS produces one output per active level per step.
+-- These must be combined into a single output tensor.
+--
+-- HADES: hope_equations/eq-074-frequency-gated (learnable combination weights)
+
+AGGREGATION:
+  alpha: [k] f32                 -- raw logits, outer_loop_param lifetime
+  weights = softmax(alpha)       -- normalized per-level weights, always sum to 1
+  y = sum_l weights[l] * y_l     -- weighted combination of level outputs
+
+  -- alpha is initialized to zeros → uniform 1/k weighting at init
+  -- The Wengert tape differentiates through softmax and the weighted sum
+  -- (TapeOp::WeightedSum), so alpha learns from the training signal.
+  --
+  -- When k=1: softmax([alpha_0]) = [1.0], reduces to identity.
+  -- No special-casing needed for any value of k.
+
+WHY LEARNABLE (not fixed):
+  -- Fixed 1/k or 1/sqrt(k) normalization violates NL IS #9 (principled, not ad hoc).
+  -- Different levels contribute differently depending on the task.
+  -- Learnable weights let the model discover the right balance.
+  -- Cost: k additional f32 parameters per CMS block — negligible.
+
+PHASE 2 EXTENSION (future, requires self-referential infrastructure S3b-S12):
+  -- alpha_l becomes context-dependent: M_agg(x_t) produces per-token weights.
+  -- Uses ProjectionKind::Adaptive(rule) from self_referential/00_interface.md.
+  -- See composition_patterns/04_hope.md Variant 2 and task_44105a.
+```
+
 ## Configuration Interface
 
 ```
@@ -106,6 +138,7 @@ STRUCT: CMSConfig
   n_levels: usize                -- k: number of frequency levels
   frequencies: Vec<u64>          -- [1, 8, 64, 512] typically
   level_dims: Vec<usize>         -- parameter count per level
+  alpha: Vec<f32>                -- [k] aggregation logits (outer_loop_param, init zeros)
   variant: CMSVariant            -- Basic, Nested, Sequential, Independent, Hybrid
   blocks: Vec<BlockConfig>       -- per-block configuration
 
@@ -123,6 +156,7 @@ When k=1 with frequency=[1], CMS reduces to a standard Transformer block:
 - No error accumulation
 - No multi-scale behavior
 - Standard MLP with standard optimizer
+- Aggregation: softmax([alpha_0]) = [1.0] — identity, no combination needed
 
 This is important: CMS is a STRICT GENERALIZATION of the Transformer.
 Every Transformer is a CMS model with k=1. The papers prove this formally.
