@@ -70,6 +70,7 @@ TRAIT: MemoryUpdateRule
     Query memory with q, return output.
     Does NOT mutate state. Pure function.
 
+  <!-- HADES: Derived from miras_equations/eq-008-hebbian-rule (MIRAS Eq 8, k/v/q projections); H3 (Fu et al. 2023, arXiv 2212.14052, short conv convention); specs/infrastructure/attention/02_short_conv.md -->
   STEP(state: &mut State, x: &Tensor, outer: &OuterParams, pulse: &Pulse) -> Tensor
     Combined operation: project x to k,v,q; apply short conv; compute gates; WRITE; READ.
     The k and q inputs to WRITE/READ are post-convolution outputs — already
