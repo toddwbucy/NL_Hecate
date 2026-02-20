@@ -7,11 +7,12 @@ This document provides the single authoritative view of project progress and upc
 The project is organized into **Stages**, each containing **Milestones**. No two milestones share a name.
 
 ```
-Stage 0: Foundation       — Toolchain, spike, pipeline validation
-Stage 1: Algorithm Core   — Memory rules, compositions, scheduling, parallelization
-Stage 2: Production Infra — Multi-GPU, serving, compilation, deployment
-Stage 3: Extensions       — Pluggable retention, M3 optimizer, CMS variants
-Stage 4: MVP              — Build a model, serve it locally
+Stage 0:  Foundation            — Toolchain, spike, pipeline validation
+Stage 1:  Algorithm Core        — Memory rules, compositions, scheduling, parallelization
+Stage 2:  Production Infra      — Multi-GPU, serving, compilation, deployment
+Stage 3:  Extensions            — Pluggable retention, M3 optimizer, CMS variants
+Stage 3b: Primitive Completeness — Remaining MIRAS knobs, self-referential architecture, Hope
+Stage 4:  MVP                   — Build a model, serve it locally
 ```
 
 ---
@@ -316,6 +317,107 @@ CMS frequencies were hardcoded `[1, 8, 64, 512]` with pure modular arithmetic. T
 
 ---
 
+## Stage 3b: Primitive Completeness (NOT STARTED)
+
+The NL paper suite defines ~50 primitives. Stages 1-3 implemented 26. This stage completes the primitive inventory — **specs first, then code**. Each primitive gets a spec sheet built from HADES graph traceability (paper equations, source fields) before any Rust touches a keyboard.
+
+The Hope architecture (self-modifying Titans + CMS) is the castle. These are the lego pieces.
+
+### Spec Work: Phase 1 — Inner-Loop Algorithm Knobs
+
+The MIRAS Algorithm knob currently has {GD, GD+Momentum}. The papers define at least 5 more.
+
+| Spec Task | Primitive | Paper Source | Spec Path (planned) | Status |
+|-----------|-----------|-------------|---------------------|--------|
+| **S3b-S1** | DGD (Delta Gradient Descent) | HOPE (2512.24695) §4.5 | `specs/algorithms/optimization_machinery/03_dgd.md` | NOT STARTED |
+| **S3b-S2** | DMGD (Deep Momentum Gradient Descent) | HOPE (2512.24695) §4.5 Eq 33+ | `specs/algorithms/optimization_machinery/04_dmgd.md` | NOT STARTED |
+| **S3b-S3** | FTRL (Follow the Regularized Leader) | MIRAS (2504.13173) §3.1 | `specs/algorithms/optimization_machinery/05_ftrl.md` | NOT STARTED |
+| **S3b-S4** | Implicit GD (Longhorn-style) | Atlas (2505.23735) Table 1 | `specs/algorithms/optimization_machinery/06_implicit_gd.md` | NOT STARTED |
+| **S3b-S5** | Newton-Schulz (inner-loop) | Atlas/HOPE (momentum nonlinearity) | `specs/algorithms/optimization_machinery/07_newton_schulz_inner.md` | NOT STARTED |
+
+**DGD is the highest priority** — it's the core inner-loop optimizer for Hope. The update depends on both the current input AND the current memory state M, making it fundamentally more expressive than plain GD. The HOPE ablation shows ~1.2 ppl cost for removing it.
+
+### Spec Work: Phase 2 — Retention & Bias Gaps
+
+The pluggable retention system (S3-M1) provides the dispatch infrastructure. These specs fill the missing variants.
+
+| Spec Task | Primitive | Paper Source | Spec Path (planned) | Status |
+|-----------|-----------|-------------|---------------------|--------|
+| **S3b-S6** | Bregman divergence (general) | MIRAS (2504.13173) §5.2 Variant 5 | `specs/algorithms/retention_mechanisms/06_bregman.md` | NOT STARTED |
+| **S3b-S7** | L_q norm retention (general q) | MIRAS (2504.13173) §5.2 Variant 4 | `specs/algorithms/retention_mechanisms/07_lq_norm.md` | NOT STARTED |
+| **S3b-S8** | Sigmoid-bounded retention | MIRAS (2504.13173) §5.2 (Bregman+logit) | `specs/algorithms/retention_mechanisms/08_sigmoid_bounded.md` | NOT STARTED |
+| **S3b-S9** | l_1 attentional bias | MIRAS (2504.13173) §5.1 (p=1 sign-based) | `specs/algorithms/attentional_biases/01_l1_sign.md` | NOT STARTED |
+| **S3b-S10** | KL attentional bias | MIRAS (2504.13173) §5.1 (theoretical) | `specs/algorithms/attentional_biases/02_kl_objective.md` | NOT STARTED |
+| **S3b-S11** | Generic l_p bias dispatch | MIRAS (2504.13173) §5.1 Eq 11 | `specs/algorithms/attentional_biases/00_interface.md` | NOT STARTED |
+
+### Spec Work: Phase 3 — Self-Referential Architecture
+
+The central HOPE contribution. Requires Phase 1 (DGD) as a prerequisite — self-modifying without DGD is a roof without walls.
+
+| Spec Task | Primitive | Paper Source | Spec Path (planned) | Status |
+|-----------|-----------|-------------|---------------------|--------|
+| **S3b-S12** | Self-referential projections (M_k, M_v, M_q) | HOPE (2512.24695) §8.1 Eq 79-85 | `specs/algorithms/self_referential/00_interface.md` | NOT STARTED |
+| **S3b-S13** | Self-generated values (v̂ = M_□(v)) | HOPE (2512.24695) §8.1 Eq 84 | `specs/algorithms/self_referential/01_self_generated_values.md` | NOT STARTED |
+| **S3b-S14** | Higher-order feature maps φ(k) | HOPE (2512.24695) §4.5 extension | `specs/algorithms/self_referential/02_feature_maps.md` | NOT STARTED |
+| **S3b-S15** | Chunkwise training for self-ref Titans | HOPE (2512.24695) §8.2 | `specs/algorithms/self_referential/03_chunkwise_self_ref.md` | NOT STARTED |
+
+### Spec Work: Phase 4 — Outer-Loop & Architectural Gaps
+
+| Spec Task | Primitive | Paper Source | Spec Path (planned) | Status |
+|-----------|-----------|-------------|---------------------|--------|
+| **S3b-S16** | AdamW (outer-loop) | Standard / TNT experiments | `specs/algorithms/optimization_machinery/08_adamw_outer.md` | NOT STARTED |
+| **S3b-S17** | AdaMuon | Atlas (2505.23735) | `specs/algorithms/optimization_machinery/09_adamuon.md` | NOT STARTED |
+| **S3b-S18** | Atlas Omega rule spec | Atlas (2505.23735) | `specs/algorithms/memory_update_rules/titans_family/04_atlas_omega.md` | NOT STARTED |
+| **S3b-S19** | Short Conv1D on keys/queries | Atlas (2505.23735), modern convention | `specs/infrastructure/attention/02_short_conv.md` | NOT STARTED |
+| **S3b-S20** | Hope composition (self-mod Titans + CMS) | HOPE (2512.24695) §8.3 | `specs/algorithms/composition_patterns/04_hope.md` | NOT STARTED |
+
+### Implementation Milestones (blocked by specs)
+
+Implementation begins only after the corresponding spec is written and approved.
+
+| Milestone | Implements Specs | Description | Dependencies | Status |
+|-----------|-----------------|-------------|-------------|--------|
+| **S3b-M1: Algorithm Knob Expansion** | S3b-S1 through S3b-S5 | DGD, DMGD, FTRL, implicit GD, NS inner. New `AlgorithmKind` enum or extend existing rule dispatch. | Specs S3b-S1–S5 | NOT STARTED |
+| **S3b-M2: Retention & Bias Completion** | S3b-S6 through S3b-S11 | Bregman, L_q, sigmoid-bounded retention. l_1, KL bias. Generic l_p dispatch. | Specs S3b-S6–S11 | NOT STARTED |
+| **S3b-M3: Self-Referential Primitives** | S3b-S12 through S3b-S15 | M_k/M_v/M_q memory modules replacing W projections. Feature maps. Chunkwise parallel. | S3b-M1 (DGD required), Specs S3b-S12–S15 | NOT STARTED |
+| **S3b-M4: Outer-Loop & Architectural** | S3b-S16 through S3b-S20 | AdamW, AdaMuon, Atlas spec, short conv, Hope composition. | Specs S3b-S16–S20 | NOT STARTED |
+
+### Priority Order
+
+```
+Phase 1 Specs (Algorithm Knobs)     ─── highest priority, foundation for everything
+    │
+    ├─► Phase 2 Specs (Retention/Bias)  ─── independent of Phase 1, can parallel
+    │
+    ▼
+Phase 1 Implementation (S3b-M1)     ─── DGD needed before self-ref
+    │
+    ├─► Phase 2 Implementation (S3b-M2) ─── independent, can parallel
+    │
+    ▼
+Phase 3 Specs (Self-Referential)    ─── needs DGD spec as input
+    │
+    ▼
+Phase 3 Implementation (S3b-M3)     ─── the castle walls
+    │
+    ├─► Phase 4 Specs + Impl (S3b-M4)  ─── outer-loop + architectural gaps
+    │
+    ▼
+Hope Architecture                   ─── the castle (S3b-S20 → future milestone)
+```
+
+### Spec Writing Process
+
+Each spec follows the existing CONTRACT format and MUST include:
+1. **CONTRACT header** — Purpose, Expects, Guarantees, Cost, Trade-off, Position, Source
+2. **HADES traceability** — Specific equation numbers, paper IDs, collection references
+3. **MIRAS knob mapping** — Which knobs this primitive fills
+4. **Pseudocode** — Rust-like with trait bounds
+5. **Gradient derivation** — Analytical backward for tape integration
+6. **Interaction matrix** — Which existing primitives this composes with
+
+---
+
 ## Stage 4: MVP — Build & Serve (IN PROGRESS)
 
 Build a model and serve it locally. Not production-scale — just the primitives working end-to-end.
@@ -477,7 +579,7 @@ Stage 1: Algorithm Core ──────────────────�
                                     └─► S4-M7: Build Hardening ── PLANNED
 ```
 
-Stage 2 milestones are sequential (each builds on the last). Stage 3 milestones are independent of each other and can be done in any order. Stage 3 does not block Stage 2. Stage 4 depends on S4-M1 (serialization) for the full build→save→load→serve pipeline.
+Stage 2 milestones are sequential (each builds on the last). Stage 3 milestones are independent of each other and can be done in any order. Stage 3 does not block Stage 2. Stage 3b is spec-first: each primitive gets a spec sheet before implementation. S3b Phase 3 (self-referential) depends on S3b Phase 1 (DGD). Stage 4 depends on S4-M1 (serialization) for the full build→save→load→serve pipeline. Stage 3b and Stage 4 can proceed in parallel — Stage 3b enriches the primitive space while Stage 4 validates the build pipeline with existing primitives.
 
 ---
 
@@ -489,7 +591,7 @@ Stage 2 milestones are sequential (each builds on the last). Stage 3 milestones 
 | Stage 1: Algorithm Core | 19 | 778 Rust + 27 Python | COMPLETE |
 | Stage 2: Production Infra | 4 (+M1a, +M1b) | 33 CUDA + 13 dispatch + 6 GPU-resident + 20 edge + 18 serving + 18 distributed | COMPLETE |
 | Stage 3: Extensions | 5 | 22 retention + 35 M3/variants + 26 Atlas + 22 dynamic freq = 105 | COMPLETE |
-
+| Stage 3b: Primitive Completeness | 20 specs + 4 impl milestones | — | NOT STARTED |
 | Stage 4: MVP Build & Serve | 8 (7 done, 1 planned) | 27 Python + 120 tape/traced/class3 Rust | IN PROGRESS |
 
-**Current position**: S0–S3 complete. S4 MVP pipeline delivered (M1–M6, M8): can build a model on real text data and serve it locally. Wengert tape is the production gradient path (M8, PRs #55–65). S4-M7 (build hardening) is next — run the 60M toy model end-to-end. Total test count: 834 Rust lib + 27 Python = **861 tests** (lib only; full `cargo test` is higher).
+**Current position**: S0–S3 complete. S4 MVP pipeline delivered (M1–M6, M8): can build a model on real text data and serve it locally. Wengert tape is the production gradient path (M8, PRs #55–65). S4-M7 (build hardening) is next — run the 60M toy model end-to-end. S3b (primitive completeness) runs in parallel — 20 spec sheets needed to cover the full paper-defined primitive space before implementing DGD, self-referential projections, and the Hope architecture. Total test count: 834 Rust lib + 27 Python = **861 tests** (lib only; full `cargo test` is higher).
