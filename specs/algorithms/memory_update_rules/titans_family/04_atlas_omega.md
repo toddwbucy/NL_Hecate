@@ -128,6 +128,8 @@ ALGORITHM: atlas_omega_step(state: &mut AtlasOmegaState, x_t: &Tensor,
     return y_t
 
   -- Compute context-window gradient (Atlas Eq 9/56)
+  -- This is omega_t in the state-independent explanation below:
+  -- omega_t = grad_L = sum gamma_i (M @ phi(k_i) - v_i) @ phi(k_i)^T
   grad = zeros(d_out, d_in)
   FOR i in 0..state.window_keys.len():
     ki = state.window_keys[i]
@@ -136,13 +138,13 @@ ALGORITHM: atlas_omega_step(state: &mut AtlasOmegaState, x_t: &Tensor,
     error_i = state.M @ ki - vi                     -- (d_out,)
     grad += gamma_i * outer_product(error_i, ki)    -- (d_out, d_in)
 
-  -- Update momentum with Muon (Atlas Eq 33)
+  -- Update momentum (Atlas Eq 33): accumulate gradient into S
   state.S = eta_t * state.S + theta_t * grad        -- (d_out, d_in)
 
   -- Apply Newton-Schulz orthogonalization (Atlas Eq 32)
   ns_update = newton_schulz_k(state.S, k_ns)        -- (d_out, d_in)
 
-  -- Update memory with retention (Atlas Eq 32)
+  -- Update memory with retention (Atlas Eq 32): gradient DESCENT (subtract)
   state.M = alpha_t * state.M - theta_t * ns_update  -- (d_out, d_in)
 
   -- Read: query memory
