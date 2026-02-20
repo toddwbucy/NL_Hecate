@@ -461,7 +461,7 @@ each phase changes what the composition pattern must support.
 
 5. **Composition is always two-axis**: When configuring a model, you specify BOTH:
    (a) memory-attention pattern (MAC/MAG/MAL) per level, and
-   (b) level-composition variant (1-5) for the CMS system.
+   (b) level-composition variant (1-5) for the CMS.
    These choices are independent. The configuration struct in `02_cms_variants.md`
    already captures both via `BlockConfig.pattern` and `CMSConfig.variant`.
 
