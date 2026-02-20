@@ -28,6 +28,7 @@ CONTRACT
 
 Standard GD, viewed as an associative memory, uses a dot-product objective:
 
+<!-- HADES: hope_equations/eq-092-dot-product-recurrent (§8.2 Eq 92) -->
 ```
 L_inner(M; k_t, v_t) = -<M k_t, v_t>
 
@@ -43,6 +44,7 @@ are highly correlated, it wastes capacity by re-storing information M already ha
 
 Replace dot-product similarity with L2 regression:
 
+<!-- HADES: hope_equations/imported-titans-loss-associative-memory (Titans §3.2), hope_definitions/def5-ggd -->
 ```
 L_inner(M; k_t, v_t) = ||M k_t - v_t||^2_2
 
@@ -52,6 +54,7 @@ L_inner(M; k_t, v_t) = ||M k_t - v_t||^2_2
 
 The DGD update with retention becomes:
 
+<!-- HADES: hope_equations/eq-088-practical-dgd-update (§8.1 Eq 88), hope_equations/eq-121-delta-gd-final (Appendix C Eq 121) -->
 ```
 FUNCTION: dgd_step(M: &mut Tensor, k: &Tensor, v: &Tensor,
                     alpha_t: f32, theta_t: f32) -> ()
@@ -73,18 +76,21 @@ FUNCTION: dgd_step(M: &mut Tensor, k: &Tensor, v: &Tensor,
 
 The proximal viewpoint derives DGD as the exact solution to:
 
+<!-- HADES: hope_equations/eq-121-delta-gd-final (Appendix C), parent: hope_definitions/spec-appendix-c-dgd -->
 ```
 M_{t+1} = argmin_M { ||M k_t - v_t||^2 + eta_t^{-1} ||M - M_t||^2_F }
 ```
 
 Taking the gradient and setting to zero:
 
+<!-- HADES: hope_equations/eq-121-delta-gd-final (Appendix C, derivation step) -->
 ```
 (k_t k_t^T + eta_t^{-1} I) (M_{t+1} - M_t) = -(M_t k_t - v_t) k_t^T
 ```
 
 By Sherman-Morrison (assuming ||k_t|| = phi):
 
+<!-- HADES: hope_equations/eq-121-delta-gd-final (Appendix C Eq 121, final form) -->
 ```
 eta'_t = eta_t / (1 + eta_t)
 
@@ -130,6 +136,7 @@ choosing the (objective, solver) pair.
 
 DGD composes with momentum (the **Delta Momentum** variant, HOPE §4.4):
 
+<!-- HADES: hope_equations/eq-088-practical-dgd-update (§8.1 Eq 88, momentum variant) -->
 ```
 FUNCTION: dgd_momentum_step(M: &mut Tensor, S: &mut Tensor,
                              k: &Tensor, v: &Tensor,
@@ -153,6 +160,7 @@ but that is specified separately in `04_dmgd.md`.
 The backward pass through `dgd_step` requires gradients of loss w.r.t. the
 outer-loop parameters (W_K, W_V, W_Q, gate params) that produce k, v, alpha, theta.
 
+<!-- HADES: Derived from hope_equations/eq-121-delta-gd-final (Appendix C Eq 121), analytical VJP -->
 ```
 -- Forward: M_{t+1} = (1 - alpha_t) * M_t - theta_t * (M_t @ k_t - v_t) @ k_t^T
 -- Let E_t = M_t @ k_t - v_t (the prediction error)
@@ -185,6 +193,7 @@ The tape records the forward pass; the adapter provides these backward equations
 DGD is nonlinear in M (the `M @ k` term), so associative scan is inapplicable.
 Use chunkwise GD (existing `chunkwise_gd.rs` infrastructure):
 
+<!-- HADES: hope_equations/eq-090-chunk-wise-update (§8.2 Eq 90) -->
 ```
 -- Split sequence into chunks of size C
 -- For each chunk:
@@ -200,6 +209,7 @@ chunkwise framework because it shares the same nonlinear structure.
 
 ## Ablation Evidence (HOPE Table 6)
 
+<!-- HADES: HOPE (2512.24695) Table 6 ablation study -->
 ```
 | Configuration      | Perplexity | Reasoning Accuracy |
 |--------------------|-----------|-------------------|
