@@ -187,7 +187,7 @@ When writing or modifying a spec file in `specs/`, the corresponding HADES graph
 
 **Verification** (should return only infra-only specs like `edge_deployment`, `wengert_tape`):
 ```bash
-hades --db NL db aql "
+hades --database NL db aql "
   FOR s IN hecate_specs
     LET edges = (
       FOR e IN nl_hecate_trace_edges
