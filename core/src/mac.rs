@@ -24,6 +24,9 @@ use crate::mag::MemoryCache;
 
 /// Softmax over logits: w[i] = exp(a[i]) / sum_j exp(a[j]).
 /// Numerically stable (max-subtraction).
+/// Note: allocates [k]-sized Vec per call. k is small (1–8), matching the
+/// existing allocation pattern throughout mac.rs. Arena migration is a
+/// cross-cutting Stage 3 concern (CS-42).
 fn softmax(logits: &[f32]) -> Vec<f32> {
     if logits.is_empty() {
         return vec![];

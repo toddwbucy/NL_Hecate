@@ -394,6 +394,9 @@ pub fn tape_compute_gradients(
             }
         }
 
+        // TODO: Tape path doesn't yet extract alpha_mem/alpha_refl gradients.
+        // Hand-written backward (cms_mac_backward) computes these via softmax Jacobian.
+        // Tape-based alpha grads are a Stage 3 task (TapeOp::WeightedSum registration).
         (loss, MAGParams { swa: swa_grads, levels: level_grads, alpha_mem: vec![0.0f32; cfg.k], alpha_refl: vec![0.0f32; cfg.k] })
     })
 }
