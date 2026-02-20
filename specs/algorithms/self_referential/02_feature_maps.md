@@ -14,8 +14,9 @@ CONTRACT
               kernel-based memory (phi = random features, polynomial features,
               or learned transforms).
   Expects:    Key vector k_t [d, 1]. Feature map phi: R^d -> R^d_phi where
-              d_phi >= d (expansion) or d_phi = d (same-dimensional transform).
-              Memory state M [d, d_phi] (widened if d_phi > d).
+              d_phi is arbitrary (d_phi < d for compression, d_phi = d for
+              same-dimensional transform, or d_phi > d for expansion).
+              Memory state M [d, d_phi] (reshaped from [d, d] when d_phi != d).
   Guarantees: phi(k) replaces k in all memory operations: update, read, gradient.
               When phi = identity, all equations reduce to the standard (no
               feature map) case. The MIRAS 4-knob framework applies unchanged
