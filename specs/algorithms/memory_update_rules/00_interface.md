@@ -68,11 +68,15 @@ TRAIT: MemoryUpdateRule
     Does NOT mutate state. Pure function.
 
   STEP(state: &mut State, x: &Tensor, outer: &OuterParams, pulse: &Pulse) -> Tensor
-    Combined operation: project x to k,v,q; compute gates; WRITE; READ.
+    Combined operation: project x to k,v,q; apply short conv; compute gates; WRITE; READ.
+    The k and q inputs to WRITE/READ are post-convolution outputs — already
+    preprocessed by the short causal Conv1D (see specs/infrastructure/attention/02_short_conv.md).
     Convenience method. Equivalent to:
-      k = x @ outer.W_K^T
-      v = x @ outer.W_V^T
-      q = x @ outer.W_Q^T
+      k_raw = x @ outer.W_K^T
+      q_raw = x @ outer.W_Q^T
+      k = causal_conv1d(k_raw, outer.w_k_conv)   -- short conv preprocessing
+      q = causal_conv1d(q_raw, outer.w_q_conv)   -- short conv preprocessing
+      v = x @ outer.W_V^T                         -- values NOT convolved
       gates = compute_gates(k, v, outer.gate_params)
       IF pulse.is_active(self.level()):
         WRITE(state, k, v, gates, pulse)

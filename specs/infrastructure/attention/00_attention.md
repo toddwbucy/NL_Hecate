@@ -149,6 +149,20 @@ MAL (Memory As Layer):
 --   We invest engineering effort in memory, not attention.
 ```
 
+## Key/Query Preprocessing
+
+```
+-- Before entering attention (or memory), keys and queries are preprocessed
+-- by a short causal depthwise Conv1D (kernel_size=4, SiLU activation).
+-- This injects local token interactions that pointwise projections alone
+-- cannot capture. Standard SSM convention (H3/Hyena/Mamba/Based/Atlas).
+--
+-- See: specs/infrastructure/attention/02_short_conv.md for full specification.
+--
+-- Data flow:  x → W_K/W_Q projection → short conv1d → memory / attention
+-- The conv operates on projected keys and queries, NOT on values.
+```
+
 ## Axiom Compliance
 
 - **NL IS NOT #5** (not optimizers as just optimizers): Attention is the counterpoint — it IS just attention. Memory is where IS #6 lives.
