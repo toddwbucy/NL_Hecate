@@ -58,7 +58,7 @@ TRAIT: MemoryUpdateRule
   INIT(config: Config) -> (State, OuterParams)
     Create initial memory state and outer-loop parameters from configuration.
     State includes: memory weights, momentum (if any).
-    OuterParams includes: W_K, W_V, W_Q, gate weights.
+    OuterParams includes: W_K, W_V, W_Q, w_k_conv, w_q_conv, gate weights.
 
   WRITE(state: &mut State, k: &Tensor, v: &Tensor, gates: &Gates, pulse: &Pulse)
     Update memory given a key-value pair.
