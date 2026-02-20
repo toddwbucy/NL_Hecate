@@ -300,6 +300,11 @@ schedule in a layered manner:
    independently to each of the 6 component memories. With checkpointing,
    component memory states at chunk boundaries are recomputed during
    backward rather than stored — trading 6× compute for 6× memory savings.
+   **Caution (CS-48)**: Gradient checkpointing can degrade NL convergence
+   because CMS-aware gradient flow depends on exact intermediate states at
+   chunk boundaries. Recomputation introduces floating-point non-determinism
+   that compounds across CMS levels. Profile carefully before enabling —
+   the memory savings may not justify the convergence cost.
 
 ## Axiom Compliance
 
