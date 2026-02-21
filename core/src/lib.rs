@@ -30,6 +30,7 @@ pub mod gradient;
 #[cfg(not(feature = "internal"))]
 pub(crate) mod gradient;
 
+pub mod adamw;
 pub mod m3;
 pub mod cms_variants;
 #[cfg(feature = "cuda")]
