@@ -74,6 +74,7 @@ impl TwoStageBuildConfig {
 /// These are separate from MemoryLevelParams because they are TNT-specific
 /// (Q-K projection and attention summary query) and not shared with other
 /// parallelization strategies.
+#[derive(Clone)]
 pub struct TNTParams {
     /// W_QK: projects queries into key domain [d, d]. TNT Eq 13-14.
     pub w_qk: Vec<f32>,
@@ -185,6 +186,8 @@ pub fn qk_project_backward(
     n: usize,
 ) -> (Vec<f32>, Vec<f32>) {
     debug_assert_eq!(d_aligned.len(), n * d);
+    debug_assert_eq!(q.len(), n * d);
+    debug_assert_eq!(w_qk.len(), d * d);
     // d_q = d_aligned @ W_QK
     let mut d_q = vec![0.0f32; n * d];
     for t in 0..n {
@@ -437,6 +440,10 @@ pub fn tnt_forward(
                 );
                 (k, v, Some(cache))
             } else {
+                eprintln!(
+                    "warning: use_attention_summary=true but tnt_params is None; \
+                     falling back to compute_shard_summary_mean"
+                );
                 let (k, v) = compute_shard_summary_mean(&shard_y, shard_len, d);
                 (k, v, None)
             }
@@ -1125,6 +1132,61 @@ mod tests {
             .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
         assert!(max_diff > 1e-6,
             "attention vs mean summary should differ, max_diff={max_diff}");
+    }
+
+    #[test]
+    fn test_attention_summary_backward_fd() {
+        // FD-verify the w_summary_q gradient through the full tnt_forward/tnt_backward path.
+        let cfg = MAGConfig::test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let s = cfg.swa.seq_len;
+        let d = cfg.swa.d_model;
+        let mut rng = SimpleRng::new(77);
+        let tnt_p = TNTParams::init(d, &mut rng);
+        let tnt = TNTConfig {
+            global_chunk_size: 2, local_chunk_size: 1,
+            use_qk_projection: false, use_attention_summary: true,
+        };
+
+        // Analytical gradient
+        let (y, cache) = tnt_forward(
+            &params.levels[0], &embedded, s, d, &tnt, &cfg, None, Some(&tnt_p),
+        );
+        let d_y = vec![1.0f32; s * d]; // d(sum(y))/dy = 1
+        let (_grads, _d_emb, tnt_grads) = tnt_backward(
+            &params.levels[0], &cache, &d_y, &embedded, &tnt, &cfg, Some(&tnt_p),
+        );
+        let analytical = tnt_grads.as_ref().unwrap().w_summary_q[0];
+
+        // Finite difference on w_summary_q[0]
+        let eps = 1e-2f32;
+        let mut tp_p = tnt_p.clone();
+        tp_p.w_summary_q[0] += eps;
+        let (y_p, _) = tnt_forward(
+            &params.levels[0], &embedded, s, d, &tnt, &cfg, None, Some(&tp_p),
+        );
+        let loss_p: f32 = y_p.iter().sum();
+
+        let mut tp_m = tnt_p.clone();
+        tp_m.w_summary_q[0] -= eps;
+        let (y_m, _) = tnt_forward(
+            &params.levels[0], &embedded, s, d, &tnt, &cfg, None, Some(&tp_m),
+        );
+        let loss_m: f32 = y_m.iter().sum();
+        let fd = (loss_p - loss_m) / (2.0 * eps);
+
+        // Loose tolerance: at f32 with eps=1e-2, expect sign agreement and rough magnitude
+        let loss_base: f32 = y.iter().sum();
+        let _ = loss_base; // used only to confirm finite
+        if analytical.abs() > 1e-5 || fd.abs() > 1e-5 {
+            let rel_err = (analytical - fd).abs() / (analytical.abs().max(fd.abs()));
+            assert!(rel_err < 0.5,
+                "attention summary backward FD: analytical={analytical:.6e} fd={fd:.6e} rel_err={rel_err:.4}");
+        }
+        // At minimum, both should be finite
+        assert!(analytical.is_finite(), "analytical gradient not finite");
+        assert!(fd.is_finite(), "FD gradient not finite");
     }
 
     #[test]
