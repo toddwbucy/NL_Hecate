@@ -14,7 +14,7 @@ use crate::m3::M3Config;
 
 /// Five CMS deployment patterns.
 #[derive(Clone, Debug, PartialEq)]
-pub enum CMSVariant {
+pub enum DeploymentVariant {
     /// Single block, single CMS config (current system).
     Basic,
     /// CMS + M3 optimizer (requires S3-M2). Each block has its own M3 config.
@@ -27,14 +27,14 @@ pub enum CMSVariant {
     Hybrid,
 }
 
-impl std::fmt::Display for CMSVariant {
+impl std::fmt::Display for DeploymentVariant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CMSVariant::Basic => write!(f, "Basic"),
-            CMSVariant::Nested => write!(f, "Nested"),
-            CMSVariant::Sequential => write!(f, "Sequential"),
-            CMSVariant::Independent => write!(f, "Independent"),
-            CMSVariant::Hybrid => write!(f, "Hybrid"),
+            DeploymentVariant::Basic => write!(f, "Basic"),
+            DeploymentVariant::Nested => write!(f, "Nested"),
+            DeploymentVariant::Sequential => write!(f, "Sequential"),
+            DeploymentVariant::Independent => write!(f, "Independent"),
+            DeploymentVariant::Hybrid => write!(f, "Hybrid"),
         }
     }
 }
@@ -98,7 +98,7 @@ impl BlockConfig {
 /// Multi-block CMS configuration: variant + per-block configs + global params.
 #[derive(Clone, Debug)]
 pub struct MultiBlockConfig {
-    pub variant: CMSVariant,
+    pub variant: DeploymentVariant,
     pub blocks: Vec<BlockConfig>,
     pub d_model: usize,
     pub num_heads: usize,
@@ -119,7 +119,7 @@ impl MultiBlockConfig {
             m3: cfg.m3.clone(),
         };
         let mbc = MultiBlockConfig {
-            variant: CMSVariant::Basic,
+            variant: DeploymentVariant::Basic,
             blocks: vec![block],
             d_model: cfg.swa.d_model,
             num_heads: cfg.swa.num_heads,
@@ -134,7 +134,7 @@ impl MultiBlockConfig {
     pub fn nested(blocks: Vec<BlockConfig>, d_model: usize, num_heads: usize,
                   seq_len: usize, vocab_size: usize) -> Result<Self, String> {
         let mbc = MultiBlockConfig {
-            variant: CMSVariant::Nested,
+            variant: DeploymentVariant::Nested,
             blocks,
             d_model,
             num_heads,
@@ -149,7 +149,7 @@ impl MultiBlockConfig {
     pub fn sequential(blocks: Vec<BlockConfig>, d_model: usize, num_heads: usize,
                       seq_len: usize, vocab_size: usize) -> Result<Self, String> {
         let mbc = MultiBlockConfig {
-            variant: CMSVariant::Sequential,
+            variant: DeploymentVariant::Sequential,
             blocks,
             d_model,
             num_heads,
@@ -164,7 +164,7 @@ impl MultiBlockConfig {
     pub fn independent(blocks: Vec<BlockConfig>, d_model: usize, num_heads: usize,
                        seq_len: usize, vocab_size: usize) -> Result<Self, String> {
         let mbc = MultiBlockConfig {
-            variant: CMSVariant::Independent,
+            variant: DeploymentVariant::Independent,
             blocks,
             d_model,
             num_heads,
@@ -179,7 +179,7 @@ impl MultiBlockConfig {
     pub fn hybrid(blocks: Vec<BlockConfig>, d_model: usize, num_heads: usize,
                   seq_len: usize, vocab_size: usize) -> Result<Self, String> {
         let mbc = MultiBlockConfig {
-            variant: CMSVariant::Hybrid,
+            variant: DeploymentVariant::Hybrid,
             blocks,
             d_model,
             num_heads,
@@ -238,7 +238,7 @@ pub fn validate(cfg: &MultiBlockConfig) -> Result<(), String> {
 
     // Variant-specific validation
     match cfg.variant {
-        CMSVariant::Basic => {
+        DeploymentVariant::Basic => {
             if cfg.blocks.len() != 1 {
                 return Err(format!(
                     "Basic variant requires exactly 1 block, got {}",
@@ -246,7 +246,7 @@ pub fn validate(cfg: &MultiBlockConfig) -> Result<(), String> {
                 ));
             }
         }
-        CMSVariant::Nested => {
+        DeploymentVariant::Nested => {
             // Every CMS block must have M3 config
             for (i, block) in cfg.blocks.iter().enumerate() {
                 if block.cms_enabled && block.m3.is_none() {
@@ -259,7 +259,7 @@ pub fn validate(cfg: &MultiBlockConfig) -> Result<(), String> {
                 }
             }
         }
-        CMSVariant::Sequential => {
+        DeploymentVariant::Sequential => {
             // k must be non-decreasing across CMS blocks
             let mut prev_k = 0;
             for (i, block) in cfg.blocks.iter().enumerate() {
@@ -274,10 +274,10 @@ pub fn validate(cfg: &MultiBlockConfig) -> Result<(), String> {
                 }
             }
         }
-        CMSVariant::Independent => {
+        DeploymentVariant::Independent => {
             // No additional constraints beyond common validation
         }
-        CMSVariant::Hybrid => {
+        DeploymentVariant::Hybrid => {
             // Must have at least one CMS and one non-CMS block
             let has_cms = cfg.blocks.iter().any(|b| b.cms_enabled);
             let has_non_cms = cfg.blocks.iter().any(|b| !b.cms_enabled);
@@ -299,11 +299,11 @@ mod tests {
 
     #[test]
     fn test_variant_display() {
-        assert_eq!(format!("{}", CMSVariant::Basic), "Basic");
-        assert_eq!(format!("{}", CMSVariant::Nested), "Nested");
-        assert_eq!(format!("{}", CMSVariant::Sequential), "Sequential");
-        assert_eq!(format!("{}", CMSVariant::Independent), "Independent");
-        assert_eq!(format!("{}", CMSVariant::Hybrid), "Hybrid");
+        assert_eq!(format!("{}", DeploymentVariant::Basic), "Basic");
+        assert_eq!(format!("{}", DeploymentVariant::Nested), "Nested");
+        assert_eq!(format!("{}", DeploymentVariant::Sequential), "Sequential");
+        assert_eq!(format!("{}", DeploymentVariant::Independent), "Independent");
+        assert_eq!(format!("{}", DeploymentVariant::Hybrid), "Hybrid");
     }
 
     #[test]

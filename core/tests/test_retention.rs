@@ -7,7 +7,7 @@
 //! - Integration: elastic net configs in training loop
 
 use nl_hecate_core::model::{
-    MAGConfig, MAGParams, SWAConfig, CompositionKind, MemoryRuleKind,
+    MAGConfig, MAGParams, SWAConfig, CompositionKind, MemoryRuleKind, HopeVariant,
 };
 use nl_hecate_core::dynamic_freq::FrequencySchedule;
 use nl_hecate_core::retention::{
@@ -51,6 +51,7 @@ fn tiny_config(rule: MemoryRuleKind, retention: RetentionKind) -> MAGConfig {
         m3: None,
         frequency_schedule: FrequencySchedule::Fixed,
         checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
     }
 }
 
