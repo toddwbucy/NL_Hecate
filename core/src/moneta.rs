@@ -879,10 +879,10 @@ pub fn bias_to_f32(bias: crate::model::AttentionalBias) -> f32 {
 /// Lp(2.0) returns 2*error — so we must distinguish them.
 pub fn f32_to_bias(v: f32) -> crate::model::AttentionalBias {
     use crate::model::AttentionalBias;
-    if v == 2.0 { AttentionalBias::L2 }
-    else if v == 1.0 { AttentionalBias::L1 }
-    else if v == -1.0 { AttentionalBias::KL }
-    else if v == -2.0 { AttentionalBias::Huber }
+    if (v - 2.0).abs() < 1e-6 { AttentionalBias::L2 }
+    else if (v - 1.0).abs() < 1e-6 { AttentionalBias::L1 }
+    else if (v - (-1.0)).abs() < 1e-6 { AttentionalBias::KL }
+    else if (v - (-2.0)).abs() < 1e-6 { AttentionalBias::Huber }
     else { AttentionalBias::Lp(v) }
 }
 
