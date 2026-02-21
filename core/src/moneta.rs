@@ -865,7 +865,7 @@ pub fn bias_to_f32(bias: crate::model::AttentionalBias) -> f32 {
         AttentionalBias::L2 => 2.0,
         AttentionalBias::L1 => 1.0,
         AttentionalBias::Lp(p) => {
-            debug_assert!(p != 2.0 && p != 1.0,
+            assert!(p != 2.0 && p != 1.0,
                 "Lp({p}) collides with L2/L1 encoding — call normalize_bias() first");
             p
         }
