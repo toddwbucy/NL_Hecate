@@ -728,7 +728,7 @@ impl OpaqueVjp for Moneta {
         &self, tape: &mut Tape, level_params: &MemoryLevelParams,
         embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
     ) -> (Vec<f32>, BufId, BufId, BufId) {
-        let extra_meta = [self.d_hidden as f32, self.lp_p, self.lambda_2];
+        let extra_meta = [self.d_hidden as f32, self.lp_p, self.lambda_2, self.sign_sharpness];
         let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
             record_common_inputs(tape, level_params, embedded, seq_len, d, &extra_meta);
 

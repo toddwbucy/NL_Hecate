@@ -269,7 +269,7 @@ impl MAGConfig {
     #[pyo3(signature = (
         d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled,
         k=1, chunk_sizes=None, memory_rule="delta", composition="mag",
-        d_hidden=None, lp_p=None, lq_q=None, lambda_local=None, lambda_2=None,
+        d_hidden=None, lp_p=None, sign_sharpness=None, lq_q=None, lambda_local=None, lambda_2=None,
         delta=None, m_slots=None, d_compress=None, lambda_k=None, lambda_v=None,
         retention=None, m3=None, frequency_schedule=None, checkpoint_interval=None,
     ))]
@@ -287,6 +287,7 @@ impl MAGConfig {
         composition: &str,
         d_hidden: Option<usize>,
         lp_p: Option<f32>,
+        sign_sharpness: Option<f32>,
         lq_q: Option<f32>,
         lambda_local: Option<f32>,
         lambda_2: Option<f32>,
@@ -400,7 +401,7 @@ impl MAGConfig {
                 chunk_sizes,
                 d_hidden: d_hidden.unwrap_or(0),
                 lp_p: lp_p.unwrap_or(2.0),
-                sign_sharpness: 10.0,
+                sign_sharpness: sign_sharpness.unwrap_or(10.0),
                 lq_q: lq_q.unwrap_or(2.0),
                 lambda_local: lambda_local.unwrap_or(0.0),
                 lambda_2: lambda_2.unwrap_or(0.0),
@@ -581,7 +582,7 @@ impl MAGForwardCache {
 #[pyo3(signature = (
     d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled,
     k=1, chunk_sizes=None, memory_rule="delta", composition="mag",
-    d_hidden=None, lp_p=None, lq_q=None, lambda_local=None, lambda_2=None,
+    d_hidden=None, lp_p=None, sign_sharpness=None, lq_q=None, lambda_local=None, lambda_2=None,
     delta=None, m_slots=None, d_compress=None, lambda_k=None, lambda_v=None,
     retention=None, m3=None, frequency_schedule=None, checkpoint_interval=None,
 ))]
@@ -599,6 +600,7 @@ fn mag_create_config(
     composition: &str,
     d_hidden: Option<usize>,
     lp_p: Option<f32>,
+    sign_sharpness: Option<f32>,
     lq_q: Option<f32>,
     lambda_local: Option<f32>,
     lambda_2: Option<f32>,
@@ -615,7 +617,7 @@ fn mag_create_config(
     MAGConfig::new(
         d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled,
         k, chunk_sizes, memory_rule, composition,
-        d_hidden, lp_p, lq_q, lambda_local, lambda_2, delta, m_slots, d_compress, lambda_k, lambda_v,
+        d_hidden, lp_p, sign_sharpness, lq_q, lambda_local, lambda_2, delta, m_slots, d_compress, lambda_k, lambda_v,
         retention, m3, frequency_schedule, checkpoint_interval,
     )
 }

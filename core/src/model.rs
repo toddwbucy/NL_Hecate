@@ -402,6 +402,7 @@ pub struct MAGConfig {
     pub lp_p: f32,
     /// Smooth Sign sharpness for l_p gradient: tanh(a * e) approximates signum(e).
     /// Default: 10.0. See specs/algorithms/attentional_biases/01_l1_sign.md.
+    #[serde(default = "default_sign_sharpness")]
     pub sign_sharpness: f32,
     /// L_q retention exponent for MONETA (default: 2.0).
     pub lq_q: f32,
@@ -437,6 +438,8 @@ pub struct MAGConfig {
     #[serde(default)]
     pub checkpoint_interval: Option<usize>,
 }
+
+fn default_sign_sharpness() -> f32 { 10.0 }
 
 /// Default gate bias init values per level index.
 fn default_b_alpha(level: usize) -> f32 {
