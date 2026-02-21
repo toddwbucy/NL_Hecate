@@ -73,7 +73,7 @@ fn dispatch_memory_step(
             (y, MemoryCache::MEMORA(cache))
         }
         MemoryRuleKind::LatticeOSR => {
-            let rule = LatticeOSR { m_slots: cfg.m_slots };
+            let rule = LatticeOSR { m_slots: cfg.m_slots, variant: cfg.lattice_variant };
             let (y, cache) = rule.step(level_params, embedded, s, d, initial_m);
             (y, MemoryCache::Lattice(cache))
         }
@@ -114,7 +114,7 @@ fn dispatch_memory_backward(
             rule.step_backward(level_params, c, d_y, embedded)
         }
         MemoryCache::Lattice(c) => {
-            let rule = LatticeOSR { m_slots: cfg.m_slots };
+            let rule = LatticeOSR { m_slots: cfg.m_slots, variant: cfg.lattice_variant };
             rule.step_backward(level_params, c, d_y, embedded)
         }
         MemoryCache::Trellis(c) => {

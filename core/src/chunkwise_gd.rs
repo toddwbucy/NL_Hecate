@@ -156,7 +156,7 @@ fn run_chunk(
             (y, MemoryCache::MEMORA(cache))
         }
         MemoryRuleKind::LatticeOSR => {
-            let rule = LatticeOSR { m_slots: cfg.m_slots };
+            let rule = LatticeOSR { m_slots: cfg.m_slots, variant: cfg.lattice_variant };
             let (y, cache) = rule.step(level_params, embedded_chunk, chunk_len, d, initial_m);
             (y, MemoryCache::Lattice(cache))
         }
@@ -198,7 +198,7 @@ fn run_chunk_backward(
             rule.step_backward(level_params, c, d_y_chunk, embedded_chunk)
         }
         MemoryCache::Lattice(c) => {
-            let rule = LatticeOSR { m_slots: cfg.m_slots };
+            let rule = LatticeOSR { m_slots: cfg.m_slots, variant: cfg.lattice_variant };
             rule.step_backward(level_params, c, d_y_chunk, embedded_chunk)
         }
         MemoryCache::Trellis(c) => {

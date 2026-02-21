@@ -7,6 +7,7 @@ use nl_hecate_core::model::{MAGConfig, MAGParams};
 use nl_hecate_core::lattice_gla::{lattice_gla_forward, lattice_gla_backward, trellis_gla_forward};
 use nl_hecate_core::delta_rule::MemoryRule;
 use nl_hecate_core::lattice_osr::LatticeOSR;
+use nl_hecate_core::model::LatticeVariant;
 use nl_hecate_core::tensor::SimpleRng;
 
 fn make_embedded(cfg: &MAGConfig, seed: u64) -> Vec<f32> {
@@ -71,7 +72,7 @@ fn test_lattice_gla_quality_sweep() {
     let d = cfg.swa.d_model;
 
     // Sequential baseline
-    let rule = LatticeOSR { m_slots: cfg.m_slots };
+    let rule = LatticeOSR { m_slots: cfg.m_slots, variant: LatticeVariant::Decode };
     let (y_seq, _) = rule.step(&params.levels[0], &embedded, s, d, None);
 
     // GLA with full sequence (no renormalization) should match

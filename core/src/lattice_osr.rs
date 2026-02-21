@@ -34,14 +34,20 @@ use crate::tensor::{
     frobenius_dot_f32, vec_norm_f32, vec_normalize_f32,
 };
 use crate::retention::sphere_project_and_normalize_inplace;
-use crate::model::MemoryLevelParams;
+use crate::model::{MemoryLevelParams, LatticeVariant};
 use crate::delta_rule::{MemoryRule, MemoryState, Gates, MemoryError};
 
 // ── LatticeOSR implementation ────────────────────────────────────────
 
 /// Lattice OSR: m unit vectors on the sphere, orthogonal projection updates.
+///
+/// The `variant` field selects which delta_s computation to use:
+/// - Decode (default, Eqs 5-6): delta_s = gate_i * v_t
+/// - Encode (Eqs 24-25): delta_s = gate_i * k_t
+/// - Similarity (Eqs 7-8): delta_s = gate_i * (v_t - dot(S[i], v_t) * S[i])
 pub struct LatticeOSR {
     pub m_slots: usize,
+    pub variant: LatticeVariant,
 }
 
 /// All intermediate values from a Lattice forward pass, needed for backward.
@@ -49,6 +55,8 @@ pub struct LatticeCache {
     pub seq_len: usize,
     pub d: usize,
     pub m: usize,
+    /// Which variant was used in the forward pass.
+    pub variant: LatticeVariant,
     /// Slot states S_t for t=0..seq_len: [(seq_len+1) * m * d]
     pub s_states: Vec<f32>,
     /// Per-token projected keys: [seq_len, d]
@@ -107,16 +115,40 @@ impl MemoryRule for LatticeOSR {
             let slot = &state.m[i * d..(i + 1) * d];
             let score = frobenius_dot_f32(slot, k);
             let gate_i = sigmoid_f32(score);
-            // delta_s = alpha * gate_i * v
+
+            // Compute input for orthogonal update based on variant
+            let input = match self.variant {
+                LatticeVariant::Decode => {
+                    // Eqs 5-6: delta_s = gate_i * v_t
+                    let mut inp = vec![0.0f32; d];
+                    for j in 0..d { inp[j] = v[j]; }
+                    inp
+                }
+                LatticeVariant::Encode => {
+                    // Eqs 24-25: delta_s = gate_i * k_t
+                    let mut inp = vec![0.0f32; d];
+                    for j in 0..d { inp[j] = k[j]; }
+                    inp
+                }
+                LatticeVariant::Similarity => {
+                    // Eqs 7-8: delta_s = gate_i * (v_t - dot(S[i], v_t) * S[i])
+                    let dot_sv = frobenius_dot_f32(slot, v);
+                    let mut inp = vec![0.0f32; d];
+                    for j in 0..d { inp[j] = v[j] - dot_sv * slot[j]; }
+                    inp
+                }
+            };
+
+            // delta_s = alpha * gate_i * input
             // orthogonal = delta_s - dot(s, delta_s) * s
             let mut s_unnorm = vec![0.0f32; d];
             let mut p = 0.0f32;
             for j in 0..d {
-                let delta_s_j = gates.alpha * gate_i * v[j];
+                let delta_s_j = gates.alpha * gate_i * input[j];
                 p += slot[j] * delta_s_j;
             }
             for j in 0..d {
-                let delta_s_j = gates.alpha * gate_i * v[j];
+                let delta_s_j = gates.alpha * gate_i * input[j];
                 let ortho = delta_s_j - p * slot[j];
                 s_unnorm[j] = slot[j] + ortho;
             }
@@ -248,10 +280,24 @@ impl MemoryRule for LatticeOSR {
                 let gate_i = sigmoid_f32(score_i);
                 slot_gates[t * m + i] = gate_i;
 
-                // delta_s = alpha_t * gate_i * v_t (write into scratch)
+                // Variant-dependent delta_s computation (Eq 26 unified form)
                 let scale = alpha[t] * gate_i;
-                for j in 0..d {
-                    delta_s_scratch[j] = scale * v_t[j];
+                match self.variant {
+                    LatticeVariant::Decode => {
+                        // Eqs 5-6: delta_s = alpha_t * gate_i * v_t
+                        for j in 0..d { delta_s_scratch[j] = scale * v_t[j]; }
+                    }
+                    LatticeVariant::Encode => {
+                        // Eqs 24-25: delta_s = alpha_t * gate_i * k_t
+                        for j in 0..d { delta_s_scratch[j] = scale * k_t[j]; }
+                    }
+                    LatticeVariant::Similarity => {
+                        // Eqs 7-8: delta_s = alpha_t * gate_i * (v_t - dot(S[i], v_t) * S[i])
+                        let dot_sv = frobenius_dot_f32(slot, v_t);
+                        for j in 0..d {
+                            delta_s_scratch[j] = scale * (v_t[j] - dot_sv * slot[j]);
+                        }
+                    }
                 }
 
                 // Sphere retention: orthogonal projection + normalize (in-place)
@@ -264,7 +310,7 @@ impl MemoryRule for LatticeOSR {
         }
 
         let cache = LatticeCache {
-            seq_len, d, m,
+            seq_len, d, m, variant: self.variant,
             s_states, k_mem, v_mem, q_mem, concat_kv,
             alpha_pre, alpha, scores: scores_cache, slot_gates,
             read_weights, s_unnorm_norms,
@@ -369,75 +415,110 @@ impl MemoryRule for LatticeOSR {
                     }
                 }
 
+                // ── Recompute delta_s for this variant ──────────────────
+                // Forward: delta_s = alpha_t * gate_i * input
+                // where input depends on variant
+                let mut delta_s = vec![0.0f32; d];
+                match cache.variant {
+                    LatticeVariant::Decode => {
+                        for j in 0..d { delta_s[j] = alpha_t * gate_i * v_t[j]; }
+                    }
+                    LatticeVariant::Encode => {
+                        for j in 0..d { delta_s[j] = alpha_t * gate_i * k_t[j]; }
+                    }
+                    LatticeVariant::Similarity => {
+                        let dot_sv = frobenius_dot_f32(slot, v_t);
+                        for j in 0..d {
+                            delta_s[j] = alpha_t * gate_i * (v_t[j] - dot_sv * slot[j]);
+                        }
+                    }
+                }
+
                 // Through orthogonal projection:
                 // s_unnorm = slot + delta_s - dot(slot, delta_s) * slot
                 //          = slot * (1 - p) + delta_s  where p = dot(slot, delta_s)
-                //
-                // delta_s_j = alpha_t * gate_i * v_t[j]
-                let mut p = 0.0f32;
-                for j in 0..d {
-                    p += slot[j] * alpha_t * gate_i * v_t[j];
-                }
+                let p: f32 = (0..d).map(|j| slot[j] * delta_s[j]).sum();
 
-                // d_slot from orthogonal projection:
-                // ds_unnorm/dslot[j] = (1-p) * delta_{jj'} - delta_s[j'] * slot[j]  ... complex
-                // Simpler: d_slot_j = d_s_unnorm_j * (1-p) - dot(d_s_unnorm, slot) * delta_s_j
-                //          + (- dot(d_s_unnorm, slot) * slot_j  ... from chain through p)
-                // Wait, let's be more careful.
-                //
-                // s_unnorm_j = slot_j + delta_s_j - p * slot_j = slot_j * (1-p) + delta_s_j
-                // where p = sum_k slot_k * delta_s_k
-                //
-                // ds_unnorm_j / d_slot_k:
-                //   = (1-p)*delta_jk + slot_j * (-dp/d_slot_k) + 0
-                //   = (1-p)*delta_jk - slot_j * delta_s_k
-                // (since dp/d_slot_k = delta_s_k)
-                //
-                // d_slot_k = sum_j d_s_unnorm_j * ds_unnorm_j/d_slot_k
-                //          = d_s_unnorm_k * (1-p) - delta_s_k * sum_j(d_s_unnorm_j * slot_j)
-                //          = d_s_unnorm_k * (1-p) - delta_s_k * dot(d_s_unnorm, slot)
-
+                // d_slot_k = d_s_unnorm_k * (1-p) - delta_s_k * dot(d_s_unnorm, slot)
                 let dot_dsun_slot: f32 = (0..d).map(|j| d_s_unnorm[j] * slot[j]).sum();
 
                 for j in 0..d {
-                    let delta_s_j = alpha_t * gate_i * v_t[j];
-                    d_s_prev[i * d + j] += d_s_unnorm[j] * (1.0 - p) - delta_s_j * dot_dsun_slot;
+                    d_s_prev[i * d + j] += d_s_unnorm[j] * (1.0 - p) - delta_s[j] * dot_dsun_slot;
                 }
 
-                // ds_unnorm_j / d_delta_s_k:
-                //   = delta_jk - slot_j * dp/d_delta_s_k
-                //   = delta_jk - slot_j * slot_k
-                //
-                // d_delta_s_k = sum_j d_s_unnorm_j * (delta_jk - slot_j * slot_k)
-                //             = d_s_unnorm_k - slot_k * dot(d_s_unnorm, slot)
+                // d_delta_s_k = d_s_unnorm_k - slot_k * dot(d_s_unnorm, slot)
                 let mut d_delta_s = vec![0.0f32; d];
                 for j in 0..d {
                     d_delta_s[j] = d_s_unnorm[j] - slot[j] * dot_dsun_slot;
                 }
 
-                // Through delta_s = alpha_t * gate_i * v_t:
-                // d_alpha += gate_i * dot(d_delta_s, v_t)
-                let dot_dds_v: f32 = frobenius_dot_f32(&d_delta_s, v_t);
-                d_alpha_total += gate_i * dot_dds_v;
+                // ── Variant-dependent backward through delta_s ────────────
+                // delta_s = alpha_t * gate_i * input
+                // d_delta_s is the gradient on delta_s from orthogonal projection
+                match cache.variant {
+                    LatticeVariant::Decode => {
+                        // input = v_t
+                        let dot_dds_input: f32 = frobenius_dot_f32(&d_delta_s, v_t);
+                        d_alpha_total += gate_i * dot_dds_input;
+                        let d_gate_i = alpha_t * dot_dds_input;
+                        for j in 0..d {
+                            d_v_mem[t * d + j] += alpha_t * gate_i * d_delta_s[j];
+                        }
+                        // Through gate_i = sigmoid(score_i)
+                        let d_score_i = d_gate_i * gate_i * (1.0 - gate_i);
+                        for j in 0..d {
+                            d_s_prev[i * d + j] += d_score_i * k_t[j];
+                            d_k_mem[t * d + j] += d_score_i * slot[j];
+                        }
+                    }
+                    LatticeVariant::Encode => {
+                        // input = k_t
+                        let dot_dds_input: f32 = frobenius_dot_f32(&d_delta_s, k_t);
+                        d_alpha_total += gate_i * dot_dds_input;
+                        let d_gate_i = alpha_t * dot_dds_input;
+                        for j in 0..d {
+                            d_k_mem[t * d + j] += alpha_t * gate_i * d_delta_s[j];
+                        }
+                        // Through gate_i = sigmoid(score_i)
+                        let d_score_i = d_gate_i * gate_i * (1.0 - gate_i);
+                        for j in 0..d {
+                            d_s_prev[i * d + j] += d_score_i * k_t[j];
+                            d_k_mem[t * d + j] += d_score_i * slot[j];
+                        }
+                    }
+                    LatticeVariant::Similarity => {
+                        // input = v_t - dot(S[i], v_t) * S[i]
+                        // Recompute input for gradient
+                        let dot_sv = frobenius_dot_f32(slot, v_t);
+                        let mut input = vec![0.0f32; d];
+                        for j in 0..d { input[j] = v_t[j] - dot_sv * slot[j]; }
 
-                // d_gate_i = alpha_t * dot(d_delta_s, v_t)
-                let d_gate_i = alpha_t * dot_dds_v;
+                        let dot_dds_input: f32 = frobenius_dot_f32(&d_delta_s, &input);
+                        d_alpha_total += gate_i * dot_dds_input;
+                        let d_gate_i = alpha_t * dot_dds_input;
 
-                // d_v_mem[t] += alpha_t * gate_i * d_delta_s
-                for j in 0..d {
-                    d_v_mem[t * d + j] += alpha_t * gate_i * d_delta_s[j];
-                }
+                        // d_input = alpha_t * gate_i * d_delta_s
+                        let mut d_input = vec![0.0f32; d];
+                        for j in 0..d { d_input[j] = alpha_t * gate_i * d_delta_s[j]; }
 
-                // Through gate_i = sigmoid(score_i):
-                // d_score_i = d_gate_i * gate_i * (1 - gate_i)
-                let d_score_i = d_gate_i * gate_i * (1.0 - gate_i);
+                        // Through input = v_t - dot_sv * S[i]:
+                        // d_v_t[j] += d_input[j] - dot(d_input, S[i]) * S[i][j]
+                        let dot_dinput_slot: f32 = frobenius_dot_f32(&d_input, slot);
+                        for j in 0..d {
+                            d_v_mem[t * d + j] += d_input[j] - dot_dinput_slot * slot[j];
+                        }
+                        // d_S[i][j] += -dot_sv * d_input[j] - dot(d_input, S[i]) * v_t[j]
+                        for j in 0..d {
+                            d_s_prev[i * d + j] += -dot_sv * d_input[j] - dot_dinput_slot * v_t[j];
+                        }
 
-                // score_i = dot(S_t[i], k_t)
-                // d_S_t[i] += d_score_i * k_t
-                // d_k_mem[t] += d_score_i * S_t[i]
-                for j in 0..d {
-                    d_s_prev[i * d + j] += d_score_i * k_t[j];
-                    d_k_mem[t * d + j] += d_score_i * slot[j];
+                        // Through gate_i = sigmoid(score_i)
+                        let d_score_i = d_gate_i * gate_i * (1.0 - gate_i);
+                        for j in 0..d {
+                            d_s_prev[i * d + j] += d_score_i * k_t[j];
+                            d_k_mem[t * d + j] += d_score_i * slot[j];
+                        }
+                    }
                 }
             }
 
@@ -616,7 +697,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = LatticeOSR { m_slots: cfg.m_slots };
+        let rule = LatticeOSR { m_slots: cfg.m_slots, variant: LatticeVariant::Decode };
         let (y, _cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for (i, &v) in y.iter().enumerate() {
             assert!(v.is_finite(), "y[{i}] is not finite: {v}");
@@ -628,7 +709,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = LatticeOSR { m_slots: cfg.m_slots };
+        let rule = LatticeOSR { m_slots: cfg.m_slots, variant: LatticeVariant::Decode };
         let (y1, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let (y2, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         assert_eq!(y1, y2, "Lattice forward should be deterministic");
@@ -639,7 +720,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = LatticeOSR { m_slots: cfg.m_slots };
+        let rule = LatticeOSR { m_slots: cfg.m_slots, variant: LatticeVariant::Decode };
         let (y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
@@ -656,7 +737,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = LatticeOSR { m_slots: cfg.m_slots };
+        let rule = LatticeOSR { m_slots: cfg.m_slots, variant: LatticeVariant::Decode };
         let (_y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let d = cfg.swa.d_model;
         let m = cfg.m_slots;
@@ -678,7 +759,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = LatticeOSR { m_slots: cfg.m_slots };
+        let rule = LatticeOSR { m_slots: cfg.m_slots, variant: LatticeVariant::Decode };
         let (_y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for t in 0..cfg.swa.seq_len {
             let a = cache.alpha[t];
@@ -695,7 +776,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = LatticeOSR { m_slots: cfg.m_slots };
+        let rule = LatticeOSR { m_slots: cfg.m_slots, variant: LatticeVariant::Decode };
         let (_y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let d = cfg.swa.d_model;
         let m = cfg.m_slots;
@@ -719,7 +800,7 @@ mod tests {
         let embedded = make_embedded(&cfg, 99);
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
-        let rule = LatticeOSR { m_slots: cfg.m_slots };
+        let rule = LatticeOSR { m_slots: cfg.m_slots, variant: LatticeVariant::Decode };
         let (_y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
 
         let d_y = vec![1.0f32; s * d];
@@ -746,7 +827,7 @@ mod tests {
         let embedded = make_embedded(&cfg, 99);
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
-        let rule = LatticeOSR { m_slots: cfg.m_slots };
+        let rule = LatticeOSR { m_slots: cfg.m_slots, variant: LatticeVariant::Decode };
         let (_y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
 
         let d_y = vec![1.0f32; s * d];
@@ -770,7 +851,7 @@ mod tests {
         let embedded = make_embedded(&cfg, 99);
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
-        let rule = LatticeOSR { m_slots: cfg.m_slots };
+        let rule = LatticeOSR { m_slots: cfg.m_slots, variant: LatticeVariant::Decode };
         let (_y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
 
         let d_y = vec![1.0f32; s * d];
@@ -788,7 +869,7 @@ mod tests {
 
     #[test]
     fn test_lattice_init() {
-        let rule = LatticeOSR { m_slots: 4 };
+        let rule = LatticeOSR { m_slots: 4, variant: LatticeVariant::Decode };
         let state = rule.init(8);
         assert_eq!(state.m.len(), 4 * 8);
         assert_eq!(state.d, 8);
@@ -801,7 +882,7 @@ mod tests {
 
     #[test]
     fn test_lattice_write_read() {
-        let rule = LatticeOSR { m_slots: 2 };
+        let rule = LatticeOSR { m_slots: 2, variant: LatticeVariant::Decode };
         let mut state = rule.init(4);
         let k = [1.0f32, 0.0, 0.0, 0.0];
         let v = [0.0f32, 0.0, 0.0, 1.0];
@@ -826,7 +907,7 @@ mod tests {
 
     #[test]
     fn test_lattice_level_and_parallelization() {
-        let rule = LatticeOSR { m_slots: 4 };
+        let rule = LatticeOSR { m_slots: 4, variant: LatticeVariant::Decode };
         assert_eq!(rule.level(), 0);
         let strategies = rule.supported_parallelization();
         assert!(strategies.contains(&"sequential"));
@@ -884,7 +965,7 @@ mod tests {
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
         let m = cfg.m_slots;
-        let rule = LatticeOSR { m_slots: m };
+        let rule = LatticeOSR { m_slots: m, variant: LatticeVariant::Decode };
 
         // Custom initial slots
         let mut custom_s0 = vec![0.0f32; m * d];
@@ -907,7 +988,7 @@ mod tests {
         let params = MAGParams::init(&cfg, 42);
         let d = cfg.swa.d_model;
         let m = cfg.m_slots;
-        let rule = LatticeOSR { m_slots: m };
+        let rule = LatticeOSR { m_slots: m, variant: LatticeVariant::Decode };
 
         let mut current_s: Option<Vec<f32>> = None;
         for step in 0..10 {
@@ -927,6 +1008,202 @@ mod tests {
             }
 
             current_s = Some(cache.s_states[s_final_off..s_final_off + m * d].to_vec());
+        }
+    }
+
+    // ── Variant tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_encode_variant_forward_finite() {
+        let cfg = test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let rule = LatticeOSR { m_slots: cfg.m_slots, variant: LatticeVariant::Encode };
+        let (y, _cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
+        for (i, &v) in y.iter().enumerate() {
+            assert!(v.is_finite(), "encode y[{i}] not finite: {v}");
+        }
+    }
+
+    #[test]
+    fn test_encode_variant_sphere_preserved() {
+        let cfg = test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let d = cfg.swa.d_model;
+        let m = cfg.m_slots;
+        let rule = LatticeOSR { m_slots: m, variant: LatticeVariant::Encode };
+        let (_y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, d, None);
+        for t in 0..=cfg.swa.seq_len {
+            for i in 0..m {
+                let off = t * m * d + i * d;
+                let slot = &cache.s_states[off..off + d];
+                let norm = vec_norm_f32(slot);
+                assert!((norm - 1.0).abs() < 1e-5,
+                    "Encode: slot [{t},{i}] not unit: norm={norm:.8}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_encode_variant_differs_from_decode() {
+        let cfg = test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let s = cfg.swa.seq_len;
+        let d = cfg.swa.d_model;
+
+        let decode_rule = LatticeOSR { m_slots: cfg.m_slots, variant: LatticeVariant::Decode };
+        let encode_rule = LatticeOSR { m_slots: cfg.m_slots, variant: LatticeVariant::Encode };
+        let (y_decode, _) = decode_rule.step(&params.levels[0], &embedded, s, d, None);
+        let (y_encode, _) = encode_rule.step(&params.levels[0], &embedded, s, d, None);
+
+        let diff: f32 = y_decode.iter().zip(y_encode.iter())
+            .map(|(a, b)| (a - b).powi(2)).sum::<f32>().sqrt();
+        assert!(diff > 1e-6, "Encode and Decode should produce different outputs, diff={diff:.4e}");
+    }
+
+    #[test]
+    fn test_encode_variant_backward_finite() {
+        let cfg = test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let s = cfg.swa.seq_len;
+        let d = cfg.swa.d_model;
+        let rule = LatticeOSR { m_slots: cfg.m_slots, variant: LatticeVariant::Encode };
+        let (_y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
+        let d_y = vec![1.0f32; s * d];
+        let (grads, d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
+        for (name, g) in [("w_k_mem", &grads.w_k_mem), ("w_v_mem", &grads.w_v_mem), ("w_q_mem", &grads.w_q_mem)] {
+            for (i, &v) in g.iter().enumerate() {
+                assert!(v.is_finite(), "encode grad_{name}[{i}] not finite: {v}");
+            }
+        }
+        for (i, &v) in d_emb.iter().enumerate() {
+            assert!(v.is_finite(), "encode d_embedded[{i}] not finite: {v}");
+        }
+    }
+
+    #[test]
+    fn test_similarity_variant_forward_finite() {
+        let cfg = test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let rule = LatticeOSR { m_slots: cfg.m_slots, variant: LatticeVariant::Similarity };
+        let (y, _cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
+        for (i, &v) in y.iter().enumerate() {
+            assert!(v.is_finite(), "similarity y[{i}] not finite: {v}");
+        }
+    }
+
+    #[test]
+    fn test_similarity_variant_sphere_preserved() {
+        let cfg = test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let d = cfg.swa.d_model;
+        let m = cfg.m_slots;
+        let rule = LatticeOSR { m_slots: m, variant: LatticeVariant::Similarity };
+        let (_y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, d, None);
+        for t in 0..=cfg.swa.seq_len {
+            for i in 0..m {
+                let off = t * m * d + i * d;
+                let slot = &cache.s_states[off..off + d];
+                let norm = vec_norm_f32(slot);
+                assert!((norm - 1.0).abs() < 1e-5,
+                    "Similarity: slot [{t},{i}] not unit: norm={norm:.8}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_similarity_variant_differs_from_decode() {
+        let cfg = test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let s = cfg.swa.seq_len;
+        let d = cfg.swa.d_model;
+
+        let decode_rule = LatticeOSR { m_slots: cfg.m_slots, variant: LatticeVariant::Decode };
+        let similarity_rule = LatticeOSR { m_slots: cfg.m_slots, variant: LatticeVariant::Similarity };
+        let (y_decode, _) = decode_rule.step(&params.levels[0], &embedded, s, d, None);
+        let (y_similarity, _) = similarity_rule.step(&params.levels[0], &embedded, s, d, None);
+
+        // Similarity pre-projects v_t onto the tangent plane before the standard
+        // orthogonal update. In tiny configs (d=8, random slots), the pre-projection
+        // effect is small since dot(S[i], v_t) ≈ 0 for random unit vectors. The
+        // difference is measurable but tiny — verify it's nonzero.
+        let diff: f32 = y_decode.iter().zip(y_similarity.iter())
+            .map(|(a, b)| (a - b).powi(2)).sum::<f32>().sqrt();
+        assert!(diff > 1e-10, "Similarity and Decode should produce different outputs, diff={diff:.4e}");
+    }
+
+    #[test]
+    fn test_similarity_variant_backward_finite() {
+        let cfg = test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let s = cfg.swa.seq_len;
+        let d = cfg.swa.d_model;
+        let rule = LatticeOSR { m_slots: cfg.m_slots, variant: LatticeVariant::Similarity };
+        let (_y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
+        let d_y = vec![1.0f32; s * d];
+        let (grads, d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
+        for (name, g) in [("w_k_mem", &grads.w_k_mem), ("w_v_mem", &grads.w_v_mem), ("w_q_mem", &grads.w_q_mem)] {
+            for (i, &v) in g.iter().enumerate() {
+                assert!(v.is_finite(), "similarity grad_{name}[{i}] not finite: {v}");
+            }
+        }
+        for (i, &v) in d_emb.iter().enumerate() {
+            assert!(v.is_finite(), "similarity d_embedded[{i}] not finite: {v}");
+        }
+    }
+
+    #[test]
+    fn test_similarity_variant_backward_nonzero() {
+        let cfg = test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let s = cfg.swa.seq_len;
+        let d = cfg.swa.d_model;
+        let rule = LatticeOSR { m_slots: cfg.m_slots, variant: LatticeVariant::Similarity };
+        let (_y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
+        let d_y = vec![1.0f32; s * d];
+        let (grads, d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
+        for (name, g) in [("w_k_mem", &grads.w_k_mem), ("w_v_mem", &grads.w_v_mem), ("w_q_mem", &grads.w_q_mem)] {
+            let max_abs = g.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            assert!(max_abs > 1e-10, "similarity grad_{name} all zeros (max_abs={max_abs})");
+        }
+        let emb_max = d_emb.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        assert!(emb_max > 1e-10, "similarity d_embedded all zeros");
+    }
+
+    #[test]
+    fn test_write_read_encode_variant() {
+        let rule = LatticeOSR { m_slots: 2, variant: LatticeVariant::Encode };
+        let mut state = rule.init(4);
+        let k = [1.0f32, 0.0, 0.0, 0.0];
+        let v = [0.0f32, 0.0, 0.0, 1.0];
+        let gates = Gates { alpha: 0.5, theta: 0.0 };
+        rule.write(&mut state, &k, &v, &gates).unwrap();
+        // Slots should still be unit norm
+        for i in 0..2 {
+            let norm = vec_norm_f32(&state.m[i * 4..(i + 1) * 4]);
+            assert!((norm - 1.0).abs() < 1e-5, "encode write: slot {i} norm={norm}");
+        }
+    }
+
+    #[test]
+    fn test_write_read_similarity_variant() {
+        let rule = LatticeOSR { m_slots: 2, variant: LatticeVariant::Similarity };
+        let mut state = rule.init(4);
+        let k = [1.0f32, 0.0, 0.0, 0.0];
+        let v = [0.0f32, 0.0, 0.0, 1.0];
+        let gates = Gates { alpha: 0.5, theta: 0.0 };
+        rule.write(&mut state, &k, &v, &gates).unwrap();
+        for i in 0..2 {
+            let norm = vec_norm_f32(&state.m[i * 4..(i + 1) * 4]);
+            assert!((norm - 1.0).abs() < 1e-5, "similarity write: slot {i} norm={norm}");
         }
     }
 }

@@ -788,7 +788,7 @@ fn traced_active_level(
             (y, MemoryCache::MEMORA(cache), final_m, y_id)
         }
         MemoryRuleKind::LatticeOSR => {
-            let rule = LatticeOSR { m_slots: cfg.m_slots };
+            let rule = LatticeOSR { m_slots: cfg.m_slots, variant: cfg.lattice_variant };
             let (y, cache) = rule.step(level_params, embedded, s, d, initial_m);
             let m = cfg.m_slots;
             let s_final = &cache.s_states[s * m * d..(s + 1) * m * d];

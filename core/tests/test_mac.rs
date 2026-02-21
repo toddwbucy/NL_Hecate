@@ -1,7 +1,7 @@
 //! MAC (Memory As Context) integration tests: multi-step training,
 //! reflective gate verification, CMS k=2, comparison vs MAG.
 
-use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind, CompositionKind, HopeVariant};
+use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind, CompositionKind, HopeVariant, LatticeVariant};
 use nl_hecate_core::dynamic_freq::FrequencySchedule;
 use nl_hecate_core::retention::RetentionKind;
 use nl_hecate_core::mac::{mac_forward, mac_backward, cms_mac_forward, cms_mac_backward};
@@ -315,6 +315,7 @@ fn test_mac_vs_mag() {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
     };
     let cfg_mac = MAGConfig {
         swa: swa_mac, memory_enabled: true,
@@ -328,6 +329,7 @@ fn test_mac_vs_mag() {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
     };
 
     let seq_len = 8;

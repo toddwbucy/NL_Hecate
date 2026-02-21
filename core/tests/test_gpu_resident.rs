@@ -6,7 +6,7 @@
 ///
 /// Requires: --features cuda
 
-use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind, CompositionKind, HopeVariant};
+use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind, CompositionKind, HopeVariant, LatticeVariant};
 use nl_hecate_core::conductor::{Pulse, ContextState};
 use nl_hecate_core::dispatch;
 use nl_hecate_core::mag::cms_forward;
@@ -37,6 +37,7 @@ fn make_test_config(rule: MemoryRuleKind) -> MAGConfig {
         frequency_schedule: nl_hecate_core::dynamic_freq::FrequencySchedule::Fixed,
         checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
     }
 }
 

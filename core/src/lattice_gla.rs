@@ -281,7 +281,7 @@ mod tests {
         let (y_gla, _) = lattice_gla_forward(
             &params.levels[0], &embedded, s, d, s, &cfg, None,
         );
-        let rule = LatticeOSR { m_slots: cfg.m_slots };
+        let rule = LatticeOSR { m_slots: cfg.m_slots, variant: cfg.lattice_variant };
         let (y_seq, _) = rule.step(&params.levels[0], &embedded, s, d, None);
 
         let max_diff: f32 = y_gla.iter().zip(y_seq.iter())
@@ -298,7 +298,7 @@ mod tests {
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
 
-        let rule = LatticeOSR { m_slots: cfg.m_slots };
+        let rule = LatticeOSR { m_slots: cfg.m_slots, variant: cfg.lattice_variant };
         let (y_seq, _) = rule.step(&params.levels[0], &embedded, s, d, None);
 
         let c = 4.min(s);
@@ -539,7 +539,7 @@ mod tests {
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
 
-        let rule = LatticeOSR { m_slots: cfg.m_slots };
+        let rule = LatticeOSR { m_slots: cfg.m_slots, variant: cfg.lattice_variant };
         let (y_seq, _) = rule.step(&params.levels[0], &embedded, s, d, None);
 
         let (y_gla, _) = lattice_gla_forward(
