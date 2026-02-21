@@ -82,7 +82,7 @@ impl std::fmt::Display for CompositionError {
 pub fn validate_composition(
     rule: MemoryRuleKind,
     retention: RetentionKind,
-    _composition: CompositionKind, // reserved for PS-TC-02: MAC/MAG/MAL constraints
+    composition: CompositionKind,
     parallel: Option<ParallelStrategy>,
 ) -> Result<(), Vec<CompositionError>> {
     let mut errors = Vec::new();
@@ -117,6 +117,29 @@ pub fn validate_composition(
                 reason: "KL retention requires probability simplex state. \
                          Only MEMORA maintains simplex invariant.".into(),
             });
+        }
+    }
+
+    // ── Composition × Parallelization ──────────────────────────────
+    // MAC is sequential (memory reads feed into attention input), so
+    // parallelization strategies that restructure the memory update
+    // loop may conflict with MAC's read-then-write data flow.
+    if composition == CompositionKind::MAC {
+        if let Some(ref strategy) = parallel {
+            if matches!(strategy, ParallelStrategy::AssociativeScan | ParallelStrategy::AtlasParallel) {
+                errors.push(CompositionError {
+                    axis_a: "MAC composition",
+                    axis_b: match strategy {
+                        ParallelStrategy::AssociativeScan => "AssociativeScan",
+                        ParallelStrategy::AtlasParallel => "AtlasParallel",
+                        _ => unreachable!(),
+                    },
+                    reason: "MAC requires sequential read-then-write data flow. \
+                             AssociativeScan and AtlasParallel restructure the memory \
+                             update loop in ways incompatible with MAC's assembled context."
+                        .into(),
+                });
+            }
         }
     }
 
@@ -589,6 +612,46 @@ mod tests {
             .parallel(ParallelStrategy::LatticeGLA)
             .build();
         assert!(result.is_ok(), "LatticeOSR+Sphere+GLA is the canonical Lattice config");
+    }
+
+    // ── Composition × Parallelization ──────────────────────────────
+
+    #[test]
+    fn test_mac_assoc_scan_invalid() {
+        let result = MemoryRuleBuilder::new(MemoryRuleKind::HebbianRule)
+            .composition(CompositionKind::MAC)
+            .parallel(ParallelStrategy::AssociativeScan)
+            .build();
+        assert!(result.is_err(), "MAC+AssociativeScan should be invalid");
+    }
+
+    #[test]
+    fn test_mac_atlas_parallel_invalid() {
+        let result = MemoryRuleBuilder::new(MemoryRuleKind::AtlasOmega)
+            .composition(CompositionKind::MAC)
+            .parallel(ParallelStrategy::AtlasParallel)
+            .build();
+        assert!(result.is_err(), "MAC+AtlasParallel should be invalid");
+    }
+
+    #[test]
+    fn test_mac_chunkwise_valid() {
+        // MAC + ChunkwiseGD is fine (sequential within chunk)
+        let result = MemoryRuleBuilder::new(MemoryRuleKind::DeltaRule)
+            .composition(CompositionKind::MAC)
+            .parallel(ParallelStrategy::ChunkwiseGD)
+            .build();
+        assert!(result.is_ok(), "MAC+ChunkwiseGD should be valid");
+    }
+
+    #[test]
+    fn test_mag_assoc_scan_valid() {
+        // MAG + AssociativeScan + Hebbian is fine
+        let result = MemoryRuleBuilder::new(MemoryRuleKind::HebbianRule)
+            .composition(CompositionKind::MAG)
+            .parallel(ParallelStrategy::AssociativeScan)
+            .build();
+        assert!(result.is_ok(), "MAG+Hebbian+AssociativeScan should be valid");
     }
 
     // ── Builder defaults ────────────────────────────────────────────
