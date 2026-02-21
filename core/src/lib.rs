@@ -31,6 +31,7 @@ pub mod gradient;
 pub(crate) mod gradient;
 
 pub mod adamw;
+pub mod bf16;
 pub mod m3;
 pub mod cms_variants;
 #[cfg(feature = "cuda")]
