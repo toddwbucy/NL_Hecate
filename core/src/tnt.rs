@@ -102,6 +102,8 @@ impl TNTParams {
 
     /// Accumulate gradients from another TNTParams.
     pub fn accumulate(&mut self, other: &TNTParams) {
+        debug_assert_eq!(self.w_qk.len(), other.w_qk.len(), "w_qk length mismatch in accumulate");
+        debug_assert_eq!(self.w_summary_q.len(), other.w_summary_q.len(), "w_summary_q length mismatch in accumulate");
         for (a, b) in self.w_qk.iter_mut().zip(other.w_qk.iter()) { *a += b; }
         for (a, b) in self.w_summary_q.iter_mut().zip(other.w_summary_q.iter()) { *a += b; }
     }
@@ -245,6 +247,11 @@ pub struct AttentionSummaryCache {
 /// summary = attn_weights^T @ local_y  (weighted combination)
 ///
 /// Returns (k_summary, v_summary, cache).
+///
+/// **Note**: Assumes global_m has a d×d matrix layout (matrix memory rules:
+/// Delta, Titans, Hebbian, AtlasOmega). Will panic for non-matrix rules
+/// (MLP rules like Moneta/YAAD/MEMORA, compression rules like Lattice/Trellis)
+/// whose memory_state_size() != d*d.
 fn compute_shard_summary_attention(
     local_y: &[f32],
     shard_len: usize,
@@ -252,6 +259,13 @@ fn compute_shard_summary_attention(
     w_summary_q: &[f32],
     d: usize,
 ) -> (Vec<f32>, Vec<f32>, AttentionSummaryCache) {
+    assert_eq!(
+        global_m.len(), d * d,
+        "compute_shard_summary_attention requires d×d matrix memory layout, got {} (d={}). \
+         Attention summary is only valid for matrix rules (Delta/Titans/Hebbian/AtlasOmega).",
+        global_m.len(), d
+    );
+
     if shard_len == 0 {
         return (
             vec![0.0f32; d],
@@ -261,16 +275,15 @@ fn compute_shard_summary_attention(
     }
 
     // Derive query from global memory: mean of M rows → project through W_summary_q
-    let m_size = global_m.len();
-    let m_rows = m_size / d; // for d×d matrix rules: m_rows = d
+    // Mean of M rows (d rows of d elements each, d×d layout)
     let mut mean_row = vec![0.0f32; d];
-    if m_rows > 0 {
-        for r in 0..m_rows {
-            for j in 0..d.min(m_size - r * d) {
-                mean_row[j] += global_m[r * d + j];
-            }
+    for r in 0..d {
+        for j in 0..d {
+            mean_row[j] += global_m[r * d + j];
         }
-        let inv = 1.0 / m_rows as f32;
+    }
+    if d > 0 {
+        let inv = 1.0 / d as f32;
         for j in 0..d { mean_row[j] *= inv; }
     }
 
@@ -507,6 +520,105 @@ fn shard_summary_backward(
     d_local_y
 }
 
+/// Backward through attention-based shard summary.
+///
+/// Forward path:
+///   mean_row = mean(global_m rows)                      [d]
+///   summary_q = mean_row @ W_summary_q^T                [d]
+///   scores[t] = (local_y[t] · summary_q) / sqrt(d)      [shard_len]
+///   attn_weights = softmax(scores)                       [shard_len]
+///   summary[j] = sum_t attn_weights[t] * local_y[t,j]   [d]
+///   k_summary = v_summary = summary
+///
+/// Returns (d_local_y, d_w_summary_q, d_global_m_from_summary).
+fn shard_summary_attention_backward(
+    d_k_summary: &[f32],
+    d_v_summary: &[f32],
+    cache: &AttentionSummaryCache,
+    local_y: &[f32],
+    global_m: &[f32],
+    w_summary_q: &[f32],
+    d: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let shard_len = cache.shard_len;
+    let mut d_local_y = vec![0.0f32; shard_len * d];
+    let mut d_w_summary_q = vec![0.0f32; d * d];
+    let mut d_global_m = vec![0.0f32; d * d];
+
+    if shard_len == 0 {
+        return (d_local_y, d_w_summary_q, d_global_m);
+    }
+
+    // d_summary = d_k_summary + d_v_summary (since k_summary = v_summary = summary)
+    let mut d_summary = vec![0.0f32; d];
+    for j in 0..d {
+        d_summary[j] = d_k_summary[j] + d_v_summary[j];
+    }
+
+    // Backward through: summary[j] = sum_t attn_weights[t] * local_y[t,j]
+    // d_attn_weights[t] = sum_j d_summary[j] * local_y[t,j]
+    // d_local_y[t,j] += attn_weights[t] * d_summary[j]
+    let mut d_attn_weights = vec![0.0f32; shard_len];
+    for t in 0..shard_len {
+        for j in 0..d {
+            d_attn_weights[t] += d_summary[j] * local_y[t * d + j];
+            d_local_y[t * d + j] += cache.attn_weights[t] * d_summary[j];
+        }
+    }
+
+    // Backward through softmax: d_scores[t] = attn_weights[t] * (d_attn_weights[t] - sum_k attn_weights[k] * d_attn_weights[k])
+    let weighted_sum: f32 = (0..shard_len)
+        .map(|t| cache.attn_weights[t] * d_attn_weights[t])
+        .sum();
+    let mut d_scores = vec![0.0f32; shard_len];
+    for t in 0..shard_len {
+        d_scores[t] = cache.attn_weights[t] * (d_attn_weights[t] - weighted_sum);
+    }
+
+    // Backward through: scores[t] = (local_y[t] · summary_q) / sqrt(d)
+    // d_local_y[t,j] += d_scores[t] * summary_q[j] / sqrt(d)
+    // d_summary_q[j] += sum_t d_scores[t] * local_y[t,j] / sqrt(d)
+    let scale = 1.0 / (d as f32).sqrt();
+    let mut d_summary_q = vec![0.0f32; d];
+    for t in 0..shard_len {
+        let ds = d_scores[t] * scale;
+        for j in 0..d {
+            d_local_y[t * d + j] += ds * cache.summary_q[j];
+            d_summary_q[j] += ds * local_y[t * d + j];
+        }
+    }
+
+    // Backward through: summary_q[j] = sum_k mean_row[k] * W_summary_q[j,k]
+    // d_mean_row[k] += sum_j d_summary_q[j] * W_summary_q[j,k]
+    // d_W_summary_q[j,k] += d_summary_q[j] * mean_row[k]
+    let mut mean_row = vec![0.0f32; d];
+    for r in 0..d {
+        for j in 0..d {
+            mean_row[j] += global_m[r * d + j];
+        }
+    }
+    let inv_d = 1.0 / d as f32;
+    for j in 0..d { mean_row[j] *= inv_d; }
+
+    let mut d_mean_row = vec![0.0f32; d];
+    for j in 0..d {
+        for k in 0..d {
+            d_mean_row[k] += d_summary_q[j] * w_summary_q[j * d + k];
+            d_w_summary_q[j * d + k] += d_summary_q[j] * mean_row[k];
+        }
+    }
+
+    // Backward through: mean_row = mean(global_m rows)
+    // d_global_m[r,j] += d_mean_row[j] / d
+    for r in 0..d {
+        for j in 0..d {
+            d_global_m[r * d + j] += d_mean_row[j] * inv_d;
+        }
+    }
+
+    (d_local_y, d_w_summary_q, d_global_m)
+}
+
 /// TNT backward pass: reverse through shards, propagating gradients through
 /// both local chunkwise passes and global memory updates.
 ///
@@ -553,9 +665,26 @@ pub fn tnt_backward(
             d_global_m = d_gm_old;
 
             // Backward through shard summary → additional d_y for this shard
-            let d_shard_y_from_global = shard_summary_backward(
-                &d_k_sum, &d_v_sum, shard_len, d,
-            );
+            let d_shard_y_from_global = if let Some(attn_cache) = &shard.attn_summary_cache {
+                // Attention-based summary backward: produces gradients for
+                // local_y, w_summary_q, and additional d_global_m
+                let global_m_at_shard = &cache.global_states[shard_idx];
+                let tp = tnt_params.expect("attn_summary_cache requires tnt_params");
+                let (d_ly, d_wsq, d_gm_attn) = shard_summary_attention_backward(
+                    &d_k_sum, &d_v_sum, attn_cache,
+                    &shard.local_y, global_m_at_shard, &tp.w_summary_q, d,
+                );
+                // Accumulate w_summary_q gradient
+                if let Some(ref mut tg) = tnt_grads {
+                    for (a, b) in tg.w_summary_q.iter_mut().zip(d_wsq.iter()) { *a += b; }
+                }
+                // Add attention summary's contribution to d_global_m
+                for (a, b) in d_global_m.iter_mut().zip(d_gm_attn.iter()) { *a += b; }
+                d_ly
+            } else {
+                // Mean-pooling backward (original path)
+                shard_summary_backward(&d_k_sum, &d_v_sum, shard_len, d)
+            };
 
             // Combine upstream d_y with gradient from global path
             let mut d_y_combined = vec![0.0f32; shard_len * d];
@@ -974,10 +1103,7 @@ mod tests {
         let mut global_m = vec![0.0f32; d * d];
         rng.fill_uniform(&mut global_m, 0.5);
 
-        let (k_mean, _, ) = {
-            let (k, v) = compute_shard_summary_mean(&local_y, shard_len, d);
-            (k, v)
-        };
+        let (k_mean, _) = compute_shard_summary_mean(&local_y, shard_len, d);
         let (k_attn, _, _cache) = compute_shard_summary_attention(
             &local_y, shard_len, &global_m, &tnt_p.w_summary_q, d,
         );
