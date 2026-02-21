@@ -592,35 +592,10 @@ impl MemoryRule for Moneta {
                 }
             }
 
-            // ── lp_grad backward (smooth): dispatch mirrors forward fast-paths ──
-            // p=2: lp_g = 2*e, so d/de = 2 (trivial)
-            // p=1: lp_g = tanh(a*e), so d/de = a * sech^2(a*e)
-            // General: product rule on p * tanh(a*e) * (e^2+eps)^{(p-1)/2}
+            // ── lp_grad backward: d/de [p * Sign(e) ⊙ |e|^{p-1}] ──
             let mut d_err = vec![0.0f32; d];
             for i in 0..d {
-                let e = cache.error[pred_base + i];
-                if (p - 2.0).abs() < 1e-6 {
-                    // L2 fast-path: lp_g = 2*e, derivative = 2
-                    d_err[i] = d_lp_g[i] * 2.0;
-                } else if (p - 1.0).abs() < 1e-6 {
-                    // L1 fast-path: lp_g = tanh(a*e), d/de = a * sech^2(a*e)
-                    let tanh_ae = (a * e).tanh();
-                    let sech2 = 1.0 - tanh_ae * tanh_ae;
-                    d_err[i] = d_lp_g[i] * a * sech2;
-                } else {
-                    // General p: d/de [p * tanh(a*e) * (e^2+eps)^{(p-1)/2}]
-                    // Product rule: p * [d_sign * power + sign * d_power]
-                    // d_sign = a * sech^2(a*e)
-                    // d_power = (p-1) * e * (e^2+eps)^{(p-3)/2}
-                    let tanh_ae = (a * e).tanh();
-                    let sech2 = 1.0 - tanh_ae * tanh_ae;
-                    let e2_eps = e * e + 1e-6_f32;
-                    let power = e2_eps.powf((p - 1.0) / 2.0);
-                    let d_power = (p - 1.0) * e * e2_eps.powf((p - 3.0) / 2.0);
-                    let term1 = a * sech2 * power;
-                    let term2 = tanh_ae * d_power;
-                    d_err[i] = d_lp_g[i] * p * (term1 + term2);
-                }
+                d_err[i] = d_lp_g[i] * lp_grad_deriv(cache.error[pred_base + i], p, a);
             }
 
             // error = prediction - v_t backward
@@ -726,6 +701,28 @@ impl MemoryRule for Moneta {
     }
 }
 
+/// Derivative of lp_grad w.r.t. error: d/de [p * Sign(e) ⊙ |e|^{p-1}].
+///
+/// Used by both `step_backward` (MONETA MLP) and `lp_bias_gradient_backward`
+/// (standalone dispatch) to avoid duplicating the per-element VJP logic.
+#[inline]
+fn lp_grad_deriv(e: f32, p: f32, sign_sharpness: f32) -> f32 {
+    let a = sign_sharpness;
+    if (p - 2.0).abs() < 1e-6 {
+        2.0
+    } else if (p - 1.0).abs() < 1e-6 {
+        let tanh_ae = (a * e).tanh();
+        a * (1.0 - tanh_ae * tanh_ae)
+    } else {
+        let tanh_ae = (a * e).tanh();
+        let sech2 = 1.0 - tanh_ae * tanh_ae;
+        let e2_eps = e * e + 1e-6_f32;
+        let power = e2_eps.powf((p - 1.0) / 2.0);
+        let d_power = (p - 1.0) * e * e2_eps.powf((p - 3.0) / 2.0);
+        p * (a * sech2 * power + tanh_ae * d_power)
+    }
+}
+
 // ── Standalone l_p dispatch (linear-memory rules) ────────────────────
 
 /// Compute the l_p gradient vector: p * Sign(e) ⊙ |e|^{p-1} per element.
@@ -765,25 +762,12 @@ pub fn lp_bias_gradient_backward(
     p: f32,
     sign_sharpness: f32,
 ) -> Vec<f32> {
+    assert_eq!(d_lp.len(), error.len(),
+        "lp_bias_gradient_backward: d_lp.len() ({}) != error.len() ({})", d_lp.len(), error.len());
     let d = error.len();
-    let a = sign_sharpness;
     let mut d_error = vec![0.0f32; d];
     for i in 0..d {
-        let e = error[i];
-        if (p - 2.0).abs() < 1e-6 {
-            d_error[i] = d_lp[i] * 2.0;
-        } else if (p - 1.0).abs() < 1e-6 {
-            let tanh_ae = (a * e).tanh();
-            let sech2 = 1.0 - tanh_ae * tanh_ae;
-            d_error[i] = d_lp[i] * a * sech2;
-        } else {
-            let tanh_ae = (a * e).tanh();
-            let sech2 = 1.0 - tanh_ae * tanh_ae;
-            let e2_eps = e * e + 1e-6_f32;
-            let power = e2_eps.powf((p - 1.0) / 2.0);
-            let d_power = (p - 1.0) * e * e2_eps.powf((p - 3.0) / 2.0);
-            d_error[i] = d_lp[i] * p * (a * sech2 * power + tanh_ae * d_power);
-        }
+        d_error[i] = d_lp[i] * lp_grad_deriv(error[i], p, sign_sharpness);
     }
     d_error
 }
