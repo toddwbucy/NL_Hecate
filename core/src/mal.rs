@@ -323,6 +323,9 @@ pub fn mal_backward(
     // Reconstruct qkv_input for weight gradients
     let mut qkv_input = vec![0.0f32; s_total * d];
     if n_p > 0 {
+        assert_eq!(params.persistent_tokens.len(), n_p * d,
+            "persistent_tokens length mismatch: expected {} got {}",
+            n_p * d, params.persistent_tokens.len());
         qkv_input[..n_p * d].copy_from_slice(&params.persistent_tokens);
     }
     qkv_input[n_p * d..].copy_from_slice(&cache.attn_input);
@@ -745,6 +748,9 @@ pub fn cms_mal_backward(
     // ── Stage 3: QKV projection backward (inputs are [persistent | attn_input]) ──
     let mut qkv_input = vec![0.0f32; s_total * d];
     if n_p > 0 {
+        assert_eq!(params.persistent_tokens.len(), n_p * d,
+            "persistent_tokens length mismatch: expected {} got {}",
+            n_p * d, params.persistent_tokens.len());
         qkv_input[..n_p * d].copy_from_slice(&params.persistent_tokens);
     }
     qkv_input[n_p * d..].copy_from_slice(&cache.attn_input);
