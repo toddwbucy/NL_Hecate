@@ -839,8 +839,8 @@ pub fn apply_attentional_bias_backward(
 pub fn normalize_bias(bias: crate::model::AttentionalBias) -> crate::model::AttentionalBias {
     use crate::model::AttentionalBias;
     match bias {
-        AttentionalBias::Lp(p) if p == 2.0 => AttentionalBias::L2,
-        AttentionalBias::Lp(p) if p == 1.0 => AttentionalBias::L1,
+        AttentionalBias::Lp(p) if (p - 2.0).abs() < 1e-6 => AttentionalBias::L2,
+        AttentionalBias::Lp(p) if (p - 1.0).abs() < 1e-6 => AttentionalBias::L1,
         other => other,
     }
 }
@@ -865,7 +865,7 @@ pub fn bias_to_f32(bias: crate::model::AttentionalBias) -> f32 {
         AttentionalBias::L2 => 2.0,
         AttentionalBias::L1 => 1.0,
         AttentionalBias::Lp(p) => {
-            assert!(p != 2.0 && p != 1.0,
+            assert!((p - 2.0).abs() >= 1e-6 && (p - 1.0).abs() >= 1e-6,
                 "Lp({p}) collides with L2/L1 encoding — call normalize_bias() first");
             p
         }
