@@ -82,7 +82,7 @@ impl std::fmt::Display for CompositionError {
 pub fn validate_composition(
     rule: MemoryRuleKind,
     retention: RetentionKind,
-    _composition: CompositionKind,
+    _composition: CompositionKind, // reserved for PS-TC-02: MAC/MAG/MAL constraints
     parallel: Option<ParallelStrategy>,
 ) -> Result<(), Vec<CompositionError>> {
     let mut errors = Vec::new();
