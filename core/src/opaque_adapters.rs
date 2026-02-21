@@ -83,30 +83,49 @@ pub fn level_params_from_flat(flat: &[f32], d: usize, kernel_size: usize) -> Mem
     let w_eta = take(&mut offset, 2 * d);
     let b_eta = take(&mut offset, 1);
     let w_omega = take(&mut offset, d * 2 * d);
-    // Variable-length optional fields: freq then conv
-    // Compute expected sizes to parse from remaining
-    let freq_size = {
-        // Check if freq fields are present by examining remaining length
-        let remaining = flat.len() - offset;
-        let conv_size = if kernel_size > 0 { 2 * d * kernel_size + 2 * d } else { 0 };
-        let non_conv = remaining - conv_size;
-        if non_conv > 0 {
-            assert!(non_conv == d + 1,
-                "malformed level_params buffer: expected freq size 0 or {}, got {}",
-                d + 1, non_conv);
+    // Variable-length optional fields: freq then conv.
+    // Both are detected from the remaining buffer length when kernel_size == 0
+    // (opaque backward adapters don't carry kernel_size in metadata).
+    let remaining = flat.len() - offset;
+    // Determine actual kernel_size: if caller passed 0, infer from buffer.
+    // Conv fields occupy 2*d*ks + 2*d = 2*d*(ks+1) elements.
+    // Freq fields occupy 0 or d+1 elements.
+    let effective_ks = if kernel_size > 0 {
+        kernel_size
+    } else if remaining > 0 {
+        // Try freq = d+1 first, then check if leftover is valid conv
+        let (freq_guess, leftover) = if remaining >= d + 1 && (remaining == d + 1 || (remaining > d + 1 && (remaining - (d + 1)) % (2 * d) == 0)) {
+            (d + 1, remaining - (d + 1))
+        } else {
+            (0, remaining)
+        };
+        if leftover > 0 && leftover % (2 * d) == 0 {
+            let _ = freq_guess; // freq_guess used below via offset tracking
+            leftover / (2 * d) - 1
+        } else {
+            0
         }
-        non_conv
+    } else {
+        0
     };
+    // Now parse freq: present if remaining > conv_size
+    let conv_size = if effective_ks > 0 { 2 * d * effective_ks + 2 * d } else { 0 };
+    let freq_size = remaining - conv_size;
+    if freq_size > 0 {
+        assert!(freq_size == d + 1,
+            "malformed level_params buffer: expected freq size 0 or {}, got {}",
+            d + 1, freq_size);
+    }
     let (w_freq, b_freq) = if freq_size > 0 {
         (take(&mut offset, d), take(&mut offset, 1))
     } else {
         (vec![], vec![])
     };
-    let (w_k_conv, b_k_conv, w_q_conv, b_q_conv) = if kernel_size > 0 {
+    let (w_k_conv, b_k_conv, w_q_conv, b_q_conv) = if effective_ks > 0 {
         (
-            take(&mut offset, d * kernel_size),
+            take(&mut offset, d * effective_ks),
             take(&mut offset, d),
-            take(&mut offset, d * kernel_size),
+            take(&mut offset, d * effective_ks),
             take(&mut offset, d),
         )
     } else {

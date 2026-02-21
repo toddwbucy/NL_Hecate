@@ -272,7 +272,7 @@ impl MAGConfig {
         d_hidden=None, lp_p=None, sign_sharpness=None, lq_q=None, lambda_local=None, lambda_2=None,
         delta=None, m_slots=None, d_compress=None, lambda_k=None, lambda_v=None,
         retention=None, m3=None, frequency_schedule=None, checkpoint_interval=None,
-        attentional_bias=None,
+        attentional_bias=None, kernel_size=0,
     ))]
     fn new(
         d_model: usize,
@@ -302,6 +302,7 @@ impl MAGConfig {
         frequency_schedule: Option<&Bound<'_, PyAny>>,
         checkpoint_interval: Option<usize>,
         attentional_bias: Option<&str>,
+        kernel_size: usize,
     ) -> PyResult<Self> {
         if d_model != num_heads * head_dim {
             return Err(PyValueError::new_err(format!(
@@ -436,7 +437,7 @@ impl MAGConfig {
                 lattice_variant: nl_hecate_core::model::LatticeVariant::Decode,
                 n_persistent: 0,
                 attentional_bias: bias_kind,
-                kernel_size: 0,
+                kernel_size,
             },
         })
     }
@@ -607,7 +608,7 @@ impl MAGForwardCache {
     d_hidden=None, lp_p=None, sign_sharpness=None, lq_q=None, lambda_local=None, lambda_2=None,
     delta=None, m_slots=None, d_compress=None, lambda_k=None, lambda_v=None,
     retention=None, m3=None, frequency_schedule=None, checkpoint_interval=None,
-    attentional_bias=None,
+    attentional_bias=None, kernel_size=0,
 ))]
 fn mag_create_config(
     d_model: usize,
@@ -637,12 +638,13 @@ fn mag_create_config(
     frequency_schedule: Option<&Bound<'_, PyAny>>,
     checkpoint_interval: Option<usize>,
     attentional_bias: Option<&str>,
+    kernel_size: usize,
 ) -> PyResult<MAGConfig> {
     MAGConfig::new(
         d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled,
         k, chunk_sizes, memory_rule, composition,
         d_hidden, lp_p, sign_sharpness, lq_q, lambda_local, lambda_2, delta, m_slots, d_compress, lambda_k, lambda_v,
-        retention, m3, frequency_schedule, checkpoint_interval, attentional_bias,
+        retention, m3, frequency_schedule, checkpoint_interval, attentional_bias, kernel_size,
     )
 }
 
