@@ -491,10 +491,16 @@ pub fn linearized_gla_forward(
     (y, cache)
 }
 
-/// Backward for true linearized GLA.
+/// Backward for true linearized GLA (read path only).
 ///
-/// Computes gradients for W_K_mem, W_V_mem, W_Q_mem, w_alpha, b_alpha,
-/// and d_embedded. Uses the cached coefficients and boundary states.
+/// Computes gradients for `grads.w_q_mem` and `d_embedded` through the
+/// read path (softmax attention over boundary slots → query projection).
+/// All other gradient fields in the returned `MemoryLevelParams` (w_k_mem,
+/// w_v_mem, w_alpha, b_alpha, etc.) are left as zeros — they require
+/// differentiating through the cumulative product recurrence (write path),
+/// which is not yet implemented here. Use the approximate
+/// `lattice_gla_backward` (which delegates to `chunkwise_gd_backward`)
+/// for full write-path gradients.
 pub fn linearized_gla_backward(
     level_params: &MemoryLevelParams,
     cache: &LinearizedGLACache,
@@ -906,27 +912,21 @@ mod tests {
     // ─── True Linearized GLA tests ──────────────────────────
 
     #[test]
-    fn test_linearized_gla_c1_matches_sequential() {
-        // With chunk_size=seq_len (single chunk), the linearized GLA should
-        // match the sequential lattice_osr forward closely.
+    fn test_linearized_gla_single_chunk_finite() {
+        // With chunk_size=seq_len (single chunk), verify outputs are finite.
+        // Note: the linearized version reads from boundary state (frozen within
+        // chunk), so outputs differ from sequential (which reads from evolving
+        // state). This is expected — the linearization approximation trades
+        // per-token state updates for parallelism.
         let cfg = MAGConfig::lattice_test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
 
-        let rule = LatticeOSR { m_slots: cfg.m_slots, variant: cfg.lattice_variant };
-        let (y_seq, _) = rule.step(&params.levels[0], &embedded, s, d, None);
-
         let (y_lin, _) = linearized_gla_forward(
             &params.levels[0], &embedded, s, d, s, &cfg, None,
         );
-
-        // Note: The linearized version reads from boundary state (not evolving state),
-        // so even at C=1 it reads from the initial state for all tokens. The sequential
-        // version reads from updated state. For C=seq_len this is one chunk, so
-        // boundary is the initial state and outputs differ from sequential.
-        // But we can verify finiteness and reasonable magnitudes.
         for &v in &y_lin { assert!(v.is_finite(), "linearized GLA output not finite"); }
     }
 
