@@ -224,7 +224,7 @@ pub fn cosine_lr(step: u32, warmup_steps: u32, total_steps: u32,
     if step < warmup_steps {
         return lr_peak * step as f32 / warmup_steps.max(1) as f32;
     }
-    let progress = (step - warmup_steps) as f32 / (total_steps - warmup_steps).max(1) as f32;
+    let progress = (step - warmup_steps) as f32 / total_steps.saturating_sub(warmup_steps).max(1) as f32;
     let progress = progress.min(1.0);
     lr_min + 0.5 * (lr_peak - lr_min) * (1.0 + (std::f32::consts::PI * progress).cos())
 }
