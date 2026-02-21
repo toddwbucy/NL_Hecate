@@ -215,6 +215,103 @@ pub fn elastic_net_apply(w: &mut [f32], retain: f32, lambda_1: f32, theta: f32) 
     }
 }
 
+// ── FTRL Accumulator Pattern (MIRAS §3.2, Eq 23) ────────────────────
+
+/// FTRL elastic net step: accumulate into A, then derive W via soft thresholding.
+///
+/// This implements the two-step FTRL update from MIRAS Eq 23:
+///   Step 1: `A[i] -= eta * grad[i]`  (gradient accumulation)
+///   Step 2: `W[i] = sign(A[i]) * max(0, |A[i]| - lambda)`  (proximal step)
+///
+/// The accumulator A is an `inner_loop_state` tensor that persists alongside
+/// the memory matrix W. It tracks the cumulative gradient sum, while W is the
+/// regularized solution derived from A. The L1 component drives small entries
+/// in A to exactly zero in W, producing sparse memory matrices.
+///
+/// # Arguments
+/// * `accum` — gradient accumulator A, mutated in-place (same shape as W)
+/// * `w` — memory matrix W, overwritten with soft_threshold(A) (same shape as A)
+/// * `grad` — current gradient (same shape as A)
+/// * `eta` — inner-loop learning rate (theta gate output)
+/// * `lambda` — L1 threshold: `eta / alpha` where alpha controls L1 strength
+pub fn ftrl_elastic_net_step(
+    accum: &mut [f32],
+    w: &mut [f32],
+    grad: &[f32],
+    eta: f32,
+    lambda: f32,
+) {
+    debug_assert_eq!(accum.len(), w.len());
+    debug_assert_eq!(accum.len(), grad.len());
+    debug_assert!(lambda >= 0.0, "FTRL lambda must be non-negative, got {lambda}");
+
+    for i in 0..accum.len() {
+        // Step 1: Accumulate
+        accum[i] -= eta * grad[i];
+
+        // Step 2: Soft threshold → W
+        let abs_a = accum[i].abs();
+        if abs_a <= lambda {
+            w[i] = 0.0;
+        } else {
+            w[i] = accum[i].signum() * (abs_a - lambda);
+        }
+    }
+}
+
+/// Backward pass through FTRL soft thresholding (straight-through estimator).
+///
+/// The soft thresholding `W = sign(A) * max(0, |A| - lambda)` has gradient:
+///   `dL/dA = dL/dW * indicator(|A| > lambda)`
+///
+/// Active entries (|A| > lambda, W ≠ 0): gradient passes through unchanged.
+/// Killed entries (|A| <= lambda, W = 0): gradient is zeroed.
+///
+/// This is the STE approach: at the discontinuity |A| = lambda, we use 0
+/// (conservative — don't revive dead entries via gradient noise).
+///
+/// # Arguments
+/// * `d_w` — upstream gradient dL/dW
+/// * `accum` — accumulator A (needed to compute the indicator)
+/// * `lambda` — same threshold used in the forward pass
+///
+/// # Returns
+/// `d_accum` — gradient dL/dA (same shape as d_w)
+pub fn ftrl_soft_threshold_backward(
+    d_w: &[f32],
+    accum: &[f32],
+    lambda: f32,
+) -> Vec<f32> {
+    debug_assert_eq!(d_w.len(), accum.len());
+    debug_assert!(lambda >= 0.0, "FTRL lambda must be non-negative, got {lambda}");
+
+    d_w.iter()
+        .zip(accum.iter())
+        .map(|(&dw, &a)| {
+            if a.abs() > lambda { dw } else { 0.0 }
+        })
+        .collect()
+}
+
+/// In-place variant of `ftrl_soft_threshold_backward`.
+///
+/// Writes `d_accum[i] = d_w[i] * indicator(|accum[i]| > lambda)` into `d_accum`.
+#[inline]
+pub fn ftrl_soft_threshold_backward_inplace(
+    d_w: &[f32],
+    accum: &[f32],
+    lambda: f32,
+    d_accum: &mut [f32],
+) {
+    debug_assert_eq!(d_w.len(), accum.len());
+    debug_assert_eq!(d_w.len(), d_accum.len());
+    debug_assert!(lambda >= 0.0, "FTRL lambda must be non-negative, got {lambda}");
+
+    for i in 0..d_w.len() {
+        d_accum[i] = if accum[i].abs() > lambda { d_w[i] } else { 0.0 };
+    }
+}
+
 // ── Sphere Normalization (Lattice OSR) ──────────────────────────────
 
 /// Apply orthogonal projection + normalize for one slot.
@@ -467,6 +564,115 @@ mod tests {
         let expected_norm = (1.0f32 + 0.25).sqrt();
         assert!((s_new[0] - 1.0 / expected_norm).abs() < 1e-6);
         assert!((s_new[1] - 0.5 / expected_norm).abs() < 1e-6);
+    }
+
+    // ── FTRL accumulator pattern ────────────────────────────────────
+
+    #[test]
+    fn test_ftrl_elastic_net_step_basic() {
+        let mut accum = vec![0.0f32; 4];
+        let mut w = vec![0.0f32; 4];
+        let grad = vec![1.0, -2.0, 0.5, -0.1];
+
+        // eta=0.1, lambda=0.05
+        ftrl_elastic_net_step(&mut accum, &mut w, &grad, 0.1, 0.05);
+
+        // accum: [0 - 0.1*1.0, 0 - 0.1*(-2.0), 0 - 0.1*0.5, 0 - 0.1*(-0.1)]
+        //      = [-0.1, 0.2, -0.05, 0.01]
+        assert!((accum[0] - (-0.1)).abs() < 1e-7);
+        assert!((accum[1] - 0.2).abs() < 1e-7);
+        assert!((accum[2] - (-0.05)).abs() < 1e-7);
+        assert!((accum[3] - 0.01).abs() < 1e-7);
+
+        // W = soft_threshold(accum, 0.05):
+        // |−0.1| > 0.05 → −(0.1−0.05) = −0.05
+        // |0.2| > 0.05 → +(0.2−0.05) = 0.15
+        // |−0.05| <= 0.05 → 0.0  (exactly at threshold → killed)
+        // |0.01| <= 0.05 → 0.0
+        assert!((w[0] - (-0.05)).abs() < 1e-7);
+        assert!((w[1] - 0.15).abs() < 1e-7);
+        assert_eq!(w[2], 0.0);
+        assert_eq!(w[3], 0.0);
+    }
+
+    #[test]
+    fn test_ftrl_accumulates_across_steps() {
+        let mut accum = vec![0.0f32; 2];
+        let mut w = vec![0.0f32; 2];
+
+        // Step 1: small gradient
+        ftrl_elastic_net_step(&mut accum, &mut w, &[0.5, -0.3], 0.1, 0.02);
+        assert!((accum[0] - (-0.05)).abs() < 1e-7);
+        assert!((accum[1] - 0.03).abs() < 1e-7);
+
+        // Step 2: accumulates on top
+        ftrl_elastic_net_step(&mut accum, &mut w, &[0.5, -0.3], 0.1, 0.02);
+        assert!((accum[0] - (-0.10)).abs() < 1e-7);
+        assert!((accum[1] - 0.06).abs() < 1e-7);
+
+        // W derived from final A
+        // |−0.10| > 0.02 → −(0.10−0.02) = −0.08
+        // |0.06| > 0.02 → +(0.06−0.02) = 0.04
+        assert!((w[0] - (-0.08)).abs() < 1e-7);
+        assert!((w[1] - 0.04).abs() < 1e-7);
+    }
+
+    #[test]
+    fn test_ftrl_zero_lambda_no_thresholding() {
+        let mut accum = vec![0.0f32; 3];
+        let mut w = vec![0.0f32; 3];
+
+        ftrl_elastic_net_step(&mut accum, &mut w, &[1.0, -1.0, 0.001], 0.1, 0.0);
+        // lambda=0 → W = A (no thresholding, recovers pure L2)
+        for i in 0..3 {
+            assert_eq!(w[i], accum[i], "zero lambda should make W=A");
+        }
+    }
+
+    #[test]
+    fn test_ftrl_backward_ste_basic() {
+        let d_w = vec![1.0, 2.0, 3.0, 4.0];
+        let accum = vec![0.5, 0.01, -0.3, -0.001];
+        let lambda = 0.05;
+
+        let d_a = ftrl_soft_threshold_backward(&d_w, &accum, lambda);
+
+        // |0.5| > 0.05 → pass through: 1.0
+        // |0.01| <= 0.05 → killed: 0.0
+        // |−0.3| > 0.05 → pass through: 3.0
+        // |−0.001| <= 0.05 → killed: 0.0
+        assert_eq!(d_a[0], 1.0);
+        assert_eq!(d_a[1], 0.0);
+        assert_eq!(d_a[2], 3.0);
+        assert_eq!(d_a[3], 0.0);
+    }
+
+    #[test]
+    fn test_ftrl_backward_inplace_matches() {
+        let d_w = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let accum = vec![0.5, 0.01, -0.3, -0.001, 1.0];
+        let lambda = 0.05;
+
+        let expected = ftrl_soft_threshold_backward(&d_w, &accum, lambda);
+
+        let mut d_a = vec![0.0f32; 5];
+        ftrl_soft_threshold_backward_inplace(&d_w, &accum, lambda, &mut d_a);
+
+        assert_eq!(d_a, expected);
+    }
+
+    #[test]
+    fn test_ftrl_backward_zero_lambda_all_pass() {
+        let d_w = vec![1.0, 2.0, 3.0];
+        let accum = vec![0.001, -0.001, 0.0]; // tiny but nonzero
+        let lambda = 0.0;
+
+        let d_a = ftrl_soft_threshold_backward(&d_w, &accum, lambda);
+        // lambda=0: |A| > 0 for nonzero entries → pass through
+        // |0.0| is NOT > 0 → killed
+        assert_eq!(d_a[0], 1.0);
+        assert_eq!(d_a[1], 2.0);
+        assert_eq!(d_a[2], 0.0); // exactly zero accumulator → killed
     }
 
     // ── default_retention mapping ───────────────────────────────────
