@@ -44,6 +44,9 @@ struct MomentLevel {
     m_b_theta: GpuBuf<f32>,  v_b_theta: GpuBuf<f32>,
     m_w_eta: GpuBuf<f32>,    v_w_eta: GpuBuf<f32>,
     m_b_eta: GpuBuf<f32>,    v_b_eta: GpuBuf<f32>,
+    /// Level-local step counter for per-level bias correction.
+    /// Counts how many times this level has actually fired, not global steps.
+    level_step: u32,
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -102,6 +105,7 @@ impl GpuAdamWState {
             v_w_eta: GpuBuf::zeros(lp.w_eta.len()),
             m_b_eta: GpuBuf::zeros(lp.b_eta.len()),
             v_b_eta: GpuBuf::zeros(lp.b_eta.len()),
+            level_step: 0,
         }).collect();
 
         // Max buffer for norm reduction: find largest param buffer across all weights.
