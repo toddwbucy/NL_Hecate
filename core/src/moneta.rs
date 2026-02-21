@@ -90,21 +90,31 @@ pub struct MonetaCache {
 
 /// Compute l_p gradient: p * smooth_sign(e) * |e|^(p-1).
 ///
-/// Uses tanh(a*e) as smooth Sign approximation (MIRAS Remark 5)
-/// instead of raw signum(), which is non-differentiable at zero.
-/// The Wengert tape can differentiate through tanh natively.
+/// Uses tanh(a*e) as smooth Sign approximation and (e^2+eps)^{(p-1)/2}
+/// as smooth absolute-power approximation (MIRAS §5.1 Remark 5).
+/// Both are fully differentiable, enabling Wengert tape integration.
 ///
-/// For p=1 (L1 fast-path): |e|^0 = 1, so gradient = tanh(a*e).
-/// For p=2 (L2): tanh(a*e) ≈ sign(e) for |e| >> 0, recovers 2*e behavior.
+/// Fast-path dispatch (spec: 03_lp_dispatch.md):
+/// - p=1 (L1): |e|^0 = 1 vanishes, only Sign needed → tanh(a*e)
+/// - p=2 (L2): Sign(e)⊙|e| = e, no approximators → 2*e
+/// - General p: both smooth approximators required
 #[inline]
 fn lp_grad(e: f32, p: f32, sign_sharpness: f32) -> f32 {
-    let smooth_sign = (sign_sharpness * e).tanh();
-    if (p - 1.0).abs() < 1e-6 {
-        // L1 fast-path: |e|^0 = 1, magnitude term vanishes
-        smooth_sign
+    if (p - 2.0).abs() < 1e-6 {
+        // L2 fast-path: Sign(e) ⊙ |e|^1 = e, so p * e = 2 * e.
+        // No tanh, no power — standard Delta rule gradient.
+        2.0 * e
+    } else if (p - 1.0).abs() < 1e-6 {
+        // L1 fast-path: |e|^0 = 1, magnitude term vanishes.
+        // Only Sign approximator survives.
+        (sign_sharpness * e).tanh()
     } else {
-        let abs_e = e.abs().max(1e-8); // avoid NaN in pow for p < 2
-        p * smooth_sign * abs_e.powf(p - 1.0)
+        // General l_p: p * tanh(a*e) * (e^2 + eps)^{(p-1)/2}
+        // Smooth power approximator: (e^2 + eps)^{(p-1)/2} ≈ |e|^{p-1}
+        // Fully differentiable at e=0 (unlike |e|^{p-1}).
+        let smooth_sign = (sign_sharpness * e).tanh();
+        let power_approx = (e * e + 1e-6_f32).powf((p - 1.0) / 2.0);
+        p * smooth_sign * power_approx
     }
 }
 
@@ -582,24 +592,33 @@ impl MemoryRule for Moneta {
                 }
             }
 
-            // ── lp_grad backward (smooth): lp_g = p * tanh(a*e) * |e|^(p-1) ──
-            // For p=1 (L1 fast-path): lp_g = tanh(a*e), d/de = a * sech^2(a*e)
-            // For general p: product rule on tanh(a*e) * |e|^(p-1)
+            // ── lp_grad backward (smooth): dispatch mirrors forward fast-paths ──
+            // p=2: lp_g = 2*e, so d/de = 2 (trivial)
+            // p=1: lp_g = tanh(a*e), so d/de = a * sech^2(a*e)
+            // General: product rule on p * tanh(a*e) * (e^2+eps)^{(p-1)/2}
             let mut d_err = vec![0.0f32; d];
             for i in 0..d {
                 let e = cache.error[pred_base + i];
-                let tanh_ae = (a * e).tanh();
-                let sech2 = 1.0 - tanh_ae * tanh_ae; // sech^2(a*e)
-                if (p - 1.0).abs() < 1e-6 {
-                    // L1: d/de tanh(a*e) = a * sech^2(a*e)
+                if (p - 2.0).abs() < 1e-6 {
+                    // L2 fast-path: lp_g = 2*e, derivative = 2
+                    d_err[i] = d_lp_g[i] * 2.0;
+                } else if (p - 1.0).abs() < 1e-6 {
+                    // L1 fast-path: lp_g = tanh(a*e), d/de = a * sech^2(a*e)
+                    let tanh_ae = (a * e).tanh();
+                    let sech2 = 1.0 - tanh_ae * tanh_ae;
                     d_err[i] = d_lp_g[i] * a * sech2;
                 } else {
-                    // General p: d/de [p * tanh(a*e) * |e|^(p-1)]
-                    // = p * [a*sech^2(a*e)*|e|^(p-1) + tanh(a*e)*(p-1)*|e|^(p-2)*sign(e)]
-                    // Use smooth sign for the sign(e) term too:
-                    let abs_e = e.abs().max(1e-8);
-                    let term1 = a * sech2 * abs_e.powf(p - 1.0);
-                    let term2 = tanh_ae * (p - 1.0) * abs_e.powf(p - 2.0) * tanh_ae;
+                    // General p: d/de [p * tanh(a*e) * (e^2+eps)^{(p-1)/2}]
+                    // Product rule: p * [d_sign * power + sign * d_power]
+                    // d_sign = a * sech^2(a*e)
+                    // d_power = (p-1) * e * (e^2+eps)^{(p-3)/2}
+                    let tanh_ae = (a * e).tanh();
+                    let sech2 = 1.0 - tanh_ae * tanh_ae;
+                    let e2_eps = e * e + 1e-6_f32;
+                    let power = e2_eps.powf((p - 1.0) / 2.0);
+                    let d_power = (p - 1.0) * e * e2_eps.powf((p - 3.0) / 2.0);
+                    let term1 = a * sech2 * power;
+                    let term2 = tanh_ae * d_power;
                     d_err[i] = d_lp_g[i] * p * (term1 + term2);
                 }
             }
@@ -705,6 +724,68 @@ impl MemoryRule for Moneta {
 
         (grads, d_embedded)
     }
+}
+
+// ── Standalone l_p dispatch (linear-memory rules) ────────────────────
+
+/// Compute the l_p gradient vector: p * Sign(e) ⊙ |e|^{p-1} per element.
+///
+/// Standalone dispatch for matrix-memory rules (Delta, Titans, Hebbian, etc.)
+/// where error = W @ k - v. The caller computes the error vector; this function
+/// applies the element-wise l_p gradient with fast-path dispatch.
+///
+/// Returns a d-dimensional gradient vector. The caller forms the outer product
+/// `grad_vec @ k^T` to get the d×d weight gradient.
+///
+/// Source: MIRAS §5.1 Eq 11, specs/algorithms/attentional_biases/03_lp_dispatch.md
+pub fn lp_bias_gradient(error: &[f32], p: f32, sign_sharpness: f32) -> Vec<f32> {
+    let d = error.len();
+    let mut grad = vec![0.0f32; d];
+    for i in 0..d {
+        grad[i] = lp_grad(error[i], p, sign_sharpness);
+    }
+    grad
+}
+
+/// Backward through the l_p gradient vector (VJP).
+///
+/// Given upstream gradient d_lp (d-dimensional, flowing back through the l_p
+/// gradient computation), returns d_error (d-dimensional gradient w.r.t. the
+/// error vector).
+///
+/// Fast-path dispatch mirrors the forward:
+/// - p=2: d/de(2*e) = 2
+/// - p=1: d/de(tanh(a*e)) = a * sech^2(a*e)
+/// - General: product rule on p * tanh(a*e) * (e^2+eps)^{(p-1)/2}
+///
+/// Source: specs/algorithms/attentional_biases/03_lp_dispatch.md (VJP section)
+pub fn lp_bias_gradient_backward(
+    d_lp: &[f32],
+    error: &[f32],
+    p: f32,
+    sign_sharpness: f32,
+) -> Vec<f32> {
+    let d = error.len();
+    let a = sign_sharpness;
+    let mut d_error = vec![0.0f32; d];
+    for i in 0..d {
+        let e = error[i];
+        if (p - 2.0).abs() < 1e-6 {
+            d_error[i] = d_lp[i] * 2.0;
+        } else if (p - 1.0).abs() < 1e-6 {
+            let tanh_ae = (a * e).tanh();
+            let sech2 = 1.0 - tanh_ae * tanh_ae;
+            d_error[i] = d_lp[i] * a * sech2;
+        } else {
+            let tanh_ae = (a * e).tanh();
+            let sech2 = 1.0 - tanh_ae * tanh_ae;
+            let e2_eps = e * e + 1e-6_f32;
+            let power = e2_eps.powf((p - 1.0) / 2.0);
+            let d_power = (p - 1.0) * e * e2_eps.powf((p - 3.0) / 2.0);
+            d_error[i] = d_lp[i] * p * (a * sech2 * power + tanh_ae * d_power);
+        }
+    }
+    d_error
 }
 
 // ── Read-only functions (for frozen CMS levels) ─────────────────────
@@ -1096,5 +1177,110 @@ mod tests {
 
         // Outputs should differ with different initial memory
         assert_ne!(y1, y2, "Initial memory seeding should change output");
+    }
+
+    // ── l_p dispatch tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_lp_grad_l2_fast_path() {
+        // p=2: lp_grad should return 2*e exactly
+        let errors = [-1.0, -0.5, 0.0, 0.5, 1.0, 2.0];
+        for &e in &errors {
+            let g = lp_grad(e, 2.0, 10.0);
+            let expected = 2.0 * e;
+            assert!((g - expected).abs() < 1e-10,
+                "p=2 fast-path: lp_grad({e}) = {g}, expected {expected}");
+        }
+    }
+
+    #[test]
+    fn test_lp_grad_l1_fast_path() {
+        // p=1: lp_grad should return tanh(a*e)
+        let a = 10.0;
+        let errors = [-1.0, -0.5, 0.0, 0.1, 0.5, 1.0];
+        for &e in &errors {
+            let g = lp_grad(e, 1.0, a);
+            let expected = (a * e).tanh();
+            assert!((g - expected).abs() < 1e-10,
+                "p=1 fast-path: lp_grad({e}) = {g}, expected {expected}");
+        }
+    }
+
+    #[test]
+    fn test_lp_grad_general_p3() {
+        // p=3: gradient should be 3 * tanh(a*e) * (e^2+eps)^1.0
+        let a = 10.0;
+        let e = 0.5;
+        let g = lp_grad(e, 3.0, a);
+        let expected = 3.0 * (a * e).tanh() * (e * e + 1e-6_f32).powf(1.0);
+        assert!((g - expected).abs() < 1e-6,
+            "p=3: lp_grad({e}) = {g}, expected {expected}");
+    }
+
+    #[test]
+    fn test_lp_grad_smooth_at_zero() {
+        // All p values should produce finite, non-NaN results at e=0
+        for p in [1.0, 1.5, 2.0, 3.0, 4.0] {
+            let g = lp_grad(0.0, p, 10.0);
+            assert!(g.is_finite(), "lp_grad(0, p={p}) should be finite, got {g}");
+        }
+    }
+
+    #[test]
+    fn test_lp_bias_gradient_standalone() {
+        // Verify standalone dispatch matches per-element lp_grad
+        let error = vec![-0.5, 0.0, 0.3, 1.0];
+        let p = 3.0;
+        let a = 10.0;
+        let grad = lp_bias_gradient(&error, p, a);
+        assert_eq!(grad.len(), 4);
+        for i in 0..4 {
+            let expected = lp_grad(error[i], p, a);
+            assert!((grad[i] - expected).abs() < 1e-10,
+                "lp_bias_gradient[{i}] = {}, expected {expected}", grad[i]);
+        }
+    }
+
+    #[test]
+    fn test_lp_bias_gradient_backward_l2() {
+        // p=2: d/de(2*e) = 2, so d_error = 2 * d_lp
+        let d_lp = vec![1.0, -0.5, 0.3];
+        let error = vec![0.1, -0.2, 0.5];
+        let d_err = lp_bias_gradient_backward(&d_lp, &error, 2.0, 10.0);
+        for i in 0..3 {
+            let expected = d_lp[i] * 2.0;
+            assert!((d_err[i] - expected).abs() < 1e-10,
+                "p=2 backward: d_err[{i}] = {}, expected {expected}", d_err[i]);
+        }
+    }
+
+    #[test]
+    fn test_lp_bias_gradient_backward_fd_check() {
+        // Finite-difference check for p=3 at a few error values
+        let error = vec![0.3, -0.5, 1.0, 0.01];
+        let p = 3.0;
+        let a = 10.0;
+        let eps = 1e-3;
+
+        let d_lp = vec![1.0; error.len()];
+        let d_err = lp_bias_gradient_backward(&d_lp, &error, p, a);
+
+        for i in 0..error.len() {
+            let mut e_plus = error.clone();
+            let mut e_minus = error.clone();
+            e_plus[i] += eps;
+            e_minus[i] -= eps;
+            let g_plus = lp_grad(e_plus[i], p, a);
+            let g_minus = lp_grad(e_minus[i], p, a);
+            let fd = (g_plus - g_minus) / (2.0 * eps);
+            let rel_err = if fd.abs() > 1e-4 {
+                ((d_err[i] - fd) / fd).abs()
+            } else {
+                (d_err[i] - fd).abs()
+            };
+            assert!(rel_err < 0.05,
+                "FD check p={p} e={}: analytic={}, fd={fd}, rel_err={rel_err:.4}",
+                error[i], d_err[i]);
+        }
     }
 }
