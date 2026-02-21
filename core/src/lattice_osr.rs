@@ -141,15 +141,14 @@ impl MemoryRule for LatticeOSR {
 
             // delta_s = alpha * gate_i * input
             // orthogonal = delta_s - dot(s, delta_s) * s
+            let scale = gates.alpha * gate_i;
             let mut s_unnorm = vec![0.0f32; d];
             let mut p = 0.0f32;
             for j in 0..d {
-                let delta_s_j = gates.alpha * gate_i * input[j];
-                p += slot[j] * delta_s_j;
+                p += slot[j] * scale * input[j];
             }
             for j in 0..d {
-                let delta_s_j = gates.alpha * gate_i * input[j];
-                let ortho = delta_s_j - p * slot[j];
+                let ortho = scale * input[j] - p * slot[j];
                 s_unnorm[j] = slot[j] + ortho;
             }
             vec_normalize_f32(&mut s_unnorm);

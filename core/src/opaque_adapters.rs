@@ -121,10 +121,6 @@ fn read_meta_3(saved: &[f32]) -> (usize, usize, usize) {
     (saved[0] as usize, saved[1] as usize, saved[2] as usize)
 }
 
-fn read_meta_4(saved: &[f32]) -> (usize, usize, usize, usize) {
-    (saved[0] as usize, saved[1] as usize, saved[2] as usize, saved[3] as usize)
-}
-
 // ── Active rule adapters ──────────────────────────────────────────────
 //
 // Saved buffer layout for matrix-memory rules (Delta, Titans, Hebbian, Atlas):
