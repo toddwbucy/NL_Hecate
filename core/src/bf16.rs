@@ -6,16 +6,21 @@
 /// before use, ensuring no precision loss in memory accumulation.
 ///
 /// bf16 format: 1 sign + 8 exponent + 7 mantissa bits (same range as f32, less precision).
-/// Conversion is a simple truncation of the lower 16 bits of the f32 mantissa.
+/// Conversion rounds the lower 16 mantissa bits to nearest-even before truncation.
 ///
 /// Source: specs/infrastructure/precision/00_numerical_precision.md
 /// Constraint: Inner-loop MUST be fp32 (bf16 drift corrupts memory after ~100 steps).
 
-/// Convert f32 to bf16, stored as u16. Truncates the lower 16 mantissa bits.
+/// Convert f32 to bf16, stored as u16. Rounds lower 16 mantissa bits to nearest-even.
 #[inline]
 pub fn f32_to_bf16(x: f32) -> u16 {
-    // bf16 is the upper 16 bits of f32 (with rounding).
     let bits = x.to_bits();
+    // Preserve NaNs explicitly: rounding can collapse some NaN payloads to ±inf.
+    if x.is_nan() {
+        // Force quiet-NaN: exponent all-ones, mantissa bit set.
+        let sign = (bits >> 16) & 0x8000;
+        return (sign | 0x7FC0) as u16; // qNaN in bf16
+    }
     // Round to nearest even: add 0x7FFF + bit 16 (round-to-even bias)
     let round = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
     (round >> 16) as u16
@@ -67,8 +72,9 @@ impl Bf16Storage {
         bf16_slice_to_f32(&self.stored)
     }
 
-    /// Get mutable reference to fp32 master copy (for optimizer updates).
-    pub fn master_mut(&mut self) -> &mut Vec<f32> {
+    /// Get mutable slice of fp32 master copy (for optimizer updates).
+    /// Returns a slice (not Vec) to prevent callers from resizing the buffer.
+    pub fn master_mut(&mut self) -> &mut [f32] {
         &mut self.master
     }
 
@@ -79,7 +85,8 @@ impl Bf16Storage {
 
     /// Sync bf16 stored copy from fp32 master (call after optimizer step).
     pub fn sync_from_master(&mut self) {
-        debug_assert_eq!(self.stored.len(), self.master.len());
+        assert_eq!(self.stored.len(), self.master.len(),
+            "bf16 stored/master length mismatch: {} vs {}", self.stored.len(), self.master.len());
         for i in 0..self.master.len() {
             self.stored[i] = f32_to_bf16(self.master[i]);
         }
@@ -141,7 +148,9 @@ mod tests {
         let bf = f32_to_bf16(0.0);
         assert_eq!(bf16_to_f32(bf), 0.0);
         let bf_neg = f32_to_bf16(-0.0);
-        assert_eq!(bf16_to_f32(bf_neg), -0.0);
+        let back_neg = bf16_to_f32(bf_neg);
+        assert_eq!(back_neg, 0.0);
+        assert!(back_neg.is_sign_negative(), "negative zero sign bit should be preserved");
     }
 
     #[test]
