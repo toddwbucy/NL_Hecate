@@ -257,6 +257,125 @@ pub fn newton_schulz_5(s: &[f32], d: usize, iterations: usize) -> Vec<f32> {
     x
 }
 
+/// Inner-loop Newton-Schulz iteration with generalized per-iteration zeta step sizes.
+///
+/// Implements the gradient-descent form from HOPE Eq 44:
+///   O_{i+1} = O_i - zeta_{i+1} * (O_i - G + 2 * O_i @ (O_i^T @ O_i - I))
+///
+/// Unlike `newton_schulz_5` (which uses the classical polynomial form for the outer loop),
+/// this keeps G as an anchor throughout the iteration — the update is pulled toward the
+/// original input, not just toward orthogonality. This matches Atlas's inner-loop usage
+/// where the momentum signal S_t should be orthogonalized while preserving its relationship
+/// to the accumulated gradients.
+///
+/// When all zetas = 1.0, this reduces to:
+///   O_{i+1} = 2*O_i - 2*O_i@O_i^T@O_i + G
+///
+/// # Arguments
+/// * `s` — input momentum/gradient matrix [d*d], row-major
+/// * `d` — matrix dimension (s must be d×d)
+/// * `iterations` — number of NS iterations (Atlas default: 5)
+/// * `zetas` — per-iteration step sizes, length must equal `iterations`.
+///   **Warning**: `None` defaults to all 1.0, which diverges for non-orthogonal
+///   inputs (the gradient term grows cubically in ||O||). Use `zeta ≈ 0.25` for
+///   stable convergence matching the classical NS polynomial coefficients (3/2, -1/2).
+///
+/// Source: HOPE (2512.24695) §4.2 Eq 44; Atlas (2505.23735) §5 Eq 32
+pub fn newton_schulz_inner(
+    s: &[f32],
+    d: usize,
+    iterations: usize,
+    zetas: Option<&[f32]>,
+) -> Vec<f32> {
+    assert_eq!(s.len(), d * d,
+        "newton_schulz_inner: expected {}x{} matrix, got len {}", d, d, s.len());
+
+    if let Some(z) = zetas {
+        assert_eq!(z.len(), iterations,
+            "newton_schulz_inner: zetas length {} != iterations {}", z.len(), iterations);
+    }
+
+    if d == 0 || iterations == 0 {
+        return s.to_vec();
+    }
+
+    // Frobenius normalization for convergence
+    let frob: f32 = s.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if frob < 1e-12 {
+        return s.to_vec();
+    }
+    let scale = 1.0 / frob;
+
+    // G = normalized input (anchor throughout iteration)
+    let g: Vec<f32> = s.iter().map(|&v| v * scale).collect();
+    let mut o = g.clone();
+
+    for iter in 0..iterations {
+        let zeta = zetas.map_or(1.0, |z| z[iter]);
+
+        // O^T @ O
+        let oto = matmul_t_a(&o, &o, d);
+
+        // O^T @ O - I
+        let mut oto_minus_i = oto;
+        for i in 0..d {
+            oto_minus_i[i * d + i] -= 1.0;
+        }
+
+        // 2 * O @ (O^T O - I)
+        let o_oto_i = matmul(&o, &oto_minus_i, d);
+
+        // O_{i+1} = O_i - zeta * (O_i - G + 2 * O @ (O^T O - I))
+        for i in 0..d * d {
+            let grad = o[i] - g[i] + 2.0 * o_oto_i[i];
+            o[i] -= zeta * grad;
+        }
+    }
+
+    // Rescale back
+    for v in o.iter_mut() {
+        *v *= frob;
+    }
+
+    o
+}
+
+/// Batched Newton-Schulz: apply inner-loop NS independently to C matrices.
+///
+/// In Atlas's chunk-parallel training (§5.1 Eqs 39-41), each position in a chunk
+/// has an independent momentum S_t that needs NS orthogonalization. These C calls
+/// are embarrassingly parallel — on GPU this would be a single batched operation.
+/// This CPU reference implementation processes them sequentially.
+///
+/// # Arguments
+/// * `batch` — C concatenated d×d matrices [C * d * d], row-major
+/// * `c` — batch size (number of matrices)
+/// * `d` — matrix dimension per element
+/// * `iterations` — NS iterations per matrix
+/// * `zetas` — shared per-iteration step sizes (applied to all C matrices)
+pub fn newton_schulz_batched(
+    batch: &[f32],
+    c: usize,
+    d: usize,
+    iterations: usize,
+    zetas: Option<&[f32]>,
+) -> Vec<f32> {
+    assert_eq!(batch.len(), c * d * d,
+        "newton_schulz_batched: expected {}*{}*{}={} elements, got {}",
+        c, d, d, c * d * d, batch.len());
+
+    let dd = d * d;
+    let mut out = vec![0.0f32; c * dd];
+
+    for b in 0..c {
+        let input = &batch[b * dd..(b + 1) * dd];
+        let result = newton_schulz_inner(input, d, iterations, zetas);
+        out[b * dd..(b + 1) * dd].copy_from_slice(&result);
+    }
+
+    out
+}
+
 /// Matrix multiply: C = A * B (all d×d, row-major).
 fn matmul(a: &[f32], b: &[f32], d: usize) -> Vec<f32> {
     let mut c = vec![0.0f32; d * d];
@@ -503,5 +622,158 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── Inner-loop Newton-Schulz tests ──────────────────────────────────
+
+    #[test]
+    fn test_ns_inner_identity() {
+        let d = 4;
+        let mut identity = vec![0.0f32; d * d];
+        for i in 0..d { identity[i * d + i] = 1.0; }
+        let result = newton_schulz_inner(&identity, d, 5, None);
+        // Identity is already orthogonal — output should be proportional to identity
+        let diag_val = result[0];
+        assert!(diag_val > 0.5, "NS inner identity: diag should be positive: {diag_val}");
+        for i in 0..d {
+            for j in 0..d {
+                if i == j {
+                    assert!((result[i * d + j] - diag_val).abs() < 0.1,
+                        "NS inner: [{i},{j}] = {} expected ~{diag_val}", result[i * d + j]);
+                } else {
+                    assert!(result[i * d + j].abs() < 0.1,
+                        "NS inner: off-diag [{i},{j}] = {} expected ~0", result[i * d + j]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_ns_inner_orthogonalizes() {
+        // The general form is gradient descent on L_orth + proximity to G.
+        // zeta=0.25 gives first-step coefficients matching the classical NS polynomial,
+        // so convergence is similar. zeta=1.0 diverges (step too aggressive).
+        let d = 3;
+        let m = vec![1.0, 0.5, 0.2,
+                     0.3, 1.0, 0.1,
+                     0.1, 0.2, 1.0];
+        let zetas = vec![0.25; 10];
+        let result = newton_schulz_inner(&m, d, 10, Some(&zetas));
+
+        // Check off-diagonal of X^T X is small relative to diagonal
+        let xtx = matmul_t_a(&result, &result, d);
+        let diag_avg = (0..d).map(|i| xtx[i * d + i]).sum::<f32>() / d as f32;
+        assert!(diag_avg > 0.0, "diagonal average should be positive, got {diag_avg}");
+        for i in 0..d {
+            for j in 0..d {
+                if i != j {
+                    let ratio = xtx[i * d + j].abs() / diag_avg;
+                    assert!(ratio < 0.2,
+                        "NS inner orthogonal: off-diag [{i},{j}] ratio = {ratio}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_ns_inner_custom_zetas() {
+        let d = 3;
+        let m = vec![1.0, 0.5, 0.2,
+                     0.3, 1.0, 0.1,
+                     0.1, 0.2, 1.0];
+        // Conservative step sizes (smaller zeta = more cautious convergence)
+        let zetas = vec![0.5, 0.5, 0.5, 0.5, 0.5];
+        let result = newton_schulz_inner(&m, d, 5, Some(&zetas));
+        // Should still produce finite, non-zero output
+        for (i, &v) in result.iter().enumerate() {
+            assert!(v.is_finite(), "NS inner zeta: result[{i}] not finite: {v}");
+        }
+        let norm: f32 = result.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(norm > 0.1, "NS inner zeta: result should be non-trivial, norm={norm}");
+    }
+
+    #[test]
+    fn test_ns_inner_zeta_one_deterministic() {
+        // Same input, same zetas → same output
+        let d = 4;
+        let m: Vec<f32> = (0..d*d).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let r1 = newton_schulz_inner(&m, d, 5, None);
+        let r2 = newton_schulz_inner(&m, d, 5, None);
+        assert_eq!(r1, r2, "NS inner should be deterministic");
+    }
+
+    #[test]
+    fn test_ns_inner_zero_iterations() {
+        let d = 3;
+        let m = vec![1.0; d * d];
+        let result = newton_schulz_inner(&m, d, 0, None);
+        assert_eq!(result, m, "0 iterations should return input unchanged");
+    }
+
+    #[test]
+    fn test_ns_inner_near_zero() {
+        let d = 3;
+        let m = vec![1e-15; d * d];
+        let result = newton_schulz_inner(&m, d, 5, None);
+        // Near-zero matrix should be returned as-is
+        assert_eq!(result, m);
+    }
+
+    // ── Batched Newton-Schulz tests ─────────────────────────────────────
+
+    #[test]
+    fn test_ns_batched_matches_individual() {
+        let d = 3;
+        let c = 4;
+        let dd = d * d;
+
+        // Create C distinct matrices
+        let mut batch = vec![0.0f32; c * dd];
+        for b in 0..c {
+            for i in 0..dd {
+                batch[b * dd + i] = ((b * dd + i) as f32 + 1.0) * 0.05;
+            }
+        }
+
+        let batched = newton_schulz_batched(&batch, c, d, 5, None);
+
+        // Compare each element with individual NS call
+        for b in 0..c {
+            let individual = newton_schulz_inner(&batch[b * dd..(b + 1) * dd], d, 5, None);
+            for i in 0..dd {
+                let diff = (batched[b * dd + i] - individual[i]).abs();
+                assert!(diff < 1e-6,
+                    "batch[{b}][{i}]: batched={} vs individual={}, diff={diff}",
+                    batched[b * dd + i], individual[i]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_ns_batched_with_zetas() {
+        let d = 3;
+        let c = 2;
+        let dd = d * d;
+        let mut batch = vec![0.0f32; c * dd];
+        for i in 0..c * dd {
+            batch[i] = (i as f32 + 1.0) * 0.03;
+        }
+        let zetas = vec![0.8, 0.8, 0.8];
+        let result = newton_schulz_batched(&batch, c, d, 3, Some(&zetas));
+        assert_eq!(result.len(), c * dd);
+        for (i, &v) in result.iter().enumerate() {
+            assert!(v.is_finite(), "batched with zetas: result[{i}] not finite");
+        }
+    }
+
+    #[test]
+    fn test_ns_batched_single_element() {
+        let d = 3;
+        let m = vec![1.0, 0.5, 0.2,
+                     0.3, 1.0, 0.1,
+                     0.1, 0.2, 1.0];
+        let batched = newton_schulz_batched(&m, 1, d, 5, None);
+        let single = newton_schulz_inner(&m, d, 5, None);
+        assert_eq!(batched, single, "batch of 1 should match single call");
     }
 }
