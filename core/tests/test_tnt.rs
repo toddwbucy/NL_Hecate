@@ -14,6 +14,15 @@ fn make_embedded(cfg: &MAGConfig, seed: u64) -> Vec<f32> {
     e
 }
 
+fn tnt_cfg(cg: usize, cl: usize) -> TNTConfig {
+    TNTConfig {
+        global_chunk_size: cg,
+        local_chunk_size: cl,
+        use_qk_projection: false,
+        use_attention_summary: false,
+    }
+}
+
 /// Smoke test: TNT forward + backward work end-to-end.
 #[test]
 fn test_tnt_smoke() {
@@ -22,13 +31,13 @@ fn test_tnt_smoke() {
     let embedded = make_embedded(&cfg, 99);
     let s = cfg.swa.seq_len;
     let d = cfg.swa.d_model;
-    let tnt = TNTConfig { global_chunk_size: 2, local_chunk_size: 1 };
+    let tnt = tnt_cfg(2, 1);
 
-    let (y, cache) = tnt_forward(&params.levels[0], &embedded, s, d, &tnt, &cfg, None);
+    let (y, cache) = tnt_forward(&params.levels[0], &embedded, s, d, &tnt, &cfg, None, None);
     assert_eq!(y.len(), s * d);
 
     let d_y = vec![1.0f32; s * d];
-    let (grads, d_emb) = tnt_backward(&params.levels[0], &cache, &d_y, &embedded, &tnt, &cfg);
+    let (grads, d_emb, _) = tnt_backward(&params.levels[0], &cache, &d_y, &embedded, &tnt, &cfg, None);
     assert_eq!(d_emb.len(), s * d);
     let norm: f32 = grads.w_k_mem.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(norm > 1e-10);
@@ -47,13 +56,11 @@ fn test_tnt_quality_comparison() {
     let (y_seq, _) = chunkwise_gd_forward(&params.levels[0], &embedded, s, d, 1, &cfg, None);
 
     // TNT with small shards
-    let tnt = TNTConfig { global_chunk_size: 2, local_chunk_size: 1 };
-    let (y_tnt, _) = tnt_forward(&params.levels[0], &embedded, s, d, &tnt, &cfg, None);
+    let tnt = tnt_cfg(2, 1);
+    let (y_tnt, _) = tnt_forward(&params.levels[0], &embedded, s, d, &tnt, &cfg, None, None);
 
-    // TNT is approximate — allow significant divergence at tiny scale
     let max_diff: f32 = y_seq.iter().zip(y_tnt.iter())
         .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-    // Just verify it's not wildly wrong (not NaN, reasonable magnitude)
     assert!(max_diff.is_finite(), "TNT vs sequential diff should be finite");
 }
 
@@ -64,7 +71,7 @@ fn test_tnt_convergence() {
     let mut level_params = MAGParams::init(&cfg, 42).levels.into_iter().next().unwrap();
     let s = cfg.swa.seq_len;
     let d = cfg.swa.d_model;
-    let tnt = TNTConfig { global_chunk_size: 2, local_chunk_size: 1 };
+    let tnt = tnt_cfg(2, 1);
     let lr = 0.1;
 
     let mut rng = SimpleRng::new(99);
@@ -77,7 +84,7 @@ fn test_tnt_convergence() {
     let mut last_loss = 0.0f32;
 
     for step in 0..50 {
-        let (y, cache) = tnt_forward(&level_params, &embedded, s, d, &tnt, &cfg, None);
+        let (y, cache) = tnt_forward(&level_params, &embedded, s, d, &tnt, &cfg, None, None);
         let loss: f32 = y.iter().zip(target.iter())
             .map(|(a, b)| (a - b).powi(2)).sum::<f32>() / (s * d) as f32;
         if step == 0 { first_loss = loss; }
@@ -85,7 +92,7 @@ fn test_tnt_convergence() {
 
         let d_y: Vec<f32> = y.iter().zip(target.iter())
             .map(|(a, b)| 2.0 * (a - b) / (s * d) as f32).collect();
-        let (grads, _) = tnt_backward(&level_params, &cache, &d_y, &embedded, &tnt, &cfg);
+        let (grads, _, _) = tnt_backward(&level_params, &cache, &d_y, &embedded, &tnt, &cfg, None);
 
         for (w, g) in level_params.w_k_mem.iter_mut().zip(grads.w_k_mem.iter()) { *w -= lr * g; }
         for (w, g) in level_params.w_v_mem.iter_mut().zip(grads.w_v_mem.iter()) { *w -= lr * g; }
@@ -104,14 +111,14 @@ fn test_tnt_cms_k2() {
     let params = MAGParams::init(&cfg, 42);
     let s = cfg.swa.seq_len;
     let d = cfg.swa.d_model;
-    let tnt = TNTConfig { global_chunk_size: 4, local_chunk_size: 2 };
+    let tnt = tnt_cfg(4, 2);
 
     let mut rng = SimpleRng::new(99);
     let mut embedded = vec![0.0f32; s * d];
     rng.fill_uniform(&mut embedded, 0.1);
 
     for level in 0..cfg.k {
-        let (y, _) = tnt_forward(&params.levels[level], &embedded, s, d, &tnt, &cfg, None);
+        let (y, _) = tnt_forward(&params.levels[level], &embedded, s, d, &tnt, &cfg, None, None);
         for &v in &y {
             assert!(v.is_finite(), "level {level} TNT output not finite");
         }
