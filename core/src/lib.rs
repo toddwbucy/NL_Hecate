@@ -49,6 +49,7 @@ pub mod conductor;
 pub mod context_stream;
 pub mod dispatch;
 pub mod traced_forward;
+pub mod composition_safety;
 #[cfg(feature = "distributed")]
 pub mod distributed;
 #[cfg(feature = "serving")]
