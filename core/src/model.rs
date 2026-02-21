@@ -41,6 +41,32 @@ pub enum MemoryRuleKind {
     AtlasOmega,
 }
 
+/// MIRAS Knob 2: Attentional bias (loss function for memory updates).
+///
+/// Selects the objective that drives the inner-loop memory gradient.
+/// L2 is the default (squared error). L1 uses smooth tanh approximation.
+/// Lp generalizes to arbitrary p-norms. KL uses cross-entropy on softmax.
+/// See specs/algorithms/attentional_biases/ for details.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum AttentionalBias {
+    /// L2 squared error: grad = 2 * (M@k - v) @ k^T. Default for most rules.
+    L2,
+    /// L1 value-less: grad = tanh(a * (M@k - v)) @ k^T. Robust to outliers.
+    L1,
+    /// General l_p norm: grad = p * tanh(a*e) * |e|^(p-1) @ k^T.
+    Lp(f32),
+    /// KL cross-entropy: grad = (softmax(M@k) - softmax(v)) @ k^T.
+    KL,
+    /// Huber: L2 for |e| < delta, L1 for |e| >= delta. Bridges L2 and L1.
+    Huber,
+}
+
+impl Default for AttentionalBias {
+    fn default() -> Self {
+        AttentionalBias::L2
+    }
+}
+
 /// Model configuration — immutable after construction.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SWAConfig {
@@ -374,6 +400,10 @@ pub struct MAGConfig {
     pub d_hidden: usize,
     /// l_p norm exponent for MONETA attentional bias (default: 2.0).
     pub lp_p: f32,
+    /// Smooth Sign sharpness for l_p gradient: tanh(a * e) approximates signum(e).
+    /// Default: 10.0. See specs/algorithms/attentional_biases/01_l1_sign.md.
+    #[serde(default = "default_sign_sharpness")]
+    pub sign_sharpness: f32,
     /// L_q retention exponent for MONETA (default: 2.0).
     pub lq_q: f32,
     /// Local retention strength: L2 penalty toward chunk-boundary snapshot.
@@ -408,6 +438,8 @@ pub struct MAGConfig {
     #[serde(default)]
     pub checkpoint_interval: Option<usize>,
 }
+
+fn default_sign_sharpness() -> f32 { 10.0 }
 
 /// Default gate bias init values per level index.
 fn default_b_alpha(level: usize) -> f32 {
@@ -470,7 +502,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 1,
             chunk_sizes: vec![1],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            d_hidden: 0, lp_p: 2.0, sign_sharpness: 10.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
@@ -495,7 +527,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 2,
             chunk_sizes: vec![1, 8],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            d_hidden: 0, lp_p: 2.0, sign_sharpness: 10.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
@@ -520,7 +552,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 1,
             chunk_sizes: vec![1],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            d_hidden: 0, lp_p: 2.0, sign_sharpness: 10.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
@@ -546,7 +578,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 2,
             chunk_sizes: vec![1, 8],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            d_hidden: 0, lp_p: 2.0, sign_sharpness: 10.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
@@ -572,7 +604,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 4,
             chunk_sizes: vec![1, 8, 64, 512],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            d_hidden: 0, lp_p: 2.0, sign_sharpness: 10.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
@@ -598,7 +630,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 4,
             chunk_sizes: vec![1, 8, 64, 512],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            d_hidden: 0, lp_p: 2.0, sign_sharpness: 10.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
@@ -623,7 +655,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::TitansLMM,
             k: 1,
             chunk_sizes: vec![1],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            d_hidden: 0, lp_p: 2.0, sign_sharpness: 10.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
@@ -648,7 +680,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::HebbianRule,
             k: 1,
             chunk_sizes: vec![1],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            d_hidden: 0, lp_p: 2.0, sign_sharpness: 10.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
@@ -673,7 +705,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::HebbianRule,
             k: 2,
             chunk_sizes: vec![1, 8],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            d_hidden: 0, lp_p: 2.0, sign_sharpness: 10.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
@@ -698,7 +730,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::TitansLMM,
             k: 2,
             chunk_sizes: vec![1, 8],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            d_hidden: 0, lp_p: 2.0, sign_sharpness: 10.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
@@ -725,6 +757,7 @@ impl MAGConfig {
             chunk_sizes: vec![1],
             d_hidden: 4,
             lp_p: 2.0,
+            sign_sharpness: 10.0,
             lq_q: 2.0,
             lambda_local: 0.0,
             lambda_2: 0.01,
@@ -759,6 +792,7 @@ impl MAGConfig {
             chunk_sizes: vec![1, 8],
             d_hidden: 4,
             lp_p: 2.0,
+            sign_sharpness: 10.0,
             lq_q: 2.0,
             lambda_local: 0.0,
             lambda_2: 0.01,
@@ -793,6 +827,7 @@ impl MAGConfig {
             chunk_sizes: vec![1],
             d_hidden: 4,
             lp_p: 2.0,
+            sign_sharpness: 10.0,
             lq_q: 2.0,
             lambda_local: 0.01,
             lambda_2: 0.01,
@@ -827,6 +862,7 @@ impl MAGConfig {
             chunk_sizes: vec![1, 8],
             d_hidden: 4,
             lp_p: 2.0,
+            sign_sharpness: 10.0,
             lq_q: 2.0,
             lambda_local: 0.01,
             lambda_2: 0.01,
@@ -861,6 +897,7 @@ impl MAGConfig {
             chunk_sizes: vec![1],
             d_hidden: 4,
             lp_p: 2.0,
+            sign_sharpness: 10.0,
             lq_q: 2.0,
             lambda_local: 0.0,
             lambda_2: 0.0,
@@ -895,6 +932,7 @@ impl MAGConfig {
             chunk_sizes: vec![1, 8],
             d_hidden: 4,
             lp_p: 2.0,
+            sign_sharpness: 10.0,
             lq_q: 2.0,
             lambda_local: 0.0,
             lambda_2: 0.0,
@@ -927,7 +965,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::LatticeOSR,
             k: 1,
             chunk_sizes: vec![1],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
+            d_hidden: 0, lp_p: 2.0, sign_sharpness: 10.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
             m_slots: 4, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::LatticeOSR),
@@ -953,7 +991,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::LatticeOSR,
             k: 2,
             chunk_sizes: vec![1, 8],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
+            d_hidden: 0, lp_p: 2.0, sign_sharpness: 10.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
             m_slots: 4, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::LatticeOSR),
@@ -979,7 +1017,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::Trellis,
             k: 1,
             chunk_sizes: vec![1],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
+            d_hidden: 0, lp_p: 2.0, sign_sharpness: 10.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
             m_slots: 0,
             d_compress: 8,
             lambda_k: 0.01,
@@ -1008,7 +1046,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::Trellis,
             k: 2,
             chunk_sizes: vec![1, 8],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
+            d_hidden: 0, lp_p: 2.0, sign_sharpness: 10.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0,
             m_slots: 0,
             d_compress: 8,
             lambda_k: 0.01,
@@ -1037,7 +1075,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::AtlasOmega,
             k: 1,
             chunk_sizes: vec![1],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            d_hidden: 0, lp_p: 2.0, sign_sharpness: 10.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::AtlasOmega),
             m3: None,
@@ -1062,7 +1100,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::AtlasOmega,
             k: 2,
             chunk_sizes: vec![1, 8],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            d_hidden: 0, lp_p: 2.0, sign_sharpness: 10.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::AtlasOmega),
             m3: None,
@@ -1087,7 +1125,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 1,
             chunk_sizes: vec![1],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            d_hidden: 0, lp_p: 2.0, sign_sharpness: 10.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
@@ -1112,7 +1150,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 2,
             chunk_sizes: vec![1, 8],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            d_hidden: 0, lp_p: 2.0, sign_sharpness: 10.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
@@ -1138,7 +1176,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 1,
             chunk_sizes: vec![1],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            d_hidden: 0, lp_p: 2.0, sign_sharpness: 10.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
@@ -1163,7 +1201,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 2,
             chunk_sizes: vec![1, 8],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            d_hidden: 0, lp_p: 2.0, sign_sharpness: 10.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
@@ -1189,7 +1227,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 2,
             chunk_sizes: vec![1, 8],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            d_hidden: 0, lp_p: 2.0, sign_sharpness: 10.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,
@@ -1215,7 +1253,7 @@ impl MAGConfig {
             memory_rule: MemoryRuleKind::DeltaRule,
             k: 4,
             chunk_sizes: vec![1, 8, 64, 512],
-            d_hidden: 0, lp_p: 2.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
+            d_hidden: 0, lp_p: 2.0, sign_sharpness: 10.0, lq_q: 2.0, lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0, lambda_k: 0.0, lambda_v: 0.0,
             parallel: None,
             retention: default_retention(MemoryRuleKind::DeltaRule),
             m3: None,

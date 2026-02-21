@@ -667,7 +667,7 @@ fn traced_active_level(
             (y, MemoryCache::Hebbian(cache), final_m, y_id)
         }
         MemoryRuleKind::Moneta => {
-            let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2 };
+            let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2, sign_sharpness: cfg.sign_sharpness };
             let (y, cache) = rule.step(level_params, embedded, s, d, initial_m);
             let dh = cfg.d_hidden;
             let w1_size = dh * d;
@@ -678,7 +678,7 @@ fn traced_active_level(
             final_m.extend_from_slice(w1_final);
             final_m.extend_from_slice(w2_final);
 
-            let extra_meta = [dh as f32, cfg.lp_p, cfg.lambda_2];
+            let extra_meta = [dh as f32, cfg.lp_p, cfg.lambda_2, cfg.sign_sharpness];
             let (meta_id, lp_saved, emb_saved) =
                 alloc_common_saved(tape, level_params, embedded, s, d, &extra_meta);
             let cache_ids = vec![

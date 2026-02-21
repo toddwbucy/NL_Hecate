@@ -243,6 +243,7 @@ pub fn moneta_opaque_backward(
     let (seq_len, d, d_hidden) = read_meta_3(saved[0]);
     let lp_p = saved[0][3];
     let lambda_2 = saved[0][4];
+    let sign_sharpness = if saved[0].len() > 5 { saved[0][5] } else { 10.0 };
     let level_params = level_params_from_flat(saved[1], d);
     let embedded = saved[2];
     let d_y = d_outputs[0];
@@ -266,9 +267,10 @@ pub fn moneta_opaque_backward(
         y: saved[17].to_vec(),
         lp_p,
         lambda_2,
+        sign_sharpness,
     };
 
-    let rule = Moneta { d_hidden, lp_p, lambda_2 };
+    let rule = Moneta { d_hidden, lp_p, lambda_2, sign_sharpness };
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
     d_inputs[0] = d_embedded;
@@ -726,7 +728,7 @@ impl OpaqueVjp for Moneta {
         &self, tape: &mut Tape, level_params: &MemoryLevelParams,
         embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
     ) -> (Vec<f32>, BufId, BufId, BufId) {
-        let extra_meta = [self.d_hidden as f32, self.lp_p, self.lambda_2];
+        let extra_meta = [self.d_hidden as f32, self.lp_p, self.lambda_2, self.sign_sharpness];
         let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
             record_common_inputs(tape, level_params, embedded, seq_len, d, &extra_meta);
 
@@ -1171,7 +1173,7 @@ mod tests {
 
     #[test]
     fn test_opaque_vjp_moneta() {
-        assert_opaque_roundtrip(&Moneta { d_hidden: 8, lp_p: 2.0, lambda_2: 0.01 }, 4, 3);
+        assert_opaque_roundtrip(&Moneta { d_hidden: 8, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0 }, 4, 3);
     }
 
     #[test]
@@ -1204,7 +1206,7 @@ mod tests {
         assert_eq!(DeltaRule.opaque_key(), OpaqueKey::DeltaRule);
         assert_eq!(TitansLMM.opaque_key(), OpaqueKey::TitansLMM);
         assert_eq!(HebbianRule.opaque_key(), OpaqueKey::HebbianRule);
-        assert_eq!((Moneta { d_hidden: 8, lp_p: 2.0, lambda_2: 0.01 }).opaque_key(), OpaqueKey::Moneta);
+        assert_eq!((Moneta { d_hidden: 8, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0 }).opaque_key(), OpaqueKey::Moneta);
         assert_eq!((YAAD { d_hidden: 8, delta: 0.9, lambda_local: 0.1, lambda_2: 0.01 }).opaque_key(), OpaqueKey::YAAD);
         assert_eq!((MEMORA { d_hidden: 8 }).opaque_key(), OpaqueKey::MEMORA);
         assert_eq!((LatticeOSR { m_slots: 3 }).opaque_key(), OpaqueKey::LatticeOSR);
@@ -1300,7 +1302,7 @@ mod tests {
     #[test]
     fn test_class1_hebbian() { assert_class1_isolation(&HebbianRule, 4, 3); }
     #[test]
-    fn test_class1_moneta() { assert_class1_isolation(&Moneta { d_hidden: 8, lp_p: 2.0, lambda_2: 0.01 }, 4, 3); }
+    fn test_class1_moneta() { assert_class1_isolation(&Moneta { d_hidden: 8, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0 }, 4, 3); }
     #[test]
     fn test_class1_yaad() { assert_class1_isolation(&YAAD { d_hidden: 8, delta: 0.9, lambda_local: 0.1, lambda_2: 0.01 }, 4, 3); }
     #[test]

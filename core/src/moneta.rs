@@ -38,6 +38,11 @@ pub struct Moneta {
     pub d_hidden: usize,
     pub lp_p: f32,
     pub lambda_2: f32,
+    /// Sharpness parameter for smooth Sign approximation: tanh(a * x).
+    /// Default: 10.0. Higher values → sharper transition, closer to true signum.
+    /// At a=10: tanh(10 * 0.01) ≈ 0.1 (smooth near 0), tanh(10 * 0.5) ≈ 1.0 (saturated).
+    /// See specs/algorithms/attentional_biases/01_l1_sign.md (MIRAS Remark 5).
+    pub sign_sharpness: f32,
 }
 
 /// All intermediate values from a MONETA forward pass, needed for backward.
@@ -79,14 +84,28 @@ pub struct MonetaCache {
     pub lp_p: f32,
     /// L2 retention strength (cached for backward)
     pub lambda_2: f32,
+    /// Sign sharpness (cached for backward)
+    pub sign_sharpness: f32,
 }
 
-/// Compute l_p gradient: p * sign(e) * |e|^(p-1).
-/// Clamped to avoid NaN when p < 2 and e ≈ 0.
+/// Compute l_p gradient: p * smooth_sign(e) * |e|^(p-1).
+///
+/// Uses tanh(a*e) as smooth Sign approximation (MIRAS Remark 5)
+/// instead of raw signum(), which is non-differentiable at zero.
+/// The Wengert tape can differentiate through tanh natively.
+///
+/// For p=1 (L1 fast-path): |e|^0 = 1, so gradient = tanh(a*e).
+/// For p=2 (L2): tanh(a*e) ≈ sign(e) for |e| >> 0, recovers 2*e behavior.
 #[inline]
-fn lp_grad(e: f32, p: f32) -> f32 {
-    let abs_e = e.abs().max(1e-8); // avoid NaN in pow for p < 2
-    p * e.signum() * abs_e.powf(p - 1.0)
+fn lp_grad(e: f32, p: f32, sign_sharpness: f32) -> f32 {
+    let smooth_sign = (sign_sharpness * e).tanh();
+    if (p - 1.0).abs() < 1e-6 {
+        // L1 fast-path: |e|^0 = 1, magnitude term vanishes
+        smooth_sign
+    } else {
+        let abs_e = e.abs().max(1e-8); // avoid NaN in pow for p < 2
+        p * smooth_sign * abs_e.powf(p - 1.0)
+    }
 }
 
 impl MemoryRule for Moneta {
@@ -123,6 +142,7 @@ impl MemoryRule for Moneta {
         let dh = self.d_hidden;
         let p = self.lp_p;
         let l2 = self.lambda_2;
+        let a = self.sign_sharpness;
         debug_assert_eq!(embedded.len(), seq_len * d);
 
         // Project embedded → k_mem, v_mem, q_mem via W^T
@@ -233,7 +253,7 @@ impl MemoryRule for Moneta {
             // l_p gradient on error
             let mut lp_g = vec![0.0f32; d];
             for i in 0..d {
-                lp_g[i] = lp_grad(error_all[pred_base + i], p);
+                lp_g[i] = lp_grad(error_all[pred_base + i], p, a);
             }
 
             // grad_W2 = outer(lp_grad, h) → [d, dh]
@@ -305,7 +325,7 @@ impl MemoryRule for Moneta {
             pre_act: pre_act_all, hidden: hidden_all,
             prediction: prediction_all, error: error_all,
             y: y.clone(),
-            lp_p: p, lambda_2: l2,
+            lp_p: p, lambda_2: l2, sign_sharpness: a,
         };
 
         (y, cache)
@@ -322,6 +342,7 @@ impl MemoryRule for Moneta {
         let d = cache.d;
         let dh = cache.d_hidden;
         let p = cache.lp_p;
+        let a = cache.sign_sharpness;
         let l2 = cache.lambda_2;
         let l2_2 = l2 * 2.0;
         let w1_size = dh * d;
@@ -420,7 +441,7 @@ impl MemoryRule for Moneta {
             let pred_base = t * d;
             let mut lp_g = vec![0.0f32; d];
             for i in 0..d {
-                lp_g[i] = lp_grad(cache.error[pred_base + i], p);
+                lp_g[i] = lp_grad(cache.error[pred_base + i], p, a);
             }
 
             // Recompute grad_W2 = outer(lp_g, h_t)
@@ -561,15 +582,26 @@ impl MemoryRule for Moneta {
                 }
             }
 
-            // ── lp_grad backward: lp_g = p * sign(e) * |e|^(p-1) ──
-            // For p=2: lp_g = 2*e, so d_e = 2 * d_lp_g (derivative of 2*e w.r.t. e is 2)
-            // For general p: d lp_grad/de = p*(p-1)*|e|^(p-2) (when e != 0)
+            // ── lp_grad backward (smooth): lp_g = p * tanh(a*e) * |e|^(p-1) ──
+            // For p=1 (L1 fast-path): lp_g = tanh(a*e), d/de = a * sech^2(a*e)
+            // For general p: product rule on tanh(a*e) * |e|^(p-1)
             let mut d_err = vec![0.0f32; d];
             for i in 0..d {
                 let e = cache.error[pred_base + i];
-                let abs_e = e.abs().max(1e-8);
-                let lp_second = p * (p - 1.0) * abs_e.powf(p - 2.0);
-                d_err[i] = d_lp_g[i] * lp_second;
+                let tanh_ae = (a * e).tanh();
+                let sech2 = 1.0 - tanh_ae * tanh_ae; // sech^2(a*e)
+                if (p - 1.0).abs() < 1e-6 {
+                    // L1: d/de tanh(a*e) = a * sech^2(a*e)
+                    d_err[i] = d_lp_g[i] * a * sech2;
+                } else {
+                    // General p: d/de [p * tanh(a*e) * |e|^(p-1)]
+                    // = p * [a*sech^2(a*e)*|e|^(p-1) + tanh(a*e)*(p-1)*|e|^(p-2)*sign(e)]
+                    // Use smooth sign for the sign(e) term too:
+                    let abs_e = e.abs().max(1e-8);
+                    let term1 = a * sech2 * abs_e.powf(p - 1.0);
+                    let term2 = tanh_ae * (p - 1.0) * abs_e.powf(p - 2.0) * tanh_ae;
+                    d_err[i] = d_lp_g[i] * p * (term1 + term2);
+                }
             }
 
             // error = prediction - v_t backward
@@ -810,7 +842,7 @@ mod tests {
     }
 
     fn make_moneta(cfg: &MAGConfig) -> Moneta {
-        Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2 }
+        Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2, sign_sharpness: cfg.sign_sharpness }
     }
 
     #[test]
@@ -968,7 +1000,7 @@ mod tests {
 
     #[test]
     fn test_moneta_init() {
-        let rule = Moneta { d_hidden: 4, lp_p: 2.0, lambda_2: 0.01 };
+        let rule = Moneta { d_hidden: 4, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0 };
         let state = rule.init(8);
         assert_eq!(state.m.len(), 64);
         assert_eq!(state.d, 8);
@@ -977,7 +1009,7 @@ mod tests {
 
     #[test]
     fn test_moneta_level_and_parallelization() {
-        let rule = Moneta { d_hidden: 4, lp_p: 2.0, lambda_2: 0.01 };
+        let rule = Moneta { d_hidden: 4, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0 };
         assert_eq!(rule.level(), 0);
         let strategies = rule.supported_parallelization();
         assert!(strategies.contains(&"sequential"));
