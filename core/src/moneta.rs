@@ -793,8 +793,13 @@ pub fn apply_attentional_bias(
         AttentionalBias::L2 => error.to_vec(),
         AttentionalBias::L1 => lp_bias_gradient(error, 1.0, sign_sharpness),
         AttentionalBias::Lp(p) => lp_bias_gradient(error, p, sign_sharpness),
-        AttentionalBias::KL | AttentionalBias::Huber => {
-            unimplemented!("KL and Huber attentional biases are separate specs (02_kl_objective.md)")
+        AttentionalBias::KL => {
+            panic!("KL attentional bias not yet implemented — see specs/algorithms/attentional_biases/02_kl_objective.md. \
+                    Call validate_bias() at config load to catch this early.")
+        }
+        AttentionalBias::Huber => {
+            panic!("Huber attentional bias not yet implemented — see specs/algorithms/attentional_biases/02_kl_objective.md. \
+                    Call validate_bias() at config load to catch this early.")
         }
     }
 }
@@ -817,20 +822,53 @@ pub fn apply_attentional_bias_backward(
         AttentionalBias::L2 => d_biased.to_vec(),
         AttentionalBias::L1 => lp_bias_gradient_backward(d_biased, error, 1.0, sign_sharpness),
         AttentionalBias::Lp(p) => lp_bias_gradient_backward(d_biased, error, p, sign_sharpness),
-        AttentionalBias::KL | AttentionalBias::Huber => {
-            unimplemented!("KL and Huber attentional biases are separate specs (02_kl_objective.md)")
+        AttentionalBias::KL => {
+            panic!("KL attentional bias not yet implemented — see specs/algorithms/attentional_biases/02_kl_objective.md. \
+                    Call validate_bias() at config load to catch this early.")
         }
+        AttentionalBias::Huber => {
+            panic!("Huber attentional bias not yet implemented — see specs/algorithms/attentional_biases/02_kl_objective.md. \
+                    Call validate_bias() at config load to catch this early.")
+        }
+    }
+}
+
+/// Normalize AttentionalBias: Lp(2.0)→L2, Lp(1.0)→L1 to avoid ambiguity.
+/// L2 returns identity while Lp(2.0) returns 2*error — semantically different.
+/// Call this at config load/construction to prevent downstream confusion.
+pub fn normalize_bias(bias: crate::model::AttentionalBias) -> crate::model::AttentionalBias {
+    use crate::model::AttentionalBias;
+    match bias {
+        AttentionalBias::Lp(p) if p == 2.0 => AttentionalBias::L2,
+        AttentionalBias::Lp(p) if p == 1.0 => AttentionalBias::L1,
+        other => other,
+    }
+}
+
+/// Validate that the bias is supported by apply_attentional_bias.
+/// KL and Huber are separate specs (02_kl_objective.md) and not yet implemented.
+pub fn validate_bias(bias: crate::model::AttentionalBias) -> Result<(), String> {
+    use crate::model::AttentionalBias;
+    match bias {
+        AttentionalBias::L2 | AttentionalBias::L1 | AttentionalBias::Lp(_) => Ok(()),
+        AttentionalBias::KL => Err("KL attentional bias not yet implemented (see 02_kl_objective.md)".into()),
+        AttentionalBias::Huber => Err("Huber attentional bias not yet implemented (see 02_kl_objective.md)".into()),
     }
 }
 
 /// Encode AttentionalBias as a single f32 for tape metadata.
 /// L2 → 2.0, L1 → 1.0, Lp(p) → p, KL → -1.0, Huber → -2.0.
+/// Panics on Lp(1.0) or Lp(2.0) — call normalize_bias() first.
 pub fn bias_to_f32(bias: crate::model::AttentionalBias) -> f32 {
     use crate::model::AttentionalBias;
     match bias {
         AttentionalBias::L2 => 2.0,
         AttentionalBias::L1 => 1.0,
-        AttentionalBias::Lp(p) => p,
+        AttentionalBias::Lp(p) => {
+            debug_assert!(p != 2.0 && p != 1.0,
+                "Lp({p}) collides with L2/L1 encoding — call normalize_bias() first");
+            p
+        }
         AttentionalBias::KL => -1.0,
         AttentionalBias::Huber => -2.0,
     }

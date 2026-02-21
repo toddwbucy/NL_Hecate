@@ -108,12 +108,20 @@ impl MemoryRule for TitansLMM {
         let mut prediction = vec![0.0f32; d];
         matmul_f32(&state.m, k, &mut prediction, d, d, 1);
 
+        // error = prediction - v
+        let mut error = vec![0.0f32; d];
+        for i in 0..d {
+            error[i] = prediction[i] - v[i];
+        }
+
+        // Apply attentional bias (L2 = identity, L1/Lp = nonlinear)
+        let biased = apply_attentional_bias(&error, self.bias, self.sign_sharpness);
+
         let retention = 1.0 - gates.alpha;
         let lr = gates.theta;
         for i in 0..d {
-            let err_i = prediction[i] - v[i];
             for j in 0..d {
-                state.m[i * d + j] = retention * state.m[i * d + j] - lr * err_i * k[j];
+                state.m[i * d + j] = retention * state.m[i * d + j] - lr * biased[i] * k[j];
             }
         }
         Ok(())

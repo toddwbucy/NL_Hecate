@@ -502,7 +502,7 @@ Success criteria:
 5. Serve generates coherent byte sequences
 
 **Dependencies**: S4-M6 (model design + config)
-**Note**: Can proceed in parallel with S3b spec work. Low priority relative to S3b.
+**Note**: Can proceed in parallel with S3b spec work. Low-priority relative to S3b.
 **Status**: NOT STARTED
 
 ---
