@@ -99,28 +99,25 @@ pub fn validate_composition(
                      vs regularizing memory state).".into(),
         });
     }
-    // MEMORA specifically uses KL — that's valid. But other MLP rules + KL is suspect.
-    if matches!(rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD)
-        && matches!(retention, RetentionKind::KLDivergence)
-    {
-        errors.push(CompositionError {
-            axis_a: &rule_name(rule),
-            axis_b: "KLDivergence retention",
-            reason: "KL retention requires probability simplex state. \
-                     Only MEMORA maintains simplex invariant.".into(),
-        });
-    }
-
-    // ── Retention × Retention compatibility ─────────────────────────
-    // Sphere normalization + KL: different manifolds (unit sphere ≠ simplex)
-    if matches!(rule, MemoryRuleKind::LatticeOSR) && matches!(retention, RetentionKind::KLDivergence) {
-        errors.push(CompositionError {
-            axis_a: "SphereNormalization (LatticeOSR)",
-            axis_b: "KLDivergence retention",
-            reason: "unit sphere and probability simplex are different manifolds. \
-                     SphereNormalization projects to ||M||=1, KL requires non-negative \
-                     rows summing to 1.".into(),
-        });
+    // KL retention requires probability simplex — only MEMORA maintains that invariant.
+    // LatticeOSR gets a specific error (manifold mismatch); all others get a general error.
+    if matches!(retention, RetentionKind::KLDivergence) && !matches!(rule, MemoryRuleKind::MEMORA) {
+        if matches!(rule, MemoryRuleKind::LatticeOSR) {
+            errors.push(CompositionError {
+                axis_a: "SphereNormalization (LatticeOSR)",
+                axis_b: "KLDivergence retention",
+                reason: "unit sphere and probability simplex are different manifolds. \
+                         SphereNormalization projects to ||M||=1, KL requires non-negative \
+                         rows summing to 1.".into(),
+            });
+        } else {
+            errors.push(CompositionError {
+                axis_a: rule_name(rule),
+                axis_b: "KLDivergence retention",
+                reason: "KL retention requires probability simplex state. \
+                         Only MEMORA maintains simplex invariant.".into(),
+            });
+        }
     }
 
     // ── Memory Algorithm × Parallelization ──────────────────────────
@@ -499,6 +496,52 @@ mod tests {
             .parallel(ParallelStrategy::LatticeGLA)
             .build();
         assert!(result.is_err(), "Titans+LatticeGLA should be invalid");
+    }
+
+    #[test]
+    fn test_delta_kl_invalid() {
+        // DeltaRule doesn't maintain simplex — KL retention invalid
+        let result = MemoryRuleBuilder::new(MemoryRuleKind::DeltaRule)
+            .retention(RetentionKind::KLDivergence)
+            .composition(CompositionKind::MAG)
+            .build();
+        assert!(result.is_err(), "Delta+KL should be invalid");
+    }
+
+    #[test]
+    fn test_titans_kl_invalid() {
+        let result = MemoryRuleBuilder::new(MemoryRuleKind::TitansLMM)
+            .retention(RetentionKind::KLDivergence)
+            .composition(CompositionKind::MAG)
+            .build();
+        assert!(result.is_err(), "Titans+KL should be invalid");
+    }
+
+    #[test]
+    fn test_hebbian_kl_invalid() {
+        let result = MemoryRuleBuilder::new(MemoryRuleKind::HebbianRule)
+            .retention(RetentionKind::KLDivergence)
+            .composition(CompositionKind::MAG)
+            .build();
+        assert!(result.is_err(), "Hebbian+KL should be invalid");
+    }
+
+    #[test]
+    fn test_trellis_kl_invalid() {
+        let result = MemoryRuleBuilder::new(MemoryRuleKind::Trellis)
+            .retention(RetentionKind::KLDivergence)
+            .composition(CompositionKind::MAG)
+            .build();
+        assert!(result.is_err(), "Trellis+KL should be invalid");
+    }
+
+    #[test]
+    fn test_atlas_kl_invalid() {
+        let result = MemoryRuleBuilder::new(MemoryRuleKind::AtlasOmega)
+            .retention(RetentionKind::KLDivergence)
+            .composition(CompositionKind::MAG)
+            .build();
+        assert!(result.is_err(), "Atlas+KL should be invalid");
     }
 
     #[test]
