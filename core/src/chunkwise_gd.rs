@@ -129,11 +129,11 @@ fn run_chunk(
 ) -> (Vec<f32>, MemoryCache) {
     match cfg.memory_rule {
         MemoryRuleKind::DeltaRule => {
-            let (y, cache) = DeltaRule.step(level_params, embedded_chunk, chunk_len, d, initial_m);
+            let (y, cache) = DeltaRule::from_cfg(cfg).step(level_params, embedded_chunk, chunk_len, d, initial_m);
             (y, MemoryCache::Delta(cache))
         }
         MemoryRuleKind::TitansLMM => {
-            let (y, cache) = TitansLMM.step(level_params, embedded_chunk, chunk_len, d, initial_m);
+            let (y, cache) = TitansLMM::from_cfg(cfg).step(level_params, embedded_chunk, chunk_len, d, initial_m);
             (y, MemoryCache::Titans(cache))
         }
         MemoryRuleKind::HebbianRule => {
@@ -182,8 +182,8 @@ fn run_chunk_backward(
     cfg: &MAGConfig,
 ) -> (MemoryLevelParams, Vec<f32>) {
     match cache {
-        MemoryCache::Delta(c) => DeltaRule.step_backward(level_params, c, d_y_chunk, embedded_chunk),
-        MemoryCache::Titans(c) => TitansLMM.step_backward(level_params, c, d_y_chunk, embedded_chunk),
+        MemoryCache::Delta(c) => DeltaRule::from_cfg(cfg).step_backward(level_params, c, d_y_chunk, embedded_chunk),
+        MemoryCache::Titans(c) => TitansLMM::from_cfg(cfg).step_backward(level_params, c, d_y_chunk, embedded_chunk),
         MemoryCache::Hebbian(c) => HebbianRule.step_backward(level_params, c, d_y_chunk, embedded_chunk),
         MemoryCache::Moneta(c) => {
             let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2, sign_sharpness: cfg.sign_sharpness };

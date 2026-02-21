@@ -418,9 +418,15 @@ Each spec follows the existing CONTRACT format and MUST include:
 
 ---
 
-## Stage 4: MVP — Build & Serve (IN PROGRESS)
+## Stage 4: Build & Serve
 
-Build a model and serve it locally. Not production-scale — just the primitives working end-to-end.
+Stage 4 has two phases with different scopes:
+
+**Phase 1 (M1–M8)**: Pipeline infrastructure built alongside S1–S3 using whatever primitives existed at the time. Goal was to prove the build→serve loop works end-to-end. `toy_60m.json` is a pre-HOPE model: Titans LMM + MAG + k=2 CMS. It is a regression checkpoint, not the destination architecture.
+
+**Phase 2 (M9–M14)**: Expanded after S3b delivers DGD, self-referential projections, and the HOPE composition. This is the real build — the HOPE architecture running end-to-end. The full scope of Phase 2 cannot be locked down until S3b specs are written, but the milestones below represent the known requirements.
+
+**S4 Phase 1 and S3b run in parallel.** S4-M7 (primitive validation) can proceed now. S4 Phase 2 milestones are blocked on their corresponding S3b deliverables.
 
 ### S4-M1: Weight Serialization ✅
 
@@ -484,9 +490,11 @@ Concrete model configuration proving the build→serve pipeline works end-to-end
 
 ---
 
-### S4-M7: Build Hardening (PLANNED)
+### S4-M7: Primitive Validation (PLANNED)
 
-Run the toy_60m config end-to-end. Validate all success criteria:
+Run the toy_60m config end-to-end as a regression checkpoint for the pre-S3b primitive set. This validates that the build→serve pipeline works with existing primitives (Titans LMM + MAG + k=2 CMS + plain SGD outer-loop + byte tokenizer). It does NOT validate the HOPE architecture — that is S4 Phase 2.
+
+Success criteria:
 1. Loss converges (byte-level CE from ~5.5 to <4.0)
 2. No NaN/Inf through 5000 steps
 3. k=2 matches or beats k=1 baseline
@@ -494,6 +502,102 @@ Run the toy_60m config end-to-end. Validate all success criteria:
 5. Serve generates coherent byte sequences
 
 **Dependencies**: S4-M6 (model design + config)
+**Note**: Can proceed in parallel with S3b spec work. Low-priority relative to S3b.
+**Status**: NOT STARTED
+
+---
+
+## Stage 4 Phase 2: HOPE Build & Serve (BLOCKED ON S3b)
+
+These milestones become active as S3b delivers its primitives. They cannot be fully specced until S3b specs are written — the scope below is the known shape.
+
+### S4-M9: Multi-Block CMS Execution Engine (PLANNED)
+
+S3-M3 (CMS Variants) built the configuration schema and validation for 5 deployment patterns (Basic, Nested, Sequential, Independent, Hybrid). What is missing is the actual execution engine that runs multiple blocks with independent or hierarchical CMS schedules.
+
+**What this delivers**:
+- Runtime that instantiates and steps multiple `BlockConfig` entries
+- Block-level output aggregation (concat, sum, or attention-mix)
+- Independent Conductor instances per block (for Independent/Hybrid variants)
+- Integration with distributed_step for multi-block multi-GPU
+
+**Dependencies**: S3-M3 (CMS Variant schemas, COMPLETE), S3b-M4 (HOPE composition spec for block wiring)
+**Status**: NOT STARTED
+
+---
+
+### S4-M10: DGD Inner-Loop Build Path (PLANNED)
+
+Replace plain gradient descent in the inner loop with DGD (Delta Gradient Descent). DGD's update depends on both the current input AND the current memory state M — making it fundamentally more expressive than plain GD. The HOPE ablation shows ~1.2 ppl cost for removing it.
+
+**What this delivers**:
+- `build.py` updated to configure `AlgorithmKind::DGD` (from S3b-M1)
+- New `configs/hope_Nm_dgd.json` config with DGD enabled
+- Validation: DGD build loop converges, loss is better than plain GD baseline
+
+**Dependencies**: S3b-M1 (DGD implementation)
+**Status**: NOT STARTED
+
+---
+
+### S4-M11: Self-Referential Build (PLANNED)
+
+Replace fixed W_Q/W_K/W_V projection matrices with memory-derived projections (M_k, M_v, M_q from HOPE §8.1 Eq 79-85). The memory matrices project their own keys, values, and queries — the model's attention is computed from what the memory has learned, not from fixed outer-loop weights.
+
+**What this delivers**:
+- `build.py` updated to use self-referential projection path (from S3b-M3)
+- Config: `configs/hope_Nm_selfref.json`
+- Validation: gradient flows through M_k/M_v/M_q correctly, no gradient blocking
+- Chunkwise parallel path for self-referential Titans (from S3b-S15)
+
+**Dependencies**: S3b-M3 (self-referential primitives), S4-M10 (DGD required before self-ref per S3b ordering)
+**Status**: NOT STARTED
+
+---
+
+### S4-M12: AdamW / AdaMuon Outer-Loop (PLANNED)
+
+Replace plain SGD in `build.py` with AdamW or AdaMuon for the outer-loop weight updates. Plain SGD does not scale to real builds. The outer-loop optimizer choice does not violate IS/IS NOT — AdamW applies to the outer (slow) loop parameters, not the inner (fast) memory updates.
+
+**What this delivers**:
+- `apply_weight_gradients_adamw()` / `apply_weight_gradients_adamuon()` on MAGParams (from S3b-M4)
+- `build.py` `--outer_optimizer` flag: `"sgd"` (default, backward compat) / `"adamw"` / `"adamuon"`
+- Validation: AdamW outer-loop converges faster than SGD baseline at matched step count
+
+**Dependencies**: S3b-M4 (AdamW + AdaMuon specs and implementation)
+**Status**: NOT STARTED
+
+---
+
+### S4-M13: HOPE Model Config (PLANNED)
+
+The full HOPE architecture config: self-referential Titans + DGD inner-loop + k=4 CMS + AdamW outer-loop. This replaces `toy_60m.json` as the primary build target.
+
+**What this delivers**:
+- `configs/hope_Nm.json` (size TBD once S3b primitives are costed)
+- Documents the composition: which memory rules, which parallelization, which CMS variant
+- Traces every config field back to a HOPE paper equation or S3b spec
+- Defines the validation suite for the HOPE architecture
+
+**Dependencies**: S4-M10 (DGD), S4-M11 (self-ref), S4-M12 (AdamW), S3b-S20 (HOPE composition spec)
+**Status**: NOT STARTED — spec cannot be written until S3b-S20 exists
+
+---
+
+### S4-M14: HOPE End-to-End Validation (PLANNED)
+
+Run the `hope_Nm.json` config end-to-end. This is the real build hardening milestone — the HOPE architecture working, not the toy_60m scaffolding.
+
+Success criteria:
+1. Loss converges on real text data (FineWeb or equivalent)
+2. DGD inner-loop shows measurable ppl improvement over plain GD (ablation)
+3. Self-referential projections: M_k/M_v/M_q gradients non-zero throughout build
+4. k=4 CMS: all 4 levels contribute (gate diagnostics)
+5. AdamW outer-loop: no divergence through full build
+6. Checkpoint → restore → continue: identical loss trajectory
+7. Serve: model generates coherent text, memory self-modifies during inference
+
+**Dependencies**: S4-M13 (HOPE config), all S4 Phase 2 milestones
 **Status**: NOT STARTED
 
 ---
@@ -540,46 +644,50 @@ Stage 0: Foundation ────────────────────
 Stage 1: Algorithm Core ─────────────────────── COMPLETE (805 tests)
     │
     ├─► S4-M8: Wengert Tape Integration ──────── COMPLETE (PRs #55–65)
-    │       (tape replaces hand-written backward)
     │
     ├─► S2-M1: Compilation Strategy ─────────── COMPLETE
     │       │
     │       ├─► S2-M1a: SWA head_dim fix ──────── COMPLETE (PR #40)
-    │       │
     │       ├─► S2-M1b: GPU-resident model ────── COMPLETE (PR #41)
-    │       │
     │       ├─► S2-M2: Multi-GPU Distribution ── COMPLETE
-    │       │
     │       └─► S2-M3: Serving ──────────────── COMPLETE
-    │               │
     │               └─► S2-M4: Edge Deployment ─ COMPLETE
     │
     ├─► S3-M1: Pluggable Retention ─────────── COMPLETE (PR #31)
-    │
     ├─► S3-M2: M3 Optimizer ────────────────── COMPLETE (PR #32)
-    │       │
-    │       └─► S3-M3: CMS Variants ──────── COMPLETE (PR #32)
-    │
+    │       └─► S3-M3: CMS Variants (schemas) ── COMPLETE (PR #32)
+    │               └─► S4-M9: Multi-Block Execution Engine ── PLANNED (needs S3b-M4)
     ├─► S3-M4: Atlas Omega Rule ────────────── COMPLETE (PR #35)
-    │
     ├─► S3-M5: Dynamic Frequency ───────────── COMPLETE (PR #36)
     │
     └─► S4-M1: Weight Serialization ────────── COMPLETE (PR #37)
-            │
             └─► S4-M2: Stateful PyO3 ────────── COMPLETE (PR #38)
-                    │
                     ├─► S4-M3: Build Script ──── COMPLETE (PR #38)
-                    │
                     ├─► S4-M4: Serve Script ──── COMPLETE (PR #38)
-                    │
                     └─► S4-M5: Declared Ckpt ─── COMPLETE (PR #39)
-                            │
-                            └─► S4-M6: Model Design ── COMPLETE
-                                    │
-                                    └─► S4-M7: Build Hardening ── PLANNED
+                            └─► S4-M6: Model Design (toy_60m) ── COMPLETE
+                                    └─► S4-M7: Primitive Validation ── PLANNED (parallel with S3b)
+
+── S3b ─────────────────────────────────────────── NOT STARTED
+    │
+    ├─► S3b-M1: Algorithm Knobs (DGD, DMGD, FTRL…)
+    │       └─► S4-M10: DGD Build Path ── PLANNED
+    │               └─► S4-M11: Self-Referential Build ── PLANNED (needs S3b-M3)
+    │
+    ├─► S3b-M2: Retention & Bias Completion
+    │
+    ├─► S3b-M3: Self-Referential Primitives ── (needs S3b-M1)
+    │
+    └─► S3b-M4: Outer-Loop & Architectural
+            └─► S4-M12: AdamW/AdaMuon Outer-Loop ── PLANNED
+                    │
+                    (S4-M10 + S4-M11 + S4-M12 + S3b-S20)
+                    │
+                    └─► S4-M13: HOPE Model Config ── PLANNED
+                            └─► S4-M14: HOPE End-to-End Validation ── PLANNED
 ```
 
-Stage 2 milestones are sequential (each builds on the last). Stage 3 milestones are independent of each other and can be done in any order. Stage 3 does not block Stage 2. Stage 3b is spec-first: each primitive gets a spec sheet before implementation. S3b Phase 3 (self-referential) depends on S3b Phase 1 (DGD). Stage 4 depends on S4-M1 (serialization) for the full build→save→load→serve pipeline. Stage 3b and Stage 4 can proceed in parallel — Stage 3b enriches the primitive space while Stage 4 validates the build pipeline with existing primitives.
+**Stage 2** milestones are sequential. **Stage 3** milestones are independent. **Stage 3b** is spec-first: primitives get spec sheets before implementation; S3b Phase 3 (self-referential) depends on S3b Phase 1 (DGD). **Stage 4 Phase 1** (M1–M8) is complete/planned with existing primitives and runs in parallel with S3b. **Stage 4 Phase 2** (M9–M14) is the real HOPE build — blocked on S3b deliverables; scope cannot be fully locked until S3b specs exist.
 
 ---
 
@@ -592,6 +700,14 @@ Stage 2 milestones are sequential (each builds on the last). Stage 3 milestones 
 | Stage 2: Production Infra | 4 (+M1a, +M1b) | 33 CUDA + 13 dispatch + 6 GPU-resident + 20 edge + 18 serving + 18 distributed | COMPLETE |
 | Stage 3: Extensions | 5 | 22 retention + 35 M3/variants + 26 Atlas + 22 dynamic freq = 105 | COMPLETE |
 | Stage 3b: Primitive Completeness | 20 specs + 4 impl milestones | — | NOT STARTED |
-| Stage 4: MVP Build & Serve | 8 (7 done, 1 planned) | 27 Python + 120 tape/traced/class3 Rust | IN PROGRESS |
+| Stage 4 Phase 1: Pipeline Scaffolding | 8 (7 done, 1 planned) | 27 Python + 120 tape/traced/class3 Rust | IN PROGRESS |
+| Stage 4 Phase 2: HOPE Build & Serve | 6 milestones (M9–M14) | — | BLOCKED ON S3b |
 
-**Current position**: S0–S3 complete. S4 MVP pipeline delivered (M1–M6, M8): can build a model on real text data and serve it locally. Wengert tape is the production gradient path (M8, PRs #55–65). S4-M7 (build hardening) is next — run the 60M toy model end-to-end. S3b (primitive completeness) runs in parallel — 20 spec sheets needed to cover the full paper-defined primitive space before implementing DGD, self-referential projections, and the Hope architecture. Total test count: 834 Rust lib + 27 Python = **861 tests** (lib only; full `cargo test` is higher).
+**Current position**: S0–S3 complete. S4 Phase 1 pipeline delivered (M1–M6, M8): can build a model on real text data and serve it locally using pre-S3b primitives. Wengert tape is the production gradient path (M8, PRs #55–65).
+
+**Active fronts**:
+1. **S3b spec work** (highest priority): 20 spec sheets for DGD, self-referential projections, retention gaps, and the HOPE composition. These are the lego pieces the castle is built from.
+2. **S4-M7** (parallel, low priority): validate the toy_60m pipeline as a regression checkpoint on existing primitives.
+3. **S4 Phase 2** (blocked): expands as S3b delivers. The real build — HOPE architecture end-to-end — cannot begin until DGD and self-referential projections are implemented.
+
+Total test count: 834 Rust lib + 27 Python = **861 tests** (lib only; full `cargo test` is higher).

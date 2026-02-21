@@ -8,7 +8,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::types::PyDict;
 
 use nl_hecate_core::model::{SWAConfig as RustConfig, SWAParams as RustParams};
-use nl_hecate_core::model::{MAGConfig as RustMAGConfig, MAGParams as RustMAGParams, MemoryRuleKind, CompositionKind};
+use nl_hecate_core::model::{MAGConfig as RustMAGConfig, MAGParams as RustMAGParams, MemoryRuleKind, CompositionKind, AttentionalBias as RustAttentionalBias};
 use nl_hecate_core::retention::{RetentionKind, default_retention};
 use nl_hecate_core::m3::M3Config as RustM3Config;
 use nl_hecate_core::dynamic_freq::{FrequencySchedule, LearnedFreqConfig};
@@ -272,6 +272,7 @@ impl MAGConfig {
         d_hidden=None, lp_p=None, sign_sharpness=None, lq_q=None, lambda_local=None, lambda_2=None,
         delta=None, m_slots=None, d_compress=None, lambda_k=None, lambda_v=None,
         retention=None, m3=None, frequency_schedule=None, checkpoint_interval=None,
+        attentional_bias=None,
     ))]
     fn new(
         d_model: usize,
@@ -300,6 +301,7 @@ impl MAGConfig {
         m3: Option<&Bound<'_, PyDict>>,
         frequency_schedule: Option<&Bound<'_, PyAny>>,
         checkpoint_interval: Option<usize>,
+        attentional_bias: Option<&str>,
     ) -> PyResult<Self> {
         if d_model != num_heads * head_dim {
             return Err(PyValueError::new_err(format!(
@@ -384,6 +386,21 @@ impl MAGConfig {
                 }
             }
         };
+        let bias_kind = match attentional_bias {
+            None | Some("l2") | Some("L2") => RustAttentionalBias::L2,
+            Some("l1") | Some("L1") => RustAttentionalBias::L1,
+            Some(s) if s.starts_with("lp(") || s.starts_with("Lp(") => {
+                let inner = s.trim_start_matches(|c: char| c != '(')
+                    .trim_start_matches('(').trim_end_matches(')');
+                let p: f32 = inner.parse().map_err(|_| PyValueError::new_err(
+                    format!("Invalid Lp parameter: '{s}'. Expected format: 'Lp(3.0)'")
+                ))?;
+                nl_hecate_core::moneta::normalize_bias(RustAttentionalBias::Lp(p))
+            }
+            Some(s) => return Err(PyValueError::new_err(format!(
+                "Unknown attentional_bias '{s}'. Expected: 'L2', 'L1', or 'Lp(p)'"
+            ))),
+        };
         Ok(MAGConfig {
             inner: RustMAGConfig {
                 swa: RustConfig {
@@ -415,6 +432,10 @@ impl MAGConfig {
                 m3: m3_cfg,
                 frequency_schedule: freq_sched,
                 checkpoint_interval,
+                hope_variant: nl_hecate_core::model::HopeVariant::FreqGated,
+                lattice_variant: nl_hecate_core::model::LatticeVariant::Decode,
+                n_persistent: 0,
+                attentional_bias: bias_kind,
             },
         })
     }
@@ -585,6 +606,7 @@ impl MAGForwardCache {
     d_hidden=None, lp_p=None, sign_sharpness=None, lq_q=None, lambda_local=None, lambda_2=None,
     delta=None, m_slots=None, d_compress=None, lambda_k=None, lambda_v=None,
     retention=None, m3=None, frequency_schedule=None, checkpoint_interval=None,
+    attentional_bias=None,
 ))]
 fn mag_create_config(
     d_model: usize,
@@ -613,12 +635,13 @@ fn mag_create_config(
     m3: Option<&Bound<'_, PyDict>>,
     frequency_schedule: Option<&Bound<'_, PyAny>>,
     checkpoint_interval: Option<usize>,
+    attentional_bias: Option<&str>,
 ) -> PyResult<MAGConfig> {
     MAGConfig::new(
         d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled,
         k, chunk_sizes, memory_rule, composition,
         d_hidden, lp_p, sign_sharpness, lq_q, lambda_local, lambda_2, delta, m_slots, d_compress, lambda_k, lambda_v,
-        retention, m3, frequency_schedule, checkpoint_interval,
+        retention, m3, frequency_schedule, checkpoint_interval, attentional_bias,
     )
 }
 

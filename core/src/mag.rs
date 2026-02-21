@@ -103,11 +103,11 @@ pub fn mag_forward(
     // Stage 2b+3b: Memory branch — dispatch based on memory rule
     let (y, memory_cache) = match cfg.memory_rule {
         MemoryRuleKind::DeltaRule => {
-            let (y, cache) = DeltaRule.step(&params.levels[0], &embedded, s, d, None);
+            let (y, cache) = DeltaRule::from_cfg(cfg).step(&params.levels[0], &embedded, s, d, None);
             (y, MemoryCache::Delta(cache))
         }
         MemoryRuleKind::TitansLMM => {
-            let (y, cache) = TitansLMM.step(&params.levels[0], &embedded, s, d, None);
+            let (y, cache) = TitansLMM::from_cfg(cfg).step(&params.levels[0], &embedded, s, d, None);
             (y, MemoryCache::Titans(cache))
         }
         MemoryRuleKind::HebbianRule => {
@@ -257,10 +257,10 @@ pub fn mag_backward(
     // ── Stage 3b: Memory backward — dispatch on cache variant ──────────
     let (mem_grads, d_embedded_mem) = match &cache.memory_cache {
         MemoryCache::Delta(delta_cache) => {
-            DeltaRule.step_backward(&params.levels[0], delta_cache, &d_y, &cache.embedded)
+            DeltaRule::from_cfg(cfg).step_backward(&params.levels[0], delta_cache, &d_y, &cache.embedded)
         }
         MemoryCache::Titans(titans_cache) => {
-            TitansLMM.step_backward(&params.levels[0], titans_cache, &d_y, &cache.embedded)
+            TitansLMM::from_cfg(cfg).step_backward(&params.levels[0], titans_cache, &d_y, &cache.embedded)
         }
         MemoryCache::Hebbian(hebbian_cache) => {
             HebbianRule.step_backward(&params.levels[0], hebbian_cache, &d_y, &cache.embedded)
@@ -575,13 +575,13 @@ fn run_level_memory(
         let initial_m = Some(std::mem::take(&mut context.memory[level]));
         let (y_level, mem_cache) = match cfg.memory_rule {
             MemoryRuleKind::DeltaRule => {
-                let (y, cache) = DeltaRule.step(&params.levels[level], input, s, d, initial_m);
+                let (y, cache) = DeltaRule::from_cfg(cfg).step(&params.levels[level], input, s, d, initial_m);
                 let m_final_start = s * d * d;
                 context.memory[level] = cache.m_states[m_final_start..m_final_start + d * d].to_vec();
                 (y, MemoryCache::Delta(cache))
             }
             MemoryRuleKind::TitansLMM => {
-                let (y, cache) = TitansLMM.step(&params.levels[level], input, s, d, initial_m);
+                let (y, cache) = TitansLMM::from_cfg(cfg).step(&params.levels[level], input, s, d, initial_m);
                 let m_final_start = s * d * d;
                 context.memory[level] = cache.m_states[m_final_start..m_final_start + d * d].to_vec();
                 (y, MemoryCache::Titans(cache))
@@ -994,10 +994,10 @@ pub fn cms_backward(
             let mem_cache = cache.memory_caches[level].as_ref().unwrap();
             let (mem_grads, d_embedded_mem) = match mem_cache {
                 MemoryCache::Delta(delta_cache) => {
-                    DeltaRule.step_backward(&params.levels[level], delta_cache, &d_y_combined, &cache.embedded)
+                    DeltaRule::from_cfg(cfg).step_backward(&params.levels[level], delta_cache, &d_y_combined, &cache.embedded)
                 }
                 MemoryCache::Titans(titans_cache) => {
-                    TitansLMM.step_backward(&params.levels[level], titans_cache, &d_y_combined, &cache.embedded)
+                    TitansLMM::from_cfg(cfg).step_backward(&params.levels[level], titans_cache, &d_y_combined, &cache.embedded)
                 }
                 MemoryCache::Hebbian(hebbian_cache) => {
                     HebbianRule.step_backward(&params.levels[level], hebbian_cache, &d_y_combined, &cache.embedded)

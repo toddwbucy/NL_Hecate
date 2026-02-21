@@ -151,7 +151,7 @@ fn test_cuda_delta_forward_full_pipeline() {
     let embedded = rand_buf(s * d, 99);
 
     // Rust reference: full DeltaRule::step
-    let rule = DeltaRule;
+    let rule = DeltaRule::l2();
     let (y_rust, cache_rust) = rule.step(&params.levels[0], &embedded, s, d, None);
 
     // CUDA path: extract projections in Rust, inner loop in CUDA
@@ -365,7 +365,7 @@ fn test_cuda_delta_backward_full_pipeline() {
     let embedded = rand_buf(s * d, 99);
 
     // Rust reference backward
-    let rule = DeltaRule;
+    let rule = DeltaRule::l2();
     let (_y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
     let d_y = rand_buf(s * d, 1500);
     let (grads_rust, _d_emb_rust) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);

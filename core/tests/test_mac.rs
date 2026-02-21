@@ -317,6 +317,7 @@ fn test_mac_vs_mag() {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: Default::default(),
     };
     let cfg_mac = MAGConfig {
         swa: swa_mac, memory_enabled: true,
@@ -332,6 +333,7 @@ fn test_mac_vs_mag() {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: Default::default(),
     };
 
     let seq_len = 8;

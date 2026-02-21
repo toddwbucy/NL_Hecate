@@ -584,7 +584,7 @@ fn traced_active_level(
 
     match cfg.memory_rule {
         MemoryRuleKind::DeltaRule => {
-            let (y, cache) = DeltaRule.step(level_params, embedded, s, d, initial_m);
+            let (y, cache) = DeltaRule::from_cfg(cfg).step(level_params, embedded, s, d, initial_m);
             let m_final_start = s * d * d;
             let final_m = cache.m_states[m_final_start..m_final_start + d * d].to_vec();
 
@@ -612,7 +612,7 @@ fn traced_active_level(
             (y, MemoryCache::Delta(cache), final_m, y_id)
         }
         MemoryRuleKind::TitansLMM => {
-            let (y, cache) = TitansLMM.step(level_params, embedded, s, d, initial_m);
+            let (y, cache) = TitansLMM::from_cfg(cfg).step(level_params, embedded, s, d, initial_m);
             let m_final_start = s * d * d;
             let final_m = cache.m_states[m_final_start..m_final_start + d * d].to_vec();
 

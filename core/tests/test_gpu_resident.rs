@@ -39,6 +39,7 @@ fn make_test_config(rule: MemoryRuleKind) -> MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: Default::default(),
     }
 }
 

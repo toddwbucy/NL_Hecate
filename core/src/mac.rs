@@ -141,11 +141,11 @@ fn step_dispatch(
 ) -> (Vec<f32>, MemoryCache) {
     match cfg.memory_rule {
         MemoryRuleKind::DeltaRule => {
-            let (y, c) = DeltaRule.step(level_params, input, s, d, initial_m);
+            let (y, c) = DeltaRule::from_cfg(cfg).step(level_params, input, s, d, initial_m);
             (y, MemoryCache::Delta(c))
         }
         MemoryRuleKind::TitansLMM => {
-            let (y, c) = TitansLMM.step(level_params, input, s, d, initial_m);
+            let (y, c) = TitansLMM::from_cfg(cfg).step(level_params, input, s, d, initial_m);
             (y, MemoryCache::Titans(c))
         }
         MemoryRuleKind::HebbianRule => {
@@ -193,8 +193,8 @@ fn step_backward_dispatch(
     input: &[f32],
 ) -> (MemoryLevelParams, Vec<f32>) {
     match cache {
-        MemoryCache::Delta(c) => DeltaRule.step_backward(level_params, c, d_y, input),
-        MemoryCache::Titans(c) => TitansLMM.step_backward(level_params, c, d_y, input),
+        MemoryCache::Delta(c) => DeltaRule::from_cfg(cfg).step_backward(level_params, c, d_y, input),
+        MemoryCache::Titans(c) => TitansLMM::from_cfg(cfg).step_backward(level_params, c, d_y, input),
         MemoryCache::Hebbian(c) => HebbianRule.step_backward(level_params, c, d_y, input),
         MemoryCache::Moneta(c) => {
             let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2, sign_sharpness: cfg.sign_sharpness };

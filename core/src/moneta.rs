@@ -772,6 +772,120 @@ pub fn lp_bias_gradient_backward(
     d_error
 }
 
+// ── AttentionalBias dispatch (all matrix-memory rules) ──────────────
+
+/// Apply attentional bias transformation to raw error vector.
+///
+/// Maps AttentionalBias enum → element-wise gradient transformation:
+/// - L2: identity (raw error, factor of 2 absorbed into learning rate)
+/// - L1: tanh(a * error) per element (smooth Sign approximation)
+/// - Lp(p): p * tanh(a*e) * (e²+eps)^{(p-1)/2} per element
+///
+/// The caller forms outer(result, k) to get the d×d weight gradient.
+/// Source: MIRAS §5.1 Eq 11, specs/algorithms/attentional_biases/03_lp_dispatch.md
+pub fn apply_attentional_bias(
+    error: &[f32],
+    bias: crate::model::AttentionalBias,
+    sign_sharpness: f32,
+) -> Vec<f32> {
+    use crate::model::AttentionalBias;
+    match bias {
+        AttentionalBias::L2 => error.to_vec(),
+        AttentionalBias::L1 => lp_bias_gradient(error, 1.0, sign_sharpness),
+        AttentionalBias::Lp(p) => lp_bias_gradient(error, p, sign_sharpness),
+        AttentionalBias::KL => {
+            panic!("KL attentional bias not yet implemented — see specs/algorithms/attentional_biases/02_kl_objective.md. \
+                    Call validate_bias() at config load to catch this early.")
+        }
+        AttentionalBias::Huber => {
+            panic!("Huber attentional bias not yet implemented — see specs/algorithms/attentional_biases/02_kl_objective.md. \
+                    Call validate_bias() at config load to catch this early.")
+        }
+    }
+}
+
+/// Backward (VJP) through attentional bias transformation.
+///
+/// Given upstream gradient flowing back through the bias transform,
+/// returns gradient w.r.t. the raw error vector.
+/// - L2: identity (d/de(e) = 1)
+/// - L1: a * sech²(a*e) per element
+/// - Lp(p): product rule on tanh and power terms
+pub fn apply_attentional_bias_backward(
+    d_biased: &[f32],
+    error: &[f32],
+    bias: crate::model::AttentionalBias,
+    sign_sharpness: f32,
+) -> Vec<f32> {
+    use crate::model::AttentionalBias;
+    match bias {
+        AttentionalBias::L2 => d_biased.to_vec(),
+        AttentionalBias::L1 => lp_bias_gradient_backward(d_biased, error, 1.0, sign_sharpness),
+        AttentionalBias::Lp(p) => lp_bias_gradient_backward(d_biased, error, p, sign_sharpness),
+        AttentionalBias::KL => {
+            panic!("KL attentional bias not yet implemented — see specs/algorithms/attentional_biases/02_kl_objective.md. \
+                    Call validate_bias() at config load to catch this early.")
+        }
+        AttentionalBias::Huber => {
+            panic!("Huber attentional bias not yet implemented — see specs/algorithms/attentional_biases/02_kl_objective.md. \
+                    Call validate_bias() at config load to catch this early.")
+        }
+    }
+}
+
+/// Normalize AttentionalBias: Lp(2.0)→L2, Lp(1.0)→L1 to avoid ambiguity.
+/// L2 returns identity while Lp(2.0) returns 2*error — semantically different.
+/// Call this at config load/construction to prevent downstream confusion.
+pub fn normalize_bias(bias: crate::model::AttentionalBias) -> crate::model::AttentionalBias {
+    use crate::model::AttentionalBias;
+    match bias {
+        AttentionalBias::Lp(p) if (p - 2.0).abs() < 1e-6 => AttentionalBias::L2,
+        AttentionalBias::Lp(p) if (p - 1.0).abs() < 1e-6 => AttentionalBias::L1,
+        other => other,
+    }
+}
+
+/// Validate that the bias is supported by apply_attentional_bias.
+/// KL and Huber are separate specs (02_kl_objective.md) and not yet implemented.
+pub fn validate_bias(bias: crate::model::AttentionalBias) -> Result<(), String> {
+    use crate::model::AttentionalBias;
+    match bias {
+        AttentionalBias::L2 | AttentionalBias::L1 | AttentionalBias::Lp(_) => Ok(()),
+        AttentionalBias::KL => Err("KL attentional bias not yet implemented (see 02_kl_objective.md)".into()),
+        AttentionalBias::Huber => Err("Huber attentional bias not yet implemented (see 02_kl_objective.md)".into()),
+    }
+}
+
+/// Encode AttentionalBias as a single f32 for tape metadata.
+/// L2 → 2.0, L1 → 1.0, Lp(p) → p, KL → -1.0, Huber → -2.0.
+/// Panics on Lp(1.0) or Lp(2.0) — call normalize_bias() first.
+pub fn bias_to_f32(bias: crate::model::AttentionalBias) -> f32 {
+    use crate::model::AttentionalBias;
+    match bias {
+        AttentionalBias::L2 => 2.0,
+        AttentionalBias::L1 => 1.0,
+        AttentionalBias::Lp(p) => {
+            assert!((p - 2.0).abs() >= 1e-6 && (p - 1.0).abs() >= 1e-6,
+                "Lp({p}) collides with L2/L1 encoding — call normalize_bias() first");
+            p
+        }
+        AttentionalBias::KL => -1.0,
+        AttentionalBias::Huber => -2.0,
+    }
+}
+
+/// Decode a single f32 back to AttentionalBias (inverse of bias_to_f32).
+/// L2 returns identity (factor of 2 absorbed into learning rate), while
+/// Lp(2.0) returns 2*error — so we must distinguish them.
+pub fn f32_to_bias(v: f32) -> crate::model::AttentionalBias {
+    use crate::model::AttentionalBias;
+    if v == 2.0 { AttentionalBias::L2 }
+    else if v == 1.0 { AttentionalBias::L1 }
+    else if v == -1.0 { AttentionalBias::KL }
+    else if v == -2.0 { AttentionalBias::Huber }
+    else { AttentionalBias::Lp(v) }
+}
+
 // ── Read-only functions (for frozen CMS levels) ─────────────────────
 
 /// Forward pass for a frozen MONETA level: y_t = W2 @ silu(W1 @ q_t).

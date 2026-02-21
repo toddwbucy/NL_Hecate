@@ -12,15 +12,27 @@ All math stays in Rust. This script is pure orchestration (CS-18).
 """
 
 import argparse
+import gc
 import json
 import math
 import mmap
 import os
 from pathlib import Path
 import random
+import resource
 import struct
 import time
 from typing import Any, Optional
+
+
+def rss_mb() -> float:
+    """Current process RSS in MB (from /proc for accuracy)."""
+    try:
+        with open("/proc/self/statm") as f:
+            pages = int(f.read().split()[1])  # resident pages
+        return pages * 4096 / (1024 * 1024)
+    except Exception:
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
 
 import nl_hecate
 
@@ -64,10 +76,16 @@ class BuildConfig:
     # Data
     data_path: str | None = None
     data_format: str = "byte"  # "byte" or "sharegpt"
+    doc_starts_path: str | None = None  # byte offsets of document boundaries
+    val_path: str | None = None  # byte-level val corpus
+    val_doc_starts_path: str | None = None  # val doc boundaries
 
     # Eval
     eval_every: int = 0  # 0 = disabled; evaluate on val set every N steps
     eval_max_chunks: int = 100  # max chunks per eval pass
+
+    # Gradient checkpointing (VRAM optimization for memory rules)
+    checkpoint_interval: int | None = None  # None = full trajectory; C = store M every C steps
 
     # Runtime
     gpu: bool = False
@@ -117,6 +135,12 @@ class BuildConfig:
                         flat["data_path"] = sub["path"]
                     if "format" in sub:
                         flat["data_format"] = sub["format"]
+                    if "doc_starts" in sub:
+                        flat["doc_starts_path"] = sub["doc_starts"]
+                    if "val_path" in sub:
+                        flat["val_path"] = sub["val_path"]
+                    if "val_doc_starts" in sub:
+                        flat["val_doc_starts_path"] = sub["val_doc_starts"]
                 else:
                     flat.update(sub)
         # Top-level overrides (for flat configs)
@@ -148,6 +172,7 @@ class BuildConfig:
             "beta1": "beta1", "beta2": "beta2", "max_grad_norm": "max_grad_norm",
             "load": "load", "log_file": "log_file",
             "eval_every": "eval_every", "eval_max_chunks": "eval_max_chunks",
+            "checkpoint_interval": "checkpoint_interval",
         }
         for cli_name, cfg_name in mapping.items():
             val = getattr(args, cli_name, None)
@@ -357,42 +382,80 @@ def load_binary_tokens(path: str) -> list[int]:
         return list(f.read())
 
 
-def evaluate(gpu_model, bcfg: BuildConfig, val_loader: "BpeDataLoader",
-             max_chunks: int) -> tuple[float, float]:
-    """Run forward-only eval on val set. Returns (avg_loss, perplexity).
+def evaluate(gpu_model, bcfg: BuildConfig, val_loader,
+             max_chunks: int, val_doc_starts=None) -> tuple[float, float]:
+    """Run forward-only on val set. Returns (avg_loss, perplexity).
 
-    Uses a fresh Conductor per eval (independent CMS state) so eval
-    doesn't corrupt training context. No backward pass, no weight update.
+    Uses a fresh Conductor + ContextState so eval doesn't corrupt
+    training memory. Same forward path as training — no mode flag (CS-10).
+    Document boundary resets apply if val_doc_starts is provided.
     """
+    import numpy as np
+
     conductor = nl_hecate.Conductor(bcfg.k, bcfg.chunk_sizes)
     context = nl_hecate.ContextState(bcfg.k, bcfg.d_model)
-
-    # Reset val loader position for deterministic eval
-    val_loader.position = 0
 
     total_loss = 0.0
     n_chunks = 0
 
-    for _ in range(max_chunks):
-        chunk = val_loader.next_chunk(bcfg.seq_len)
-        if chunk is None:
-            break
-        input_ids, target_ids = chunk
-        pulse = conductor.pulse()
+    if isinstance(val_loader, BpeDataLoader):
+        val_loader.position = 0
+        for _ in range(max_chunks):
+            chunk = val_loader.next_chunk(bcfg.seq_len)
+            if chunk is None:
+                break
+            input_ids, target_ids = chunk
+            pulse = conductor.pulse()
 
-        if gpu_model is not None:
-            loss, _ = gpu_model.forward(input_ids, target_ids, pulse)
-        else:
-            # CPU eval path
-            params_ref = None  # caller must handle CPU case separately
-            raise NotImplementedError("CPU eval not yet implemented for BPE")
+            if gpu_model is not None:
+                loss, _ = gpu_model.forward(input_ids, target_ids, pulse)
+            else:
+                raise NotImplementedError("CPU eval not yet implemented for BPE")
 
-        if math.isnan(loss) or math.isinf(loss):
-            continue
+            if not (math.isnan(loss) or math.isinf(loss)):
+                total_loss += loss
+                n_chunks += 1
+            conductor.advance()
+    else:
+        # Byte-level eval: VecStream over val corpus
+        val_stream = nl_hecate.VecStream.from_bytes(val_loader)
+        val_conductor = nl_hecate.Conductor(bcfg.k, bcfg.chunk_sizes)
+        val_conductor.attach_stream(val_stream)
 
-        total_loss += loss
-        n_chunks += 1
-        conductor.advance()
+        next_doc_idx = 1
+        for chunk_i in range(max_chunks):
+            result = val_conductor.next_chunk(bcfg.seq_len)
+            if result is None:
+                break
+            input_ids, target_ids, pulse = result
+            if len(input_ids) != bcfg.seq_len:
+                val_conductor.advance()
+                continue
+
+            if gpu_model is not None:
+                loss, _ = gpu_model.forward(input_ids, target_ids, pulse)
+            else:
+                loss, _ = nl_hecate.cms_forward(
+                    None, None, input_ids, target_ids, pulse, context)
+                # CPU eval would need params/cfg passed in — skip for now
+                raise NotImplementedError("CPU byte-level eval not yet wired")
+
+            if not (math.isnan(loss) or math.isinf(loss)):
+                total_loss += loss
+                n_chunks += 1
+
+            val_conductor.advance()
+
+            # Document boundary reset (same as training)
+            if val_doc_starts is not None:
+                byte_pos = (chunk_i + 1) * bcfg.seq_len
+                prev_idx = next_doc_idx
+                while (next_doc_idx < len(val_doc_starts)
+                       and byte_pos >= val_doc_starts[next_doc_idx]):
+                    next_doc_idx += 1
+                if next_doc_idx > prev_idx:
+                    # Reset eval context (not training context)
+                    gpu_model.reset_context()
 
     if n_chunks == 0:
         return 0.0, 1.0
@@ -408,6 +471,34 @@ SAMPLE_PROMPTS = [
     "Explain how a neural network learns in simple terms.",
     "Write a short poem about the ocean.",
 ]
+
+# Short prompts for eval-time coherence check (byte-level friendly)
+EVAL_PROMPTS = [
+    "Once upon a time",
+    "The meaning of life is",
+    "In the beginning",
+]
+
+
+def eval_coherence_samples(gpu_model, cfg, max_tokens: int = 30):
+    """Generate short completions from fixed prompts to eyeball coherence.
+
+    Uses greedy decoding (temperature=0) for deterministic output.
+    Works with byte-level (vocab_size=256) models — no tokenizer needed.
+    """
+    from serve import generate, ByteTokenizer
+    tok = ByteTokenizer()
+    results = []
+    for prompt in EVAL_PROMPTS:
+        prompt_ids = tok.encode(prompt)
+        out_ids = generate(
+            params=None, cfg=cfg, prompt_tokens=prompt_ids,
+            max_tokens=max_tokens, temperature=0.0,
+            gpu_model=gpu_model,
+        )
+        gen_text = tok.decode(out_ids[len(prompt_ids):])
+        results.append((prompt, gen_text))
+    return results
 
 
 def generate_samples(gpu_model, cfg, tokenizer, step: int,
@@ -458,6 +549,8 @@ def main():
                         help="Comma-separated chunk sizes per level (e.g. '1,8')")
     parser.add_argument("--memory_rule", type=str, default=None, help="Memory rule")
     parser.add_argument("--composition", type=str, default=None, help="Composition pattern")
+    parser.add_argument("--checkpoint_interval", type=int, default=None,
+                        help="Gradient checkpointing interval (VRAM optimization, e.g. 64)")
     parser.add_argument("--lr", type=float, default=None, help="Learning rate")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
     parser.add_argument("--save_path", type=str, default=None,
@@ -537,6 +630,29 @@ def main():
         print(f"Using built-in demo text ({len(text):,} chars)")
         token_ids = encode(text)
 
+    # ── Load document boundaries (for doc-aware memory reset) ──────
+    import numpy as np
+    doc_starts = None
+    if bcfg.doc_starts_path:
+        doc_starts = np.load(bcfg.doc_starts_path).astype(np.uint64)
+        print(f"Loaded {len(doc_starts):,} document boundaries from {bcfg.doc_starts_path}")
+
+    # ── Load byte-level val data ─────────────────────────────────────
+    val_bytes: bytes | None = None
+    val_doc_starts = None
+    if not use_bpe and bcfg.eval_every > 0 and bcfg.val_path:
+        if os.path.exists(bcfg.val_path):
+            with open(bcfg.val_path, "rb") as f:
+                val_bytes = f.read()
+            print(f"Loaded val corpus: {len(val_bytes):,} bytes from {bcfg.val_path}")
+            if bcfg.val_doc_starts_path and os.path.exists(bcfg.val_doc_starts_path):
+                val_doc_starts = np.load(bcfg.val_doc_starts_path).astype(np.uint64)
+                print(f"Loaded {len(val_doc_starts):,} val document boundaries")
+            val_loader = val_bytes  # evaluate() accepts bytes for byte-level
+        else:
+            print(f"Warning: val_path {bcfg.val_path} not found, disabling eval")
+            bcfg.eval_every = 0
+
     if not use_bpe and token_ids is not None and len(token_ids) < bcfg.seq_len + 1:
         print(f"Error: text too short ({len(token_ids)} tokens < seq_len+1={bcfg.seq_len + 1})")
         return
@@ -578,6 +694,7 @@ def main():
             chunk_sizes=bcfg.chunk_sizes,
             memory_rule=bcfg.memory_rule,
             composition=bcfg.composition,
+            checkpoint_interval=bcfg.checkpoint_interval,
         )
         params = nl_hecate.mag_init_params(cfg, bcfg.seed)
 
@@ -588,6 +705,8 @@ def main():
           f"seq_len={bcfg.seq_len}, vocab={bcfg.vocab_size}")
     print(f"  Memory:   rule={cfg.memory_rule}, composition={cfg.composition}, k={bcfg.k}")
     print(f"  CMS:      chunk_sizes={bcfg.chunk_sizes}")
+    if bcfg.checkpoint_interval:
+        print(f"  GradCkpt: interval={bcfg.checkpoint_interval}")
     print(f"  Params:   {params.num_params():,}")
     data_len = len(bpe_loader) if use_bpe else len(token_ids)
     print(f"  Data:     {data_len:,} tokens" +
@@ -624,19 +743,23 @@ def main():
     else:
         # Byte-level: VecStream + Conductor for integrated data + pulse.
         if isinstance(token_ids, MmapTokenStream):
+            # Read raw bytes and convert in Rust (avoids billion-element Python list)
             mm = token_ids
-            token_ids = list(mm)
+            raw_bytes = bytes(mm._mm[:])
             mm.close()
+            stream = nl_hecate.VecStream.from_bytes(raw_bytes)
+            del raw_bytes
+            token_ids = None  # no longer needed
+        else:
+            stream = nl_hecate.VecStream(token_ids)
         if bcfg.load:
             conductor = nl_hecate.Conductor(bcfg.k, bcfg.chunk_sizes)
-            stream = nl_hecate.VecStream(token_ids)
             conductor.attach_stream(stream)
             conductor.restore_from_dict(build_state)
             context = nl_hecate.ContextState(bcfg.k, bcfg.d_model)
             context.set_memory(build_state["context_memory"])
         else:
             conductor = nl_hecate.Conductor(bcfg.k, bcfg.chunk_sizes)
-            stream = nl_hecate.VecStream(token_ids)
             conductor.attach_stream(stream)
             context = nl_hecate.ContextState(bcfg.k, bcfg.d_model)
 
@@ -646,6 +769,12 @@ def main():
         gpu_model = nl_hecate.GpuModel.from_params(params, cfg)
 
     error_buffers = nl_hecate.ErrorBufferList(bcfg.k, bcfg.d_model)
+
+    # Document boundary tracking for memory resets
+    next_doc_idx = 1  # 0 is always the start
+    if doc_starts is not None and resume_step > 0:
+        byte_pos = resume_step * bcfg.seq_len
+        next_doc_idx = int(np.searchsorted(doc_starts, byte_pos, side="right"))
 
     # Initialize optimizer
     adamw_opt = None
@@ -752,18 +881,39 @@ def main():
 
         # Advance conductor (CS-32: observe-then-advance)
         conductor.advance()
+
+        # Document boundary reset: zero memory when crossing into new doc
+        if doc_starts is not None:
+            byte_pos = (step + 1) * bcfg.seq_len
+            prev_idx = next_doc_idx
+            while next_doc_idx < len(doc_starts) and byte_pos >= doc_starts[next_doc_idx]:
+                next_doc_idx += 1
+            if next_doc_idx > prev_idx:
+                if gpu_model is not None:
+                    gpu_model.reset_context()
+                else:
+                    context.reset()
+                error_buffers.reset()
+
         losses.append(loss)
+
+        # Periodic GC to rule out Python reference cycles
+        if step % 100 == 0:
+            gc.collect()
 
         # Compute perplexity
         ppl = math.exp(min(loss, 20.0))
 
-        # Logging
-        if step % bcfg.log_every == 0 or step == end_step - 1:
+        # Logging (every 10 steps for first 100, then normal interval)
+        log_this = (step % bcfg.log_every == 0 or step == end_step - 1
+                    or (step < 100 and step % 10 == 0))
+        if log_this:
             msg = f"  step {step:5d}  loss={loss:.4f}  ppl={ppl:.1f}"
             if g_norm > 0:
                 msg += f"  gnorm={g_norm:.4f}"
             if adamw_opt or use_adamw_gpu:
                 msg += f"  lr={current_lr:.6f}"
+            msg += f"  rss={rss_mb():.0f}MB"
             print(msg)
 
         # Structured JSONL log
@@ -786,9 +936,26 @@ def main():
         # Periodic eval on val set
         if (bcfg.eval_every > 0 and val_loader is not None
                 and step > 0 and step % bcfg.eval_every == 0):
+            # Save training context before eval (eval uses fresh context)
+            saved_ctx = None
+            if gpu_model is not None:
+                saved_ctx = gpu_model.to_host_context()
+                gpu_model.reset_context()
             eval_loss, eval_ppl = evaluate(
-                gpu_model, bcfg, val_loader, bcfg.eval_max_chunks)
+                gpu_model, bcfg, val_loader, bcfg.eval_max_chunks,
+                val_doc_starts=val_doc_starts)
+            # Restore training context after eval
+            if gpu_model is not None and saved_ctx is not None:
+                gpu_model.upload_context(saved_ctx)
             print(f"  [eval] step {step:5d}  loss={eval_loss:.4f}  ppl={eval_ppl:.1f}")
+            if gpu_model is not None:
+                try:
+                    samples = eval_coherence_samples(gpu_model, cfg, max_tokens=30)
+                    for prompt, completion in samples:
+                        safe = completion.replace("\n", "\\n")
+                        print(f"    \"{prompt}\" → \"{safe}\"")
+                except Exception as e:
+                    print(f"    [coherence sample failed: {e}]")
             if jsonl:
                 jsonl.log(event="eval", step=step, eval_loss=eval_loss,
                           eval_ppl=eval_ppl, eval_chunks=bcfg.eval_max_chunks)

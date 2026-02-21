@@ -155,6 +155,15 @@ impl ContextState {
         let memory = (0..k).map(|_| vec![0.0f32; mem_size]).collect();
         ContextState { memory, d }
     }
+
+    /// Zero all memory matrices in-place. Used at document boundaries
+    /// to prevent stale state from leaking across unrelated documents.
+    /// Does NOT reset the Conductor step counter — CMS scheduling stays global.
+    pub fn reset(&mut self) {
+        for m in &mut self.memory {
+            m.fill(0.0);
+        }
+    }
 }
 
 /// Accumulated outer-loop gradients for a frozen level.
@@ -362,6 +371,23 @@ mod tests {
             c.advance();
         }
         assert_eq!(l3_active_steps, vec![0, 512, 1024]);
+    }
+
+    #[test]
+    fn test_context_state_reset() {
+        let mut ctx = ContextState::new(2, 4);
+        // Write non-zero values
+        ctx.memory[0].fill(1.0);
+        ctx.memory[1].fill(2.0);
+        assert!(!ctx.memory[0].iter().all(|&v| v == 0.0));
+        // Reset
+        ctx.reset();
+        assert!(ctx.memory[0].iter().all(|&v| v == 0.0));
+        assert!(ctx.memory[1].iter().all(|&v| v == 0.0));
+        // Shape preserved
+        assert_eq!(ctx.memory.len(), 2);
+        assert_eq!(ctx.memory[0].len(), 16);
+        assert_eq!(ctx.d, 4);
     }
 
     #[test]

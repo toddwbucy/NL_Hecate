@@ -513,6 +513,11 @@ pub struct MAGConfig {
     /// to the assembled context. Default: 0 (backward compatible, 2-branch assemble).
     #[serde(default)]
     pub n_persistent: usize,
+    /// Which attentional bias (inner-loop loss) to use. Default: L2 (standard Delta rule).
+    /// L1 uses smooth tanh approximation. Lp(p) generalizes to arbitrary p-norms.
+    /// See specs/algorithms/attentional_biases/03_lp_dispatch.md.
+    #[serde(default)]
+    pub attentional_bias: AttentionalBias,
 }
 
 fn default_sign_sharpness() -> f32 { 10.0 }
@@ -587,6 +592,7 @@ impl MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: AttentionalBias::L2,
         }
     }
 
@@ -615,6 +621,7 @@ impl MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: AttentionalBias::L2,
         }
     }
 
@@ -643,6 +650,7 @@ impl MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: AttentionalBias::L2,
         }
     }
 
@@ -672,6 +680,7 @@ impl MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: AttentionalBias::L2,
         }
     }
 
@@ -701,6 +710,7 @@ impl MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: AttentionalBias::L2,
         }
     }
 
@@ -730,6 +740,7 @@ impl MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: AttentionalBias::L2,
         }
     }
 
@@ -758,6 +769,7 @@ impl MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: AttentionalBias::L2,
         }
     }
 
@@ -786,6 +798,7 @@ impl MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: AttentionalBias::L2,
         }
     }
 
@@ -814,6 +827,7 @@ impl MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: AttentionalBias::L2,
         }
     }
 
@@ -842,6 +856,7 @@ impl MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: AttentionalBias::L2,
         }
     }
 
@@ -880,6 +895,7 @@ impl MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: AttentionalBias::L2,
         }
     }
 
@@ -918,6 +934,7 @@ impl MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: AttentionalBias::L2,
         }
     }
 
@@ -956,6 +973,7 @@ impl MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: AttentionalBias::L2,
         }
     }
 
@@ -994,6 +1012,7 @@ impl MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: AttentionalBias::L2,
         }
     }
 
@@ -1032,6 +1051,7 @@ impl MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: AttentionalBias::L2,
         }
     }
 
@@ -1070,6 +1090,7 @@ impl MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: AttentionalBias::L2,
         }
     }
 
@@ -1099,6 +1120,7 @@ impl MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: AttentionalBias::L2,
         }
     }
 
@@ -1128,6 +1150,7 @@ impl MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: AttentionalBias::L2,
         }
     }
 
@@ -1160,6 +1183,7 @@ impl MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: AttentionalBias::L2,
         }
     }
 
@@ -1192,6 +1216,7 @@ impl MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: AttentionalBias::L2,
         }
     }
 
@@ -1220,6 +1245,7 @@ impl MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: AttentionalBias::L2,
         }
     }
 
@@ -1248,6 +1274,7 @@ impl MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: AttentionalBias::L2,
         }
     }
 
@@ -1276,6 +1303,7 @@ impl MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: AttentionalBias::L2,
         }
     }
 
@@ -1304,6 +1332,7 @@ impl MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: AttentionalBias::L2,
         }
     }
 
@@ -1333,6 +1362,7 @@ impl MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: AttentionalBias::L2,
         }
     }
 
@@ -1361,6 +1391,7 @@ impl MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: AttentionalBias::L2,
         }
     }
 
@@ -1390,6 +1421,7 @@ impl MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: AttentionalBias::L2,
         }
     }
 
@@ -1419,6 +1451,7 @@ impl MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: AttentionalBias::L2,
         }
     }
 }

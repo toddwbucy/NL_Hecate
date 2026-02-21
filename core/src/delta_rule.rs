@@ -24,6 +24,7 @@ use crate::tensor::{
 };
 use crate::retention::l2_apply_retention;
 use crate::model::MemoryLevelParams;
+use crate::moneta::{apply_attentional_bias, apply_attentional_bias_backward};
 use crate::tape::OpaqueVjp;
 
 // ── Memory rule trait ────────────────────────────────────────────────
@@ -125,8 +126,28 @@ pub trait MemoryRule: OpaqueVjp {
 
 /// Delta Rule: simplest NL memory — GD without momentum (Titans Eq 34).
 ///
-/// MIRAS knobs: matrix structure, L2 bias, L2 decay retention, GD algorithm.
-pub struct DeltaRule;
+/// MIRAS knobs: matrix structure, configurable l_p bias, L2 decay retention, GD algorithm.
+/// `bias` controls the inner-loop loss: L2 (default), L1, or Lp(p).
+/// `sign_sharpness` controls the tanh approximation steepness for non-L2 biases.
+pub struct DeltaRule {
+    pub bias: crate::model::AttentionalBias,
+    pub sign_sharpness: f32,
+}
+
+impl DeltaRule {
+    /// L2 bias (backward compatible default).
+    pub fn l2() -> Self {
+        DeltaRule { bias: crate::model::AttentionalBias::L2, sign_sharpness: 10.0 }
+    }
+    /// Construct from MAGConfig fields.
+    pub fn from_cfg(cfg: &crate::model::MAGConfig) -> Self {
+        DeltaRule { bias: cfg.attentional_bias, sign_sharpness: cfg.sign_sharpness }
+    }
+}
+
+impl Default for DeltaRule {
+    fn default() -> Self { Self::l2() }
+}
 
 /// All intermediate values from a Delta Rule forward pass, needed for backward.
 pub struct DeltaRuleCache {
@@ -178,14 +199,21 @@ impl MemoryRule for DeltaRule {
         let mut prediction = vec![0.0f32; d];
         matmul_f32(&state.m, k, &mut prediction, d, d, 1);
 
-        // error = prediction - v; grad = outer(error, k)
-        // M = (1-alpha) * M - theta * outer(error, k)
+        // error = prediction - v
+        let mut error = vec![0.0f32; d];
+        for i in 0..d {
+            error[i] = prediction[i] - v[i];
+        }
+
+        // Apply attentional bias (L2 = identity, L1/Lp = nonlinear)
+        let biased = apply_attentional_bias(&error, self.bias, self.sign_sharpness);
+
+        // M = (1-alpha) * M - theta * outer(biased_error, k)
         let lr = gates.theta;
         l2_apply_retention(&mut state.m, 1.0 - gates.alpha);
         for i in 0..d {
-            let err_i = prediction[i] - v[i];
             for j in 0..d {
-                state.m[i * d + j] -= lr * err_i * k[j];
+                state.m[i * d + j] -= lr * biased[i] * k[j];
             }
         }
         Ok(())
@@ -267,15 +295,18 @@ impl MemoryRule for DeltaRule {
             let mut prediction = vec![0.0f32; d];
             matmul_f32(m_t, k_t, &mut prediction, d, d, 1);
 
-            // error = prediction - v_t
+            // error = prediction - v_t (raw error, stored for backward VJP)
             let e_base = t * d;
             for i in 0..d {
                 error[e_base + i] = prediction[i] - v_t[i];
             }
 
-            // grad = outer(error, k_t)
+            // Apply attentional bias: L2 → identity, L1 → tanh(a*e), Lp → general
+            let biased = apply_attentional_bias(&error[e_base..e_base + d], self.bias, self.sign_sharpness);
+
+            // grad = outer(biased_error, k_t)
             let g_base = t * d * d;
-            outer_product_f32(&error[e_base..e_base + d], k_t, &mut grad_outer[g_base..g_base + d * d]);
+            outer_product_f32(&biased, k_t, &mut grad_outer[g_base..g_base + d * d]);
 
             // M_{t+1} = (1-alpha_t) * M_t - theta_t * grad
             let lr = theta[t];
@@ -376,22 +407,30 @@ impl MemoryRule for DeltaRule {
             let mut d_m_prev = d_m.clone();
             l2_apply_retention(&mut d_m_prev, 1.0 - alpha_t);
 
-            // ── grad = outer(error, k) backward ──
-            let mut d_err = vec![0.0f32; d];
+            // ── grad = outer(biased_error, k) backward ──
+            // Recompute biased error for d_k (not stored in cache)
+            let biased = apply_attentional_bias(err_t, self.bias, self.sign_sharpness);
+
+            // d_biased[i] = sum_j d_grad[i,j] * k[j]
+            let mut d_biased = vec![0.0f32; d];
             for i in 0..d {
                 let mut sum = 0.0f32;
                 for j in 0..d {
                     sum += d_grad[i * d + j] * k_t[j];
                 }
-                d_err[i] = sum;
+                d_biased[i] = sum;
             }
+            // d_k[j] += sum_i d_grad[i,j] * biased[i]
             for j in 0..d {
                 let mut sum = 0.0f32;
                 for i in 0..d {
-                    sum += d_grad[i * d + j] * err_t[i];
+                    sum += d_grad[i * d + j] * biased[i];
                 }
                 d_k_mem[t * d + j] += sum;
             }
+
+            // ── VJP through attentional bias: biased = f(error) ──
+            let d_err = apply_attentional_bias_backward(&d_biased, err_t, self.bias, self.sign_sharpness);
 
             // ── error = prediction - v backward ──
             for i in 0..d {
@@ -565,7 +604,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = DeltaRule;
+        let rule = DeltaRule::l2();
         let (y, _cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for (i, &v) in y.iter().enumerate() {
             assert!(v.is_finite(), "y[{i}] is not finite: {v}");
@@ -577,7 +616,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = DeltaRule;
+        let rule = DeltaRule::l2();
         let (_y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let d = cfg.swa.d_model;
         let s = cfg.swa.seq_len;
@@ -595,7 +634,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = DeltaRule;
+        let rule = DeltaRule::l2();
         let (_y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for t in 0..cfg.swa.seq_len {
             let a = cache.alpha[t];
@@ -610,7 +649,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = DeltaRule;
+        let rule = DeltaRule::l2();
         let (y1, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let (y2, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         assert_eq!(y1, y2, "Delta rule forward should be deterministic");
@@ -621,7 +660,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = DeltaRule;
+        let rule = DeltaRule::l2();
         let (y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
@@ -639,7 +678,7 @@ mod tests {
         let embedded = make_embedded(&cfg, 99);
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
-        let rule = DeltaRule;
+        let rule = DeltaRule::l2();
         let (_y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
 
         let d_y = vec![1.0f32; s * d];
@@ -667,7 +706,7 @@ mod tests {
         let embedded = make_embedded(&cfg, 99);
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
-        let rule = DeltaRule;
+        let rule = DeltaRule::l2();
         let (_y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
 
         let d_y = vec![1.0f32; s * d];
@@ -691,7 +730,7 @@ mod tests {
         let embedded = make_embedded(&cfg, 99);
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
-        let rule = DeltaRule;
+        let rule = DeltaRule::l2();
         let (_y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
 
         let d_y = vec![1.0f32; s * d];
@@ -711,7 +750,7 @@ mod tests {
 
     #[test]
     fn test_delta_init() {
-        let rule = DeltaRule;
+        let rule = DeltaRule::l2();
         let state = rule.init(8);
         assert_eq!(state.m.len(), 64);
         assert_eq!(state.d, 8);
@@ -720,7 +759,7 @@ mod tests {
 
     #[test]
     fn test_delta_write_read() {
-        let rule = DeltaRule;
+        let rule = DeltaRule::l2();
         let mut state = rule.init(4);
         let k = [1.0f32, 0.0, 0.0, 0.0];
         let v = [0.0f32, 1.0, 0.0, 0.0];
@@ -742,7 +781,7 @@ mod tests {
 
     #[test]
     fn test_delta_level_and_parallelization() {
-        let rule = DeltaRule;
+        let rule = DeltaRule::l2();
         assert_eq!(rule.level(), 0);
         let strategies = rule.supported_parallelization();
         assert!(strategies.contains(&"sequential"));
@@ -780,5 +819,98 @@ mod tests {
         for i in 0..(s * d) {
             assert!((y[i] - q_mem[i]).abs() < 1e-6, "y[{i}]={} != q_mem[{i}]={}", y[i], q_mem[i]);
         }
+    }
+
+    // ── Attentional bias dispatch tests ──────────────────────────────
+
+    #[test]
+    fn test_delta_l1_forward_finite() {
+        let cfg = test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let rule = DeltaRule { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0 };
+        let (y, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
+        for (i, &v) in y.iter().enumerate() {
+            assert!(v.is_finite(), "L1 y[{i}] not finite: {v}");
+        }
+    }
+
+    #[test]
+    fn test_delta_lp3_forward_finite() {
+        let cfg = test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let rule = DeltaRule { bias: crate::model::AttentionalBias::Lp(3.0), sign_sharpness: 10.0 };
+        let (y, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
+        for (i, &v) in y.iter().enumerate() {
+            assert!(v.is_finite(), "Lp(3) y[{i}] not finite: {v}");
+        }
+    }
+
+    #[test]
+    fn test_delta_l1_backward_finite() {
+        let cfg = test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let rule = DeltaRule { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0 };
+        let (y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
+        let d_y = vec![1.0f32; y.len()];
+        let (grads, d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
+        for (i, &v) in d_emb.iter().enumerate() {
+            assert!(v.is_finite(), "L1 d_emb[{i}] not finite: {v}");
+        }
+        for (i, &v) in grads.w_k_mem.iter().enumerate() {
+            assert!(v.is_finite(), "L1 d_w_k_mem[{i}] not finite: {v}");
+        }
+    }
+
+    #[test]
+    fn test_delta_l2_vs_lp2_different() {
+        // L2 returns identity (absorbed factor of 2), Lp(2.0) returns 2*error.
+        // They should produce different gradients.
+        let cfg = test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let (y_l2, _) = DeltaRule::l2().step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
+        let rule_lp2 = DeltaRule { bias: crate::model::AttentionalBias::Lp(2.0), sign_sharpness: 10.0 };
+        let (y_lp2, _) = rule_lp2.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
+        // Forward outputs should differ (biased grad → different M updates)
+        let max_diff: f32 = y_l2.iter().zip(y_lp2.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_diff > 1e-8, "L2 and Lp(2.0) should produce different results, max_diff={max_diff}");
+    }
+
+    #[test]
+    fn test_delta_bias_tape_roundtrip_l1() {
+        // Verify that L1 forward+backward through the tape matches direct step_backward.
+        use crate::opaque_adapters::{register_opaque_vjps, level_params_grads_to_flat};
+        let d = 4;
+        let seq_len = 3;
+        let mut rng = SimpleRng::new(42);
+        let params = crate::model::MemoryLevelParams::init(d, &mut rng, 3.0, -4.6, -1.0);
+        let mut embedded = vec![0.0f32; seq_len * d];
+        SimpleRng::new(99).fill_uniform(&mut embedded, 0.5);
+
+        let rule = DeltaRule { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0 };
+        let (_, cache) = rule.step(&params, &embedded, seq_len, d, None);
+        let d_y = vec![1.0f32; seq_len * d];
+        let (pg_direct, de_direct) = rule.step_backward(&params, &cache, &d_y, &embedded);
+
+        let registry = register_opaque_vjps();
+        crate::tape::with_tape(registry, |tape| {
+            let (_, y_id, emb_in, lp_in) = rule.record_on_tape(tape, &params, &embedded, seq_len, d, None);
+            tape.seed_grad(y_id, d_y.clone());
+            tape.backward(y_id);
+            let de_tape = tape.get_grad(emb_in).unwrap();
+            let dlp_tape = tape.get_grad(lp_in).unwrap();
+            for (i, (&t, &d)) in de_tape.iter().zip(de_direct.iter()).enumerate() {
+                assert!((t - d).abs() < 1e-5, "L1 tape d_emb[{i}]: tape={t} direct={d}");
+            }
+            let lp_direct = level_params_grads_to_flat(&pg_direct);
+            for (i, (&t, &d)) in dlp_tape.iter().zip(lp_direct.iter()).enumerate() {
+                assert!((t - d).abs() < 1e-5, "L1 tape d_lp[{i}]: tape={t} direct={d}");
+            }
+        });
     }
 }
