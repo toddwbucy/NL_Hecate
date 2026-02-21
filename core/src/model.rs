@@ -1442,6 +1442,7 @@ pub struct MAGParams {
     /// Learnable persistent tokens for MAC composition (Titans Eq 22).
     /// Shape: [n_persistent * d_model]. outer_loop_param — updated by AD.
     /// Empty when n_persistent == 0.
+    #[serde(default)]
     pub persistent_tokens: Vec<f32>,
 }
 
@@ -1541,6 +1542,9 @@ impl MAGParams {
         }
         for (a, &da) in self.alpha_refl.iter_mut().zip(grads.alpha_refl.iter()) {
             *a -= lr * da;
+        }
+        for (p, &dp) in self.persistent_tokens.iter_mut().zip(grads.persistent_tokens.iter()) {
+            *p -= lr * dp;
         }
     }
 

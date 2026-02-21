@@ -146,15 +146,23 @@ impl GpuMemoryLevelParams {
 pub struct GpuMAGParams {
     pub swa: GpuSWAParams,
     pub levels: Vec<GpuMemoryLevelParams>,
+    /// Persistent tokens on GPU. Empty (len=0) when n_persistent == 0.
+    pub persistent_tokens: GpuBuf<f32>,
 }
 
 #[cfg(feature = "cuda")]
 impl GpuMAGParams {
     /// Upload all parameters from host to GPU. Called once at model init.
     pub fn from_host(host: &MAGParams) -> Self {
+        let persistent_tokens = if host.persistent_tokens.is_empty() {
+            GpuBuf::zeros(1) // Avoid zero-length cudaMalloc
+        } else {
+            GpuBuf::from_host(&host.persistent_tokens)
+        };
         GpuMAGParams {
             swa: GpuSWAParams::from_host(&host.swa),
             levels: host.levels.iter().map(GpuMemoryLevelParams::from_host).collect(),
+            persistent_tokens,
         }
     }
 
@@ -162,12 +170,17 @@ impl GpuMAGParams {
     pub fn to_host(&self, cfg: &MAGConfig) -> MAGParams {
         let d = cfg.swa.d_model;
         let v = cfg.swa.vocab_size;
+        let n_pt = cfg.n_persistent * d;
+        let mut persistent_tokens = vec![0.0f32; n_pt];
+        if n_pt > 0 {
+            self.persistent_tokens.copy_to_host(&mut persistent_tokens);
+        }
         MAGParams {
             swa: self.swa.to_host(d, v),
             levels: self.levels.iter().map(|l| l.to_host(d)).collect(),
             alpha_mem: vec![0.0f32; cfg.k],
             alpha_refl: vec![0.0f32; cfg.k],
-            persistent_tokens: vec![0.0f32; cfg.n_persistent * cfg.swa.d_model],
+            persistent_tokens,
         }
     }
 }
