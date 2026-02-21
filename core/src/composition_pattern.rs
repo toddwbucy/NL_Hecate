@@ -151,13 +151,14 @@ pub fn validate_attention_compatibility(
     match composition {
         CompositionKind::MAC => {
             // MAC assembles [h_t | x] of length 2*seq_len, needs full causal.
-            if window_size < 2 * seq_len {
+            let required = seq_len
+                .checked_mul(2)
+                .ok_or_else(|| "seq_len too large for 2*seq_len window check".to_string())?;
+            if window_size < required {
                 return Err(format!(
                     "MAC requires window_size >= 2*seq_len for full causal attention \
                      over assembled context. Got window_size={}, seq_len={} (need >= {}).",
-                    window_size,
-                    seq_len,
-                    2 * seq_len
+                    window_size, seq_len, required
                 ));
             }
         }
