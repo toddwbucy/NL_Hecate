@@ -8,7 +8,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::types::PyDict;
 
 use nl_hecate_core::model::{SWAConfig as RustConfig, SWAParams as RustParams};
-use nl_hecate_core::model::{MAGConfig as RustMAGConfig, MAGParams as RustMAGParams, MemoryRuleKind, CompositionKind};
+use nl_hecate_core::model::{MAGConfig as RustMAGConfig, MAGParams as RustMAGParams, MemoryRuleKind, CompositionKind, AttentionalBias as RustAttentionalBias};
 use nl_hecate_core::retention::{RetentionKind, default_retention};
 use nl_hecate_core::m3::M3Config as RustM3Config;
 use nl_hecate_core::dynamic_freq::{FrequencySchedule, LearnedFreqConfig};
@@ -415,6 +415,7 @@ impl MAGConfig {
                 m3: m3_cfg,
                 frequency_schedule: freq_sched,
                 checkpoint_interval,
+                attentional_bias: RustAttentionalBias::L2,
             },
         })
     }
