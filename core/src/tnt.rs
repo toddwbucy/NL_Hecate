@@ -674,9 +674,12 @@ pub fn tnt_backward(
             );
             d_global_m = d_gm_old;
 
-            // Backward through shard summary → additional d_y for this shard
+            // Backward through shard summary → d_shard_y_from_global for this shard.
+            // Invariant: attn_summary_cache is only populated during forward when
+            // tnt_params was provided (see tnt_forward lines 422-431), so the
+            // expect on tnt_params below is guaranteed safe.
             let d_shard_y_from_global = if let Some(attn_cache) = &shard.attn_summary_cache {
-                // Attention-based summary backward: produces gradients for
+                // shard_summary_attention_backward: produces gradients for
                 // local_y, w_summary_q, and additional d_global_m
                 let global_m_at_shard = &cache.global_states[shard_idx];
                 let tp = tnt_params.expect("attn_summary_cache requires tnt_params");
