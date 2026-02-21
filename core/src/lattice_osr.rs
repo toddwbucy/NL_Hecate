@@ -31,7 +31,7 @@
 
 use crate::tensor::{
     matmul_f32, transpose_f32, sigmoid_f32, softmax_f32,
-    frobenius_dot_f32, vec_norm_f32, vec_normalize_f32,
+    frobenius_dot_f32, vec_norm_f32, vec_normalize_f32, init_slots,
 };
 use crate::retention::sphere_project_and_normalize_inplace;
 use crate::model::{MemoryLevelParams, LatticeVariant};
@@ -79,20 +79,6 @@ pub struct LatticeCache {
     pub read_weights: Vec<f32>,
     /// ||s_unnorm|| per slot per step: [seq_len, m]
     pub s_unnorm_norms: Vec<f32>,
-}
-
-/// Initialize m unit vectors on the sphere using deterministic hash.
-fn init_slots(m: usize, d: usize) -> Vec<f32> {
-    let mut s = vec![0.0f32; m * d];
-    for i in 0..m {
-        for j in 0..d {
-            let idx = (i * d + j) as u32;
-            let hash = idx.wrapping_mul(2654435761) as f32 / u32::MAX as f32;
-            s[i * d + j] = hash - 0.5;
-        }
-        vec_normalize_f32(&mut s[i * d..(i + 1) * d]);
-    }
-    s
 }
 
 impl MemoryRule for LatticeOSR {

@@ -16,7 +16,7 @@
 /// trade quality for parallelism.
 
 use crate::model::{MAGConfig, MemoryLevelParams, LatticeVariant};
-use crate::tensor::{matmul_f32, transpose_f32, sigmoid_f32, frobenius_dot_f32, softmax_f32, vec_normalize_f32};
+use crate::tensor::{matmul_f32, transpose_f32, sigmoid_f32, frobenius_dot_f32, softmax_f32, vec_normalize_f32, init_slots};
 use crate::chunkwise_gd::{chunkwise_gd_forward, chunkwise_gd_backward, ChunkwiseGDCache};
 
 /// Cache for Lattice GLA forward pass.
@@ -290,20 +290,6 @@ pub struct LinearizedGLACache {
     pub variant: LatticeVariant,
 }
 
-/// Initialize m unit vectors on the sphere (same as lattice_osr.rs init_slots).
-fn init_slots(m: usize, d: usize) -> Vec<f32> {
-    let mut s = vec![0.0f32; m * d];
-    for i in 0..m {
-        for j in 0..d {
-            let idx = (i * d + j) as u32;
-            let hash = idx.wrapping_mul(2654435761) as f32 / u32::MAX as f32;
-            s[i * d + j] = hash - 0.5;
-        }
-        vec_normalize_f32(&mut s[i * d..(i + 1) * d]);
-    }
-    s
-}
-
 /// Compute the variant-specific update input for slot i at token t.
 /// Returns the direction vector before scaling by alpha * gate.
 fn variant_input(
@@ -437,7 +423,7 @@ pub fn linearized_gla_forward(
             // cum_prod[C] = 1.0 (empty product)
             let mut cum_prod = vec![1.0f32; clen + 1];
             for t in (0..clen).rev() {
-                cum_prod[t] = cum_prod[t + 1] * chunk_decay[i * clen + t];
+                cum_prod[t] = (cum_prod[t + 1] * chunk_decay[i * clen + t]).max(1e-30);
             }
 
             // s_final = cum_prod[0] * s_boundary + sum_t cum_prod[t+1] * b[t]
@@ -506,7 +492,7 @@ pub fn linearized_gla_backward(
     cache: &LinearizedGLACache,
     d_y: &[f32],
     embedded: &[f32],
-    cfg: &MAGConfig,
+    _cfg: &MAGConfig,
 ) -> (MemoryLevelParams, Vec<f32>) {
     let s = cache.seq_len;
     let d = cache.d;
@@ -1044,8 +1030,9 @@ mod tests {
         // C=1 because boundary updates happen after each token.
         let max_diff: f32 = y_approx.iter().zip(y_lin.iter())
             .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
-        // Loose tolerance because the write paths differ slightly
-        assert!(max_diff < 0.5,
-            "C=1: linearized vs approximate max_diff={max_diff} (expect similar)");
+        // Write paths differ (linearized recurrence vs chunkwise GD) so outputs
+        // are not identical — this is a similarity check, not an exactness test.
+        assert!(max_diff < 0.2,
+            "C=1: linearized vs approximate max_diff={max_diff} (expect roughly similar)");
     }
 }

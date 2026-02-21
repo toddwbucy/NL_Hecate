@@ -259,6 +259,21 @@ pub fn vec_normalize_f32(a: &mut [f32]) {
     }
 }
 
+/// Initialize m unit vectors on the sphere using deterministic hash.
+/// Shared by LatticeOSR and linearized GLA for slot initialization.
+pub fn init_slots(m: usize, d: usize) -> Vec<f32> {
+    let mut s = vec![0.0f32; m * d];
+    for i in 0..m {
+        for j in 0..d {
+            let idx = (i * d + j) as u32;
+            let hash = idx.wrapping_mul(2654435761) as f32 / u32::MAX as f32;
+            s[i * d + j] = hash - 0.5;
+        }
+        vec_normalize_f32(&mut s[i * d..(i + 1) * d]);
+    }
+    s
+}
+
 /// Frobenius dot product: sum_ij A[i,j] * B[i,j].
 /// Both A and B are flat slices of the same length.
 pub fn frobenius_dot_f32(a: &[f32], b: &[f32]) -> f32 {
