@@ -1005,4 +1005,109 @@ mod tests {
         assert_eq!(grads1.swa.w_q, grads2.swa.w_q);
         assert_eq!(cache1.n_persistent, 0);
     }
+
+    // ── CMS MAL persistent token tests ──────────────────────────────
+
+    fn cms_persistent_config() -> MAGConfig {
+        let mut cfg = MAGConfig::mal_test_config_k2();
+        cfg.n_persistent = 2;
+        cfg.swa.window_size = cfg.swa.seq_len + cfg.n_persistent;
+        cfg
+    }
+
+    #[test]
+    fn test_cms_mal_persistent_forward_finite() {
+        let cfg = cms_persistent_config();
+        let params = MAGParams::init(&cfg, 42);
+        let (input_ids, target_ids) = make_test_data(&cfg);
+        let pulse = Pulse { global_step: 0, active_levels: vec![true; cfg.k] };
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+
+        let (loss, cache) = cms_mal_forward(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx);
+        assert!(loss.is_finite(), "CMS MAL+persistent loss not finite: {loss}");
+        assert!(loss > 0.0);
+        assert_eq!(cache.n_persistent, 2);
+        let s_total = cfg.n_persistent + cfg.swa.seq_len;
+        assert_eq!(cache.q.len(), s_total * cfg.swa.d_model);
+    }
+
+    #[test]
+    fn test_cms_mal_persistent_differs_from_no_persistent() {
+        let cfg_base = MAGConfig::mal_test_config_k2();
+        let cfg_pers = cms_persistent_config();
+        let params_base = MAGParams::init(&cfg_base, 42);
+        let params_pers = MAGParams::init(&cfg_pers, 42);
+        let (input_ids, target_ids) = make_test_data(&cfg_base);
+        let pulse = Pulse { global_step: 0, active_levels: vec![true; cfg_base.k] };
+
+        let mut ctx1 = ContextState::new(cfg_base.k, cfg_base.swa.d_model);
+        let mut ctx2 = ContextState::new(cfg_pers.k, cfg_pers.swa.d_model);
+
+        let (loss_base, _) = cms_mal_forward(&params_base, &cfg_base, &input_ids, &target_ids, &pulse, &mut ctx1);
+        let (loss_pers, _) = cms_mal_forward(&params_pers, &cfg_pers, &input_ids, &target_ids, &pulse, &mut ctx2);
+        assert!((loss_base - loss_pers).abs() > 1e-6,
+            "Persistent tokens should change CMS MAL output, base={loss_base} pers={loss_pers}");
+    }
+
+    #[test]
+    fn test_cms_mal_persistent_backward_finite() {
+        let cfg = cms_persistent_config();
+        let params = MAGParams::init(&cfg, 42);
+        let (input_ids, target_ids) = make_test_data(&cfg);
+        let pulse = Pulse { global_step: 0, active_levels: vec![true; cfg.k] };
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut err_bufs: Vec<ErrorBuffer> = (0..cfg.k)
+            .map(|_| ErrorBuffer::new(cfg.swa.d_model))
+            .collect();
+
+        let (_loss, cache) = cms_mal_forward(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx);
+        let grads = cms_mal_backward(&params, &cfg, &cache, &input_ids, &target_ids, &mut err_bufs);
+
+        for (name, g) in [
+            ("w_o", &grads.swa.w_o),
+            ("persistent_tokens", &grads.persistent_tokens),
+        ] {
+            for (i, &val) in g.iter().enumerate() {
+                assert!(val.is_finite(), "cms_mal persistent grad_{name}[{i}] not finite: {val}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_cms_mal_persistent_backward_has_gradient() {
+        let cfg = cms_persistent_config();
+        let params = MAGParams::init(&cfg, 42);
+        let (input_ids, target_ids) = make_test_data(&cfg);
+        let pulse = Pulse { global_step: 0, active_levels: vec![true; cfg.k] };
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut err_bufs: Vec<ErrorBuffer> = (0..cfg.k)
+            .map(|_| ErrorBuffer::new(cfg.swa.d_model))
+            .collect();
+
+        let (_loss, cache) = cms_mal_forward(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx);
+        let grads = cms_mal_backward(&params, &cfg, &cache, &input_ids, &target_ids, &mut err_bufs);
+
+        let max_abs = grads.persistent_tokens.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        assert!(max_abs > 1e-10,
+            "CMS MAL persistent_tokens should have nonzero gradient, max_abs={max_abs}");
+    }
+
+    #[test]
+    fn test_cms_mal_zero_persistent_matches_original() {
+        let cfg = MAGConfig::mal_test_config_k2(); // n_persistent=0
+        let params = MAGParams::init(&cfg, 42);
+        let (input_ids, target_ids) = make_test_data(&cfg);
+        let pulse = Pulse { global_step: 0, active_levels: vec![true; cfg.k] };
+
+        let mut ctx1 = ContextState::new(cfg.k, cfg.swa.d_model);
+        let mut ctx2 = ContextState::new(cfg.k, cfg.swa.d_model);
+
+        let (loss1, cache1) = cms_mal_forward(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx1);
+        let (loss2, cache2) = cms_mal_forward(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx2);
+
+        assert_eq!(loss1, loss2);
+        assert_eq!(cache1.n_persistent, 0);
+        assert_eq!(cache2.n_persistent, 0);
+        assert_eq!(cache1.q.len(), cfg.swa.seq_len * cfg.swa.d_model);
+    }
 }
