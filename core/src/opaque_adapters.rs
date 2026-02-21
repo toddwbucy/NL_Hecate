@@ -94,13 +94,12 @@ pub fn level_params_from_flat(flat: &[f32], d: usize, kernel_size: usize) -> Mem
         kernel_size
     } else if remaining > 0 {
         // Try freq = d+1 first, then check if leftover is valid conv
-        let (freq_guess, leftover) = if remaining >= d + 1 && (remaining == d + 1 || (remaining > d + 1 && (remaining - (d + 1)) % (2 * d) == 0)) {
-            (d + 1, remaining - (d + 1))
+        let leftover = if remaining >= d + 1 && (remaining == d + 1 || (remaining > d + 1 && (remaining - (d + 1)) % (2 * d) == 0)) {
+            remaining - (d + 1)
         } else {
-            (0, remaining)
+            remaining
         };
         if leftover > 0 && leftover % (2 * d) == 0 {
-            let _ = freq_guess; // freq_guess used below via offset tracking
             leftover / (2 * d) - 1
         } else {
             0
@@ -1106,6 +1105,33 @@ mod tests {
         assert_eq!(params.w_omega, reconstructed.w_omega);
         assert_eq!(params.w_freq, reconstructed.w_freq);
         assert_eq!(params.b_freq, reconstructed.b_freq);
+    }
+
+    #[test]
+    fn test_conv_auto_detect_roundtrip() {
+        use crate::tensor::SimpleRng;
+        let d = 8;
+        let kernel_size = 4;
+        let mut rng = SimpleRng::new(99);
+        let mut params = MemoryLevelParams::init(d, &mut rng, 3.0, -4.6, -1.0);
+        // Simulate conv fields (as init_conv would produce)
+        params.w_k_conv = vec![0.1; d * kernel_size];
+        params.b_k_conv = vec![0.0; d];
+        params.w_q_conv = vec![0.2; d * kernel_size];
+        params.b_q_conv = vec![0.0; d];
+
+        // Serialize with explicit kernel_size
+        let flat = level_params_grads_to_flat(&params);
+
+        // Reconstruct with kernel_size=0 (auto-detect)
+        let recon = level_params_from_flat(&flat, d, 0);
+        assert_eq!(recon.w_k_conv, params.w_k_conv);
+        assert_eq!(recon.b_k_conv, params.b_k_conv);
+        assert_eq!(recon.w_q_conv, params.w_q_conv);
+        assert_eq!(recon.b_q_conv, params.b_q_conv);
+        assert_eq!(recon.w_k_mem, params.w_k_mem);
+        assert_eq!(recon.w_freq, params.w_freq);
+        assert_eq!(recon.b_freq, params.b_freq);
     }
 
     #[test]

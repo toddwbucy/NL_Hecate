@@ -520,7 +520,7 @@ impl MAGParams {
     }
 
     /// Flatten all params into a single Vec<f32> for Python-side optimizers.
-    /// Order: SWA(embed,q,k,v,o,unembed) then per-level(k_mem,v_mem,q_mem,alpha,b_alpha,theta,b_theta,eta,b_eta,omega,freq,b_freq).
+    /// Order: SWA(embed,q,k,v,o,unembed) then per-level(k_mem,v_mem,q_mem,alpha,b_alpha,theta,b_theta,eta,b_eta,omega,freq,b_freq,conv).
     fn get_flat_weights(&self) -> Vec<f32> {
         let mut flat = Vec::with_capacity(self.inner.num_params());
         flat.extend_from_slice(&self.inner.swa.w_embed);
@@ -542,6 +542,10 @@ impl MAGParams {
             flat.extend_from_slice(&level.w_omega);
             flat.extend_from_slice(&level.w_freq);
             flat.extend_from_slice(&level.b_freq);
+            flat.extend_from_slice(&level.w_k_conv);
+            flat.extend_from_slice(&level.b_k_conv);
+            flat.extend_from_slice(&level.w_q_conv);
+            flat.extend_from_slice(&level.b_q_conv);
         }
         flat
     }
@@ -579,6 +583,10 @@ impl MAGParams {
             copy_slice!(level.w_omega);
             copy_slice!(level.w_freq);
             copy_slice!(level.b_freq);
+            copy_slice!(level.w_k_conv);
+            copy_slice!(level.b_k_conv);
+            copy_slice!(level.w_q_conv);
+            copy_slice!(level.b_q_conv);
         }
         Ok(())
     }
