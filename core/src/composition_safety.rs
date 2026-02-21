@@ -122,7 +122,7 @@ pub fn validate_composition(
 
     // ── Memory Algorithm × Parallelization ──────────────────────────
     if let Some(strategy) = parallel {
-        validate_parallel(rule, strategy, &mut errors);
+        validate_parallel(rule, retention, strategy, &mut errors);
     }
 
     if errors.is_empty() {
@@ -132,9 +132,10 @@ pub fn validate_composition(
     }
 }
 
-/// Validate memory rule × parallelization strategy.
+/// Validate memory rule × parallelization strategy (with retention context for cross-axis checks).
 fn validate_parallel(
     rule: MemoryRuleKind,
+    retention: RetentionKind,
     strategy: ParallelStrategy,
     errors: &mut Vec<CompositionError>,
 ) {
@@ -182,6 +183,20 @@ fn validate_parallel(
                          LatticeGLA requires M_{{t+1}} = decay * M_t + write_t (linear in M).",
                         rule_name(rule)
                     ),
+                });
+            }
+            // SphereNormalization is nonlinear (M/||M||) and breaks GLA linearization —
+            // EXCEPT for LatticeOSR where the projection is integral to the rule's design.
+            if matches!(retention, RetentionKind::SphereNormalization)
+                && !matches!(rule, MemoryRuleKind::LatticeOSR)
+            {
+                errors.push(CompositionError {
+                    axis_a: "SphereNormalization retention",
+                    axis_b: "LatticeGLA",
+                    reason: "SphereNormalization (M/||M||) is a nonlinear projection that \
+                             breaks the linear recurrence required by GLA. Only LatticeOSR \
+                             integrates sphere projection into its GLA-compatible update."
+                        .into(),
                 });
             }
         }
@@ -552,6 +567,28 @@ mod tests {
             .parallel(ParallelStrategy::LatticeGLA)
             .build();
         assert!(result.is_err(), "Moneta+LatticeGLA should be invalid");
+    }
+
+    #[test]
+    fn test_delta_sphere_gla_invalid() {
+        // Delta + SphereNormalization + LatticeGLA: sphere projection breaks linearization
+        let result = MemoryRuleBuilder::new(MemoryRuleKind::DeltaRule)
+            .retention(RetentionKind::SphereNormalization)
+            .composition(CompositionKind::MAG)
+            .parallel(ParallelStrategy::LatticeGLA)
+            .build();
+        assert!(result.is_err(), "Delta+Sphere+GLA should be invalid (nonlinear projection)");
+    }
+
+    #[test]
+    fn test_lattice_osr_sphere_gla_valid() {
+        // LatticeOSR + SphereNormalization + LatticeGLA: this IS the designed combo
+        let result = MemoryRuleBuilder::new(MemoryRuleKind::LatticeOSR)
+            .retention(RetentionKind::SphereNormalization)
+            .composition(CompositionKind::MAG)
+            .parallel(ParallelStrategy::LatticeGLA)
+            .build();
+        assert!(result.is_ok(), "LatticeOSR+Sphere+GLA is the canonical Lattice config");
     }
 
     // ── Builder defaults ────────────────────────────────────────────
