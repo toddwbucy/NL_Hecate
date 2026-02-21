@@ -283,6 +283,7 @@ pub fn ftrl_soft_threshold_backward(
     lambda: f32,
 ) -> Vec<f32> {
     debug_assert_eq!(d_w.len(), accum.len());
+    debug_assert!(lambda >= 0.0, "FTRL lambda must be non-negative, got {lambda}");
 
     d_w.iter()
         .zip(accum.iter())
@@ -304,6 +305,7 @@ pub fn ftrl_soft_threshold_backward_inplace(
 ) {
     debug_assert_eq!(d_w.len(), accum.len());
     debug_assert_eq!(d_w.len(), d_accum.len());
+    debug_assert!(lambda >= 0.0, "FTRL lambda must be non-negative, got {lambda}");
 
     for i in 0..d_w.len() {
         d_accum[i] = if accum[i].abs() > lambda { d_w[i] } else { 0.0 };
