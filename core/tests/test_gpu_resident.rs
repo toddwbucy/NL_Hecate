@@ -38,6 +38,7 @@ fn make_test_config(rule: MemoryRuleKind) -> MAGConfig {
         checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
     }
 }
 

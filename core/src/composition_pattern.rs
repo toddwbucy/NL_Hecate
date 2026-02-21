@@ -140,25 +140,35 @@ pub fn prepend_persistent_backward(
 
 /// Validate that a composition kind is compatible with the given window size.
 ///
-/// MAC requires full causal attention: window_size >= 2 * seq_len
-/// (so the assembled sequence including memory context is fully attended to).
+/// MAC requires full causal attention: window_size >= n_persistent + 2 * seq_len
+/// (so the assembled sequence [persistent | h_t | x] is fully attended to).
 /// MAG/MAL use sliding window and have no minimum beyond seq_len.
 pub fn validate_attention_compatibility(
     composition: CompositionKind,
     window_size: usize,
     seq_len: usize,
 ) -> Result<(), String> {
+    validate_attention_compatibility_with_persistent(composition, window_size, seq_len, 0)
+}
+
+/// Like `validate_attention_compatibility` but accounts for persistent tokens.
+pub fn validate_attention_compatibility_with_persistent(
+    composition: CompositionKind,
+    window_size: usize,
+    seq_len: usize,
+    n_persistent: usize,
+) -> Result<(), String> {
     match composition {
         CompositionKind::MAC => {
-            // MAC assembles [h_t | x] of length 2*seq_len, needs full causal.
-            let required = seq_len
+            // MAC assembles [persistent | h_t | x] of length n_p + 2*seq_len.
+            let required = n_persistent + seq_len
                 .checked_mul(2)
-                .ok_or_else(|| "seq_len too large for 2*seq_len window check".to_string())?;
+                .ok_or_else(|| "seq_len too large for window check".to_string())?;
             if window_size < required {
                 return Err(format!(
-                    "MAC requires window_size >= 2*seq_len for full causal attention \
-                     over assembled context. Got window_size={}, seq_len={} (need >= {}).",
-                    window_size, seq_len, required
+                    "MAC requires window_size >= n_persistent + 2*seq_len for full causal attention \
+                     over assembled context. Got window_size={}, n_persistent={}, seq_len={} (need >= {}).",
+                    window_size, n_persistent, seq_len, required
                 ));
             }
         }
@@ -294,7 +304,7 @@ mod tests {
     fn test_mac_insufficient_window() {
         let result = validate_attention_compatibility(CompositionKind::MAC, 16, 24);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("window_size >= 2*seq_len"));
+        assert!(result.unwrap_err().contains("n_persistent + 2*seq_len"));
     }
 
     #[test]

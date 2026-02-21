@@ -38,6 +38,7 @@ fn make_config(rule: MemoryRuleKind, checkpoint_interval: Option<usize>) -> MAGC
         checkpoint_interval,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
     }
 }
 

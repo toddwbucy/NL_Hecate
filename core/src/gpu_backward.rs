@@ -80,7 +80,7 @@ impl GpuMAGGrads {
 
         // TODO: GPU kernels don't yet compute alpha_mem/alpha_refl gradients.
         // These are small [k] vectors — GPU-side aggregation backward is a Stage 3 task.
-        crate::model::MAGParams { swa, levels, alpha_mem: vec![0.0f32; cfg.k], alpha_refl: vec![0.0f32; cfg.k] }
+        crate::model::MAGParams { swa, levels, alpha_mem: vec![0.0f32; cfg.k], alpha_refl: vec![0.0f32; cfg.k], persistent_tokens: vec![0.0f32; cfg.n_persistent * cfg.swa.d_model] }
     }
 }
 

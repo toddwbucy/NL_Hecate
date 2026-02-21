@@ -167,6 +167,7 @@ impl GpuMAGParams {
             levels: self.levels.iter().map(|l| l.to_host(d)).collect(),
             alpha_mem: vec![0.0f32; cfg.k],
             alpha_refl: vec![0.0f32; cfg.k],
+            persistent_tokens: vec![0.0f32; cfg.n_persistent * cfg.swa.d_model],
         }
     }
 }

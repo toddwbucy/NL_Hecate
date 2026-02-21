@@ -322,6 +322,9 @@ pub fn flatten_mag_params(params: &MAGParams) -> Vec<f32> {
     flat.extend_from_slice(&params.alpha_mem);
     flat.extend_from_slice(&params.alpha_refl);
 
+    // Persistent tokens
+    flat.extend_from_slice(&params.persistent_tokens);
+
     flat
 }
 
@@ -374,7 +377,9 @@ pub fn unflatten_to_mag_grads(flat: &[f32], template: &MAGParams) -> MAGParams {
     assert_eq!(offset, flat.len(),
         "unflatten consumed {} of {} elements", offset, flat.len());
 
-    MAGParams { swa, levels, alpha_mem, alpha_refl }
+    let persistent_tokens = take(flat, &mut offset, template.persistent_tokens.len());
+
+    MAGParams { swa, levels, alpha_mem, alpha_refl, persistent_tokens }
 }
 
 /// Total parameter count for a MAGParams instance.
