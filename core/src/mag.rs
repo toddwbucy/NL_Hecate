@@ -710,9 +710,10 @@ pub fn chained_level_outputs(
             q_mem_per_level.push(qm);
             frozen_memories.push(fm);
         } else {
-            // Frozen: read-only, but still uses current h as input
+            // Frozen: read-only, but still advances h so downstream levels
+            // see this level's read-only transform (preserving serial pipeline).
             let (y_level, mc, qm, fm) = run_level_memory(params, cfg, level, &h, s, d, false, context);
-            // Frozen level passes through: h remains unchanged for next level
+            h = y_level.clone();
             y_per_level.push(y_level);
             memory_caches.push(mc);
             q_mem_per_level.push(qm);
