@@ -90,6 +90,10 @@ pub fn level_params_from_flat(flat: &[f32], d: usize, kernel_size: usize) -> Mem
     // Determine actual kernel_size: if caller passed 0, infer from buffer.
     // Conv fields occupy 2*d*ks + 2*d = 2*d*(ks+1) elements.
     // Freq fields occupy 0 or d+1 elements.
+    // Note: auto-detection is unambiguous for d >= 2 (since d+1 is odd when d is even,
+    // it cannot equal 2*d*(ks+1) which is always even). For d=1, pass kernel_size explicitly.
+    assert!(kernel_size > 0 || remaining == 0 || d >= 2,
+        "auto-detect requires d >= 2; pass kernel_size explicitly for d=1");
     let effective_ks = if kernel_size > 0 {
         kernel_size
     } else if remaining > 0 {
