@@ -102,8 +102,8 @@ impl TNTParams {
 
     /// Accumulate gradients from another TNTParams.
     pub fn accumulate(&mut self, other: &TNTParams) {
-        debug_assert_eq!(self.w_qk.len(), other.w_qk.len(), "w_qk length mismatch in accumulate");
-        debug_assert_eq!(self.w_summary_q.len(), other.w_summary_q.len(), "w_summary_q length mismatch in accumulate");
+        assert_eq!(self.w_qk.len(), other.w_qk.len(), "w_qk length mismatch in accumulate");
+        assert_eq!(self.w_summary_q.len(), other.w_summary_q.len(), "w_summary_q length mismatch in accumulate");
         for (a, b) in self.w_qk.iter_mut().zip(other.w_qk.iter()) { *a += b; }
         for (a, b) in self.w_summary_q.iter_mut().zip(other.w_summary_q.iter()) { *a += b; }
     }
@@ -372,6 +372,16 @@ pub fn tnt_forward(
     let cl = tnt_cfg.local_chunk_size;
     assert!(cl <= cg, "local chunk size must be <= global chunk size");
     assert!(cl >= 1 && cg >= 1);
+    // Q-K projection (TNT Eqs 13-14) requires injecting projected queries into
+    // the inner memory retrieval loop. This needs chunkwise_gd_forward API changes
+    // to accept a query transform. The qk_project/qk_project_backward primitives
+    // are implemented and tested; integration is deferred until the chunkwise API
+    // supports query hooks.
+    assert!(
+        !tnt_cfg.use_qk_projection,
+        "use_qk_projection is not yet integrated into the chunkwise forward/backward pipeline. \
+         The qk_project primitives are implemented but require chunkwise API changes to wire in."
+    );
 
     let state_size = memory_state_size(cfg);
     let num_shards = (seq_len + cg - 1) / cg;
