@@ -3,7 +3,7 @@
 //! Categories: construction (~5), validation (~5), helpers (~5).
 
 use nl_hecate_core::cms_variants::{
-    CMSVariant, BlockConfig, MultiBlockConfig, validate,
+    DeploymentVariant, BlockConfig, MultiBlockConfig, validate,
 };
 use nl_hecate_core::model::{MAGConfig, CompositionKind, MemoryRuleKind};
 use nl_hecate_core::m3::M3Config;
@@ -14,7 +14,7 @@ use nl_hecate_core::m3::M3Config;
 fn test_basic_from_mag_config() {
     let mag_cfg = MAGConfig::test_config();
     let mbc = MultiBlockConfig::basic(&mag_cfg).unwrap();
-    assert_eq!(mbc.variant, CMSVariant::Basic);
+    assert_eq!(mbc.variant, DeploymentVariant::Basic);
     assert_eq!(mbc.blocks.len(), 1);
     assert!(mbc.blocks[0].cms_enabled);
     assert_eq!(mbc.blocks[0].k, 1);
@@ -30,7 +30,7 @@ fn test_sequential_k_nondecreasing() {
         BlockConfig::default_cms(4, MemoryRuleKind::DeltaRule, CompositionKind::MAG),
     ];
     let mbc = MultiBlockConfig::sequential(blocks, 64, 4, 32, 256).unwrap();
-    assert_eq!(mbc.variant, CMSVariant::Sequential);
+    assert_eq!(mbc.variant, DeploymentVariant::Sequential);
     assert_eq!(mbc.blocks.len(), 3);
 }
 
@@ -41,7 +41,7 @@ fn test_nested_requires_m3() {
     ];
     blocks[0].m3 = Some(M3Config::default_k2());
     let mbc = MultiBlockConfig::nested(blocks, 64, 4, 32, 256).unwrap();
-    assert_eq!(mbc.variant, CMSVariant::Nested);
+    assert_eq!(mbc.variant, DeploymentVariant::Nested);
 }
 
 #[test]
@@ -51,7 +51,7 @@ fn test_hybrid_requires_mix() {
         BlockConfig::default_cms(2, MemoryRuleKind::DeltaRule, CompositionKind::MAG),
     ];
     let mbc = MultiBlockConfig::hybrid(blocks, 64, 4, 32, 256).unwrap();
-    assert_eq!(mbc.variant, CMSVariant::Hybrid);
+    assert_eq!(mbc.variant, DeploymentVariant::Hybrid);
     assert_eq!(mbc.blocks.len(), 2);
 }
 
@@ -63,7 +63,7 @@ fn test_independent_any_config() {
         BlockConfig::default_cms(2, MemoryRuleKind::HebbianRule, CompositionKind::MAC),
     ];
     let mbc = MultiBlockConfig::independent(blocks, 64, 4, 32, 256).unwrap();
-    assert_eq!(mbc.variant, CMSVariant::Independent);
+    assert_eq!(mbc.variant, DeploymentVariant::Independent);
     assert_eq!(mbc.blocks.len(), 3);
 }
 
@@ -116,7 +116,7 @@ fn test_hybrid_rejects_all_noncms() {
 #[test]
 fn test_empty_blocks_rejected() {
     let cfg = MultiBlockConfig {
-        variant: CMSVariant::Basic,
+        variant: DeploymentVariant::Basic,
         blocks: vec![],
         d_model: 64,
         num_heads: 4,
@@ -159,11 +159,11 @@ fn test_total_params_estimate() {
 
 #[test]
 fn test_variant_display() {
-    assert_eq!(CMSVariant::Basic.to_string(), "Basic");
-    assert_eq!(CMSVariant::Nested.to_string(), "Nested");
-    assert_eq!(CMSVariant::Sequential.to_string(), "Sequential");
-    assert_eq!(CMSVariant::Independent.to_string(), "Independent");
-    assert_eq!(CMSVariant::Hybrid.to_string(), "Hybrid");
+    assert_eq!(DeploymentVariant::Basic.to_string(), "Basic");
+    assert_eq!(DeploymentVariant::Nested.to_string(), "Nested");
+    assert_eq!(DeploymentVariant::Sequential.to_string(), "Sequential");
+    assert_eq!(DeploymentVariant::Independent.to_string(), "Independent");
+    assert_eq!(DeploymentVariant::Hybrid.to_string(), "Hybrid");
 }
 
 #[test]
@@ -174,7 +174,7 @@ fn test_k1_degenerates_to_transformer() {
     assert_eq!(block.frequencies, vec![1]);
     // Should be valid as Basic
     let mbc = MultiBlockConfig {
-        variant: CMSVariant::Basic,
+        variant: DeploymentVariant::Basic,
         blocks: vec![block],
         d_model: 64,
         num_heads: 4,

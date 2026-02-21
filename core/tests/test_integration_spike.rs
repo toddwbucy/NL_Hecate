@@ -8,7 +8,7 @@
 //! A model that learned should achieve significantly lower loss AND correct predictions.
 
 use nl_hecate_core::model::{
-    MAGConfig, MAGParams, SWAConfig, CompositionKind, MemoryRuleKind,
+    MAGConfig, MAGParams, SWAConfig, CompositionKind, MemoryRuleKind, HopeVariant,
 };
 use nl_hecate_core::dynamic_freq::FrequencySchedule;
 use nl_hecate_core::conductor::{Conductor, ContextState, ErrorBuffer, Pulse};
@@ -63,6 +63,7 @@ fn spike_config_a() -> MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
     }
 }
 
@@ -90,6 +91,7 @@ fn spike_config_b() -> MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
     }
 }
 
@@ -117,6 +119,7 @@ fn spike_config_c() -> MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
     }
 }
 
@@ -707,6 +710,7 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
         m3: None,
         frequency_schedule: FrequencySchedule::Fixed,
         checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
     }
 }
 

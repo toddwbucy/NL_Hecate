@@ -67,6 +67,41 @@ impl Default for AttentionalBias {
     }
 }
 
+/// HOPE §6 level-level composition variants (Eqs 70-75).
+///
+/// Defines how CMS levels interact with EACH OTHER — orthogonal to
+/// memory-attention composition (MAC/MAG/MAL) which defines how memory
+/// interacts with attention WITHIN a single level.
+///
+/// Source: HOPE (2512.24695) §6 Eqs 70-75.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum HopeVariant {
+    /// Variant 1 (Eq 70): levels in series, output chains through all.
+    /// Level 0 processes first, each subsequent level sees transformed input.
+    Chained,
+    /// Variant 2 (Eq 71): each level updates at its own frequency, idle otherwise.
+    /// All levels independently process raw input, outputs aggregated.
+    /// This is the DEFAULT — what the Conductor + Pulse system implements.
+    FreqGated,
+    /// Variant 3 (Eq 72): higher level meta-learns initial state of lower.
+    /// Level s re-initializes level s+1 via linear projection of its memory state.
+    Nested,
+    /// Variant 4 (Eq 73): output of level s feeds level s+1, all initialized
+    /// from slowest level's meta-learned state.
+    Sequential,
+    /// Variant 5 (Eq 74): levels process input independently, outputs aggregated.
+    /// Identical to FreqGated in NL_Hecate (notational distinction in paper).
+    Independent,
+}
+
+impl Default for HopeVariant {
+    fn default() -> Self {
+        HopeVariant::FreqGated
+    }
+}
+
+fn default_hope_variant() -> HopeVariant { HopeVariant::FreqGated }
+
 /// Model configuration — immutable after construction.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SWAConfig {
@@ -437,6 +472,10 @@ pub struct MAGConfig {
     /// Some(C) = store M every C steps, recompute during backward.
     #[serde(default)]
     pub checkpoint_interval: Option<usize>,
+    /// HOPE §6 level-level composition variant. Determines how CMS levels
+    /// interact with each other. Default: FreqGated (Variant 2).
+    #[serde(default = "default_hope_variant")]
+    pub hope_variant: HopeVariant,
 }
 
 fn default_sign_sharpness() -> f32 { 10.0 }
@@ -508,6 +547,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
         }
     }
 
@@ -533,6 +573,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
         }
     }
 
@@ -558,6 +599,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
         }
     }
 
@@ -584,6 +626,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
         }
     }
 
@@ -610,6 +653,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
         }
     }
 
@@ -636,6 +680,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
         }
     }
 
@@ -661,6 +706,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
         }
     }
 
@@ -686,6 +732,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
         }
     }
 
@@ -711,6 +758,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
         }
     }
 
@@ -736,6 +784,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
         }
     }
 
@@ -771,6 +820,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
         }
     }
 
@@ -806,6 +856,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
         }
     }
 
@@ -841,6 +892,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
         }
     }
 
@@ -876,6 +928,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
         }
     }
 
@@ -911,6 +964,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
         }
     }
 
@@ -946,6 +1000,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
         }
     }
 
@@ -972,6 +1027,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
         }
     }
 
@@ -998,6 +1054,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
         }
     }
 
@@ -1027,6 +1084,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
         }
     }
 
@@ -1056,6 +1114,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
         }
     }
 
@@ -1081,6 +1140,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
         }
     }
 
@@ -1106,6 +1166,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
         }
     }
 
@@ -1131,6 +1192,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
         }
     }
 
@@ -1156,6 +1218,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
         }
     }
 
@@ -1182,6 +1245,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
         }
     }
 
@@ -1207,6 +1271,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
         }
     }
 
@@ -1233,6 +1298,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Learned(LearnedFreqConfig::default()),
             checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
         }
     }
 
@@ -1259,6 +1325,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Learned(LearnedFreqConfig::default()),
             checkpoint_interval: None,
+            hope_variant: HopeVariant::FreqGated,
         }
     }
 }

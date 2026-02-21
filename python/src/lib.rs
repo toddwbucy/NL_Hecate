@@ -13,7 +13,7 @@ use nl_hecate_core::retention::{RetentionKind, default_retention};
 use nl_hecate_core::m3::M3Config as RustM3Config;
 use nl_hecate_core::dynamic_freq::{FrequencySchedule, LearnedFreqConfig};
 use nl_hecate_core::cms_variants::{
-    CMSVariant as RustCMSVariant,
+    DeploymentVariant as RustDeploymentVariant,
     BlockConfig as RustBlockConfig,
     MultiBlockConfig as RustMultiBlockConfig,
 };
@@ -779,11 +779,11 @@ impl MultiBlockConfig {
     #[getter]
     fn variant(&self) -> &str {
         match self.inner.variant {
-            RustCMSVariant::Basic => "basic",
-            RustCMSVariant::Nested => "nested",
-            RustCMSVariant::Sequential => "sequential",
-            RustCMSVariant::Independent => "independent",
-            RustCMSVariant::Hybrid => "hybrid",
+            RustDeploymentVariant::Basic => "basic",
+            RustDeploymentVariant::Nested => "nested",
+            RustDeploymentVariant::Sequential => "sequential",
+            RustDeploymentVariant::Independent => "independent",
+            RustDeploymentVariant::Hybrid => "hybrid",
         }
     }
 
