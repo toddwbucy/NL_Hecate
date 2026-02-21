@@ -153,7 +153,7 @@ fn validate_parallel(
             );
             if !has_linear {
                 errors.push(CompositionError {
-                    axis_a: &rule_name(rule),
+                    axis_a: rule_name(rule),
                     axis_b: "AssociativeScan",
                     reason: format!(
                         "{} does not implement LinearRecurrence. \
@@ -175,7 +175,7 @@ fn validate_parallel(
             );
             if !supports_gla {
                 errors.push(CompositionError {
-                    axis_a: &rule_name(rule),
+                    axis_a: rule_name(rule),
                     axis_b: "LatticeGLA",
                     reason: format!(
                         "{} update cannot be linearized into GLA form. \
@@ -189,7 +189,7 @@ fn validate_parallel(
             // Requires state-independent momentum (Newton-Schulz / Omega rule).
             if !matches!(rule, MemoryRuleKind::AtlasOmega) {
                 errors.push(CompositionError {
-                    axis_a: &rule_name(rule),
+                    axis_a: rule_name(rule),
                     axis_b: "AtlasParallel",
                     reason: format!(
                         "{} does not implement StateIndependentMomentum. \
