@@ -435,6 +435,10 @@ pub fn flatten_mag_params(params: &MAGParams) -> Vec<f32> {
         flat.extend_from_slice(&level.w_omega);
         flat.extend_from_slice(&level.w_freq);
         flat.extend_from_slice(&level.b_freq);
+        flat.extend_from_slice(&level.w_k_conv);
+        flat.extend_from_slice(&level.b_k_conv);
+        flat.extend_from_slice(&level.w_q_conv);
+        flat.extend_from_slice(&level.b_q_conv);
     }
 
     // CMS aggregation weights
@@ -487,6 +491,10 @@ pub fn unflatten_to_mag_grads(flat: &[f32], template: &MAGParams) -> MAGParams {
             w_omega: take(flat, &mut offset, tl.w_omega.len()),
             w_freq: take(flat, &mut offset, tl.w_freq.len()),
             b_freq: take(flat, &mut offset, tl.b_freq.len()),
+            w_k_conv: take(flat, &mut offset, tl.w_k_conv.len()),
+            b_k_conv: take(flat, &mut offset, tl.b_k_conv.len()),
+            w_q_conv: take(flat, &mut offset, tl.w_q_conv.len()),
+            b_q_conv: take(flat, &mut offset, tl.b_q_conv.len()),
         });
     }
 

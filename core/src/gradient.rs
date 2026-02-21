@@ -337,7 +337,7 @@ pub fn tape_compute_gradients(
         let mut level_grads = Vec::with_capacity(cfg.k);
         for level in 0..cfg.k {
             let lp_grad_flat = tape.get_param_grad(param_ids.level_params[level]);
-            let mut lp_grad = level_params_from_flat(&lp_grad_flat, d);
+            let mut lp_grad = level_params_from_flat(&lp_grad_flat, d, cfg.kernel_size);
 
             // For frozen levels, the w_q_mem was registered as a separate param.
             // Merge its gradient into the level's w_q_mem field.

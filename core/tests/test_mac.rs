@@ -318,6 +318,7 @@ fn test_mac_vs_mag() {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: Default::default(),
+            kernel_size: 0,
     };
     let cfg_mac = MAGConfig {
         swa: swa_mac, memory_enabled: true,
@@ -334,6 +335,7 @@ fn test_mac_vs_mag() {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: Default::default(),
+            kernel_size: 0,
     };
 
     let seq_len = 8;

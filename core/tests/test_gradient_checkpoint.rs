@@ -40,6 +40,7 @@ fn make_config(rule: MemoryRuleKind, checkpoint_interval: Option<usize>) -> MAGC
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: Default::default(),
+            kernel_size: 0,
     }
 }
 

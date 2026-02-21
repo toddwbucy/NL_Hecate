@@ -436,6 +436,7 @@ impl MAGConfig {
                 lattice_variant: nl_hecate_core::model::LatticeVariant::Decode,
                 n_persistent: 0,
                 attentional_bias: bias_kind,
+                kernel_size: 0,
             },
         })
     }

@@ -871,7 +871,7 @@ mod tests {
         let mut state = rule.init(4);
         let k = [1.0f32, 0.0, 0.0, 0.0];
         let v = [0.0f32, 0.0, 0.0, 1.0];
-        let gates = Gates { alpha: 0.5, theta: 0.0 };
+        let gates = Gates { alpha: 0.5, theta: 0.0, eta: 1.0 };
 
         rule.write(&mut state, &k, &v, &gates).unwrap();
 
@@ -1169,7 +1169,7 @@ mod tests {
         let mut state = rule.init(4);
         let k = [1.0f32, 0.0, 0.0, 0.0];
         let v = [0.0f32, 0.0, 0.0, 1.0];
-        let gates = Gates { alpha: 0.5, theta: 0.0 };
+        let gates = Gates { alpha: 0.5, theta: 0.0, eta: 1.0 };
         rule.write(&mut state, &k, &v, &gates).unwrap();
         // Slots should still be unit norm
         for i in 0..2 {
@@ -1184,7 +1184,7 @@ mod tests {
         let mut state = rule.init(4);
         let k = [1.0f32, 0.0, 0.0, 0.0];
         let v = [0.0f32, 0.0, 0.0, 1.0];
-        let gates = Gates { alpha: 0.5, theta: 0.0 };
+        let gates = Gates { alpha: 0.5, theta: 0.0, eta: 1.0 };
         rule.write(&mut state, &k, &v, &gates).unwrap();
         for i in 0..2 {
             let norm = vec_norm_f32(&state.m[i * 4..(i + 1) * 4]);

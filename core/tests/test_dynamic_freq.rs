@@ -427,6 +427,7 @@ fn test_k1_learned_is_noop() {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: Default::default(),
+            kernel_size: 0,
     };
     let params = MAGParams::init(&cfg, 42);
     let d = cfg.swa.d_model;
@@ -551,6 +552,7 @@ fn test_anneal_uses_fixed_schedule() {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: Default::default(),
+            kernel_size: 0,
     };
 
     let params = MAGParams::init(&cfg, 42);

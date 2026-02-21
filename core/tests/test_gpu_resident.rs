@@ -40,6 +40,7 @@ fn make_test_config(rule: MemoryRuleKind) -> MAGConfig {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: Default::default(),
+            kernel_size: 0,
     }
 }
 

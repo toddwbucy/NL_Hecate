@@ -79,6 +79,12 @@ pub struct GpuMemoryLevelParams {
     pub w_freq: GpuBuf<f32>,
     pub b_freq: GpuBuf<f32>,
     pub has_freq: bool,
+    // Conv1D weights (empty when kernel_size=0 — use len=1 dummy)
+    pub w_k_conv: GpuBuf<f32>,
+    pub b_k_conv: GpuBuf<f32>,
+    pub w_q_conv: GpuBuf<f32>,
+    pub b_q_conv: GpuBuf<f32>,
+    pub has_conv: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -97,6 +103,12 @@ impl GpuMemoryLevelParams {
             GpuBuf::zeros(1)
         };
 
+        let has_conv = !host.w_k_conv.is_empty();
+        let w_k_conv = if has_conv { GpuBuf::from_host(&host.w_k_conv) } else { GpuBuf::zeros(1) };
+        let b_k_conv = if has_conv { GpuBuf::from_host(&host.b_k_conv) } else { GpuBuf::zeros(1) };
+        let w_q_conv = if has_conv { GpuBuf::from_host(&host.w_q_conv) } else { GpuBuf::zeros(1) };
+        let b_q_conv = if has_conv { GpuBuf::from_host(&host.b_q_conv) } else { GpuBuf::zeros(1) };
+
         GpuMemoryLevelParams {
             w_k_mem: GpuBuf::from_host(&host.w_k_mem),
             w_v_mem: GpuBuf::from_host(&host.w_v_mem),
@@ -111,6 +123,8 @@ impl GpuMemoryLevelParams {
             w_freq,
             b_freq,
             has_freq,
+            w_k_conv, b_k_conv, w_q_conv, b_q_conv,
+            has_conv,
         }
     }
 
@@ -131,6 +145,16 @@ impl GpuMemoryLevelParams {
             p.b_freq = vec![0.0f32; self.b_freq.len()];
             self.w_freq.copy_to_host(&mut p.w_freq);
             self.b_freq.copy_to_host(&mut p.b_freq);
+        }
+        if self.has_conv {
+            p.w_k_conv = vec![0.0f32; self.w_k_conv.len()];
+            p.b_k_conv = vec![0.0f32; self.b_k_conv.len()];
+            p.w_q_conv = vec![0.0f32; self.w_q_conv.len()];
+            p.b_q_conv = vec![0.0f32; self.b_q_conv.len()];
+            self.w_k_conv.copy_to_host(&mut p.w_k_conv);
+            self.b_k_conv.copy_to_host(&mut p.b_k_conv);
+            self.w_q_conv.copy_to_host(&mut p.w_q_conv);
+            self.b_q_conv.copy_to_host(&mut p.b_q_conv);
         }
         p
     }
