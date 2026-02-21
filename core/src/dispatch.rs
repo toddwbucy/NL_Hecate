@@ -710,6 +710,12 @@ fn cuda_backward(
 /// Takes pre-computed projections and gates (from Rust), runs the sequential
 /// M recurrence in either Rust or CUDA depending on feature gate.
 ///
+/// NOTE: This dispatch path uses L2 attentional bias only. Non-L2 biases
+/// (L1, Lp) are handled by the MemoryRule trait path (DeltaRule::step).
+/// The dispatch path is used for GPU-resident forward/backward and gradient
+/// checkpointing; extending it to support configurable l_p requires adding
+/// bias parameters through the entire dispatch chain including CUDA kernels.
+///
 /// Returns (m_states, y) where m_states is [(seq_len+1)*d*d] and y is [seq_len*d].
 pub fn delta_forward_dispatch(
     k_mem: &[f32],

@@ -66,6 +66,7 @@ fn spike_config_a() -> MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: Default::default(),
     }
 }
 
@@ -96,6 +97,7 @@ fn spike_config_b() -> MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: Default::default(),
     }
 }
 
@@ -126,6 +128,7 @@ fn spike_config_c() -> MAGConfig {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: Default::default(),
     }
 }
 
@@ -719,6 +722,7 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: Default::default(),
     }
 }
 

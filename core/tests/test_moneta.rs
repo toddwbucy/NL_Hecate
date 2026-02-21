@@ -209,6 +209,7 @@ fn test_moneta_vs_delta() {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: Default::default(),
     };
     let cfg_moneta = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
@@ -224,6 +225,7 @@ fn test_moneta_vs_delta() {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: Default::default(),
     };
 
     let input_ids: Vec<usize> = (0..swa.seq_len).map(|t| t % swa.vocab_size).collect();

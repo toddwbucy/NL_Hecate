@@ -25,12 +25,33 @@ use crate::tensor::{
 };
 use crate::retention::l2_apply_retention;
 use crate::model::MemoryLevelParams;
+use crate::moneta::{apply_attentional_bias, apply_attentional_bias_backward};
 use crate::delta_rule::{MemoryRule, MemoryState, Gates, MemoryError};
 
 // ── Titans LMM implementation ───────────────────────────────────────
 
 /// Titans LMM: GD + momentum memory rule (Titans Eqs 12-15, 32-33).
-pub struct TitansLMM;
+/// `bias` controls the inner-loop loss: L2 (default), L1, or Lp(p).
+/// `sign_sharpness` controls the tanh approximation steepness for non-L2 biases.
+pub struct TitansLMM {
+    pub bias: crate::model::AttentionalBias,
+    pub sign_sharpness: f32,
+}
+
+impl TitansLMM {
+    /// L2 bias (backward compatible default).
+    pub fn l2() -> Self {
+        TitansLMM { bias: crate::model::AttentionalBias::L2, sign_sharpness: 10.0 }
+    }
+    /// Construct from MAGConfig fields.
+    pub fn from_cfg(cfg: &crate::model::MAGConfig) -> Self {
+        TitansLMM { bias: cfg.attentional_bias, sign_sharpness: cfg.sign_sharpness }
+    }
+}
+
+impl Default for TitansLMM {
+    fn default() -> Self { Self::l2() }
+}
 
 /// All intermediate values from a Titans LMM forward pass, needed for backward.
 pub struct TitansLMMCache {
@@ -190,15 +211,18 @@ impl MemoryRule for TitansLMM {
             let mut prediction = vec![0.0f32; d];
             matmul_f32(m_t, k_t, &mut prediction, d, d, 1);
 
-            // error = prediction - v_t
+            // error = prediction - v_t (raw error, stored for backward VJP)
             let e_base = t * d;
             for i in 0..d {
                 error[e_base + i] = prediction[i] - v_t[i];
             }
 
-            // grad = outer(error, k_t)
+            // Apply attentional bias: L2 → identity, L1 → tanh(a*e), Lp → general
+            let biased = apply_attentional_bias(&error[e_base..e_base + d], self.bias, self.sign_sharpness);
+
+            // grad = outer(biased_error, k_t)
             let g_base = t * d * d;
-            outer_product_f32(&error[e_base..e_base + d], k_t, &mut grad_outer[g_base..g_base + d * d]);
+            outer_product_f32(&biased, k_t, &mut grad_outer[g_base..g_base + d * d]);
 
             // S_{t+1} = eta_t * S_t - theta_t * grad  (momentum update)
             let eta_t = eta[t];
@@ -320,22 +344,30 @@ impl MemoryRule for TitansLMM {
             let mut d_s_prev = d_s.clone();
             l2_apply_retention(&mut d_s_prev, eta_t);
 
-            // ── grad = outer(error, k) backward ──
-            let mut d_err = vec![0.0f32; d];
+            // ── grad = outer(biased_error, k) backward ──
+            // Recompute biased error for d_k (not stored in cache)
+            let biased = apply_attentional_bias(err_t, self.bias, self.sign_sharpness);
+
+            // d_biased[i] = sum_j d_grad[i,j] * k[j]
+            let mut d_biased = vec![0.0f32; d];
             for i in 0..d {
                 let mut sum = 0.0f32;
                 for j in 0..d {
                     sum += d_grad[i * d + j] * k_t[j];
                 }
-                d_err[i] = sum;
+                d_biased[i] = sum;
             }
+            // d_k[j] += sum_i d_grad[i,j] * biased[i]
             for j in 0..d {
                 let mut sum = 0.0f32;
                 for i in 0..d {
-                    sum += d_grad[i * d + j] * err_t[i];
+                    sum += d_grad[i * d + j] * biased[i];
                 }
                 d_k_mem[t * d + j] += sum;
             }
+
+            // ── VJP through attentional bias: biased = f(error) ──
+            let d_err = apply_attentional_bias_backward(&d_biased, err_t, self.bias, self.sign_sharpness);
 
             // ── error = prediction - v backward ──
             for i in 0..d {
@@ -451,7 +483,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = TitansLMM;
+        let rule = TitansLMM::l2();
         let (y, _cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for (i, &v) in y.iter().enumerate() {
             assert!(v.is_finite(), "y[{i}] is not finite: {v}");
@@ -463,7 +495,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = TitansLMM;
+        let rule = TitansLMM::l2();
         let (_y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let d = cfg.swa.d_model;
         let s = cfg.swa.seq_len;
@@ -481,7 +513,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = TitansLMM;
+        let rule = TitansLMM::l2();
         let (_y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let d = cfg.swa.d_model;
         let s = cfg.swa.seq_len;
@@ -502,7 +534,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = TitansLMM;
+        let rule = TitansLMM::l2();
         let (_y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for t in 0..cfg.swa.seq_len {
             let a = cache.alpha[t];
@@ -519,7 +551,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = TitansLMM;
+        let rule = TitansLMM::l2();
         let (y1, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let (y2, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         assert_eq!(y1, y2, "Titans LMM forward should be deterministic");
@@ -530,7 +562,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = TitansLMM;
+        let rule = TitansLMM::l2();
         let (y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
@@ -550,7 +582,7 @@ mod tests {
         let embedded = make_embedded(&cfg, 99);
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
-        let rule = TitansLMM;
+        let rule = TitansLMM::l2();
         let (_y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
 
         let d_y = vec![1.0f32; s * d];
@@ -579,7 +611,7 @@ mod tests {
         let embedded = make_embedded(&cfg, 99);
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
-        let rule = TitansLMM;
+        let rule = TitansLMM::l2();
         let (_y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
 
         let d_y = vec![1.0f32; s * d];
@@ -607,7 +639,7 @@ mod tests {
         let embedded = make_embedded(&cfg, 99);
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
-        let rule = TitansLMM;
+        let rule = TitansLMM::l2();
         let (_y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
 
         let d_y = vec![1.0f32; s * d];
@@ -658,7 +690,7 @@ mod tests {
 
     #[test]
     fn test_titans_level_and_parallelization() {
-        let rule = TitansLMM;
+        let rule = TitansLMM::l2();
         assert_eq!(rule.level(), 0);
         let strategies = rule.supported_parallelization();
         assert!(strategies.contains(&"sequential"));

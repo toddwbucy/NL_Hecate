@@ -195,6 +195,7 @@ fn test_mal_vs_mag() {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: Default::default(),
     };
     let cfg_mal = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
@@ -210,6 +211,7 @@ fn test_mal_vs_mag() {
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
+            attentional_bias: Default::default(),
     };
 
     let input_ids: Vec<usize> = (0..swa.seq_len).map(|t| t % swa.vocab_size).collect();

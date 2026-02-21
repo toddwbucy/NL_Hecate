@@ -121,6 +121,19 @@ fn read_meta_3(saved: &[f32]) -> (usize, usize, usize) {
     (saved[0] as usize, saved[1] as usize, saved[2] as usize)
 }
 
+/// Read metadata with attentional bias encoding: [seq_len, d, bias_f32, sign_sharpness].
+/// Used by DeltaRule and TitansLMM opaque backward adapters.
+fn read_meta_with_bias(saved: &[f32]) -> (usize, usize, crate::model::AttentionalBias, f32) {
+    let seq_len = saved[0] as usize;
+    let d = saved[1] as usize;
+    let (bias, sign_sharpness) = if saved.len() > 3 {
+        (crate::moneta::f32_to_bias(saved[2]), saved[3])
+    } else {
+        (crate::model::AttentionalBias::L2, 10.0)
+    };
+    (seq_len, d, bias, sign_sharpness)
+}
+
 // ── Active rule adapters ──────────────────────────────────────────────
 //
 // Saved buffer layout for matrix-memory rules (Delta, Titans, Hebbian, Atlas):
@@ -139,7 +152,7 @@ pub fn delta_rule_opaque_backward(
     saved: &[&[f32]],
     d_inputs: &mut [Vec<f32>],
 ) {
-    let (seq_len, d) = read_meta_2(saved[0]);
+    let (seq_len, d, bias, sign_sharpness) = read_meta_with_bias(saved[0]);
     let level_params = level_params_from_flat(saved[1], d);
     let embedded = saved[2];
     let d_y = d_outputs[0];
@@ -160,7 +173,7 @@ pub fn delta_rule_opaque_backward(
         y: saved[14].to_vec(),
     };
 
-    let rule = DeltaRule;
+    let rule = DeltaRule { bias, sign_sharpness };
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
     d_inputs[0] = d_embedded;
@@ -173,7 +186,7 @@ pub fn titans_lmm_opaque_backward(
     saved: &[&[f32]],
     d_inputs: &mut [Vec<f32>],
 ) {
-    let (seq_len, d) = read_meta_2(saved[0]);
+    let (seq_len, d, bias, sign_sharpness) = read_meta_with_bias(saved[0]);
     let level_params = level_params_from_flat(saved[1], d);
     let embedded = saved[2];
     let d_y = d_outputs[0];
@@ -197,7 +210,7 @@ pub fn titans_lmm_opaque_backward(
         y: saved[17].to_vec(),
     };
 
-    let rule = TitansLMM;
+    let rule = TitansLMM { bias, sign_sharpness };
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
     d_inputs[0] = d_embedded;
@@ -630,8 +643,9 @@ impl OpaqueVjp for DeltaRule {
         &self, tape: &mut Tape, level_params: &MemoryLevelParams,
         embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
     ) -> (Vec<f32>, BufId, BufId, BufId) {
+        let extra_meta = [crate::moneta::bias_to_f32(self.bias), self.sign_sharpness];
         let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
-            record_common_inputs(tape, level_params, embedded, seq_len, d, &[]);
+            record_common_inputs(tape, level_params, embedded, seq_len, d, &extra_meta);
 
         let (y, cache) = self.step(level_params, embedded, seq_len, d, initial_m);
 
@@ -667,8 +681,9 @@ impl OpaqueVjp for TitansLMM {
         &self, tape: &mut Tape, level_params: &MemoryLevelParams,
         embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
     ) -> (Vec<f32>, BufId, BufId, BufId) {
+        let extra_meta = [crate::moneta::bias_to_f32(self.bias), self.sign_sharpness];
         let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
-            record_common_inputs(tape, level_params, embedded, seq_len, d, &[]);
+            record_common_inputs(tape, level_params, embedded, seq_len, d, &extra_meta);
 
         let (y, cache) = self.step(level_params, embedded, seq_len, d, initial_m);
 
@@ -1173,12 +1188,12 @@ mod tests {
 
     #[test]
     fn test_opaque_vjp_delta_rule() {
-        assert_opaque_roundtrip(&DeltaRule, 4, 3);
+        assert_opaque_roundtrip(&DeltaRule::l2(), 4, 3);
     }
 
     #[test]
     fn test_opaque_vjp_titans_lmm() {
-        assert_opaque_roundtrip(&TitansLMM, 4, 3);
+        assert_opaque_roundtrip(&TitansLMM::l2(), 4, 3);
     }
 
     #[test]
@@ -1218,8 +1233,8 @@ mod tests {
 
     #[test]
     fn test_opaque_key_correct() {
-        assert_eq!(DeltaRule.opaque_key(), OpaqueKey::DeltaRule);
-        assert_eq!(TitansLMM.opaque_key(), OpaqueKey::TitansLMM);
+        assert_eq!(DeltaRule::l2().opaque_key(), OpaqueKey::DeltaRule);
+        assert_eq!(TitansLMM::l2().opaque_key(), OpaqueKey::TitansLMM);
         assert_eq!(HebbianRule.opaque_key(), OpaqueKey::HebbianRule);
         assert_eq!((Moneta { d_hidden: 8, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0 }).opaque_key(), OpaqueKey::Moneta);
         assert_eq!((YAAD { d_hidden: 8, delta: 0.9, lambda_local: 0.1, lambda_2: 0.01 }).opaque_key(), OpaqueKey::YAAD);
@@ -1311,9 +1326,9 @@ mod tests {
     }
 
     #[test]
-    fn test_class1_delta_rule() { assert_class1_isolation(&DeltaRule, 4, 3); }
+    fn test_class1_delta_rule() { assert_class1_isolation(&DeltaRule::l2(), 4, 3); }
     #[test]
-    fn test_class1_titans_lmm() { assert_class1_isolation(&TitansLMM, 4, 3); }
+    fn test_class1_titans_lmm() { assert_class1_isolation(&TitansLMM::l2(), 4, 3); }
     #[test]
     fn test_class1_hebbian() { assert_class1_isolation(&HebbianRule, 4, 3); }
     #[test]
