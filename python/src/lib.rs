@@ -432,6 +432,9 @@ impl MAGConfig {
                 m3: m3_cfg,
                 frequency_schedule: freq_sched,
                 checkpoint_interval,
+                hope_variant: nl_hecate_core::model::HopeVariant::FreqGated,
+                lattice_variant: nl_hecate_core::model::LatticeVariant::Decode,
+                n_persistent: 0,
                 attentional_bias: bias_kind,
             },
         })
@@ -603,6 +606,7 @@ impl MAGForwardCache {
     d_hidden=None, lp_p=None, sign_sharpness=None, lq_q=None, lambda_local=None, lambda_2=None,
     delta=None, m_slots=None, d_compress=None, lambda_k=None, lambda_v=None,
     retention=None, m3=None, frequency_schedule=None, checkpoint_interval=None,
+    attentional_bias=None,
 ))]
 fn mag_create_config(
     d_model: usize,
@@ -631,12 +635,13 @@ fn mag_create_config(
     m3: Option<&Bound<'_, PyDict>>,
     frequency_schedule: Option<&Bound<'_, PyAny>>,
     checkpoint_interval: Option<usize>,
+    attentional_bias: Option<&str>,
 ) -> PyResult<MAGConfig> {
     MAGConfig::new(
         d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled,
         k, chunk_sizes, memory_rule, composition,
         d_hidden, lp_p, sign_sharpness, lq_q, lambda_local, lambda_2, delta, m_slots, d_compress, lambda_k, lambda_v,
-        retention, m3, frequency_schedule, checkpoint_interval,
+        retention, m3, frequency_schedule, checkpoint_interval, attentional_bias,
     )
 }
 

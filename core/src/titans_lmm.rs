@@ -706,4 +706,47 @@ mod tests {
         assert!(strategies.contains(&"associative_scan_partial"));
         assert!(strategies.contains(&"tnt"));
     }
+
+    // ── Attentional bias dispatch tests ──────────────────────────────
+
+    #[test]
+    fn test_titans_l1_forward_finite() {
+        let cfg = test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let rule = TitansLMM { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0 };
+        let (y, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
+        for (i, &v) in y.iter().enumerate() {
+            assert!(v.is_finite(), "L1 y[{i}] not finite: {v}");
+        }
+    }
+
+    #[test]
+    fn test_titans_lp3_forward_finite() {
+        let cfg = test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let rule = TitansLMM { bias: crate::model::AttentionalBias::Lp(3.0), sign_sharpness: 10.0 };
+        let (y, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
+        for (i, &v) in y.iter().enumerate() {
+            assert!(v.is_finite(), "Lp(3) y[{i}] not finite: {v}");
+        }
+    }
+
+    #[test]
+    fn test_titans_l1_backward_finite() {
+        let cfg = test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let rule = TitansLMM { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0 };
+        let (y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
+        let d_y = vec![1.0f32; y.len()];
+        let (grads, d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
+        for (i, &v) in d_emb.iter().enumerate() {
+            assert!(v.is_finite(), "L1 d_emb[{i}] not finite: {v}");
+        }
+        for (i, &v) in grads.w_k_mem.iter().enumerate() {
+            assert!(v.is_finite(), "L1 d_w_k_mem[{i}] not finite: {v}");
+        }
+    }
 }
