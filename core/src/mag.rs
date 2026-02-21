@@ -115,7 +115,7 @@ pub fn mag_forward(
             (y, MemoryCache::Hebbian(cache))
         }
         MemoryRuleKind::Moneta => {
-            let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2 };
+            let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2, sign_sharpness: cfg.sign_sharpness };
             let (y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
             (y, MemoryCache::Moneta(cache))
         }
@@ -266,7 +266,7 @@ pub fn mag_backward(
             HebbianRule.step_backward(&params.levels[0], hebbian_cache, &d_y, &cache.embedded)
         }
         MemoryCache::Moneta(moneta_cache) => {
-            let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2 };
+            let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2, sign_sharpness: cfg.sign_sharpness };
             rule.step_backward(&params.levels[0], moneta_cache, &d_y, &cache.embedded)
         }
         MemoryCache::YAAD(yaad_cache) => {
@@ -477,7 +477,7 @@ pub fn cms_forward(
                     (y, MemoryCache::Hebbian(cache))
                 }
                 MemoryRuleKind::Moneta => {
-                    let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2 };
+                    let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2, sign_sharpness: cfg.sign_sharpness };
                     let (y, cache) = rule.step(&params.levels[level], &embedded, s, d, initial_m);
                     let dh = cfg.d_hidden;
                     let w1_size = dh * d;
@@ -751,7 +751,7 @@ pub fn cms_backward(
                     HebbianRule.step_backward(&params.levels[level], hebbian_cache, &d_y_combined, &cache.embedded)
                 }
                 MemoryCache::Moneta(moneta_cache) => {
-                    let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2 };
+                    let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2, sign_sharpness: cfg.sign_sharpness };
                     rule.step_backward(&params.levels[level], moneta_cache, &d_y_combined, &cache.embedded)
                 }
                 MemoryCache::YAAD(yaad_cache) => {

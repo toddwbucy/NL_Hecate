@@ -400,6 +400,7 @@ impl MAGConfig {
                 chunk_sizes,
                 d_hidden: d_hidden.unwrap_or(0),
                 lp_p: lp_p.unwrap_or(2.0),
+                sign_sharpness: 10.0,
                 lq_q: lq_q.unwrap_or(2.0),
                 lambda_local: lambda_local.unwrap_or(0.0),
                 lambda_2: lambda_2.unwrap_or(0.0),

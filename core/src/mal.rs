@@ -58,7 +58,7 @@ fn dispatch_memory_step(
             (y, MemoryCache::Hebbian(cache))
         }
         MemoryRuleKind::Moneta => {
-            let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2 };
+            let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2, sign_sharpness: cfg.sign_sharpness };
             let (y, cache) = rule.step(level_params, embedded, s, d, initial_m);
             (y, MemoryCache::Moneta(cache))
         }
@@ -102,7 +102,7 @@ fn dispatch_memory_backward(
         MemoryCache::Titans(c) => TitansLMM.step_backward(level_params, c, d_y, embedded),
         MemoryCache::Hebbian(c) => HebbianRule.step_backward(level_params, c, d_y, embedded),
         MemoryCache::Moneta(c) => {
-            let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2 };
+            let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2, sign_sharpness: cfg.sign_sharpness };
             rule.step_backward(level_params, c, d_y, embedded)
         }
         MemoryCache::YAAD(c) => {

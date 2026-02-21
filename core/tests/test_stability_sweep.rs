@@ -80,7 +80,7 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
         k,
         chunk_sizes,
         d_hidden,
-        lp_p: 2.0,
+        lp_p: 2.0, sign_sharpness: 10.0,
         lq_q: 2.0,
         lambda_local,
         lambda_2,

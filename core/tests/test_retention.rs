@@ -37,7 +37,7 @@ fn tiny_config(rule: MemoryRuleKind, retention: RetentionKind) -> MAGConfig {
         k: 1,
         chunk_sizes: vec![1],
         d_hidden: 4,
-        lp_p: 2.0,
+        lp_p: 2.0, sign_sharpness: 10.0,
         lq_q: 2.0,
         lambda_local: 0.01,
         lambda_2: 0.01,
