@@ -484,29 +484,44 @@ pub fn cms_forward(
         }
     };
 
-    // Combine: y_combined = sum of level outputs, with 1/sqrt(k) normalization for k>2.
+    // Combine level outputs into y_combined.
     //
-    // At k=2, additive composition works fine (signal doubles, sigmoid handles it).
-    // At k=4+, additive sum grows linearly with k, pushing sigmoid into saturation
-    // where gradients vanish. 1/sqrt(k) normalization keeps signal variance constant
-    // (analogous to attention's 1/sqrt(d) scaling) while preserving gradient magnitude.
+    // Chained/Sequential (Eqs 70, 73): levels process in series — the final level's
+    // output IS y_combined (RETURN h). No aggregation sum.
+    //
+    // FreqGated/Independent/Nested (Eqs 71, 72, 74): levels process independently —
+    // outputs are summed with 1/sqrt(k) normalization for k>2.
+    //
+    // Why 1/sqrt(k) for k>2: additive sum grows linearly with k, pushing sigmoid
+    // into saturation where gradients vanish. 1/sqrt(k) keeps signal variance
+    // constant (analogous to attention's 1/sqrt(d) scaling).
     //
     // Why not normalize k=2: the 1/sqrt(k) factor also scales the backward gradient
     // to all memory parameters, slowing outer-loop learning of gate biases (b_theta,
     // b_alpha). At k=2, this cost outweighs the benefit since the signal isn't large
     // enough to cause saturation.
-    let mut y_combined = vec![0.0f32; s * d];
-    for y_level in &y_per_level {
-        for i in 0..(s * d) {
-            y_combined[i] += y_level[i];
+    let y_combined = match cfg.hope_variant {
+        HopeVariant::Chained | HopeVariant::Sequential => {
+            // Serial pipeline: final level's output is the result (spec: RETURN h)
+            y_per_level.last().unwrap().clone()
         }
-    }
-    if cfg.k > 2 {
-        let scale = 1.0 / (cfg.k as f32).sqrt();
-        for i in 0..(s * d) {
-            y_combined[i] *= scale;
+        _ => {
+            // Parallel/independent: aggregate via sum + optional 1/sqrt(k) scaling
+            let mut combined = vec![0.0f32; s * d];
+            for y_level in &y_per_level {
+                for i in 0..(s * d) {
+                    combined[i] += y_level[i];
+                }
+            }
+            if cfg.k > 2 {
+                let scale = 1.0 / (cfg.k as f32).sqrt();
+                for i in 0..(s * d) {
+                    combined[i] *= scale;
+                }
+            }
+            combined
         }
-    }
+    };
 
     // Stage 4: Gating — gate = sigmoid(y_combined), gated_out = attn_out * gate
     let mut gate = vec![0.0f32; s * d];
@@ -912,21 +927,68 @@ pub fn cms_backward(
         d_y_combined[i] = d_gate[i] * cache.gate[i] * (1.0 - cache.gate[i]);
     }
 
-    // Chain rule for 1/sqrt(k) normalization: d_y_level = (1/sqrt(k)) * d_y_combined
-    // Scale d_y_combined once before distributing to per-level backward passes.
-    // Only applies for k>2 (matching forward normalization).
-    if cfg.k > 2 {
-        let scale = 1.0 / (cfg.k as f32).sqrt();
-        for i in 0..(s * d) {
-            d_y_combined[i] *= scale;
+    // Chain rule for aggregation backward.
+    //
+    // Chained/Sequential: y_combined = y_last, so d_y_combined flows only to the
+    // last level. Full chain-rule through the serial pipeline (d_y_k-1 → d_y_k-2
+    // → ...) is a Stage 3 backward extension — for now, only the last level gets
+    // gradients. Earlier levels in the chain still get frozen-path gradients via
+    // error buffers when applicable.
+    //
+    // FreqGated/Independent/Nested: y_combined = sum, so d_y_combined distributes
+    // to all levels equally (with 1/sqrt(k) scaling for k>2).
+    match cfg.hope_variant {
+        HopeVariant::Chained | HopeVariant::Sequential => {
+            // No scaling needed — d_y_combined goes only to last level (handled below)
+        }
+        _ => {
+            if cfg.k > 2 {
+                let scale = 1.0 / (cfg.k as f32).sqrt();
+                for i in 0..(s * d) {
+                    d_y_combined[i] *= scale;
+                }
+            }
         }
     }
 
     // ── Stage 3b: Per-level memory backward ──────────────────────────
-    // d_y_combined (now scaled by 1/sqrt(k) for k>2) distributes to each level
+    // For aggregated variants: d_y_combined distributes to each level.
+    // For Chained/Sequential: only the last level receives d_y_combined.
+    let chained_backward = matches!(cfg.hope_variant, HopeVariant::Chained | HopeVariant::Sequential);
     let mut d_embedded_mem_total = vec![0.0f32; s * d];
 
     for level in 0..cfg.k {
+        // Chained/Sequential: only last level gets gradient from y_combined
+        if chained_backward && level != cfg.k - 1 {
+            // Earlier levels in the serial chain: no direct gradient from y_combined.
+            // Their error buffers still accumulate frozen-path gradients when applicable.
+            if !cache.pulse.active_levels[level] {
+                let q_mem = cache.q_mem_per_level[level].as_ref().unwrap();
+                let frozen_m = cache.frozen_memories[level].as_ref().unwrap();
+                let (mem_grads, _d_embedded_mem) = match cfg.memory_rule {
+                    MemoryRuleKind::Moneta => moneta_read_only_backward(
+                        &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.d_hidden,
+                    ),
+                    MemoryRuleKind::YAAD => yaad_read_only_backward(
+                        &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.d_hidden,
+                    ),
+                    MemoryRuleKind::MEMORA => memora_read_only_backward(
+                        &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.d_hidden,
+                    ),
+                    MemoryRuleKind::LatticeOSR => lattice_read_only_backward(
+                        &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.m_slots,
+                    ),
+                    MemoryRuleKind::Trellis => trellis_read_only_backward(
+                        &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.d_compress,
+                    ),
+                    _ => delta_rule_read_only_backward(
+                        &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d,
+                    ),
+                };
+                error_buffers[level].accumulate(&mem_grads);
+            }
+            continue;
+        }
         if cache.pulse.active_levels[level] {
             // Active level: dispatch backward based on cache variant
             let mem_cache = cache.memory_caches[level].as_ref().unwrap();
