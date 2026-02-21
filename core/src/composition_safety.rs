@@ -166,7 +166,7 @@ fn validate_parallel(
         ParallelStrategy::LatticeGLA => {
             // Requires the update to be expressible as linear scan with decay matrix.
             // GD + L2 retention (linear in M), FTRL for certain regularizers,
-            // Lattice OSR, Trellis, OnlineMirrorDescent.
+            // Lattice OSR, Trellis.
             let supports_gla = matches!(
                 rule,
                 MemoryRuleKind::DeltaRule
