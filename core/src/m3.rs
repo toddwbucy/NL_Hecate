@@ -275,7 +275,10 @@ pub fn newton_schulz_5(s: &[f32], d: usize, iterations: usize) -> Vec<f32> {
 /// * `s` — input momentum/gradient matrix [d*d], row-major
 /// * `d` — matrix dimension (s must be d×d)
 /// * `iterations` — number of NS iterations (Atlas default: 5)
-/// * `zetas` — per-iteration step sizes. None = all 1.0. Must have length == iterations.
+/// * `zetas` — per-iteration step sizes, length must equal `iterations`.
+///   **Warning**: `None` defaults to all 1.0, which diverges for non-orthogonal
+///   inputs (the gradient term grows cubically in ||O||). Use `zeta ≈ 0.25` for
+///   stable convergence matching the classical NS polynomial coefficients (3/2, -1/2).
 ///
 /// Source: HOPE (2512.24695) §4.2 Eq 44; Atlas (2505.23735) §5 Eq 32
 pub fn newton_schulz_inner(
