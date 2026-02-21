@@ -130,7 +130,7 @@ pub fn mag_forward(
             (y, MemoryCache::MEMORA(cache))
         }
         MemoryRuleKind::LatticeOSR => {
-            let rule = LatticeOSR { m_slots: cfg.m_slots };
+            let rule = LatticeOSR { m_slots: cfg.m_slots, variant: cfg.lattice_variant };
             let (y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
             (y, MemoryCache::Lattice(cache))
         }
@@ -278,7 +278,7 @@ pub fn mag_backward(
             rule.step_backward(&params.levels[0], memora_cache, &d_y, &cache.embedded)
         }
         MemoryCache::Lattice(lattice_cache) => {
-            let rule = LatticeOSR { m_slots: cfg.m_slots };
+            let rule = LatticeOSR { m_slots: cfg.m_slots, variant: cfg.lattice_variant };
             rule.step_backward(&params.levels[0], lattice_cache, &d_y, &cache.embedded)
         }
         MemoryCache::Trellis(trellis_cache) => {
@@ -635,7 +635,7 @@ fn run_level_memory(
                 (y, MemoryCache::MEMORA(cache))
             }
             MemoryRuleKind::LatticeOSR => {
-                let rule = LatticeOSR { m_slots: cfg.m_slots };
+                let rule = LatticeOSR { m_slots: cfg.m_slots, variant: cfg.lattice_variant };
                 let (y, cache) = rule.step(&params.levels[level], input, s, d, initial_m);
                 let m = cfg.m_slots;
                 let s_final = &cache.s_states[s * m * d..(s + 1) * m * d];
@@ -1015,7 +1015,7 @@ pub fn cms_backward(
                     rule.step_backward(&params.levels[level], memora_cache, &d_y_combined, &cache.embedded)
                 }
                 MemoryCache::Lattice(lattice_cache) => {
-                    let rule = LatticeOSR { m_slots: cfg.m_slots };
+                    let rule = LatticeOSR { m_slots: cfg.m_slots, variant: cfg.lattice_variant };
                     rule.step_backward(&params.levels[level], lattice_cache, &d_y_combined, &cache.embedded)
                 }
                 MemoryCache::Trellis(trellis_cache) => {

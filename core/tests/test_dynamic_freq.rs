@@ -6,7 +6,7 @@
 ///   - Gradient tests verifying w_freq/b_freq receive non-zero updates
 ///   - Edge cases (k=1, all gates above/below threshold)
 
-use nl_hecate_core::model::{MAGConfig, MAGParams, HopeVariant};
+use nl_hecate_core::model::{MAGConfig, MAGParams, HopeVariant, LatticeVariant};
 use nl_hecate_core::conductor::{Pulse, ContextState, ErrorBuffer};
 use nl_hecate_core::mag::{cms_forward, cms_backward};
 use nl_hecate_core::dynamic_freq::{
@@ -424,6 +424,7 @@ fn test_k1_learned_is_noop() {
         frequency_schedule: FrequencySchedule::Learned(LearnedFreqConfig::default()),
         checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
     };
     let params = MAGParams::init(&cfg, 42);
     let d = cfg.swa.d_model;
@@ -545,6 +546,7 @@ fn test_anneal_uses_fixed_schedule() {
         }),
         checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
     };
 
     let params = MAGParams::init(&cfg, 42);

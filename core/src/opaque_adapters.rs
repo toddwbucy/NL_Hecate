@@ -368,6 +368,15 @@ pub fn lattice_osr_opaque_backward(
     d_inputs: &mut [Vec<f32>],
 ) {
     let (seq_len, d, m_slots) = read_meta_3(saved[0]);
+    let variant = if saved[0].len() > 3 {
+        match saved[0][3] as usize {
+            1 => crate::model::LatticeVariant::Encode,
+            2 => crate::model::LatticeVariant::Similarity,
+            _ => crate::model::LatticeVariant::Decode,
+        }
+    } else {
+        crate::model::LatticeVariant::Decode
+    };
     let level_params = level_params_from_flat(saved[1], d);
     let embedded = saved[2];
     let d_y = d_outputs[0];
@@ -375,6 +384,7 @@ pub fn lattice_osr_opaque_backward(
     let cache = LatticeCache {
         seq_len, d,
         m: m_slots,
+        variant,
         s_states: saved[3].to_vec(),
         k_mem: saved[4].to_vec(),
         v_mem: saved[5].to_vec(),
@@ -388,7 +398,7 @@ pub fn lattice_osr_opaque_backward(
         s_unnorm_norms: saved[13].to_vec(),
     };
 
-    let rule = LatticeOSR { m_slots };
+    let rule = LatticeOSR { m_slots, variant };
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
     d_inputs[0] = d_embedded;
@@ -852,7 +862,12 @@ impl OpaqueVjp for LatticeOSR {
         &self, tape: &mut Tape, level_params: &MemoryLevelParams,
         embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
     ) -> (Vec<f32>, BufId, BufId, BufId) {
-        let extra_meta = [self.m_slots as f32];
+        let variant_code = match self.variant {
+            crate::model::LatticeVariant::Decode => 0.0f32,
+            crate::model::LatticeVariant::Encode => 1.0f32,
+            crate::model::LatticeVariant::Similarity => 2.0f32,
+        };
+        let extra_meta = [self.m_slots as f32, variant_code];
         let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
             record_common_inputs(tape, level_params, embedded, seq_len, d, &extra_meta);
 
@@ -1188,7 +1203,7 @@ mod tests {
 
     #[test]
     fn test_opaque_vjp_lattice_osr() {
-        assert_opaque_roundtrip(&LatticeOSR { m_slots: 3 }, 4, 3);
+        assert_opaque_roundtrip(&LatticeOSR { m_slots: 3, variant: crate::model::LatticeVariant::Decode }, 4, 3);
     }
 
     #[test]
@@ -1209,7 +1224,7 @@ mod tests {
         assert_eq!((Moneta { d_hidden: 8, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0 }).opaque_key(), OpaqueKey::Moneta);
         assert_eq!((YAAD { d_hidden: 8, delta: 0.9, lambda_local: 0.1, lambda_2: 0.01 }).opaque_key(), OpaqueKey::YAAD);
         assert_eq!((MEMORA { d_hidden: 8 }).opaque_key(), OpaqueKey::MEMORA);
-        assert_eq!((LatticeOSR { m_slots: 3 }).opaque_key(), OpaqueKey::LatticeOSR);
+        assert_eq!((LatticeOSR { m_slots: 3, variant: crate::model::LatticeVariant::Decode }).opaque_key(), OpaqueKey::LatticeOSR);
         assert_eq!((Trellis { d_k: 3, lambda_k: 0.01, lambda_v: 0.01 }).opaque_key(), OpaqueKey::Trellis);
         assert_eq!(AtlasOmega.opaque_key(), OpaqueKey::AtlasOmega);
     }
@@ -1308,7 +1323,7 @@ mod tests {
     #[test]
     fn test_class1_memora() { assert_class1_isolation(&MEMORA { d_hidden: 8 }, 4, 3); }
     #[test]
-    fn test_class1_lattice_osr() { assert_class1_isolation(&LatticeOSR { m_slots: 3 }, 4, 3); }
+    fn test_class1_lattice_osr() { assert_class1_isolation(&LatticeOSR { m_slots: 3, variant: crate::model::LatticeVariant::Decode }, 4, 3); }
     #[test]
     fn test_class1_trellis() { assert_class1_isolation(&Trellis { d_k: 3, lambda_k: 0.01, lambda_v: 0.01 }, 4, 3); }
     #[test]

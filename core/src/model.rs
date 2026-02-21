@@ -102,6 +102,34 @@ impl Default for HopeVariant {
 
 fn default_hope_variant() -> HopeVariant { HopeVariant::FreqGated }
 
+/// Lattice OSR update variants (Lattice Eqs 5-8, 24-26).
+///
+/// Three ways to compute delta_s in the slot update:
+/// - Decode: delta_s = gate * v_t (store the value — default, Eqs 5-6)
+/// - Encode: delta_s = gate * k_t (store the key — Eqs 24-25)
+/// - Similarity: delta_s = gate * (v_t - dot(S[i], v_t) * S[i]) (pre-project — Eqs 7-8)
+///
+/// All share the same orthogonal_update + normalize step afterward.
+/// Source: Lattice (2504.05646) Section 3-4, unified under Eq 26.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum LatticeVariant {
+    /// Eqs 5-6: delta_s = gate_i * v_t. Store the value.
+    Decode,
+    /// Eqs 24-25: delta_s = gate_i * k_t. Store the key.
+    Encode,
+    /// Eqs 7-8: delta_s = gate_i * (v_t - dot(S[i], v_t) * S[i]).
+    /// Explicit orthogonal projection of v_t before the standard orthogonal_update.
+    Similarity,
+}
+
+impl Default for LatticeVariant {
+    fn default() -> Self {
+        LatticeVariant::Decode
+    }
+}
+
+fn default_lattice_variant() -> LatticeVariant { LatticeVariant::Decode }
+
 /// Model configuration — immutable after construction.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SWAConfig {
@@ -476,6 +504,10 @@ pub struct MAGConfig {
     /// interact with each other. Default: FreqGated (Variant 2).
     #[serde(default = "default_hope_variant")]
     pub hope_variant: HopeVariant,
+    /// Lattice OSR update variant. Only used when memory_rule == LatticeOSR.
+    /// Default: Decode (Eqs 5-6). See Lattice (2504.05646) Eqs 5-8, 24-26.
+    #[serde(default = "default_lattice_variant")]
+    pub lattice_variant: LatticeVariant,
 }
 
 fn default_sign_sharpness() -> f32 { 10.0 }
@@ -548,6 +580,7 @@ impl MAGConfig {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
         }
     }
 
@@ -574,6 +607,7 @@ impl MAGConfig {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
         }
     }
 
@@ -600,6 +634,7 @@ impl MAGConfig {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
         }
     }
 
@@ -627,6 +662,7 @@ impl MAGConfig {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
         }
     }
 
@@ -654,6 +690,7 @@ impl MAGConfig {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
         }
     }
 
@@ -681,6 +718,7 @@ impl MAGConfig {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
         }
     }
 
@@ -707,6 +745,7 @@ impl MAGConfig {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
         }
     }
 
@@ -733,6 +772,7 @@ impl MAGConfig {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
         }
     }
 
@@ -759,6 +799,7 @@ impl MAGConfig {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
         }
     }
 
@@ -785,6 +826,7 @@ impl MAGConfig {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
         }
     }
 
@@ -821,6 +863,7 @@ impl MAGConfig {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
         }
     }
 
@@ -857,6 +900,7 @@ impl MAGConfig {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
         }
     }
 
@@ -893,6 +937,7 @@ impl MAGConfig {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
         }
     }
 
@@ -929,6 +974,7 @@ impl MAGConfig {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
         }
     }
 
@@ -965,6 +1011,7 @@ impl MAGConfig {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
         }
     }
 
@@ -1001,6 +1048,7 @@ impl MAGConfig {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
         }
     }
 
@@ -1028,6 +1076,7 @@ impl MAGConfig {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
         }
     }
 
@@ -1055,6 +1104,7 @@ impl MAGConfig {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
         }
     }
 
@@ -1085,6 +1135,7 @@ impl MAGConfig {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
         }
     }
 
@@ -1115,6 +1166,7 @@ impl MAGConfig {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
         }
     }
 
@@ -1141,6 +1193,7 @@ impl MAGConfig {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
         }
     }
 
@@ -1167,6 +1220,7 @@ impl MAGConfig {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
         }
     }
 
@@ -1193,6 +1247,7 @@ impl MAGConfig {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
         }
     }
 
@@ -1219,6 +1274,7 @@ impl MAGConfig {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
         }
     }
 
@@ -1246,6 +1302,7 @@ impl MAGConfig {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
         }
     }
 
@@ -1272,6 +1329,7 @@ impl MAGConfig {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
         }
     }
 
@@ -1299,6 +1357,7 @@ impl MAGConfig {
             frequency_schedule: FrequencySchedule::Learned(LearnedFreqConfig::default()),
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
         }
     }
 
@@ -1326,6 +1385,7 @@ impl MAGConfig {
             frequency_schedule: FrequencySchedule::Learned(LearnedFreqConfig::default()),
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
         }
     }
 }

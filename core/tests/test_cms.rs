@@ -1,6 +1,6 @@
 //! CMS integration tests: multi-step training, error buffer health, falsification.
 
-use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind, CompositionKind, HopeVariant};
+use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind, CompositionKind, HopeVariant, LatticeVariant};
 use nl_hecate_core::dynamic_freq::FrequencySchedule;
 use nl_hecate_core::retention::RetentionKind;
 use nl_hecate_core::mag::{cms_forward, cms_backward};
@@ -212,6 +212,7 @@ fn test_k2_beats_k1() {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
 
         };
     // k=2 config
@@ -228,6 +229,7 @@ fn test_k2_beats_k1() {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
 
         };
 
@@ -409,6 +411,7 @@ fn test_k4_vs_k2_multiscale() {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
 
         };
     let cfg_k4 = MAGConfig {
@@ -424,6 +427,7 @@ fn test_k4_vs_k2_multiscale() {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
 
         };
 
@@ -516,6 +520,7 @@ fn test_k4_diagnostics() {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
 
         };
 
@@ -786,6 +791,7 @@ fn test_cms_stability_boundary() {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
 
         };
     let cfg_k2 = MAGConfig {
@@ -801,6 +807,7 @@ fn test_cms_stability_boundary() {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
 
         };
 
@@ -990,6 +997,7 @@ fn test_k4_normalization_magnitude() {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
 
         };
     let params_k4 = MAGParams::init(&cfg_k4, 42);
@@ -1058,6 +1066,7 @@ fn test_k4_uniform_init_stable() {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
 
         };
 
@@ -1112,6 +1121,7 @@ fn test_k4_normalized_stable() {
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
+            lattice_variant: LatticeVariant::Decode,
 
         };
 
