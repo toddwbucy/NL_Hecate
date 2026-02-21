@@ -213,6 +213,7 @@ fn test_k2_beats_k1() {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
 
         };
     // k=2 config
@@ -230,6 +231,7 @@ fn test_k2_beats_k1() {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
 
         };
 
@@ -412,6 +414,7 @@ fn test_k4_vs_k2_multiscale() {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
 
         };
     let cfg_k4 = MAGConfig {
@@ -428,6 +431,7 @@ fn test_k4_vs_k2_multiscale() {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
 
         };
 
@@ -521,6 +525,7 @@ fn test_k4_diagnostics() {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
 
         };
 
@@ -792,6 +797,7 @@ fn test_cms_stability_boundary() {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
 
         };
     let cfg_k2 = MAGConfig {
@@ -808,6 +814,7 @@ fn test_cms_stability_boundary() {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
 
         };
 
@@ -998,6 +1005,7 @@ fn test_k4_normalization_magnitude() {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
 
         };
     let params_k4 = MAGParams::init(&cfg_k4, 42);
@@ -1067,6 +1075,7 @@ fn test_k4_uniform_init_stable() {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
 
         };
 
@@ -1122,6 +1131,7 @@ fn test_k4_normalized_stable() {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
 
         };
 

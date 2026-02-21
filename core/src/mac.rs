@@ -70,15 +70,16 @@ pub struct MACForwardCache {
     pub h_t: Vec<f32>,            // (s, d) — read from current M
     pub q_mem_read: Vec<f32>,     // for read_only backward
     pub frozen_m_read: Vec<f32>,  // M used for read_only
-    // Assembled and attention
-    pub assembled: Vec<f32>,      // (2s, d) = concat(h_t, embedded)
-    pub q: Vec<f32>,              // (2s, d)
-    pub k: Vec<f32>,              // (2s, d)
-    pub v: Vec<f32>,              // (2s, d)
-    pub attn_out: Vec<f32>,       // (2s, d)
+    // Assembled and attention: (n_p + 2s, d) = concat(persistent, h_t, embedded)
+    pub assembled: Vec<f32>,
+    pub n_persistent: usize,      // N_p tokens prepended (0 = legacy 2-branch)
+    pub q: Vec<f32>,
+    pub k: Vec<f32>,
+    pub v: Vec<f32>,
+    pub attn_out: Vec<f32>,
     pub attn_weights: Vec<f32>,
     // y_t extraction and reflective memory
-    pub y_t: Vec<f32>,            // (s, d) — extracted from attn_out[s:]
+    pub y_t: Vec<f32>,            // (s, d) — extracted from attn_out[(n_p+s)*d:]
     pub memory_cache: MemoryCache,
     pub reflective_y: Vec<f32>,   // (s, d) — memory output from step(y_t)
     // Reflective gate
@@ -250,12 +251,13 @@ pub fn mac_forward(
     let nh = swa_cfg.num_heads;
     let hd = swa_cfg.head_dim;
     let ws = swa_cfg.window_size;
-    let s2 = 2 * s;
+    let n_p = cfg.n_persistent;
+    let s_total = n_p + 2 * s;  // persistent + h_t + embedded
 
     assert_eq!(d, nh * hd);
     assert!(input_ids.len() >= s);
     assert!(target_ids.len() >= s);
-    assert!(ws >= s2, "MAC requires window_size >= 2*seq_len for full causal attention on assembled input");
+    assert!(ws >= s_total, "MAC requires window_size >= n_persistent + 2*seq_len for full causal attention on assembled input");
 
     // Stage 1: Embedding lookup
     let mut embedded = vec![0.0f32; s * d];
@@ -269,10 +271,14 @@ pub fn mac_forward(
     let m_state = initial_memory_state(cfg, d);
     let (h_t, q_mem_read) = read_only_dispatch(cfg, &params.levels[0], &embedded, &m_state, s, d);
 
-    // Stage 3: Assemble — concat(h_t, embedded) → (2s, d)
-    let mut assembled = vec![0.0f32; s2 * d];
-    assembled[..s * d].copy_from_slice(&h_t);
-    assembled[s * d..].copy_from_slice(&embedded);
+    // Stage 3: Assemble — concat(persistent, h_t, embedded) → (n_p + 2s, d)
+    // Titans Eq 22: S_tilde = [persistent || h_t || x]
+    let mut assembled = vec![0.0f32; s_total * d];
+    if n_p > 0 {
+        assembled[..n_p * d].copy_from_slice(&params.persistent_tokens);
+    }
+    assembled[n_p * d..(n_p + s) * d].copy_from_slice(&h_t);
+    assembled[(n_p + s) * d..].copy_from_slice(&embedded);
 
     // Stage 4: QKV projections on assembled
     let mut w_q_t = vec![0.0f32; d * d];
@@ -282,20 +288,20 @@ pub fn mac_forward(
     transpose_f32(&params.swa.w_k, &mut w_k_t, d, d);
     transpose_f32(&params.swa.w_v, &mut w_v_t, d, d);
 
-    let mut q = vec![0.0f32; s2 * d];
-    let mut k = vec![0.0f32; s2 * d];
-    let mut vv = vec![0.0f32; s2 * d];
-    matmul_f32(&assembled, &w_q_t, &mut q, s2, d, d);
-    matmul_f32(&assembled, &w_k_t, &mut k, s2, d, d);
-    matmul_f32(&assembled, &w_v_t, &mut vv, s2, d, d);
+    let mut q = vec![0.0f32; s_total * d];
+    let mut k = vec![0.0f32; s_total * d];
+    let mut vv = vec![0.0f32; s_total * d];
+    matmul_f32(&assembled, &w_q_t, &mut q, s_total, d, d);
+    matmul_f32(&assembled, &w_k_t, &mut k, s_total, d, d);
+    matmul_f32(&assembled, &w_v_t, &mut vv, s_total, d, d);
 
-    // Stage 5: Full causal attention on assembled (ws >= 2s)
-    let mut attn_out = vec![0.0f32; s2 * d];
-    let mut attn_weights = vec![0.0f32; nh * s2 * ws];
-    crate::dispatch::swa_forward_dispatch(&q, &k, &vv, &mut attn_out, &mut attn_weights, s2, nh, hd, ws);
+    // Stage 5: Full causal attention on assembled (ws >= n_p + 2s)
+    let mut attn_out = vec![0.0f32; s_total * d];
+    let mut attn_weights = vec![0.0f32; nh * s_total * ws];
+    crate::dispatch::swa_forward_dispatch(&q, &k, &vv, &mut attn_out, &mut attn_weights, s_total, nh, hd, ws);
 
-    // Stage 6: Extract y_t = attn_out[s*d..] → (s, d)
-    let y_t = attn_out[s * d..].to_vec();
+    // Stage 6: Extract y_t = attn_out[(n_p+s)*d..] → (s, d) — segment portion only
+    let y_t = attn_out[(n_p + s) * d..].to_vec();
 
     // Stage 7: Memory step on y_t → reflective_y (updates M)
     let (reflective_y, memory_cache) = step_dispatch(
@@ -325,7 +331,7 @@ pub fn mac_forward(
 
     let cache = MACForwardCache {
         embedded, h_t, q_mem_read, frozen_m_read: m_state,
-        assembled, q, k, v: vv, attn_out, attn_weights,
+        assembled, n_persistent: n_p, q, k, v: vv, attn_out, attn_weights,
         y_t, memory_cache, reflective_y, reflective_gate, gated_out,
         projected, logits,
     };
@@ -348,7 +354,8 @@ pub fn mac_backward(
     let nh = swa_cfg.num_heads;
     let hd = swa_cfg.head_dim;
     let ws = swa_cfg.window_size;
-    let s2 = 2 * s;
+    let n_p = cache.n_persistent;
+    let s_total = n_p + 2 * s;
 
     let mut grads = MAGParams::zeros_like(cfg);
 
@@ -430,45 +437,46 @@ pub fn mac_backward(
         d_y_t[i] = d_y_t_gate[i] + d_y_t_mem[i];
     }
 
-    // ── Stage 6: Scatter d_y_t into d_attn_out at positions [s*d..] ─
-    let mut d_attn_out = vec![0.0f32; s2 * d];
-    d_attn_out[s * d..].copy_from_slice(&d_y_t);
+    // ── Stage 6: Scatter d_y_t into d_attn_out at positions [(n_p+s)*d..] ─
+    let mut d_attn_out = vec![0.0f32; s_total * d];
+    d_attn_out[(n_p + s) * d..].copy_from_slice(&d_y_t);
 
-    // ── Stage 5: SWA backward (ws=2s) ────────────────────────────────
-    let mut d_q = vec![0.0f32; s2 * d];
-    let mut d_k = vec![0.0f32; s2 * d];
-    let mut d_v = vec![0.0f32; s2 * d];
+    // ── Stage 5: SWA backward ────────────────────────────────────────
+    let mut d_q = vec![0.0f32; s_total * d];
+    let mut d_k = vec![0.0f32; s_total * d];
+    let mut d_v = vec![0.0f32; s_total * d];
 
     crate::dispatch::swa_backward_dispatch(
         &cache.q, &cache.k, &cache.v,
         &cache.attn_weights, &d_attn_out,
         &mut d_q, &mut d_k, &mut d_v,
-        s2, nh, hd, ws,
+        s_total, nh, hd, ws,
     );
 
     // ── Stage 4: QKV projection backward ─────────────────────────────
-    let mut d_assembled = vec![0.0f32; s2 * d];
+    let mut d_assembled = vec![0.0f32; s_total * d];
 
-    crate::tensor::matmul_acc_f32(&d_q, &params.swa.w_q, &mut d_assembled, s2, d, d);
-    crate::tensor::matmul_acc_f32(&d_k, &params.swa.w_k, &mut d_assembled, s2, d, d);
-    crate::tensor::matmul_acc_f32(&d_v, &params.swa.w_v, &mut d_assembled, s2, d, d);
+    crate::tensor::matmul_acc_f32(&d_q, &params.swa.w_q, &mut d_assembled, s_total, d, d);
+    crate::tensor::matmul_acc_f32(&d_k, &params.swa.w_k, &mut d_assembled, s_total, d, d);
+    crate::tensor::matmul_acc_f32(&d_v, &params.swa.w_v, &mut d_assembled, s_total, d, d);
 
     // Weight gradients: d_W = d_QKV^T @ assembled
-    let mut d_q_t = vec![0.0f32; d * s2];
-    transpose_f32(&d_q, &mut d_q_t, s2, d);
-    matmul_f32(&d_q_t, &cache.assembled, &mut grads.swa.w_q, d, s2, d);
+    let mut d_q_t = vec![0.0f32; d * s_total];
+    transpose_f32(&d_q, &mut d_q_t, s_total, d);
+    matmul_f32(&d_q_t, &cache.assembled, &mut grads.swa.w_q, d, s_total, d);
 
-    let mut d_k_t = vec![0.0f32; d * s2];
-    transpose_f32(&d_k, &mut d_k_t, s2, d);
-    matmul_f32(&d_k_t, &cache.assembled, &mut grads.swa.w_k, d, s2, d);
+    let mut d_k_t = vec![0.0f32; d * s_total];
+    transpose_f32(&d_k, &mut d_k_t, s_total, d);
+    matmul_f32(&d_k_t, &cache.assembled, &mut grads.swa.w_k, d, s_total, d);
 
-    let mut d_v_t = vec![0.0f32; d * s2];
-    transpose_f32(&d_v, &mut d_v_t, s2, d);
-    matmul_f32(&d_v_t, &cache.assembled, &mut grads.swa.w_v, d, s2, d);
+    let mut d_v_t = vec![0.0f32; d * s_total];
+    transpose_f32(&d_v, &mut d_v_t, s_total, d);
+    matmul_f32(&d_v_t, &cache.assembled, &mut grads.swa.w_v, d, s_total, d);
 
-    // ── Stage 3: Split d_assembled → d_h_t + d_embedded_attn ─────────
-    let d_h_t = &d_assembled[..s * d];
-    let d_embedded_attn = &d_assembled[s * d..];
+    // ── Stage 3: Split d_assembled → d_persistent + d_h_t + d_embedded_attn
+    let d_persistent = &d_assembled[..n_p * d];
+    let d_h_t = &d_assembled[n_p * d..(n_p + s) * d];
+    let d_embedded_attn = &d_assembled[(n_p + s) * d..];
 
     // ── Stage 2: Read-only backward → d_embedded_read + mem_grads_read
     let (mem_grads_read, d_embedded_read) = read_only_backward_dispatch(
@@ -494,6 +502,11 @@ pub fn mac_backward(
         }
     }
 
+    // Persistent token gradients (outer_loop_param)
+    if n_p > 0 {
+        grads.persistent_tokens[..n_p * d].copy_from_slice(d_persistent);
+    }
+
     grads
 }
 
@@ -506,8 +519,9 @@ pub struct CMSMACForwardCache {
     pub read_caches: Vec<ReadOnlyCacheLevel>,
     pub h_t_per_level: Vec<Vec<f32>>,
     pub h_t_combined: Vec<f32>,
-    // Assembled and attention
+    // Assembled and attention: (n_p + 2s, d) = concat(persistent, h_t, embedded)
     pub assembled: Vec<f32>,
+    pub n_persistent: usize,
     pub q: Vec<f32>,
     pub k: Vec<f32>,
     pub v: Vec<f32>,
@@ -558,12 +572,13 @@ pub fn cms_mac_forward(
     let nh = swa_cfg.num_heads;
     let hd = swa_cfg.head_dim;
     let ws = swa_cfg.window_size;
-    let s2 = 2 * s;
+    let n_p = cfg.n_persistent;
+    let s_total = n_p + 2 * s;
 
     assert_eq!(d, nh * hd);
     assert!(input_ids.len() >= s);
     assert!(target_ids.len() >= s);
-    assert!(ws >= s2, "CMS MAC requires window_size >= 2*seq_len");
+    assert!(ws >= s_total, "CMS MAC requires window_size >= n_persistent + 2*seq_len");
     assert_eq!(pulse.active_levels.len(), cfg.k);
     assert_eq!(context.memory.len(), cfg.k);
 
@@ -600,10 +615,13 @@ pub fn cms_mac_forward(
         }
     }
 
-    // Stage 3: Assemble
-    let mut assembled = vec![0.0f32; s2 * d];
-    assembled[..s * d].copy_from_slice(&h_t_combined);
-    assembled[s * d..].copy_from_slice(&embedded);
+    // Stage 3: Assemble — concat(persistent, h_t, embedded) → (n_p + 2s, d)
+    let mut assembled = vec![0.0f32; s_total * d];
+    if n_p > 0 {
+        assembled[..n_p * d].copy_from_slice(&params.persistent_tokens);
+    }
+    assembled[n_p * d..(n_p + s) * d].copy_from_slice(&h_t_combined);
+    assembled[(n_p + s) * d..].copy_from_slice(&embedded);
 
     // Stage 4: QKV projections on assembled
     let mut w_q_t = vec![0.0f32; d * d];
@@ -613,20 +631,20 @@ pub fn cms_mac_forward(
     transpose_f32(&params.swa.w_k, &mut w_k_t, d, d);
     transpose_f32(&params.swa.w_v, &mut w_v_t, d, d);
 
-    let mut q = vec![0.0f32; s2 * d];
-    let mut k = vec![0.0f32; s2 * d];
-    let mut vv = vec![0.0f32; s2 * d];
-    matmul_f32(&assembled, &w_q_t, &mut q, s2, d, d);
-    matmul_f32(&assembled, &w_k_t, &mut k, s2, d, d);
-    matmul_f32(&assembled, &w_v_t, &mut vv, s2, d, d);
+    let mut q = vec![0.0f32; s_total * d];
+    let mut k = vec![0.0f32; s_total * d];
+    let mut vv = vec![0.0f32; s_total * d];
+    matmul_f32(&assembled, &w_q_t, &mut q, s_total, d, d);
+    matmul_f32(&assembled, &w_k_t, &mut k, s_total, d, d);
+    matmul_f32(&assembled, &w_v_t, &mut vv, s_total, d, d);
 
     // Stage 5: Full causal attention
-    let mut attn_out = vec![0.0f32; s2 * d];
-    let mut attn_weights = vec![0.0f32; nh * s2 * ws];
-    crate::dispatch::swa_forward_dispatch(&q, &k, &vv, &mut attn_out, &mut attn_weights, s2, nh, hd, ws);
+    let mut attn_out = vec![0.0f32; s_total * d];
+    let mut attn_weights = vec![0.0f32; nh * s_total * ws];
+    crate::dispatch::swa_forward_dispatch(&q, &k, &vv, &mut attn_out, &mut attn_weights, s_total, nh, hd, ws);
 
-    // Stage 6: Extract y_t
-    let y_t = attn_out[s * d..].to_vec();
+    // Stage 6: Extract y_t = attn_out[(n_p+s)*d..] → (s, d) — segment portion
+    let y_t = attn_out[(n_p + s) * d..].to_vec();
 
     // Stage 7: Per-level reflective memory step (active only)
     let mut step_caches: Vec<Option<MemoryCache>> = Vec::with_capacity(cfg.k);
@@ -683,7 +701,7 @@ pub fn cms_mac_forward(
 
     let cache = CMSMACForwardCache {
         embedded, read_caches, h_t_per_level, h_t_combined,
-        assembled, q, k, v: vv, attn_out, attn_weights, y_t,
+        assembled, n_persistent: n_p, q, k, v: vv, attn_out, attn_weights, y_t,
         step_caches, reflective_per_level, reflective_y_combined,
         reflective_gate, gated_out,
         projected, logits,
@@ -709,7 +727,8 @@ pub fn cms_mac_backward(
     let nh = swa_cfg.num_heads;
     let hd = swa_cfg.head_dim;
     let ws = swa_cfg.window_size;
-    let s2 = 2 * s;
+    let n_p = cache.n_persistent;
+    let s_total = n_p + 2 * s;
 
     let mut grads = MAGParams::zeros_like(cfg);
 
@@ -819,43 +838,44 @@ pub fn cms_mac_backward(
     }
 
     // ── Stage 6: Scatter d_y_t into d_attn_out ──────────────────────
-    let mut d_attn_out = vec![0.0f32; s2 * d];
-    d_attn_out[s * d..].copy_from_slice(&d_y_t);
+    let mut d_attn_out = vec![0.0f32; s_total * d];
+    d_attn_out[(n_p + s) * d..].copy_from_slice(&d_y_t);
 
     // ── Stage 5: SWA backward ────────────────────────────────────────
-    let mut d_q = vec![0.0f32; s2 * d];
-    let mut d_k = vec![0.0f32; s2 * d];
-    let mut d_v = vec![0.0f32; s2 * d];
+    let mut d_q = vec![0.0f32; s_total * d];
+    let mut d_k = vec![0.0f32; s_total * d];
+    let mut d_v = vec![0.0f32; s_total * d];
 
     crate::dispatch::swa_backward_dispatch(
         &cache.q, &cache.k, &cache.v,
         &cache.attn_weights, &d_attn_out,
         &mut d_q, &mut d_k, &mut d_v,
-        s2, nh, hd, ws,
+        s_total, nh, hd, ws,
     );
 
     // ── Stage 4: QKV projection backward ─────────────────────────────
-    let mut d_assembled = vec![0.0f32; s2 * d];
+    let mut d_assembled = vec![0.0f32; s_total * d];
 
-    crate::tensor::matmul_acc_f32(&d_q, &params.swa.w_q, &mut d_assembled, s2, d, d);
-    crate::tensor::matmul_acc_f32(&d_k, &params.swa.w_k, &mut d_assembled, s2, d, d);
-    crate::tensor::matmul_acc_f32(&d_v, &params.swa.w_v, &mut d_assembled, s2, d, d);
+    crate::tensor::matmul_acc_f32(&d_q, &params.swa.w_q, &mut d_assembled, s_total, d, d);
+    crate::tensor::matmul_acc_f32(&d_k, &params.swa.w_k, &mut d_assembled, s_total, d, d);
+    crate::tensor::matmul_acc_f32(&d_v, &params.swa.w_v, &mut d_assembled, s_total, d, d);
 
-    let mut d_q_t = vec![0.0f32; d * s2];
-    transpose_f32(&d_q, &mut d_q_t, s2, d);
-    matmul_f32(&d_q_t, &cache.assembled, &mut grads.swa.w_q, d, s2, d);
+    let mut d_q_t = vec![0.0f32; d * s_total];
+    transpose_f32(&d_q, &mut d_q_t, s_total, d);
+    matmul_f32(&d_q_t, &cache.assembled, &mut grads.swa.w_q, d, s_total, d);
 
-    let mut d_k_t = vec![0.0f32; d * s2];
-    transpose_f32(&d_k, &mut d_k_t, s2, d);
-    matmul_f32(&d_k_t, &cache.assembled, &mut grads.swa.w_k, d, s2, d);
+    let mut d_k_t = vec![0.0f32; d * s_total];
+    transpose_f32(&d_k, &mut d_k_t, s_total, d);
+    matmul_f32(&d_k_t, &cache.assembled, &mut grads.swa.w_k, d, s_total, d);
 
-    let mut d_v_t = vec![0.0f32; d * s2];
-    transpose_f32(&d_v, &mut d_v_t, s2, d);
-    matmul_f32(&d_v_t, &cache.assembled, &mut grads.swa.w_v, d, s2, d);
+    let mut d_v_t = vec![0.0f32; d * s_total];
+    transpose_f32(&d_v, &mut d_v_t, s_total, d);
+    matmul_f32(&d_v_t, &cache.assembled, &mut grads.swa.w_v, d, s_total, d);
 
-    // ── Stage 3: Split d_assembled ───────────────────────────────────
-    let d_h_t_combined = &d_assembled[..s * d];
-    let d_embedded_attn = &d_assembled[s * d..];
+    // ── Stage 3: Split d_assembled → d_persistent + d_h_t + d_embedded_attn
+    let d_persistent = &d_assembled[..n_p * d];
+    let d_h_t_combined = &d_assembled[n_p * d..(n_p + s) * d];
+    let d_embedded_attn = &d_assembled[(n_p + s) * d..];
 
     // Learnable memory aggregation backward: per-level gradient + d_alpha_mem
     let w_mem = softmax(&params.alpha_mem);
@@ -905,6 +925,11 @@ pub fn cms_mac_backward(
         for dd in 0..d {
             grads.swa.w_embed[tok * d + dd] += d_embedded[t * d + dd];
         }
+    }
+
+    // Persistent token gradients (outer_loop_param)
+    if n_p > 0 {
+        grads.persistent_tokens[..n_p * d].copy_from_slice(d_persistent);
     }
 
     grads
@@ -1003,5 +1028,92 @@ mod tests {
             assert!(g > 0.0 && g < 1.0, "reflective_gate value {g} not in (0,1)");
         }
         eprintln!("MAC reflective gate mean: {gate_mean:.4}");
+    }
+
+    // ── Persistent token tests ───────────────────────────────────────
+
+    fn persistent_config() -> MAGConfig {
+        let mut cfg = MAGConfig::mac_test_config();
+        cfg.n_persistent = 2;
+        // window_size must be >= n_persistent + 2*seq_len = 2 + 8 = 10
+        cfg.swa.window_size = 10;
+        cfg
+    }
+
+    #[test]
+    fn test_mac_persistent_forward_finite() {
+        let cfg = persistent_config();
+        let params = MAGParams::init(&cfg, 42);
+        assert_eq!(params.persistent_tokens.len(), 2 * 8); // n_p * d
+        let (input_ids, target_ids) = make_test_data(&cfg);
+        let (loss, cache) = mac_forward(&params, &cfg, &input_ids, &target_ids);
+        assert!(loss.is_finite(), "MAC+persistent loss not finite: {loss}");
+        assert!(loss > 0.0);
+        assert_eq!(cache.n_persistent, 2);
+        // assembled should be (n_p + 2*s) * d = (2 + 8) * 8 = 80
+        assert_eq!(cache.assembled.len(), 10 * 8);
+    }
+
+    #[test]
+    fn test_mac_persistent_differs_from_no_persistent() {
+        let cfg_no = MAGConfig::mac_test_config();
+        let params_no = MAGParams::init(&cfg_no, 42);
+        let (input_ids, target_ids) = make_test_data(&cfg_no);
+        let (loss_no, _) = mac_forward(&params_no, &cfg_no, &input_ids, &target_ids);
+
+        let cfg_yes = persistent_config();
+        let params_yes = MAGParams::init(&cfg_yes, 42);
+        let (loss_yes, _) = mac_forward(&params_yes, &cfg_yes, &input_ids, &target_ids);
+
+        // Different configs → different losses (persistent tokens change attention context)
+        assert!((loss_no - loss_yes).abs() > 1e-6,
+            "persistent tokens should change loss: no={loss_no}, yes={loss_yes}");
+    }
+
+    #[test]
+    fn test_mac_persistent_backward_finite() {
+        let cfg = persistent_config();
+        let params = MAGParams::init(&cfg, 42);
+        let (input_ids, target_ids) = make_test_data(&cfg);
+        let (_loss, cache) = mac_forward(&params, &cfg, &input_ids, &target_ids);
+        let grads = mac_backward(&params, &cfg, &cache, &input_ids, &target_ids);
+
+        // Check persistent token gradients are finite
+        for (i, &val) in grads.persistent_tokens.iter().enumerate() {
+            assert!(val.is_finite(), "persistent_token grad[{i}] not finite: {val}");
+        }
+        // Check they are nonzero
+        let max_abs = grads.persistent_tokens.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        assert!(max_abs > 1e-12, "persistent_token grads all zeros (max_abs={max_abs})");
+    }
+
+    #[test]
+    fn test_mac_persistent_backward_all_params() {
+        let cfg = persistent_config();
+        let params = MAGParams::init(&cfg, 42);
+        let (input_ids, target_ids) = make_test_data(&cfg);
+        let (_loss, cache) = mac_forward(&params, &cfg, &input_ids, &target_ids);
+        let grads = mac_backward(&params, &cfg, &cache, &input_ids, &target_ids);
+
+        // Existing param grads should still be nonzero
+        for (name, g) in [
+            ("w_q", &grads.swa.w_q), ("w_o", &grads.swa.w_o),
+        ] {
+            let max_abs = g.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            assert!(max_abs > 1e-12, "mac+persistent grad_{name} all zeros");
+        }
+    }
+
+    #[test]
+    fn test_mac_zero_persistent_matches_original() {
+        // n_persistent=0 should produce identical results to base config
+        let cfg = MAGConfig::mac_test_config();
+        assert_eq!(cfg.n_persistent, 0);
+        let params = MAGParams::init(&cfg, 42);
+        assert!(params.persistent_tokens.is_empty());
+        let (input_ids, target_ids) = make_test_data(&cfg);
+        let (loss, _) = mac_forward(&params, &cfg, &input_ids, &target_ids);
+        // Just verify it runs — backward compat
+        assert!(loss.is_finite());
     }
 }

@@ -65,6 +65,7 @@ fn spike_config_a() -> MAGConfig {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
     }
 }
 
@@ -94,6 +95,7 @@ fn spike_config_b() -> MAGConfig {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
     }
 }
 
@@ -123,6 +125,7 @@ fn spike_config_c() -> MAGConfig {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
     }
 }
 
@@ -715,6 +718,7 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
         checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
     }
 }
 

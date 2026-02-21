@@ -53,6 +53,7 @@ fn tiny_config(rule: MemoryRuleKind, retention: RetentionKind) -> MAGConfig {
         checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
     }
 }
 

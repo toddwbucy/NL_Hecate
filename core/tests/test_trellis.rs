@@ -220,6 +220,7 @@ fn test_trellis_vs_delta() {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
     };
     let cfg_trellis = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
@@ -235,6 +236,7 @@ fn test_trellis_vs_delta() {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
     };
 
     let input_ids: Vec<usize> = (0..swa.seq_len).map(|t| t % swa.vocab_size).collect();

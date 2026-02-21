@@ -425,6 +425,7 @@ fn test_k1_learned_is_noop() {
         checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
     };
     let params = MAGParams::init(&cfg, 42);
     let d = cfg.swa.d_model;
@@ -547,6 +548,7 @@ fn test_anneal_uses_fixed_schedule() {
         checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
     };
 
     let params = MAGParams::init(&cfg, 42);

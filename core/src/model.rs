@@ -508,6 +508,11 @@ pub struct MAGConfig {
     /// Default: Decode (Eqs 5-6). See Lattice (2504.05646) Eqs 5-8, 24-26.
     #[serde(default = "default_lattice_variant")]
     pub lattice_variant: LatticeVariant,
+    /// Number of persistent tokens for MAC composition (Titans Eq 22).
+    /// These are learnable, input-independent tokens (outer_loop_param) prepended
+    /// to the assembled context. Default: 0 (backward compatible, 2-branch assemble).
+    #[serde(default)]
+    pub n_persistent: usize,
 }
 
 fn default_sign_sharpness() -> f32 { 10.0 }
@@ -581,6 +586,7 @@ impl MAGConfig {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
         }
     }
 
@@ -608,6 +614,7 @@ impl MAGConfig {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
         }
     }
 
@@ -635,6 +642,7 @@ impl MAGConfig {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
         }
     }
 
@@ -663,6 +671,7 @@ impl MAGConfig {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
         }
     }
 
@@ -691,6 +700,7 @@ impl MAGConfig {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
         }
     }
 
@@ -719,6 +729,7 @@ impl MAGConfig {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
         }
     }
 
@@ -746,6 +757,7 @@ impl MAGConfig {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
         }
     }
 
@@ -773,6 +785,7 @@ impl MAGConfig {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
         }
     }
 
@@ -800,6 +813,7 @@ impl MAGConfig {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
         }
     }
 
@@ -827,6 +841,7 @@ impl MAGConfig {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
         }
     }
 
@@ -864,6 +879,7 @@ impl MAGConfig {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
         }
     }
 
@@ -901,6 +917,7 @@ impl MAGConfig {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
         }
     }
 
@@ -938,6 +955,7 @@ impl MAGConfig {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
         }
     }
 
@@ -975,6 +993,7 @@ impl MAGConfig {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
         }
     }
 
@@ -1012,6 +1031,7 @@ impl MAGConfig {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
         }
     }
 
@@ -1049,6 +1069,7 @@ impl MAGConfig {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
         }
     }
 
@@ -1077,6 +1098,7 @@ impl MAGConfig {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
         }
     }
 
@@ -1105,6 +1127,7 @@ impl MAGConfig {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
         }
     }
 
@@ -1136,6 +1159,7 @@ impl MAGConfig {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
         }
     }
 
@@ -1167,6 +1191,7 @@ impl MAGConfig {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
         }
     }
 
@@ -1194,6 +1219,7 @@ impl MAGConfig {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
         }
     }
 
@@ -1221,6 +1247,7 @@ impl MAGConfig {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
         }
     }
 
@@ -1248,6 +1275,7 @@ impl MAGConfig {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
         }
     }
 
@@ -1275,6 +1303,7 @@ impl MAGConfig {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
         }
     }
 
@@ -1303,6 +1332,7 @@ impl MAGConfig {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
         }
     }
 
@@ -1330,6 +1360,7 @@ impl MAGConfig {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
         }
     }
 
@@ -1358,6 +1389,7 @@ impl MAGConfig {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
         }
     }
 
@@ -1386,6 +1418,7 @@ impl MAGConfig {
             checkpoint_interval: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
+            n_persistent: 0,
         }
     }
 }
@@ -1406,6 +1439,11 @@ pub struct MAGParams {
     /// Learnable CMS aggregation logits for reflective gate signal combination.
     /// [k] f32, init zeros → softmax over active subset at init.
     pub alpha_refl: Vec<f32>,
+    /// Learnable persistent tokens for MAC composition (Titans Eq 22).
+    /// Shape: [n_persistent * d_model]. outer_loop_param — updated by AD.
+    /// Empty when n_persistent == 0.
+    #[serde(default)]
+    pub persistent_tokens: Vec<f32>,
 }
 
 impl MAGParams {
@@ -1443,7 +1481,20 @@ impl MAGParams {
 
         let alpha_mem = vec![0.0f32; cfg.k];
         let alpha_refl = vec![0.0f32; cfg.k];
-        MAGParams { swa, levels, alpha_mem, alpha_refl }
+
+        // Persistent tokens: Xavier uniform init scaled by 1/sqrt(d)
+        let n_p = cfg.n_persistent;
+        let persistent_tokens = if n_p > 0 {
+            let mut pt_rng = SimpleRng::new(seed.wrapping_add(9000));
+            let scale = 1.0 / (d as f32).sqrt();
+            let mut pt = vec![0.0f32; n_p * d];
+            pt_rng.fill_uniform(&mut pt, scale);
+            pt
+        } else {
+            vec![]
+        };
+
+        MAGParams { swa, levels, alpha_mem, alpha_refl, persistent_tokens }
         // NOTE: No weight tying at init — both w_embed and w_unembed keep their
         // independent Kaiming initialization. Weight tying (sync_embed_from_unembed)
         // is applied after each weight update during training, in the Python tier
@@ -1467,6 +1518,7 @@ impl MAGParams {
             levels,
             alpha_mem: vec![0.0f32; cfg.k],
             alpha_refl: vec![0.0f32; cfg.k],
+            persistent_tokens: vec![0.0f32; cfg.n_persistent * cfg.swa.d_model],
         }
     }
 
@@ -1476,6 +1528,7 @@ impl MAGParams {
             + self.levels.iter().map(|l| l.num_params()).sum::<usize>()
             + self.alpha_mem.len()
             + self.alpha_refl.len()
+            + self.persistent_tokens.len()
     }
 
     /// Outer-loop weight update: param -= lr * grad for all projection weights across all levels.
@@ -1489,6 +1542,9 @@ impl MAGParams {
         }
         for (a, &da) in self.alpha_refl.iter_mut().zip(grads.alpha_refl.iter()) {
             *a -= lr * da;
+        }
+        for (p, &dp) in self.persistent_tokens.iter_mut().zip(grads.persistent_tokens.iter()) {
+            *p -= lr * dp;
         }
     }
 
