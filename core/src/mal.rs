@@ -1,10 +1,20 @@
 /// MAL (Memory As Layer) composition.
 ///
 /// Architecture:
-///   embed → memory.step(embedded) → m_t → QKV(m_t) → SWA(m_t) → output proj → unembed → loss
+///   embed → memory.step(embedded) → m_t
+///   → attn_input = m_t + embedded  (residual — see deviation note below)
+///   → [persistent | attn_input] → QKV → SWA → strip persistent → output proj → unembed → loss
 ///
 /// Simplest composition: memory preprocesses input, attention processes memory output.
 /// No sigmoid gate — m_t IS the attention input. Information bottleneck by design.
+///
+/// **Residual deviation from spec**: The spec (03_mal.md) prescribes a strict
+/// information bottleneck: attention sees ONLY memory output m_t. Our implementation
+/// adds a residual connection (attn_input = m_t + embedded) to break the bootstrapping
+/// deadlock: at init m_t ≈ 0 (memory hasn't learned yet), so without the residual
+/// attention would see near-zero inputs and produce random outputs. The residual lets
+/// attention see raw embeddings at init, then progressively rely on memory as it learns.
+/// This is an intentional, documented deviation — not a bug.
 
 use crate::tensor::{matmul_f32, transpose_f32, cross_entropy_loss};
 use crate::model::{MAGConfig, MAGParams, MemoryRuleKind};
@@ -25,8 +35,9 @@ pub struct MALForwardCache {
     pub embedded: Vec<f32>,
     pub m_t: Vec<f32>,          // memory output: [seq_len, d]
     pub attn_input: Vec<f32>,   // m_t + embedded (residual for bootstrapping)
+    pub n_persistent: usize,    // number of persistent tokens prepended
     pub memory_cache: MemoryCache,
-    pub q: Vec<f32>,            // computed from attn_input
+    pub q: Vec<f32>,            // computed from [persistent | attn_input]
     pub k: Vec<f32>,
     pub v: Vec<f32>,
     pub attn_out: Vec<f32>,
@@ -165,7 +176,17 @@ pub fn mal_forward(
         attn_input[i] = m_t[i] + embedded[i];
     }
 
-    // Stage 3: QKV projections on attn_input (m_t + embedded)
+    // Stage 2.75: Prepend persistent tokens (Titans Eq 22 adapted for MAL)
+    let n_p = cfg.n_persistent;
+    let s_total = n_p + s;
+
+    let mut qkv_input = vec![0.0f32; s_total * d];
+    if n_p > 0 {
+        qkv_input[..n_p * d].copy_from_slice(&params.persistent_tokens);
+    }
+    qkv_input[n_p * d..].copy_from_slice(&attn_input);
+
+    // Stage 3: QKV projections on [persistent | attn_input]
     let mut w_q_t = vec![0.0f32; d * d];
     let mut w_k_t = vec![0.0f32; d * d];
     let mut w_v_t = vec![0.0f32; d * d];
@@ -173,17 +194,20 @@ pub fn mal_forward(
     transpose_f32(&params.swa.w_k, &mut w_k_t, d, d);
     transpose_f32(&params.swa.w_v, &mut w_v_t, d, d);
 
-    let mut q = vec![0.0f32; s * d];
-    let mut k = vec![0.0f32; s * d];
-    let mut vv = vec![0.0f32; s * d];
-    matmul_f32(&attn_input, &w_q_t, &mut q, s, d, d);
-    matmul_f32(&attn_input, &w_k_t, &mut k, s, d, d);
-    matmul_f32(&attn_input, &w_v_t, &mut vv, s, d, d);
+    let mut q = vec![0.0f32; s_total * d];
+    let mut k = vec![0.0f32; s_total * d];
+    let mut vv = vec![0.0f32; s_total * d];
+    matmul_f32(&qkv_input, &w_q_t, &mut q, s_total, d, d);
+    matmul_f32(&qkv_input, &w_k_t, &mut k, s_total, d, d);
+    matmul_f32(&qkv_input, &w_v_t, &mut vv, s_total, d, d);
 
-    // Stage 4: SWA Attention
-    let mut attn_out = vec![0.0f32; s * d];
-    let mut attn_weights = vec![0.0f32; nh * s * ws];
-    crate::dispatch::swa_forward_dispatch(&q, &k, &vv, &mut attn_out, &mut attn_weights, s, nh, hd, ws);
+    // Stage 4: SWA Attention over [persistent | attn_input]
+    let mut attn_out_full = vec![0.0f32; s_total * d];
+    let mut attn_weights = vec![0.0f32; nh * s_total * ws];
+    crate::dispatch::swa_forward_dispatch(&q, &k, &vv, &mut attn_out_full, &mut attn_weights, s_total, nh, hd, ws);
+
+    // Extract output for non-persistent positions only
+    let attn_out = attn_out_full[n_p * d..].to_vec();
 
     // Stage 5: Output projection
     let mut w_o_t = vec![0.0f32; d * d];
@@ -199,7 +223,7 @@ pub fn mal_forward(
     let loss = cross_entropy_loss(&logits, target_ids, s, v);
 
     let cache = MALForwardCache {
-        embedded, m_t, attn_input, memory_cache,
+        embedded, m_t, attn_input, n_persistent: n_p, memory_cache,
         q, k, v: vv, attn_out, attn_weights,
         projected, logits,
     };
@@ -273,39 +297,60 @@ pub fn mal_backward(
     transpose_f32(&d_projected, &mut d_projected_t, s, d);
     matmul_f32(&d_projected_t, &cache.attn_out, &mut grads.swa.w_o, d, s, d);
 
-    // ── Stage 4: SWA Attention backward ─────────────────────────────
-    let mut d_q = vec![0.0f32; s * d];
-    let mut d_k = vec![0.0f32; s * d];
-    let mut d_v = vec![0.0f32; s * d];
+    // ── Stage 4: SWA Attention backward (over [persistent | attn_input]) ─
+    let n_p = cache.n_persistent;
+    let s_total = n_p + s;
+
+    // Pad d_attn_out to full sequence: persistent positions get zero gradient from output
+    let mut d_attn_out_full = vec![0.0f32; s_total * d];
+    d_attn_out_full[n_p * d..].copy_from_slice(&d_attn_out);
+
+    let mut d_q = vec![0.0f32; s_total * d];
+    let mut d_k = vec![0.0f32; s_total * d];
+    let mut d_v = vec![0.0f32; s_total * d];
 
     crate::dispatch::swa_backward_dispatch(
         &cache.q, &cache.k, &cache.v,
-        &cache.attn_weights, &d_attn_out,
+        &cache.attn_weights, &d_attn_out_full,
         &mut d_q, &mut d_k, &mut d_v,
-        s, nh, hd, ws,
+        s_total, nh, hd, ws,
     );
 
-    // ── Stage 3: QKV projection backward (inputs are attn_input = m_t + embedded) ─
-    let mut d_attn_input = vec![0.0f32; s * d];
+    // ── Stage 3: QKV projection backward (inputs are [persistent | attn_input]) ─
+    // Reconstruct qkv_input for weight gradients
+    let mut qkv_input = vec![0.0f32; s_total * d];
+    if n_p > 0 {
+        qkv_input[..n_p * d].copy_from_slice(&params.persistent_tokens);
+    }
+    qkv_input[n_p * d..].copy_from_slice(&cache.attn_input);
 
-    crate::tensor::matmul_acc_f32(&d_q, &params.swa.w_q, &mut d_attn_input, s, d, d);
-    crate::tensor::matmul_acc_f32(&d_k, &params.swa.w_k, &mut d_attn_input, s, d, d);
-    crate::tensor::matmul_acc_f32(&d_v, &params.swa.w_v, &mut d_attn_input, s, d, d);
+    let mut d_qkv_input = vec![0.0f32; s_total * d];
 
-    // Weight gradients: d_W = d_QKV^T @ attn_input
-    let mut d_q_t = vec![0.0f32; d * s];
-    transpose_f32(&d_q, &mut d_q_t, s, d);
-    matmul_f32(&d_q_t, &cache.attn_input, &mut grads.swa.w_q, d, s, d);
+    crate::tensor::matmul_acc_f32(&d_q, &params.swa.w_q, &mut d_qkv_input, s_total, d, d);
+    crate::tensor::matmul_acc_f32(&d_k, &params.swa.w_k, &mut d_qkv_input, s_total, d, d);
+    crate::tensor::matmul_acc_f32(&d_v, &params.swa.w_v, &mut d_qkv_input, s_total, d, d);
 
-    let mut d_k_t = vec![0.0f32; d * s];
-    transpose_f32(&d_k, &mut d_k_t, s, d);
-    matmul_f32(&d_k_t, &cache.attn_input, &mut grads.swa.w_k, d, s, d);
+    // Weight gradients: d_W = d_QKV^T @ qkv_input (full sequence)
+    let mut d_q_t = vec![0.0f32; d * s_total];
+    transpose_f32(&d_q, &mut d_q_t, s_total, d);
+    matmul_f32(&d_q_t, &qkv_input, &mut grads.swa.w_q, d, s_total, d);
 
-    let mut d_v_t = vec![0.0f32; d * s];
-    transpose_f32(&d_v, &mut d_v_t, s, d);
-    matmul_f32(&d_v_t, &cache.attn_input, &mut grads.swa.w_v, d, s, d);
+    let mut d_k_t = vec![0.0f32; d * s_total];
+    transpose_f32(&d_k, &mut d_k_t, s_total, d);
+    matmul_f32(&d_k_t, &qkv_input, &mut grads.swa.w_k, d, s_total, d);
+
+    let mut d_v_t = vec![0.0f32; d * s_total];
+    transpose_f32(&d_v, &mut d_v_t, s_total, d);
+    matmul_f32(&d_v_t, &qkv_input, &mut grads.swa.w_v, d, s_total, d);
+
+    // ── Stage 2.75: Persistent token gradient ────────────────────────
+    if n_p > 0 {
+        grads.persistent_tokens[..n_p * d].copy_from_slice(&d_qkv_input[..n_p * d]);
+    }
 
     // ── Stage 2.5: Residual backward (attn_input = m_t + embedded) ──
+    // d_attn_input = gradient from QKV for non-persistent positions
+    let d_attn_input = d_qkv_input[n_p * d..].to_vec();
     // d_m_t = d_attn_input (gradient flows to memory)
     // d_embedded_res = d_attn_input (gradient flows to embedding via residual)
     let d_m_t = d_attn_input.clone();
@@ -340,6 +385,7 @@ pub struct CMSMALForwardCache {
     pub y_per_level: Vec<Vec<f32>>,
     pub m_t_combined: Vec<f32>,
     pub attn_input: Vec<f32>,   // m_t_combined + embedded (residual)
+    pub n_persistent: usize,    // number of persistent tokens prepended
     pub q: Vec<f32>,
     pub k: Vec<f32>,
     pub v: Vec<f32>,
@@ -547,7 +593,17 @@ pub fn cms_mal_forward(
         attn_input[i] = m_t_combined[i] + embedded[i];
     }
 
-    // Stage 3: QKV projections on attn_input
+    // Stage 2.75: Prepend persistent tokens
+    let n_p = cfg.n_persistent;
+    let s_total = n_p + s;
+
+    let mut qkv_input = vec![0.0f32; s_total * d];
+    if n_p > 0 {
+        qkv_input[..n_p * d].copy_from_slice(&params.persistent_tokens);
+    }
+    qkv_input[n_p * d..].copy_from_slice(&attn_input);
+
+    // Stage 3: QKV projections on [persistent | attn_input]
     let mut w_q_t = vec![0.0f32; d * d];
     let mut w_k_t = vec![0.0f32; d * d];
     let mut w_v_t = vec![0.0f32; d * d];
@@ -555,17 +611,20 @@ pub fn cms_mal_forward(
     transpose_f32(&params.swa.w_k, &mut w_k_t, d, d);
     transpose_f32(&params.swa.w_v, &mut w_v_t, d, d);
 
-    let mut q = vec![0.0f32; s * d];
-    let mut k = vec![0.0f32; s * d];
-    let mut vv = vec![0.0f32; s * d];
-    matmul_f32(&attn_input, &w_q_t, &mut q, s, d, d);
-    matmul_f32(&attn_input, &w_k_t, &mut k, s, d, d);
-    matmul_f32(&attn_input, &w_v_t, &mut vv, s, d, d);
+    let mut q = vec![0.0f32; s_total * d];
+    let mut k = vec![0.0f32; s_total * d];
+    let mut vv = vec![0.0f32; s_total * d];
+    matmul_f32(&qkv_input, &w_q_t, &mut q, s_total, d, d);
+    matmul_f32(&qkv_input, &w_k_t, &mut k, s_total, d, d);
+    matmul_f32(&qkv_input, &w_v_t, &mut vv, s_total, d, d);
 
-    // Stage 4: SWA Attention
-    let mut attn_out = vec![0.0f32; s * d];
-    let mut attn_weights = vec![0.0f32; nh * s * ws];
-    crate::dispatch::swa_forward_dispatch(&q, &k, &vv, &mut attn_out, &mut attn_weights, s, nh, hd, ws);
+    // Stage 4: SWA Attention over [persistent | attn_input]
+    let mut attn_out_full = vec![0.0f32; s_total * d];
+    let mut attn_weights = vec![0.0f32; nh * s_total * ws];
+    crate::dispatch::swa_forward_dispatch(&q, &k, &vv, &mut attn_out_full, &mut attn_weights, s_total, nh, hd, ws);
+
+    // Extract output for non-persistent positions only
+    let attn_out = attn_out_full[n_p * d..].to_vec();
 
     // Stage 5: Output projection
     let mut w_o_t = vec![0.0f32; d * d];
@@ -582,7 +641,7 @@ pub fn cms_mal_forward(
 
     let cache = CMSMALForwardCache {
         embedded, memory_caches, q_mem_per_level, frozen_memories,
-        y_per_level, m_t_combined, attn_input,
+        y_per_level, m_t_combined, attn_input, n_persistent: n_p,
         q, k, v: vv, attn_out, attn_weights,
         projected, logits,
         pulse: pulse.clone(),
@@ -658,38 +717,57 @@ pub fn cms_mal_backward(
     transpose_f32(&d_projected, &mut d_projected_t, s, d);
     matmul_f32(&d_projected_t, &cache.attn_out, &mut grads.swa.w_o, d, s, d);
 
-    // ── Stage 4: SWA Attention backward ─────────────────────────────
-    let mut d_q = vec![0.0f32; s * d];
-    let mut d_k = vec![0.0f32; s * d];
-    let mut d_v = vec![0.0f32; s * d];
+    // ── Stage 4: SWA Attention backward (over [persistent | attn_input]) ─
+    let n_p = cache.n_persistent;
+    let s_total = n_p + s;
+
+    // Pad d_attn_out to full sequence: persistent positions get zero gradient from output
+    let mut d_attn_out_full = vec![0.0f32; s_total * d];
+    d_attn_out_full[n_p * d..].copy_from_slice(&d_attn_out);
+
+    let mut d_q = vec![0.0f32; s_total * d];
+    let mut d_k = vec![0.0f32; s_total * d];
+    let mut d_v = vec![0.0f32; s_total * d];
 
     crate::dispatch::swa_backward_dispatch(
         &cache.q, &cache.k, &cache.v,
-        &cache.attn_weights, &d_attn_out,
+        &cache.attn_weights, &d_attn_out_full,
         &mut d_q, &mut d_k, &mut d_v,
-        s, nh, hd, ws,
+        s_total, nh, hd, ws,
     );
 
-    // ── Stage 3: QKV projection backward (inputs are attn_input) ──
-    let mut d_attn_input = vec![0.0f32; s * d];
+    // ── Stage 3: QKV projection backward (inputs are [persistent | attn_input]) ──
+    let mut qkv_input = vec![0.0f32; s_total * d];
+    if n_p > 0 {
+        qkv_input[..n_p * d].copy_from_slice(&params.persistent_tokens);
+    }
+    qkv_input[n_p * d..].copy_from_slice(&cache.attn_input);
 
-    crate::tensor::matmul_acc_f32(&d_q, &params.swa.w_q, &mut d_attn_input, s, d, d);
-    crate::tensor::matmul_acc_f32(&d_k, &params.swa.w_k, &mut d_attn_input, s, d, d);
-    crate::tensor::matmul_acc_f32(&d_v, &params.swa.w_v, &mut d_attn_input, s, d, d);
+    let mut d_qkv_input = vec![0.0f32; s_total * d];
 
-    let mut d_q_t = vec![0.0f32; d * s];
-    transpose_f32(&d_q, &mut d_q_t, s, d);
-    matmul_f32(&d_q_t, &cache.attn_input, &mut grads.swa.w_q, d, s, d);
+    crate::tensor::matmul_acc_f32(&d_q, &params.swa.w_q, &mut d_qkv_input, s_total, d, d);
+    crate::tensor::matmul_acc_f32(&d_k, &params.swa.w_k, &mut d_qkv_input, s_total, d, d);
+    crate::tensor::matmul_acc_f32(&d_v, &params.swa.w_v, &mut d_qkv_input, s_total, d, d);
 
-    let mut d_k_t = vec![0.0f32; d * s];
-    transpose_f32(&d_k, &mut d_k_t, s, d);
-    matmul_f32(&d_k_t, &cache.attn_input, &mut grads.swa.w_k, d, s, d);
+    let mut d_q_t = vec![0.0f32; d * s_total];
+    transpose_f32(&d_q, &mut d_q_t, s_total, d);
+    matmul_f32(&d_q_t, &qkv_input, &mut grads.swa.w_q, d, s_total, d);
 
-    let mut d_v_t = vec![0.0f32; d * s];
-    transpose_f32(&d_v, &mut d_v_t, s, d);
-    matmul_f32(&d_v_t, &cache.attn_input, &mut grads.swa.w_v, d, s, d);
+    let mut d_k_t = vec![0.0f32; d * s_total];
+    transpose_f32(&d_k, &mut d_k_t, s_total, d);
+    matmul_f32(&d_k_t, &qkv_input, &mut grads.swa.w_k, d, s_total, d);
+
+    let mut d_v_t = vec![0.0f32; d * s_total];
+    transpose_f32(&d_v, &mut d_v_t, s_total, d);
+    matmul_f32(&d_v_t, &qkv_input, &mut grads.swa.w_v, d, s_total, d);
+
+    // ── Stage 2.75: Persistent token gradient ────────────────────────
+    if n_p > 0 {
+        grads.persistent_tokens[..n_p * d].copy_from_slice(&d_qkv_input[..n_p * d]);
+    }
 
     // ── Stage 2.5: Residual backward (attn_input = m_t_combined + embedded) ──
+    let d_attn_input = d_qkv_input[n_p * d..].to_vec();
     let mut d_m_t = d_attn_input.clone();
 
     // 1/sqrt(k) normalization chain rule for k>2
@@ -832,5 +910,93 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .sum();
         assert!(diff > 1e-6, "m_t should differ from embedded, diff={diff}");
+    }
+
+    // ── Persistent token tests ──────────────────────────────────────
+
+    fn persistent_config() -> MAGConfig {
+        let mut cfg = test_config();
+        cfg.n_persistent = 2;
+        // Expand window to accommodate persistent tokens
+        cfg.swa.window_size = cfg.swa.seq_len + cfg.n_persistent;
+        cfg
+    }
+
+    #[test]
+    fn test_mal_persistent_forward_finite() {
+        let cfg = persistent_config();
+        let params = MAGParams::init(&cfg, 42);
+        let (input_ids, target_ids) = make_test_data(&cfg);
+        let (loss, cache) = mal_forward(&params, &cfg, &input_ids, &target_ids);
+        assert!(loss.is_finite(), "MAL+persistent loss not finite: {loss}");
+        assert!(loss > 0.0);
+        assert_eq!(cache.n_persistent, 2);
+        // Q/K/V should be expanded to (n_p + s) * d
+        let s_total = cfg.n_persistent + cfg.swa.seq_len;
+        assert_eq!(cache.q.len(), s_total * cfg.swa.d_model);
+    }
+
+    #[test]
+    fn test_mal_persistent_differs_from_no_persistent() {
+        let cfg_base = test_config();
+        let cfg_pers = persistent_config();
+        let params_base = MAGParams::init(&cfg_base, 42);
+        let params_pers = MAGParams::init(&cfg_pers, 42);
+        let (input_ids, target_ids) = make_test_data(&cfg_base);
+
+        let (loss_base, _) = mal_forward(&params_base, &cfg_base, &input_ids, &target_ids);
+        let (loss_pers, _) = mal_forward(&params_pers, &cfg_pers, &input_ids, &target_ids);
+        // Different init seeds mean different persistent tokens → different loss
+        assert!((loss_base - loss_pers).abs() > 1e-6,
+            "Persistent tokens should change output, base={loss_base} pers={loss_pers}");
+    }
+
+    #[test]
+    fn test_mal_persistent_backward_finite() {
+        let cfg = persistent_config();
+        let params = MAGParams::init(&cfg, 42);
+        let (input_ids, target_ids) = make_test_data(&cfg);
+        let (_loss, cache) = mal_forward(&params, &cfg, &input_ids, &target_ids);
+        let grads = mal_backward(&params, &cfg, &cache, &input_ids, &target_ids);
+
+        for (name, g) in [
+            ("w_q", &grads.swa.w_q), ("w_o", &grads.swa.w_o),
+            ("persistent_tokens", &grads.persistent_tokens),
+        ] {
+            for (i, &val) in g.iter().enumerate() {
+                assert!(val.is_finite(), "mal persistent grad_{name}[{i}] not finite: {val}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_mal_persistent_backward_has_gradient() {
+        let cfg = persistent_config();
+        let params = MAGParams::init(&cfg, 42);
+        let (input_ids, target_ids) = make_test_data(&cfg);
+        let (_loss, cache) = mal_forward(&params, &cfg, &input_ids, &target_ids);
+        let grads = mal_backward(&params, &cfg, &cache, &input_ids, &target_ids);
+
+        let max_abs = grads.persistent_tokens.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        assert!(max_abs > 1e-10,
+            "persistent_tokens should have nonzero gradient, max_abs={max_abs}");
+    }
+
+    #[test]
+    fn test_mal_zero_persistent_matches_original() {
+        // n_persistent=0 should produce identical results to the base config
+        let cfg = test_config(); // n_persistent=0
+        let params = MAGParams::init(&cfg, 42);
+        let (input_ids, target_ids) = make_test_data(&cfg);
+
+        let (loss1, cache1) = mal_forward(&params, &cfg, &input_ids, &target_ids);
+        let grads1 = mal_backward(&params, &cfg, &cache1, &input_ids, &target_ids);
+
+        let (loss2, cache2) = mal_forward(&params, &cfg, &input_ids, &target_ids);
+        let grads2 = mal_backward(&params, &cfg, &cache2, &input_ids, &target_ids);
+
+        assert_eq!(loss1, loss2);
+        assert_eq!(grads1.swa.w_q, grads2.swa.w_q);
+        assert_eq!(cache1.n_persistent, 0);
     }
 }
