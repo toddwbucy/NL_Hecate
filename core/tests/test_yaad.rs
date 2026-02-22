@@ -222,6 +222,7 @@ fn test_yaad_vs_delta() {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: Default::default(),
+            kernel_size: 0,
     };
     let cfg_yaad = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
@@ -238,6 +239,7 @@ fn test_yaad_vs_delta() {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: Default::default(),
+            kernel_size: 0,
     };
 
     let input_ids: Vec<usize> = (0..swa.seq_len).map(|t| t % swa.vocab_size).collect();

@@ -42,6 +42,8 @@ pub struct Gates {
     pub alpha: f32,
     /// Learning rate: softplus output, non-negative.
     pub theta: f32,
+    /// Momentum gate: sigmoid output in [0, 1]. Default 1.0 (neutral).
+    pub eta: f32,
 }
 
 /// Error type for memory operations that may not be supported by all rules.
@@ -763,7 +765,7 @@ mod tests {
         let mut state = rule.init(4);
         let k = [1.0f32, 0.0, 0.0, 0.0];
         let v = [0.0f32, 1.0, 0.0, 0.0];
-        let gates = Gates { alpha: 0.0, theta: 1.0 };
+        let gates = Gates { alpha: 0.0, theta: 1.0, eta: 1.0 };
 
         // Write: M = 0 - 1.0 * outer(0*k - v, k) = outer(v, k)
         // prediction = M@k = 0, error = 0-v = -v, grad = outer(-v, k)

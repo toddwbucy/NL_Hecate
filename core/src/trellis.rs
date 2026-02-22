@@ -1057,7 +1057,7 @@ mod tests {
         let mut state = rule.init(8);
         let k = [0.0f32; 8];
         let v = [0.0f32; 8];
-        let gates = Gates { alpha: 0.5, theta: 0.01 };
+        let gates = Gates { alpha: 0.5, theta: 0.01, eta: 1.0 };
         assert_eq!(rule.write(&mut state, &k, &v, &gates), Err(MemoryError::UnsupportedOperation));
         let mut out = [0.0f32; 8];
         assert_eq!(rule.read(&state, &k, &mut out), Err(MemoryError::UnsupportedOperation));

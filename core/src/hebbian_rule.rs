@@ -470,7 +470,7 @@ mod tests {
         let mut state = rule.init(4);
         let k = [1.0f32, 0.0, 0.0, 0.0];
         let v = [0.0f32, 1.0, 0.0, 0.0];
-        let gates = Gates { alpha: 0.0, theta: 0.0 };
+        let gates = Gates { alpha: 0.0, theta: 0.0, eta: 1.0 };
 
         // Write: M = (1-0)*0 + outer(v, k) = outer(v, k)
         // = [[0,0,0,0],[1,0,0,0],[0,0,0,0],[0,0,0,0]]

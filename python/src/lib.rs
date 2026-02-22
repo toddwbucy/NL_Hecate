@@ -272,7 +272,7 @@ impl MAGConfig {
         d_hidden=None, lp_p=None, sign_sharpness=None, lq_q=None, lambda_local=None, lambda_2=None,
         delta=None, m_slots=None, d_compress=None, lambda_k=None, lambda_v=None,
         retention=None, m3=None, frequency_schedule=None, checkpoint_interval=None,
-        attentional_bias=None,
+        attentional_bias=None, kernel_size=0,
     ))]
     fn new(
         d_model: usize,
@@ -302,6 +302,7 @@ impl MAGConfig {
         frequency_schedule: Option<&Bound<'_, PyAny>>,
         checkpoint_interval: Option<usize>,
         attentional_bias: Option<&str>,
+        kernel_size: usize,
     ) -> PyResult<Self> {
         if d_model != num_heads * head_dim {
             return Err(PyValueError::new_err(format!(
@@ -436,6 +437,7 @@ impl MAGConfig {
                 lattice_variant: nl_hecate_core::model::LatticeVariant::Decode,
                 n_persistent: 0,
                 attentional_bias: bias_kind,
+                kernel_size,
             },
         })
     }
@@ -518,7 +520,7 @@ impl MAGParams {
     }
 
     /// Flatten all params into a single Vec<f32> for Python-side optimizers.
-    /// Order: SWA(embed,q,k,v,o,unembed) then per-level(k_mem,v_mem,q_mem,alpha,b_alpha,theta,b_theta,eta,b_eta,omega,freq,b_freq).
+    /// Order: SWA(embed,q,k,v,o,unembed) then per-level(k_mem,v_mem,q_mem,alpha,b_alpha,theta,b_theta,eta,b_eta,omega,freq,b_freq,conv).
     fn get_flat_weights(&self) -> Vec<f32> {
         let mut flat = Vec::with_capacity(self.inner.num_params());
         flat.extend_from_slice(&self.inner.swa.w_embed);
@@ -540,6 +542,10 @@ impl MAGParams {
             flat.extend_from_slice(&level.w_omega);
             flat.extend_from_slice(&level.w_freq);
             flat.extend_from_slice(&level.b_freq);
+            flat.extend_from_slice(&level.w_k_conv);
+            flat.extend_from_slice(&level.b_k_conv);
+            flat.extend_from_slice(&level.w_q_conv);
+            flat.extend_from_slice(&level.b_q_conv);
         }
         flat
     }
@@ -577,6 +583,10 @@ impl MAGParams {
             copy_slice!(level.w_omega);
             copy_slice!(level.w_freq);
             copy_slice!(level.b_freq);
+            copy_slice!(level.w_k_conv);
+            copy_slice!(level.b_k_conv);
+            copy_slice!(level.w_q_conv);
+            copy_slice!(level.b_q_conv);
         }
         Ok(())
     }
@@ -606,7 +616,7 @@ impl MAGForwardCache {
     d_hidden=None, lp_p=None, sign_sharpness=None, lq_q=None, lambda_local=None, lambda_2=None,
     delta=None, m_slots=None, d_compress=None, lambda_k=None, lambda_v=None,
     retention=None, m3=None, frequency_schedule=None, checkpoint_interval=None,
-    attentional_bias=None,
+    attentional_bias=None, kernel_size=0,
 ))]
 fn mag_create_config(
     d_model: usize,
@@ -636,12 +646,13 @@ fn mag_create_config(
     frequency_schedule: Option<&Bound<'_, PyAny>>,
     checkpoint_interval: Option<usize>,
     attentional_bias: Option<&str>,
+    kernel_size: usize,
 ) -> PyResult<MAGConfig> {
     MAGConfig::new(
         d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled,
         k, chunk_sizes, memory_rule, composition,
         d_hidden, lp_p, sign_sharpness, lq_q, lambda_local, lambda_2, delta, m_slots, d_compress, lambda_k, lambda_v,
-        retention, m3, frequency_schedule, checkpoint_interval, attentional_bias,
+        retention, m3, frequency_schedule, checkpoint_interval, attentional_bias, kernel_size,
     )
 }
 

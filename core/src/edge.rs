@@ -74,6 +74,7 @@ impl EdgeConfig {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
+            kernel_size: 0,
         }
     }
 

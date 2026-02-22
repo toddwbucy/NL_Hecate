@@ -279,6 +279,14 @@ pub struct MemoryLevelParams {
     pub w_freq: Vec<f32>,
     /// Dynamic frequency gate bias: [1]. Empty for Fixed schedule.
     pub b_freq: Vec<f32>,
+    /// Conv1D key weights: [d, kernel_size]. Empty when kernel_size=0.
+    pub w_k_conv: Vec<f32>,
+    /// Conv1D key bias: [d]. Empty when kernel_size=0.
+    pub b_k_conv: Vec<f32>,
+    /// Conv1D query weights: [d, kernel_size]. Empty when kernel_size=0.
+    pub w_q_conv: Vec<f32>,
+    /// Conv1D query bias: [d]. Empty when kernel_size=0.
+    pub b_q_conv: Vec<f32>,
 }
 
 impl MemoryLevelParams {
@@ -322,7 +330,7 @@ impl MemoryLevelParams {
         let w_freq = vec![];
         let b_freq = vec![];
 
-        MemoryLevelParams { w_k_mem, w_v_mem, w_q_mem, w_alpha, b_alpha, w_theta, b_theta, w_eta, b_eta, w_omega, w_freq, b_freq }
+        MemoryLevelParams { w_k_mem, w_v_mem, w_q_mem, w_alpha, b_alpha, w_theta, b_theta, w_eta, b_eta, w_omega, w_freq, b_freq, w_k_conv: vec![], b_k_conv: vec![], w_q_conv: vec![], b_q_conv: vec![] }
     }
 
     /// Initialize with Xavier-initialized w_omega for Atlas Omega rule.
@@ -342,6 +350,19 @@ impl MemoryLevelParams {
         self.b_freq = vec![default_b_freq(level)];
     }
 
+    /// Initialize Conv1D weights for key/query preprocessing.
+    /// Called by MAGParams::init() when kernel_size > 0.
+    /// Kaiming uniform init: fan_in = kernel_size.
+    pub fn init_conv(&mut self, d: usize, kernel_size: usize, rng: &mut SimpleRng) {
+        let conv_scale = (1.0 / kernel_size as f32).sqrt();
+        self.w_k_conv = vec![0.0f32; d * kernel_size];
+        rng.fill_uniform(&mut self.w_k_conv, conv_scale);
+        self.b_k_conv = vec![0.0f32; d]; // zeros
+        self.w_q_conv = vec![0.0f32; d * kernel_size];
+        rng.fill_uniform(&mut self.w_q_conv, conv_scale);
+        self.b_q_conv = vec![0.0f32; d]; // zeros
+    }
+
     /// Create zero-initialized shadow for gradient accumulation.
     /// If `freq_d` > 0, allocates w_freq/b_freq for Learned schedule.
     pub fn zeros_like(d: usize) -> Self {
@@ -358,6 +379,10 @@ impl MemoryLevelParams {
             w_omega: vec![0.0f32; d * 2 * d],
             w_freq: vec![],
             b_freq: vec![],
+            w_k_conv: vec![],
+            b_k_conv: vec![],
+            w_q_conv: vec![],
+            b_q_conv: vec![],
         }
     }
 
@@ -367,6 +392,12 @@ impl MemoryLevelParams {
         if !template.w_freq.is_empty() {
             z.w_freq = vec![0.0f32; template.w_freq.len()];
             z.b_freq = vec![0.0f32; template.b_freq.len()];
+        }
+        if !template.w_k_conv.is_empty() {
+            z.w_k_conv = vec![0.0f32; template.w_k_conv.len()];
+            z.b_k_conv = vec![0.0f32; template.b_k_conv.len()];
+            z.w_q_conv = vec![0.0f32; template.w_q_conv.len()];
+            z.b_q_conv = vec![0.0f32; template.b_q_conv.len()];
         }
         z
     }
@@ -379,6 +410,8 @@ impl MemoryLevelParams {
             + self.w_eta.len() + self.b_eta.len()
             + self.w_omega.len()
             + self.w_freq.len() + self.b_freq.len()
+            + self.w_k_conv.len() + self.b_k_conv.len()
+            + self.w_q_conv.len() + self.b_q_conv.len()
     }
 
     /// Outer-loop weight update: param -= lr * grad for all projection weights.
@@ -401,6 +434,12 @@ impl MemoryLevelParams {
         if !self.w_freq.is_empty() && !grads.w_freq.is_empty() {
             step(&mut self.w_freq, &grads.w_freq, lr);
             step(&mut self.b_freq, &grads.b_freq, lr);
+        }
+        if !self.w_k_conv.is_empty() && !grads.w_k_conv.is_empty() {
+            step(&mut self.w_k_conv, &grads.w_k_conv, lr);
+            step(&mut self.b_k_conv, &grads.b_k_conv, lr);
+            step(&mut self.w_q_conv, &grads.w_q_conv, lr);
+            step(&mut self.b_q_conv, &grads.b_q_conv, lr);
         }
     }
 
@@ -425,6 +464,12 @@ impl MemoryLevelParams {
             acc(&mut self.w_freq, &other.w_freq);
             acc(&mut self.b_freq, &other.b_freq);
         }
+        if !self.w_k_conv.is_empty() && !other.w_k_conv.is_empty() {
+            acc(&mut self.w_k_conv, &other.w_k_conv);
+            acc(&mut self.b_k_conv, &other.b_k_conv);
+            acc(&mut self.w_q_conv, &other.w_q_conv);
+            acc(&mut self.b_q_conv, &other.b_q_conv);
+        }
     }
 
     /// Frobenius norm across all weight matrices.
@@ -433,7 +478,8 @@ impl MemoryLevelParams {
         for v in [&self.w_k_mem, &self.w_v_mem, &self.w_q_mem,
                    &self.w_alpha, &self.b_alpha, &self.w_theta, &self.b_theta,
                    &self.w_eta, &self.b_eta, &self.w_omega,
-                   &self.w_freq, &self.b_freq] {
+                   &self.w_freq, &self.b_freq,
+                   &self.w_k_conv, &self.b_k_conv, &self.w_q_conv, &self.b_q_conv] {
             for &x in v.iter() {
                 sum += x * x;
             }
@@ -518,6 +564,11 @@ pub struct MAGConfig {
     /// See specs/algorithms/attentional_biases/03_lp_dispatch.md.
     #[serde(default)]
     pub attentional_bias: AttentionalBias,
+    /// Conv1D kernel size for key/query preprocessing. Default: 0 (disabled).
+    /// When > 0, depthwise causal Conv1D is applied to keys and queries before
+    /// the memory module. See specs/infrastructure/attention/02_short_conv.md.
+    #[serde(default)]
+    pub kernel_size: usize,
 }
 
 fn default_sign_sharpness() -> f32 { 10.0 }
@@ -593,6 +644,7 @@ impl MAGConfig {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
+            kernel_size: 0,
         }
     }
 
@@ -622,6 +674,7 @@ impl MAGConfig {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
+            kernel_size: 0,
         }
     }
 
@@ -651,6 +704,7 @@ impl MAGConfig {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
+            kernel_size: 0,
         }
     }
 
@@ -681,6 +735,7 @@ impl MAGConfig {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
+            kernel_size: 0,
         }
     }
 
@@ -711,6 +766,7 @@ impl MAGConfig {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
+            kernel_size: 0,
         }
     }
 
@@ -741,6 +797,7 @@ impl MAGConfig {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
+            kernel_size: 0,
         }
     }
 
@@ -770,6 +827,7 @@ impl MAGConfig {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
+            kernel_size: 0,
         }
     }
 
@@ -799,6 +857,7 @@ impl MAGConfig {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
+            kernel_size: 0,
         }
     }
 
@@ -828,6 +887,7 @@ impl MAGConfig {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
+            kernel_size: 0,
         }
     }
 
@@ -857,6 +917,7 @@ impl MAGConfig {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
+            kernel_size: 0,
         }
     }
 
@@ -896,6 +957,7 @@ impl MAGConfig {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
+            kernel_size: 0,
         }
     }
 
@@ -935,6 +997,7 @@ impl MAGConfig {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
+            kernel_size: 0,
         }
     }
 
@@ -974,6 +1037,7 @@ impl MAGConfig {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
+            kernel_size: 0,
         }
     }
 
@@ -1013,6 +1077,7 @@ impl MAGConfig {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
+            kernel_size: 0,
         }
     }
 
@@ -1052,6 +1117,7 @@ impl MAGConfig {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
+            kernel_size: 0,
         }
     }
 
@@ -1091,6 +1157,7 @@ impl MAGConfig {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
+            kernel_size: 0,
         }
     }
 
@@ -1121,6 +1188,7 @@ impl MAGConfig {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
+            kernel_size: 0,
         }
     }
 
@@ -1151,6 +1219,7 @@ impl MAGConfig {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
+            kernel_size: 0,
         }
     }
 
@@ -1184,6 +1253,7 @@ impl MAGConfig {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
+            kernel_size: 0,
         }
     }
 
@@ -1217,6 +1287,7 @@ impl MAGConfig {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
+            kernel_size: 0,
         }
     }
 
@@ -1246,6 +1317,7 @@ impl MAGConfig {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
+            kernel_size: 0,
         }
     }
 
@@ -1275,6 +1347,7 @@ impl MAGConfig {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
+            kernel_size: 0,
         }
     }
 
@@ -1304,6 +1377,7 @@ impl MAGConfig {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
+            kernel_size: 0,
         }
     }
 
@@ -1333,6 +1407,7 @@ impl MAGConfig {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
+            kernel_size: 0,
         }
     }
 
@@ -1363,6 +1438,7 @@ impl MAGConfig {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
+            kernel_size: 0,
         }
     }
 
@@ -1392,6 +1468,7 @@ impl MAGConfig {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
+            kernel_size: 0,
         }
     }
 
@@ -1422,6 +1499,7 @@ impl MAGConfig {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
+            kernel_size: 0,
         }
     }
 
@@ -1452,6 +1530,7 @@ impl MAGConfig {
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
+            kernel_size: 0,
         }
     }
 }
@@ -1509,6 +1588,11 @@ impl MAGParams {
                 let mut freq_rng = SimpleRng::new(seed.wrapping_add(5000 + level as u64 * 100));
                 level_params.init_freq_gate(d, &mut freq_rng, level);
             }
+            // Initialize Conv1D weights if kernel_size > 0
+            if cfg.kernel_size > 0 {
+                let mut conv_rng = SimpleRng::new(seed.wrapping_add(7000 + level as u64 * 100));
+                level_params.init_conv(d, cfg.kernel_size, &mut conv_rng);
+            }
             levels.push(level_params);
         }
 
@@ -1543,6 +1627,12 @@ impl MAGParams {
             if has_freq {
                 z.w_freq = vec![0.0f32; d];
                 z.b_freq = vec![0.0f32; 1];
+            }
+            if cfg.kernel_size > 0 {
+                z.w_k_conv = vec![0.0f32; d * cfg.kernel_size];
+                z.b_k_conv = vec![0.0f32; d];
+                z.w_q_conv = vec![0.0f32; d * cfg.kernel_size];
+                z.b_q_conv = vec![0.0f32; d];
             }
             z
         }).collect();
@@ -2099,5 +2189,104 @@ mod tests {
         assert!(!ts.is_empty());
         assert!(ts.starts_with("epoch:"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── Conv1D field tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_gates_eta_field() {
+        let g = crate::delta_rule::Gates { alpha: 0.5, theta: 0.1, eta: 0.9 };
+        assert_eq!(g.alpha, 0.5);
+        assert_eq!(g.theta, 0.1);
+        assert_eq!(g.eta, 0.9);
+    }
+
+    #[test]
+    fn test_conv_fields_disabled() {
+        let cfg = MAGConfig::test_config(); // kernel_size: 0
+        assert_eq!(cfg.kernel_size, 0);
+        let params = MAGParams::init(&cfg, 42);
+        for level in &params.levels {
+            assert!(level.w_k_conv.is_empty());
+            assert!(level.b_k_conv.is_empty());
+            assert!(level.w_q_conv.is_empty());
+            assert!(level.b_q_conv.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_conv_fields_enabled() {
+        let mut cfg = MAGConfig::test_config();
+        cfg.kernel_size = 4;
+        let d = cfg.swa.d_model;
+        let params = MAGParams::init(&cfg, 42);
+        for level in &params.levels {
+            assert_eq!(level.w_k_conv.len(), d * 4);
+            assert_eq!(level.b_k_conv.len(), d);
+            assert_eq!(level.w_q_conv.len(), d * 4);
+            assert_eq!(level.b_q_conv.len(), d);
+            // Bias should be zeros
+            assert!(level.b_k_conv.iter().all(|&x| x == 0.0));
+            assert!(level.b_q_conv.iter().all(|&x| x == 0.0));
+            // Weights should be non-zero (random init)
+            assert!(level.w_k_conv.iter().any(|&x| x != 0.0));
+            assert!(level.w_q_conv.iter().any(|&x| x != 0.0));
+        }
+    }
+
+    #[test]
+    fn test_conv_num_params() {
+        let mut cfg = MAGConfig::test_config();
+        let d = cfg.swa.d_model;
+        let params_no_conv = MAGParams::init(&cfg, 42);
+        let base_count = params_no_conv.num_params();
+
+        cfg.kernel_size = 4;
+        let params_conv = MAGParams::init(&cfg, 42);
+        let conv_count = params_conv.num_params();
+        // Each level adds 2*d*ks + 2*d = 2*d*(ks+1) params for conv
+        let expected_extra = cfg.k * (2 * d * 4 + 2 * d);
+        assert_eq!(conv_count, base_count + expected_extra);
+    }
+
+    #[test]
+    fn test_conv_flat_roundtrip() {
+        use crate::opaque_adapters::*;
+        let mut cfg = MAGConfig::test_config();
+        cfg.kernel_size = 4;
+        let params = MAGParams::init(&cfg, 42);
+        let level = &params.levels[0];
+
+        let mut flat = Vec::new();
+        level_params_to_flat(level, &mut flat);
+        let reconstructed = level_params_from_flat(&flat, cfg.swa.d_model, cfg.kernel_size);
+
+        assert_eq!(level.w_k_conv, reconstructed.w_k_conv);
+        assert_eq!(level.b_k_conv, reconstructed.b_k_conv);
+        assert_eq!(level.w_q_conv, reconstructed.w_q_conv);
+        assert_eq!(level.b_q_conv, reconstructed.b_q_conv);
+    }
+
+    #[test]
+    fn test_conv_accumulate() {
+        let mut cfg = MAGConfig::test_config();
+        cfg.kernel_size = 4;
+        let d = cfg.swa.d_model;
+        let params = MAGParams::init(&cfg, 42);
+        let mut acc = MemoryLevelParams::zeros_like_from(&params.levels[0], d);
+        acc.accumulate(&params.levels[0]);
+        assert_eq!(acc.w_k_conv, params.levels[0].w_k_conv);
+    }
+
+    #[test]
+    fn test_conv_zeros_like_from() {
+        let mut cfg = MAGConfig::test_config();
+        cfg.kernel_size = 4;
+        let d = cfg.swa.d_model;
+        let params = MAGParams::init(&cfg, 42);
+        let z = MemoryLevelParams::zeros_like_from(&params.levels[0], d);
+        assert_eq!(z.w_k_conv.len(), params.levels[0].w_k_conv.len());
+        assert_eq!(z.b_k_conv.len(), params.levels[0].b_k_conv.len());
+        assert!(z.w_k_conv.iter().all(|&x| x == 0.0));
     }
 }

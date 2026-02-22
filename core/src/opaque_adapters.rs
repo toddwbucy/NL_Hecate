@@ -36,6 +36,8 @@ pub fn level_params_flat_len(p: &MemoryLevelParams) -> usize {
         + p.w_eta.len() + p.b_eta.len()
         + p.w_omega.len()
         + p.w_freq.len() + p.b_freq.len()
+        + p.w_k_conv.len() + p.b_k_conv.len()
+        + p.w_q_conv.len() + p.b_q_conv.len()
 }
 
 /// Flatten MemoryLevelParams into a contiguous f32 slice.
@@ -53,12 +55,18 @@ pub fn level_params_to_flat(p: &MemoryLevelParams, out: &mut Vec<f32>) {
     out.extend_from_slice(&p.w_omega);
     out.extend_from_slice(&p.w_freq);
     out.extend_from_slice(&p.b_freq);
+    out.extend_from_slice(&p.w_k_conv);
+    out.extend_from_slice(&p.b_k_conv);
+    out.extend_from_slice(&p.w_q_conv);
+    out.extend_from_slice(&p.b_q_conv);
 }
 
 /// Reconstruct MemoryLevelParams from a flat slice. Requires knowing d.
 /// w_freq and b_freq are variable-length (empty when FrequencySchedule::Fixed,
 /// d and 1 respectively when Learned). Determined from remaining slice length.
-pub fn level_params_from_flat(flat: &[f32], d: usize) -> MemoryLevelParams {
+/// `kernel_size`: Conv1D kernel size (0 = no conv fields). When > 0, expects
+/// 2*d*kernel_size + 2*d trailing elements for w_k_conv/b_k_conv/w_q_conv/b_q_conv.
+pub fn level_params_from_flat(flat: &[f32], d: usize, kernel_size: usize) -> MemoryLevelParams {
     let mut offset = 0;
     let take = |off: &mut usize, n: usize| -> Vec<f32> {
         let slice = flat[*off..*off + n].to_vec();
@@ -75,19 +83,61 @@ pub fn level_params_from_flat(flat: &[f32], d: usize) -> MemoryLevelParams {
     let w_eta = take(&mut offset, 2 * d);
     let b_eta = take(&mut offset, 1);
     let w_omega = take(&mut offset, d * 2 * d);
-    // w_freq/b_freq: consume remaining (0 if Fixed schedule, d+1 if Learned)
+    // Variable-length optional fields: freq then conv.
+    // Both are detected from the remaining buffer length when kernel_size == 0
+    // (opaque backward adapters don't carry kernel_size in metadata).
     let remaining = flat.len() - offset;
-    let (w_freq, b_freq) = if remaining > 0 {
-        assert!(remaining == d + 1,
-            "malformed level_params buffer: expected 0 or {} trailing elements, got {}",
-            d + 1, remaining);
+    // Determine actual kernel_size: if caller passed 0, infer from buffer.
+    // Conv fields occupy 2*d*ks + 2*d = 2*d*(ks+1) elements.
+    // Freq fields occupy 0 or d+1 elements.
+    // Note: auto-detection is unambiguous for d >= 2 (since d+1 is odd when d is even,
+    // it cannot equal 2*d*(ks+1) which is always even). For d=1, pass kernel_size explicitly.
+    assert!(kernel_size > 0 || remaining == 0 || d >= 2,
+        "auto-detect requires d >= 2; pass kernel_size explicitly for d=1");
+    let effective_ks = if kernel_size > 0 {
+        kernel_size
+    } else if remaining > 0 {
+        // Try freq = d+1 first, then check if leftover is valid conv
+        let leftover = if remaining >= d + 1 && (remaining == d + 1 || (remaining > d + 1 && (remaining - (d + 1)) % (2 * d) == 0)) {
+            remaining - (d + 1)
+        } else {
+            remaining
+        };
+        if leftover > 0 && leftover % (2 * d) == 0 {
+            leftover / (2 * d) - 1
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    // Now parse freq: present if remaining > conv_size
+    let conv_size = if effective_ks > 0 { 2 * d * effective_ks + 2 * d } else { 0 };
+    let freq_size = remaining - conv_size;
+    if freq_size > 0 {
+        assert!(freq_size == d + 1,
+            "malformed level_params buffer: expected freq size 0 or {}, got {}",
+            d + 1, freq_size);
+    }
+    let (w_freq, b_freq) = if freq_size > 0 {
         (take(&mut offset, d), take(&mut offset, 1))
     } else {
         (vec![], vec![])
     };
+    let (w_k_conv, b_k_conv, w_q_conv, b_q_conv) = if effective_ks > 0 {
+        (
+            take(&mut offset, d * effective_ks),
+            take(&mut offset, d),
+            take(&mut offset, d * effective_ks),
+            take(&mut offset, d),
+        )
+    } else {
+        (vec![], vec![], vec![], vec![])
+    };
     MemoryLevelParams {
         w_k_mem, w_v_mem, w_q_mem, w_alpha, b_alpha, w_theta, b_theta,
         w_eta, b_eta, w_omega, w_freq, b_freq,
+        w_k_conv, b_k_conv, w_q_conv, b_q_conv,
     }
 }
 
@@ -153,7 +203,7 @@ pub fn delta_rule_opaque_backward(
     d_inputs: &mut [Vec<f32>],
 ) {
     let (seq_len, d, bias, sign_sharpness) = read_meta_with_bias(saved[0]);
-    let level_params = level_params_from_flat(saved[1], d);
+    let level_params = level_params_from_flat(saved[1], d, 0);
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
@@ -187,7 +237,7 @@ pub fn titans_lmm_opaque_backward(
     d_inputs: &mut [Vec<f32>],
 ) {
     let (seq_len, d, bias, sign_sharpness) = read_meta_with_bias(saved[0]);
-    let level_params = level_params_from_flat(saved[1], d);
+    let level_params = level_params_from_flat(saved[1], d, 0);
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
@@ -224,7 +274,7 @@ pub fn hebbian_opaque_backward(
     d_inputs: &mut [Vec<f32>],
 ) {
     let (seq_len, d) = read_meta_2(saved[0]);
-    let level_params = level_params_from_flat(saved[1], d);
+    let level_params = level_params_from_flat(saved[1], d, 0);
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
@@ -257,7 +307,7 @@ pub fn moneta_opaque_backward(
     let lp_p = saved[0][3];
     let lambda_2 = saved[0][4];
     let sign_sharpness = if saved[0].len() > 5 { saved[0][5] } else { 10.0 };
-    let level_params = level_params_from_flat(saved[1], d);
+    let level_params = level_params_from_flat(saved[1], d, 0);
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
@@ -300,7 +350,7 @@ pub fn yaad_opaque_backward(
     let delta = saved[0][3];
     let lambda_local = saved[0][4];
     let lambda_2 = saved[0][5];
-    let level_params = level_params_from_flat(saved[1], d);
+    let level_params = level_params_from_flat(saved[1], d, 0);
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
@@ -342,7 +392,7 @@ pub fn memora_opaque_backward(
     d_inputs: &mut [Vec<f32>],
 ) {
     let (seq_len, d, d_hidden) = read_meta_3(saved[0]);
-    let level_params = level_params_from_flat(saved[1], d);
+    let level_params = level_params_from_flat(saved[1], d, 0);
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
@@ -390,7 +440,7 @@ pub fn lattice_osr_opaque_backward(
     } else {
         crate::model::LatticeVariant::Decode
     };
-    let level_params = level_params_from_flat(saved[1], d);
+    let level_params = level_params_from_flat(saved[1], d, 0);
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
@@ -427,7 +477,7 @@ pub fn trellis_opaque_backward(
     let (seq_len, d, d_k) = read_meta_3(saved[0]);
     let lambda_k = saved[0][3];
     let lambda_v = saved[0][4];
-    let level_params = level_params_from_flat(saved[1], d);
+    let level_params = level_params_from_flat(saved[1], d, 0);
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
@@ -471,7 +521,7 @@ pub fn atlas_omega_opaque_backward(
     d_inputs: &mut [Vec<f32>],
 ) {
     let (seq_len, d) = read_meta_2(saved[0]);
-    let level_params = level_params_from_flat(saved[1], d);
+    let level_params = level_params_from_flat(saved[1], d, 0);
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
@@ -1045,7 +1095,7 @@ mod tests {
         let params = MemoryLevelParams::init(d, &mut rng, 3.0, -4.6, -1.0);
 
         let flat = level_params_grads_to_flat(&params);
-        let reconstructed = level_params_from_flat(&flat, d);
+        let reconstructed = level_params_from_flat(&flat, d, 0);
 
         assert_eq!(params.w_k_mem, reconstructed.w_k_mem);
         assert_eq!(params.w_v_mem, reconstructed.w_v_mem);
@@ -1059,6 +1109,33 @@ mod tests {
         assert_eq!(params.w_omega, reconstructed.w_omega);
         assert_eq!(params.w_freq, reconstructed.w_freq);
         assert_eq!(params.b_freq, reconstructed.b_freq);
+    }
+
+    #[test]
+    fn test_conv_auto_detect_roundtrip() {
+        use crate::tensor::SimpleRng;
+        let d = 8;
+        let kernel_size = 4;
+        let mut rng = SimpleRng::new(99);
+        let mut params = MemoryLevelParams::init(d, &mut rng, 3.0, -4.6, -1.0);
+        // Simulate conv fields (as init_conv would produce)
+        params.w_k_conv = vec![0.1; d * kernel_size];
+        params.b_k_conv = vec![0.0; d];
+        params.w_q_conv = vec![0.2; d * kernel_size];
+        params.b_q_conv = vec![0.0; d];
+
+        // Serialize with explicit kernel_size
+        let flat = level_params_grads_to_flat(&params);
+
+        // Reconstruct with kernel_size=0 (auto-detect)
+        let recon = level_params_from_flat(&flat, d, 0);
+        assert_eq!(recon.w_k_conv, params.w_k_conv);
+        assert_eq!(recon.b_k_conv, params.b_k_conv);
+        assert_eq!(recon.w_q_conv, params.w_q_conv);
+        assert_eq!(recon.b_q_conv, params.b_q_conv);
+        assert_eq!(recon.w_k_mem, params.w_k_mem);
+        assert_eq!(recon.w_freq, params.w_freq);
+        assert_eq!(recon.b_freq, params.b_freq);
     }
 
     #[test]
