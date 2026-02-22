@@ -242,27 +242,20 @@ pub fn titans_lmm_opaque_backward(
     let d_y = d_outputs[0];
 
     // Read momentum_kind from extra_meta if present (new format: meta[4] = momentum_kind as f32).
-    // DeepMomentum requires deep_cache to be restored for backward — if those saved entries
-    // aren't present, downgrade to EMA to avoid panic in step_backward().
     let momentum_kind = if saved[0].len() > 4 {
         match saved[0][4] as u8 {
             0 => crate::model::MomentumKind::None,
             1 => crate::model::MomentumKind::EMA,
             2 => crate::model::MomentumKind::DeltaMomentum,
-            3 => {
-                // DeepMomentum backward needs deep_cache; without saved MLP
-                // state we can't reconstruct it, so fall back to EMA.
-                // Full deep momentum opaque backward is future work.
-                eprintln!(
-                    "WARNING: opaque backward recorded DeepMomentum but deep_cache \
-                     cannot be restored (MLP state not saved). Falling back to EMA."
-                );
-                debug_assert!(false,
-                    "DeepMomentum opaque backward not yet implemented — \
-                     record_on_tape must save MLP state before this path is used");
-                crate::model::MomentumKind::EMA
-            }
-            _ => crate::model::MomentumKind::EMA,
+            3 => panic!(
+                "DeepMomentum recorded on tape but deep_cache/MLP state not saved — \
+                 cannot reconstruct opaque backward. record_on_tape must save MLP \
+                 W1/W2/pre_act/hidden/output before DeepMomentum can use the tape."
+            ),
+            v => panic!(
+                "Unknown MomentumKind value {v} in opaque backward meta — \
+                 tape may be corrupt or from an incompatible version"
+            ),
         }
     } else {
         crate::model::MomentumKind::EMA // backward compat: old recordings used EMA
@@ -809,8 +802,11 @@ impl OpaqueVjp for TitansLMM {
             tape.alloc(cache.y, vec![]),
         ];
 
-        // Save DeltaMomentum decay buffer
-        if !cache.decay.is_empty() {
+        // Save DeltaMomentum decay buffer — keyed on momentum_kind, not emptiness,
+        // so backward can rely on saved[18] being present for DeltaMomentum.
+        if self.momentum_kind == crate::model::MomentumKind::DeltaMomentum {
+            assert!(!cache.decay.is_empty(),
+                "DeltaMomentum forward produced empty decay buffer — step() bug");
             cache_ids.push(tape.alloc(cache.decay, vec![]));
         }
 
