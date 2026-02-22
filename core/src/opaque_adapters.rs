@@ -253,6 +253,13 @@ pub fn titans_lmm_opaque_backward(
                 // DeepMomentum backward needs deep_cache; without saved MLP
                 // state we can't reconstruct it, so fall back to EMA.
                 // Full deep momentum opaque backward is future work.
+                eprintln!(
+                    "WARNING: opaque backward recorded DeepMomentum but deep_cache \
+                     cannot be restored (MLP state not saved). Falling back to EMA."
+                );
+                debug_assert!(false,
+                    "DeepMomentum opaque backward not yet implemented — \
+                     record_on_tape must save MLP state before this path is used");
                 crate::model::MomentumKind::EMA
             }
             _ => crate::model::MomentumKind::EMA,
