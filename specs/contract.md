@@ -617,16 +617,16 @@ specs/                              <- root node
   algorithms/                       <- algorithmic components (paper math)
     memory_update_rules/            <- MIRAS 4-knob framework (9 rules)
       00_interface.md               <- MemoryRule trait definition
-      titans_family/                <- Titans-derived rules
+      titans_family/                <- Titans-derived rules (01-04, global numbering)
         01_titans_lmm.md            <- Full LMM with momentum
         02_delta_rule.md            <- eta=0 special case
         03_hebbian_rule.md          <- No gradient, direct association
         04_atlas_omega.md           <- 3-gate (alpha/theta/eta) with omega (v0.4.1)
-      miras_family/                 <- MIRAS design space exploration
-        04_moneta.md                <- 2-layer MLP + l_p + L_q
+      miras_family/                 <- MIRAS design space exploration (04-06)
+        04_moneta.md                <- 2-layer MLP + l_p + L_q (04 shared with atlas_omega)
         05_yaad.md                  <- Huber loss + decoupled retention
         06_memora.md                <- KL divergence + softmax
-      compression_family/           <- Memory compression variants
+      compression_family/           <- Memory compression variants (07-08)
         07_lattice_osr.md           <- Orthogonal State Recurrence
         08_trellis_twopass.md       <- Two-pass KV compression
     attentional_biases/             <- MIRAS Knob #2 extensions (v0.4.1)
