@@ -36,7 +36,8 @@ use crate::tensor::{
 };
 use crate::retention::{l2_apply_retention, l2_decoupled_gradient};
 use crate::model::MemoryLevelParams;
-use crate::delta_rule::{MemoryRule, MemoryState, Gates, MemoryError};
+use crate::delta_rule::{MemoryRule, Gates, MemoryError};
+use crate::moneta::MlpState;
 
 // ── YAAD implementation ─────────────────────────────────────────────
 
@@ -112,6 +113,7 @@ fn huber_grad(e: f32, delta: f32) -> f32 {
 
 impl MemoryRule for YAAD {
     type Cache = YAADCache;
+    type State = MlpState;
 
     fn level(&self) -> usize { 0 }
 
@@ -119,16 +121,21 @@ impl MemoryRule for YAAD {
         crate::parallel::supported_strategies(crate::model::MemoryRuleKind::YAAD)
     }
 
-    fn init(&self, d: usize) -> MemoryState {
-        // For API compatibility — actual YAAD state is W1+W2+boundaries, not a d×d matrix.
-        MemoryState { m: vec![0.0f32; d * d], d }
+    fn init(&self, d: usize) -> MlpState {
+        let dh = self.d_hidden;
+        MlpState {
+            w1: vec![0.0f32; dh * d],
+            w2: vec![0.0f32; d * dh],
+            d_hidden: dh,
+            d,
+        }
     }
 
-    fn write(&self, _state: &mut MemoryState, _k: &[f32], _v: &[f32], _gates: &Gates) -> Result<(), MemoryError> {
+    fn write(&self, _state: &mut MlpState, _k: &[f32], _v: &[f32], _gates: &Gates) -> Result<(), MemoryError> {
         Err(MemoryError::UnsupportedOperation)
     }
 
-    fn read(&self, _state: &MemoryState, _q: &[f32], _out: &mut [f32]) -> Result<(), MemoryError> {
+    fn read(&self, _state: &MlpState, _q: &[f32], _out: &mut [f32]) -> Result<(), MemoryError> {
         Err(MemoryError::UnsupportedOperation)
     }
 
@@ -930,9 +937,12 @@ mod tests {
     fn test_yaad_init() {
         let rule = YAAD { d_hidden: 4, delta: 1.0, lambda_local: 0.01, lambda_2: 0.01 };
         let state = rule.init(8);
-        assert_eq!(state.m.len(), 64);
+        assert_eq!(state.w1.len(), 4 * 8); // [d_hidden, d]
+        assert_eq!(state.w2.len(), 8 * 4); // [d, d_hidden]
+        assert_eq!(state.d_hidden, 4);
         assert_eq!(state.d, 8);
-        assert!(state.m.iter().all(|&x| x == 0.0));
+        assert!(state.w1.iter().all(|&x| x == 0.0));
+        assert!(state.w2.iter().all(|&x| x == 0.0));
     }
 
     #[test]

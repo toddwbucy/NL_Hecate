@@ -39,7 +39,8 @@ use crate::tensor::{
 };
 use crate::retention::kl_apply_retention_inplace;
 use crate::model::MemoryLevelParams;
-use crate::delta_rule::{MemoryRule, MemoryState, Gates, MemoryError};
+use crate::delta_rule::{MemoryRule, Gates, MemoryError};
+use crate::moneta::MlpState;
 
 // ── MEMORA implementation ─────────────────────────────────────────────
 
@@ -95,6 +96,7 @@ pub struct MEMORACache {
 
 impl MemoryRule for MEMORA {
     type Cache = MEMORACache;
+    type State = MlpState;
 
     fn level(&self) -> usize { 0 }
 
@@ -102,16 +104,21 @@ impl MemoryRule for MEMORA {
         crate::parallel::supported_strategies(crate::model::MemoryRuleKind::MEMORA)
     }
 
-    fn init(&self, d: usize) -> MemoryState {
-        // For API compatibility — actual MEMORA state is W1+W2, not a d×d matrix.
-        MemoryState { m: vec![0.0f32; d * d], d }
+    fn init(&self, d: usize) -> MlpState {
+        let dh = self.d_hidden;
+        MlpState {
+            w1: vec![0.0f32; dh * d],
+            w2: vec![0.0f32; d * dh],
+            d_hidden: dh,
+            d,
+        }
     }
 
-    fn write(&self, _state: &mut MemoryState, _k: &[f32], _v: &[f32], _gates: &Gates) -> Result<(), MemoryError> {
+    fn write(&self, _state: &mut MlpState, _k: &[f32], _v: &[f32], _gates: &Gates) -> Result<(), MemoryError> {
         Err(MemoryError::UnsupportedOperation)
     }
 
-    fn read(&self, _state: &MemoryState, _q: &[f32], _out: &mut [f32]) -> Result<(), MemoryError> {
+    fn read(&self, _state: &MlpState, _q: &[f32], _out: &mut [f32]) -> Result<(), MemoryError> {
         Err(MemoryError::UnsupportedOperation)
     }
 
@@ -932,9 +939,12 @@ mod tests {
     fn test_memora_init() {
         let rule = MEMORA { d_hidden: 4 };
         let state = rule.init(8);
-        assert_eq!(state.m.len(), 64);
+        assert_eq!(state.w1.len(), 4 * 8); // [d_hidden, d]
+        assert_eq!(state.w2.len(), 8 * 4); // [d, d_hidden]
+        assert_eq!(state.d_hidden, 4);
         assert_eq!(state.d, 8);
-        assert!(state.m.iter().all(|&x| x == 0.0));
+        assert!(state.w1.iter().all(|&x| x == 0.0));
+        assert!(state.w2.iter().all(|&x| x == 0.0));
     }
 
     #[test]

@@ -34,7 +34,20 @@ use crate::tensor::{
 };
 use crate::retention::l2_apply_retention;
 use crate::model::MemoryLevelParams;
-use crate::delta_rule::{MemoryRule, MemoryState, Gates, MemoryError};
+use crate::delta_rule::{MemoryRule, Gates, MemoryError};
+
+// ── Trellis State ───────────────────────────────────────────────────
+
+/// Memory state for Trellis: separate key and value compressor matrices.
+#[derive(Clone, Debug)]
+pub struct TrellisState {
+    /// Key compressor S_K: [d_k, d] row-major.
+    pub s_k: Vec<f32>,
+    /// Value compressor S_V: [d, d_k] row-major.
+    pub s_v: Vec<f32>,
+    pub d_k: usize,
+    pub d: usize,
+}
 
 // ── Trellis implementation ──────────────────────────────────────────
 
@@ -102,25 +115,29 @@ pub struct TrellisCache {
 
 impl MemoryRule for Trellis {
     type Cache = TrellisCache;
+    type State = TrellisState;
 
     fn level(&self) -> usize { 0 }
     fn supported_parallelization(&self) -> &'static [&'static str] {
         crate::parallel::supported_strategies(crate::model::MemoryRuleKind::Trellis)
     }
 
-    fn init(&self, d: usize) -> MemoryState {
-        // Trellis uses two matrices, but MemoryState only has one flat vec.
-        // For the trait API, store S_K ++ S_V concatenated.
+    fn init(&self, d: usize) -> TrellisState {
         let d_k = self.d_k;
-        MemoryState { m: vec![0.0f32; d_k * d + d * d_k], d }
+        TrellisState {
+            s_k: vec![0.0f32; d_k * d],
+            s_v: vec![0.0f32; d * d_k],
+            d_k,
+            d,
+        }
     }
 
-    fn write(&self, _state: &mut MemoryState, _k: &[f32], _v: &[f32], _gates: &Gates) -> Result<(), MemoryError> {
+    fn write(&self, _state: &mut TrellisState, _k: &[f32], _v: &[f32], _gates: &Gates) -> Result<(), MemoryError> {
         // Trellis fuses write+read in step() — two-pass update doesn't fit per-token API
         Err(MemoryError::UnsupportedOperation)
     }
 
-    fn read(&self, _state: &MemoryState, _q: &[f32], _out: &mut [f32]) -> Result<(), MemoryError> {
+    fn read(&self, _state: &TrellisState, _q: &[f32], _out: &mut [f32]) -> Result<(), MemoryError> {
         Err(MemoryError::UnsupportedOperation)
     }
 
@@ -1062,7 +1079,9 @@ mod tests {
     fn test_trellis_init() {
         let rule = Trellis { d_k: 4, lambda_k: 0.01, lambda_v: 0.01 };
         let state = rule.init(8);
-        assert_eq!(state.m.len(), 4 * 8 + 8 * 4); // sk_size + sv_size
+        assert_eq!(state.s_k.len(), 4 * 8); // [d_k, d]
+        assert_eq!(state.s_v.len(), 8 * 4); // [d, d_k]
+        assert_eq!(state.d_k, 4);
         assert_eq!(state.d, 8);
     }
 

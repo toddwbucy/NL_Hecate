@@ -75,6 +75,14 @@ pub trait MemoryRule: OpaqueVjp {
     /// Cache type for backward pass.
     type Cache;
 
+    /// Rule-specific memory state type.
+    ///
+    /// Matrix-based rules (Delta, Titans, Hebbian, Atlas) use `MemoryState` (d×d matrix).
+    /// LatticeOSR uses `LatticeState` (m_slots × d slot matrix).
+    /// Trellis uses `TrellisState` (separate S_K and S_V compressor matrices).
+    /// MLP-family rules (Moneta, YAAD, MEMORA) use `MlpState` (W1 + W2 weight matrices).
+    type State;
+
     /// CMS frequency level index. Level 0 fires every token.
     fn level(&self) -> usize;
 
@@ -82,21 +90,21 @@ pub trait MemoryRule: OpaqueVjp {
     fn supported_parallelization(&self) -> &'static [&'static str];
 
     /// Create initial memory state (M_0 = zeros).
-    fn init(&self, d: usize) -> MemoryState;
+    fn init(&self, d: usize) -> Self::State;
 
     /// Per-token WRITE: mutate memory state given projected k, v and gates.
     /// Does NOT produce output — use `read` after write.
     ///
     /// Returns `Err(MemoryError::UnsupportedOperation)` for MLP-family rules
     /// (MONETA, YAAD, MEMORA) where write is fused into `step()`.
-    fn write(&self, state: &mut MemoryState, k: &[f32], v: &[f32], gates: &Gates) -> Result<(), MemoryError>;
+    fn write(&self, state: &mut Self::State, k: &[f32], v: &[f32], gates: &Gates) -> Result<(), MemoryError>;
 
     /// Per-token READ: query memory with q, write result to `out`.
     /// Pure function — does NOT mutate state.
     ///
     /// Returns `Err(MemoryError::UnsupportedOperation)` for MLP-family rules
     /// (MONETA, YAAD, MEMORA) where read is fused into `step()`.
-    fn read(&self, state: &MemoryState, q: &[f32], out: &mut [f32]) -> Result<(), MemoryError>;
+    fn read(&self, state: &Self::State, q: &[f32], out: &mut [f32]) -> Result<(), MemoryError>;
 
     /// Full sequence forward: project → gate → write → read for all tokens.
     /// Returns (output [seq_len, d], cache for backward).
@@ -188,6 +196,7 @@ pub struct DeltaRuleCache {
 
 impl MemoryRule for DeltaRule {
     type Cache = DeltaRuleCache;
+    type State = MemoryState;
 
     fn level(&self) -> usize { 0 }
 

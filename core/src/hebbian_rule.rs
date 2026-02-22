@@ -57,6 +57,7 @@ pub struct HebbianCache {
 
 impl MemoryRule for HebbianRule {
     type Cache = HebbianCache;
+    type State = MemoryState;
 
     fn level(&self) -> usize { 0 }
 
