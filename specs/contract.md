@@ -335,8 +335,10 @@ trait MemoryRule: OpaqueVjp {
 
 // CompositionPattern trait (composition_pattern.rs)
 trait CompositionPattern {
-  fn prepend_persistent(cfg, level_params, embedded) -> Vec<f32>;
+  fn attention_kind(&self) -> AttentionKind;
 }
+// Standalone function (not a trait method):
+// fn prepend_persistent(x, seq_len, persistent, n_persistent, d_model) -> Vec<f32>
 
 // Invalid combinations are compile errors:
 // - KL retention requires softmax structure (ProbabilitySimplex)
