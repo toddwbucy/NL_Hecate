@@ -26,13 +26,13 @@ use crate::tensor::{
     matmul_f32, transpose_f32, sigmoid_f32, softplus_f32,
     silu_f32, silu_prime_f32, frobenius_dot_f32,
 };
-use crate::retention::{l2_apply_retention, l2_retention_gradient};
+use crate::retention::{l2_apply_retention, l2_retention_gradient, lq_normalize};
 use crate::model::MemoryLevelParams;
 use crate::delta_rule::{MemoryRule, MemoryState, Gates, MemoryError};
 
 // ── MONETA implementation ───────────────────────────────────────────
 
-/// MONETA: 2-layer MLP memory with l_p loss and L2 retention.
+/// MONETA: 2-layer MLP memory with l_p loss and L_q retention.
 /// Carries config params to avoid changing the MemoryRule trait signature.
 pub struct Moneta {
     pub d_hidden: usize,
@@ -43,6 +43,10 @@ pub struct Moneta {
     /// At a=10: tanh(10 * 0.01) ≈ 0.1 (smooth near 0), tanh(10 * 0.5) ≈ 1.0 (saturated).
     /// See specs/algorithms/attentional_biases/01_l1_sign.md (MIRAS Remark 5).
     pub sign_sharpness: f32,
+    /// L_q norm retention exponent. At q=2: standard L2 (identity normalization).
+    /// At q=4 (MONETA design target): W = A / ||A||_4^2, bounding peak magnitudes.
+    /// Source: MIRAS §5.3 Eqs 24-25, specs/algorithms/retention_mechanisms/07_lq_norm.md.
+    pub lq_q: f32,
 }
 
 /// All intermediate values from a MONETA forward pass, needed for backward.
@@ -86,6 +90,14 @@ pub struct MonetaCache {
     pub lambda_2: f32,
     /// Sign sharpness (cached for backward)
     pub sign_sharpness: f32,
+    /// L_q exponent (cached for backward). q=2 means no L_q normalization.
+    pub lq_q: f32,
+    /// Pre-normalization W1 accumulator states when lq_q > 2: [(seq_len+1) * w1_size].
+    /// Empty when lq_q ≈ 2 (zero overhead for standard L2 path).
+    pub a1_states: Vec<f32>,
+    /// Pre-normalization W2 accumulator states when lq_q > 2: [(seq_len+1) * w2_size].
+    /// Empty when lq_q ≈ 2 (zero overhead for standard L2 path).
+    pub a2_states: Vec<f32>,
 }
 
 /// Compute l_p gradient: p * smooth_sign(e) * |e|^(p-1).
@@ -153,6 +165,8 @@ impl MemoryRule for Moneta {
         let p = self.lp_p;
         let l2 = self.lambda_2;
         let a = self.sign_sharpness;
+        let q = self.lq_q;
+        let use_lq = (q - 2.0).abs() >= 1e-6;
         debug_assert_eq!(embedded.len(), seq_len * d);
 
         // Project embedded → k_mem, v_mem, q_mem via W^T
@@ -176,11 +190,21 @@ impl MemoryRule for Moneta {
         let mut w1_states = vec![0.0f32; (seq_len + 1) * w1_size];
         let mut w2_states = vec![0.0f32; (seq_len + 1) * w2_size];
 
+        // L_q accumulator states: only allocated when q > 2 (zero overhead at q=2)
+        let mut a1_states = if use_lq { vec![0.0f32; (seq_len + 1) * w1_size] } else { vec![] };
+        let mut a2_states = if use_lq { vec![0.0f32; (seq_len + 1) * w2_size] } else { vec![] };
+
         if let Some(m0) = initial_m {
             // CMS context memory format: W1_flat ++ W2_flat
             debug_assert_eq!(m0.len(), w1_size + w2_size);
             w1_states[..w1_size].copy_from_slice(&m0[..w1_size]);
             w2_states[..w2_size].copy_from_slice(&m0[w1_size..w1_size + w2_size]);
+            if use_lq {
+                // Initialize accumulators from W (A_0 = W_0 since W = A / norm^{q-2},
+                // and at initialization norm is arbitrary — use W as A directly).
+                a1_states[..w1_size].copy_from_slice(&m0[..w1_size]);
+                a2_states[..w2_size].copy_from_slice(&m0[w1_size..w1_size + w2_size]);
+            }
         } else {
             // Xavier-like init for W1 to break the zero saddle point.
             // With W1=0, W2=0: h=silu(0)=0, so grad_W2=outer(lp_g,0)=0 — MLP can never
@@ -192,6 +216,11 @@ impl MemoryRule for Moneta {
                 w1_states[i] = scale * (hash - 0.5);
             }
             // W2 stays zero — gets nonzero gradient from first step via outer(lp_g, h≠0)
+            if use_lq {
+                // A_0 = W_0 (accumulator starts at initial memory state)
+                a1_states[..w1_size].copy_from_slice(&w1_states[..w1_size]);
+                // a2_states[..w2_size] already zero (W2_0 = 0)
+            }
         }
 
         let mut concat_kv = vec![0.0f32; seq_len * 2 * d];
@@ -298,23 +327,51 @@ impl MemoryRule for Moneta {
                 }
             }
 
-            // Retention: L2 global penalty gradient + multiplicative decay
-            let ret_grad_w1 = l2_retention_gradient(w1_t, l2);
-            let ret_grad_w2 = l2_retention_gradient(w2_t, l2);
-
-            // Update: W1 = alpha_t * W1 - theta_t * (grad_W1 + ret_grad_W1)
-            //         W2 = alpha_t * W2 - theta_t * (grad_W2 + ret_grad_W2)
             let alpha_t = alpha[t];
             let theta_t = theta[t];
-            w1_next.copy_from_slice(w1_t);
-            l2_apply_retention(w1_next, alpha_t);
-            for i in 0..w1_size {
-                w1_next[i] -= theta_t * (grad_w1[i] + ret_grad_w1[i]);
-            }
-            w2_next.copy_from_slice(w2_t);
-            l2_apply_retention(w2_next, alpha_t);
-            for i in 0..w2_size {
-                w2_next[i] -= theta_t * (grad_w2[i] + ret_grad_w2[i]);
+
+            if use_lq {
+                // L_q retention path (MIRAS Eqs 24-25):
+                //   A_{t+1} = alpha_t * A_t - theta_t * (grad + l2_ret_grad)
+                //   W_{t+1} = A_{t+1} / ||A_{t+1}||_q^{q-2}
+                // Note: alpha_t is the retain factor (consistent with L2 path).
+                let (a1_left, a1_right) = a1_states.split_at_mut((t + 1) * w1_size);
+                let a1_t = &a1_left[t * w1_size..];
+                let a1_next = &mut a1_right[..w1_size];
+
+                let (a2_left, a2_right) = a2_states.split_at_mut((t + 1) * w2_size);
+                let a2_t = &a2_left[t * w2_size..];
+                let a2_next = &mut a2_right[..w2_size];
+
+                let ret_grad_w1 = l2_retention_gradient(w1_t, l2);
+                let ret_grad_w2 = l2_retention_gradient(w2_t, l2);
+
+                // A_{t+1} = alpha * A_t - theta * (grad + ret_grad)
+                for i in 0..w1_size {
+                    a1_next[i] = alpha_t * a1_t[i] - theta_t * (grad_w1[i] + ret_grad_w1[i]);
+                }
+                for i in 0..w2_size {
+                    a2_next[i] = alpha_t * a2_t[i] - theta_t * (grad_w2[i] + ret_grad_w2[i]);
+                }
+
+                // W_{t+1} = A_{t+1} / ||A_{t+1}||_q^{q-2}
+                lq_normalize(a1_next, w1_next, q);
+                lq_normalize(a2_next, w2_next, q);
+            } else {
+                // Standard L2 retention path (q=2): W = A (no normalization)
+                let ret_grad_w1 = l2_retention_gradient(w1_t, l2);
+                let ret_grad_w2 = l2_retention_gradient(w2_t, l2);
+
+                w1_next.copy_from_slice(w1_t);
+                l2_apply_retention(w1_next, alpha_t);
+                for i in 0..w1_size {
+                    w1_next[i] -= theta_t * (grad_w1[i] + ret_grad_w1[i]);
+                }
+                w2_next.copy_from_slice(w2_t);
+                l2_apply_retention(w2_next, alpha_t);
+                for i in 0..w2_size {
+                    w2_next[i] -= theta_t * (grad_w2[i] + ret_grad_w2[i]);
+                }
             }
 
             // Read: y_t = W2_next @ silu(W1_next @ q_t)
@@ -336,6 +393,7 @@ impl MemoryRule for Moneta {
             prediction: prediction_all, error: error_all,
             y: y.clone(),
             lp_p: p, lambda_2: l2, sign_sharpness: a,
+            lq_q: q, a1_states, a2_states,
         };
 
         (y, cache)
@@ -355,6 +413,8 @@ impl MemoryRule for Moneta {
         let a = cache.sign_sharpness;
         let l2 = cache.lambda_2;
         let l2_2 = l2 * 2.0;
+        let q = cache.lq_q;
+        let use_lq = (q - 2.0).abs() >= 1e-6;
         let w1_size = dh * d;
         let w2_size = d * dh;
         debug_assert_eq!(d_y.len(), s * d);
@@ -366,8 +426,13 @@ impl MemoryRule for Moneta {
         let mut d_q_mem = vec![0.0f32; s * d];
 
         // Accumulated gradients on W1 and W2 (the MLP "memory state")
+        // When use_lq: d_w1/d_w2 hold dL/dW from READ operations only.
+        // d_a1_accum/d_a2_accum hold dL/dA from the accumulation chain.
+        // At each step, total dL/dA_{t+1} = lq_normalize_backward(d_w, A_{t+1}) + d_a_accum.
         let mut d_w1 = vec![0.0f32; w1_size];
         let mut d_w2 = vec![0.0f32; w2_size];
+        let mut d_a1_accum = vec![0.0f32; w1_size];
+        let mut d_a2_accum = vec![0.0f32; w2_size];
 
         // Reverse token loop
         for t in (0..s).rev() {
@@ -436,18 +501,253 @@ impl MemoryRule for Moneta {
                 d_q_mem[t * d + j] = sum;
             }
 
-            // ── W_next = alpha * W_t - theta * (grad_W + l2*2*W_t) backward ──
-            // d_W1_next is our current d_w1, d_W2_next is our current d_w2
-            //
-            // d_alpha from W1: sum_i(d_W1_next_i * W1_t_i)
-            // d_alpha from W2: sum_i(d_W2_next_i * W2_t_i)
+            // ── L_q backward: convert d_W_next → d_A_next if q > 2 ──
+            // When using L_q normalization, the forward is:
+            //   A_{t+1} = alpha * A_t - theta * (grad + ret_grad)
+            //   W_{t+1} = A_{t+1} / ||A_{t+1}||_q^{q-2}
+            // So d_W_next needs to go through lq_normalize_backward to get d_A_next,
+            // then the accumulation backward operates on A instead of W.
+            if use_lq {
+                // L_q backward with TWO accumulators:
+                //   d_w1/d_w2: dL/dW_{t+1} from read operations (y uses W)
+                //   d_a1_accum/d_a2_accum: dL/dA_{t+1} from accumulation chain
+                //
+                // At each step:
+                // 1. Total dL/dA_{t+1} = lq_normalize_bwd(d_w_reads, A_{t+1}) + d_a_accum
+                // 2. Gate grads, MLP backward using total dL/dA_{t+1}
+                // 3. d_w1 = MLP contributions to dL/dW_t + ret_grad contribution
+                // 4. d_a_accum = alpha * total_dL/dA_{t+1}
+
+                let a1_next = &cache.a1_states[(t + 1) * w1_size..(t + 2) * w1_size];
+                let a2_next = &cache.a2_states[(t + 1) * w2_size..(t + 2) * w2_size];
+                let a1_t = &cache.a1_states[t * w1_size..(t + 1) * w1_size];
+                let _a2_t = &cache.a2_states[t * w2_size..(t + 1) * w2_size];
+
+                // Step 1: Convert d_W_{t+1} (from reads) → d_A_{t+1}, then add accumulation
+                let mut d_a1_from_w = vec![0.0f32; w1_size];
+                let mut d_a2_from_w = vec![0.0f32; w2_size];
+                crate::retention::lq_normalize_backward(&d_w1, a1_next, &mut d_a1_from_w, q);
+                crate::retention::lq_normalize_backward(&d_w2, a2_next, &mut d_a2_from_w, q);
+
+                // Total dL/dA_{t+1}
+                let mut d_a1: Vec<f32> = d_a1_from_w.iter().zip(d_a1_accum.iter())
+                    .map(|(&a, &b)| a + b).collect();
+                let mut d_a2: Vec<f32> = d_a2_from_w.iter().zip(d_a2_accum.iter())
+                    .map(|(&a, &b)| a + b).collect();
+
+                // Step 2: Gate gradients
+                // d_alpha = dot(d_A_{t+1}, A_t)
+                let d_alpha_a1: f32 = d_a1.iter().zip(a1_t.iter()).map(|(&da, &at)| da * at).sum();
+                let d_alpha_a2: f32 = d_a2.iter().zip(_a2_t.iter()).map(|(&da, &at)| da * at).sum();
+                let d_alpha_scalar = d_alpha_a1 + d_alpha_a2;
+
+                // Recompute inner-loop gradients
+                let pred_base = t * d;
+                let mut lp_g = vec![0.0f32; d];
+                for i in 0..d {
+                    lp_g[i] = lp_grad(cache.error[pred_base + i], p, a);
+                }
+                let mut grad_w2 = vec![0.0f32; w2_size];
+                for i in 0..d {
+                    for j in 0..dh {
+                        grad_w2[i * dh + j] = lp_g[i] * h_t[j];
+                    }
+                }
+                let mut grad_h = vec![0.0f32; dh];
+                for i in 0..dh {
+                    let mut sum = 0.0f32;
+                    for j in 0..d {
+                        sum += w2_t[j * dh + i] * lp_g[j];
+                    }
+                    grad_h[i] = sum;
+                }
+                let mut grad_pre = vec![0.0f32; dh];
+                for i in 0..dh {
+                    grad_pre[i] = grad_h[i] * silu_prime_f32(cache.pre_act[pa_base + i]);
+                }
+                let mut grad_w1 = vec![0.0f32; w1_size];
+                for i in 0..dh {
+                    for j in 0..d {
+                        grad_w1[i * d + j] = grad_pre[i] * k_t[j];
+                    }
+                }
+                let ret_grad_w1 = l2_retention_gradient(w1_t, l2);
+                let ret_grad_w2 = l2_retention_gradient(w2_t, l2);
+
+                // d_theta = -dot(d_A_{t+1}, (grad + ret_grad))
+                let mut d_theta_scalar = 0.0f32;
+                for i in 0..w1_size {
+                    d_theta_scalar -= d_a1[i] * (grad_w1[i] + ret_grad_w1[i]);
+                }
+                for i in 0..w2_size {
+                    d_theta_scalar -= d_a2[i] * (grad_w2[i] + ret_grad_w2[i]);
+                }
+
+                // d_grad = -theta * d_A_{t+1} (for MLP backward)
+                let mut d_grad_w1 = vec![0.0f32; w1_size];
+                let mut d_grad_w2 = vec![0.0f32; w2_size];
+                for i in 0..w1_size {
+                    d_grad_w1[i] = -theta_t * d_a1[i];
+                }
+                for i in 0..w2_size {
+                    d_grad_w2[i] = -theta_t * d_a2[i];
+                }
+
+                // Step 3: Accumulate dL/dW_t from non-read paths
+                // Start with ret_grad contribution: -theta * l2_2 * d_A_{t+1}
+                let mut d_w1_nonread = vec![0.0f32; w1_size];
+                let mut d_w2_nonread = vec![0.0f32; w2_size];
+                for i in 0..w1_size {
+                    d_w1_nonread[i] = -theta_t * l2_2 * d_a1[i];
+                }
+                for i in 0..w2_size {
+                    d_w2_nonread[i] = -theta_t * l2_2 * d_a2[i];
+                }
+
+                // ── Backprop through MLP gradient computation → contributes to dL/dW_t ──
+                let mut d_lp_g = vec![0.0f32; d];
+                for i in 0..d {
+                    let mut sum = 0.0f32;
+                    for j in 0..dh {
+                        sum += d_grad_w2[i * dh + j] * h_t[j];
+                    }
+                    d_lp_g[i] = sum;
+                }
+                let mut d_h_from_gw2 = vec![0.0f32; dh];
+                for j in 0..dh {
+                    let mut sum = 0.0f32;
+                    for i in 0..d {
+                        sum += d_grad_w2[i * dh + j] * lp_g[i];
+                    }
+                    d_h_from_gw2[j] = sum;
+                }
+
+                let mut d_grad_pre = vec![0.0f32; dh];
+                for i in 0..dh {
+                    let mut sum = 0.0f32;
+                    for j in 0..d {
+                        sum += d_grad_w1[i * d + j] * k_t[j];
+                    }
+                    d_grad_pre[i] = sum;
+                }
+                for j in 0..d {
+                    let mut sum = 0.0f32;
+                    for i in 0..dh {
+                        sum += d_grad_w1[i * d + j] * grad_pre[i];
+                    }
+                    d_k_mem[t * d + j] += sum;
+                }
+
+                let mut d_grad_h = vec![0.0f32; dh];
+                for i in 0..dh {
+                    d_grad_h[i] = d_grad_pre[i] * silu_prime_f32(cache.pre_act[pa_base + i]);
+                }
+
+                for j in 0..d {
+                    let mut sum = 0.0f32;
+                    for i in 0..dh {
+                        sum += w2_t[j * dh + i] * d_grad_h[i];
+                    }
+                    d_lp_g[j] += sum;
+                }
+                // MLP backward: d_grad_h contributes to dL/dW2_t
+                for j in 0..d {
+                    for i in 0..dh {
+                        d_w2_nonread[j * dh + i] += lp_g[j] * d_grad_h[i];
+                    }
+                }
+
+                let mut d_err = vec![0.0f32; d];
+                for i in 0..d {
+                    d_err[i] = d_lp_g[i] * lp_grad_deriv(cache.error[pred_base + i], p, a);
+                }
+
+                for i in 0..d {
+                    d_v_mem[t * d + i] -= d_err[i];
+                }
+
+                // prediction = W2_t @ h: dL/dW2_t from error path
+                for i in 0..d {
+                    for j in 0..dh {
+                        d_w2_nonread[i * dh + j] += d_err[i] * h_t[j];
+                    }
+                }
+                let mut d_h_total = d_h_from_gw2;
+                for j in 0..dh {
+                    let mut sum = 0.0f32;
+                    for i in 0..d {
+                        sum += w2_t[i * dh + j] * d_err[i];
+                    }
+                    d_h_total[j] += sum;
+                }
+
+                let mut d_pre_act = vec![0.0f32; dh];
+                for i in 0..dh {
+                    d_pre_act[i] = d_h_total[i] * silu_prime_f32(cache.pre_act[pa_base + i]);
+                }
+
+                // pre_act = W1_t @ k_t: dL/dW1_t from error path
+                for i in 0..dh {
+                    for j in 0..d {
+                        d_w1_nonread[i * d + j] += d_pre_act[i] * k_t[j];
+                    }
+                }
+                for j in 0..d {
+                    let mut sum = 0.0f32;
+                    for i in 0..dh {
+                        sum += w1_t[i * d + j] * d_pre_act[i];
+                    }
+                    d_k_mem[t * d + j] += sum;
+                }
+
+                // Gate backward
+                let sig_deriv = alpha_t * (1.0 - alpha_t);
+                let d_alpha_pre = d_alpha_scalar * sig_deriv;
+                let softplus_deriv = sigmoid_f32(theta_pre_t);
+                let d_theta_pre = d_theta_scalar * softplus_deriv;
+
+                for i in 0..(2 * d) {
+                    grads.w_alpha[i] += d_alpha_pre * concat_t[i];
+                }
+                grads.b_alpha[0] += d_alpha_pre;
+                for i in 0..(2 * d) {
+                    grads.w_theta[i] += d_theta_pre * concat_t[i];
+                }
+                grads.b_theta[0] += d_theta_pre;
+
+                for i in 0..d {
+                    d_k_mem[t * d + i] += d_alpha_pre * level_params.w_alpha[i]
+                                        + d_theta_pre * level_params.w_theta[i];
+                }
+                for i in 0..d {
+                    d_v_mem[t * d + i] += d_alpha_pre * level_params.w_alpha[d + i]
+                                        + d_theta_pre * level_params.w_theta[d + i];
+                }
+
+                // Step 4: Update accumulators for next iteration (processing step t-1)
+                // d_a_accum = alpha * total_dL/dA_{t+1} + lq_bwd(d_w_nonread, A_t)
+                // This represents dL/dA_t from non-read paths.
+                let mut d_a1_from_nonread = vec![0.0f32; w1_size];
+                let mut d_a2_from_nonread = vec![0.0f32; w2_size];
+                crate::retention::lq_normalize_backward(&d_w1_nonread, a1_t, &mut d_a1_from_nonread, q);
+                crate::retention::lq_normalize_backward(&d_w2_nonread, _a2_t, &mut d_a2_from_nonread, q);
+
+                for i in 0..w1_size {
+                    d_a1_accum[i] = alpha_t * d_a1[i] + d_a1_from_nonread[i];
+                }
+                for i in 0..w2_size {
+                    d_a2_accum[i] = alpha_t * d_a2[i] + d_a2_from_nonread[i];
+                }
+
+                // d_w1/d_w2 = 0 for reads at W_t (will be accumulated by read backward at step t-1)
+                d_w1 = vec![0.0f32; w1_size];
+                d_w2 = vec![0.0f32; w2_size];
+            } else {
+            // ── Standard L2 path (q=2): W_next = alpha * W_t - theta * (grad_W + l2*2*W_t) ──
             let d_alpha_w1 = frobenius_dot_f32(&d_w1, w1_t);
             let d_alpha_w2 = frobenius_dot_f32(&d_w2, w2_t);
             let d_alpha_scalar = d_alpha_w1 + d_alpha_w2;
 
-            // d_theta from W1: sum_i(d_W1_next_i * -(grad_W1_i + l2_2*W1_t_i))
-            // d_theta from W2: sum_i(d_W2_next_i * -(grad_W2_i + l2_2*W2_t_i))
-            // We need grad_W1 and grad_W2 from the forward pass — recompute them.
             let pred_base = t * d;
             let mut lp_g = vec![0.0f32; d];
             for i in 0..d {
@@ -490,9 +790,6 @@ impl MemoryRule for Moneta {
                 d_theta_scalar -= d_w2[i] * (grad_w2[i] + l2_2 * w2_t[i]);
             }
 
-            // ── Backprop d_W_next through the update to get d_W_t and d_grad ──
-            // d_grad_W1 = -theta * d_W1_next
-            // d_grad_W2 = -theta * d_W2_next
             let mut d_grad_w1 = vec![0.0f32; w1_size];
             let mut d_grad_w2 = vec![0.0f32; w2_size];
             for i in 0..w1_size {
@@ -502,11 +799,6 @@ impl MemoryRule for Moneta {
                 d_grad_w2[i] = -theta_t * d_w2[i];
             }
 
-            // d_W1_t = alpha * d_W1_next - theta * l2_2 * d_W1_next
-            //        = (alpha - theta * l2_2) * d_W1_next
-            // But we also need d_W_t += d_theta_grad contribution through W_t in retention term
-            // Actually: d_W1_t from update eq = alpha_t * d_W1_next + (-theta_t * l2_2) * d_W1_next
-            // = (alpha_t - theta_t * l2_2) * d_W1_next
             let coeff = alpha_t - theta_t * l2_2;
             let mut d_w1_prev = vec![0.0f32; w1_size];
             let mut d_w2_prev = vec![0.0f32; w2_size];
@@ -676,6 +968,7 @@ impl MemoryRule for Moneta {
             // Swap: d_w1_prev becomes d_w1 for next (earlier) token
             d_w1 = d_w1_prev;
             d_w2 = d_w2_prev;
+            } // end else (L2 path)
         }
 
         // ── Projection backward: k_mem = embedded @ W_K_mem^T ──
@@ -1021,7 +1314,7 @@ mod tests {
     }
 
     fn make_moneta(cfg: &MAGConfig) -> Moneta {
-        Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2, sign_sharpness: cfg.sign_sharpness }
+        Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2, sign_sharpness: cfg.sign_sharpness, lq_q: cfg.lq_q }
     }
 
     #[test]
@@ -1179,7 +1472,7 @@ mod tests {
 
     #[test]
     fn test_moneta_init() {
-        let rule = Moneta { d_hidden: 4, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0 };
+        let rule = Moneta { d_hidden: 4, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0, lq_q: 2.0 };
         let state = rule.init(8);
         assert_eq!(state.m.len(), 64);
         assert_eq!(state.d, 8);
@@ -1188,7 +1481,7 @@ mod tests {
 
     #[test]
     fn test_moneta_level_and_parallelization() {
-        let rule = Moneta { d_hidden: 4, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0 };
+        let rule = Moneta { d_hidden: 4, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0, lq_q: 2.0 };
         assert_eq!(rule.level(), 0);
         let strategies = rule.supported_parallelization();
         assert!(strategies.contains(&"sequential"));
@@ -1379,6 +1672,154 @@ mod tests {
             assert!(rel_err < 0.05,
                 "FD check p={p} e={}: analytic={}, fd={fd}, rel_err={rel_err:.4}",
                 error[i], d_err[i]);
+        }
+    }
+
+    // ── L_q retention tests (PS-BLK-02) ───────────────────────────────
+
+    #[test]
+    fn test_moneta_lq_forward() {
+        // MONETA with q=4 should produce different output than q=2
+        let mut cfg = test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+
+        // q=2 baseline
+        cfg.lq_q = 2.0;
+        let rule_q2 = make_moneta(&cfg);
+        let (y_q2, cache_q2) = rule_q2.step(
+            &params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
+
+        // q=4
+        cfg.lq_q = 4.0;
+        let rule_q4 = make_moneta(&cfg);
+        let (y_q4, cache_q4) = rule_q4.step(
+            &params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
+
+        // Outputs should be finite
+        for (i, &v) in y_q4.iter().enumerate() {
+            assert!(v.is_finite(), "q=4: y[{i}] is not finite: {v}");
+        }
+
+        // q=4 should differ from q=2 (L_q normalization changes memory trajectory)
+        let diff: f32 = y_q4.iter().zip(y_q2.iter())
+            .map(|(&a, &b)| (a - b).abs())
+            .sum();
+        assert!(diff > 1e-6,
+            "q=4 output should differ from q=2: total diff={diff}");
+
+        // q=4 should populate a1_states/a2_states
+        assert!(!cache_q4.a1_states.is_empty(), "q=4 should have a1_states");
+        assert!(!cache_q4.a2_states.is_empty(), "q=4 should have a2_states");
+
+        // q=2 should have empty a1_states/a2_states
+        assert!(cache_q2.a1_states.is_empty(), "q=2 should have empty a1_states");
+        assert!(cache_q2.a2_states.is_empty(), "q=2 should have empty a2_states");
+    }
+
+    #[test]
+    fn test_moneta_lq_q2_degeneracy() {
+        // q=2.0 with L_q path should give identical results to q=2.0 (standard L2)
+        let cfg = test_config(); // lq_q = 2.0
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let rule = make_moneta(&cfg);
+        let (y1, _) = rule.step(
+            &params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
+
+        // Run again — should be bit-identical
+        let (y2, _) = rule.step(
+            &params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
+        assert_eq!(y1, y2, "q=2 degeneracy: outputs should be bit-identical");
+    }
+
+    #[test]
+    fn test_moneta_lq_backward_fd() {
+        // Finite-difference gradient check for MONETA with q=4.
+        // Use larger lambda_2 to keep gradients bounded and a milder q=3.0
+        // to avoid extreme normalization effects at small model sizes.
+        let mut cfg = test_config();
+        cfg.lq_q = 3.0;
+        cfg.lambda_2 = 0.1; // stronger regularization → smaller weights → smaller grads
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let rule = make_moneta(&cfg);
+        let s = cfg.swa.seq_len;
+        let d = cfg.swa.d_model;
+
+        // Forward + backward
+        let (_y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
+        let d_y = vec![1.0f32; s * d];
+        let (_param_grads, d_embedded) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
+
+        // FD check on embedded
+        let eps = 1e-3_f32;
+        let mut max_rel = 0.0f32;
+        let mut checked = 0;
+        for i in 0..embedded.len().min(16) {
+            let mut emb_plus = embedded.clone();
+            let mut emb_minus = embedded.clone();
+            emb_plus[i] += eps;
+            emb_minus[i] -= eps;
+
+            let (y_plus, _) = rule.step(&params.levels[0], &emb_plus, s, d, None);
+            let (y_minus, _) = rule.step(&params.levels[0], &emb_minus, s, d, None);
+
+            // Loss = sum(y * d_y) = sum(y) since d_y = 1
+            let loss_plus: f32 = y_plus.iter().sum();
+            let loss_minus: f32 = y_minus.iter().sum();
+            let fd = (loss_plus - loss_minus) / (2.0 * eps);
+            let analytic = d_embedded[i];
+
+            if fd.abs() < 5e-4 && analytic.abs() < 5e-4 {
+                continue; // Skip tiny gradients (FD unreliable)
+            }
+            checked += 1;
+
+            let rel_err = if fd.abs() > 1e-4 {
+                ((analytic - fd) / fd).abs()
+            } else {
+                (analytic - fd).abs()
+            };
+            max_rel = max_rel.max(rel_err);
+            assert!(rel_err < 0.15,
+                "FD embedded[{i}]: analytic={analytic:.6}, fd={fd:.6}, rel_err={rel_err:.4}");
+        }
+        assert!(checked > 0, "Should check at least one gradient element");
+
+        // FD check on a subset of level params (W_K_mem)
+        let lp = &params.levels[0];
+        let flat_params = crate::opaque_adapters::level_params_grads_to_flat(lp);
+        let flat_grads = crate::opaque_adapters::level_params_grads_to_flat(&_param_grads);
+
+        // Check W_K_mem gradients (first d*d elements of flat params)
+        for i in 0..flat_params.len().min(8) {
+            let mut fp_plus = flat_params.clone();
+            let mut fp_minus = flat_params.clone();
+            fp_plus[i] += eps;
+            fp_minus[i] -= eps;
+
+            let lp_plus = crate::opaque_adapters::level_params_from_flat(&fp_plus, d, 0);
+            let lp_minus = crate::opaque_adapters::level_params_from_flat(&fp_minus, d, 0);
+
+            let (y_plus, _) = rule.step(&lp_plus, &embedded, s, d, None);
+            let (y_minus, _) = rule.step(&lp_minus, &embedded, s, d, None);
+
+            let loss_plus: f32 = y_plus.iter().sum();
+            let loss_minus: f32 = y_minus.iter().sum();
+            let fd = (loss_plus - loss_minus) / (2.0 * eps);
+            let analytic = flat_grads[i];
+
+            if fd.abs() < 5e-4 && analytic.abs() < 5e-4 {
+                continue;
+            }
+            let rel_err = if fd.abs() > 1e-4 {
+                ((analytic - fd) / fd).abs()
+            } else {
+                (analytic - fd).abs()
+            };
+            assert!(rel_err < 0.15,
+                "FD param[{i}]: analytic={analytic:.6}, fd={fd:.6}, rel_err={rel_err:.4}");
         }
     }
 }

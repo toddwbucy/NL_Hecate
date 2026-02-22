@@ -312,6 +312,114 @@ pub fn ftrl_soft_threshold_backward_inplace(
     }
 }
 
+// ── L_q Norm Retention (MONETA) ──────────────────────────────────────
+
+/// L_q normalization: W = A / ||A||_q^{q-2}.
+///
+/// At q=2: ||A||_2^0 = 1, so W = A (identity — fast path, no computation).
+/// At q=4: W = A / ||A||_4^2, bounding peak magnitudes.
+///
+/// Uses smooth power approximation: |x|^q ≈ (x^2 + eps)^{q/2} for numerical
+/// stability near zero.
+///
+/// Source: MIRAS §5.3 Eqs 24-25, specs/algorithms/retention_mechanisms/07_lq_norm.md.
+pub fn lq_normalize(a: &[f32], w: &mut [f32], q: f32) {
+    debug_assert_eq!(a.len(), w.len());
+    if (q - 2.0).abs() < 1e-6 {
+        // q=2 fast-path: identity normalization
+        w.copy_from_slice(a);
+        return;
+    }
+
+    let eps = 1e-12_f32;
+    // Compute ||A||_q = (sum |a_i|^q)^{1/q} using smooth approximation
+    let mut sum_aq = 0.0f64; // use f64 accumulator for stability
+    for &ai in a.iter() {
+        sum_aq += (ai as f64 * ai as f64 + eps as f64).powf(q as f64 / 2.0);
+    }
+    let norm_q = (sum_aq as f32).powf(1.0 / q);
+
+    // Divisor = norm_q^{q-2}
+    let divisor = norm_q.powf(q - 2.0);
+    if divisor < 1e-30 {
+        // Near-zero accumulator: leave W = A to avoid division by zero
+        w.copy_from_slice(a);
+        return;
+    }
+
+    let inv_div = 1.0 / divisor;
+    for (wi, &ai) in w.iter_mut().zip(a.iter()) {
+        *wi = ai * inv_div;
+    }
+}
+
+/// Backward (VJP) through L_q normalization: W = A / ||A||_q^{q-2}.
+///
+/// Given dL/dW (upstream), computes dL/dA.
+///
+/// At q=2: dL/dA = dL/dW (identity — fast path).
+/// General case: applies the chain rule through the normalization factor.
+///
+/// Let s = ||A||_q^{q-2}. Then W = A / s, so:
+///   dL/dA_i = dL/dW_i / s - (q-2) * norm_q^{q-3} * (d norm_q / dA_i) * dot(dL/dW, A) / s^2
+///
+/// where d norm_q / dA_i = |A_i|^{q-1} * sign(A_i) / norm_q^{q-1}
+///                       ≈ A_i * (A_i^2 + eps)^{(q-2)/2} / norm_q^{q-1}
+///
+/// Source: specs/algorithms/retention_mechanisms/07_lq_norm.md §Gradient Derivation.
+pub fn lq_normalize_backward(d_w: &[f32], a: &[f32], d_a: &mut [f32], q: f32) {
+    debug_assert_eq!(d_w.len(), a.len());
+    debug_assert_eq!(d_w.len(), d_a.len());
+
+    if (q - 2.0).abs() < 1e-6 {
+        // q=2 fast-path: identity
+        d_a.copy_from_slice(d_w);
+        return;
+    }
+
+    let eps = 1e-12_f32;
+    let n = a.len();
+
+    // Recompute norm_q and divisor
+    let mut sum_aq = 0.0f64;
+    for &ai in a.iter() {
+        sum_aq += (ai as f64 * ai as f64 + eps as f64).powf(q as f64 / 2.0);
+    }
+    let norm_q = (sum_aq as f32).powf(1.0 / q);
+    let s = norm_q.powf(q - 2.0); // divisor
+
+    if s < 1e-30 {
+        d_a.copy_from_slice(d_w);
+        return;
+    }
+
+    let inv_s = 1.0 / s;
+
+    // dot(dL/dW, A) / s^2 — needed for the correction term
+    let mut dw_dot_a = 0.0f64;
+    for i in 0..n {
+        dw_dot_a += d_w[i] as f64 * a[i] as f64;
+    }
+
+    // Precompute: (q-2) / (norm_q^2 * s^2)
+    // s = norm_q^{q-2}, so norm_q^2 * s^2 = norm_q^{2 + 2(q-2)} = norm_q^{2q-2}
+    let norm_pow = norm_q * norm_q * s * s;
+    let coeff = if norm_pow.abs() > 1e-30 {
+        (q - 2.0) / norm_pow
+    } else {
+        0.0
+    };
+
+    for i in 0..n {
+        let ai = a[i];
+        // ds/dA_i factor (without the (q-2)/norm_q^2 prefix): a_i * (a_i^2 + eps)^{(q-2)/2}
+        let d_norm_i = ai * (ai * ai + eps).powf((q - 2.0) / 2.0);
+
+        // dL/dA_i = dL/dW_i / s - coeff * d_norm_i * dot(dW, A)
+        d_a[i] = d_w[i] * inv_s - coeff * d_norm_i * dw_dot_a as f32;
+    }
+}
+
 // ── Sphere Normalization (Lattice OSR) ──────────────────────────────
 
 /// Apply orthogonal projection + normalize for one slot.
@@ -688,5 +796,100 @@ mod tests {
         assert_eq!(default_retention(MemoryRuleKind::Trellis), RetentionKind::L2WeightDecay);
         assert_eq!(default_retention(MemoryRuleKind::MEMORA), RetentionKind::KLDivergence);
         assert_eq!(default_retention(MemoryRuleKind::LatticeOSR), RetentionKind::SphereNormalization);
+    }
+
+    // ── L_q normalization tests ───────────────────────────────────────
+
+    #[test]
+    fn test_lq_normalize_identity() {
+        // q=2: W = A (identity normalization)
+        let a = vec![1.0, -2.0, 3.0, 0.5];
+        let mut w = vec![0.0f32; 4];
+        lq_normalize(&a, &mut w, 2.0);
+        for (i, (&wi, &ai)) in w.iter().zip(a.iter()).enumerate() {
+            assert!((wi - ai).abs() < 1e-7,
+                "q=2 identity: w[{i}]={wi} != a[{i}]={ai}");
+        }
+    }
+
+    #[test]
+    fn test_lq_normalize_q4() {
+        // q=4: W = A / ||A||_4^2, magnitude bounded
+        let a = vec![1.0, -2.0, 3.0, 0.5];
+        let mut w = vec![0.0f32; 4];
+        lq_normalize(&a, &mut w, 4.0);
+
+        // Compute expected: ||A||_4 = (1^4 + 2^4 + 3^4 + 0.5^4)^{1/4}
+        //                           = (1 + 16 + 81 + 0.0625)^{1/4}
+        //                           = 98.0625^{1/4}
+        let norm4 = 98.0625_f64.powf(0.25) as f32;
+        let divisor = norm4 * norm4; // norm_q^{q-2} = norm_q^2
+
+        for (i, (&wi, &ai)) in w.iter().zip(a.iter()).enumerate() {
+            let expected = ai / divisor;
+            assert!((wi - expected).abs() < 1e-5,
+                "q=4: w[{i}]={wi}, expected={expected}");
+        }
+
+        // L_q normalization should reduce magnitudes (divisor > 1 for this input)
+        let w_norm: f32 = w.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let a_norm: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(w_norm < a_norm, "q=4 should reduce magnitude: w_norm={w_norm}, a_norm={a_norm}");
+    }
+
+    #[test]
+    fn test_lq_normalize_backward_fd() {
+        // Finite-difference check of lq_normalize_backward
+        let a = vec![1.0, -0.5, 2.0, -1.5, 0.3];
+        let q = 4.0_f32;
+
+        // Use f64 FD for higher accuracy
+        let eps = 1e-5_f64;
+
+        // Forward: compute W
+        let mut w = vec![0.0f32; a.len()];
+        lq_normalize(&a, &mut w, q);
+
+        // Use d_W = [1, 0, 0, ...] to check one column at a time
+        for check_dim in 0..a.len() {
+            let mut d_w = vec![0.0f32; a.len()];
+            d_w[check_dim] = 1.0;
+
+            // Analytical backward
+            let mut d_a = vec![0.0f32; a.len()];
+            lq_normalize_backward(&d_w, &a, &mut d_a, q);
+
+            // Finite-difference: perturb each a[j], measure change in w[check_dim]
+            for j in 0..a.len() {
+                let mut a_plus = a.iter().map(|&x| x as f64).collect::<Vec<_>>();
+                let mut a_minus = a.iter().map(|&x| x as f64).collect::<Vec<_>>();
+                a_plus[j] += eps;
+                a_minus[j] -= eps;
+
+                // Compute lq_normalize in f64 for FD accuracy
+                let q64 = q as f64;
+                let eps_smooth = 1e-12_f64;
+
+                let norm_plus = {
+                    let sum: f64 = a_plus.iter().map(|&x| (x*x + eps_smooth).powf(q64/2.0)).sum();
+                    let nq = sum.powf(1.0/q64);
+                    let div = nq.powf(q64 - 2.0);
+                    if div < 1e-30 { a_plus[check_dim] } else { a_plus[check_dim] / div }
+                };
+                let norm_minus = {
+                    let sum: f64 = a_minus.iter().map(|&x| (x*x + eps_smooth).powf(q64/2.0)).sum();
+                    let nq = sum.powf(1.0/q64);
+                    let div = nq.powf(q64 - 2.0);
+                    if div < 1e-30 { a_minus[check_dim] } else { a_minus[check_dim] / div }
+                };
+
+                let fd = ((norm_plus - norm_minus) / (2.0 * eps)) as f32;
+                let err = (d_a[j] - fd).abs();
+                let tol = 0.10 * fd.abs().max(1e-4);
+                assert!(err < tol,
+                    "FD check dim={check_dim} j={j}: analytic={:.6}, fd={fd:.6}, err={err:.6}",
+                    d_a[j]);
+            }
+        }
     }
 }
