@@ -40,6 +40,7 @@ use crate::delta_rule::{MemoryRule, Gates, MemoryError};
 // ── LatticeOSR State ────────────────────────────────────────────────
 
 /// Memory state for LatticeOSR: m unit-norm slot vectors on the d-sphere.
+#[derive(Clone, Debug)]
 pub struct LatticeState {
     /// Flat [m_slots * d] row-major: slot i is `slots[i*d..(i+1)*d]`.
     pub slots: Vec<f32>,
@@ -127,11 +128,11 @@ impl MemoryRule for LatticeOSR {
             match self.variant {
                 LatticeVariant::Decode => {
                     // Eqs 5-6: delta_s = gate_i * v_t
-                    input[..d].copy_from_slice(&v[..d]);
+                    input.copy_from_slice(v);
                 }
                 LatticeVariant::Encode => {
                     // Eqs 24-25: delta_s = gate_i * k_t
-                    input[..d].copy_from_slice(&k[..d]);
+                    input.copy_from_slice(k);
                 }
                 LatticeVariant::Similarity => {
                     // Eqs 7-8: delta_s = gate_i * (v_t - dot(S[i], v_t) * S[i])

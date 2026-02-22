@@ -36,6 +36,7 @@ use crate::delta_rule::{MemoryRule, Gates, MemoryError};
 ///
 /// The 2-layer MLP state is W1 [d_hidden, d] and W2 [d, d_hidden].
 /// write()/read() return UnsupportedOperation — the MLP fuses these in step().
+#[derive(Clone, Debug)]
 pub struct MlpState {
     /// First layer weights: [d_hidden, d] row-major.
     pub w1: Vec<f32>,

@@ -39,6 +39,7 @@ use crate::delta_rule::{MemoryRule, Gates, MemoryError};
 // ── Trellis State ───────────────────────────────────────────────────
 
 /// Memory state for Trellis: separate key and value compressor matrices.
+#[derive(Clone, Debug)]
 pub struct TrellisState {
     /// Key compressor S_K: [d_k, d] row-major.
     pub s_k: Vec<f32>,
