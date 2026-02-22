@@ -317,7 +317,7 @@ Not all MIRAS knob combinations are valid. The Rust trait system enforces this a
 via marker traits (`core/src/composition_safety.rs`) and the CompositionPattern trait
 (`core/src/composition_pattern.rs`).
 
-```
+```rust
 // Marker traits (composition_safety.rs) — enforce mathematical constraints
 trait ProbabilitySimplex { }      // KL retention requires this
 trait UnitSphere { }              // Lattice OSR requires this
@@ -407,7 +407,7 @@ RULE: Every memory update rule specifies which parallelization
 48 code smells (CS-01 through CS-48) define what code must NOT look like. Key categories
 (full index: `specs/constraints/code_smells/00_index.md`):
 
-```
+```text
 Ontological smells (CS-01, CS-04–09, CS-10, CS-11, CS-13, CS-19–21, CS-37, CS-38):
   - No MemoryModule class, no train/eval, no TrainingLoop, no "training" word
   - Use "levels" not "layers" for frequency hierarchy
@@ -540,7 +540,7 @@ See: infrastructure/track_zero/00_track_zero.md for full specification.
 
 > Added during partial-specs sweep to document all core/src/ modules.
 
-```
+```text
 core/src/ module map:
 
 Memory rules (9 total, each implements MemoryRule + OpaqueVjp):
@@ -603,7 +603,7 @@ Feature-gated (serving/distribution/edge):
 
 ## Directory Structure as Graph
 
-```
+```text
 specs/                              <- root node
   contract.md                       <- THIS FILE: top-level specification
   algorithms/                       <- algorithmic components (paper math)
