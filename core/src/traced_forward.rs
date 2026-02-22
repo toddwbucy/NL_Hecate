@@ -232,8 +232,10 @@ fn alloc_common_saved(
     d: usize,
     extra_meta: &[f32],
 ) -> (BufId, BufId, BufId) {
+    let kernel_size = if level_params.w_k_conv.is_empty() { 0 } else { level_params.w_k_conv.len() / d };
     let mut meta = vec![seq_len as f32, d as f32];
     meta.extend_from_slice(extra_meta);
+    meta.push(kernel_size as f32); // always last element — matches record_common_inputs
     let meta_id = tape.alloc(meta, vec![]);
     let lp_flat = level_params_grads_to_flat(level_params);
     let lp_saved = tape.alloc(lp_flat, vec![]);

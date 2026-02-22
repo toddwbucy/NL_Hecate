@@ -48,20 +48,23 @@ fn save_conv_cache(
 
 /// Restore conv1d cache from saved buffers at the given offset.
 /// `saved` starts from the first conv buffer (k_pre_conv).
-/// Returns (k_conv_cache, q_conv_cache) — both None if saved is empty/insufficient.
+/// Returns (k_conv_cache, q_conv_cache) — both None if saved is empty.
+/// Panics on partial cache (1, 2, or 3 buffers) which indicates save/restore drift.
 fn restore_conv_cache(saved: &[&[f32]]) -> (Option<Conv1DCache>, Option<Conv1DCache>) {
-    if saved.len() >= 4 {
-        let k_cache = Conv1DCache {
-            pre_conv: saved[0].to_vec(),
-            pre_silu: saved[1].to_vec(),
-        };
-        let q_cache = Conv1DCache {
-            pre_conv: saved[2].to_vec(),
-            pre_silu: saved[3].to_vec(),
-        };
-        (Some(k_cache), Some(q_cache))
-    } else {
-        (None, None)
+    match saved.len() {
+        0 => (None, None),
+        4 => {
+            let k_cache = Conv1DCache {
+                pre_conv: saved[0].to_vec(),
+                pre_silu: saved[1].to_vec(),
+            };
+            let q_cache = Conv1DCache {
+                pre_conv: saved[2].to_vec(),
+                pre_silu: saved[3].to_vec(),
+            };
+            (Some(k_cache), Some(q_cache))
+        }
+        n => panic!("restore_conv_cache: expected 0 or 4 buffers, got {} (partial Conv1D cache)", n),
     }
 }
 
@@ -130,11 +133,9 @@ pub fn level_params_from_flat(flat: &[f32], d: usize, kernel_size: usize) -> Mem
     // Determine actual kernel_size: if caller passed 0, infer from buffer.
     // Conv fields occupy 2*d*ks + 2*d = 2*d*(ks+1) elements.
     // Freq fields occupy 0 or d+1 elements.
-    // Note: auto-detection is unambiguous for d >= 2 (since d+1 is odd when d is even,
-    // it cannot equal 2*d*(ks+1) which is always even). For d=1, pass kernel_size explicitly.
-    // Auto-detection is unambiguous for d >= 2 (conv fields are always even-length,
-    // freq fields are d+1 which is odd when d is even). For d=1, the only ambiguous
-    // case is remaining > d+1 with mixed conv+freq; freq-only (remaining == d+1) is safe.
+    // Auto-detection is unambiguous for d >= 2 (conv size is always even,
+    // freq size d+1 is odd when d is even). For d=1, freq-only (remaining == d+1)
+    // is safe; mixed conv+freq is ambiguous — pass kernel_size explicitly.
     assert!(kernel_size > 0 || remaining == 0 || d >= 2 || (d == 1 && remaining == d + 1),
         "auto-detect requires d >= 2 or freq-only buffer; pass kernel_size explicitly for d=1 with conv");
     let effective_ks = if kernel_size > 0 {
@@ -214,7 +215,13 @@ fn read_meta_3(saved: &[f32]) -> (usize, usize, usize) {
     (saved[0] as usize, saved[1] as usize, saved[2] as usize)
 }
 
-/// Read metadata with attentional bias encoding: [seq_len, d, bias_f32, sign_sharpness].
+/// Read kernel_size from the last element of the metadata vector.
+/// All metadata vectors have kernel_size appended as the final element.
+fn read_kernel_size(saved: &[f32]) -> usize {
+    *saved.last().expect("metadata must not be empty") as usize
+}
+
+/// Read metadata with attentional bias encoding: [seq_len, d, bias_f32, sign_sharpness, kernel_size].
 /// Used by DeltaRule and TitansLMM opaque backward adapters.
 fn read_meta_with_bias(saved: &[f32]) -> (usize, usize, crate::model::AttentionalBias, f32) {
     let seq_len = saved[0] as usize;
@@ -246,7 +253,7 @@ pub fn delta_rule_opaque_backward(
     d_inputs: &mut [Vec<f32>],
 ) {
     let (seq_len, d, bias, sign_sharpness) = read_meta_with_bias(saved[0]);
-    let level_params = level_params_from_flat(saved[1], d, 0);
+    let level_params = level_params_from_flat(saved[1], d, read_kernel_size(saved[0]));
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
@@ -286,7 +293,7 @@ pub fn titans_lmm_opaque_backward(
     d_inputs: &mut [Vec<f32>],
 ) {
     let (seq_len, d, bias, sign_sharpness) = read_meta_with_bias(saved[0]);
-    let level_params = level_params_from_flat(saved[1], d, 0);
+    let level_params = level_params_from_flat(saved[1], d, read_kernel_size(saved[0]));
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
@@ -365,7 +372,7 @@ pub fn hebbian_opaque_backward(
     d_inputs: &mut [Vec<f32>],
 ) {
     let (seq_len, d) = read_meta_2(saved[0]);
-    let level_params = level_params_from_flat(saved[1], d, 0);
+    let level_params = level_params_from_flat(saved[1], d, read_kernel_size(saved[0]));
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
@@ -407,7 +414,7 @@ pub fn moneta_opaque_backward(
     let lambda_2 = saved[0][4];
     let sign_sharpness = if saved[0].len() > 5 { saved[0][5] } else { 10.0 };
     let lq_q = if saved[0].len() > 6 { saved[0][6] } else { 2.0 };
-    let level_params = level_params_from_flat(saved[1], d, 0);
+    let level_params = level_params_from_flat(saved[1], d, read_kernel_size(saved[0]));
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
@@ -468,7 +475,7 @@ pub fn yaad_opaque_backward(
     let delta = saved[0][3];
     let lambda_local = saved[0][4];
     let lambda_2 = saved[0][5];
-    let level_params = level_params_from_flat(saved[1], d, 0);
+    let level_params = level_params_from_flat(saved[1], d, read_kernel_size(saved[0]));
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
@@ -518,7 +525,7 @@ pub fn memora_opaque_backward(
     d_inputs: &mut [Vec<f32>],
 ) {
     let (seq_len, d, d_hidden) = read_meta_3(saved[0]);
-    let level_params = level_params_from_flat(saved[1], d, 0);
+    let level_params = level_params_from_flat(saved[1], d, read_kernel_size(saved[0]));
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
@@ -574,7 +581,7 @@ pub fn lattice_osr_opaque_backward(
     } else {
         crate::model::LatticeVariant::Decode
     };
-    let level_params = level_params_from_flat(saved[1], d, 0);
+    let level_params = level_params_from_flat(saved[1], d, read_kernel_size(saved[0]));
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
@@ -619,7 +626,7 @@ pub fn trellis_opaque_backward(
     let (seq_len, d, d_k) = read_meta_3(saved[0]);
     let lambda_k = saved[0][3];
     let lambda_v = saved[0][4];
-    let level_params = level_params_from_flat(saved[1], d, 0);
+    let level_params = level_params_from_flat(saved[1], d, read_kernel_size(saved[0]));
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
@@ -671,7 +678,7 @@ pub fn atlas_omega_opaque_backward(
     d_inputs: &mut [Vec<f32>],
 ) {
     let (seq_len, d) = read_meta_2(saved[0]);
-    let level_params = level_params_from_flat(saved[1], d, 0);
+    let level_params = level_params_from_flat(saved[1], d, read_kernel_size(saved[0]));
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
@@ -835,8 +842,10 @@ fn record_common_inputs(
     let lp_input = tape.register_param(&lp_flat, vec![lp_flat.len()]);
 
     // Saved BufIds (for backward reconstruction)
+    let kernel_size = if level_params.w_k_conv.is_empty() { 0 } else { level_params.w_k_conv.len() / d };
     let mut meta = vec![seq_len as f32, d as f32];
     meta.extend_from_slice(extra_meta);
+    meta.push(kernel_size as f32); // always last element
     let meta_id = tape.alloc(meta, vec![]);
     let lp_saved = tape.alloc(lp_flat, vec![]);
     let emb_saved = tape.alloc(embedded.to_vec(), vec![seq_len, d]);
