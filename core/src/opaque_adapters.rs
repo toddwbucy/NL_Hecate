@@ -307,9 +307,17 @@ pub fn moneta_opaque_backward(
     let lp_p = saved[0][3];
     let lambda_2 = saved[0][4];
     let sign_sharpness = if saved[0].len() > 5 { saved[0][5] } else { 10.0 };
+    let lq_q = if saved[0].len() > 6 { saved[0][6] } else { 2.0 };
     let level_params = level_params_from_flat(saved[1], d, 0);
     let embedded = saved[2];
     let d_y = d_outputs[0];
+
+    // When lq_q > 2, a1_states and a2_states are saved as extra buffers after y
+    let (a1_states, a2_states) = if (lq_q - 2.0).abs() >= 1e-6 && saved.len() > 19 {
+        (saved[18].to_vec(), saved[19].to_vec())
+    } else {
+        (vec![], vec![])
+    };
 
     let cache = MonetaCache {
         seq_len, d, d_hidden,
@@ -331,9 +339,12 @@ pub fn moneta_opaque_backward(
         lp_p,
         lambda_2,
         sign_sharpness,
+        lq_q,
+        a1_states,
+        a2_states,
     };
 
-    let rule = Moneta { d_hidden, lp_p, lambda_2, sign_sharpness };
+    let rule = Moneta { d_hidden, lp_p, lambda_2, sign_sharpness, lq_q };
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
     d_inputs[0] = d_embedded;
@@ -803,13 +814,13 @@ impl OpaqueVjp for Moneta {
         &self, tape: &mut Tape, level_params: &MemoryLevelParams,
         embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
     ) -> (Vec<f32>, BufId, BufId, BufId) {
-        let extra_meta = [self.d_hidden as f32, self.lp_p, self.lambda_2, self.sign_sharpness];
+        let extra_meta = [self.d_hidden as f32, self.lp_p, self.lambda_2, self.sign_sharpness, self.lq_q];
         let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
             record_common_inputs(tape, level_params, embedded, seq_len, d, &extra_meta);
 
         let (y, cache) = self.step(level_params, embedded, seq_len, d, initial_m);
 
-        let cache_ids: Vec<BufId> = vec![
+        let mut cache_ids: Vec<BufId> = vec![
             tape.alloc(cache.w1_states, vec![]),
             tape.alloc(cache.w2_states, vec![]),
             tape.alloc(cache.k_mem, vec![]),
@@ -826,6 +837,11 @@ impl OpaqueVjp for Moneta {
             tape.alloc(cache.error, vec![]),
             tape.alloc(cache.y, vec![]),
         ];
+        // Save a1/a2 accumulator states when L_q > 2 (needed for backward)
+        if !cache.a1_states.is_empty() {
+            cache_ids.push(tape.alloc(cache.a1_states, vec![]));
+            cache_ids.push(tape.alloc(cache.a2_states, vec![]));
+        }
 
         let y_id = tape.alloc(y.clone(), vec![seq_len, d]);
         let mut saved = vec![meta_id, lp_saved, emb_saved];
@@ -1280,7 +1296,7 @@ mod tests {
 
     #[test]
     fn test_opaque_vjp_moneta() {
-        assert_opaque_roundtrip(&Moneta { d_hidden: 8, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0 }, 4, 3);
+        assert_opaque_roundtrip(&Moneta { d_hidden: 8, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0, lq_q: 2.0 }, 4, 3);
     }
 
     #[test]
@@ -1313,7 +1329,7 @@ mod tests {
         assert_eq!(DeltaRule::l2().opaque_key(), OpaqueKey::DeltaRule);
         assert_eq!(TitansLMM::l2().opaque_key(), OpaqueKey::TitansLMM);
         assert_eq!(HebbianRule.opaque_key(), OpaqueKey::HebbianRule);
-        assert_eq!((Moneta { d_hidden: 8, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0 }).opaque_key(), OpaqueKey::Moneta);
+        assert_eq!((Moneta { d_hidden: 8, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0, lq_q: 2.0 }).opaque_key(), OpaqueKey::Moneta);
         assert_eq!((YAAD { d_hidden: 8, delta: 0.9, lambda_local: 0.1, lambda_2: 0.01 }).opaque_key(), OpaqueKey::YAAD);
         assert_eq!((MEMORA { d_hidden: 8 }).opaque_key(), OpaqueKey::MEMORA);
         assert_eq!((LatticeOSR { m_slots: 3, variant: crate::model::LatticeVariant::Decode }).opaque_key(), OpaqueKey::LatticeOSR);
@@ -1409,7 +1425,7 @@ mod tests {
     #[test]
     fn test_class1_hebbian() { assert_class1_isolation(&HebbianRule, 4, 3); }
     #[test]
-    fn test_class1_moneta() { assert_class1_isolation(&Moneta { d_hidden: 8, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0 }, 4, 3); }
+    fn test_class1_moneta() { assert_class1_isolation(&Moneta { d_hidden: 8, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0, lq_q: 2.0 }, 4, 3); }
     #[test]
     fn test_class1_yaad() { assert_class1_isolation(&YAAD { d_hidden: 8, delta: 0.9, lambda_local: 0.1, lambda_2: 0.01 }, 4, 3); }
     #[test]

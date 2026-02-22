@@ -667,7 +667,7 @@ fn traced_active_level(
             (y, MemoryCache::Hebbian(cache), final_m, y_id)
         }
         MemoryRuleKind::Moneta => {
-            let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2, sign_sharpness: cfg.sign_sharpness };
+            let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2, sign_sharpness: cfg.sign_sharpness, lq_q: cfg.lq_q };
             let (y, cache) = rule.step(level_params, embedded, s, d, initial_m);
             let dh = cfg.d_hidden;
             let w1_size = dh * d;
@@ -678,10 +678,10 @@ fn traced_active_level(
             final_m.extend_from_slice(w1_final);
             final_m.extend_from_slice(w2_final);
 
-            let extra_meta = [dh as f32, cfg.lp_p, cfg.lambda_2, cfg.sign_sharpness];
+            let extra_meta = [dh as f32, cfg.lp_p, cfg.lambda_2, cfg.sign_sharpness, cfg.lq_q];
             let (meta_id, lp_saved, emb_saved) =
                 alloc_common_saved(tape, level_params, embedded, s, d, &extra_meta);
-            let cache_ids = vec![
+            let mut cache_ids = vec![
                 tape.alloc(cache.w1_states.clone(), vec![]),
                 tape.alloc(cache.w2_states.clone(), vec![]),
                 tape.alloc(cache.k_mem.clone(), vec![]),
@@ -698,6 +698,11 @@ fn traced_active_level(
                 tape.alloc(cache.error.clone(), vec![]),
                 tape.alloc(cache.y.clone(), vec![]),
             ];
+            // Save a1/a2 accumulator states when L_q > 2 (needed for backward)
+            if !cache.a1_states.is_empty() {
+                cache_ids.push(tape.alloc(cache.a1_states.clone(), vec![]));
+                cache_ids.push(tape.alloc(cache.a2_states.clone(), vec![]));
+            }
             let y_id = tape.alloc(y.clone(), vec![s, d]);
             let mut saved = vec![meta_id, lp_saved, emb_saved];
             saved.extend(cache_ids);
@@ -1155,6 +1160,39 @@ mod tests {
     #[test] fn test_bitwise_k2_lattice_osr() { assert_bitwise_identity_k2(MemoryRuleKind::LatticeOSR); }
     #[test] fn test_bitwise_k2_trellis() { assert_bitwise_identity_k2(MemoryRuleKind::Trellis); }
     #[test] fn test_bitwise_k2_atlas_omega() { assert_bitwise_identity_k2(MemoryRuleKind::AtlasOmega); }
+
+    // ── L_q > 2 traced path: bitwise identity ─────────────────────
+
+    /// Verify traced path with lq_q > 2 produces bit-identical results to
+    /// the reference cms_forward, exercising the a1/a2 accumulator save/restore
+    /// through the opaque adapter.
+    #[test]
+    fn test_bitwise_k1_moneta_lq3() {
+        let mut cfg = make_config_k1(MemoryRuleKind::Moneta);
+        cfg.lq_q = 3.0;
+        cfg.lambda_2 = 0.1;
+        let s = cfg.swa.seq_len;
+        let v = cfg.swa.vocab_size;
+        let params = MAGParams::init(&cfg, 42);
+        let (input_ids, target_ids) = make_input(s, v, 123);
+        let pulse = Pulse { global_step: 0, active_levels: vec![true] };
+
+        let mut ctx_ref = context_for_rule(&cfg);
+        let (loss_ref, _) = cms_forward(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx_ref);
+
+        let registry = register_opaque_vjps();
+        let mut ctx_traced = context_for_rule(&cfg);
+        let (loss_traced, _, _, _) = with_tape(registry, |tape| {
+            traced_cms_forward(tape, &params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx_traced)
+        });
+
+        assert_eq!(loss_ref.to_bits(), loss_traced.to_bits(),
+            "k=1 Moneta lq_q=3: loss_ref={loss_ref} loss_traced={loss_traced}");
+        for level in 0..cfg.k {
+            assert_eq!(ctx_ref.memory[level], ctx_traced.memory[level],
+                "k=1 Moneta lq_q=3: context.memory[{level}] mismatch");
+        }
+    }
 
     // ── Learned frequency gate: bitwise identity ────────────────────
 
