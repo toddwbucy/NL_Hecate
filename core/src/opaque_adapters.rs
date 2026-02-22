@@ -279,7 +279,11 @@ pub fn titans_lmm_opaque_backward(
         grad_outer: saved[16].to_vec(),
         y: saved[17].to_vec(),
         momentum_kind,
-        decay: if momentum_kind == crate::model::MomentumKind::DeltaMomentum && saved.len() > 18 {
+        decay: if momentum_kind == crate::model::MomentumKind::DeltaMomentum {
+            assert!(saved.len() > 18,
+                "DeltaMomentum opaque backward requires decay buffer at saved[18] \
+                 but only {} entries saved — tape corrupt or from incompatible version",
+                saved.len());
             saved[18].to_vec()
         } else { vec![] },
         deep_cache: None, // Deep momentum backward through opaque adapter is future work
