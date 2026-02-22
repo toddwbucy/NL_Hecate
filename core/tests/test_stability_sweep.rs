@@ -23,7 +23,7 @@
 //! If >20% of 72 valid combinations produce degenerate dynamics (NaN, divergence,
 //! or no loss decrease), the constraint matrix needs rebuilding.
 
-use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind, CompositionKind, SWAConfig, HopeVariant, LatticeVariant};
+use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind, CompositionKind, SWAConfig, HopeVariant, LatticeVariant, MomentumKind};
 use nl_hecate_core::dynamic_freq::FrequencySchedule;
 use nl_hecate_core::mag::{mag_forward, mag_backward, cms_forward, cms_backward};
 use nl_hecate_core::mal::{mal_forward, mal_backward, cms_mal_forward, cms_mal_backward};
@@ -103,6 +103,8 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
             n_persistent: 0,
             attentional_bias: Default::default(),
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
     }
 }
 

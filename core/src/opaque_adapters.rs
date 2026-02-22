@@ -241,6 +241,19 @@ pub fn titans_lmm_opaque_backward(
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
+    // Read momentum_kind from extra_meta if present (new format: meta[4] = momentum_kind as f32)
+    let momentum_kind = if saved[0].len() > 4 {
+        match saved[0][4] as u8 {
+            0 => crate::model::MomentumKind::None,
+            1 => crate::model::MomentumKind::EMA,
+            2 => crate::model::MomentumKind::DeltaMomentum,
+            3 => crate::model::MomentumKind::DeepMomentum,
+            _ => crate::model::MomentumKind::EMA,
+        }
+    } else {
+        crate::model::MomentumKind::EMA // backward compat: old recordings used EMA
+    };
+
     let cache = TitansLMMCache {
         seq_len, d,
         m_states: saved[3].to_vec(),
@@ -258,9 +271,19 @@ pub fn titans_lmm_opaque_backward(
         error: saved[15].to_vec(),
         grad_outer: saved[16].to_vec(),
         y: saved[17].to_vec(),
+        momentum_kind,
+        decay: if momentum_kind == crate::model::MomentumKind::DeltaMomentum && saved.len() > 18 {
+            saved[18].to_vec()
+        } else { vec![] },
+        deep_cache: None, // Deep momentum backward through opaque adapter is future work
+        deep_d_hidden: 0,
     };
 
-    let rule = TitansLMM { bias, sign_sharpness };
+    let rule = TitansLMM {
+        bias, sign_sharpness,
+        momentum_kind,
+        momentum_d_hidden: 0,
+    };
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
     d_inputs[0] = d_embedded;
@@ -742,13 +765,19 @@ impl OpaqueVjp for TitansLMM {
         &self, tape: &mut Tape, level_params: &MemoryLevelParams,
         embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
     ) -> (Vec<f32>, BufId, BufId, BufId) {
-        let extra_meta = [crate::moneta::bias_to_f32(self.bias), self.sign_sharpness];
+        let mk_f32 = match self.momentum_kind {
+            crate::model::MomentumKind::None => 0.0f32,
+            crate::model::MomentumKind::EMA => 1.0,
+            crate::model::MomentumKind::DeltaMomentum => 2.0,
+            crate::model::MomentumKind::DeepMomentum => 3.0,
+        };
+        let extra_meta = [crate::moneta::bias_to_f32(self.bias), self.sign_sharpness, mk_f32];
         let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
             record_common_inputs(tape, level_params, embedded, seq_len, d, &extra_meta);
 
         let (y, cache) = self.step(level_params, embedded, seq_len, d, initial_m);
 
-        let cache_ids: Vec<BufId> = vec![
+        let mut cache_ids: Vec<BufId> = vec![
             tape.alloc(cache.m_states, vec![]),
             tape.alloc(cache.s_states, vec![]),
             tape.alloc(cache.k_mem, vec![]),
@@ -765,6 +794,11 @@ impl OpaqueVjp for TitansLMM {
             tape.alloc(cache.grad_outer, vec![]),
             tape.alloc(cache.y, vec![]),
         ];
+
+        // Save DeltaMomentum decay buffer
+        if !cache.decay.is_empty() {
+            cache_ids.push(tape.alloc(cache.decay, vec![]));
+        }
 
         let y_id = tape.alloc(y.clone(), vec![seq_len, d]);
         let mut saved = vec![meta_id, lp_saved, emb_saved];

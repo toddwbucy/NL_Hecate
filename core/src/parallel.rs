@@ -119,6 +119,10 @@ pub struct ChunkBoundary {
     pub state: Vec<f32>,
     /// Momentum accumulator (TitansLMM only). None for all other rules.
     pub momentum: Option<Vec<f32>>,
+    /// DeepMomentum MLP W1 weights at boundary. None unless DeepMomentum.
+    pub momentum_mlp_w1: Option<Vec<f32>>,
+    /// DeepMomentum MLP W2 weights at boundary. None unless DeepMomentum.
+    pub momentum_mlp_w2: Option<Vec<f32>>,
 }
 
 impl ChunkBoundary {
@@ -127,6 +131,8 @@ impl ChunkBoundary {
         ChunkBoundary {
             state: vec![0.0f32; d * d],
             momentum: None,
+            momentum_mlp_w1: None,
+            momentum_mlp_w2: None,
         }
     }
 
@@ -135,17 +141,19 @@ impl ChunkBoundary {
         ChunkBoundary {
             state: vec![0.0f32; d * d],
             momentum: Some(vec![0.0f32; d * d]),
+            momentum_mlp_w1: None,
+            momentum_mlp_w2: None,
         }
     }
 
     /// Create a boundary from existing state.
     pub fn from_state(state: Vec<f32>) -> Self {
-        ChunkBoundary { state, momentum: None }
+        ChunkBoundary { state, momentum: None, momentum_mlp_w1: None, momentum_mlp_w2: None }
     }
 
     /// Create a boundary from existing state + momentum.
     pub fn from_state_with_momentum(state: Vec<f32>, momentum: Vec<f32>) -> Self {
-        ChunkBoundary { state, momentum: Some(momentum) }
+        ChunkBoundary { state, momentum: Some(momentum), momentum_mlp_w1: None, momentum_mlp_w2: None }
     }
 }
 

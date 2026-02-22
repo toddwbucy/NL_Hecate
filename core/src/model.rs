@@ -23,6 +23,34 @@ pub enum CompositionKind {
     MAC,
 }
 
+/// Momentum expressiveness hierarchy (HOPE §4.2-4.4).
+///
+/// Four levels of momentum sophistication for inner-loop memory updates.
+/// Orthogonal to memory rule choice — any momentum kind can pair with any rule
+/// that uses a momentum accumulator (currently TitansLMM, AtlasOmega).
+///
+/// - None (Level 0): No momentum accumulator. Used by DeltaRule, Hebbian, etc.
+/// - EMA (Level 1): S = eta*S - theta*grad (HOPE Eq 33, Titans Eqs 32-33).
+/// - DeltaMomentum (Level 2): State-dependent decay S*(eta - g^Tg) - theta*P@g (HOPE Eq 49).
+/// - DeepMomentum (Level 3): MLP replaces linear accumulator (HOPE Eq 50).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum MomentumKind {
+    /// Level 0: no momentum accumulator.
+    None,
+    /// Level 1: exponential moving average. S_{t+1} = eta_t * S_t - theta_t * grad.
+    EMA,
+    /// Level 2: gradient-dependent decay. decay = clamp(eta - ||g||^2, eps, 1-eps).
+    DeltaMomentum,
+    /// Level 3: MLP-based momentum. W1,W2 inner-loop weights replace linear S.
+    DeepMomentum,
+}
+
+impl Default for MomentumKind {
+    fn default() -> Self {
+        MomentumKind::None
+    }
+}
+
 /// Which memory update rule to use for the inner loop.
 ///
 /// MIRAS Algorithm knob: selects the optimizer for memory updates.
@@ -569,6 +597,15 @@ pub struct MAGConfig {
     /// the memory module. See specs/infrastructure/attention/02_short_conv.md.
     #[serde(default)]
     pub kernel_size: usize,
+    /// Which momentum variant to use (HOPE §4.2-4.4). Default: None.
+    /// Only meaningful for rules with momentum accumulators (TitansLMM, AtlasOmega).
+    /// TitansLMM with None auto-upgrades to EMA for backward compat.
+    #[serde(default)]
+    pub momentum_kind: MomentumKind,
+    /// MLP hidden dimension for DeepMomentum. Default: 0 (auto = 4*d).
+    /// Ignored for MomentumKind::None/EMA/DeltaMomentum.
+    #[serde(default)]
+    pub momentum_d_hidden: usize,
 }
 
 fn default_sign_sharpness() -> f32 { 10.0 }
@@ -645,6 +682,8 @@ impl MAGConfig {
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
         }
     }
 
@@ -675,6 +714,8 @@ impl MAGConfig {
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
         }
     }
 
@@ -705,6 +746,8 @@ impl MAGConfig {
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
         }
     }
 
@@ -736,6 +779,8 @@ impl MAGConfig {
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
         }
     }
 
@@ -767,6 +812,8 @@ impl MAGConfig {
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
         }
     }
 
@@ -798,6 +845,8 @@ impl MAGConfig {
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
         }
     }
 
@@ -828,6 +877,8 @@ impl MAGConfig {
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
         }
     }
 
@@ -858,6 +909,8 @@ impl MAGConfig {
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
         }
     }
 
@@ -888,6 +941,8 @@ impl MAGConfig {
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
         }
     }
 
@@ -918,6 +973,8 @@ impl MAGConfig {
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
         }
     }
 
@@ -958,6 +1015,8 @@ impl MAGConfig {
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
         }
     }
 
@@ -998,6 +1057,8 @@ impl MAGConfig {
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
         }
     }
 
@@ -1038,6 +1099,8 @@ impl MAGConfig {
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
         }
     }
 
@@ -1078,6 +1141,8 @@ impl MAGConfig {
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
         }
     }
 
@@ -1118,6 +1183,8 @@ impl MAGConfig {
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
         }
     }
 
@@ -1158,6 +1225,8 @@ impl MAGConfig {
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
         }
     }
 
@@ -1189,6 +1258,8 @@ impl MAGConfig {
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
         }
     }
 
@@ -1220,6 +1291,8 @@ impl MAGConfig {
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
         }
     }
 
@@ -1254,6 +1327,8 @@ impl MAGConfig {
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
         }
     }
 
@@ -1288,6 +1363,8 @@ impl MAGConfig {
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
         }
     }
 
@@ -1318,6 +1395,8 @@ impl MAGConfig {
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
         }
     }
 
@@ -1348,6 +1427,8 @@ impl MAGConfig {
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
         }
     }
 
@@ -1378,6 +1459,8 @@ impl MAGConfig {
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
         }
     }
 
@@ -1408,6 +1491,8 @@ impl MAGConfig {
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
         }
     }
 
@@ -1439,6 +1524,8 @@ impl MAGConfig {
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
         }
     }
 
@@ -1469,6 +1556,8 @@ impl MAGConfig {
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
         }
     }
 
@@ -1500,6 +1589,8 @@ impl MAGConfig {
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
         }
     }
 
@@ -1531,6 +1622,8 @@ impl MAGConfig {
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
         }
     }
 }

@@ -6,7 +6,7 @@
 ///
 /// Requires: --features cuda
 
-use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind, CompositionKind, HopeVariant, LatticeVariant};
+use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind, CompositionKind, HopeVariant, LatticeVariant, MomentumKind};
 use nl_hecate_core::conductor::{Pulse, ContextState};
 use nl_hecate_core::dispatch;
 use nl_hecate_core::mag::cms_forward;
@@ -41,6 +41,8 @@ fn make_test_config(rule: MemoryRuleKind) -> MAGConfig {
             n_persistent: 0,
             attentional_bias: Default::default(),
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
     }
 }
 
