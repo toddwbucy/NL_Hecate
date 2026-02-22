@@ -12,6 +12,7 @@
 // Convention: saved[0] = metadata, saved[1] = level_params_flat, saved[2] = embedded, saved[3..] = cache fields.
 
 use std::collections::HashMap;
+use crate::bf16::Bf16Storage;
 use crate::tape::{OpaqueKey, OpaqueBackwardFn, OpaqueVjp, Tape, BufId};
 use crate::model::MemoryLevelParams;
 use crate::delta_rule::{DeltaRule, DeltaRuleCache, MemoryRule};
@@ -88,11 +89,12 @@ pub fn level_params_flat_len(p: &MemoryLevelParams) -> usize {
 }
 
 /// Flatten MemoryLevelParams into a contiguous f32 slice.
+/// Bf16Storage fields flatten their master (fp32) copy.
 pub fn level_params_to_flat(p: &MemoryLevelParams, out: &mut Vec<f32>) {
     out.clear();
-    out.extend_from_slice(&p.w_k_mem);
-    out.extend_from_slice(&p.w_v_mem);
-    out.extend_from_slice(&p.w_q_mem);
+    out.extend_from_slice(p.w_k_mem.master());
+    out.extend_from_slice(p.w_v_mem.master());
+    out.extend_from_slice(p.w_q_mem.master());
     out.extend_from_slice(&p.w_alpha);
     out.extend_from_slice(&p.b_alpha);
     out.extend_from_slice(&p.w_theta);
@@ -120,9 +122,9 @@ pub fn level_params_from_flat(flat: &[f32], d: usize, kernel_size: usize) -> Mem
         *off += n;
         slice
     };
-    let w_k_mem = take(&mut offset, d * d);
-    let w_v_mem = take(&mut offset, d * d);
-    let w_q_mem = take(&mut offset, d * d);
+    let w_k_mem = Bf16Storage::from_f32(&take(&mut offset, d * d));
+    let w_v_mem = Bf16Storage::from_f32(&take(&mut offset, d * d));
+    let w_q_mem = Bf16Storage::from_f32(&take(&mut offset, d * d));
     let w_alpha = take(&mut offset, 2 * d);
     let b_alpha = take(&mut offset, 1);
     let w_theta = take(&mut offset, 2 * d);

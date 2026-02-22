@@ -4,6 +4,7 @@
 /// All weight matrices are flat Vec<f32> in row-major layout.
 
 use serde::{Serialize, Deserialize};
+use crate::bf16::Bf16Storage;
 use crate::tensor::SimpleRng;
 use crate::parallel::ParallelConfig;
 use crate::retention::{RetentionKind, default_retention};
@@ -291,9 +292,9 @@ impl SWAParams {
 ///   w_omega:  [d, 2*d] Atlas Omega projection (AtlasOmega only; zero-init for others)
 #[derive(Clone, Serialize, Deserialize)]
 pub struct MemoryLevelParams {
-    pub w_k_mem: Vec<f32>,
-    pub w_v_mem: Vec<f32>,
-    pub w_q_mem: Vec<f32>,
+    pub w_k_mem: Bf16Storage,
+    pub w_v_mem: Bf16Storage,
+    pub w_q_mem: Bf16Storage,
     pub w_alpha: Vec<f32>,
     pub b_alpha: Vec<f32>,
     pub w_theta: Vec<f32>,
@@ -327,14 +328,17 @@ impl MemoryLevelParams {
         let proj_scale = (2.0 / (d + d) as f32).sqrt();
         let gate_scale = (1.0 / (2 * d) as f32).sqrt();
 
-        let mut w_k_mem = vec![0.0f32; d * d];
-        rng.fill_uniform(&mut w_k_mem, proj_scale);
+        let mut w_k_raw = vec![0.0f32; d * d];
+        rng.fill_uniform(&mut w_k_raw, proj_scale);
+        let w_k_mem = Bf16Storage::from_f32_vec(w_k_raw);
 
-        let mut w_v_mem = vec![0.0f32; d * d];
-        rng.fill_uniform(&mut w_v_mem, proj_scale);
+        let mut w_v_raw = vec![0.0f32; d * d];
+        rng.fill_uniform(&mut w_v_raw, proj_scale);
+        let w_v_mem = Bf16Storage::from_f32_vec(w_v_raw);
 
-        let mut w_q_mem = vec![0.0f32; d * d];
-        rng.fill_uniform(&mut w_q_mem, proj_scale);
+        let mut w_q_raw = vec![0.0f32; d * d];
+        rng.fill_uniform(&mut w_q_raw, proj_scale);
+        let w_q_mem = Bf16Storage::from_f32_vec(w_q_raw);
 
         let mut w_alpha = vec![0.0f32; 2 * d];
         rng.fill_uniform(&mut w_alpha, gate_scale);
@@ -395,9 +399,9 @@ impl MemoryLevelParams {
     /// If `freq_d` > 0, allocates w_freq/b_freq for Learned schedule.
     pub fn zeros_like(d: usize) -> Self {
         MemoryLevelParams {
-            w_k_mem: vec![0.0f32; d * d],
-            w_v_mem: vec![0.0f32; d * d],
-            w_q_mem: vec![0.0f32; d * d],
+            w_k_mem: Bf16Storage::zeros(d * d),
+            w_v_mem: Bf16Storage::zeros(d * d),
+            w_q_mem: Bf16Storage::zeros(d * d),
             w_alpha: vec![0.0f32; 2 * d],
             b_alpha: vec![0.0f32; 1],
             w_theta: vec![0.0f32; 2 * d],
@@ -443,15 +447,19 @@ impl MemoryLevelParams {
     }
 
     /// Outer-loop weight update: param -= lr * grad for all projection weights.
+    /// For Bf16Storage fields: update master copy, then sync bf16 stored copy.
     pub fn apply_weight_gradients(&mut self, grads: &MemoryLevelParams, lr: f32) {
         fn step(param: &mut [f32], grad: &[f32], lr: f32) {
             for i in 0..param.len() {
                 param[i] -= lr * grad[i];
             }
         }
-        step(&mut self.w_k_mem, &grads.w_k_mem, lr);
-        step(&mut self.w_v_mem, &grads.w_v_mem, lr);
-        step(&mut self.w_q_mem, &grads.w_q_mem, lr);
+        step(self.w_k_mem.master_mut(), grads.w_k_mem.master(), lr);
+        self.w_k_mem.sync_from_master();
+        step(self.w_v_mem.master_mut(), grads.w_v_mem.master(), lr);
+        self.w_v_mem.sync_from_master();
+        step(self.w_q_mem.master_mut(), grads.w_q_mem.master(), lr);
+        self.w_q_mem.sync_from_master();
         step(&mut self.w_alpha, &grads.w_alpha, lr);
         step(&mut self.b_alpha, &grads.b_alpha, lr);
         step(&mut self.w_theta, &grads.w_theta, lr);
@@ -472,15 +480,17 @@ impl MemoryLevelParams {
     }
 
     /// Element-wise accumulate: self += other.
+    /// For Bf16Storage fields: accumulate into master copy (no sync needed —
+    /// accumulate is used for gradient aggregation, not parameter update).
     pub fn accumulate(&mut self, other: &MemoryLevelParams) {
         fn acc(dst: &mut [f32], src: &[f32]) {
             for i in 0..dst.len() {
                 dst[i] += src[i];
             }
         }
-        acc(&mut self.w_k_mem, &other.w_k_mem);
-        acc(&mut self.w_v_mem, &other.w_v_mem);
-        acc(&mut self.w_q_mem, &other.w_q_mem);
+        acc(self.w_k_mem.master_mut(), other.w_k_mem.master());
+        acc(self.w_v_mem.master_mut(), other.w_v_mem.master());
+        acc(self.w_q_mem.master_mut(), other.w_q_mem.master());
         acc(&mut self.w_alpha, &other.w_alpha);
         acc(&mut self.b_alpha, &other.b_alpha);
         acc(&mut self.w_theta, &other.w_theta);
@@ -501,10 +511,17 @@ impl MemoryLevelParams {
     }
 
     /// Frobenius norm across all weight matrices.
+    /// For Bf16Storage fields: uses master (fp32) copy for norm calculation.
     pub fn norm(&self) -> f32 {
         let mut sum = 0.0f32;
-        for v in [&self.w_k_mem, &self.w_v_mem, &self.w_q_mem,
-                   &self.w_alpha, &self.b_alpha, &self.w_theta, &self.b_theta,
+        // Bf16Storage fields — iterate master copy
+        for v in [self.w_k_mem.master(), self.w_v_mem.master(), self.w_q_mem.master()] {
+            for &x in v.iter() {
+                sum += x * x;
+            }
+        }
+        // Plain Vec<f32> fields
+        for v in [&self.w_alpha, &self.b_alpha, &self.w_theta, &self.b_theta,
                    &self.w_eta, &self.b_eta, &self.w_omega,
                    &self.w_freq, &self.b_freq,
                    &self.w_k_conv, &self.b_k_conv, &self.w_q_conv, &self.b_q_conv] {
@@ -513,6 +530,15 @@ impl MemoryLevelParams {
             }
         }
         sum.sqrt()
+    }
+
+    /// Snap bf16 master copies to match their stored bf16 values.
+    /// After this, `w_k_mem.master()[i] == w_k_mem.as_f32()[i]` for all i.
+    /// Used before FD gradient checking so get_weight reads what forward sees.
+    pub fn snap_bf16_masters(&mut self) {
+        self.w_k_mem.snap_master_to_stored();
+        self.w_v_mem.snap_master_to_stored();
+        self.w_q_mem.snap_master_to_stored();
     }
 }
 
@@ -2007,7 +2033,7 @@ mod tests {
         let cfg = MAGConfig::test_config();
         let z = MAGParams::zeros_like(&cfg);
         assert_eq!(z.levels.len(), 1);
-        assert!(z.levels[0].w_k_mem.iter().all(|&x| x == 0.0));
+        assert!(z.levels[0].w_k_mem.master().iter().all(|&x| x == 0.0));
         assert!(z.levels[0].w_alpha.iter().all(|&x| x == 0.0));
         assert!(z.levels[0].b_alpha.iter().all(|&x| x == 0.0));
         assert!(z.swa.w_q.iter().all(|&x| x == 0.0));
@@ -2060,12 +2086,12 @@ mod tests {
         let d = 4;
         let mut a = MemoryLevelParams::zeros_like(d);
         let mut b = MemoryLevelParams::zeros_like(d);
-        a.w_k_mem[0] = 1.0;
-        b.w_k_mem[0] = 2.0;
+        a.w_k_mem.master_mut()[0] = 1.0;
+        b.w_k_mem.master_mut()[0] = 2.0;
         a.b_alpha[0] = 0.5;
         b.b_alpha[0] = 0.3;
         a.accumulate(&b);
-        assert!((a.w_k_mem[0] - 3.0).abs() < 1e-6);
+        assert!((a.w_k_mem.master()[0] - 3.0).abs() < 1e-6);
         assert!((a.b_alpha[0] - 0.8).abs() < 1e-6);
     }
 
@@ -2073,8 +2099,8 @@ mod tests {
     fn test_memory_level_params_norm() {
         let d = 2;
         let mut p = MemoryLevelParams::zeros_like(d);
-        p.w_k_mem[0] = 3.0;
-        p.w_k_mem[1] = 4.0;
+        p.w_k_mem.master_mut()[0] = 3.0;
+        p.w_k_mem.master_mut()[1] = 4.0;
         // norm = sqrt(9+16) = 5.0
         assert!((p.norm() - 5.0).abs() < 1e-6);
     }

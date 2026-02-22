@@ -71,8 +71,8 @@ mod tests {
         let mut grads = MAGParams::zeros_like(&cfg);
         // Set some non-zero gradients
         grads.swa.w_q[0] = 1.0;
-        grads.levels[0].w_k_mem[0] = 2.0;
-        grads.levels[1].w_k_mem[0] = 3.0;
+        grads.levels[0].w_k_mem.master_mut()[0] = 2.0;
+        grads.levels[1].w_k_mem.master_mut()[0] = 3.0;
 
         let pulse = Pulse { global_step: 0, active_levels: vec![true, true] };
         let group = MockProcessGroup::new_group(2);
@@ -84,16 +84,16 @@ mod tests {
 
         // After mock allreduce (multiply by 2) then divide by 2: values unchanged
         assert!((grads.swa.w_q[0] - 1.0).abs() < 1e-6);
-        assert!((grads.levels[0].w_k_mem[0] - 2.0).abs() < 1e-6);
-        assert!((grads.levels[1].w_k_mem[0] - 3.0).abs() < 1e-6);
+        assert!((grads.levels[0].w_k_mem.master()[0] - 2.0).abs() < 1e-6);
+        assert!((grads.levels[1].w_k_mem.master()[0] - 3.0).abs() < 1e-6);
     }
 
     #[test]
     fn test_sync_partial_active() {
         let cfg = test_config_k2();
         let mut grads = MAGParams::zeros_like(&cfg);
-        grads.levels[0].w_k_mem[0] = 1.0;
-        grads.levels[1].w_k_mem[0] = 1.0;
+        grads.levels[0].w_k_mem.master_mut()[0] = 1.0;
+        grads.levels[1].w_k_mem.master_mut()[0] = 1.0;
 
         // Only level 0 active
         let pulse = Pulse { global_step: 1, active_levels: vec![true, false] };
@@ -110,12 +110,12 @@ mod tests {
         let cfg = test_config_k2();
         let mut grads = MAGParams::zeros_like(&cfg);
         // Set level 1 grads (which will be frozen)
-        grads.levels[1].w_k_mem[0] = 5.0;
-        grads.levels[1].w_v_mem[0] = 7.0;
+        grads.levels[1].w_k_mem.master_mut()[0] = 5.0;
+        grads.levels[1].w_v_mem.master_mut()[0] = 7.0;
         grads.levels[1].b_alpha[0] = 0.3;
 
-        let original_wk = grads.levels[1].w_k_mem[0];
-        let original_wv = grads.levels[1].w_v_mem[0];
+        let original_wk = grads.levels[1].w_k_mem.master()[0];
+        let original_wv = grads.levels[1].w_v_mem.master()[0];
         let original_ba = grads.levels[1].b_alpha[0];
 
         // Level 1 frozen
@@ -125,8 +125,8 @@ mod tests {
         sync_gradients(&mut grads, &pulse, &group[0]);
 
         // Frozen level grads should be completely untouched
-        assert_eq!(grads.levels[1].w_k_mem[0], original_wk);
-        assert_eq!(grads.levels[1].w_v_mem[0], original_wv);
+        assert_eq!(grads.levels[1].w_k_mem.master()[0], original_wk);
+        assert_eq!(grads.levels[1].w_v_mem.master()[0], original_wv);
         assert_eq!(grads.levels[1].b_alpha[0], original_ba);
     }
 
@@ -135,7 +135,7 @@ mod tests {
         let cfg = test_config_k2();
         let mut grads = MAGParams::zeros_like(&cfg);
         grads.swa.w_q[0] = 10.0;
-        grads.levels[0].w_k_mem[0] = 20.0;
+        grads.levels[0].w_k_mem.master_mut()[0] = 20.0;
 
         let pulse = Pulse { global_step: 0, active_levels: vec![true, true] };
         let group = MockProcessGroup::new_group(4);
@@ -144,7 +144,7 @@ mod tests {
 
         // Mock allreduce: 10.0 * 4 = 40.0, then /4 = 10.0 (same input since identical ranks)
         assert!((grads.swa.w_q[0] - 10.0).abs() < 1e-6);
-        assert!((grads.levels[0].w_k_mem[0] - 20.0).abs() < 1e-6);
+        assert!((grads.levels[0].w_k_mem.master()[0] - 20.0).abs() < 1e-6);
     }
 
     // ── Group 3: ThroughputTracker (3 tests) ─────────────────────────
@@ -314,7 +314,7 @@ mod tests {
         );
 
         // Frozen level 1 has zero direct grads, non-zero error buffer
-        let l1_norm_before: f32 = grads.levels[1].w_k_mem.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let l1_norm_before: f32 = grads.levels[1].w_k_mem.master().iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!(l1_norm_before < 1e-12, "Frozen level should have zero direct grads");
         assert!(error_buffers[1].steps_accumulated > 0, "Error buffer should have grads");
 
@@ -322,7 +322,7 @@ mod tests {
         let group = MockProcessGroup::new_group(2);
         sync_gradients(&mut grads, &pulse1, &group[0]);
 
-        let l1_norm_after: f32 = grads.levels[1].w_k_mem.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let l1_norm_after: f32 = grads.levels[1].w_k_mem.master().iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!(l1_norm_after < 1e-12, "Frozen level grads should stay zero after sync");
     }
 
@@ -406,7 +406,7 @@ mod tests {
         for level in 0..cfg.k {
             for i in 0..params_r0.levels[level].w_k_mem.len() {
                 assert!(
-                    (params_r0.levels[level].w_k_mem[i] - params_r1.levels[level].w_k_mem[i]).abs() < 1e-5,
+                    (params_r0.levels[level].w_k_mem.master()[i] - params_r1.levels[level].w_k_mem.master()[i]).abs() < 1e-5,
                     "Level {level} w_k_mem[{i}] differs"
                 );
             }
@@ -421,8 +421,8 @@ mod tests {
         let cfg = test_config_k2();
         let mut grads = MAGParams::zeros_like(&cfg);
         grads.swa.w_q[0] = 42.0;
-        grads.levels[0].w_k_mem[0] = 7.0;
-        grads.levels[1].w_k_mem[0] = 13.0;
+        grads.levels[0].w_k_mem.master_mut()[0] = 7.0;
+        grads.levels[1].w_k_mem.master_mut()[0] = 13.0;
 
         let pulse = Pulse { global_step: 0, active_levels: vec![true, true] };
         let group = MockProcessGroup::new_group(1);
@@ -431,8 +431,8 @@ mod tests {
 
         // world_size=1: allreduce_sum multiplies by 1, then divides by 1
         assert!((grads.swa.w_q[0] - 42.0).abs() < 1e-6);
-        assert!((grads.levels[0].w_k_mem[0] - 7.0).abs() < 1e-6);
-        assert!((grads.levels[1].w_k_mem[0] - 13.0).abs() < 1e-6);
+        assert!((grads.levels[0].w_k_mem.master()[0] - 7.0).abs() < 1e-6);
+        assert!((grads.levels[1].w_k_mem.master()[0] - 13.0).abs() < 1e-6);
     }
 
     #[test]
@@ -450,8 +450,8 @@ mod tests {
         assert!(grads.swa.w_q.iter().all(|&v| v == 0.0));
         assert!(grads.swa.w_embed.iter().all(|&v| v == 0.0));
         for level in &grads.levels {
-            assert!(level.w_k_mem.iter().all(|&v| v == 0.0));
-            assert!(level.w_v_mem.iter().all(|&v| v == 0.0));
+            assert!(level.w_k_mem.master().iter().all(|&v| v == 0.0));
+            assert!(level.w_v_mem.master().iter().all(|&v| v == 0.0));
         }
     }
 }

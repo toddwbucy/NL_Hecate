@@ -6,6 +6,7 @@
 /// - `finite_diff_gradient`: central finite differences for verification
 /// - Gradient checking utilities
 
+use crate::bf16::Bf16Storage;
 use crate::model::{SWAConfig, SWAParams, MAGConfig, MAGParams, MemoryRuleKind, MemoryLevelParams};
 use crate::forward::forward;
 use crate::backward::backward_full;
@@ -77,7 +78,7 @@ fn fd_single(
     cfg: &SWAConfig,
     input_ids: &[usize],
     target_ids: &[usize],
-    get_weight: impl Fn(&SWAParams) -> &Vec<f32>,
+    get_weight: impl Fn(&SWAParams) -> &[f32],
     set_weight: impl Fn(&mut SWAParams, usize, f32),
     idx: usize,
     eps: f32,
@@ -102,7 +103,7 @@ fn mag_fd_single(
     cfg: &MAGConfig,
     input_ids: &[usize],
     target_ids: &[usize],
-    get_weight: impl Fn(&MAGParams) -> &Vec<f32>,
+    get_weight: impl Fn(&MAGParams) -> &[f32],
     set_weight: impl Fn(&mut MAGParams, usize, f32),
     idx: usize,
     eps: f32,
@@ -111,13 +112,22 @@ fn mag_fd_single(
 
     let mut p_plus = params.clone();
     set_weight(&mut p_plus, idx, orig + eps);
+    // Read back effective value after bf16 truncation (if applicable).
+    let eff_plus = get_weight(&p_plus)[idx];
     let (loss_plus, _) = mag_forward(&p_plus, cfg, input_ids, target_ids);
 
     let mut p_minus = params.clone();
     set_weight(&mut p_minus, idx, orig - eps);
+    let eff_minus = get_weight(&p_minus)[idx];
     let (loss_minus, _) = mag_forward(&p_minus, cfg, input_ids, target_ids);
 
-    (loss_plus - loss_minus) / (2.0 * eps)
+    // Use effective perturbation as denominator — accounts for bf16 quantization.
+    let effective_delta = eff_plus - eff_minus;
+    if effective_delta.abs() < 1e-30 {
+        0.0 // perturbation collapsed to zero (shouldn't happen with eps=1e-2)
+    } else {
+        (loss_plus - loss_minus) / effective_delta
+    }
 }
 
 /// Check gradient for a specific weight matrix (SWA).
@@ -134,9 +144,9 @@ pub(crate) fn check_weight_gradient(
     target_ids: &[usize],
     grads: &SWAParams,
     name: &str,
-    get_weight: impl Fn(&SWAParams) -> &Vec<f32>,
+    get_weight: impl Fn(&SWAParams) -> &[f32],
     set_weight: impl Fn(&mut SWAParams, usize, f32),
-    get_grad: impl Fn(&SWAParams) -> &Vec<f32>,
+    get_grad: impl Fn(&SWAParams) -> &[f32],
     num_samples: usize,
     eps: f32,
     tol: f32,
@@ -200,9 +210,9 @@ pub(crate) fn mag_check_weight_gradient(
     target_ids: &[usize],
     grads: &MAGParams,
     name: &str,
-    get_weight: impl Fn(&MAGParams) -> &Vec<f32>,
+    get_weight: impl Fn(&MAGParams) -> &[f32],
     set_weight: impl Fn(&mut MAGParams, usize, f32),
-    get_grad: impl Fn(&MAGParams) -> &Vec<f32>,
+    get_grad: impl Fn(&MAGParams) -> &[f32],
     num_samples: usize,
     eps: f32,
     tol: f32,
@@ -347,7 +357,7 @@ pub fn tape_compute_gradients(
                 // frozen path registered w_q_mem separately. The lp_flat's
                 // w_q_mem slice received no gradient (the tape routed through
                 // the separate w_q_mem_id). So replace rather than add.
-                lp_grad.w_q_mem = w_q_mem_grad;
+                lp_grad.w_q_mem = Bf16Storage::from_f32_vec(w_q_mem_grad);
             }
 
             if cache.pulse.active_levels[level] {
@@ -410,7 +420,7 @@ fn cms_fd_single(
     input_ids: &[usize],
     target_ids: &[usize],
     pulse: &Pulse,
-    get_weight: impl Fn(&MAGParams) -> &Vec<f32>,
+    get_weight: impl Fn(&MAGParams) -> &[f32],
     set_weight: impl Fn(&mut MAGParams, usize, f32),
     idx: usize,
     eps: f32,
@@ -419,15 +429,23 @@ fn cms_fd_single(
 
     let mut p_plus = params.clone();
     set_weight(&mut p_plus, idx, orig + eps);
+    let eff_plus = get_weight(&p_plus)[idx];
     let mut ctx_plus = make_context_state(cfg);
     let (loss_plus, _) = cms_forward(&p_plus, cfg, input_ids, target_ids, pulse, &mut ctx_plus);
 
     let mut p_minus = params.clone();
     set_weight(&mut p_minus, idx, orig - eps);
+    let eff_minus = get_weight(&p_minus)[idx];
     let mut ctx_minus = make_context_state(cfg);
     let (loss_minus, _) = cms_forward(&p_minus, cfg, input_ids, target_ids, pulse, &mut ctx_minus);
 
-    (loss_plus - loss_minus) / (2.0 * eps)
+    // Use effective perturbation as denominator — accounts for bf16 quantization.
+    let effective_delta = eff_plus - eff_minus;
+    if effective_delta.abs() < 1e-30 {
+        0.0
+    } else {
+        (loss_plus - loss_minus) / effective_delta
+    }
 }
 
 /// Check gradient for a specific weight matrix (CMS).
@@ -441,9 +459,9 @@ pub(crate) fn cms_check_weight_gradient(
     grads: &MAGParams,
     name: &str,
     pulse: &Pulse,
-    get_weight: impl Fn(&MAGParams) -> &Vec<f32>,
+    get_weight: impl Fn(&MAGParams) -> &[f32],
     set_weight: impl Fn(&mut MAGParams, usize, f32),
-    get_grad: impl Fn(&MAGParams) -> &Vec<f32>,
+    get_grad: impl Fn(&MAGParams) -> &[f32],
     num_samples: usize,
     eps: f32,
     tol: f32,
@@ -516,7 +534,7 @@ fn mal_fd_single(
     cfg: &MAGConfig,
     input_ids: &[usize],
     target_ids: &[usize],
-    get_weight: impl Fn(&MAGParams) -> &Vec<f32>,
+    get_weight: impl Fn(&MAGParams) -> &[f32],
     set_weight: impl Fn(&mut MAGParams, usize, f32),
     idx: usize,
     eps: f32,
@@ -543,9 +561,9 @@ pub(crate) fn mal_check_weight_gradient(
     target_ids: &[usize],
     grads: &MAGParams,
     name: &str,
-    get_weight: impl Fn(&MAGParams) -> &Vec<f32>,
+    get_weight: impl Fn(&MAGParams) -> &[f32],
     set_weight: impl Fn(&mut MAGParams, usize, f32),
-    get_grad: impl Fn(&MAGParams) -> &Vec<f32>,
+    get_grad: impl Fn(&MAGParams) -> &[f32],
     num_samples: usize,
     eps: f32,
     tol: f32,
@@ -604,7 +622,7 @@ fn cms_mal_fd_single(
     input_ids: &[usize],
     target_ids: &[usize],
     pulse: &Pulse,
-    get_weight: impl Fn(&MAGParams) -> &Vec<f32>,
+    get_weight: impl Fn(&MAGParams) -> &[f32],
     set_weight: impl Fn(&mut MAGParams, usize, f32),
     idx: usize,
     eps: f32,
@@ -634,9 +652,9 @@ pub(crate) fn cms_mal_check_weight_gradient(
     grads: &MAGParams,
     name: &str,
     pulse: &Pulse,
-    get_weight: impl Fn(&MAGParams) -> &Vec<f32>,
+    get_weight: impl Fn(&MAGParams) -> &[f32],
     set_weight: impl Fn(&mut MAGParams, usize, f32),
-    get_grad: impl Fn(&MAGParams) -> &Vec<f32>,
+    get_grad: impl Fn(&MAGParams) -> &[f32],
     num_samples: usize,
     eps: f32,
     tol: f32,
@@ -693,7 +711,7 @@ fn mac_fd_single(
     cfg: &MAGConfig,
     input_ids: &[usize],
     target_ids: &[usize],
-    get_weight: impl Fn(&MAGParams) -> &Vec<f32>,
+    get_weight: impl Fn(&MAGParams) -> &[f32],
     set_weight: impl Fn(&mut MAGParams, usize, f32),
     idx: usize,
     eps: f32,
@@ -720,9 +738,9 @@ pub(crate) fn mac_check_weight_gradient(
     target_ids: &[usize],
     grads: &MAGParams,
     name: &str,
-    get_weight: impl Fn(&MAGParams) -> &Vec<f32>,
+    get_weight: impl Fn(&MAGParams) -> &[f32],
     set_weight: impl Fn(&mut MAGParams, usize, f32),
-    get_grad: impl Fn(&MAGParams) -> &Vec<f32>,
+    get_grad: impl Fn(&MAGParams) -> &[f32],
     num_samples: usize,
     eps: f32,
     tol: f32,
@@ -781,7 +799,7 @@ fn cms_mac_fd_single(
     input_ids: &[usize],
     target_ids: &[usize],
     pulse: &Pulse,
-    get_weight: impl Fn(&MAGParams) -> &Vec<f32>,
+    get_weight: impl Fn(&MAGParams) -> &[f32],
     set_weight: impl Fn(&mut MAGParams, usize, f32),
     idx: usize,
     eps: f32,
@@ -811,9 +829,9 @@ pub(crate) fn cms_mac_check_weight_gradient(
     grads: &MAGParams,
     name: &str,
     pulse: &Pulse,
-    get_weight: impl Fn(&MAGParams) -> &Vec<f32>,
+    get_weight: impl Fn(&MAGParams) -> &[f32],
     set_weight: impl Fn(&mut MAGParams, usize, f32),
-    get_grad: impl Fn(&MAGParams) -> &Vec<f32>,
+    get_grad: impl Fn(&MAGParams) -> &[f32],
     num_samples: usize,
     eps: f32,
     tol: f32,
@@ -1021,6 +1039,8 @@ mod tests {
         for level in &mut params.levels {
             level.b_alpha = vec![0.0f32];  // sigmoid(0)=0.5
             level.b_theta = vec![0.0f32];  // softplus(0)=ln(2)≈0.69
+            // Snap bf16 master copies so FD get_weight reads what forward sees
+            level.snap_bf16_masters();
         }
         params
     }
@@ -1036,7 +1056,7 @@ mod tests {
         let (checked, passed, max_err) = mag_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads,
             "w_k_mem",
-            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            |p| p.levels[0].w_k_mem.master(), |p, i, v| p.levels[0].w_k_mem.set(i, v), |g| g.levels[0].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -1053,7 +1073,7 @@ mod tests {
         let (checked, passed, max_err) = mag_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads,
             "w_v_mem",
-            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            |p| p.levels[0].w_v_mem.master(), |p, i, v| p.levels[0].w_v_mem.set(i, v), |g| g.levels[0].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -1070,7 +1090,7 @@ mod tests {
         let (checked, passed, max_err) = mag_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads,
             "w_q_mem",
-            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            |p| p.levels[0].w_q_mem.master(), |p, i, v| p.levels[0].w_q_mem.set(i, v), |g| g.levels[0].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -1284,7 +1304,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "l0_w_k_mem", &pulse,
-            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            |p| p.levels[0].w_k_mem.master(), |p, i, v| p.levels[0].w_k_mem.set(i, v), |g| g.levels[0].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("CMS l0_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -1303,7 +1323,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "l0_w_v_mem", &pulse,
-            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            |p| p.levels[0].w_v_mem.master(), |p, i, v| p.levels[0].w_v_mem.set(i, v), |g| g.levels[0].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("CMS l0_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -1322,7 +1342,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "l0_w_q_mem", &pulse,
-            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            |p| p.levels[0].w_q_mem.master(), |p, i, v| p.levels[0].w_q_mem.set(i, v), |g| g.levels[0].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("CMS l0_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -1419,7 +1439,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "l1_w_k_mem", &pulse,
-            |p| &p.levels[1].w_k_mem, |p, i, v| p.levels[1].w_k_mem[i] = v, |g| &g.levels[1].w_k_mem,
+            |p| p.levels[1].w_k_mem.master(), |p, i, v| p.levels[1].w_k_mem.set(i, v), |g| g.levels[1].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("CMS l1_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -1438,7 +1458,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "l1_w_v_mem", &pulse,
-            |p| &p.levels[1].w_v_mem, |p, i, v| p.levels[1].w_v_mem[i] = v, |g| &g.levels[1].w_v_mem,
+            |p| p.levels[1].w_v_mem.master(), |p, i, v| p.levels[1].w_v_mem.set(i, v), |g| g.levels[1].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("CMS l1_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -1457,7 +1477,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "l1_w_q_mem", &pulse,
-            |p| &p.levels[1].w_q_mem, |p, i, v| p.levels[1].w_q_mem[i] = v, |g| &g.levels[1].w_q_mem,
+            |p| p.levels[1].w_q_mem.master(), |p, i, v| p.levels[1].w_q_mem.set(i, v), |g| g.levels[1].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("CMS l1_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -1575,7 +1595,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "l2_w_k_mem", &pulse,
-            |p| &p.levels[2].w_k_mem, |p, i, v| p.levels[2].w_k_mem[i] = v, |g| &g.levels[2].w_k_mem,
+            |p| p.levels[2].w_k_mem.master(), |p, i, v| p.levels[2].w_k_mem.set(i, v), |g| g.levels[2].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("CMS l2_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -1594,7 +1614,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "l2_w_v_mem", &pulse,
-            |p| &p.levels[2].w_v_mem, |p, i, v| p.levels[2].w_v_mem[i] = v, |g| &g.levels[2].w_v_mem,
+            |p| p.levels[2].w_v_mem.master(), |p, i, v| p.levels[2].w_v_mem.set(i, v), |g| g.levels[2].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("CMS l2_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -1613,7 +1633,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "l2_w_q_mem", &pulse,
-            |p| &p.levels[2].w_q_mem, |p, i, v| p.levels[2].w_q_mem[i] = v, |g| &g.levels[2].w_q_mem,
+            |p| p.levels[2].w_q_mem.master(), |p, i, v| p.levels[2].w_q_mem.set(i, v), |g| g.levels[2].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("CMS l2_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -1710,7 +1730,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "l3_w_k_mem", &pulse,
-            |p| &p.levels[3].w_k_mem, |p, i, v| p.levels[3].w_k_mem[i] = v, |g| &g.levels[3].w_k_mem,
+            |p| p.levels[3].w_k_mem.master(), |p, i, v| p.levels[3].w_k_mem.set(i, v), |g| g.levels[3].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("CMS l3_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -1729,7 +1749,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "l3_w_v_mem", &pulse,
-            |p| &p.levels[3].w_v_mem, |p, i, v| p.levels[3].w_v_mem[i] = v, |g| &g.levels[3].w_v_mem,
+            |p| p.levels[3].w_v_mem.master(), |p, i, v| p.levels[3].w_v_mem.set(i, v), |g| g.levels[3].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("CMS l3_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -1748,7 +1768,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "l3_w_q_mem", &pulse,
-            |p| &p.levels[3].w_q_mem, |p, i, v| p.levels[3].w_q_mem[i] = v, |g| &g.levels[3].w_q_mem,
+            |p| p.levels[3].w_q_mem.master(), |p, i, v| p.levels[3].w_q_mem.set(i, v), |g| g.levels[3].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("CMS l3_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -1857,7 +1877,7 @@ mod tests {
         let (checked, passed, max_err) = mag_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads,
             "titans_w_k_mem",
-            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            |p| p.levels[0].w_k_mem.master(), |p, i, v| p.levels[0].w_k_mem.set(i, v), |g| g.levels[0].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("titans_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -1874,7 +1894,7 @@ mod tests {
         let (checked, passed, max_err) = mag_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads,
             "titans_w_v_mem",
-            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            |p| p.levels[0].w_v_mem.master(), |p, i, v| p.levels[0].w_v_mem.set(i, v), |g| g.levels[0].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("titans_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -1891,7 +1911,7 @@ mod tests {
         let (checked, passed, max_err) = mag_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads,
             "titans_w_q_mem",
-            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            |p| p.levels[0].w_q_mem.master(), |p, i, v| p.levels[0].w_q_mem.set(i, v), |g| g.levels[0].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("titans_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -2036,7 +2056,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "titans_l0_w_k_mem", &pulse,
-            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            |p| p.levels[0].w_k_mem.master(), |p, i, v| p.levels[0].w_k_mem.set(i, v), |g| g.levels[0].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("titans CMS l0_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -2055,7 +2075,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "titans_l0_w_v_mem", &pulse,
-            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            |p| p.levels[0].w_v_mem.master(), |p, i, v| p.levels[0].w_v_mem.set(i, v), |g| g.levels[0].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("titans CMS l0_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -2074,7 +2094,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "titans_l0_w_q_mem", &pulse,
-            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            |p| p.levels[0].w_q_mem.master(), |p, i, v| p.levels[0].w_q_mem.set(i, v), |g| g.levels[0].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("titans CMS l0_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -2209,7 +2229,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "titans_l1_w_k_mem", &pulse,
-            |p| &p.levels[1].w_k_mem, |p, i, v| p.levels[1].w_k_mem[i] = v, |g| &g.levels[1].w_k_mem,
+            |p| p.levels[1].w_k_mem.master(), |p, i, v| p.levels[1].w_k_mem.set(i, v), |g| g.levels[1].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("titans CMS l1_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -2228,7 +2248,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "titans_l1_w_v_mem", &pulse,
-            |p| &p.levels[1].w_v_mem, |p, i, v| p.levels[1].w_v_mem[i] = v, |g| &g.levels[1].w_v_mem,
+            |p| p.levels[1].w_v_mem.master(), |p, i, v| p.levels[1].w_v_mem.set(i, v), |g| g.levels[1].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("titans CMS l1_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -2247,7 +2267,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "titans_l1_w_q_mem", &pulse,
-            |p| &p.levels[1].w_q_mem, |p, i, v| p.levels[1].w_q_mem[i] = v, |g| &g.levels[1].w_q_mem,
+            |p| p.levels[1].w_q_mem.master(), |p, i, v| p.levels[1].w_q_mem.set(i, v), |g| g.levels[1].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("titans CMS l1_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -2392,7 +2412,7 @@ mod tests {
         let (checked, passed, max_err) = mag_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads,
             "hebbian_w_k_mem",
-            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            |p| p.levels[0].w_k_mem.master(), |p, i, v| p.levels[0].w_k_mem.set(i, v), |g| g.levels[0].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("hebbian_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -2409,7 +2429,7 @@ mod tests {
         let (checked, passed, max_err) = mag_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads,
             "hebbian_w_v_mem",
-            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            |p| p.levels[0].w_v_mem.master(), |p, i, v| p.levels[0].w_v_mem.set(i, v), |g| g.levels[0].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("hebbian_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -2426,7 +2446,7 @@ mod tests {
         let (checked, passed, max_err) = mag_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads,
             "hebbian_w_q_mem",
-            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            |p| p.levels[0].w_q_mem.master(), |p, i, v| p.levels[0].w_q_mem.set(i, v), |g| g.levels[0].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("hebbian_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -2501,7 +2521,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "hebbian_l0_w_k_mem", &pulse,
-            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            |p| p.levels[0].w_k_mem.master(), |p, i, v| p.levels[0].w_k_mem.set(i, v), |g| g.levels[0].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("hebbian CMS l0_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -2520,7 +2540,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "hebbian_l0_w_v_mem", &pulse,
-            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            |p| p.levels[0].w_v_mem.master(), |p, i, v| p.levels[0].w_v_mem.set(i, v), |g| g.levels[0].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("hebbian CMS l0_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -2539,7 +2559,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "hebbian_l0_w_q_mem", &pulse,
-            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            |p| p.levels[0].w_q_mem.master(), |p, i, v| p.levels[0].w_q_mem.set(i, v), |g| g.levels[0].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("hebbian CMS l0_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -2598,7 +2618,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "hebbian_l1_w_k_mem", &pulse,
-            |p| &p.levels[1].w_k_mem, |p, i, v| p.levels[1].w_k_mem[i] = v, |g| &g.levels[1].w_k_mem,
+            |p| p.levels[1].w_k_mem.master(), |p, i, v| p.levels[1].w_k_mem.set(i, v), |g| g.levels[1].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("hebbian CMS l1_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -2617,7 +2637,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "hebbian_l1_w_v_mem", &pulse,
-            |p| &p.levels[1].w_v_mem, |p, i, v| p.levels[1].w_v_mem[i] = v, |g| &g.levels[1].w_v_mem,
+            |p| p.levels[1].w_v_mem.master(), |p, i, v| p.levels[1].w_v_mem.set(i, v), |g| g.levels[1].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("hebbian CMS l1_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -2636,7 +2656,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "hebbian_l1_w_q_mem", &pulse,
-            |p| &p.levels[1].w_q_mem, |p, i, v| p.levels[1].w_q_mem[i] = v, |g| &g.levels[1].w_q_mem,
+            |p| p.levels[1].w_q_mem.master(), |p, i, v| p.levels[1].w_q_mem.set(i, v), |g| g.levels[1].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("hebbian CMS l1_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -2705,7 +2725,7 @@ mod tests {
         let (checked, passed, max_err) = mag_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads,
             "moneta_w_k_mem",
-            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            |p| p.levels[0].w_k_mem.master(), |p, i, v| p.levels[0].w_k_mem.set(i, v), |g| g.levels[0].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("moneta_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -2722,7 +2742,7 @@ mod tests {
         let (checked, passed, max_err) = mag_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads,
             "moneta_w_v_mem",
-            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            |p| p.levels[0].w_v_mem.master(), |p, i, v| p.levels[0].w_v_mem.set(i, v), |g| g.levels[0].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("moneta_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -2739,7 +2759,7 @@ mod tests {
         let (checked, passed, max_err) = mag_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads,
             "moneta_w_q_mem",
-            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            |p| p.levels[0].w_q_mem.master(), |p, i, v| p.levels[0].w_q_mem.set(i, v), |g| g.levels[0].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("moneta_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -2848,7 +2868,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "moneta_l0_w_k_mem", &pulse,
-            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            |p| p.levels[0].w_k_mem.master(), |p, i, v| p.levels[0].w_k_mem.set(i, v), |g| g.levels[0].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("moneta CMS l0_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -2867,7 +2887,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "moneta_l0_w_v_mem", &pulse,
-            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            |p| p.levels[0].w_v_mem.master(), |p, i, v| p.levels[0].w_v_mem.set(i, v), |g| g.levels[0].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("moneta CMS l0_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -2886,7 +2906,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "moneta_l0_w_q_mem", &pulse,
-            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            |p| p.levels[0].w_q_mem.master(), |p, i, v| p.levels[0].w_q_mem.set(i, v), |g| g.levels[0].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("moneta CMS l0_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -2983,7 +3003,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "moneta_l1_w_k_mem", &pulse,
-            |p| &p.levels[1].w_k_mem, |p, i, v| p.levels[1].w_k_mem[i] = v, |g| &g.levels[1].w_k_mem,
+            |p| p.levels[1].w_k_mem.master(), |p, i, v| p.levels[1].w_k_mem.set(i, v), |g| g.levels[1].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("moneta CMS l1_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -3002,7 +3022,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "moneta_l1_w_v_mem", &pulse,
-            |p| &p.levels[1].w_v_mem, |p, i, v| p.levels[1].w_v_mem[i] = v, |g| &g.levels[1].w_v_mem,
+            |p| p.levels[1].w_v_mem.master(), |p, i, v| p.levels[1].w_v_mem.set(i, v), |g| g.levels[1].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("moneta CMS l1_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -3021,7 +3041,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "moneta_l1_w_q_mem", &pulse,
-            |p| &p.levels[1].w_q_mem, |p, i, v| p.levels[1].w_q_mem[i] = v, |g| &g.levels[1].w_q_mem,
+            |p| p.levels[1].w_q_mem.master(), |p, i, v| p.levels[1].w_q_mem.set(i, v), |g| g.levels[1].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("moneta CMS l1_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -3128,7 +3148,7 @@ mod tests {
         let (checked, passed, max_err) = mag_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads,
             "yaad_w_k_mem",
-            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            |p| p.levels[0].w_k_mem.master(), |p, i, v| p.levels[0].w_k_mem.set(i, v), |g| g.levels[0].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("yaad_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -3145,7 +3165,7 @@ mod tests {
         let (checked, passed, max_err) = mag_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads,
             "yaad_w_v_mem",
-            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            |p| p.levels[0].w_v_mem.master(), |p, i, v| p.levels[0].w_v_mem.set(i, v), |g| g.levels[0].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("yaad_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -3162,7 +3182,7 @@ mod tests {
         let (checked, passed, max_err) = mag_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads,
             "yaad_w_q_mem",
-            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            |p| p.levels[0].w_q_mem.master(), |p, i, v| p.levels[0].w_q_mem.set(i, v), |g| g.levels[0].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("yaad_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -3271,7 +3291,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "yaad_l0_w_k_mem", &pulse,
-            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            |p| p.levels[0].w_k_mem.master(), |p, i, v| p.levels[0].w_k_mem.set(i, v), |g| g.levels[0].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("yaad CMS l0_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -3290,7 +3310,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "yaad_l0_w_v_mem", &pulse,
-            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            |p| p.levels[0].w_v_mem.master(), |p, i, v| p.levels[0].w_v_mem.set(i, v), |g| g.levels[0].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("yaad CMS l0_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -3309,7 +3329,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "yaad_l0_w_q_mem", &pulse,
-            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            |p| p.levels[0].w_q_mem.master(), |p, i, v| p.levels[0].w_q_mem.set(i, v), |g| g.levels[0].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("yaad CMS l0_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -3406,7 +3426,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "yaad_l1_w_k_mem", &pulse,
-            |p| &p.levels[1].w_k_mem, |p, i, v| p.levels[1].w_k_mem[i] = v, |g| &g.levels[1].w_k_mem,
+            |p| p.levels[1].w_k_mem.master(), |p, i, v| p.levels[1].w_k_mem.set(i, v), |g| g.levels[1].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("yaad CMS l1_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -3425,7 +3445,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "yaad_l1_w_v_mem", &pulse,
-            |p| &p.levels[1].w_v_mem, |p, i, v| p.levels[1].w_v_mem[i] = v, |g| &g.levels[1].w_v_mem,
+            |p| p.levels[1].w_v_mem.master(), |p, i, v| p.levels[1].w_v_mem.set(i, v), |g| g.levels[1].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("yaad CMS l1_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -3444,7 +3464,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "yaad_l1_w_q_mem", &pulse,
-            |p| &p.levels[1].w_q_mem, |p, i, v| p.levels[1].w_q_mem[i] = v, |g| &g.levels[1].w_q_mem,
+            |p| p.levels[1].w_q_mem.master(), |p, i, v| p.levels[1].w_q_mem.set(i, v), |g| g.levels[1].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("yaad CMS l1_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -3551,7 +3571,7 @@ mod tests {
         let (checked, passed, max_err) = mag_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads,
             "memora_w_k_mem",
-            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            |p| p.levels[0].w_k_mem.master(), |p, i, v| p.levels[0].w_k_mem.set(i, v), |g| g.levels[0].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("memora_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -3568,7 +3588,7 @@ mod tests {
         let (checked, passed, max_err) = mag_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads,
             "memora_w_v_mem",
-            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            |p| p.levels[0].w_v_mem.master(), |p, i, v| p.levels[0].w_v_mem.set(i, v), |g| g.levels[0].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("memora_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -3585,7 +3605,7 @@ mod tests {
         let (checked, passed, max_err) = mag_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads,
             "memora_w_q_mem",
-            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            |p| p.levels[0].w_q_mem.master(), |p, i, v| p.levels[0].w_q_mem.set(i, v), |g| g.levels[0].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("memora_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -3694,7 +3714,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "memora_l0_w_k_mem", &pulse,
-            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            |p| p.levels[0].w_k_mem.master(), |p, i, v| p.levels[0].w_k_mem.set(i, v), |g| g.levels[0].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("memora CMS l0_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -3713,7 +3733,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "memora_l0_w_v_mem", &pulse,
-            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            |p| p.levels[0].w_v_mem.master(), |p, i, v| p.levels[0].w_v_mem.set(i, v), |g| g.levels[0].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("memora CMS l0_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -3732,7 +3752,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "memora_l0_w_q_mem", &pulse,
-            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            |p| p.levels[0].w_q_mem.master(), |p, i, v| p.levels[0].w_q_mem.set(i, v), |g| g.levels[0].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("memora CMS l0_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -3829,7 +3849,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "memora_l1_w_k_mem", &pulse,
-            |p| &p.levels[1].w_k_mem, |p, i, v| p.levels[1].w_k_mem[i] = v, |g| &g.levels[1].w_k_mem,
+            |p| p.levels[1].w_k_mem.master(), |p, i, v| p.levels[1].w_k_mem.set(i, v), |g| g.levels[1].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("memora CMS l1_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -3848,7 +3868,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "memora_l1_w_v_mem", &pulse,
-            |p| &p.levels[1].w_v_mem, |p, i, v| p.levels[1].w_v_mem[i] = v, |g| &g.levels[1].w_v_mem,
+            |p| p.levels[1].w_v_mem.master(), |p, i, v| p.levels[1].w_v_mem.set(i, v), |g| g.levels[1].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("memora CMS l1_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -3867,7 +3887,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "memora_l1_w_q_mem", &pulse,
-            |p| &p.levels[1].w_q_mem, |p, i, v| p.levels[1].w_q_mem[i] = v, |g| &g.levels[1].w_q_mem,
+            |p| p.levels[1].w_q_mem.master(), |p, i, v| p.levels[1].w_q_mem.set(i, v), |g| g.levels[1].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("memora CMS l1_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -3974,7 +3994,7 @@ mod tests {
         let (checked, passed, max_err) = mag_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads,
             "lattice_w_k_mem",
-            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            |p| p.levels[0].w_k_mem.master(), |p, i, v| p.levels[0].w_k_mem.set(i, v), |g| g.levels[0].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("lattice_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -3991,7 +4011,7 @@ mod tests {
         let (checked, passed, max_err) = mag_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads,
             "lattice_w_v_mem",
-            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            |p| p.levels[0].w_v_mem.master(), |p, i, v| p.levels[0].w_v_mem.set(i, v), |g| g.levels[0].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("lattice_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -4008,7 +4028,7 @@ mod tests {
         let (checked, passed, max_err) = mag_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads,
             "lattice_w_q_mem",
-            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            |p| p.levels[0].w_q_mem.master(), |p, i, v| p.levels[0].w_q_mem.set(i, v), |g| g.levels[0].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("lattice_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -4083,7 +4103,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "lattice_l0_w_k_mem", &pulse,
-            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            |p| p.levels[0].w_k_mem.master(), |p, i, v| p.levels[0].w_k_mem.set(i, v), |g| g.levels[0].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("lattice CMS l0_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -4102,7 +4122,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "lattice_l0_w_v_mem", &pulse,
-            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            |p| p.levels[0].w_v_mem.master(), |p, i, v| p.levels[0].w_v_mem.set(i, v), |g| g.levels[0].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("lattice CMS l0_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -4121,7 +4141,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "lattice_l0_w_q_mem", &pulse,
-            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            |p| p.levels[0].w_q_mem.master(), |p, i, v| p.levels[0].w_q_mem.set(i, v), |g| g.levels[0].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("lattice CMS l0_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -4180,7 +4200,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "lattice_l1_w_k_mem", &pulse,
-            |p| &p.levels[1].w_k_mem, |p, i, v| p.levels[1].w_k_mem[i] = v, |g| &g.levels[1].w_k_mem,
+            |p| p.levels[1].w_k_mem.master(), |p, i, v| p.levels[1].w_k_mem.set(i, v), |g| g.levels[1].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("lattice CMS l1_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -4199,7 +4219,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "lattice_l1_w_v_mem", &pulse,
-            |p| &p.levels[1].w_v_mem, |p, i, v| p.levels[1].w_v_mem[i] = v, |g| &g.levels[1].w_v_mem,
+            |p| p.levels[1].w_v_mem.master(), |p, i, v| p.levels[1].w_v_mem.set(i, v), |g| g.levels[1].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("lattice CMS l1_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -4218,7 +4238,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "lattice_l1_w_q_mem", &pulse,
-            |p| &p.levels[1].w_q_mem, |p, i, v| p.levels[1].w_q_mem[i] = v, |g| &g.levels[1].w_q_mem,
+            |p| p.levels[1].w_q_mem.master(), |p, i, v| p.levels[1].w_q_mem.set(i, v), |g| g.levels[1].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("lattice CMS l1_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -4288,7 +4308,7 @@ mod tests {
         let (checked, passed, max_err) = mag_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads,
             "trellis_w_k_mem",
-            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            |p| p.levels[0].w_k_mem.master(), |p, i, v| p.levels[0].w_k_mem.set(i, v), |g| g.levels[0].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("trellis_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -4305,7 +4325,7 @@ mod tests {
         let (checked, passed, max_err) = mag_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads,
             "trellis_w_v_mem",
-            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            |p| p.levels[0].w_v_mem.master(), |p, i, v| p.levels[0].w_v_mem.set(i, v), |g| g.levels[0].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("trellis_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -4322,7 +4342,7 @@ mod tests {
         let (checked, passed, max_err) = mag_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads,
             "trellis_w_q_mem",
-            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            |p| p.levels[0].w_q_mem.master(), |p, i, v| p.levels[0].w_q_mem.set(i, v), |g| g.levels[0].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("trellis_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -4432,7 +4452,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "trellis_l0_w_k_mem", &pulse,
-            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            |p| p.levels[0].w_k_mem.master(), |p, i, v| p.levels[0].w_k_mem.set(i, v), |g| g.levels[0].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("trellis CMS l0_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -4451,7 +4471,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "trellis_l0_w_v_mem", &pulse,
-            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            |p| p.levels[0].w_v_mem.master(), |p, i, v| p.levels[0].w_v_mem.set(i, v), |g| g.levels[0].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("trellis CMS l0_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -4470,7 +4490,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "trellis_l0_w_q_mem", &pulse,
-            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            |p| p.levels[0].w_q_mem.master(), |p, i, v| p.levels[0].w_q_mem.set(i, v), |g| g.levels[0].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("trellis CMS l0_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -4567,7 +4587,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "trellis_l1_w_k_mem", &pulse,
-            |p| &p.levels[1].w_k_mem, |p, i, v| p.levels[1].w_k_mem[i] = v, |g| &g.levels[1].w_k_mem,
+            |p| p.levels[1].w_k_mem.master(), |p, i, v| p.levels[1].w_k_mem.set(i, v), |g| g.levels[1].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("trellis CMS l1_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -4586,7 +4606,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "trellis_l1_w_v_mem", &pulse,
-            |p| &p.levels[1].w_v_mem, |p, i, v| p.levels[1].w_v_mem[i] = v, |g| &g.levels[1].w_v_mem,
+            |p| p.levels[1].w_v_mem.master(), |p, i, v| p.levels[1].w_v_mem.set(i, v), |g| g.levels[1].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("trellis CMS l1_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -4605,7 +4625,7 @@ mod tests {
 
         let (checked, passed, max_err) = cms_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "trellis_l1_w_q_mem", &pulse,
-            |p| &p.levels[1].w_q_mem, |p, i, v| p.levels[1].w_q_mem[i] = v, |g| &g.levels[1].w_q_mem,
+            |p| p.levels[1].w_q_mem.master(), |p, i, v| p.levels[1].w_q_mem.set(i, v), |g| g.levels[1].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("trellis CMS l1_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -4720,7 +4740,7 @@ mod tests {
         let (_loss, grads) = mal_compute_gradients(&params, &cfg, &input_ids, &target_ids);
         let (checked, passed, max_err) = mal_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "mal_w_k_mem",
-            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            |p| p.levels[0].w_k_mem.master(), |p, i, v| p.levels[0].w_k_mem.set(i, v), |g| g.levels[0].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("MAL w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -4735,7 +4755,7 @@ mod tests {
         let (_loss, grads) = mal_compute_gradients(&params, &cfg, &input_ids, &target_ids);
         let (checked, passed, max_err) = mal_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "mal_w_v_mem",
-            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            |p| p.levels[0].w_v_mem.master(), |p, i, v| p.levels[0].w_v_mem.set(i, v), |g| g.levels[0].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("MAL w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -4751,7 +4771,7 @@ mod tests {
         let (_loss, grads) = mal_compute_gradients(&params, &cfg, &input_ids, &target_ids);
         let (checked, passed, max_err) = mal_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "mal_w_q_mem",
-            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            |p| p.levels[0].w_q_mem.master(), |p, i, v| p.levels[0].w_q_mem.set(i, v), |g| g.levels[0].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("MAL w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -4853,7 +4873,7 @@ mod tests {
         let (_loss, grads) = cms_mal_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
         let (checked, passed, max_err) = cms_mal_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "mal_l0_w_k_mem", &pulse,
-            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            |p| p.levels[0].w_k_mem.master(), |p, i, v| p.levels[0].w_k_mem.set(i, v), |g| g.levels[0].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("MAL CMS l0_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -4871,7 +4891,7 @@ mod tests {
         let (_loss, grads) = cms_mal_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
         let (checked, passed, max_err) = cms_mal_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "mal_l0_w_v_mem", &pulse,
-            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            |p| p.levels[0].w_v_mem.master(), |p, i, v| p.levels[0].w_v_mem.set(i, v), |g| g.levels[0].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("MAL CMS l0_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -4890,7 +4910,7 @@ mod tests {
         let (_loss, grads) = cms_mal_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
         let (checked, passed, max_err) = cms_mal_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "mal_l0_w_q_mem", &pulse,
-            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            |p| p.levels[0].w_q_mem.master(), |p, i, v| p.levels[0].w_q_mem.set(i, v), |g| g.levels[0].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("MAL CMS l0_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -4983,7 +5003,7 @@ mod tests {
         let (_loss, grads) = cms_mal_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
         let (checked, passed, max_err) = cms_mal_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "mal_l1_w_k_mem", &pulse,
-            |p| &p.levels[1].w_k_mem, |p, i, v| p.levels[1].w_k_mem[i] = v, |g| &g.levels[1].w_k_mem,
+            |p| p.levels[1].w_k_mem.master(), |p, i, v| p.levels[1].w_k_mem.set(i, v), |g| g.levels[1].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("MAL CMS l1_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -5001,7 +5021,7 @@ mod tests {
         let (_loss, grads) = cms_mal_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
         let (checked, passed, max_err) = cms_mal_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "mal_l1_w_v_mem", &pulse,
-            |p| &p.levels[1].w_v_mem, |p, i, v| p.levels[1].w_v_mem[i] = v, |g| &g.levels[1].w_v_mem,
+            |p| p.levels[1].w_v_mem.master(), |p, i, v| p.levels[1].w_v_mem.set(i, v), |g| g.levels[1].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("MAL CMS l1_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -5020,7 +5040,7 @@ mod tests {
         let (_loss, grads) = cms_mal_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
         let (checked, passed, max_err) = cms_mal_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "mal_l1_w_q_mem", &pulse,
-            |p| &p.levels[1].w_q_mem, |p, i, v| p.levels[1].w_q_mem[i] = v, |g| &g.levels[1].w_q_mem,
+            |p| p.levels[1].w_q_mem.master(), |p, i, v| p.levels[1].w_q_mem.set(i, v), |g| g.levels[1].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("MAL CMS l1_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -5130,7 +5150,7 @@ mod tests {
         let (_loss, grads) = mac_compute_gradients(&params, &cfg, &input_ids, &target_ids);
         let (checked, passed, max_err) = mac_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "mac_w_k_mem",
-            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            |p| p.levels[0].w_k_mem.master(), |p, i, v| p.levels[0].w_k_mem.set(i, v), |g| g.levels[0].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("MAC w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -5145,7 +5165,7 @@ mod tests {
         let (_loss, grads) = mac_compute_gradients(&params, &cfg, &input_ids, &target_ids);
         let (checked, passed, max_err) = mac_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "mac_w_v_mem",
-            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            |p| p.levels[0].w_v_mem.master(), |p, i, v| p.levels[0].w_v_mem.set(i, v), |g| g.levels[0].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("MAC w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -5160,7 +5180,7 @@ mod tests {
         let (_loss, grads) = mac_compute_gradients(&params, &cfg, &input_ids, &target_ids);
         let (checked, passed, max_err) = mac_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "mac_w_q_mem",
-            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            |p| p.levels[0].w_q_mem.master(), |p, i, v| p.levels[0].w_q_mem.set(i, v), |g| g.levels[0].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("MAC w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -5261,7 +5281,7 @@ mod tests {
         let (_loss, grads) = cms_mac_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
         let (checked, passed, max_err) = cms_mac_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "mac_l0_w_k_mem", &pulse,
-            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem,
+            |p| p.levels[0].w_k_mem.master(), |p, i, v| p.levels[0].w_k_mem.set(i, v), |g| g.levels[0].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("MAC CMS l0_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -5279,7 +5299,7 @@ mod tests {
         let (_loss, grads) = cms_mac_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
         let (checked, passed, max_err) = cms_mac_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "mac_l0_w_v_mem", &pulse,
-            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem,
+            |p| p.levels[0].w_v_mem.master(), |p, i, v| p.levels[0].w_v_mem.set(i, v), |g| g.levels[0].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("MAC CMS l0_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -5297,7 +5317,7 @@ mod tests {
         let (_loss, grads) = cms_mac_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
         let (checked, passed, max_err) = cms_mac_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "mac_l0_w_q_mem", &pulse,
-            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem,
+            |p| p.levels[0].w_q_mem.master(), |p, i, v| p.levels[0].w_q_mem.set(i, v), |g| g.levels[0].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("MAC CMS l0_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -5389,7 +5409,7 @@ mod tests {
         let (_loss, grads) = cms_mac_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
         let (checked, passed, max_err) = cms_mac_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "mac_l1_w_k_mem", &pulse,
-            |p| &p.levels[1].w_k_mem, |p, i, v| p.levels[1].w_k_mem[i] = v, |g| &g.levels[1].w_k_mem,
+            |p| p.levels[1].w_k_mem.master(), |p, i, v| p.levels[1].w_k_mem.set(i, v), |g| g.levels[1].w_k_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("MAC CMS l1_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -5407,7 +5427,7 @@ mod tests {
         let (_loss, grads) = cms_mac_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
         let (checked, passed, max_err) = cms_mac_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "mac_l1_w_v_mem", &pulse,
-            |p| &p.levels[1].w_v_mem, |p, i, v| p.levels[1].w_v_mem[i] = v, |g| &g.levels[1].w_v_mem,
+            |p| p.levels[1].w_v_mem.master(), |p, i, v| p.levels[1].w_v_mem.set(i, v), |g| g.levels[1].w_v_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("MAC CMS l1_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -5425,7 +5445,7 @@ mod tests {
         let (_loss, grads) = cms_mac_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
         let (checked, passed, max_err) = cms_mac_check_weight_gradient(
             &params, &cfg, &input_ids, &target_ids, &grads, "mac_l1_w_q_mem", &pulse,
-            |p| &p.levels[1].w_q_mem, |p, i, v| p.levels[1].w_q_mem[i] = v, |g| &g.levels[1].w_q_mem,
+            |p| p.levels[1].w_q_mem.master(), |p, i, v| p.levels[1].w_q_mem.set(i, v), |g| g.levels[1].w_q_mem.master(),
             20, FD_EPS, FD_TOL,
         );
         eprintln!("MAC CMS l1_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
@@ -5560,9 +5580,9 @@ mod tests {
         // Level 0 gradients: finite and nonzero for key fields
         let lp = &grads_tape.levels[0];
         let level_fields: Vec<(&str, &[f32])> = vec![
-            ("w_k_mem", &lp.w_k_mem),
-            ("w_v_mem", &lp.w_v_mem),
-            ("w_q_mem", &lp.w_q_mem),
+            ("w_k_mem", lp.w_k_mem.master()),
+            ("w_v_mem", lp.w_v_mem.master()),
+            ("w_q_mem", lp.w_q_mem.master()),
             ("w_alpha", &lp.w_alpha),
             ("b_alpha", &lp.b_alpha),
         ];
@@ -5624,15 +5644,15 @@ mod tests {
             "loss mismatch: ref={loss_ref} tape={loss_tape}");
 
         // Level 0 (active): grads should be nonzero.
-        let l0_norm: f32 = grads_tape.levels[0].w_k_mem.iter()
+        let l0_norm: f32 = grads_tape.levels[0].w_k_mem.master().iter()
             .map(|x| x * x).sum::<f32>().sqrt();
         assert!(l0_norm > 0.0, "Active level 0 grads should be nonzero");
 
         // Level 1 (frozen): returned grads should be all zeros.
         let l1_fields: Vec<(&str, &[f32])> = vec![
-            ("w_k_mem", &grads_tape.levels[1].w_k_mem),
-            ("w_v_mem", &grads_tape.levels[1].w_v_mem),
-            ("w_q_mem", &grads_tape.levels[1].w_q_mem),
+            ("w_k_mem", grads_tape.levels[1].w_k_mem.master()),
+            ("w_v_mem", grads_tape.levels[1].w_v_mem.master()),
+            ("w_q_mem", grads_tape.levels[1].w_q_mem.master()),
             ("w_alpha", &grads_tape.levels[1].w_alpha),
             ("b_alpha", &grads_tape.levels[1].b_alpha),
         ];
@@ -5647,7 +5667,7 @@ mod tests {
         // then through the matmul to get d_W_Q_mem.
         assert_eq!(ebufs_tape[1].steps_accumulated, 1,
             "error_buffers[1] should have 1 step accumulated");
-        let ebuf_wqm_norm: f32 = ebufs_tape[1].grads.w_q_mem.iter()
+        let ebuf_wqm_norm: f32 = ebufs_tape[1].grads.w_q_mem.master().iter()
             .map(|x| x * x).sum::<f32>().sqrt();
         assert!(ebuf_wqm_norm > 0.0,
             "error_buffers[1].grads.w_q_mem should be nonzero");
@@ -5659,13 +5679,13 @@ mod tests {
         // Reference error buffer should match tape error buffer.
         assert_eq!(ebufs_ref[1].steps_accumulated, ebufs_tape[1].steps_accumulated,
             "steps_accumulated mismatch");
-        let ref_wqm_norm: f32 = ebufs_ref[1].grads.w_q_mem.iter()
+        let ref_wqm_norm: f32 = ebufs_ref[1].grads.w_q_mem.master().iter()
             .map(|x| x * x).sum::<f32>().sqrt();
         assert!(ref_wqm_norm > 0.0,
             "Reference error_buffers[1].grads.w_q_mem should also be nonzero");
 
         // Reference grads for level 1 should also be zero (cms_backward routes to ebuf).
-        let ref_l1_norm: f32 = grads_ref.levels[1].w_q_mem.iter()
+        let ref_l1_norm: f32 = grads_ref.levels[1].w_q_mem.master().iter()
             .map(|x| x * x).sum::<f32>().sqrt();
         assert_eq!(ref_l1_norm, 0.0,
             "Reference level 1 grads should also be zero (routed to ebuf)");
@@ -5837,9 +5857,9 @@ mod tests {
             let rl = &grads_ref.levels[level];
             let tl = &grads_tape.levels[level];
             let level_fields: Vec<(&str, &[f32], &[f32])> = vec![
-                ("w_k_mem", &rl.w_k_mem, &tl.w_k_mem),
-                ("w_v_mem", &rl.w_v_mem, &tl.w_v_mem),
-                ("w_q_mem", &rl.w_q_mem, &tl.w_q_mem),
+                ("w_k_mem", rl.w_k_mem.master(), tl.w_k_mem.master()),
+                ("w_v_mem", rl.w_v_mem.master(), tl.w_v_mem.master()),
+                ("w_q_mem", rl.w_q_mem.master(), tl.w_q_mem.master()),
                 ("w_alpha", &rl.w_alpha, &tl.w_alpha),
                 ("b_alpha", &rl.b_alpha, &tl.b_alpha),
                 ("w_theta", &rl.w_theta, &tl.w_theta),
@@ -6025,15 +6045,15 @@ mod tests {
         let atol = 1e-6;
         let (_, mm) = compare_grad_slices(
             "frozen/level[0].w_k_mem",
-            &grads_ref.levels[0].w_k_mem, &grads_tape.levels[0].w_k_mem,
+            grads_ref.levels[0].w_k_mem.master(), grads_tape.levels[0].w_k_mem.master(),
             rtol, atol,
         );
         assert_eq!(mm, 0, "frozen/level[0] gradient mismatch");
 
         // Level 1 (frozen): returned grads should be zero in both paths.
-        let ref_l1_norm: f32 = grads_ref.levels[1].w_k_mem.iter()
+        let ref_l1_norm: f32 = grads_ref.levels[1].w_k_mem.master().iter()
             .map(|x| x * x).sum::<f32>().sqrt();
-        let tape_l1_norm: f32 = grads_tape.levels[1].w_k_mem.iter()
+        let tape_l1_norm: f32 = grads_tape.levels[1].w_k_mem.master().iter()
             .map(|x| x * x).sum::<f32>().sqrt();
         assert!(ref_l1_norm < 1e-10,
             "frozen/level[1]: ref grads should be zero (routed to ebuf), norm={ref_l1_norm}");
@@ -6059,9 +6079,9 @@ mod tests {
     fn tape_fd_check(
         cfg: &MAGConfig,
         name: &str,
-        get_weight: impl Fn(&MAGParams) -> &Vec<f32>,
+        get_weight: impl Fn(&MAGParams) -> &[f32],
         set_weight: impl Fn(&mut MAGParams, usize, f32),
-        get_grad: impl Fn(&MAGParams) -> &Vec<f32>,
+        get_grad: impl Fn(&MAGParams) -> &[f32],
     ) {
         ensure_rust_reference();
         let params = cms_params_for_grad_check(cfg, 42);
@@ -6135,21 +6155,21 @@ mod tests {
     fn test_tape_fd_delta_k1_l0_w_k_mem() {
         let cfg = MAGConfig::test_config();
         tape_fd_check(&cfg, "delta_k1/l0_w_k_mem",
-            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem);
+            |p| p.levels[0].w_k_mem.master(), |p, i, v| p.levels[0].w_k_mem.set(i, v), |g| g.levels[0].w_k_mem.master());
     }
 
     #[test]
     fn test_tape_fd_delta_k1_l0_w_v_mem() {
         let cfg = MAGConfig::test_config();
         tape_fd_check(&cfg, "delta_k1/l0_w_v_mem",
-            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem);
+            |p| p.levels[0].w_v_mem.master(), |p, i, v| p.levels[0].w_v_mem.set(i, v), |g| g.levels[0].w_v_mem.master());
     }
 
     #[test]
     fn test_tape_fd_delta_k1_l0_w_q_mem() {
         let cfg = MAGConfig::test_config();
         tape_fd_check(&cfg, "delta_k1/l0_w_q_mem",
-            |p| &p.levels[0].w_q_mem, |p, i, v| p.levels[0].w_q_mem[i] = v, |g| &g.levels[0].w_q_mem);
+            |p| p.levels[0].w_q_mem.master(), |p, i, v| p.levels[0].w_q_mem.set(i, v), |g| g.levels[0].w_q_mem.master());
     }
 
     #[test]
@@ -6188,14 +6208,14 @@ mod tests {
     fn test_tape_fd_delta_k2_l0_w_k_mem() {
         let cfg = MAGConfig::test_config_k2();
         tape_fd_check(&cfg, "delta_k2/l0_w_k_mem",
-            |p| &p.levels[0].w_k_mem, |p, i, v| p.levels[0].w_k_mem[i] = v, |g| &g.levels[0].w_k_mem);
+            |p| p.levels[0].w_k_mem.master(), |p, i, v| p.levels[0].w_k_mem.set(i, v), |g| g.levels[0].w_k_mem.master());
     }
 
     #[test]
     fn test_tape_fd_delta_k2_l0_w_v_mem() {
         let cfg = MAGConfig::test_config_k2();
         tape_fd_check(&cfg, "delta_k2/l0_w_v_mem",
-            |p| &p.levels[0].w_v_mem, |p, i, v| p.levels[0].w_v_mem[i] = v, |g| &g.levels[0].w_v_mem);
+            |p| p.levels[0].w_v_mem.master(), |p, i, v| p.levels[0].w_v_mem.set(i, v), |g| g.levels[0].w_v_mem.master());
     }
 
     #[test]
@@ -6209,21 +6229,21 @@ mod tests {
     fn test_tape_fd_delta_k2_l1_w_k_mem() {
         let cfg = MAGConfig::test_config_k2();
         tape_fd_check(&cfg, "delta_k2/l1_w_k_mem",
-            |p| &p.levels[1].w_k_mem, |p, i, v| p.levels[1].w_k_mem[i] = v, |g| &g.levels[1].w_k_mem);
+            |p| p.levels[1].w_k_mem.master(), |p, i, v| p.levels[1].w_k_mem.set(i, v), |g| g.levels[1].w_k_mem.master());
     }
 
     #[test]
     fn test_tape_fd_delta_k2_l1_w_v_mem() {
         let cfg = MAGConfig::test_config_k2();
         tape_fd_check(&cfg, "delta_k2/l1_w_v_mem",
-            |p| &p.levels[1].w_v_mem, |p, i, v| p.levels[1].w_v_mem[i] = v, |g| &g.levels[1].w_v_mem);
+            |p| p.levels[1].w_v_mem.master(), |p, i, v| p.levels[1].w_v_mem.set(i, v), |g| g.levels[1].w_v_mem.master());
     }
 
     #[test]
     fn test_tape_fd_delta_k2_l1_w_q_mem() {
         let cfg = MAGConfig::test_config_k2();
         tape_fd_check(&cfg, "delta_k2/l1_w_q_mem",
-            |p| &p.levels[1].w_q_mem, |p, i, v| p.levels[1].w_q_mem[i] = v, |g| &g.levels[1].w_q_mem);
+            |p| p.levels[1].w_q_mem.master(), |p, i, v| p.levels[1].w_q_mem.set(i, v), |g| g.levels[1].w_q_mem.master());
     }
 
     #[test]
@@ -6362,9 +6382,9 @@ mod tests {
         }
         // Levels
         for level in &grads.levels {
-            for &g in level.w_k_mem.iter()
-                .chain(level.w_v_mem.iter())
-                .chain(level.w_q_mem.iter())
+            for &g in level.w_k_mem.master().iter()
+                .chain(level.w_v_mem.master().iter())
+                .chain(level.w_q_mem.master().iter())
                 .chain(level.w_alpha.iter())
                 .chain(level.b_alpha.iter())
                 .chain(level.w_theta.iter())

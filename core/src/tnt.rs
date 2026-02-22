@@ -872,17 +872,17 @@ mod tests {
                     );
 
                     let mut lp_p = params.levels[0].clone();
-                    lp_p.w_k_mem[0] += eps;
+                    lp_p.w_k_mem.master_mut()[0] += eps;
                     let (y_p, _) = tnt_forward(&lp_p, &embedded, s, d, &tnt, &cfg, None, None);
                     let loss_p: f32 = y_p.iter().sum();
 
                     let mut lp_m = params.levels[0].clone();
-                    lp_m.w_k_mem[0] -= eps;
+                    lp_m.w_k_mem.master_mut()[0] -= eps;
                     let (y_m, _) = tnt_forward(&lp_m, &embedded, s, d, &tnt, &cfg, None, None);
                     let loss_m: f32 = y_m.iter().sum();
 
                     let fd = (loss_p - loss_m) / (2.0 * eps);
-                    let analytical = grads.w_k_mem[0];
+                    let analytical = grads.w_k_mem.master()[0];
                     let same_sign = (analytical > 0.0) == (fd > 0.0)
                         || analytical.abs() < 5e-4;
                     assert!(same_sign || (analytical.abs() < 5e-4 && fd.abs() < 5e-4),
@@ -982,9 +982,9 @@ mod tests {
                 &level_params, &cache, &d_y, &embedded, &tnt, &cfg, None,
             );
 
-            for (w, g) in level_params.w_k_mem.iter_mut().zip(grads.w_k_mem.iter()) { *w -= lr * g; }
-            for (w, g) in level_params.w_v_mem.iter_mut().zip(grads.w_v_mem.iter()) { *w -= lr * g; }
-            for (w, g) in level_params.w_q_mem.iter_mut().zip(grads.w_q_mem.iter()) { *w -= lr * g; }
+            for (w, g) in level_params.w_k_mem.master_mut().iter_mut().zip(grads.w_k_mem.master().iter()) { *w -= lr * g; }
+            for (w, g) in level_params.w_v_mem.master_mut().iter_mut().zip(grads.w_v_mem.master().iter()) { *w -= lr * g; }
+            for (w, g) in level_params.w_q_mem.master_mut().iter_mut().zip(grads.w_q_mem.master().iter()) { *w -= lr * g; }
         }
 
         assert!(last_loss <= first_loss + 1e-6,
@@ -1034,7 +1034,7 @@ mod tests {
             &params.levels[0], &cache, &d_y, &embedded, &tnt, &cfg, None,
         );
 
-        let grad_norm: f32 = grads.w_k_mem.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let grad_norm: f32 = grads.w_k_mem.master().iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!(grad_norm > 1e-10, "TNT backward grads should be non-zero");
         let emb_norm: f32 = d_emb.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!(emb_norm > 1e-10, "TNT d_embedded should be non-zero");

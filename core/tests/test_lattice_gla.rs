@@ -39,7 +39,7 @@ fn test_lattice_gla_smoke() {
         &params.levels[0], &cache, &d_y, &embedded, &cfg,
     );
     assert_eq!(d_emb.len(), s * d);
-    let norm: f32 = grads.w_k_mem.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm: f32 = grads.w_k_mem.master().iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(norm > 1e-10);
 }
 

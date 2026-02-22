@@ -336,9 +336,9 @@ pub fn linearized_gla_forward(
     let mut w_k_t = vec![0.0f32; d * d];
     let mut w_v_t = vec![0.0f32; d * d];
     let mut w_q_t = vec![0.0f32; d * d];
-    transpose_f32(&level_params.w_k_mem, &mut w_k_t, d, d);
-    transpose_f32(&level_params.w_v_mem, &mut w_v_t, d, d);
-    transpose_f32(&level_params.w_q_mem, &mut w_q_t, d, d);
+    transpose_f32(&level_params.w_k_mem.as_f32(), &mut w_k_t, d, d);
+    transpose_f32(&level_params.w_v_mem.as_f32(), &mut w_v_t, d, d);
+    transpose_f32(&level_params.w_q_mem.as_f32(), &mut w_q_t, d, d);
 
     let mut k_mem = vec![0.0f32; seq_len * d];
     let mut v_mem = vec![0.0f32; seq_len * d];
@@ -554,18 +554,19 @@ pub fn linearized_gla_backward(
     // d_W_Q_mem[j,k] = sum_t d_q_mem[t,j] * embedded[t,k]  (via d_q_mem^T @ embedded)
     // d_embedded[t,k] += sum_j d_q_mem[t,j] * W_Q_mem[j,k]  (via d_q_mem @ W_Q_mem)
     let mut d_w_q = vec![0.0f32; d * d];
+    let w_q_f32 = level_params.w_q_mem.as_f32();
     for t in 0..s {
         for j in 0..d {
             let dq = d_q_mem[t * d + j];
             for k in 0..d {
                 d_w_q[j * d + k] += dq * embedded[t * d + k];
-                d_embedded[t * d + k] += dq * level_params.w_q_mem[j * d + k];
+                d_embedded[t * d + k] += dq * w_q_f32[j * d + k];
             }
         }
     }
 
     // Accumulate gradients for W_Q_mem
-    for (a, b) in grads.w_q_mem.iter_mut().zip(d_w_q.iter()) { *a += b; }
+    for (a, b) in grads.w_q_mem.master_mut().iter_mut().zip(d_w_q.iter()) { *a += b; }
 
     // NOTE: Full backward through the linearized recurrence (for W_K_mem, W_V_mem,
     // w_alpha, b_alpha gradients) requires differentiating through the cumulative
@@ -680,7 +681,7 @@ mod tests {
             &params.levels[0], &cache, &d_y, &embedded, &cfg,
         );
 
-        for &v in grads.w_k_mem.iter() { assert!(v.is_finite()); }
+        for &v in grads.w_k_mem.master().iter() { assert!(v.is_finite()); }
         for &v in &d_emb { assert!(v.is_finite()); }
     }
 
@@ -741,9 +742,12 @@ mod tests {
             let (grads, _) = lattice_gla_backward(&lp, &cache, &d_y, &embedded, &cfg);
 
             // Outer-loop weight update (projection weights, not inner-loop memory)
-            for (w, g) in lp.w_k_mem.iter_mut().zip(grads.w_k_mem.iter()) { *w -= lr * g; }
-            for (w, g) in lp.w_v_mem.iter_mut().zip(grads.w_v_mem.iter()) { *w -= lr * g; }
-            for (w, g) in lp.w_q_mem.iter_mut().zip(grads.w_q_mem.iter()) { *w -= lr * g; }
+            for (w, g) in lp.w_k_mem.master_mut().iter_mut().zip(grads.w_k_mem.master().iter()) { *w -= lr * g; }
+            for (w, g) in lp.w_v_mem.master_mut().iter_mut().zip(grads.w_v_mem.master().iter()) { *w -= lr * g; }
+            for (w, g) in lp.w_q_mem.master_mut().iter_mut().zip(grads.w_q_mem.master().iter()) { *w -= lr * g; }
+            lp.w_k_mem.sync_from_master();
+            lp.w_v_mem.sync_from_master();
+            lp.w_q_mem.sync_from_master();
         }
 
         assert!(last_loss <= first_loss + 1e-6,
@@ -824,7 +828,7 @@ mod tests {
             &params.levels[0], &cache, &d_y, &embedded, &cfg,
         );
 
-        for &v in grads.w_k_mem.iter() { assert!(v.is_finite()); }
+        for &v in grads.w_k_mem.master().iter() { assert!(v.is_finite()); }
         for &v in &d_emb { assert!(v.is_finite()); }
     }
 
@@ -859,9 +863,12 @@ mod tests {
             let (grads, _) = trellis_gla_backward(&lp, &cache, &d_y, &embedded, &cfg);
 
             // Outer-loop weight update (projection weights, not inner-loop memory)
-            for (w, g) in lp.w_k_mem.iter_mut().zip(grads.w_k_mem.iter()) { *w -= lr * g; }
-            for (w, g) in lp.w_v_mem.iter_mut().zip(grads.w_v_mem.iter()) { *w -= lr * g; }
-            for (w, g) in lp.w_q_mem.iter_mut().zip(grads.w_q_mem.iter()) { *w -= lr * g; }
+            for (w, g) in lp.w_k_mem.master_mut().iter_mut().zip(grads.w_k_mem.master().iter()) { *w -= lr * g; }
+            for (w, g) in lp.w_v_mem.master_mut().iter_mut().zip(grads.w_v_mem.master().iter()) { *w -= lr * g; }
+            for (w, g) in lp.w_q_mem.master_mut().iter_mut().zip(grads.w_q_mem.master().iter()) { *w -= lr * g; }
+            lp.w_k_mem.sync_from_master();
+            lp.w_v_mem.sync_from_master();
+            lp.w_q_mem.sync_from_master();
         }
 
         assert!(last_loss <= first_loss + 1e-6,
@@ -955,10 +962,10 @@ mod tests {
             &params.levels[0], &cache, &d_y, &embedded, &cfg,
         );
 
-        for &v in grads.w_q_mem.iter() { assert!(v.is_finite()); }
+        for &v in grads.w_q_mem.master().iter() { assert!(v.is_finite()); }
         for &v in &d_emb { assert!(v.is_finite()); }
         // Should have nonzero gradients for W_Q_mem (the read path)
-        let norm: f32 = grads.w_q_mem.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let norm: f32 = grads.w_q_mem.master().iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!(norm > 1e-10, "W_Q_mem gradient should be nonzero");
     }
 

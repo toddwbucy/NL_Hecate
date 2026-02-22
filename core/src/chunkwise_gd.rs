@@ -532,9 +532,9 @@ mod tests {
                         &params.levels[0], &cache, &d_y, &embedded, &cfg,
                     );
 
-                    for &v in grads.w_k_mem.iter()
-                        .chain(grads.w_v_mem.iter())
-                        .chain(grads.w_q_mem.iter())
+                    for &v in grads.w_k_mem.master().iter()
+                        .chain(grads.w_v_mem.master().iter())
+                        .chain(grads.w_q_mem.master().iter())
                         .chain(grads.w_alpha.iter())
                         .chain(grads.b_alpha.iter())
                     {
@@ -564,7 +564,7 @@ mod tests {
                         &params.levels[0], &cache, &d_y, &embedded, &cfg,
                     );
 
-                    let norm: f32 = grads.w_k_mem.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    let norm: f32 = grads.w_k_mem.master().iter().map(|x| x * x).sum::<f32>().sqrt();
                     assert!(norm > 1e-10,
                         "{}: backward grads all zeros", stringify!($test_prefix));
 
@@ -602,17 +602,17 @@ mod tests {
                     let rel_tol = 0.30;
 
                     for idx in 0..n_check {
-                        let analytical = grads.w_k_mem[idx];
+                        let analytical = grads.w_k_mem.master()[idx];
 
                         let mut lp_plus = params.levels[0].clone();
-                        lp_plus.w_k_mem[idx] += eps;
+                        lp_plus.w_k_mem.master_mut()[idx] += eps;
                         let (y_plus, _) = chunkwise_gd_forward(
                             &lp_plus, &embedded, s, d, 2, &cfg, None,
                         );
                         let loss_plus: f32 = y_plus.iter().sum();
 
                         let mut lp_minus = params.levels[0].clone();
-                        lp_minus.w_k_mem[idx] -= eps;
+                        lp_minus.w_k_mem.master_mut()[idx] -= eps;
                         let (y_minus, _) = chunkwise_gd_forward(
                             &lp_minus, &embedded, s, d, 2, &cfg, None,
                         );
@@ -692,9 +692,9 @@ mod tests {
                         );
 
                         // Outer-loop weight update (projection weights, not inner-loop memory)
-                        for (w, g) in level_params.w_k_mem.iter_mut().zip(grads.w_k_mem.iter()) { *w -= lr * g; }
-                        for (w, g) in level_params.w_v_mem.iter_mut().zip(grads.w_v_mem.iter()) { *w -= lr * g; }
-                        for (w, g) in level_params.w_q_mem.iter_mut().zip(grads.w_q_mem.iter()) { *w -= lr * g; }
+                        for (w, g) in level_params.w_k_mem.master_mut().iter_mut().zip(grads.w_k_mem.master().iter()) { *w -= lr * g; }
+                        for (w, g) in level_params.w_v_mem.master_mut().iter_mut().zip(grads.w_v_mem.master().iter()) { *w -= lr * g; }
+                        for (w, g) in level_params.w_q_mem.master_mut().iter_mut().zip(grads.w_q_mem.master().iter()) { *w -= lr * g; }
                         for (w, g) in level_params.w_alpha.iter_mut().zip(grads.w_alpha.iter()) { *w -= lr * g; }
                         for (w, g) in level_params.b_alpha.iter_mut().zip(grads.b_alpha.iter()) { *w -= lr * g; }
                         if level_params.w_theta.len() == grads.w_theta.len() {
@@ -933,7 +933,7 @@ mod tests {
         // (more data = more gradient signal)
         assert!(cache.chunks.len() >= 2, "need at least 2 chunks");
 
-        let norm_full: f32 = grads_full.w_k_mem.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let norm_full: f32 = grads_full.w_k_mem.master().iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!(norm_full > 1e-8, "full gradients should be non-zero");
     }
 

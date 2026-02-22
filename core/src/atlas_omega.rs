@@ -31,6 +31,7 @@ use crate::tensor::{
 use crate::retention::l2_apply_retention;
 use crate::model::MemoryLevelParams;
 use crate::delta_rule::{MemoryRule, MemoryState, Gates, MemoryError};
+use crate::bf16::Bf16Storage;
 
 // ── Atlas Omega implementation ──────────────────────────────────────
 
@@ -160,12 +161,16 @@ impl MemoryRule for AtlasOmega {
         debug_assert_eq!(embedded.len(), seq_len * d);
 
         // Project embedded → k_mem, v_mem, q_mem via W^T
+        let w_k_f32 = level_params.w_k_mem.as_f32();
+        let w_v_f32 = level_params.w_v_mem.as_f32();
+        let w_q_f32 = level_params.w_q_mem.as_f32();
+
         let mut w_k_mem_t = vec![0.0f32; d * d];
         let mut w_v_mem_t = vec![0.0f32; d * d];
         let mut w_q_mem_t = vec![0.0f32; d * d];
-        transpose_f32(&level_params.w_k_mem, &mut w_k_mem_t, d, d);
-        transpose_f32(&level_params.w_v_mem, &mut w_v_mem_t, d, d);
-        transpose_f32(&level_params.w_q_mem, &mut w_q_mem_t, d, d);
+        transpose_f32(&w_k_f32, &mut w_k_mem_t, d, d);
+        transpose_f32(&w_v_f32, &mut w_v_mem_t, d, d);
+        transpose_f32(&w_q_f32, &mut w_q_mem_t, d, d);
 
         let mut k_mem = vec![0.0f32; seq_len * d];
         let mut v_mem = vec![0.0f32; seq_len * d];
@@ -476,19 +481,22 @@ impl MemoryRule for AtlasOmega {
 
         let mut d_k_mem_t = vec![0.0f32; d * s];
         transpose_f32(&d_k_mem, &mut d_k_mem_t, s, d);
-        matmul_f32(&d_k_mem_t, embedded, &mut grads.w_k_mem, d, s, d);
+        matmul_f32(&d_k_mem_t, embedded, grads.w_k_mem.master_mut(), d, s, d);
 
         let mut d_v_mem_t = vec![0.0f32; d * s];
         transpose_f32(&d_v_mem, &mut d_v_mem_t, s, d);
-        matmul_f32(&d_v_mem_t, embedded, &mut grads.w_v_mem, d, s, d);
+        matmul_f32(&d_v_mem_t, embedded, grads.w_v_mem.master_mut(), d, s, d);
 
         let mut d_q_mem_t = vec![0.0f32; d * s];
         transpose_f32(&d_q_mem, &mut d_q_mem_t, s, d);
-        matmul_f32(&d_q_mem_t, embedded, &mut grads.w_q_mem, d, s, d);
+        matmul_f32(&d_q_mem_t, embedded, grads.w_q_mem.master_mut(), d, s, d);
 
-        crate::tensor::matmul_acc_f32(&d_k_mem, &level_params.w_k_mem, &mut d_embedded, s, d, d);
-        crate::tensor::matmul_acc_f32(&d_v_mem, &level_params.w_v_mem, &mut d_embedded, s, d, d);
-        crate::tensor::matmul_acc_f32(&d_q_mem, &level_params.w_q_mem, &mut d_embedded, s, d, d);
+        let w_k_f32 = level_params.w_k_mem.as_f32();
+        let w_v_f32 = level_params.w_v_mem.as_f32();
+        let w_q_f32 = level_params.w_q_mem.as_f32();
+        crate::tensor::matmul_acc_f32(&d_k_mem, &w_k_f32, &mut d_embedded, s, d, d);
+        crate::tensor::matmul_acc_f32(&d_v_mem, &w_v_f32, &mut d_embedded, s, d, d);
+        crate::tensor::matmul_acc_f32(&d_q_mem, &w_q_f32, &mut d_embedded, s, d, d);
 
         (grads, d_embedded)
     }
@@ -629,8 +637,8 @@ mod tests {
         let (grads, d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
 
         for (name, g) in [
-            ("w_k_mem", &grads.w_k_mem), ("w_v_mem", &grads.w_v_mem),
-            ("w_q_mem", &grads.w_q_mem), ("w_alpha", &grads.w_alpha),
+            ("w_k_mem", grads.w_k_mem.master()), ("w_v_mem", grads.w_v_mem.master()),
+            ("w_q_mem", grads.w_q_mem.master()), ("w_alpha", &grads.w_alpha),
             ("b_alpha", &grads.b_alpha), ("w_theta", &grads.w_theta),
             ("b_theta", &grads.b_theta), ("w_eta", &grads.w_eta),
             ("b_eta", &grads.b_eta), ("w_omega", &grads.w_omega),
@@ -658,8 +666,8 @@ mod tests {
         let (grads, d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
 
         for (name, g) in [
-            ("w_k_mem", &grads.w_k_mem), ("w_v_mem", &grads.w_v_mem),
-            ("w_q_mem", &grads.w_q_mem), ("w_omega", &grads.w_omega),
+            ("w_k_mem", grads.w_k_mem.master()), ("w_v_mem", grads.w_v_mem.master()),
+            ("w_q_mem", grads.w_q_mem.master()), ("w_omega", &grads.w_omega),
         ] {
             let max_abs = g.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
             assert!(max_abs > 1e-10, "grad_{name} is all zeros (max_abs={max_abs})");

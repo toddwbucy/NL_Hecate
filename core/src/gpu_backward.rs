@@ -65,9 +65,9 @@ impl GpuMAGGrads {
 
         let levels: Vec<_> = self.levels.iter().enumerate().map(|(i, lg)| {
             let mut lp = crate::model::MemoryLevelParams::zeros_like(d);
-            lg.d_w_k_mem.copy_to_host(&mut lp.w_k_mem);
-            lg.d_w_v_mem.copy_to_host(&mut lp.w_v_mem);
-            lg.d_w_q_mem.copy_to_host(&mut lp.w_q_mem);
+            lg.d_w_k_mem.copy_to_host(lp.w_k_mem.master_mut()); lp.w_k_mem.sync_from_master();
+            lg.d_w_v_mem.copy_to_host(lp.w_v_mem.master_mut()); lp.w_v_mem.sync_from_master();
+            lg.d_w_q_mem.copy_to_host(lp.w_q_mem.master_mut()); lp.w_q_mem.sync_from_master();
             lg.d_w_alpha.copy_to_host(&mut lp.w_alpha);
             lg.d_b_alpha.copy_to_host(&mut lp.b_alpha);
             lg.d_w_theta.copy_to_host(&mut lp.w_theta);

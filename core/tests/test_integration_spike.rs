@@ -780,7 +780,7 @@ fn run_sweep_combo(
         (CompositionKind::MAC, MemoryRuleKind::TitansLMM) if k >= 4 => 0.15,
         (CompositionKind::MAC, MemoryRuleKind::HebbianRule) => 0.15,
         (CompositionKind::MAC, _) if k == 1 => 0.3,
-        (CompositionKind::MAL, MemoryRuleKind::HebbianRule) if k <= 2 => 0.1,
+        (CompositionKind::MAL, MemoryRuleKind::HebbianRule) if k <= 2 => 0.05, // reduced for bf16
         _ => 0.5,
     };
     // k=4 needs more steps (Level 3 fires at step 512). MAC needs more at all k values
@@ -788,6 +788,7 @@ fn run_sweep_combo(
     // hardest combo (no error correction + no CMS regularization + doubled sequence).
     let base_steps = match (&cfg.composition, &cfg.memory_rule, k) {
         (CompositionKind::MAC, MemoryRuleKind::HebbianRule, 1) => 3000,
+        (CompositionKind::MAL, MemoryRuleKind::HebbianRule, _) => 1000, // more steps for lower bf16 lr
         (CompositionKind::MAC, _, 4) => 2000,
         (CompositionKind::MAC, _, _) => 1000,
         (_, _, 4) => 1500,
@@ -807,8 +808,8 @@ fn run_sweep_combo(
         }
         // Try lower lr
         let next_lr = lr * 0.5;
-        if next_lr < 0.01 {
-            break; // Give up — even lr=0.01 diverges
+        if next_lr < 0.005 {
+            break; // Give up — even very low lr diverges
         }
         eprintln!("  {} NaN at lr={:.3}, retrying at lr={:.3}", name, lr, next_lr);
         lr = next_lr;

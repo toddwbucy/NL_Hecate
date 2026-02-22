@@ -271,9 +271,9 @@ mod tests {
         let d = 4;
         let mut buf = ErrorBuffer::new(d);
         let mut g1 = MemoryLevelParams::zeros_like(d);
-        g1.w_k_mem.iter_mut().for_each(|v| *v = 1.0);
+        g1.w_k_mem.master_mut().iter_mut().for_each(|v| *v = 1.0);
         let mut g2 = MemoryLevelParams::zeros_like(d);
-        g2.w_k_mem.iter_mut().for_each(|v| *v = 2.0);
+        g2.w_k_mem.master_mut().iter_mut().for_each(|v| *v = 2.0);
 
         buf.accumulate(&g1);
         assert_eq!(buf.steps_accumulated, 1);
@@ -281,7 +281,7 @@ mod tests {
         assert_eq!(buf.steps_accumulated, 2);
 
         // Should be summed: 1.0 + 2.0 = 3.0
-        assert!((buf.grads.w_k_mem[0] - 3.0).abs() < 1e-6);
+        assert!((buf.grads.w_k_mem.master()[0] - 3.0).abs() < 1e-6);
     }
 
     #[test]
@@ -289,18 +289,18 @@ mod tests {
         let d = 4;
         let mut buf = ErrorBuffer::new(d);
         let mut g = MemoryLevelParams::zeros_like(d);
-        g.w_k_mem.iter_mut().for_each(|v| *v = 1.0);
+        g.w_k_mem.master_mut().iter_mut().for_each(|v| *v = 1.0);
         buf.accumulate(&g);
 
         let mut params = MemoryLevelParams::zeros_like(d);
-        params.w_k_mem.iter_mut().for_each(|v| *v = 10.0);
+        params.w_k_mem.master_mut().iter_mut().for_each(|v| *v = 10.0);
 
         buf.apply_and_reset(&mut params, 0.1);
 
         // params = 10.0 - 0.1 * 1.0 = 9.9
-        assert!((params.w_k_mem[0] - 9.9).abs() < 1e-6);
+        assert!((params.w_k_mem.master()[0] - 9.9).abs() < 1e-6);
         assert_eq!(buf.steps_accumulated, 0);
-        assert!(buf.grads.w_k_mem.iter().all(|&v| v == 0.0));
+        assert!(buf.grads.w_k_mem.master().iter().all(|&v| v == 0.0));
     }
 
     #[test]
@@ -310,7 +310,7 @@ mod tests {
 
         // Accumulate 7 identical gradient steps
         let mut g = MemoryLevelParams::zeros_like(d);
-        g.w_k_mem.iter_mut().for_each(|v| *v = 1.0);
+        g.w_k_mem.master_mut().iter_mut().for_each(|v| *v = 1.0);
         for _ in 0..7 {
             buf.accumulate(&g);
         }

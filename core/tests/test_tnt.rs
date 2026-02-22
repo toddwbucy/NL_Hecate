@@ -39,7 +39,7 @@ fn test_tnt_smoke() {
     let d_y = vec![1.0f32; s * d];
     let (grads, d_emb, _) = tnt_backward(&params.levels[0], &cache, &d_y, &embedded, &tnt, &cfg, None);
     assert_eq!(d_emb.len(), s * d);
-    let norm: f32 = grads.w_k_mem.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm: f32 = grads.w_k_mem.master().iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(norm > 1e-10);
 }
 
@@ -94,9 +94,12 @@ fn test_tnt_convergence() {
             .map(|(a, b)| 2.0 * (a - b) / (s * d) as f32).collect();
         let (grads, _, _) = tnt_backward(&level_params, &cache, &d_y, &embedded, &tnt, &cfg, None);
 
-        for (w, g) in level_params.w_k_mem.iter_mut().zip(grads.w_k_mem.iter()) { *w -= lr * g; }
-        for (w, g) in level_params.w_v_mem.iter_mut().zip(grads.w_v_mem.iter()) { *w -= lr * g; }
-        for (w, g) in level_params.w_q_mem.iter_mut().zip(grads.w_q_mem.iter()) { *w -= lr * g; }
+        for (w, g) in level_params.w_k_mem.master_mut().iter_mut().zip(grads.w_k_mem.master().iter()) { *w -= lr * g; }
+        for (w, g) in level_params.w_v_mem.master_mut().iter_mut().zip(grads.w_v_mem.master().iter()) { *w -= lr * g; }
+        for (w, g) in level_params.w_q_mem.master_mut().iter_mut().zip(grads.w_q_mem.master().iter()) { *w -= lr * g; }
+        level_params.w_k_mem.sync_from_master();
+        level_params.w_v_mem.sync_from_master();
+        level_params.w_q_mem.sync_from_master();
     }
 
     assert!(last_loss.is_finite(), "TNT training loss should be finite");
