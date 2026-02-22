@@ -241,13 +241,20 @@ pub fn titans_lmm_opaque_backward(
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
-    // Read momentum_kind from extra_meta if present (new format: meta[4] = momentum_kind as f32)
+    // Read momentum_kind from extra_meta if present (new format: meta[4] = momentum_kind as f32).
+    // DeepMomentum requires deep_cache to be restored for backward — if those saved entries
+    // aren't present, downgrade to EMA to avoid panic in step_backward().
     let momentum_kind = if saved[0].len() > 4 {
         match saved[0][4] as u8 {
             0 => crate::model::MomentumKind::None,
             1 => crate::model::MomentumKind::EMA,
             2 => crate::model::MomentumKind::DeltaMomentum,
-            3 => crate::model::MomentumKind::DeepMomentum,
+            3 => {
+                // DeepMomentum backward needs deep_cache; without saved MLP
+                // state we can't reconstruct it, so fall back to EMA.
+                // Full deep momentum opaque backward is future work.
+                crate::model::MomentumKind::EMA
+            }
             _ => crate::model::MomentumKind::EMA,
         }
     } else {

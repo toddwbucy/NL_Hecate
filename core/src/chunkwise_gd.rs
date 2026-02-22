@@ -817,7 +817,9 @@ mod tests {
             &params.levels[0], &embedded, s, d, 2, &ema_cfg, None,
         );
         let diff: f32 = y_ema.iter().zip(y_delta.iter()).map(|(a, b)| (a - b).abs()).sum();
-        assert!(diff >= 0.0, "Delta should produce valid output, diff={diff}");
+        // With tiny test dims (d=8, seq_len=4), ||g||^2 is small so decay ≈ eta,
+        // but the diff should still be strictly positive (not bit-identical).
+        assert!(diff > 0.0, "DeltaMomentum should differ from EMA, diff={diff}");
 
         // All outputs finite
         for (i, &v) in y_delta.iter().enumerate() {
