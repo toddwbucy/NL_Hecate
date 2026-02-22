@@ -678,10 +678,10 @@ fn traced_active_level(
             final_m.extend_from_slice(w1_final);
             final_m.extend_from_slice(w2_final);
 
-            let extra_meta = [dh as f32, cfg.lp_p, cfg.lambda_2, cfg.sign_sharpness];
+            let extra_meta = [dh as f32, cfg.lp_p, cfg.lambda_2, cfg.sign_sharpness, cfg.lq_q];
             let (meta_id, lp_saved, emb_saved) =
                 alloc_common_saved(tape, level_params, embedded, s, d, &extra_meta);
-            let cache_ids = vec![
+            let mut cache_ids = vec![
                 tape.alloc(cache.w1_states.clone(), vec![]),
                 tape.alloc(cache.w2_states.clone(), vec![]),
                 tape.alloc(cache.k_mem.clone(), vec![]),
@@ -698,6 +698,11 @@ fn traced_active_level(
                 tape.alloc(cache.error.clone(), vec![]),
                 tape.alloc(cache.y.clone(), vec![]),
             ];
+            // Save a1/a2 accumulator states when L_q > 2 (needed for backward)
+            if !cache.a1_states.is_empty() {
+                cache_ids.push(tape.alloc(cache.a1_states.clone(), vec![]));
+                cache_ids.push(tape.alloc(cache.a2_states.clone(), vec![]));
+            }
             let y_id = tape.alloc(y.clone(), vec![s, d]);
             let mut saved = vec![meta_id, lp_saved, emb_saved];
             saved.extend(cache_ids);
