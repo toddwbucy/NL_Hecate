@@ -113,38 +113,33 @@ impl MemoryRule for LatticeOSR {
         debug_assert_eq!(state.m_slots, self.m_slots);
         let d = state.d;
         let m = state.m_slots;
+        let mut input = vec![0.0f32; d];
+        let mut s_unnorm = vec![0.0f32; d];
         for i in 0..m {
             let slot = &state.slots[i * d..(i + 1) * d];
             let score = frobenius_dot_f32(slot, k);
             let gate_i = sigmoid_f32(score);
 
             // Compute input for orthogonal update based on variant
-            let input = match self.variant {
+            match self.variant {
                 LatticeVariant::Decode => {
                     // Eqs 5-6: delta_s = gate_i * v_t
-                    let mut inp = vec![0.0f32; d];
-                    for j in 0..d { inp[j] = v[j]; }
-                    inp
+                    input[..d].copy_from_slice(&v[..d]);
                 }
                 LatticeVariant::Encode => {
                     // Eqs 24-25: delta_s = gate_i * k_t
-                    let mut inp = vec![0.0f32; d];
-                    for j in 0..d { inp[j] = k[j]; }
-                    inp
+                    input[..d].copy_from_slice(&k[..d]);
                 }
                 LatticeVariant::Similarity => {
                     // Eqs 7-8: delta_s = gate_i * (v_t - dot(S[i], v_t) * S[i])
                     let dot_sv = frobenius_dot_f32(slot, v);
-                    let mut inp = vec![0.0f32; d];
-                    for j in 0..d { inp[j] = v[j] - dot_sv * slot[j]; }
-                    inp
+                    for j in 0..d { input[j] = v[j] - dot_sv * slot[j]; }
                 }
-            };
+            }
 
             // delta_s = alpha * gate_i * input
             // orthogonal = delta_s - dot(s, delta_s) * s
             let scale = gates.alpha * gate_i;
-            let mut s_unnorm = vec![0.0f32; d];
             let mut p = 0.0f32;
             for j in 0..d {
                 p += slot[j] * scale * input[j];
