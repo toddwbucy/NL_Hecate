@@ -33,19 +33,33 @@ use crate::delta_rule::{MemoryRule, MemoryState, Gates, MemoryError};
 /// Titans LMM: GD + momentum memory rule (Titans Eqs 12-15, 32-33).
 /// `bias` controls the inner-loop loss: L2 (default), L1, or Lp(p).
 /// `sign_sharpness` controls the tanh approximation steepness for non-L2 biases.
+/// `momentum_kind` selects the momentum variant (EMA/Delta/Deep).
 pub struct TitansLMM {
     pub bias: crate::model::AttentionalBias,
     pub sign_sharpness: f32,
+    pub momentum_kind: crate::model::MomentumKind,
+    pub momentum_d_hidden: usize,
 }
 
 impl TitansLMM {
-    /// L2 bias (backward compatible default).
+    /// L2 bias (backward compatible default — EMA momentum).
     pub fn l2() -> Self {
-        TitansLMM { bias: crate::model::AttentionalBias::L2, sign_sharpness: 10.0 }
+        TitansLMM {
+            bias: crate::model::AttentionalBias::L2,
+            sign_sharpness: 10.0,
+            momentum_kind: crate::model::MomentumKind::EMA,
+            momentum_d_hidden: 0,
+        }
     }
     /// Construct from MAGConfig fields.
     pub fn from_cfg(cfg: &crate::model::MAGConfig) -> Self {
-        TitansLMM { bias: cfg.attentional_bias, sign_sharpness: cfg.sign_sharpness }
+        let mk = crate::momentum::effective_momentum_kind(cfg.momentum_kind, cfg.memory_rule);
+        TitansLMM {
+            bias: cfg.attentional_bias,
+            sign_sharpness: cfg.sign_sharpness,
+            momentum_kind: mk,
+            momentum_d_hidden: cfg.momentum_d_hidden,
+        }
     }
 }
 
@@ -87,6 +101,14 @@ pub struct TitansLMMCache {
     pub grad_outer: Vec<f32>,
     /// Memory output y_t: [seq_len, d]
     pub y: Vec<f32>,
+    /// Which momentum variant was used (needed for backward dispatch).
+    pub momentum_kind: crate::model::MomentumKind,
+    /// Per-token decay values for DeltaMomentum: [seq_len]. Empty for EMA/Deep.
+    pub decay: Vec<f32>,
+    /// Deep Momentum MLP cache. None for EMA/DeltaMomentum.
+    pub deep_cache: Option<crate::momentum::DeepMomentumCache>,
+    /// Deep Momentum MLP config dimension. 0 when not DeepMomentum.
+    pub deep_d_hidden: usize,
 }
 
 impl MemoryRule for TitansLMM {
@@ -159,6 +181,13 @@ impl MemoryRule for TitansLMM {
         matmul_f32(embedded, &w_v_mem_t, &mut v_mem, seq_len, d, d);
         matmul_f32(embedded, &w_q_mem_t, &mut q_mem, seq_len, d, d);
 
+        // Resolve momentum kind
+        let mk = self.momentum_kind;
+        let dd = d * d;
+        let deep_dh = if mk == crate::model::MomentumKind::DeepMomentum {
+            if self.momentum_d_hidden > 0 { self.momentum_d_hidden } else { 4 * d }
+        } else { 0 };
+
         // Allocate cache — seed M_0 from initial_m if provided, else zeros
         // S_0 is always zeros (no initial momentum)
         let mut m_states = vec![0.0f32; (seq_len + 1) * d * d];
@@ -177,6 +206,12 @@ impl MemoryRule for TitansLMM {
         let mut error = vec![0.0f32; seq_len * d];
         let mut grad_outer = vec![0.0f32; seq_len * d * d];
         let mut y = vec![0.0f32; seq_len * d];
+        let mut decay_buf = if mk == crate::model::MomentumKind::DeltaMomentum {
+            vec![0.0f32; seq_len]
+        } else { vec![] };
+        let mut deep_cache = if mk == crate::model::MomentumKind::DeepMomentum {
+            Some(crate::momentum::DeepMomentumCache::new(seq_len, dd, deep_dh))
+        } else { None };
 
         // Sequential token loop
         for t in 0..seq_len {
@@ -232,15 +267,27 @@ impl MemoryRule for TitansLMM {
             let g_base = t * d * d;
             outer_product_f32(&biased, k_t, &mut grad_outer[g_base..g_base + d * d]);
 
-            // S_{t+1} = eta_t * S_t - theta_t * grad  (momentum update)
+            // Momentum update — dispatched to momentum.rs
             let eta_t = eta[t];
             let theta_t = theta[t];
-            let s_t_off = t * d * d;
-            let s_next_off = (t + 1) * d * d;
-            s_states.copy_within(s_t_off..s_t_off + d * d, s_next_off);
-            l2_apply_retention(&mut s_states[s_next_off..s_next_off + d * d], eta_t);
-            for i in 0..(d * d) {
-                s_states[s_next_off + i] -= theta_t * grad_outer[g_base + i];
+            let s_next_off = (t + 1) * dd;
+            match mk {
+                crate::model::MomentumKind::EMA | crate::model::MomentumKind::None => {
+                    crate::momentum::ema_step(&mut s_states, t, d, eta_t, theta_t,
+                        &grad_outer[g_base..g_base + dd]);
+                }
+                crate::model::MomentumKind::DeltaMomentum => {
+                    crate::momentum::delta_momentum_step(&mut s_states, t, d, eta_t, theta_t,
+                        &grad_outer[g_base..g_base + dd], &mut decay_buf);
+                }
+                crate::model::MomentumKind::DeepMomentum => {
+                    // For deep momentum, the MLP output replaces S_{t+1}
+                    let dc = deep_cache.as_mut().unwrap();
+                    let mlp = crate::momentum::DeepMomentumMLP { d, d_hidden: deep_dh };
+                    let mom_out = crate::momentum::deep_momentum_step(
+                        &mlp, dc, t, eta_t, theta_t, &grad_outer[g_base..g_base + dd]);
+                    s_states[s_next_off..s_next_off + dd].copy_from_slice(&mom_out);
+                }
             }
 
             // M_{t+1} = (1-alpha_t) * M_t + S_{t+1}  (memory update with momentum)
@@ -261,6 +308,10 @@ impl MemoryRule for TitansLMM {
             seq_len, d, m_states, s_states, k_mem, v_mem, q_mem, concat_kv,
             alpha_pre, alpha, theta_pre, theta, eta_pre, eta,
             error, grad_outer, y: y.clone(),
+            momentum_kind: mk,
+            decay: decay_buf,
+            deep_cache,
+            deep_d_hidden: deep_dh,
         };
 
         (y, cache)
@@ -338,19 +389,33 @@ impl MemoryRule for TitansLMM {
             let mut d_m_prev = d_m.clone();
             l2_apply_retention(&mut d_m_prev, 1.0 - alpha_t);
 
-            // ── S_{t+1} = eta * S_t - theta * grad backward ──
-            let d_eta_scalar = frobenius_dot_f32(s_t, &d_s);
-            let d_theta_scalar = -frobenius_dot_f32(grad_t, &d_s);
-
-            // d_grad = -theta * d_S
-            let mut d_grad = vec![0.0f32; d * d];
-            for i in 0..(d * d) {
-                d_grad[i] = -theta_t * d_s[i];
-            }
-
-            // d_S_prev = eta * d_S (propagate to previous step)
-            let mut d_s_prev = d_s.clone();
-            l2_apply_retention(&mut d_s_prev, eta_t);
+            // ── Momentum backward — dispatched to momentum.rs ──
+            let (d_eta_scalar, d_theta_scalar, d_grad) = match cache.momentum_kind {
+                crate::model::MomentumKind::EMA | crate::model::MomentumKind::None => {
+                    crate::momentum::ema_step_backward(&mut d_s, s_t, grad_t, eta_t, theta_t, d)
+                }
+                crate::model::MomentumKind::DeltaMomentum => {
+                    let decay_t = cache.decay[t];
+                    crate::momentum::delta_momentum_step_backward(
+                        &mut d_s, s_t, grad_t, eta_t, theta_t, decay_t, d)
+                }
+                crate::model::MomentumKind::DeepMomentum => {
+                    let dc = cache.deep_cache.as_ref().unwrap();
+                    let mlp = crate::momentum::DeepMomentumMLP {
+                        d, d_hidden: cache.deep_d_hidden,
+                    };
+                    // For deep momentum, d_s is the d_output for the MLP
+                    let result = crate::momentum::deep_momentum_step_backward(
+                        &mlp, dc, t, eta_t, theta_t, grad_t, &d_s);
+                    // d_s_prev = 0 for deep (no linear S recurrence)
+                    for i in 0..(d * d) { d_s[i] = 0.0; }
+                    result
+                }
+            };
+            // After dispatch, d_s has been updated to d_s_prev in-place (for EMA/Delta).
+            // For Deep, d_s was zeroed (no linear S recurrence).
+            // Clone for the d_m/d_s swap at end of loop iteration.
+            let d_s_prev = d_s.clone();
 
             // ── grad = outer(biased_error, k) backward ──
             // Recompute biased error for d_k (not stored in cache)
@@ -714,7 +779,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = TitansLMM { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0 };
+        let rule = TitansLMM { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0 };
         let (y, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for (i, &v) in y.iter().enumerate() {
             assert!(v.is_finite(), "L1 y[{i}] not finite: {v}");
@@ -726,7 +791,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = TitansLMM { bias: crate::model::AttentionalBias::Lp(3.0), sign_sharpness: 10.0 };
+        let rule = TitansLMM { bias: crate::model::AttentionalBias::Lp(3.0), sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0 };
         let (y, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for (i, &v) in y.iter().enumerate() {
             assert!(v.is_finite(), "Lp(3) y[{i}] not finite: {v}");
@@ -738,7 +803,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = TitansLMM { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0 };
+        let rule = TitansLMM { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0 };
         let (y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let d_y = vec![1.0f32; y.len()];
         let (grads, d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
@@ -748,5 +813,101 @@ mod tests {
         for (i, &v) in grads.w_k_mem.iter().enumerate() {
             assert!(v.is_finite(), "L1 d_w_k_mem[{i}] not finite: {v}");
         }
+    }
+
+    // ── Momentum variant integration tests ─────────────────────────
+
+    #[test]
+    fn test_titans_ema_unchanged() {
+        // Refactored TitansLMM with EMA produces bit-identical results across runs.
+        let cfg = test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+
+        let rule = TitansLMM::l2(); // EMA by default
+        let (y1, cache1) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
+        let (y2, cache2) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
+
+        for i in 0..y1.len() {
+            assert!((y1[i] - y2[i]).abs() == 0.0,
+                "EMA should be deterministic, y[{}]: {} vs {}", i, y1[i], y2[i]);
+        }
+        for i in 0..cache1.s_states.len() {
+            assert!((cache1.s_states[i] - cache2.s_states[i]).abs() == 0.0,
+                "S_states should be identical at {}", i);
+        }
+    }
+
+    #[test]
+    fn test_titans_delta_momentum() {
+        // TitansLMM with DeltaMomentum produces different output than EMA.
+        let cfg = test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let d = cfg.swa.d_model;
+        let s = cfg.swa.seq_len;
+
+        let ema_rule = TitansLMM::l2();
+        let (y_ema, _) = ema_rule.step(&params.levels[0], &embedded, s, d, None);
+
+        let delta_rule = TitansLMM {
+            bias: crate::model::AttentionalBias::L2,
+            sign_sharpness: 10.0,
+            momentum_kind: crate::model::MomentumKind::DeltaMomentum,
+            momentum_d_hidden: 0,
+        };
+        let (y_delta, cache_delta) = delta_rule.step(&params.levels[0], &embedded, s, d, None);
+
+        for (i, &v) in y_delta.iter().enumerate() {
+            assert!(v.is_finite(), "Delta y[{i}] not finite: {v}");
+        }
+
+        let diff: f32 = y_ema.iter().zip(y_delta.iter()).map(|(a, b)| (a - b).abs()).sum();
+        // With tiny test dims (d=8, seq_len=4), ||g||^2 is small so decay ≈ eta.
+        // The diff is non-zero but tiny — just verify it's not bit-identical.
+        assert!(diff > 0.0, "DeltaMomentum should differ from EMA, diff={diff}");
+
+        assert_eq!(cache_delta.decay.len(), s);
+        for &dc in &cache_delta.decay {
+            assert!(dc >= 1e-6 && dc <= 1.0 - 1e-6, "Decay should be clamped, got {dc}");
+        }
+    }
+
+    #[test]
+    fn test_titans_deep_momentum() {
+        // TitansLMM with DeepMomentum produces valid, distinct output.
+        let cfg = test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let d = cfg.swa.d_model;
+        let s = cfg.swa.seq_len;
+
+        let deep_rule = TitansLMM {
+            bias: crate::model::AttentionalBias::L2,
+            sign_sharpness: 10.0,
+            momentum_kind: crate::model::MomentumKind::DeepMomentum,
+            momentum_d_hidden: 4 * d,
+        };
+        let (y_deep, cache_deep) = deep_rule.step(&params.levels[0], &embedded, s, d, None);
+
+        for (i, &v) in y_deep.iter().enumerate() {
+            assert!(v.is_finite(), "Deep y[{i}] not finite: {v}");
+        }
+
+        let m_final = &cache_deep.m_states[s * d * d..(s + 1) * d * d];
+        let m_norm: f32 = m_final.iter().map(|x| x * x).sum();
+        // With tiny test dims and W2_0=0, the MLP output is very small at first.
+        // W2 only gets one inner-loop update before re-evaluation, so the output
+        // is O(theta * ||grad||^2 * scale) — tiny but non-zero.
+        assert!(m_norm > 0.0, "Deep M_T should have evolved, norm={m_norm}");
+
+        assert!(cache_deep.deep_cache.is_some());
+        let dc = cache_deep.deep_cache.as_ref().unwrap();
+        assert!(!dc.output.is_empty());
+
+        let ema_rule = TitansLMM::l2();
+        let (y_ema, _) = ema_rule.step(&params.levels[0], &embedded, s, d, None);
+        let diff: f32 = y_ema.iter().zip(y_deep.iter()).map(|(a, b)| (a - b).abs()).sum();
+        assert!(diff > 1e-6, "DeepMomentum should differ from EMA, diff={diff}");
     }
 }

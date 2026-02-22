@@ -8,6 +8,7 @@ pub mod forward;
 pub mod backward;
 pub mod delta_rule;
 pub mod titans_lmm;
+pub mod momentum;
 pub mod hebbian_rule;
 pub mod moneta;
 pub mod yaad;

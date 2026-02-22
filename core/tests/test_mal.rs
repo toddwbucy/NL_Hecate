@@ -1,7 +1,7 @@
 //! MAL (Memory As Layer) integration tests: multi-step training,
 //! memory-is-attention-input verification, CMS k=2, comparison vs MAG.
 
-use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind, CompositionKind, HopeVariant, LatticeVariant};
+use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind, CompositionKind, HopeVariant, LatticeVariant, MomentumKind};
 use nl_hecate_core::dynamic_freq::FrequencySchedule;
 use nl_hecate_core::retention::RetentionKind;
 use nl_hecate_core::mal::{mal_forward, mal_backward, cms_mal_forward, cms_mal_backward};
@@ -197,6 +197,8 @@ fn test_mal_vs_mag() {
             n_persistent: 0,
             attentional_bias: Default::default(),
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
     };
     let cfg_mal = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
@@ -214,6 +216,8 @@ fn test_mal_vs_mag() {
             n_persistent: 0,
             attentional_bias: Default::default(),
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
     };
 
     let input_ids: Vec<usize> = (0..swa.seq_len).map(|t| t % swa.vocab_size).collect();

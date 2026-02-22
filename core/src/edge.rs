@@ -9,7 +9,7 @@
 /// cms_forward/cms_backward pipeline. No std::time::Instant — timing
 /// is provided externally (benchmarks, serving module).
 
-use crate::model::{MAGConfig, MAGParams, CompositionKind, MemoryRuleKind, HopeVariant, LatticeVariant, AttentionalBias};
+use crate::model::{MAGConfig, MAGParams, CompositionKind, MemoryRuleKind, HopeVariant, LatticeVariant, AttentionalBias, MomentumKind};
 use crate::dynamic_freq::FrequencySchedule;
 use crate::retention::default_retention;
 use crate::conductor::{Conductor, ContextState, ErrorBuffer};
@@ -75,6 +75,8 @@ impl EdgeConfig {
             n_persistent: 0,
             attentional_bias: AttentionalBias::L2,
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
         }
     }
 

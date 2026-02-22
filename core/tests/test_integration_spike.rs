@@ -8,7 +8,7 @@
 //! A model that learned should achieve significantly lower loss AND correct predictions.
 
 use nl_hecate_core::model::{
-    MAGConfig, MAGParams, SWAConfig, CompositionKind, MemoryRuleKind, HopeVariant, LatticeVariant,
+    MAGConfig, MAGParams, SWAConfig, CompositionKind, MemoryRuleKind, HopeVariant, LatticeVariant, MomentumKind,
 };
 use nl_hecate_core::dynamic_freq::FrequencySchedule;
 use nl_hecate_core::conductor::{Conductor, ContextState, ErrorBuffer, Pulse};
@@ -68,6 +68,8 @@ fn spike_config_a() -> MAGConfig {
             n_persistent: 0,
             attentional_bias: Default::default(),
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
     }
 }
 
@@ -100,6 +102,8 @@ fn spike_config_b() -> MAGConfig {
             n_persistent: 0,
             attentional_bias: Default::default(),
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
     }
 }
 
@@ -132,6 +136,8 @@ fn spike_config_c() -> MAGConfig {
             n_persistent: 0,
             attentional_bias: Default::default(),
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
     }
 }
 
@@ -727,6 +733,8 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
             n_persistent: 0,
             attentional_bias: Default::default(),
             kernel_size: 0,
+            momentum_kind: MomentumKind::None,
+            momentum_d_hidden: 0,
     }
 }
 

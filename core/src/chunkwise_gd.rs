@@ -790,6 +790,44 @@ mod tests {
     }
 
     #[test]
+    fn test_momentum_propagation_delta() {
+        // Delta Momentum should propagate across chunk boundaries,
+        // and the decay buffer should be populated in each chunk.
+        let mut cfg = MAGConfig::titans_test_config();
+        cfg.momentum_kind = crate::model::MomentumKind::DeltaMomentum;
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let s = cfg.swa.seq_len;
+        let d = cfg.swa.d_model;
+
+        let (y_delta, cache_delta) = chunkwise_gd_forward(
+            &params.levels[0], &embedded, s, d, 2, &cfg, None,
+        );
+
+        // Check momentum present in boundaries (Delta still uses S accumulator)
+        for chunk in &cache_delta.chunks {
+            assert!(chunk.boundary_after.momentum.is_some(),
+                "Delta Momentum chunks should have momentum in boundaries");
+        }
+
+        // Compare with EMA — outputs should differ (non-zero diff)
+        let mut ema_cfg = MAGConfig::titans_test_config();
+        ema_cfg.momentum_kind = crate::model::MomentumKind::EMA;
+        let (y_ema, _) = chunkwise_gd_forward(
+            &params.levels[0], &embedded, s, d, 2, &ema_cfg, None,
+        );
+        let diff: f32 = y_ema.iter().zip(y_delta.iter()).map(|(a, b)| (a - b).abs()).sum();
+        // With tiny test dims (d=8, seq_len=4), ||g||^2 is small so decay ≈ eta,
+        // but the diff should still be strictly positive (not bit-identical).
+        assert!(diff > 0.0, "DeltaMomentum should differ from EMA, diff={diff}");
+
+        // All outputs finite
+        for (i, &v) in y_delta.iter().enumerate() {
+            assert!(v.is_finite(), "Delta chunkwise y[{i}] not finite: {v}");
+        }
+    }
+
+    #[test]
     fn test_single_chunk_matches_full() {
         // When chunk_size >= seq_len, should be a single chunk = full sequential
         let cfg = MAGConfig::test_config();
