@@ -110,8 +110,9 @@ impl MemoryRule for LatticeOSR {
     }
 
     fn write(&self, state: &mut LatticeState, k: &[f32], v: &[f32], gates: &Gates) -> Result<(), MemoryError> {
+        debug_assert_eq!(state.m_slots, self.m_slots);
         let d = state.d;
-        let m = self.m_slots;
+        let m = state.m_slots;
         for i in 0..m {
             let slot = &state.slots[i * d..(i + 1) * d];
             let score = frobenius_dot_f32(slot, k);
@@ -159,8 +160,9 @@ impl MemoryRule for LatticeOSR {
     }
 
     fn read(&self, state: &LatticeState, q: &[f32], out: &mut [f32]) -> Result<(), MemoryError> {
+        debug_assert_eq!(state.m_slots, self.m_slots);
         let d = state.d;
-        let m = self.m_slots;
+        let m = state.m_slots;
         // softmax attention over m slots
         let mut scores = vec![0.0f32; m];
         for i in 0..m {
