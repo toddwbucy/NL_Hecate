@@ -87,6 +87,10 @@ pub struct MEMORACache {
     pub log_w1_prev: Vec<f32>,
     /// Cached log(W2_prev) per timestep: [seq_len * d * d_hidden]
     pub log_w2_prev: Vec<f32>,
+    /// Conv1D cache for key preprocessing (None when kernel_size=0)
+    pub k_conv_cache: Option<crate::conv1d::Conv1DCache>,
+    /// Conv1D cache for query preprocessing (None when kernel_size=0)
+    pub q_conv_cache: Option<crate::conv1d::Conv1DCache>,
 }
 
 impl MemoryRule for MEMORA {
@@ -136,6 +140,10 @@ impl MemoryRule for MEMORA {
         matmul_f32(embedded, &w_k_mem_t, &mut k_mem, seq_len, d, d);
         matmul_f32(embedded, &w_v_mem_t, &mut v_mem, seq_len, d, d);
         matmul_f32(embedded, &w_q_mem_t, &mut q_mem, seq_len, d, d);
+
+        // Conv1D key/query preprocessing (after projection, before memory loop)
+        let (k_conv_cache, q_conv_cache) = crate::conv1d::apply_conv1d_to_kq(
+            &mut k_mem, &mut q_mem, level_params, seq_len, d);
 
         // Allocate W1, W2 states — reuse incoming allocation when possible
         let w1_size = dh * d;
@@ -320,6 +328,7 @@ impl MemoryRule for MEMORA {
             prediction: prediction_all, error: error_all,
             y: y.clone(),
             log_w1_prev, log_w2_prev,
+            k_conv_cache, q_conv_cache,
         };
 
         (y, cache)
@@ -340,7 +349,7 @@ impl MemoryRule for MEMORA {
         debug_assert_eq!(d_y.len(), s * d);
         debug_assert_eq!(embedded.len(), s * d);
 
-        let mut grads = MemoryLevelParams::zeros_like(d);
+        let mut grads = MemoryLevelParams::zeros_like_from(level_params, d);
         let mut d_k_mem = vec![0.0f32; s * d];
         let mut d_v_mem = vec![0.0f32; s * d];
         let mut d_q_mem = vec![0.0f32; s * d];
@@ -639,6 +648,12 @@ impl MemoryRule for MEMORA {
             d_w1 = d_w1_prev;
             d_w2 = d_w2_prev;
         }
+
+        // ── Conv1D backward (before projection backward) ──
+        crate::conv1d::backward_conv1d_kq(
+            &mut d_k_mem, &mut d_q_mem,
+            &cache.k_conv_cache, &cache.q_conv_cache,
+            level_params, &mut grads, s, d);
 
         // ── Projection backward: k_mem = embedded @ W_K_mem^T ──
         let mut d_embedded = vec![0.0f32; s * d];

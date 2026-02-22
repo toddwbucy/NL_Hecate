@@ -98,6 +98,10 @@ pub struct MonetaCache {
     /// Pre-normalization W2 accumulator states when lq_q > 2: [(seq_len+1) * w2_size].
     /// Empty when lq_q ≈ 2 (zero overhead for standard L2 path).
     pub a2_states: Vec<f32>,
+    /// Conv1D cache for key preprocessing (None when kernel_size=0)
+    pub k_conv_cache: Option<crate::conv1d::Conv1DCache>,
+    /// Conv1D cache for query preprocessing (None when kernel_size=0)
+    pub q_conv_cache: Option<crate::conv1d::Conv1DCache>,
 }
 
 /// Compute l_p gradient: p * smooth_sign(e) * |e|^(p-1).
@@ -183,6 +187,10 @@ impl MemoryRule for Moneta {
         matmul_f32(embedded, &w_k_mem_t, &mut k_mem, seq_len, d, d);
         matmul_f32(embedded, &w_v_mem_t, &mut v_mem, seq_len, d, d);
         matmul_f32(embedded, &w_q_mem_t, &mut q_mem, seq_len, d, d);
+
+        // Conv1D key/query preprocessing (after projection, before memory loop)
+        let (k_conv_cache, q_conv_cache) = crate::conv1d::apply_conv1d_to_kq(
+            &mut k_mem, &mut q_mem, level_params, seq_len, d);
 
         // Allocate W1, W2 states — seed from initial_m if provided
         let w1_size = dh * d;
@@ -394,6 +402,7 @@ impl MemoryRule for Moneta {
             y: y.clone(),
             lp_p: p, lambda_2: l2, sign_sharpness: a,
             lq_q: q, a1_states, a2_states,
+            k_conv_cache, q_conv_cache,
         };
 
         (y, cache)
@@ -420,7 +429,7 @@ impl MemoryRule for Moneta {
         debug_assert_eq!(d_y.len(), s * d);
         debug_assert_eq!(embedded.len(), s * d);
 
-        let mut grads = MemoryLevelParams::zeros_like(d);
+        let mut grads = MemoryLevelParams::zeros_like_from(level_params, d);
         let mut d_k_mem = vec![0.0f32; s * d];
         let mut d_v_mem = vec![0.0f32; s * d];
         let mut d_q_mem = vec![0.0f32; s * d];
@@ -970,6 +979,12 @@ impl MemoryRule for Moneta {
             d_w2 = d_w2_prev;
             } // end else (L2 path)
         }
+
+        // ── Conv1D backward (before projection backward) ──
+        crate::conv1d::backward_conv1d_kq(
+            &mut d_k_mem, &mut d_q_mem,
+            &cache.k_conv_cache, &cache.q_conv_cache,
+            level_params, &mut grads, s, d);
 
         // ── Projection backward: k_mem = embedded @ W_K_mem^T ──
         let mut d_embedded = vec![0.0f32; s * d];

@@ -16,6 +16,7 @@ pub mod memora;
 pub mod lattice_osr;
 pub mod trellis;
 pub mod retention;
+pub mod conv1d;
 pub mod mag;
 pub mod mal;
 pub mod mac;

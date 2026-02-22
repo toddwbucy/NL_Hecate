@@ -23,7 +23,47 @@ use crate::memora::{MEMORA, MEMORACache};
 use crate::lattice_osr::{LatticeOSR, LatticeCache};
 use crate::trellis::{Trellis, TrellisCache};
 use crate::atlas_omega::{AtlasOmega, AtlasOmegaCache};
+use crate::conv1d::Conv1DCache;
 use crate::tensor;
+
+// ── Conv1D cache save/restore helpers ─────────────────────────────────
+
+/// Save conv1d cache buffers onto the tape if present.
+/// Returns BufIds for [k_pre_conv, k_pre_silu, q_pre_conv, q_pre_silu] or empty vec.
+fn save_conv_cache(
+    tape: &mut Tape,
+    k_conv: &Option<Conv1DCache>,
+    q_conv: &Option<Conv1DCache>,
+) -> Vec<BufId> {
+    match (k_conv, q_conv) {
+        (Some(kc), Some(qc)) => vec![
+            tape.alloc(kc.pre_conv.clone(), vec![]),
+            tape.alloc(kc.pre_silu.clone(), vec![]),
+            tape.alloc(qc.pre_conv.clone(), vec![]),
+            tape.alloc(qc.pre_silu.clone(), vec![]),
+        ],
+        _ => vec![],
+    }
+}
+
+/// Restore conv1d cache from saved buffers at the given offset.
+/// `saved` starts from the first conv buffer (k_pre_conv).
+/// Returns (k_conv_cache, q_conv_cache) — both None if saved is empty/insufficient.
+fn restore_conv_cache(saved: &[&[f32]]) -> (Option<Conv1DCache>, Option<Conv1DCache>) {
+    if saved.len() >= 4 {
+        let k_cache = Conv1DCache {
+            pre_conv: saved[0].to_vec(),
+            pre_silu: saved[1].to_vec(),
+        };
+        let q_cache = Conv1DCache {
+            pre_conv: saved[2].to_vec(),
+            pre_silu: saved[3].to_vec(),
+        };
+        (Some(k_cache), Some(q_cache))
+    } else {
+        (None, None)
+    }
+}
 
 // ── MemoryLevelParams serialization ───────────────────────────────────
 
@@ -207,6 +247,11 @@ pub fn delta_rule_opaque_backward(
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
+    // Conv1D cache is appended after the 12 base cache fields (saved[15..18])
+    let (k_conv_cache, q_conv_cache) = if saved.len() > 15 {
+        restore_conv_cache(&saved[15..])
+    } else { (None, None) };
+
     let cache = DeltaRuleCache {
         seq_len, d,
         m_states: saved[3].to_vec(),
@@ -221,6 +266,7 @@ pub fn delta_rule_opaque_backward(
         error: saved[12].to_vec(),
         grad_outer: saved[13].to_vec(),
         y: saved[14].to_vec(),
+        k_conv_cache, q_conv_cache,
     };
 
     let rule = DeltaRule { bias, sign_sharpness };
@@ -261,6 +307,12 @@ pub fn titans_lmm_opaque_backward(
         crate::model::MomentumKind::EMA // backward compat: old recordings used EMA
     };
 
+    // Conv1D cache at tail of saved buffers
+    let (k_conv_cache_restored, q_conv_cache_restored) = if !level_params.w_k_conv.is_empty() {
+        let n = saved.len();
+        restore_conv_cache(&saved[n-4..])
+    } else { (None, None) };
+
     let cache = TitansLMMCache {
         seq_len, d,
         m_states: saved[3].to_vec(),
@@ -288,6 +340,8 @@ pub fn titans_lmm_opaque_backward(
         } else { vec![] },
         deep_cache: None, // Deep momentum backward through opaque adapter is future work
         deep_d_hidden: 0,
+        k_conv_cache: k_conv_cache_restored,
+        q_conv_cache: q_conv_cache_restored,
     };
 
     let rule = TitansLMM {
@@ -312,6 +366,12 @@ pub fn hebbian_opaque_backward(
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
+    // Conv1D cache at tail of saved buffers
+    let (k_conv_cache_restored, q_conv_cache_restored) = if !level_params.w_k_conv.is_empty() {
+        let n = saved.len();
+        restore_conv_cache(&saved[n-4..])
+    } else { (None, None) };
+
     let cache = HebbianCache {
         seq_len, d,
         m_states: saved[3].to_vec(),
@@ -322,6 +382,8 @@ pub fn hebbian_opaque_backward(
         alpha_pre: saved[8].to_vec(),
         alpha: saved[9].to_vec(),
         y: saved[10].to_vec(),
+        k_conv_cache: k_conv_cache_restored,
+        q_conv_cache: q_conv_cache_restored,
     };
 
     let rule = HebbianRule;
@@ -353,6 +415,12 @@ pub fn moneta_opaque_backward(
         (vec![], vec![])
     };
 
+    // Conv1D cache at tail of saved buffers
+    let (k_conv_cache_restored, q_conv_cache_restored) = if !level_params.w_k_conv.is_empty() {
+        let n = saved.len();
+        restore_conv_cache(&saved[n-4..])
+    } else { (None, None) };
+
     let cache = MonetaCache {
         seq_len, d, d_hidden,
         w1_states: saved[3].to_vec(),
@@ -376,6 +444,8 @@ pub fn moneta_opaque_backward(
         lq_q,
         a1_states,
         a2_states,
+        k_conv_cache: k_conv_cache_restored,
+        q_conv_cache: q_conv_cache_restored,
     };
 
     let rule = Moneta { d_hidden, lp_p, lambda_2, sign_sharpness, lq_q };
@@ -399,6 +469,12 @@ pub fn yaad_opaque_backward(
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
+    // Conv1D cache at tail of saved buffers
+    let (k_conv_cache_restored, q_conv_cache_restored) = if !level_params.w_k_conv.is_empty() {
+        let n = saved.len();
+        restore_conv_cache(&saved[n-4..])
+    } else { (None, None) };
+
     let cache = YAADCache {
         seq_len, d, d_hidden,
         w1_states: saved[3].to_vec(),
@@ -421,6 +497,8 @@ pub fn yaad_opaque_backward(
         delta,
         lambda_local,
         lambda_2,
+        k_conv_cache: k_conv_cache_restored,
+        q_conv_cache: q_conv_cache_restored,
     };
 
     let rule = YAAD { d_hidden, delta, lambda_local, lambda_2 };
@@ -441,6 +519,12 @@ pub fn memora_opaque_backward(
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
+    // Conv1D cache at tail of saved buffers
+    let (k_conv_cache_restored, q_conv_cache_restored) = if !level_params.w_k_conv.is_empty() {
+        let n = saved.len();
+        restore_conv_cache(&saved[n-4..])
+    } else { (None, None) };
+
     let cache = MEMORACache {
         seq_len, d, d_hidden,
         w1_states: saved[3].to_vec(),
@@ -460,6 +544,8 @@ pub fn memora_opaque_backward(
         y: saved[17].to_vec(),
         log_w1_prev: saved[18].to_vec(),
         log_w2_prev: saved[19].to_vec(),
+        k_conv_cache: k_conv_cache_restored,
+        q_conv_cache: q_conv_cache_restored,
     };
 
     let rule = MEMORA { d_hidden };
@@ -489,6 +575,12 @@ pub fn lattice_osr_opaque_backward(
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
+    // Conv1D cache at tail of saved buffers
+    let (k_conv_cache_restored, q_conv_cache_restored) = if !level_params.w_k_conv.is_empty() {
+        let n = saved.len();
+        restore_conv_cache(&saved[n-4..])
+    } else { (None, None) };
+
     let cache = LatticeCache {
         seq_len, d,
         m: m_slots,
@@ -504,6 +596,8 @@ pub fn lattice_osr_opaque_backward(
         slot_gates: saved[11].to_vec(),
         read_weights: saved[12].to_vec(),
         s_unnorm_norms: saved[13].to_vec(),
+        k_conv_cache: k_conv_cache_restored,
+        q_conv_cache: q_conv_cache_restored,
     };
 
     let rule = LatticeOSR { m_slots, variant };
@@ -525,6 +619,12 @@ pub fn trellis_opaque_backward(
     let level_params = level_params_from_flat(saved[1], d, 0);
     let embedded = saved[2];
     let d_y = d_outputs[0];
+
+    // Conv1D cache at tail of saved buffers
+    let (k_conv_cache_restored, q_conv_cache_restored) = if !level_params.w_k_conv.is_empty() {
+        let n = saved.len();
+        restore_conv_cache(&saved[n-4..])
+    } else { (None, None) };
 
     let cache = TrellisCache {
         seq_len, d, d_k,
@@ -550,6 +650,8 @@ pub fn trellis_opaque_backward(
         read_compressed_q_silu_norm: saved[22].to_vec(),
         pred_v: saved[23].to_vec(),
         error_v: saved[24].to_vec(),
+        k_conv_cache: k_conv_cache_restored,
+        q_conv_cache: q_conv_cache_restored,
     };
 
     let rule = Trellis { d_k, lambda_k, lambda_v };
@@ -570,6 +672,12 @@ pub fn atlas_omega_opaque_backward(
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
+    // Conv1D cache at tail of saved buffers
+    let (k_conv_cache_restored, q_conv_cache_restored) = if !level_params.w_k_conv.is_empty() {
+        let n = saved.len();
+        restore_conv_cache(&saved[n-4..])
+    } else { (None, None) };
+
     let cache = AtlasOmegaCache {
         seq_len, d,
         m_states: saved[3].to_vec(),
@@ -588,6 +696,8 @@ pub fn atlas_omega_opaque_backward(
         omega_vecs: saved[16].to_vec(),
         omega_mats: saved[17].to_vec(),
         y: saved[18].to_vec(),
+        k_conv_cache: k_conv_cache_restored,
+        q_conv_cache: q_conv_cache_restored,
     };
 
     let rule = AtlasOmega;
@@ -760,9 +870,13 @@ impl OpaqueVjp for DeltaRule {
             tape.alloc(cache.y, vec![]),
         ];
 
+        // Save conv1d cache if active
+        let conv_ids = save_conv_cache(tape, &cache.k_conv_cache, &cache.q_conv_cache);
+
         let y_id = tape.alloc(y.clone(), vec![seq_len, d]);
         let mut saved = vec![meta_id, lp_saved, emb_saved];
         saved.extend(cache_ids);
+        saved.extend(conv_ids);
         tape.record_opaque(OpaqueKey::DeltaRule,
             vec![emb_in, lp_in], vec![y_id], saved);
         (y, y_id, emb_in, lp_in)
@@ -814,9 +928,13 @@ impl OpaqueVjp for TitansLMM {
             cache_ids.push(tape.alloc(cache.decay, vec![]));
         }
 
+        // Save conv1d cache if active
+        let conv_ids = save_conv_cache(tape, &cache.k_conv_cache, &cache.q_conv_cache);
+
         let y_id = tape.alloc(y.clone(), vec![seq_len, d]);
         let mut saved = vec![meta_id, lp_saved, emb_saved];
         saved.extend(cache_ids);
+        saved.extend(conv_ids);
         tape.record_opaque(OpaqueKey::TitansLMM,
             vec![emb_in, lp_in], vec![y_id], saved);
         (y, y_id, emb_in, lp_in)
@@ -846,9 +964,13 @@ impl OpaqueVjp for HebbianRule {
             tape.alloc(cache.y, vec![]),
         ];
 
+        // Save conv1d cache if active
+        let conv_ids = save_conv_cache(tape, &cache.k_conv_cache, &cache.q_conv_cache);
+
         let y_id = tape.alloc(y.clone(), vec![seq_len, d]);
         let mut saved = vec![meta_id, lp_saved, emb_saved];
         saved.extend(cache_ids);
+        saved.extend(conv_ids);
         tape.record_opaque(OpaqueKey::HebbianRule,
             vec![emb_in, lp_in], vec![y_id], saved);
         (y, y_id, emb_in, lp_in)
@@ -891,9 +1013,13 @@ impl OpaqueVjp for Moneta {
             cache_ids.push(tape.alloc(cache.a2_states, vec![]));
         }
 
+        // Save conv1d cache if active
+        let conv_ids = save_conv_cache(tape, &cache.k_conv_cache, &cache.q_conv_cache);
+
         let y_id = tape.alloc(y.clone(), vec![seq_len, d]);
         let mut saved = vec![meta_id, lp_saved, emb_saved];
         saved.extend(cache_ids);
+        saved.extend(conv_ids);
         tape.record_opaque(OpaqueKey::Moneta,
             vec![emb_in, lp_in], vec![y_id], saved);
         (y, y_id, emb_in, lp_in)
@@ -933,9 +1059,13 @@ impl OpaqueVjp for YAAD {
             tape.alloc(cache.y, vec![]),
         ];
 
+        // Save conv1d cache if active
+        let conv_ids = save_conv_cache(tape, &cache.k_conv_cache, &cache.q_conv_cache);
+
         let y_id = tape.alloc(y.clone(), vec![seq_len, d]);
         let mut saved = vec![meta_id, lp_saved, emb_saved];
         saved.extend(cache_ids);
+        saved.extend(conv_ids);
         tape.record_opaque(OpaqueKey::YAAD,
             vec![emb_in, lp_in], vec![y_id], saved);
         (y, y_id, emb_in, lp_in)
@@ -975,9 +1105,13 @@ impl OpaqueVjp for MEMORA {
             tape.alloc(cache.log_w2_prev, vec![]),
         ];
 
+        // Save conv1d cache if active
+        let conv_ids = save_conv_cache(tape, &cache.k_conv_cache, &cache.q_conv_cache);
+
         let y_id = tape.alloc(y.clone(), vec![seq_len, d]);
         let mut saved = vec![meta_id, lp_saved, emb_saved];
         saved.extend(cache_ids);
+        saved.extend(conv_ids);
         tape.record_opaque(OpaqueKey::MEMORA,
             vec![emb_in, lp_in], vec![y_id], saved);
         (y, y_id, emb_in, lp_in)
@@ -1016,9 +1150,13 @@ impl OpaqueVjp for LatticeOSR {
             tape.alloc(cache.s_unnorm_norms, vec![]),
         ];
 
+        // Save conv1d cache if active
+        let conv_ids = save_conv_cache(tape, &cache.k_conv_cache, &cache.q_conv_cache);
+
         let y_id = tape.alloc(y.clone(), vec![seq_len, d]);
         let mut saved = vec![meta_id, lp_saved, emb_saved];
         saved.extend(cache_ids);
+        saved.extend(conv_ids);
         tape.record_opaque(OpaqueKey::LatticeOSR,
             vec![emb_in, lp_in], vec![y_id], saved);
         (y, y_id, emb_in, lp_in)
@@ -1063,9 +1201,13 @@ impl OpaqueVjp for Trellis {
             tape.alloc(cache.error_v, vec![]),
         ];
 
+        // Save conv1d cache if active
+        let conv_ids = save_conv_cache(tape, &cache.k_conv_cache, &cache.q_conv_cache);
+
         let y_id = tape.alloc(y.clone(), vec![seq_len, d]);
         let mut saved = vec![meta_id, lp_saved, emb_saved];
         saved.extend(cache_ids);
+        saved.extend(conv_ids);
         tape.record_opaque(OpaqueKey::Trellis,
             vec![emb_in, lp_in], vec![y_id], saved);
         (y, y_id, emb_in, lp_in)
@@ -1103,9 +1245,13 @@ impl OpaqueVjp for AtlasOmega {
             tape.alloc(cache.y, vec![]),
         ];
 
+        // Save conv1d cache if active
+        let conv_ids = save_conv_cache(tape, &cache.k_conv_cache, &cache.q_conv_cache);
+
         let y_id = tape.alloc(y.clone(), vec![seq_len, d]);
         let mut saved = vec![meta_id, lp_saved, emb_saved];
         saved.extend(cache_ids);
+        saved.extend(conv_ids);
         tape.record_opaque(OpaqueKey::AtlasOmega,
             vec![emb_in, lp_in], vec![y_id], saved);
         (y, y_id, emb_in, lp_in)

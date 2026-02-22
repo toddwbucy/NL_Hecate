@@ -165,6 +165,8 @@ pub fn atlas_parallel_forward(
         seq_len, d, m_states, s_states, k_mem, v_mem, q_mem, concat_kv,
         alpha_pre, alpha, theta_pre, theta, eta_pre, eta,
         silu_kv, omega_vecs, omega_mats, y: y.clone(),
+        k_conv_cache: None,
+        q_conv_cache: None,
     };
 
     (y, cache)
