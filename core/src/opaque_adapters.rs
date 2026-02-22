@@ -1338,6 +1338,17 @@ mod tests {
     }
 
     #[test]
+    fn test_opaque_vjp_titans_lmm_delta_momentum() {
+        let rule = TitansLMM {
+            bias: crate::model::AttentionalBias::L2,
+            sign_sharpness: 10.0,
+            momentum_kind: crate::model::MomentumKind::DeltaMomentum,
+            momentum_d_hidden: 0,
+        };
+        assert_opaque_roundtrip(&rule, 4, 3);
+    }
+
+    #[test]
     fn test_opaque_vjp_hebbian() {
         assert_opaque_roundtrip(&HebbianRule, 4, 3);
     }
