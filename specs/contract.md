@@ -347,13 +347,19 @@ trait CompositionPattern {
 
 ### 7. Composition Patterns
 
-Three patterns for combining memory with attention. Each is a trait implementation.
+Four patterns for combining memory with attention. Each is a struct implementing
+the `CompositionPattern` trait (`core/src/composition_pattern.rs`), which declares
+`fn attention_kind()` (FullCausal or SlidingWindow). A standalone
+`prepend_persistent()` function handles learnable persistent memory tokens.
 
-```
+```text
 trait CompositionPattern {
-  fn forward(&mut self, x: &Tensor, memory: &mut dyn MemoryUpdateRule,
-             attention: &dyn Attention, pulse: &Pulse) -> Tensor;
+  fn attention_kind(&self) -> AttentionKind;
 }
+
+// Standalone function (not a trait method):
+fn prepend_persistent(x, seq_len, persistent, n_persistent, d_model) -> Vec<f32>
+fn prepend_persistent_backward(d_out, n_persistent, seq_len, d_model) -> (d_persistent, d_x)
 
 MAC: Memory reads -> concat with input -> attention processes -> memory writes
 MAG: Memory and attention run parallel -> memory gates attention output

@@ -11,6 +11,8 @@ CONTRACT
   Guarantees: The 4-knob framework is preserved in the trait system.
               No knob is restricted to a single option.
               New MIRAS variants can be added without modifying existing code.
+  Cost:       Zero runtime cost — trait system constraints only.
+  Trade-off:  Combinatorial design space requires more validation effort.
   Position:   specs/constraints/code_smells/05_miras.md
   Source:     MIRAS (2504.13173) Table 2; MIRAS IS #1, IS NOT #2
 ```

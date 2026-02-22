@@ -11,6 +11,8 @@ CONTRACT
               distribution, compilation, runtime state management.
   Guarantees: Known pitfalls are documented and enforceable.
               Each smell has a specific test or enforcement mechanism.
+  Cost:       Zero runtime cost — infrastructure design constraints only.
+  Trade-off:  Some GPU optimization techniques (checkpointing, DDP) are off-limits.
   Position:   specs/constraints/code_smells/06_infrastructure.md
   Source:     Track A experience; nl_code_smells CS-39 through CS-47;
               committee review cycle (CS-48)

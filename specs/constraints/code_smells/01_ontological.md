@@ -10,6 +10,8 @@ CONTRACT
   Expects:    All type definitions, class names, and module structures.
   Guarantees: No conventional ML class names in the codebase.
               Paper-native vocabulary used throughout.
+  Cost:       Zero runtime cost — naming and structural constraints only.
+  Trade-off:  Unfamiliar vocabulary for developers from PyTorch/JAX background.
   Position:   specs/constraints/code_smells/01_ontological.md
   Source:     NL IS/IS NOT containers; HOPE paper Section 1-3
 ```

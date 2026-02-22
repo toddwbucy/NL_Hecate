@@ -11,6 +11,8 @@ CONTRACT
   Guarantees: No code paths that diverge based on "training" vs "inference."
               No training loops, no epochs, no DataLoaders.
               The word "training" does not appear in the codebase.
+  Cost:       Zero runtime cost — API and control flow constraints only.
+  Trade-off:  No conditional fast paths for inference-only deployment.
   Position:   specs/constraints/code_smells/02_mode_and_phase.md
   Source:     NL IS #5, IS NOT #3; CS-10 through CS-17, CS-19
 ```
