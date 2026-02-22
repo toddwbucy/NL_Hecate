@@ -233,12 +233,15 @@ fn alloc_common_saved(
     extra_meta: &[f32],
 ) -> (BufId, BufId, BufId) {
     let kernel_size = if level_params.w_k_conv.is_empty() {
+        assert!(level_params.w_q_conv.is_empty(),
+            "alloc_common_saved: w_k_conv is empty but w_q_conv has {} elements",
+            level_params.w_q_conv.len());
         0
     } else {
         assert!(level_params.w_k_conv.len() % d == 0,
             "alloc_common_saved: w_k_conv length {} not divisible by d={}", level_params.w_k_conv.len(), d);
         let ks = level_params.w_k_conv.len() / d;
-        assert!(level_params.w_q_conv.is_empty() || level_params.w_q_conv.len() == d * ks,
+        assert!(level_params.w_q_conv.len() == d * ks,
             "alloc_common_saved: w_q_conv length {} != w_k_conv-derived d*ks={}*{}={}",
             level_params.w_q_conv.len(), d, ks, d * ks);
         ks

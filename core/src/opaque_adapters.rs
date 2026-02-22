@@ -261,9 +261,12 @@ pub fn delta_rule_opaque_backward(
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
-    // Conv1D cache is appended after the 12 base cache fields (saved[15..18])
-    let (k_conv_cache, q_conv_cache) = if saved.len() > 15 {
-        restore_conv_cache(&saved[15..])
+    // Conv1D cache at tail of saved buffers
+    let (k_conv_cache, q_conv_cache) = if !level_params.w_k_conv.is_empty() {
+        let n = saved.len();
+        assert!(n > 15, "delta_rule_opaque_backward: conv weights present but conv caches missing \
+            (saved.len()={}, expected > 15)", n);
+        restore_conv_cache(&saved[n-4..])
     } else { (None, None) };
 
     let cache = DeltaRuleCache {
@@ -847,12 +850,15 @@ fn record_common_inputs(
 
     // Saved BufIds (for backward reconstruction)
     let kernel_size = if level_params.w_k_conv.is_empty() {
+        assert!(level_params.w_q_conv.is_empty(),
+            "record_common_inputs: w_k_conv is empty but w_q_conv has {} elements",
+            level_params.w_q_conv.len());
         0
     } else {
         assert!(level_params.w_k_conv.len() % d == 0,
             "record_common_inputs: w_k_conv length {} not divisible by d={}", level_params.w_k_conv.len(), d);
         let ks = level_params.w_k_conv.len() / d;
-        assert!(level_params.w_q_conv.is_empty() || level_params.w_q_conv.len() == d * ks,
+        assert!(level_params.w_q_conv.len() == d * ks,
             "record_common_inputs: w_q_conv length {} != w_k_conv-derived d*ks={}*{}={}",
             level_params.w_q_conv.len(), d, ks, d * ks);
         ks
