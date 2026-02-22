@@ -35,7 +35,17 @@ use crate::tensor::{
 };
 use crate::retention::sphere_project_and_normalize_inplace;
 use crate::model::{MemoryLevelParams, LatticeVariant};
-use crate::delta_rule::{MemoryRule, MemoryState, Gates, MemoryError};
+use crate::delta_rule::{MemoryRule, Gates, MemoryError};
+
+// ── LatticeOSR State ────────────────────────────────────────────────
+
+/// Memory state for LatticeOSR: m unit-norm slot vectors on the d-sphere.
+pub struct LatticeState {
+    /// Flat [m_slots * d] row-major: slot i is `slots[i*d..(i+1)*d]`.
+    pub slots: Vec<f32>,
+    pub m_slots: usize,
+    pub d: usize,
+}
 
 // ── LatticeOSR implementation ────────────────────────────────────────
 
@@ -87,6 +97,7 @@ pub struct LatticeCache {
 
 impl MemoryRule for LatticeOSR {
     type Cache = LatticeCache;
+    type State = LatticeState;
 
     fn level(&self) -> usize { 0 }
 
@@ -94,15 +105,15 @@ impl MemoryRule for LatticeOSR {
         crate::parallel::supported_strategies(crate::model::MemoryRuleKind::LatticeOSR)
     }
 
-    fn init(&self, d: usize) -> MemoryState {
-        MemoryState { m: init_slots(self.m_slots, d), d }
+    fn init(&self, d: usize) -> LatticeState {
+        LatticeState { slots: init_slots(self.m_slots, d), m_slots: self.m_slots, d }
     }
 
-    fn write(&self, state: &mut MemoryState, k: &[f32], v: &[f32], gates: &Gates) -> Result<(), MemoryError> {
+    fn write(&self, state: &mut LatticeState, k: &[f32], v: &[f32], gates: &Gates) -> Result<(), MemoryError> {
         let d = state.d;
         let m = self.m_slots;
         for i in 0..m {
-            let slot = &state.m[i * d..(i + 1) * d];
+            let slot = &state.slots[i * d..(i + 1) * d];
             let score = frobenius_dot_f32(slot, k);
             let gate_i = sigmoid_f32(score);
 
@@ -142,18 +153,18 @@ impl MemoryRule for LatticeOSR {
                 s_unnorm[j] = slot[j] + ortho;
             }
             vec_normalize_f32(&mut s_unnorm);
-            state.m[i * d..(i + 1) * d].copy_from_slice(&s_unnorm);
+            state.slots[i * d..(i + 1) * d].copy_from_slice(&s_unnorm);
         }
         Ok(())
     }
 
-    fn read(&self, state: &MemoryState, q: &[f32], out: &mut [f32]) -> Result<(), MemoryError> {
+    fn read(&self, state: &LatticeState, q: &[f32], out: &mut [f32]) -> Result<(), MemoryError> {
         let d = state.d;
         let m = self.m_slots;
         // softmax attention over m slots
         let mut scores = vec![0.0f32; m];
         for i in 0..m {
-            scores[i] = frobenius_dot_f32(&state.m[i * d..(i + 1) * d], q);
+            scores[i] = frobenius_dot_f32(&state.slots[i * d..(i + 1) * d], q);
         }
         let mut weights = vec![0.0f32; m];
         softmax_f32(&scores, &mut weights, 1, m);
@@ -162,7 +173,7 @@ impl MemoryRule for LatticeOSR {
         }
         for i in 0..m {
             for j in 0..d {
-                out[j] += weights[i] * state.m[i * d + j];
+                out[j] += weights[i] * state.slots[i * d + j];
             }
         }
         Ok(())
@@ -871,11 +882,12 @@ mod tests {
     fn test_lattice_init() {
         let rule = LatticeOSR { m_slots: 4, variant: LatticeVariant::Decode };
         let state = rule.init(8);
-        assert_eq!(state.m.len(), 4 * 8);
+        assert_eq!(state.slots.len(), 4 * 8);
         assert_eq!(state.d, 8);
+        assert_eq!(state.m_slots, 4);
         // All slots should be unit norm
         for i in 0..4 {
-            let norm = vec_norm_f32(&state.m[i * 8..(i + 1) * 8]);
+            let norm = vec_norm_f32(&state.slots[i * 8..(i + 1) * 8]);
             assert!((norm - 1.0).abs() < 1e-6, "init slot {i} norm={norm}");
         }
     }
@@ -892,7 +904,7 @@ mod tests {
 
         // Slots should still be unit norm after write
         for i in 0..2 {
-            let norm = vec_norm_f32(&state.m[i * 4..(i + 1) * 4]);
+            let norm = vec_norm_f32(&state.slots[i * 4..(i + 1) * 4]);
             assert!((norm - 1.0).abs() < 1e-5, "post-write slot {i} norm={norm}");
         }
 
@@ -1188,7 +1200,7 @@ mod tests {
         rule.write(&mut state, &k, &v, &gates).unwrap();
         // Slots should still be unit norm
         for i in 0..2 {
-            let norm = vec_norm_f32(&state.m[i * 4..(i + 1) * 4]);
+            let norm = vec_norm_f32(&state.slots[i * 4..(i + 1) * 4]);
             assert!((norm - 1.0).abs() < 1e-5, "encode write: slot {i} norm={norm}");
         }
     }
@@ -1202,7 +1214,7 @@ mod tests {
         let gates = Gates { alpha: 0.5, theta: 0.0, eta: 1.0 };
         rule.write(&mut state, &k, &v, &gates).unwrap();
         for i in 0..2 {
-            let norm = vec_norm_f32(&state.m[i * 4..(i + 1) * 4]);
+            let norm = vec_norm_f32(&state.slots[i * 4..(i + 1) * 4]);
             assert!((norm - 1.0).abs() < 1e-5, "similarity write: slot {i} norm={norm}");
         }
     }

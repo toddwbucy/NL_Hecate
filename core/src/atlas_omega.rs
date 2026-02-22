@@ -111,6 +111,7 @@ fn compute_omega(k: &[f32], v: &[f32], w_omega: &[f32], d: usize) -> (Vec<f32>, 
 
 impl MemoryRule for AtlasOmega {
     type Cache = AtlasOmegaCache;
+    type State = MemoryState;
 
     fn level(&self) -> usize { 0 }
 

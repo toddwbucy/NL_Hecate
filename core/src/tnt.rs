@@ -18,7 +18,6 @@
 
 use crate::model::{MAGConfig, MemoryLevelParams, MemoryRuleKind};
 use crate::chunkwise_gd::{chunkwise_gd_forward, chunkwise_gd_backward, ChunkwiseGDCache};
-use crate::delta_rule::MemoryRule;
 use crate::delta_rule::DeltaRule;
 use crate::titans_lmm::TitansLMM;
 use crate::hebbian_rule::HebbianRule;

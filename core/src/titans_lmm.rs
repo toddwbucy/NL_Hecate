@@ -117,6 +117,7 @@ pub struct TitansLMMCache {
 
 impl MemoryRule for TitansLMM {
     type Cache = TitansLMMCache;
+    type State = MemoryState;
 
     fn level(&self) -> usize { 0 }
 
