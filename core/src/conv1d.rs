@@ -142,9 +142,15 @@ pub fn apply_conv1d_to_kq(
     if level_params.w_k_conv.is_empty() {
         return (None, None);
     }
+    assert!(level_params.w_k_conv.len() % d == 0,
+        "w_k_conv length {} not divisible by d={}", level_params.w_k_conv.len(), d);
     let kernel_size = level_params.w_k_conv.len() / d;
-    debug_assert_eq!(level_params.w_k_conv.len(), d * kernel_size);
-    debug_assert_eq!(level_params.w_q_conv.len(), d * kernel_size);
+    assert_eq!(level_params.w_q_conv.len(), d * kernel_size,
+        "w_q_conv length {} != d*kernel_size={}*{}={}", level_params.w_q_conv.len(), d, kernel_size, d * kernel_size);
+    assert!(level_params.b_k_conv.is_empty() || level_params.b_k_conv.len() == d,
+        "b_k_conv length {} must be 0 or d={}", level_params.b_k_conv.len(), d);
+    assert!(level_params.b_q_conv.is_empty() || level_params.b_q_conv.len() == d,
+        "b_q_conv length {} must be 0 or d={}", level_params.b_q_conv.len(), d);
 
     // Save pre-conv inputs
     let k_pre = k_mem.clone();

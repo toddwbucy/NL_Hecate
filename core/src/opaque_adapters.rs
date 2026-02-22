@@ -132,8 +132,11 @@ pub fn level_params_from_flat(flat: &[f32], d: usize, kernel_size: usize) -> Mem
     // Freq fields occupy 0 or d+1 elements.
     // Note: auto-detection is unambiguous for d >= 2 (since d+1 is odd when d is even,
     // it cannot equal 2*d*(ks+1) which is always even). For d=1, pass kernel_size explicitly.
-    assert!(kernel_size > 0 || remaining == 0 || d >= 2,
-        "auto-detect requires d >= 2; pass kernel_size explicitly for d=1");
+    // Auto-detection is unambiguous for d >= 2 (conv fields are always even-length,
+    // freq fields are d+1 which is odd when d is even). For d=1, the only ambiguous
+    // case is remaining > d+1 with mixed conv+freq; freq-only (remaining == d+1) is safe.
+    assert!(kernel_size > 0 || remaining == 0 || d >= 2 || (d == 1 && remaining == d + 1),
+        "auto-detect requires d >= 2 or freq-only buffer; pass kernel_size explicitly for d=1 with conv");
     let effective_ks = if kernel_size > 0 {
         kernel_size
     } else if remaining > 0 {
