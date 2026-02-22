@@ -9,6 +9,8 @@ CONTRACT
   Expects:    All module boundaries, public APIs, and wiring patterns.
   Guarantees: No broken abstractions, no silent disconnection between levels,
               no state mutation order bugs.
+  Cost:       Zero runtime cost — module boundary and API constraints only.
+  Trade-off:  Indivisible NeuralLearningModule limits independent component testing.
   Position:   specs/constraints/code_smells/03_structural.md
   Source:     NL IS #2, #6, #7; CS-18 through CS-32 (structural subset)
 ```

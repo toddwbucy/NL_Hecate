@@ -9,7 +9,7 @@ Trade-off: Breadth over depth — individual specs in specs/algorithms/ and spec
 Position: Root of the spec tree — all other specs refine sections of this contract.
 Source: Mirrokni/Behrouz research group (Google Research): arxiv 2501.00663, 2504.13173, 2512.24695, 2504.05646, 2505.23735, 2511.07343, 2512.23852.
 
-**Version**: 0.4.0
+**Version**: 0.4.1
 **Repository**: NL_Hecate
 **Language Target**: Rust + CUDA (core), Python + PyO3 (orchestration bindings)
 **Differentiation**: Wengert tape AD (Rust) + hand-written kernel pairs (CUDA)
@@ -31,13 +31,14 @@ Layer 3: Python (orchestration)
   - "So easy, even a developer can extend it"
 
 Layer 2: Rust (mathematics + control flow + Wengert tape AD)
-  - All memory update rules, composition patterns, scheduling
+  - All 9 memory update rules, 3 composition patterns, CMS scheduling
   - Wengert tape provides automatic differentiation via operation recording
   - AD operates ONLY on Rust code — never raw CUDA
   - Tape chains through CUDA kernel pairs via OpaqueVjp trait
-  - Trait system enforces valid compositions at compile time
+  - Trait system + marker traits enforce valid compositions at compile time
   - Ownership model enforces state lifecycle (outer vs inner loop)
   - Reference implementations of ALL kernels live here (portable, correct)
+  - Conv1D key/query preprocessing, centralized momentum module
 
 Layer 1: CUDA (kernel pairs — forward + backward)
   - Each kernel ships as a (forward, backward) pair
@@ -312,42 +313,60 @@ RULE: Every STEP, WRITE, READ, and FORWARD function takes a &Pulse.
 
 ### 6. Composition Safety (Trait System)
 
-Not all MIRAS knob combinations are valid. The Rust trait system enforces this at compile time.
+Not all MIRAS knob combinations are valid. The Rust trait system enforces this at compile time
+via marker traits (`core/src/composition_safety.rs`) and the CompositionPattern trait
+(`core/src/composition_pattern.rs`).
 
-```
-trait MemoryStructure { }      // Knob 1: vector, matrix, MLP
-trait AttentionalBias { }      // Knob 2: L2, dot-product, Huber, l_p
-trait RetentionMechanism { }   // Knob 3: L2 decay, KL, elastic net, etc.
-trait MemoryAlgorithm { }      // Knob 4: GD, GD+momentum, Newton, FTRL
+```rust
+// Marker traits (composition_safety.rs) — enforce mathematical constraints
+trait ProbabilitySimplex { }      // KL retention requires this
+trait UnitSphere { }              // Lattice OSR requires this
+trait LinearRecurrence { }        // Associative scan requires this
+trait StateIndependentMomentum { }// Atlas/Titans momentum constraint
 
-trait MemoryUpdateRule:
-  MemoryStructure + AttentionalBias + RetentionMechanism + MemoryAlgorithm
-{
-  fn write(&mut self, k: &Tensor, v: &Tensor, gates: &Gates, pulse: &Pulse);
-  fn read(&self, q: &Tensor) -> Tensor;
-  fn step(&mut self, x: &Tensor, pulse: &Pulse) -> (Tensor, ());
+// The MemoryRule trait (delta_rule.rs) — all 9 rules implement this
+trait MemoryRule: OpaqueVjp {
+  type Cache;
+  fn level(&self) -> usize;
+  fn supported_parallelization(&self) -> &'static [&'static str];
+  fn step(level_params, embedded, seq_len, d, initial_m) -> (Vec<f32>, Cache);
+  fn step_backward(level_params, cache, d_y, embedded) -> (grads, d_embedded);
 }
 
+// CompositionPattern trait (composition_pattern.rs)
+trait CompositionPattern {
+  fn attention_kind(&self) -> AttentionKind;
+}
+// Standalone function (not a trait method):
+// fn prepend_persistent(x, seq_len, persistent, n_persistent, d_model) -> Vec<f32>
+
 // Invalid combinations are compile errors:
-// - KL retention requires softmax structure (probability simplex)
+// - KL retention requires softmax structure (ProbabilitySimplex)
 // - Newton-Schulz algorithm requires matrix structure (not vector)
-// - Lattice OSR requires sphere normalization retention
-// - Associative scan parallelization requires LINEAR recurrence
+// - Lattice OSR requires sphere normalization (UnitSphere)
+// - Associative scan parallelization requires LinearRecurrence
 ```
 
 ### 7. Composition Patterns
 
-Three patterns for combining memory with attention. Each is a trait implementation.
+Four patterns for combining memory with attention. Each is a struct implementing
+the `CompositionPattern` trait (`core/src/composition_pattern.rs`), which declares
+`fn attention_kind()` (FullCausal or SlidingWindow). A standalone
+`prepend_persistent()` function handles learnable persistent memory tokens.
 
-```
+```text
 trait CompositionPattern {
-  fn forward(&mut self, x: &Tensor, memory: &mut dyn MemoryUpdateRule,
-             attention: &dyn Attention, pulse: &Pulse) -> Tensor;
+  fn attention_kind(&self) -> AttentionKind;
 }
+
+// Standalone function (not a trait method):
+fn prepend_persistent(x, seq_len, persistent, n_persistent, d_model) -> Vec<f32>
+fn prepend_persistent_backward(d_out, n_persistent, seq_len, d_model) -> (d_persistent, d_x)
 
 MAC: Memory reads -> concat with input -> attention processes -> memory writes
 MAG: Memory and attention run parallel -> memory gates attention output
 MAL: Memory preprocesses -> attention processes memory output
+HOPE: End-to-end variant from HOPE §6 — persistent memory tokens + Conv1D
 
 RULE: The composition pattern is orthogonal to the memory update rule.
       Any rule can plug into any pattern.
@@ -355,6 +374,8 @@ RULE: The composition pattern is orthogonal to the memory update rule.
         - MAC uses full causal attention (not sliding window)
         - MAG/MAL use sliding window attention
         - MAG requires the memory output to be in [0,1] (sigmoid gate)
+        - HOPE adds persistent memory tokens (n_persistent) and Conv1D
+          preprocessing on keys/queries before the memory module
 ```
 
 ### 8. Parallelization
@@ -377,40 +398,47 @@ Strategy 3: Hierarchical Memory (TNT)
   - Global memory at coarse grain + independent local memories
   - Enables large effective chunk sizes without approximation error
 
+Strategy 4: Lattice GLA
+  - Used by: Lattice OSR
+  - Gated Linear Attention with chunk_size=seq_len for C=1 exactness
+
+Strategy 5: Atlas Parallel
+  - Used by: Atlas Omega
+  - State-independent omega precomputed in batch, M/S recurrence sequential
+
 RULE: Every memory update rule specifies which parallelization
       strategies it supports. This is a trait bound.
 ```
 
 ### 9. Code Smell Enforcement
 
-48 code smells (CS-01 through CS-48) define what code must NOT look like. Key categories:
+48 code smells (CS-01 through CS-48) define what code must NOT look like. Key categories
+(full index: `specs/constraints/code_smells/00_index.md`):
 
-```
-Ontological smells (CS-01, CS-10, CS-11, CS-13, CS-37, CS-38):
+```text
+Ontological smells (CS-01, CS-04–09, CS-10, CS-11, CS-13, CS-19–21, CS-37, CS-38):
   - No MemoryModule class, no train/eval, no TrainingLoop, no "training" word
   - Use "levels" not "layers" for frequency hierarchy
   - Use "build" not "train", "test" not "eval"
 
-Structural smells (CS-18, CS-27, CS-28, CS-31, CS-32):
+Structural smells (CS-12, CS-18, CS-22, CS-23, CS-31):
   - Forward pass IS the only external API
   - Optimizer must be frequency-aware
   - NeuralLearningModule is indivisible
-  - Observe then advance (stateful counters mutate AFTER observers)
 
-MIRAS smells (CS-33 through CS-36):
+MIRAS smells (CS-33 through CS-36, CS-48):
   - Don't force same attentional bias across models
   - Don't restrict memory to matrix-valued
   - Don't assume GD is the only algorithm
   - Don't restrict retention to L2 only
 
-Infrastructure smells (CS-39 through CS-48):
+Infrastructure smells (CS-32, CS-39–47):
+  - Observe then advance (stateful counters mutate AFTER observers)
   - Learnable decay must be clamped
-  - Autograd is opt-in not opt-out
+  - Autograd is opt-in not opt-out (CS-40)
   - GPU utilization != throughput
   - Gradient checkpointing hurts NL
   - DDP inflates reported throughput
-  - NL cannot fill high-end GPUs
-  - torch.compile cannot trace NL inner loops
   - In-place modification destroys reproducibility
   - Shared retention parameters across CMS levels
 ```
@@ -424,7 +452,7 @@ FINDING 1: Differentiation Barrier Enforcement
   Problem:  The #[custom_vjp] mechanism was "hope-based engineering."
             No compiler enforcement prevented AD from tracing into kernels.
   Fix:      OpaqueVjp trait is a required bound on MemoryUpdateRule.
-            All inner-loop kernels (CUDA + memory rules) register as opaque
+            All inner-loop kernels (CUDA + 9 memory rules) register as opaque
             blocks on the Wengert tape via opaque_key() registry lookup.
             Barrier verification: Class 3 tests (tape vs hand-written backward)
             confirm identical gradients for all 9 rules × k=1,2,4.
@@ -516,30 +544,101 @@ See: infrastructure/track_zero/00_track_zero.md for full specification.
 - **Non-NVIDIA hardware**: AMD (ROCm), Apple (Metal), TPU — future bridges to cross if needed. The Rust reference implementations are hardware-agnostic. CUDA kernels are NVIDIA-specific optimizations.
 - **Specific GPU architecture targets**: The dispatch layer handles this. Which architectures get optimized kernels is a resourcing decision, not an architectural one. The Rust reference is always the fallback.
 
+### 14. Rust Module Inventory (v0.4.1)
+
+> Added during partial-specs sweep to document all core/src/ modules.
+
+```text
+core/src/ module map:
+
+Memory rules (9 total, each implements MemoryRule + OpaqueVjp):
+  delta_rule.rs       — Delta Rule (Titans eta=0). Also defines MemoryRule trait.
+  titans_lmm.rs       — Full Titans LMM with momentum
+  hebbian_rule.rs     — Direct association (no gradient)
+  moneta.rs           — 2-layer MLP + l_p attentional bias + L_q retention
+  yaad.rs             — Huber loss + decoupled retention
+  memora.rs           — KL divergence + softmax memory
+  lattice_osr.rs      — Orthogonal State Recurrence (sphere normalization)
+  trellis.rs          — Two-pass KV compression
+  atlas_omega.rs      — 3-gate (alpha/theta/eta) with omega outer products
+
+Composition & preprocessing:
+  mag.rs              — MAG composition (memory gates attention)
+  mal.rs              — MAL composition (memory preprocesses for attention)
+  mac.rs              — MAC composition (memory-attention-memory)
+  composition_pattern.rs — CompositionPattern trait + persistent memory tokens
+  composition_safety.rs  — Marker traits (ProbabilitySimplex, UnitSphere, etc.)
+  conv1d.rs           — Depthwise causal Conv1D with SiLU for k/q preprocessing
+  momentum.rs         — Centralized momentum module (EMA, Delta, Deep)
+
+Attention & parallelization:
+  swa.rs              — Sliding window attention (reference implementation)
+  dispatch.rs         — Backend dispatch (Rust reference / CUDA)
+  atlas_parallel.rs   — Atlas Omega parallel forward (batch omega, sequential M/S)
+
+CMS & scheduling:
+  model.rs            — MAGConfig, MemoryLevelParams, enums (MemoryRuleKind,
+                         AttentionalBias, MomentumKind, LatticeVariant, etc.)
+  cms_variants.rs     — CMS variant implementations
+  dynamic_freq.rs     — Learned frequency scheduling
+
+Differentiation:
+  tape.rs             — Wengert tape AD with opaque VJP blocks
+  opaque_adapters.rs  — Backward adapters for all 9 rules on the tape
+  traced_forward.rs   — Full CMS traced forward (active + frozen levels)
+  gradient.rs         — End-to-end gradient computation (tape.backward)
+
+Infrastructure:
+  tensor.rs           — f32 tensor ops (matmul, sigmoid, softplus, etc.)
+  retention.rs        — Retention mechanisms (L2 decay, KL, elastic net, etc.)
+  adamw.rs            — Outer-loop AdamW optimizer
+  bf16.rs             — bf16 utilities
+  context_stream.rs   — ContextStream (DataLoader replacement)
+
+Feature-gated (CUDA):
+  gpu_buf.rs          — RAII device memory (DevBuf)
+  gpu_forward.rs      — CUDA forward kernels
+  gpu_backward.rs     — CUDA backward kernels
+  gpu_optimizer.rs    — GPU-side optimizer
+  gpu_params.rs       — GPU parameter management
+  cuda_ffi.rs         — FFI bindings to nvcc-compiled kernels
+
+Feature-gated (serving/distribution/edge):
+  serving.rs          — Session, LatencyTracker, checkpoint/restore
+  distributed.rs      — CMS-aware multi-GPU gradient sync
+  edge.rs             — Edge deployment (d=64 target)
+```
+
 ## Directory Structure as Graph
 
-```
+```text
 specs/                              <- root node
   contract.md                       <- THIS FILE: top-level specification
   algorithms/                       <- algorithmic components (paper math)
-    memory_update_rules/            <- MIRAS 4-knob framework
-      00_interface.md               <- MemoryUpdateRule trait definition
-      titans_family/                <- Titans-derived rules
+    memory_update_rules/            <- MIRAS 4-knob framework (9 rules)
+      00_interface.md               <- MemoryRule trait definition
+      titans_family/                <- Titans-derived rules (01-04, global numbering)
         01_titans_lmm.md            <- Full LMM with momentum
         02_delta_rule.md            <- eta=0 special case
         03_hebbian_rule.md          <- No gradient, direct association
-      miras_family/                 <- MIRAS design space exploration
-        04_moneta.md                <- 2-layer MLP + l_p + L_q
+        04_atlas_omega.md           <- 3-gate (alpha/theta/eta) with omega (v0.4.1)
+      miras_family/                 <- MIRAS design space exploration (04-06)
+        04_moneta.md                <- 2-layer MLP + l_p + L_q (04 shared with atlas_omega)
         05_yaad.md                  <- Huber loss + decoupled retention
         06_memora.md                <- KL divergence + softmax
-      compression_family/           <- Memory compression variants
+      compression_family/           <- Memory compression variants (07-08)
         07_lattice_osr.md           <- Orthogonal State Recurrence
         08_trellis_twopass.md       <- Two-pass KV compression
-    composition_patterns/           <- MAC/MAG/MAL
+    attentional_biases/             <- MIRAS Knob #2 extensions (v0.4.1)
+      01_l1_sign.md                 <- Smooth tanh Sign approximation
+      02_kl_objective.md            <- KL divergence objective
+      03_lp_dispatch.md             <- Generalized l_p dispatch
+    composition_patterns/           <- MAC/MAG/MAL/HOPE
       00_interface.md
       01_mac.md
       02_mag.md
       03_mal.md
+      04_hope.md                    <- HOPE §6 end-to-end variant (v0.4.1)
     retention_mechanisms/           <- MIRAS Knob #3
       00_interface.md
       01_l2_weight_decay.md
@@ -547,6 +646,9 @@ specs/                              <- root node
       03_elastic_net.md
       04_f_divergence.md
       05_sphere_normalization.md
+      06_bregman.md                 <- Bregman divergence (v0.4.1)
+      07_lq_norm.md                 <- L_q norm for MONETA (v0.4.1)
+      08_sigmoid_bounded.md         <- Sigmoid-bounded retention (v0.4.1)
     parallelization/                <- Chunk-wise strategies
       00_interface.md
       01_chunkwise_gd.md
@@ -554,9 +656,21 @@ specs/                              <- root node
       03_tnt_hierarchical.md
       04_lattice_gla.md
       05_atlas_parallel.md
-    optimization_machinery/         <- Momentum hierarchy
-      01_momentum.md
-      02_m3.md
+    optimization_machinery/         <- Inner/outer loop optimizers
+      01_momentum.md                <- EMA + centralized momentum module
+      02_m3.md                      <- M3 optimizer
+      03_dgd.md                     <- Delta Gradient Descent (v0.4.1)
+      04_dmgd.md                    <- Deep Momentum GD (v0.4.1)
+      05_ftrl.md                    <- Follow-The-Regularized-Leader (v0.4.1)
+      06_implicit_gd.md             <- Implicit gradient descent (v0.4.1)
+      07_newton_schulz_inner.md     <- Inner-loop Newton-Schulz (v0.4.1)
+      08_adamw_outer.md             <- Outer-loop AdamW (v0.4.1)
+      09_adamuon.md                 <- AdamUON optimizer (v0.4.1)
+    self_referential/               <- Self-referential mechanisms (v0.4.1)
+      00_interface.md
+      01_self_generated_values.md
+      02_feature_maps.md
+      03_chunkwise_self_ref.md
     frequency_scheduling/           <- CMS gating
       01_frequency_scheduler.md
       02_cms_variants.md
@@ -564,7 +678,9 @@ specs/                              <- root node
     differentiation/                <- AD integration (Wengert tape + kernel pairs)
     state_lifecycle/                <- Outer/inner/context state management
     scheduling/                     <- Conductor + Pulse
-    attention/                      <- SWA + full causal (non-NL component)
+    attention/                      <- SWA + Conv1D preprocessing
+      00_attention.md               <- Sliding window attention
+      02_short_conv.md              <- Causal Conv1D on k/q (v0.4.1)
     distribution/                   <- Multi-GPU without DDP assumptions
     compilation/                    <- Self-modifying graph compilation
     serving/                        <- Serving non-stationary models
@@ -572,7 +688,7 @@ specs/                              <- root node
     precision/                      <- Numerical precision strategy (v0.4.0)
     track_zero/                     <- First implementation milestone (v0.4.0)
   constraints/                      <- Enforcement rules
-    code_smells/                    <- CS-01 through CS-47
+    code_smells/                    <- CS-01 through CS-48
     trait_system/                   <- Valid composition pairings
 ```
 

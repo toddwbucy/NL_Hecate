@@ -10,6 +10,8 @@ CONTRACT
   Guarantees: No optimizer operates independently of the frequency schedule.
               The feedback loop (architecture generates gradients, optimizer
               applies them, architecture uses the result) is closed and testable.
+  Cost:       Zero runtime cost — optimizer interface constraints only.
+  Trade-off:  Cannot use off-the-shelf optimizers without CMS frequency awareness.
   Position:   specs/constraints/code_smells/04_optimizer.md
   Source:     NL IS #6, IS NOT #5; HOPE Section 9; CS-27 through CS-30
 ```
