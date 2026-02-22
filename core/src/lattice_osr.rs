@@ -113,6 +113,9 @@ impl MemoryRule for LatticeOSR {
         debug_assert_eq!(state.m_slots, self.m_slots);
         let d = state.d;
         let m = state.m_slots;
+        debug_assert_eq!(state.slots.len(), m * d);
+        debug_assert_eq!(k.len(), d);
+        debug_assert_eq!(v.len(), d);
         let mut input = vec![0.0f32; d];
         let mut s_unnorm = vec![0.0f32; d];
         for i in 0..m {
@@ -158,6 +161,9 @@ impl MemoryRule for LatticeOSR {
         debug_assert_eq!(state.m_slots, self.m_slots);
         let d = state.d;
         let m = state.m_slots;
+        debug_assert_eq!(state.slots.len(), m * d);
+        debug_assert_eq!(q.len(), d);
+        debug_assert_eq!(out.len(), d);
         // softmax attention over m slots
         let mut scores = vec![0.0f32; m];
         for i in 0..m {
