@@ -35,6 +35,10 @@ fn save_conv_cache(
     k_conv: &Option<Conv1DCache>,
     q_conv: &Option<Conv1DCache>,
 ) -> Vec<BufId> {
+    assert!(k_conv.is_some() == q_conv.is_some(),
+        "save_conv_cache: partial Conv1D cache on Tape — k={}, q={}",
+        if k_conv.is_some() { "Some" } else { "None" },
+        if q_conv.is_some() { "Some" } else { "None" });
     match (k_conv, q_conv) {
         (Some(kc), Some(qc)) => vec![
             tape.alloc(kc.pre_conv.clone(), vec![]),
@@ -842,7 +846,17 @@ fn record_common_inputs(
     let lp_input = tape.register_param(&lp_flat, vec![lp_flat.len()]);
 
     // Saved BufIds (for backward reconstruction)
-    let kernel_size = if level_params.w_k_conv.is_empty() { 0 } else { level_params.w_k_conv.len() / d };
+    let kernel_size = if level_params.w_k_conv.is_empty() {
+        0
+    } else {
+        assert!(level_params.w_k_conv.len() % d == 0,
+            "record_common_inputs: w_k_conv length {} not divisible by d={}", level_params.w_k_conv.len(), d);
+        let ks = level_params.w_k_conv.len() / d;
+        assert!(level_params.w_q_conv.is_empty() || level_params.w_q_conv.len() == d * ks,
+            "record_common_inputs: w_q_conv length {} != w_k_conv-derived d*ks={}*{}={}",
+            level_params.w_q_conv.len(), d, ks, d * ks);
+        ks
+    };
     let mut meta = vec![seq_len as f32, d as f32];
     meta.extend_from_slice(extra_meta);
     meta.push(kernel_size as f32); // always last element
