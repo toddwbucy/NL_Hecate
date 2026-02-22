@@ -81,6 +81,10 @@ pub fn atlas_parallel_forward(
     matmul_f32(embedded, &w_v_mem_t, &mut v_mem, seq_len, d, d);
     matmul_f32(embedded, &w_q_mem_t, &mut q_mem, seq_len, d, d);
 
+    // Apply Conv1D preprocessing to k/q (must match atlas_omega::step)
+    let (k_conv_cache, q_conv_cache) = crate::conv1d::apply_conv1d_to_kq(
+        &mut k_mem, &mut q_mem, level_params, seq_len, d);
+
     // Batch compute omega (the key parallelizable operation)
     let (omega_vecs, silu_kv) = batch_compute_omega(&k_mem, &v_mem, &level_params.w_omega, seq_len, d);
 
@@ -165,6 +169,8 @@ pub fn atlas_parallel_forward(
         seq_len, d, m_states, s_states, k_mem, v_mem, q_mem, concat_kv,
         alpha_pre, alpha, theta_pre, theta, eta_pre, eta,
         silu_kv, omega_vecs, omega_mats, y: y.clone(),
+        k_conv_cache,
+        q_conv_cache,
     };
 
     (y, cache)

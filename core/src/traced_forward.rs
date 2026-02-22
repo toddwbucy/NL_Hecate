@@ -232,8 +232,23 @@ fn alloc_common_saved(
     d: usize,
     extra_meta: &[f32],
 ) -> (BufId, BufId, BufId) {
+    let kernel_size = if level_params.w_k_conv.is_empty() {
+        assert!(level_params.w_q_conv.is_empty(),
+            "alloc_common_saved: w_k_conv is empty but w_q_conv has {} elements",
+            level_params.w_q_conv.len());
+        0
+    } else {
+        assert!(level_params.w_k_conv.len() % d == 0,
+            "alloc_common_saved: w_k_conv length {} not divisible by d={}", level_params.w_k_conv.len(), d);
+        let ks = level_params.w_k_conv.len() / d;
+        assert!(level_params.w_q_conv.len() == d * ks,
+            "alloc_common_saved: w_q_conv length {} != w_k_conv-derived d*ks={}*{}={}",
+            level_params.w_q_conv.len(), d, ks, d * ks);
+        ks
+    };
     let mut meta = vec![seq_len as f32, d as f32];
     meta.extend_from_slice(extra_meta);
+    meta.push(kernel_size as f32); // always last element — matches record_common_inputs
     let meta_id = tape.alloc(meta, vec![]);
     let lp_flat = level_params_grads_to_flat(level_params);
     let lp_saved = tape.alloc(lp_flat, vec![]);
@@ -607,6 +622,16 @@ fn traced_active_level(
             let y_id = tape.alloc(y.clone(), vec![s, d]);
             let mut saved = vec![meta_id, lp_saved, emb_saved];
             saved.extend(cache_ids);
+            // Save conv1d cache if active
+            assert!(cache.k_conv_cache.is_some() == cache.q_conv_cache.is_some(),
+                "traced_forward: partial Conv1D cache — k={}, q={}",
+                cache.k_conv_cache.is_some(), cache.q_conv_cache.is_some());
+            if let (Some(kc), Some(qc)) = (&cache.k_conv_cache, &cache.q_conv_cache) {
+                saved.push(tape.alloc(kc.pre_conv.clone(), vec![]));
+                saved.push(tape.alloc(kc.pre_silu.clone(), vec![]));
+                saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
+                saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
+            }
             tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved);
 
             (y, MemoryCache::Delta(cache), final_m, y_id)
@@ -638,6 +663,16 @@ fn traced_active_level(
             let y_id = tape.alloc(y.clone(), vec![s, d]);
             let mut saved = vec![meta_id, lp_saved, emb_saved];
             saved.extend(cache_ids);
+            // Save conv1d cache if active
+            assert!(cache.k_conv_cache.is_some() == cache.q_conv_cache.is_some(),
+                "traced_forward: partial Conv1D cache — k={}, q={}",
+                cache.k_conv_cache.is_some(), cache.q_conv_cache.is_some());
+            if let (Some(kc), Some(qc)) = (&cache.k_conv_cache, &cache.q_conv_cache) {
+                saved.push(tape.alloc(kc.pre_conv.clone(), vec![]));
+                saved.push(tape.alloc(kc.pre_silu.clone(), vec![]));
+                saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
+                saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
+            }
             tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved);
 
             (y, MemoryCache::Titans(cache), final_m, y_id)
@@ -662,6 +697,16 @@ fn traced_active_level(
             let y_id = tape.alloc(y.clone(), vec![s, d]);
             let mut saved = vec![meta_id, lp_saved, emb_saved];
             saved.extend(cache_ids);
+            // Save conv1d cache if active
+            assert!(cache.k_conv_cache.is_some() == cache.q_conv_cache.is_some(),
+                "traced_forward: partial Conv1D cache — k={}, q={}",
+                cache.k_conv_cache.is_some(), cache.q_conv_cache.is_some());
+            if let (Some(kc), Some(qc)) = (&cache.k_conv_cache, &cache.q_conv_cache) {
+                saved.push(tape.alloc(kc.pre_conv.clone(), vec![]));
+                saved.push(tape.alloc(kc.pre_silu.clone(), vec![]));
+                saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
+                saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
+            }
             tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved);
 
             (y, MemoryCache::Hebbian(cache), final_m, y_id)
@@ -706,6 +751,16 @@ fn traced_active_level(
             let y_id = tape.alloc(y.clone(), vec![s, d]);
             let mut saved = vec![meta_id, lp_saved, emb_saved];
             saved.extend(cache_ids);
+            // Save conv1d cache if active
+            assert!(cache.k_conv_cache.is_some() == cache.q_conv_cache.is_some(),
+                "traced_forward: partial Conv1D cache — k={}, q={}",
+                cache.k_conv_cache.is_some(), cache.q_conv_cache.is_some());
+            if let (Some(kc), Some(qc)) = (&cache.k_conv_cache, &cache.q_conv_cache) {
+                saved.push(tape.alloc(kc.pre_conv.clone(), vec![]));
+                saved.push(tape.alloc(kc.pre_silu.clone(), vec![]));
+                saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
+                saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
+            }
             tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved);
 
             (y, MemoryCache::Moneta(cache), final_m, y_id)
@@ -747,6 +802,16 @@ fn traced_active_level(
             let y_id = tape.alloc(y.clone(), vec![s, d]);
             let mut saved = vec![meta_id, lp_saved, emb_saved];
             saved.extend(cache_ids);
+            // Save conv1d cache if active
+            assert!(cache.k_conv_cache.is_some() == cache.q_conv_cache.is_some(),
+                "traced_forward: partial Conv1D cache — k={}, q={}",
+                cache.k_conv_cache.is_some(), cache.q_conv_cache.is_some());
+            if let (Some(kc), Some(qc)) = (&cache.k_conv_cache, &cache.q_conv_cache) {
+                saved.push(tape.alloc(kc.pre_conv.clone(), vec![]));
+                saved.push(tape.alloc(kc.pre_silu.clone(), vec![]));
+                saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
+                saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
+            }
             tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved);
 
             (y, MemoryCache::YAAD(cache), final_m, y_id)
@@ -788,6 +853,16 @@ fn traced_active_level(
             let y_id = tape.alloc(y.clone(), vec![s, d]);
             let mut saved = vec![meta_id, lp_saved, emb_saved];
             saved.extend(cache_ids);
+            // Save conv1d cache if active
+            assert!(cache.k_conv_cache.is_some() == cache.q_conv_cache.is_some(),
+                "traced_forward: partial Conv1D cache — k={}, q={}",
+                cache.k_conv_cache.is_some(), cache.q_conv_cache.is_some());
+            if let (Some(kc), Some(qc)) = (&cache.k_conv_cache, &cache.q_conv_cache) {
+                saved.push(tape.alloc(kc.pre_conv.clone(), vec![]));
+                saved.push(tape.alloc(kc.pre_silu.clone(), vec![]));
+                saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
+                saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
+            }
             tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved);
 
             (y, MemoryCache::MEMORA(cache), final_m, y_id)
@@ -818,6 +893,16 @@ fn traced_active_level(
             let y_id = tape.alloc(y.clone(), vec![s, d]);
             let mut saved = vec![meta_id, lp_saved, emb_saved];
             saved.extend(cache_ids);
+            // Save conv1d cache if active
+            assert!(cache.k_conv_cache.is_some() == cache.q_conv_cache.is_some(),
+                "traced_forward: partial Conv1D cache — k={}, q={}",
+                cache.k_conv_cache.is_some(), cache.q_conv_cache.is_some());
+            if let (Some(kc), Some(qc)) = (&cache.k_conv_cache, &cache.q_conv_cache) {
+                saved.push(tape.alloc(kc.pre_conv.clone(), vec![]));
+                saved.push(tape.alloc(kc.pre_silu.clone(), vec![]));
+                saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
+                saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
+            }
             tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved);
 
             (y, MemoryCache::Lattice(cache), final_m, y_id)
@@ -864,6 +949,16 @@ fn traced_active_level(
             let y_id = tape.alloc(y.clone(), vec![s, d]);
             let mut saved = vec![meta_id, lp_saved, emb_saved];
             saved.extend(cache_ids);
+            // Save conv1d cache if active
+            assert!(cache.k_conv_cache.is_some() == cache.q_conv_cache.is_some(),
+                "traced_forward: partial Conv1D cache — k={}, q={}",
+                cache.k_conv_cache.is_some(), cache.q_conv_cache.is_some());
+            if let (Some(kc), Some(qc)) = (&cache.k_conv_cache, &cache.q_conv_cache) {
+                saved.push(tape.alloc(kc.pre_conv.clone(), vec![]));
+                saved.push(tape.alloc(kc.pre_silu.clone(), vec![]));
+                saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
+                saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
+            }
             tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved);
 
             (y, MemoryCache::Trellis(cache), final_m, y_id)
@@ -896,6 +991,16 @@ fn traced_active_level(
             let y_id = tape.alloc(y.clone(), vec![s, d]);
             let mut saved = vec![meta_id, lp_saved, emb_saved];
             saved.extend(cache_ids);
+            // Save conv1d cache if active
+            assert!(cache.k_conv_cache.is_some() == cache.q_conv_cache.is_some(),
+                "traced_forward: partial Conv1D cache — k={}, q={}",
+                cache.k_conv_cache.is_some(), cache.q_conv_cache.is_some());
+            if let (Some(kc), Some(qc)) = (&cache.k_conv_cache, &cache.q_conv_cache) {
+                saved.push(tape.alloc(kc.pre_conv.clone(), vec![]));
+                saved.push(tape.alloc(kc.pre_silu.clone(), vec![]));
+                saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
+                saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
+            }
             tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved);
 
             (y, MemoryCache::Atlas(cache), final_m, y_id)

@@ -79,6 +79,10 @@ pub struct LatticeCache {
     pub read_weights: Vec<f32>,
     /// ||s_unnorm|| per slot per step: [seq_len, m]
     pub s_unnorm_norms: Vec<f32>,
+    /// Conv1D cache for key preprocessing (None when kernel_size=0)
+    pub k_conv_cache: Option<crate::conv1d::Conv1DCache>,
+    /// Conv1D cache for query preprocessing (None when kernel_size=0)
+    pub q_conv_cache: Option<crate::conv1d::Conv1DCache>,
 }
 
 impl MemoryRule for LatticeOSR {
@@ -191,6 +195,10 @@ impl MemoryRule for LatticeOSR {
         matmul_f32(embedded, &w_v_mem_t, &mut v_mem, seq_len, d, d);
         matmul_f32(embedded, &w_q_mem_t, &mut q_mem, seq_len, d, d);
 
+        // Conv1D key/query preprocessing (after projection, before memory loop)
+        let (k_conv_cache, q_conv_cache) = crate::conv1d::apply_conv1d_to_kq(
+            &mut k_mem, &mut q_mem, level_params, seq_len, d);
+
         // Allocate cache — seed S_0 from initial_m if provided, else init_slots
         let mut s_states = vec![0.0f32; (seq_len + 1) * m * d];
         if let Some(m0) = initial_m {
@@ -299,6 +307,7 @@ impl MemoryRule for LatticeOSR {
             s_states, k_mem, v_mem, q_mem, concat_kv,
             alpha_pre, alpha, scores: scores_cache, slot_gates,
             read_weights, s_unnorm_norms,
+            k_conv_cache, q_conv_cache,
         };
 
         (y, cache)
@@ -318,7 +327,7 @@ impl MemoryRule for LatticeOSR {
         debug_assert_eq!(d_y.len(), s * d);
         debug_assert_eq!(embedded.len(), s * d);
 
-        let mut grads = MemoryLevelParams::zeros_like(d);
+        let mut grads = MemoryLevelParams::zeros_like_from(level_params, d);
         let mut d_k_mem = vec![0.0f32; s * d];
         let mut d_v_mem = vec![0.0f32; s * d];
         let mut d_q_mem = vec![0.0f32; s * d];
@@ -528,6 +537,12 @@ impl MemoryRule for LatticeOSR {
             // Swap: d_s_prev becomes d_s for next (earlier) token
             std::mem::swap(&mut d_s, &mut d_s_prev);
         }
+
+        // ── Conv1D backward (before projection backward) ──
+        crate::conv1d::backward_conv1d_kq(
+            &mut d_k_mem, &mut d_q_mem,
+            &cache.k_conv_cache, &cache.q_conv_cache,
+            level_params, &mut grads, s, d);
 
         // ── Projection backward: k_mem = embedded @ W_K_mem^T ──
         let mut d_embedded = vec![0.0f32; s * d];
