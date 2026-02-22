@@ -384,7 +384,7 @@ Specs are written and approved. Implementation can start immediately.
 
 ### Priority Order
 
-```
+```text
 START HERE:
 Phase 1 Implementation (S3b-M1)     ─── DGD first (unlocks self-ref), then DMGD/FTRL/Implicit GD/NS in parallel
     │

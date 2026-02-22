@@ -839,11 +839,13 @@ mod tests {
         for idx in 0..n_check {
             let mut lp_plus = params.levels[0].clone();
             lp_plus.w_k_mem.master_mut()[idx] += eps;
+            lp_plus.w_k_mem.sync_from_master();
             let (y_plus, _) = hebbian_scan_forward(&lp_plus, &embedded, s, d, None);
             let loss_plus: f32 = y_plus.iter().sum();
 
             let mut lp_minus = params.levels[0].clone();
             lp_minus.w_k_mem.master_mut()[idx] -= eps;
+            lp_minus.w_k_mem.sync_from_master();
             let (y_minus, _) = hebbian_scan_forward(&lp_minus, &embedded, s, d, None);
             let loss_minus: f32 = y_minus.iter().sum();
 

@@ -873,11 +873,13 @@ mod tests {
 
                     let mut lp_p = params.levels[0].clone();
                     lp_p.w_k_mem.master_mut()[0] += eps;
+                    lp_p.w_k_mem.sync_from_master();
                     let (y_p, _) = tnt_forward(&lp_p, &embedded, s, d, &tnt, &cfg, None, None);
                     let loss_p: f32 = y_p.iter().sum();
 
                     let mut lp_m = params.levels[0].clone();
                     lp_m.w_k_mem.master_mut()[0] -= eps;
+                    lp_m.w_k_mem.sync_from_master();
                     let (y_m, _) = tnt_forward(&lp_m, &embedded, s, d, &tnt, &cfg, None, None);
                     let loss_m: f32 = y_m.iter().sum();
 
@@ -985,6 +987,9 @@ mod tests {
             for (w, g) in level_params.w_k_mem.master_mut().iter_mut().zip(grads.w_k_mem.master().iter()) { *w -= lr * g; }
             for (w, g) in level_params.w_v_mem.master_mut().iter_mut().zip(grads.w_v_mem.master().iter()) { *w -= lr * g; }
             for (w, g) in level_params.w_q_mem.master_mut().iter_mut().zip(grads.w_q_mem.master().iter()) { *w -= lr * g; }
+            level_params.w_k_mem.sync_from_master();
+            level_params.w_v_mem.sync_from_master();
+            level_params.w_q_mem.sync_from_master();
         }
 
         assert!(last_loss <= first_loss + 1e-6,
