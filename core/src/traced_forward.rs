@@ -1161,6 +1161,39 @@ mod tests {
     #[test] fn test_bitwise_k2_trellis() { assert_bitwise_identity_k2(MemoryRuleKind::Trellis); }
     #[test] fn test_bitwise_k2_atlas_omega() { assert_bitwise_identity_k2(MemoryRuleKind::AtlasOmega); }
 
+    // ── L_q > 2 traced path: bitwise identity ─────────────────────
+
+    /// Verify traced path with lq_q > 2 produces bit-identical results to
+    /// the reference cms_forward, exercising the a1/a2 accumulator save/restore
+    /// through the opaque adapter.
+    #[test]
+    fn test_bitwise_k1_moneta_lq3() {
+        let mut cfg = make_config_k1(MemoryRuleKind::Moneta);
+        cfg.lq_q = 3.0;
+        cfg.lambda_2 = 0.1;
+        let s = cfg.swa.seq_len;
+        let v = cfg.swa.vocab_size;
+        let params = MAGParams::init(&cfg, 42);
+        let (input_ids, target_ids) = make_input(s, v, 123);
+        let pulse = Pulse { global_step: 0, active_levels: vec![true] };
+
+        let mut ctx_ref = context_for_rule(&cfg);
+        let (loss_ref, _) = cms_forward(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx_ref);
+
+        let registry = register_opaque_vjps();
+        let mut ctx_traced = context_for_rule(&cfg);
+        let (loss_traced, _, _, _) = with_tape(registry, |tape| {
+            traced_cms_forward(tape, &params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx_traced)
+        });
+
+        assert_eq!(loss_ref.to_bits(), loss_traced.to_bits(),
+            "k=1 Moneta lq_q=3: loss_ref={loss_ref} loss_traced={loss_traced}");
+        for level in 0..cfg.k {
+            assert_eq!(ctx_ref.memory[level], ctx_traced.memory[level],
+                "k=1 Moneta lq_q=3: context.memory[{level}] mismatch");
+        }
+    }
+
     // ── Learned frequency gate: bitwise identity ────────────────────
 
     #[test]
