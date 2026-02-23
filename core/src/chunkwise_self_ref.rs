@@ -61,7 +61,7 @@ pub fn chunkwise_self_ref_step(
     debug_assert_eq!(embedded.len(), seq_len * d);
     debug_assert_eq!(m_mem.len(), d * d);
     debug_assert!(self_ref.is_active(), "chunkwise_self_ref_step called on empty SelfRefState");
-    debug_assert!(chunk_size >= 1, "chunk_size must be >= 1");
+    assert!(chunk_size >= 1, "chunk_size must be >= 1");
 
     let dd = d * d;
     let num_chunks = (seq_len + chunk_size - 1) / chunk_size;
