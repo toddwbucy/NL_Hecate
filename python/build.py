@@ -908,7 +908,8 @@ def main():
         elif gpu_model is not None and adamw_opt is not None:
             # Hybrid GPU+AdamW: GPU forward+backward, Rust frequency-aware optimizer
             loss, grad_params = gpu_model.backward_only(input_ids, target_ids, pulse)
-            adamw_opt.step(params, grad_params, pulse, current_lr)
+            adamw_opt.step(params, grad_params, pulse, current_lr,
+                           max_grad_norm=bcfg.max_grad_norm)
             # Weight tying: sync w_unembed^T → w_embed
             nl_hecate.mag_apply_weight_gradients(params, grad_params, 0.0)
             gpu_model.upload_params(params)
@@ -919,7 +920,8 @@ def main():
                 params, cfg, input_ids, target_ids, pulse, context,
                 error_buffers)
             if adamw_opt:
-                adamw_opt.step(params, grads, pulse, current_lr)
+                adamw_opt.step(params, grads, pulse, current_lr,
+                               max_grad_norm=bcfg.max_grad_norm)
                 # Weight tying: sync w_unembed^T → w_embed
                 nl_hecate.mag_apply_weight_gradients(params, grads, 0.0)
             else:

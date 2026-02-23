@@ -313,6 +313,9 @@ impl MAGConfig {
         if k < 1 {
             return Err(PyValueError::new_err("k must be >= 1"));
         }
+        if self_ref_chunk_size < 1 {
+            return Err(PyValueError::new_err("self_ref_chunk_size must be >= 1"));
+        }
         let chunk_sizes = chunk_sizes.unwrap_or_else(|| vec![1; k]);
         if chunk_sizes.len() != k {
             return Err(PyValueError::new_err(format!(
@@ -1681,8 +1684,10 @@ impl FrequencyAwareAdamW {
 
     /// Pulse-gated AdamW step. SWA params always update; CMS levels only
     /// update when the Pulse fires for that level.
-    fn step(&mut self, params: &mut MAGParams, grads: &MAGParams, pulse: &Pulse, lr: f32) {
-        self.inner.step(&mut params.inner, &grads.inner, &pulse.inner, lr);
+    #[pyo3(signature = (params, grads, pulse, lr, max_grad_norm=0.0))]
+    fn step(&mut self, params: &mut MAGParams, grads: &mut MAGParams, pulse: &Pulse,
+            lr: f32, max_grad_norm: f32) {
+        self.inner.step(&mut params.inner, &mut grads.inner, &pulse.inner, lr, max_grad_norm);
     }
 
     /// Get the SWA (global) step count.
