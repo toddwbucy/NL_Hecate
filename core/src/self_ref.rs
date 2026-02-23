@@ -487,6 +487,14 @@ pub fn self_ref_step_backward(
     let dd = d * d;
 
     debug_assert_eq!(d_y.len(), s * d);
+    debug_assert_eq!(
+        self_generated_values, cache.self_generated_values,
+        "self_generated_values mismatch: parameter={self_generated_values}, cache={}",
+        cache.self_generated_values
+    );
+    // Use the cache's recorded flag as source of truth — it reflects
+    // what the forward pass actually did (and whether v_hat_targets is populated).
+    let self_generated_values = cache.self_generated_values;
 
     let mut d_embedded = vec![0.0f32; s * d];
 
