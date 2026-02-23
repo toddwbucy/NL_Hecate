@@ -839,7 +839,7 @@ def main():
     level3_prev_active = 0
     phase_boundaries = {15000, 25000, 45000, 55000}
     phase_val_data: dict[str, tuple] = {}  # loaded on first boundary hit
-    min_stories_loss = float("inf")
+    min_stories_loss: float | None = None
 
     losses = []
     t_start = time.perf_counter()
@@ -878,7 +878,13 @@ def main():
                 biases = gpu_model.gate_biases()
                 if len(biases) > 3:
                     b_theta_l3 = biases[3][1]  # (b_alpha, b_theta, b_eta)[1]
-                    theta_val = math.log(1 + math.exp(b_theta_l3))  # softplus
+                    # Numerically stable softplus: avoids overflow for large b_theta
+                    if b_theta_l3 > 20.0:
+                        theta_val = b_theta_l3
+                    elif b_theta_l3 < -20.0:
+                        theta_val = math.exp(b_theta_l3)
+                    else:
+                        theta_val = math.log1p(math.exp(b_theta_l3))
                     if theta_val > 0.001:
                         level3_active_fires += 1
 
@@ -1075,14 +1081,17 @@ def main():
 
                 # Track minimum stories loss for catastrophic forgetting check
                 if "stories" in phase_losses and step <= 25000:
-                    min_stories_loss = min(min_stories_loss,
-                                           phase_losses["stories"])
+                    sl = phase_losses["stories"]
+                    if min_stories_loss is None or sl < min_stories_loss:
+                        min_stories_loss = sl
 
                 print(f"  [phase probe] step {step}: "
                       + ", ".join(f"{k}={v:.4f}" for k, v in phase_losses.items()))
                 if jsonl:
-                    log_entry = {"event": "phase_boundary", "step": step,
-                                 "min_stories_loss": min_stories_loss}
+                    log_entry: dict[str, Any] = {
+                        "event": "phase_boundary", "step": step}
+                    if min_stories_loss is not None:
+                        log_entry["min_stories_loss"] = min_stories_loss
                     for pname, pl in phase_losses.items():
                         log_entry[f"{pname}_loss"] = pl
                     jsonl.log(**log_entry)
