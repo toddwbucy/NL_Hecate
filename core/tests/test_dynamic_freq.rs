@@ -432,6 +432,7 @@ fn test_k1_learned_is_noop() {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
     };
     let params = MAGParams::init(&cfg, 42);
     let d = cfg.swa.d_model;
@@ -561,6 +562,7 @@ fn test_anneal_uses_fixed_schedule() {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
     };
 
     let params = MAGParams::init(&cfg, 42);

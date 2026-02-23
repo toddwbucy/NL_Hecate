@@ -220,6 +220,7 @@ fn test_k2_beats_k1() {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
 
         };
     // k=2 config
@@ -244,6 +245,7 @@ fn test_k2_beats_k1() {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
 
         };
 
@@ -432,6 +434,7 @@ fn test_k4_vs_k2_multiscale() {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
 
         };
     let cfg_k4 = MAGConfig {
@@ -455,6 +458,7 @@ fn test_k4_vs_k2_multiscale() {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
 
         };
 
@@ -555,6 +559,7 @@ fn test_k4_diagnostics() {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
 
         };
 
@@ -833,6 +838,7 @@ fn test_cms_stability_boundary() {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
 
         };
     let cfg_k2 = MAGConfig {
@@ -856,6 +862,7 @@ fn test_cms_stability_boundary() {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
 
         };
 
@@ -1053,6 +1060,7 @@ fn test_k4_normalization_magnitude() {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
 
         };
     let params_k4 = MAGParams::init(&cfg_k4, 42);
@@ -1129,6 +1137,7 @@ fn test_k4_uniform_init_stable() {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
 
         };
 
@@ -1191,6 +1200,7 @@ fn test_k4_normalized_stable() {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
 
         };
 
