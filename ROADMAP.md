@@ -538,7 +538,7 @@ Success criteria (hard thresholds — pre-committed, do not adjust post-hoc):
 |-----------|---------------|---------------|
 | **Loss convergence** | Validation loss must decrease by ≥15% between step 50K and step 100K | If <10% decrease, pipeline is broken |
 | **No NaN/Inf** | Zero NaN/Inf values in any tensor through full run | Any NaN = immediate stop |
-| **CMS Level 3 gate activity** | Level 3 (slowest, every 512 steps) must fire ≥50 times per 1,000 steps | If <25 fires/1K steps, CMS is degenerate |
+| **CMS Level 3 gate activity** | Level 3 (slowest, every 512 steps) must fire with non-degenerate gate ≥50 times over the full run | If <25 active fires over full run, CMS is degenerate |
 | **Wengert tape memory scaling** | Memory per token must not exceed 1.1× increase across seq_len 512→2048 | If ≥1.2× increase, tape has quadratic leak |
 | **Checkpoint roundtrip** | Loss after restore must be within 1e-6 of loss before save | Any deviation = serialization bug |
 | **Serve output** | Log generated text after build completes (informational only — coherent text is NOT expected from pre-HOPE primitives) | N/A — this run validates pipeline engineering, not model quality |

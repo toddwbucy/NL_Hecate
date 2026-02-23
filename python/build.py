@@ -469,7 +469,9 @@ def evaluate_numpy(gpu_model, bcfg, tokens_np, targets_np,
                    max_chunks: int = 10) -> tuple[float, float]:
     """Evaluate on raw numpy arrays (for per-phase curriculum probes).
 
-    Creates a fresh Conductor + context so eval doesn't corrupt training state.
+    Creates a fresh Conductor so eval pulse doesn't corrupt training state.
+    NOTE: Callers must save/restore gpu_model context externally — this
+    function uses whatever context is currently on the model.
     Returns (avg_loss, perplexity).
     """
     conductor = nl_hecate.Conductor(bcfg.k, bcfg.chunk_sizes)
@@ -833,6 +835,8 @@ def main():
     level_fire_reset_step = resume_step
     level3_total_fires = 0
     level3_active_fires = 0
+    level3_prev_fires = 0  # for window delta computation
+    level3_prev_active = 0
     phase_boundaries = {15000, 25000, 45000, 55000}
     phase_val_data: dict[str, tuple] = {}  # loaded on first boundary hit
     min_stories_loss = float("inf")
@@ -993,20 +997,21 @@ def main():
             log_fields["level_fires"] = list(level_fire_counts)
             # S4-M7: Per-level memory norms (at eval_every to avoid D2H overhead)
             if (bcfg.eval_every > 0 and step % bcfg.eval_every == 0
-                    and gpu_model is not None):
-                ctx_snap = gpu_model.to_host_context()
-                mem = ctx_snap.memory
-                memory_norms = []
-                for lev_mem in mem:
-                    norm = math.sqrt(sum(x * x for x in lev_mem))
-                    memory_norms.append(round(norm, 6))
-                log_fields["memory_norms"] = memory_norms
+                    and gpu_model is not None
+                    and hasattr(gpu_model, "memory_norms")):
+                log_fields["memory_norms"] = [
+                    round(n, 6) for n in gpu_model.memory_norms()]
             jsonl.log(**log_fields)
-            # S4-M7: Level 3 activity event (every 1000 steps)
+            # S4-M7: Level 3 activity event (every 1000 steps, as window deltas)
             if (bcfg.k >= 4 and step > 0 and step % 1000 == 0):
+                # Log window deltas (fires/active since last snapshot)
+                l3_fires_delta = level3_total_fires - level3_prev_fires
+                l3_active_delta = level3_active_fires - level3_prev_active
                 jsonl.log(event="level3_activity", step=step,
-                          fires=level3_total_fires,
-                          active=level3_active_fires)
+                          fires=l3_fires_delta,
+                          active=l3_active_delta)
+                level3_prev_fires = level3_total_fires
+                level3_prev_active = level3_active_fires
             # Reset level fire counts every 1000 steps
             if step - level_fire_reset_step >= 1000:
                 level_fire_counts = [0] * bcfg.k
@@ -1061,7 +1066,7 @@ def main():
 
                 phase_losses = {}
                 for pname, (p_toks, p_tgts) in phase_val_data.items():
-                    pl, pp = evaluate_numpy(
+                    pl, _pp = evaluate_numpy(
                         gpu_model, bcfg, p_toks, p_tgts, max_chunks=10)
                     phase_losses[pname] = pl
                     gpu_model.reset_context()  # fresh context per phase
@@ -1101,7 +1106,10 @@ def main():
             # S4-M7: Checkpoint roundtrip verification
             if use_gpu:
                 try:
-                    v_params, v_cfg = nl_hecate.load_checkpoint(ckpt_path)
+                    if use_bpe:
+                        v_params, v_cfg = nl_hecate.load_checkpoint(ckpt_path)
+                    else:
+                        v_params, v_cfg, _, _ = nl_hecate.load_build_checkpoint(ckpt_path)
                     v_model = nl_hecate.GpuModel.from_params(v_params, v_cfg)
                     v_ctx = gpu_model.to_host_context()
                     v_model.upload_context(v_ctx)
@@ -1122,7 +1130,7 @@ def main():
                         print(f"  [checkpoint roundtrip OK, "
                               f"delta={delta:.2e}]")
                     del v_model
-                except Exception as e:
+                except (OSError, RuntimeError, ValueError) as e:
                     print(f"  [checkpoint roundtrip failed: {e}]")
 
             # Generate samples at checkpoint time

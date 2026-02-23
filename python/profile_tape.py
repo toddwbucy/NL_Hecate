@@ -23,7 +23,7 @@ def rss_mb() -> float:
         with open("/proc/self/statm") as f:
             pages = int(f.read().split()[1])
         return pages * 4096 / (1024 * 1024)
-    except Exception:
+    except (OSError, ValueError, IndexError):
         return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
 
 
@@ -116,19 +116,19 @@ def main():
     print(f"  Avg step time: {r2048['avg_step_time_s']:.4f}s")
 
     # Compute ratios
-    # Memory ratio: compare peak RSS (rss_after) since tape arena grows during forward
-    mem_512 = max(r512["rss_after_mb"], 1.0)
-    mem_2048 = max(r2048["rss_after_mb"], 1.0)
-    mem_ratio = mem_2048 / mem_512
+    # Per-token memory: normalize RSS by seq_len to detect superlinear scaling
+    mem_per_tok_512 = max(r512["rss_after_mb"], 1.0) / 512
+    mem_per_tok_2048 = max(r2048["rss_after_mb"], 1.0) / 2048
+    mem_ratio = mem_per_tok_2048 / mem_per_tok_512
 
     time_ratio = r2048["avg_step_time_s"] / max(r512["avg_step_time_s"], 1e-6)
 
     print(f"\n{'=' * 60}")
     print("Results")
     print(f"{'=' * 60}")
-    print(f"  Memory (512):  {r512['rss_after_mb']:.1f} MB")
-    print(f"  Memory (2048): {r2048['rss_after_mb']:.1f} MB")
-    print(f"  Memory ratio:  {mem_ratio:.3f}x")
+    print(f"  Memory (512):  {r512['rss_after_mb']:.1f} MB ({mem_per_tok_512:.4f} MB/tok)")
+    print(f"  Memory (2048): {r2048['rss_after_mb']:.1f} MB ({mem_per_tok_2048:.4f} MB/tok)")
+    print(f"  Per-token mem ratio: {mem_ratio:.3f}x")
     print(f"  Time (512):    {r512['avg_step_time_s']:.4f}s/step")
     print(f"  Time (2048):   {r2048['avg_step_time_s']:.4f}s/step")
     print(f"  Time ratio:    {time_ratio:.3f}x")

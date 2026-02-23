@@ -463,8 +463,11 @@ def blend_curriculum(
         order = rng.permutation(len(pool))
         pools[i] = [pool[j] for j in order]
 
-    all_tokens = []
-    all_targets = []
+    # Preallocate with slack (total_tokens + 512 max overshoot)
+    capacity = total_tokens + 512
+    tokens_arr = np.empty(capacity, dtype=np.uint32)
+    targets_arr = np.empty(capacity, dtype=np.int32)
+    write_pos = 0
     emitted = 0
     pool_counts = [0, 0, 0]
 
@@ -508,17 +511,20 @@ def blend_curriculum(
             if not found:
                 break
 
-        all_tokens.extend(toks)
-        all_targets.extend(tgts)
-        emitted += len(toks)
+        n = len(toks)
+        tokens_arr[write_pos:write_pos + n] = toks
+        targets_arr[write_pos:write_pos + n] = tgts
+        write_pos += n
+        emitted += n
         pool_counts[chosen] += 1
 
-    tokens_arr = np.array(all_tokens, dtype=np.uint32)
-    targets_arr = np.array(all_targets, dtype=np.int32)
+    # Trim to actual length
+    tokens_arr = tokens_arr[:write_pos]
+    targets_arr = targets_arr[:write_pos]
 
     for name, count in zip(pool_names, pool_counts):
         print(f"    {name}: {count} examples drawn")
-    print(f"    Total: {len(all_tokens):,} tokens")
+    print(f"    Total: {write_pos:,} tokens")
 
     return tokens_arr, targets_arr
 
@@ -730,16 +736,16 @@ def main():
     print("  meta.json saved")
 
     # ── Summary ──────────────────────────────────────────────────────
-    print(f"\n{'=' * 60}")
+    print("\n" + "=" * 60)
     print("Curriculum data preparation complete")
-    print(f"{'=' * 60}")
+    print("=" * 60)
     print(f"  Output:        {out_dir}")
     print(f"  Vocab:         {vocab_size:,}")
     print(f"  Train tokens:  {len(train_tokens):,}")
     print(f"  Val tokens:    {len(val_tokens):,}")
     print(f"  Train valid:   {train_valid:,} ({train_valid/len(train_tokens):.1%})")
     print(f"  Schedule:      TinyStories → SE+tulu+Dolly → GSM8K+OpenMath")
-    print(f"{'=' * 60}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":

@@ -63,14 +63,19 @@ def check_no_nan_inf(events: list[dict]) -> tuple[bool, str]:
 
 
 def check_level3_activity(events: list[dict]) -> tuple[bool, str]:
-    """Sum level3_activity events and check active >= 50."""
-    l3_events = [e for e in events if e.get("event") == "level3_activity"]
-
-    if not l3_events:
-        return False, "No level3_activity events found"
-
-    total_fires = sum(e.get("fires", 0) for e in l3_events)
-    active_fires = sum(e.get("active", 0) for e in l3_events)
+    """Check Level 3 activity from level3_summary or level3_activity events."""
+    # Prefer end-of-run level3_summary event (cumulative totals)
+    summary = [e for e in events if e.get("event") == "level3_summary"]
+    if summary:
+        total_fires = summary[-1].get("total_fires", 0)
+        active_fires = summary[-1].get("active_fires", 0)
+    else:
+        # Fallback: sum level3_activity window deltas
+        l3_events = [e for e in events if e.get("event") == "level3_activity"]
+        if not l3_events:
+            return False, "No level3_activity or level3_summary events found"
+        total_fires = sum(e.get("fires", 0) for e in l3_events)
+        active_fires = sum(e.get("active", 0) for e in l3_events)
 
     passed = active_fires >= 50
     msg = (f"Level 3: {active_fires} active fires out of {total_fires} total "
@@ -137,7 +142,11 @@ def check_tape_scaling(events: list[dict]) -> tuple[bool, str]:
         return False, "No build_start event found"
 
     start = start_events[0]
+    # Check both top-level and nested under config
     ratio = start.get("tape_memory_ratio")
+    if ratio is None:
+        config = start.get("config", {})
+        ratio = config.get("tape_memory_ratio")
 
     if ratio is None:
         return True, "Tape memory ratio not measured (GPU path — deferred to profile_tape.py)"

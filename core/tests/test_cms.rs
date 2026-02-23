@@ -1230,8 +1230,9 @@ fn test_forget_gate_probe() {
         .collect();
 
     let lr = 0.01;
-    let value_a = 3usize;
-    let value_b = 10usize;
+    // Derive target values defensively from vocab_size (both must be < vocab_size)
+    let value_a = 3usize % cfg.swa.vocab_size;
+    let value_b = (cfg.swa.vocab_size / 2).max(4); // distant from value_a
 
     // Same input pattern for both phases — only targets change
     let input_ids: Vec<usize> = (0..cfg.swa.seq_len)
@@ -1301,8 +1302,9 @@ fn test_forget_gate_probe() {
 
     // Level 0 fires every step (50 fires in 50 steps) → adapts faster → larger delta
     // Level 1 fires every 8th step (~6 fires in 50 steps) → adapts slower → smaller delta
+    // Level 0 should show meaningfully larger delta (with tolerance for float noise)
     assert!(
-        deltas[0] > deltas[1],
+        deltas[0] > deltas[1] + 1e-8,
         "Level 0 should adapt faster than Level 1: L0_delta={:.6}, L1_delta={:.6}",
         deltas[0], deltas[1],
     );

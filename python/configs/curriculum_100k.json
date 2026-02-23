@@ -6,7 +6,6 @@
         "head_dim": 64,
         "seq_len": 512,
         "window_size": 256,
-        "vocab_size": 32000,
         "memory_rule": "titans",
         "composition": "mag",
         "k": 4,
