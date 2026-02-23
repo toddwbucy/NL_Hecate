@@ -1,6 +1,6 @@
 # DGD CUDA Kernel Pair
 
-```
+```text
 CONTRACT
   Purpose:    GPU-accelerated DGD inner-loop: dgd_forward.cu and dgd_backward.cu.
               DGD is the hottest path in HOPE — every token at every active CMS level
@@ -33,12 +33,12 @@ Four kernel entry points across two files:
 | `dgd_backward.cu` | `dgd_backward_kernel` | Full backward (all M states cached) |
 | `dgd_backward.cu` | `dgd_backward_segment_kernel` | Segment backward for checkpointed forward |
 
-**Momentum variant**: Separate kernels `dgd_momentum_forward_kernel` and
+**Momentum variant (deferred)**: Separate kernels `dgd_momentum_forward_kernel` and
 `dgd_momentum_backward_kernel` in the same files. These add the S accumulator
-(same pattern as Titans adds S over Delta).
+(same pattern as Titans adds S over Delta). Planned for a future PR.
 
 **Sherman-Morrison**: NOT a separate kernel. Deferred to a future spec. Rationale:
-SM requires normalized keys (||k|| ≈ 1) and is L2-only. The iterative DGD kernel
+SM requires keys to be normalized (||k|| ≈ 1) and is L2-only. The iterative DGD kernel
 handles all attentional biases uniformly. SM can be added as an optimization later
 without changing the kernel interface — it would be a runtime branch based on a
 `use_sherman_morrison` flag, or a separate kernel dispatched from Rust.
@@ -62,7 +62,7 @@ extern "C" void dgd_forward_f32_cuda(
 ```
 
 **Math per token** (identical to Delta Rule — DGD generalizes it):
-```
+```text
 prediction[i] = sum_j M[i,j] * k_t[j]
 error[i]      = prediction[i] - v_t[i]
 M[i,j]        = (1 - alpha_t) * M[i,j] - theta_t * error[i] * k_t[j]
@@ -90,7 +90,7 @@ extern "C" void dgd_momentum_forward_f32_cuda(
 ```
 
 **Math per token** (from `dgd_momentum_step` in `core/src/dgd.rs`):
-```
+```text
 prediction[i] = sum_j M[i,j] * k_t[j]
 error[i]      = prediction[i] - v_t[i]
 S[i,j]        = beta_t * S[i,j] + theta_t * error[i] * k_t[j]
@@ -157,7 +157,7 @@ extern "C" void dgd_backward_f32_cuda(
 ```
 
 **Reverse loop per token** (from `dgd_step_backward` in `core/src/dgd.rs`):
-```
+```text
 d_M += outer(d_y_t, q_t)                      // readout contribution
 d_q_t[j] = sum_i M_{t+1}[i,j] * d_y_t[i]     // query gradient
 
@@ -540,7 +540,7 @@ This is a spec placeholder, not a deliverable for S3b-M5.
 
 DGD non-momentum and Delta Rule perform **identical math**:
 
-```
+```text
 M = (1 - alpha) * M - theta * (M @ k - v) @ k^T
 ```
 

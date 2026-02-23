@@ -1292,6 +1292,55 @@ impl OpaqueVjp for AtlasOmega {
     }
 }
 
+// ── DGD backward adapter ────────────────────────────────────────────
+
+/// DGD opaque backward adapter.
+///
+/// Saved layout: [meta, k_mem, v_mem, q_mem, alpha, theta, m_states]
+/// where meta = [seq_len as f32, d as f32].
+///
+/// Inputs: [k_mem, v_mem, q_mem, alpha, theta, m_initial]
+/// Outputs: [y]
+/// d_inputs: [d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta, d_m_initial]
+pub fn dgd_opaque_backward(
+    d_outputs: &[&[f32]],
+    saved: &[&[f32]],
+    d_inputs: &mut [Vec<f32>],
+) {
+    let meta = saved[0];
+    let seq_len = meta[0] as usize;
+    let d = meta[1] as usize;
+
+    let k_mem = saved[1];
+    let v_mem = saved[2];
+    let q_mem = saved[3];
+    let alpha = saved[4];
+    let theta = saved[5];
+    let m_states = saved[6];
+    let d_y = d_outputs[0];
+
+    let mut d_k_mem = vec![0.0f32; seq_len * d];
+    let mut d_v_mem = vec![0.0f32; seq_len * d];
+    let mut d_q_mem = vec![0.0f32; seq_len * d];
+    let mut d_alpha = vec![0.0f32; seq_len];
+    let mut d_theta = vec![0.0f32; seq_len];
+    let mut d_m_initial = vec![0.0f32; d * d];
+
+    crate::dispatch::dgd_backward_dispatch(
+        k_mem, v_mem, q_mem, alpha, theta, m_states, d_y,
+        &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
+        &mut d_alpha, &mut d_theta, &mut d_m_initial,
+        seq_len, d,
+    );
+
+    d_inputs[0] = d_k_mem;
+    d_inputs[1] = d_v_mem;
+    d_inputs[2] = d_q_mem;
+    d_inputs[3] = d_alpha;
+    d_inputs[4] = d_theta;
+    d_inputs[5] = d_m_initial;
+}
+
 // ── Registry builder ──────────────────────────────────────────────────
 
 /// Build the complete opaque VJP registry mapping every OpaqueKey to its
@@ -1310,6 +1359,7 @@ pub fn register_opaque_vjps() -> HashMap<OpaqueKey, OpaqueBackwardFn> {
     registry.insert(OpaqueKey::Trellis, trellis_opaque_backward as OpaqueBackwardFn);
     registry.insert(OpaqueKey::AtlasOmega, atlas_omega_opaque_backward as OpaqueBackwardFn);
     registry.insert(OpaqueKey::SWA, swa_opaque_backward as OpaqueBackwardFn);
+    registry.insert(OpaqueKey::DGD, dgd_opaque_backward as OpaqueBackwardFn);
 
     // Frozen variants
     registry.insert(OpaqueKey::FrozenDeltaRule, frozen_delta_rule_backward as OpaqueBackwardFn);
@@ -1385,8 +1435,8 @@ mod tests {
     #[test]
     fn test_register_opaque_vjps_all_keys() {
         let registry = register_opaque_vjps();
-        // All 19 keys should be registered
-        assert_eq!(registry.len(), 19);
+        // All 20 keys should be registered (10 active + 1 DGD + 9 frozen)
+        assert_eq!(registry.len(), 20);
         assert!(registry.contains_key(&OpaqueKey::DeltaRule));
         assert!(registry.contains_key(&OpaqueKey::TitansLMM));
         assert!(registry.contains_key(&OpaqueKey::HebbianRule));
@@ -1397,6 +1447,7 @@ mod tests {
         assert!(registry.contains_key(&OpaqueKey::Trellis));
         assert!(registry.contains_key(&OpaqueKey::AtlasOmega));
         assert!(registry.contains_key(&OpaqueKey::SWA));
+        assert!(registry.contains_key(&OpaqueKey::DGD));
         assert!(registry.contains_key(&OpaqueKey::FrozenDeltaRule));
         assert!(registry.contains_key(&OpaqueKey::FrozenTitansLMM));
         assert!(registry.contains_key(&OpaqueKey::FrozenHebbianRule));
