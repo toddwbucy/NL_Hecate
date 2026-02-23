@@ -1256,6 +1256,7 @@ mod tests {
                 let m_t = &c.m_states[s * d * d..(s + 1) * d * d];
                 m_t.iter().map(|x| x * x).sum::<f32>().sqrt()
             }
+            crate::mag::MemoryCache::SelfRef(_) => unreachable!("SelfRef in gradient check"),
         };
         eprintln!("MAG final memory norm: {memory_evolved:.4e}");
         assert!(memory_evolved > 1e-6, "Memory should evolve during training, norm={memory_evolved}");

@@ -10,6 +10,7 @@ use crate::parallel::ParallelConfig;
 use crate::retention::{RetentionKind, default_retention};
 use crate::m3::{M3Config, M3State, m3_step, flatten_mag_params, unflatten_to_mag_grads};
 use crate::dynamic_freq::{FrequencySchedule, default_b_freq};
+use crate::self_ref::ProjectionKind;
 
 /// Which composition pattern to use (Titans Section 4).
 ///
@@ -632,6 +633,10 @@ pub struct MAGConfig {
     /// Ignored for MomentumKind::None/EMA/DeltaMomentum.
     #[serde(default)]
     pub momentum_d_hidden: usize,
+    /// Projection style for memory key/value/query generation (HOPE §5).
+    /// Static (default) = Phase 1 W @ x. Adaptive = Phase 2 DGD projection memories.
+    #[serde(default)]
+    pub projection_kind: ProjectionKind,
 }
 
 fn default_sign_sharpness() -> f32 { 10.0 }
@@ -710,6 +715,7 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
         }
     }
 
@@ -742,6 +748,7 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
         }
     }
 
@@ -774,6 +781,7 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
         }
     }
 
@@ -807,6 +815,7 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
         }
     }
 
@@ -840,6 +849,7 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
         }
     }
 
@@ -873,6 +883,7 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
         }
     }
 
@@ -905,6 +916,7 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
         }
     }
 
@@ -937,6 +949,7 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
         }
     }
 
@@ -969,6 +982,7 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
         }
     }
 
@@ -1001,6 +1015,7 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
         }
     }
 
@@ -1043,6 +1058,7 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
         }
     }
 
@@ -1085,6 +1101,7 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
         }
     }
 
@@ -1127,6 +1144,7 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
         }
     }
 
@@ -1169,6 +1187,7 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
         }
     }
 
@@ -1211,6 +1230,7 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
         }
     }
 
@@ -1253,6 +1273,7 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
         }
     }
 
@@ -1286,6 +1307,7 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
         }
     }
 
@@ -1319,6 +1341,7 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
         }
     }
 
@@ -1355,6 +1378,7 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
         }
     }
 
@@ -1391,6 +1415,7 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
         }
     }
 
@@ -1423,6 +1448,7 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
         }
     }
 
@@ -1455,6 +1481,7 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
         }
     }
 
@@ -1487,6 +1514,7 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
         }
     }
 
@@ -1519,6 +1547,7 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
         }
     }
 
@@ -1552,6 +1581,7 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
         }
     }
 
@@ -1584,6 +1614,7 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
         }
     }
 
@@ -1617,6 +1648,7 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
         }
     }
 
@@ -1650,6 +1682,7 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
         }
     }
 }

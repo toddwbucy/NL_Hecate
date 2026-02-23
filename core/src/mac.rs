@@ -217,6 +217,7 @@ fn step_backward_dispatch(
             rule.step_backward(level_params, c, d_y, input)
         }
         MemoryCache::Atlas(c) => AtlasOmega.step_backward(level_params, c, d_y, input),
+        MemoryCache::SelfRef(_) => unreachable!("SelfRef backward not yet implemented"),
     }
 }
 

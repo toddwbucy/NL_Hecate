@@ -135,6 +135,7 @@ fn dispatch_memory_backward(
         MemoryCache::Atlas(c) => {
             AtlasOmega.step_backward(level_params, c, d_y, embedded)
         }
+        MemoryCache::SelfRef(_) => unreachable!("SelfRef backward not yet implemented"),
     }
 }
 
@@ -476,6 +477,7 @@ pub fn persist_memory_state(
             let start = s * d * d;
             *context_mem = c.m_states[start..start + d * d].to_vec();
         }
+        MemoryCache::SelfRef(_) => unreachable!("SelfRef context extract not yet implemented"),
     }
 }
 
