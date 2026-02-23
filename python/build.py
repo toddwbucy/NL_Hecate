@@ -1008,20 +1008,21 @@ def main():
                 log_fields["memory_norms"] = [
                     round(n, 6) for n in gpu_model.memory_norms()]
             jsonl.log(**log_fields)
-            # S4-M7: Level 3 activity event (every 1000 steps, as window deltas)
-            if (bcfg.k >= 4 and step > 0 and step % 1000 == 0):
-                # Log window deltas (fires/active since last snapshot)
-                l3_fires_delta = level3_total_fires - level3_prev_fires
-                l3_active_delta = level3_active_fires - level3_prev_active
-                jsonl.log(event="level3_activity", step=step,
-                          fires=l3_fires_delta,
-                          active=l3_active_delta)
-                level3_prev_fires = level3_total_fires
-                level3_prev_active = level3_active_fires
-            # Reset level fire counts every 1000 steps
-            if step - level_fire_reset_step >= 1000:
-                level_fire_counts = [0] * bcfg.k
-                level_fire_reset_step = step
+
+        # S4-M7: Level 3 activity event (own cadence, independent of log_every)
+        if (jsonl and bcfg.k >= 4 and step > 0 and step % 1000 == 0):
+            l3_fires_delta = level3_total_fires - level3_prev_fires
+            l3_active_delta = level3_active_fires - level3_prev_active
+            jsonl.log(event="level3_activity", step=step,
+                      fires=l3_fires_delta,
+                      active=l3_active_delta)
+            level3_prev_fires = level3_total_fires
+            level3_prev_active = level3_active_fires
+
+        # Reset level fire counts every 1000 steps (independent of log_every)
+        if step - level_fire_reset_step >= 1000:
+            level_fire_counts = [0] * bcfg.k
+            level_fire_reset_step = step
 
         # Periodic eval on val set
         if (bcfg.eval_every > 0 and val_loader is not None
