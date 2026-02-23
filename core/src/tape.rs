@@ -75,6 +75,9 @@ pub enum OpaqueKey {
     FrozenLatticeOSR,
     FrozenTrellis,
     FrozenAtlasOmega,
+
+    // Self-referential Phase 2: all 6 memories (5 projections + main)
+    SelfRef,
 }
 
 /// Backward function for an opaque block.

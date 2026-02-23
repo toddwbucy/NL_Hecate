@@ -200,6 +200,17 @@ impl SelfRefParamGrads {
     }
 }
 
+/// Sigmoid backward: d/dx sigmoid(x) = sigmoid(x) * (1 - sigmoid(x)).
+fn sigmoid_backward(x: f32) -> f32 {
+    let s = sigmoid_f32(x);
+    s * (1.0 - s)
+}
+
+/// Softplus backward: d/dx softplus(x) = sigmoid(x).
+fn softplus_backward(x: f32) -> f32 {
+    sigmoid_f32(x)
+}
+
 /// Self-referential forward pass: all 6 memories updated per token via DGD.
 ///
 /// Per-token loop (observe-then-advance, CS-32):
@@ -331,6 +342,251 @@ pub fn self_ref_read_only(
     }
 
     y
+}
+
+/// Backward pass for self_ref_step. Reverse token loop through all 6 memories.
+///
+/// For each token t (reverse order):
+///   1. Backward through main memory read: y_t = M_mem @ q_t
+///   2. Backward through each DGD update (all 6 memories)
+///   3. Backward through gate reduction (mean → sigmoid/softplus)
+///   4. Backward through component reads (M @ x)
+///   5. Accumulate d_embedded[t]
+///
+/// Returns (d_embedded [seq_len * d], SelfRefParamGrads for initial states).
+pub fn self_ref_step_backward(
+    cache: &SelfRefCache,
+    d_y: &[f32],
+) -> (Vec<f32>, SelfRefParamGrads) {
+    let s = cache.seq_len;
+    let d = cache.d;
+    let dd = d * d;
+
+    debug_assert_eq!(d_y.len(), s * d);
+
+    let mut d_embedded = vec![0.0f32; s * d];
+
+    // Running dM accumulators for each memory (accumulate through reverse token chain)
+    let mut dm_k = vec![0.0f32; dd];
+    let mut dm_v = vec![0.0f32; dd];
+    let mut dm_q = vec![0.0f32; dd];
+    let mut dm_eta = vec![0.0f32; dd];
+    let mut dm_alpha = vec![0.0f32; dd];
+    let mut dm_mem = vec![0.0f32; dd];
+
+    // Temp buffers
+    let mut dq_t = vec![0.0f32; d];
+
+    for t in (0..s).rev() {
+        let x_t = &cache.embedded[t * d..(t + 1) * d];
+        let k_t = &cache.k_mem[t * d..(t + 1) * d];
+        let v_t = &cache.v_mem[t * d..(t + 1) * d];
+        let q_t = &cache.q_mem[t * d..(t + 1) * d];
+        let alpha_t = cache.alpha[t];
+        let theta_t = cache.theta[t];
+        let dy_t = &d_y[t * d..(t + 1) * d];
+
+        // M state at time t (before update)
+        let m_k_t = &cache.m_k_states[t * dd..(t + 1) * dd];
+        let m_v_t = &cache.m_v_states[t * dd..(t + 1) * dd];
+        let m_q_t = &cache.m_q_states[t * dd..(t + 1) * dd];
+        let m_eta_t = &cache.m_eta_states[t * dd..(t + 1) * dd];
+        let m_alpha_t = &cache.m_alpha_states[t * dd..(t + 1) * dd];
+        let m_mem_t = &cache.m_mem_states[t * dd..(t + 1) * dd];
+
+        // ── Step 1: Main memory read backward ──
+        // y_t = M_mem_t @ q_t (note: read uses state BEFORE DGD update at this t,
+        // but our forward does read then update, so M_mem_t is the correct state)
+        //
+        // Wait: actually the forward reads from the M_mem BEFORE the DGD update at time t,
+        // but the DGD updates happen AFTER the read. So we need M_mem at the state
+        // that was used for reading. That IS m_mem_t (the state at time t before update).
+        //
+        // However, the dm_mem we're carrying is dL/dM_{mem,t+1}. We need to add the
+        // read gradient to it, then flow through DGD backward.
+
+        // dL/dM_mem_read = outer(dy_t, q_t) — gradient from the read y_t = M @ q_t
+        // This adds to dm_mem (which already has dL/dM_{t+1} from the next token's DGD backward)
+        for i in 0..d {
+            for j in 0..d {
+                dm_mem[i * d + j] += dy_t[i] * q_t[j];
+            }
+        }
+
+        // dq_t from read: M_mem_t^T @ dy_t
+        // (transposed matmul: q contributes to y via M @ q, so dq = M^T @ dy)
+        for j in 0..d {
+            let mut sum = 0.0f32;
+            for i in 0..d {
+                sum += m_mem_t[i * d + j] * dy_t[i];
+            }
+            dq_t[j] = sum;
+        }
+
+        // ── Step 2: DGD backward for main memory ──
+        // Forward: M_{mem,t+1} = dgd_step(M_{mem,t}, k_t, v_t, alpha_t, theta_t)
+        // dm_mem currently holds dL/dM_{mem,t+1}
+        let main_grads = crate::dgd::dgd_step_backward(&dm_mem, m_mem_t, k_t, v_t, alpha_t, theta_t, d);
+        dm_mem.copy_from_slice(&main_grads.d_m);
+        let mut dk_t_from_main = main_grads.d_k;
+        let mut dv_t_total = main_grads.d_v;
+        let mut dalpha_total = main_grads.d_alpha;
+        let mut dtheta_total = main_grads.d_theta;
+
+        // ── Step 3: DGD backward for all 5 component memories ──
+        // All use key=x_t, value=v_t
+        // M_alpha
+        let g = crate::dgd::dgd_step_backward(&dm_alpha, m_alpha_t, x_t, v_t, alpha_t, theta_t, d);
+        dm_alpha.copy_from_slice(&g.d_m);
+        let mut dx_t = g.d_k; // dk for component = dx contribution
+        for i in 0..d { dv_t_total[i] += g.d_v[i]; }
+        dalpha_total += g.d_alpha;
+        dtheta_total += g.d_theta;
+
+        // M_eta
+        let g = crate::dgd::dgd_step_backward(&dm_eta, m_eta_t, x_t, v_t, alpha_t, theta_t, d);
+        dm_eta.copy_from_slice(&g.d_m);
+        for i in 0..d { dx_t[i] += g.d_k[i]; }
+        for i in 0..d { dv_t_total[i] += g.d_v[i]; }
+        dalpha_total += g.d_alpha;
+        dtheta_total += g.d_theta;
+
+        // M_q
+        let g = crate::dgd::dgd_step_backward(&dm_q, m_q_t, x_t, v_t, alpha_t, theta_t, d);
+        dm_q.copy_from_slice(&g.d_m);
+        for i in 0..d { dx_t[i] += g.d_k[i]; }
+        for i in 0..d { dv_t_total[i] += g.d_v[i]; }
+        dalpha_total += g.d_alpha;
+        dtheta_total += g.d_theta;
+
+        // M_v
+        let g = crate::dgd::dgd_step_backward(&dm_v, m_v_t, x_t, v_t, alpha_t, theta_t, d);
+        dm_v.copy_from_slice(&g.d_m);
+        for i in 0..d { dx_t[i] += g.d_k[i]; }
+        for i in 0..d { dv_t_total[i] += g.d_v[i]; }
+        dalpha_total += g.d_alpha;
+        dtheta_total += g.d_theta;
+
+        // M_k
+        let g = crate::dgd::dgd_step_backward(&dm_k, m_k_t, x_t, v_t, alpha_t, theta_t, d);
+        dm_k.copy_from_slice(&g.d_m);
+        for i in 0..d { dx_t[i] += g.d_k[i]; }
+        for i in 0..d { dv_t_total[i] += g.d_v[i]; }
+        dalpha_total += g.d_alpha;
+        dtheta_total += g.d_theta;
+
+        // ── Step 4: Gate backward ──
+        // alpha_t = sigmoid(mean(alpha_raw_t))
+        // theta_t = softplus(mean(eta_raw_t))
+        let alpha_raw_t = &cache.alpha_raw[t * d..(t + 1) * d];
+        let eta_raw_t = &cache.eta_raw[t * d..(t + 1) * d];
+        let alpha_mean: f32 = alpha_raw_t.iter().sum::<f32>() / d as f32;
+        let eta_mean: f32 = eta_raw_t.iter().sum::<f32>() / d as f32;
+
+        // dalpha_total → dalpha_mean = dalpha_total * sigmoid'(alpha_mean)
+        let dalpha_mean = dalpha_total * sigmoid_backward(alpha_mean);
+        // dtheta_total → deta_mean = dtheta_total * softplus'(eta_mean) = dtheta_total * sigmoid(eta_mean)
+        let deta_mean = dtheta_total * softplus_backward(eta_mean);
+
+        // d_alpha_raw[i] = dalpha_mean / d (from mean reduction)
+        // d_eta_raw[i] = deta_mean / d
+        let dalpha_per_dim = dalpha_mean / d as f32;
+        let deta_per_dim = deta_mean / d as f32;
+
+        // ── Step 5: Component read backward ──
+        // k_t = M_k_t @ x_t → dk from main memory contributes to dM_k_read and dx
+        // v_t = M_v_t @ x_t → dv_total contributes to dM_v_read and dx
+        // q_t = M_q_t @ x_t → dq_t contributes to dM_q_read and dx
+        // eta_raw = M_eta_t @ x_t → deta_per_dim per element contributes to dM_eta_read and dx
+        // alpha_raw = M_alpha_t @ x_t → dalpha_per_dim per element contributes to dM_alpha_read and dx
+
+        // dk_t_from_main flows back through k_t = M_k_t @ x_t
+        // dM_k += outer(dk_t_from_main, x_t)
+        // dx += M_k_t^T @ dk_t_from_main
+        for i in 0..d {
+            for j in 0..d {
+                dm_k[i * d + j] += dk_t_from_main[i] * x_t[j];
+            }
+        }
+        for j in 0..d {
+            let mut sum = 0.0f32;
+            for i in 0..d {
+                sum += m_k_t[i * d + j] * dk_t_from_main[i];
+            }
+            dx_t[j] += sum;
+        }
+
+        // dv_t_total flows back through v_t = M_v_t @ x_t
+        for i in 0..d {
+            for j in 0..d {
+                dm_v[i * d + j] += dv_t_total[i] * x_t[j];
+            }
+        }
+        for j in 0..d {
+            let mut sum = 0.0f32;
+            for i in 0..d {
+                sum += m_v_t[i * d + j] * dv_t_total[i];
+            }
+            dx_t[j] += sum;
+        }
+
+        // dq_t flows back through q_t = M_q_t @ x_t
+        for i in 0..d {
+            for j in 0..d {
+                dm_q[i * d + j] += dq_t[i] * x_t[j];
+            }
+        }
+        for j in 0..d {
+            let mut sum = 0.0f32;
+            for i in 0..d {
+                sum += m_q_t[i * d + j] * dq_t[i];
+            }
+            dx_t[j] += sum;
+        }
+
+        // d_eta_raw flows back through eta_raw = M_eta_t @ x_t
+        // d_eta_raw is uniform (deta_per_dim per element)
+        for i in 0..d {
+            for j in 0..d {
+                dm_eta[i * d + j] += deta_per_dim * x_t[j];
+            }
+        }
+        for j in 0..d {
+            let mut sum = 0.0f32;
+            for i in 0..d {
+                sum += m_eta_t[i * d + j] * deta_per_dim;
+            }
+            dx_t[j] += sum;
+        }
+
+        // d_alpha_raw flows back through alpha_raw = M_alpha_t @ x_t
+        for i in 0..d {
+            for j in 0..d {
+                dm_alpha[i * d + j] += dalpha_per_dim * x_t[j];
+            }
+        }
+        for j in 0..d {
+            let mut sum = 0.0f32;
+            for i in 0..d {
+                sum += m_alpha_t[i * d + j] * dalpha_per_dim;
+            }
+            dx_t[j] += sum;
+        }
+
+        // Write dx_t to d_embedded
+        d_embedded[t * d..(t + 1) * d].copy_from_slice(&dx_t);
+    }
+
+    let grads = SelfRefParamGrads {
+        d_m_k: dm_k,
+        d_m_v: dm_v,
+        d_m_q: dm_q,
+        d_m_eta: dm_eta,
+        d_m_alpha: dm_alpha,
+        d_m_mem: dm_mem,
+    };
+
+    (d_embedded, grads)
 }
 
 #[cfg(test)]
@@ -488,6 +744,191 @@ mod tests {
 
         // Should be bit-identical
         assert_eq!(k_adaptive, k_static, "M_k=W_K should give same projection");
+    }
+
+    /// Helper: compute scalar loss = sum(y^2) / 2 for simple gradient checking.
+    fn simple_loss(y: &[f32]) -> f32 {
+        y.iter().map(|x| x * x).sum::<f32>() / 2.0
+    }
+
+    /// Helper: d_y for loss = sum(y^2)/2 is just y.
+    fn simple_dloss(y: &[f32]) -> Vec<f32> {
+        y.to_vec()
+    }
+
+    #[test]
+    fn test_self_ref_backward_produces_gradients() {
+        let d = 4;
+        let seq_len = 2;
+        let mut state = SelfRefState::new(d);
+        for i in 0..d { state.m_k[i * d + i] = 0.1; }
+        for i in 0..d { state.m_v[i * d + i] = 0.1; }
+        for i in 0..d { state.m_q[i * d + i] = 0.1; }
+        for i in 0..d { state.m_eta[i * d + i] = 0.5; }
+        for i in 0..d { state.m_alpha[i * d + i] = 0.5; }
+        let mut m_mem = vec![0.0f32; d * d];
+        for i in 0..d { m_mem[i * d + i] = 0.1; }
+
+        let embedded: Vec<f32> = (0..seq_len * d).map(|i| (i as f32) * 0.1 + 0.05).collect();
+
+        let (y, cache) = self_ref_step(&mut state, &mut m_mem, &embedded, seq_len, d);
+        let d_y = simple_dloss(&y);
+        let (d_embedded, grads) = self_ref_step_backward(&cache, &d_y);
+
+        // d_embedded should be nonzero
+        let de_norm: f32 = d_embedded.iter().map(|x| x * x).sum();
+        assert!(de_norm > 1e-10, "d_embedded should be nonzero, norm={de_norm}");
+
+        // Initial state gradients should be nonzero (can be very small with these init values)
+        let dk_norm: f32 = grads.d_m_k.iter().map(|x| x * x).sum();
+        assert!(dk_norm > 0.0, "dM_k should be nonzero, norm={dk_norm}");
+        let dmem_norm: f32 = grads.d_m_mem.iter().map(|x| x * x).sum();
+        assert!(dmem_norm > 0.0, "dM_mem should be nonzero, norm={dmem_norm}");
+    }
+
+    #[test]
+    fn test_self_ref_backward_fd_check_embedded() {
+        // Finite-difference gradient check for d_embedded.
+        let d = 4;
+        let seq_len = 2;
+        let eps = 1e-3f32;
+        let tol = 0.05; // 5% relative tolerance
+
+        let embedded: Vec<f32> = (0..seq_len * d).map(|i| (i as f32) * 0.1 + 0.05).collect();
+
+        // Compute analytical gradient
+        let mut state0 = SelfRefState::new(d);
+        for i in 0..d { state0.m_k[i * d + i] = 0.1; }
+        for i in 0..d { state0.m_v[i * d + i] = 0.1; }
+        for i in 0..d { state0.m_q[i * d + i] = 0.1; }
+        for i in 0..d { state0.m_eta[i * d + i] = 0.3; }
+        for i in 0..d { state0.m_alpha[i * d + i] = 0.3; }
+        let m_mem0: Vec<f32> = (0..d * d).map(|i| if i / d == i % d { 0.1 } else { 0.0 }).collect();
+
+        let mut s = state0.clone();
+        let mut mm = m_mem0.clone();
+        let (y, cache) = self_ref_step(&mut s, &mut mm, &embedded, seq_len, d);
+        let loss0 = simple_loss(&y);
+        let d_y = simple_dloss(&y);
+        let (d_embedded, _) = self_ref_step_backward(&cache, &d_y);
+
+        // FD check for each element of embedded
+        let mut max_err = 0.0f32;
+        for idx in 0..embedded.len() {
+            let mut perturbed = embedded.clone();
+            perturbed[idx] += eps;
+
+            let mut s = state0.clone();
+            let mut mm = m_mem0.clone();
+            let (y_p, _) = self_ref_step(&mut s, &mut mm, &perturbed, seq_len, d);
+            let loss_p = simple_loss(&y_p);
+
+            let fd_grad = (loss_p - loss0) / eps;
+            let ana_grad = d_embedded[idx];
+
+            let abs_diff = (fd_grad - ana_grad).abs();
+            let denom = fd_grad.abs().max(ana_grad.abs()).max(1e-8);
+            let rel_err = abs_diff / denom;
+
+            if ana_grad.abs() > 1e-4 {
+                max_err = max_err.max(rel_err);
+            }
+        }
+        assert!(max_err < tol, "FD check failed for d_embedded: max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_self_ref_backward_fd_check_initial_mk() {
+        // Finite-difference check for dM_{k,0}.
+        let d = 4;
+        let seq_len = 2;
+        let eps = 1e-3f32;
+        let tol = 0.05;
+
+        let embedded: Vec<f32> = (0..seq_len * d).map(|i| (i as f32) * 0.1 + 0.05).collect();
+
+        let mut state0 = SelfRefState::new(d);
+        for i in 0..d { state0.m_k[i * d + i] = 0.1; }
+        for i in 0..d { state0.m_v[i * d + i] = 0.1; }
+        for i in 0..d { state0.m_q[i * d + i] = 0.1; }
+        for i in 0..d { state0.m_eta[i * d + i] = 0.3; }
+        for i in 0..d { state0.m_alpha[i * d + i] = 0.3; }
+        let m_mem0: Vec<f32> = (0..d * d).map(|i| if i / d == i % d { 0.1 } else { 0.0 }).collect();
+
+        let mut s = state0.clone();
+        let mut mm = m_mem0.clone();
+        let (y, cache) = self_ref_step(&mut s, &mut mm, &embedded, seq_len, d);
+        let loss0 = simple_loss(&y);
+        let d_y = simple_dloss(&y);
+        let (_, grads) = self_ref_step_backward(&cache, &d_y);
+
+        let mut max_err = 0.0f32;
+        for idx in 0..(d * d) {
+            let mut sp = state0.clone();
+            sp.m_k[idx] += eps;
+            let mut mm = m_mem0.clone();
+            let (y_p, _) = self_ref_step(&mut sp, &mut mm, &embedded, seq_len, d);
+            let loss_p = simple_loss(&y_p);
+
+            let fd_grad = (loss_p - loss0) / eps;
+            let ana_grad = grads.d_m_k[idx];
+
+            let abs_diff = (fd_grad - ana_grad).abs();
+            let denom = fd_grad.abs().max(ana_grad.abs()).max(1e-8);
+            let rel_err = abs_diff / denom;
+
+            if ana_grad.abs() > 1e-4 {
+                max_err = max_err.max(rel_err);
+            }
+        }
+        assert!(max_err < tol, "FD check failed for dM_k: max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_self_ref_backward_fd_check_initial_m_mem() {
+        // Finite-difference check for dM_{mem,0}.
+        let d = 4;
+        let seq_len = 2;
+        let eps = 1e-3f32;
+        let tol = 0.05;
+
+        let embedded: Vec<f32> = (0..seq_len * d).map(|i| (i as f32) * 0.1 + 0.05).collect();
+
+        let mut state0 = SelfRefState::new(d);
+        for i in 0..d { state0.m_k[i * d + i] = 0.1; }
+        for i in 0..d { state0.m_v[i * d + i] = 0.1; }
+        for i in 0..d { state0.m_q[i * d + i] = 0.1; }
+        for i in 0..d { state0.m_eta[i * d + i] = 0.3; }
+        for i in 0..d { state0.m_alpha[i * d + i] = 0.3; }
+        let m_mem0: Vec<f32> = (0..d * d).map(|i| if i / d == i % d { 0.1 } else { 0.0 }).collect();
+
+        let mut s = state0.clone();
+        let mut mm = m_mem0.clone();
+        let (y, cache) = self_ref_step(&mut s, &mut mm, &embedded, seq_len, d);
+        let loss0 = simple_loss(&y);
+        let d_y = simple_dloss(&y);
+        let (_, grads) = self_ref_step_backward(&cache, &d_y);
+
+        let mut max_err = 0.0f32;
+        for idx in 0..(d * d) {
+            let mut s = state0.clone();
+            let mut mm = m_mem0.clone();
+            mm[idx] += eps;
+            let (y_p, _) = self_ref_step(&mut s, &mut mm, &embedded, seq_len, d);
+            let loss_p = simple_loss(&y_p);
+
+            let fd_grad = (loss_p - loss0) / eps;
+            let ana_grad = grads.d_m_mem[idx];
+
+            let abs_diff = (fd_grad - ana_grad).abs();
+            let denom = fd_grad.abs().max(ana_grad.abs()).max(1e-8);
+            let rel_err = abs_diff / denom;
+
+            if ana_grad.abs() > 1e-4 {
+                max_err = max_err.max(rel_err);
+            }
+        }
+        assert!(max_err < tol, "FD check failed for dM_mem: max_rel_err={max_err:.4e}");
     }
 
     #[test]

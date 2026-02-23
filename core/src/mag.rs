@@ -19,7 +19,7 @@ use crate::lattice_osr::{LatticeOSR, LatticeCache, lattice_read_only, lattice_re
 use crate::trellis::{Trellis, TrellisCache, trellis_read_only, trellis_read_only_backward};
 use crate::atlas_omega::{AtlasOmega, AtlasOmegaCache};
 use crate::conductor::{Pulse, ContextState, ErrorBuffer};
-use crate::self_ref::{SelfRefCache, ProjectionKind, self_ref_step, self_ref_read_only};
+use crate::self_ref::{SelfRefCache, ProjectionKind, self_ref_step, self_ref_step_backward, self_ref_read_only};
 use crate::dynamic_freq::{
     FrequencySchedule, FreqGateCache,
     mean_pool, compute_freq_gates, apply_threshold, should_anneal,
@@ -291,7 +291,12 @@ pub fn mag_backward(
         MemoryCache::Atlas(atlas_cache) => {
             AtlasOmega.step_backward(&params.levels[0], atlas_cache, &d_y, &cache.embedded)
         }
-        MemoryCache::SelfRef(_) => unreachable!("SelfRef backward not yet implemented"),
+        MemoryCache::SelfRef(sr_cache) => {
+            let (d_emb, _sr_grads) = self_ref_step_backward(sr_cache, &d_y);
+            // SelfRef initial state gradients stored in _sr_grads (wired in PR 4).
+            // Static projection weights (w_k_mem etc.) unused in Adaptive mode → zero grads.
+            (crate::model::MemoryLevelParams::zeros_like(d), d_emb)
+        }
     };
 
     // Accumulate memory parameter gradients into level 0
@@ -1049,7 +1054,10 @@ pub fn cms_backward(
                 MemoryCache::Atlas(atlas_cache) => {
                     AtlasOmega.step_backward(&params.levels[level], atlas_cache, &d_y_combined, &cache.embedded)
                 }
-                MemoryCache::SelfRef(_) => unreachable!("SelfRef backward not yet implemented"),
+                MemoryCache::SelfRef(sr_cache) => {
+                    let (d_emb, _sr_grads) = self_ref_step_backward(sr_cache, &d_y_combined);
+                    (crate::model::MemoryLevelParams::zeros_like(d), d_emb)
+                }
             };
             grads.levels[level].accumulate(&mem_grads);
             for i in 0..(s * d) {
