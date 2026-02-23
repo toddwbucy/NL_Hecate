@@ -261,6 +261,13 @@ pub fn dgd_sherman_morrison(m: &mut [f32], k: &[f32], v: &[f32], eta: f32, d: us
     debug_assert_eq!(k.len(), d);
     debug_assert_eq!(v.len(), d);
 
+    // SM derivation assumes ||k|| ≈ 1 (normalized by layer-norm).
+    let k_norm_sq: f32 = k.iter().map(|x| x * x).sum();
+    debug_assert!(
+        (k_norm_sq - 1.0).abs() < 0.1,
+        "dgd_sherman_morrison requires normalized k: ||k||^2 = {k_norm_sq:.4}"
+    );
+
     let eta_prime = eta / (1.0 + eta);
 
     // Compute M @ k first (before modifying M)

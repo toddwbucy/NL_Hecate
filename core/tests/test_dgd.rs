@@ -93,14 +93,13 @@ fn test_dgd_momentum_step() {
     assert!(s_norm > 1e-6, "S should accumulate momentum, norm = {s_norm}");
 
     // Step 2: S should accumulate (beta * S_prev + theta * grad_new)
-    let _s_after_1 = s.clone();
+    let s_after_1 = s.clone();
     let error2 = dgd_error(&m, &k, &v, d);
     dgd_momentum_step(&mut m, &mut s, &error2, &k, alpha, theta, beta, d);
 
-    // S[0] should be beta * s_after_1[0] + theta * new_grad[0]
-    // We just verify it changed and is larger in magnitude (accumulation)
-    let s_norm_2: f32 = s.iter().map(|x| x * x).sum();
-    assert!(s_norm_2 > 0.0, "S should continue to accumulate");
+    // Verify S changed from step 1 (momentum accumulation with beta=0.9)
+    let s_changed = s.iter().zip(s_after_1.iter()).any(|(a, b)| (a - b).abs() > 1e-10);
+    assert!(s_changed, "S should change between momentum steps");
 }
 
 // ── Test 4: Sherman-Morrison matches dgd_step for L2 ────────────────
