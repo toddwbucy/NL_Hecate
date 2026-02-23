@@ -7,12 +7,13 @@ This document provides the single authoritative view of project progress and upc
 The project is organized into **Stages**, each containing **Milestones**. No two milestones share a name.
 
 ```
-Stage 0:  Foundation            — Toolchain, spike, pipeline validation
-Stage 1:  Algorithm Core        — Memory rules, compositions, scheduling, parallelization
-Stage 2:  Production Infra      — Multi-GPU, serving, compilation, deployment
-Stage 3:  Extensions            — Pluggable retention, M3 optimizer, CMS variants
-Stage 3b: Primitive Completeness — Remaining MIRAS knobs, self-referential architecture, Hope
-Stage 4:  MVP                   — Build a model, serve it locally
+Stage 0:  Foundation              — Toolchain, spike, pipeline validation
+Stage 1:  Algorithm Core          — Memory rules, compositions, scheduling, parallelization
+Stage 2:  Production Infra        — Multi-GPU, serving, compilation, deployment
+Stage 3:  Extensions              — Pluggable retention, M3 optimizer, CMS variants
+Stage 3b: Primitive Completeness  — Split: Critical (HOPE path) + Deferred (Stage 5)
+Stage 4:  MVP                     — Build a model, serve it locally
+Stage 5:  MIRAS Completeness      — Deferred S3b primitives (post-HOPE)
 ```
 
 ---
@@ -323,7 +324,12 @@ The NL paper suite defines ~50 primitives. Stages 1–3 implemented 26. This sta
 
 The Hope architecture (self-modifying Titans + CMS) is the castle. These are the lego pieces. All specs confirmed present on disk in `specs/` and recorded in HADES `hecate_specs` collection.
 
-### Phase 1 — Inner-Loop Algorithm Knobs ✍️ SPECS COMPLETE
+**Important**: Following the 2026-02-22 committee review, S3b is split into two tracks. **S3b-Critical** contains only the primitives required for the HOPE architecture. **S3b-Deferred** contains MIRAS design-space completeness work that is valuable but does not block the primary path. See `docs/committee_response.md` for the full rationale.
+
+### Spec Catalog (all 20 specs, unchanged)
+
+<details>
+<summary>Phase 1 — Inner-Loop Algorithm Knobs ✍️ SPECS COMPLETE</summary>
 
 The MIRAS Algorithm knob currently has {GD, GD+Momentum}. The papers define at least 5 more.
 
@@ -337,7 +343,10 @@ The MIRAS Algorithm knob currently has {GD, GD+Momentum}. The papers define at l
 
 **DGD is the highest priority** — it's the core inner-loop optimizer for Hope. The update depends on both the current input AND the current memory state M, making it fundamentally more expressive than plain GD. The HOPE ablation shows ~1.2 ppl cost for removing it.
 
-### Phase 2 — Retention & Bias Gaps ✍️ SPECS COMPLETE
+</details>
+
+<details>
+<summary>Phase 2 — Retention & Bias Gaps ✍️ SPECS COMPLETE</summary>
 
 The pluggable retention system (S3-M1) provides the dispatch infrastructure. These specs fill the missing variants.
 
@@ -350,7 +359,10 @@ The pluggable retention system (S3-M1) provides the dispatch infrastructure. The
 | **S3b-S10** | KL attentional bias | MIRAS (2504.13173) §5.1 (theoretical) | `specs/algorithms/attentional_biases/02_kl_objective.md` | SPEC COMPLETE |
 | **S3b-S11** | Generic l_p bias dispatch | MIRAS (2504.13173) §5.1 Eq 11 | `specs/algorithms/attentional_biases/03_lp_dispatch.md` | SPEC COMPLETE |
 
-### Phase 3 — Self-Referential Architecture ✍️ SPECS COMPLETE
+</details>
+
+<details>
+<summary>Phase 3 — Self-Referential Architecture ✍️ SPECS COMPLETE</summary>
 
 The central HOPE contribution. Requires Phase 1 (DGD) **implementation** as a prerequisite — self-modifying without DGD is a roof without walls. Specs are ready; wait on S3b-M1 before starting S3b-M3.
 
@@ -361,7 +373,10 @@ The central HOPE contribution. Requires Phase 1 (DGD) **implementation** as a pr
 | **S3b-S14** | Higher-order feature maps φ(k) | HOPE (2512.24695) §4.5 extension | `specs/algorithms/self_referential/02_feature_maps.md` | SPEC COMPLETE |
 | **S3b-S15** | Chunkwise training for self-ref Titans | HOPE (2512.24695) §8.2 | `specs/algorithms/self_referential/03_chunkwise_self_ref.md` | SPEC COMPLETE |
 
-### Phase 4 — Outer-Loop & Architectural Gaps ✍️ SPECS COMPLETE
+</details>
+
+<details>
+<summary>Phase 4 — Outer-Loop & Architectural Gaps ✍️ SPECS COMPLETE</summary>
 
 | Spec | Primitive | Paper Source | Spec Path | Status |
 |------|-----------|-------------|-----------|--------|
@@ -371,50 +386,69 @@ The central HOPE contribution. Requires Phase 1 (DGD) **implementation** as a pr
 | **S3b-S19** | Short Conv1D on keys/queries | Atlas (2505.23735), modern convention | `specs/infrastructure/attention/02_short_conv.md` | SPEC COMPLETE |
 | **S3b-S20** | Hope composition (self-mod Titans + CMS) | HOPE (2512.24695) §8.3 | `specs/algorithms/composition_patterns/04_hope.md` | SPEC COMPLETE |
 
-### Implementation Milestones (unblocked — all specs are done)
+</details>
 
-Specs are written and approved. Implementation can start immediately.
+### S3b-Critical: HOPE Path (implementation milestones)
 
-| Milestone | Implements Specs | Description | Dependencies | Status |
-|-----------|-----------------|-------------|-------------|--------|
-| **S3b-M1: Algorithm Knob Expansion** | S3b-S1 through S3b-S5 | DGD, DMGD, FTRL, implicit GD, NS inner. New `AlgorithmKind` enum or extend existing rule dispatch. | Specs complete ✓ | NOT STARTED |
-| **S3b-M2: Retention & Bias Completion** | S3b-S6 through S3b-S11 | Bregman, L_q, sigmoid-bounded retention. l_1, KL bias. Generic l_p dispatch. | Specs complete ✓ | NOT STARTED |
-| **S3b-M3: Self-Referential Primitives** | S3b-S12 through S3b-S15 | M_k/M_v/M_q memory modules replacing W projections. Feature maps. Chunkwise parallel. | S3b-M1 (DGD impl required first) | NOT STARTED |
-| **S3b-M4: Outer-Loop & Architectural** | S3b-S16 through S3b-S20 | AdamW, AdaMuon, short conv, Hope composition. (S3b-S18 impl already done via S3-M4.) | Specs complete ✓ | NOT STARTED |
+These are the primitives required to build the HOPE architecture. They run after S4-M7 validates the existing pipeline.
+
+| Milestone | Implements Specs | HADES Task(s) | Dependencies | Status |
+|-----------|-----------------|---------------|-------------|--------|
+| **S3b-M1: DGD** | S3b-S1 only | `task_38485e` (GAP-I) | S4-M7 (validate pipeline first) | NOT STARTED |
+| **S3b-M3: Self-Referential Primitives** | S3b-S12 through S3b-S15 | `task_929845` (GAP-L: projections), `task_eb31fd` (GAP-M: self-gen values), `task_79f2c5` (GAP-E: feature maps), `task_4a9b1d` (GAP-N: chunkwise) | S3b-M1 (DGD impl required first) | NOT STARTED |
+| **S3b-M4-critical: Outer-Loop & HOPE** | S3b-S16, S3b-S19, S3b-S20 | **AdamW impl: MISSING**, **Conv1D impl: MISSING**, **HOPE composition impl: MISSING** (specs written, closed: `task_013b41`, `task_f903ab`) | S3b-S16/S19 parallel with M1; S3b-S20 blocked on M3 | NOT STARTED |
+
+### S3b-Deferred: MIRAS Completeness (Stage 5 — post-HOPE)
+
+These primitives complete the MIRAS design space but are not required for the HOPE architecture. They will be implemented after the HOPE model is building and serving successfully.
+
+| Milestone | Implements Specs | HADES Task(s) | Status |
+|-----------|-----------------|---------------|--------|
+| **S3b-M1-deferred: Algorithm Knobs** | S3b-S2, S3b-S3, S3b-S4, S3b-S5 | `task_544d8d` (GAP-J: Implicit GD), `task_c48b71` (GAP-K: FTRL) | DEFERRED (Stage 5) |
+| **S3b-M2: Retention & Bias** | S3b-S6 through S3b-S11 | `task_60e757` (GAP-F: Bregman), `task_eb6a4f` (GAP-G: L_q), `task_f18e65` (GAP-H: sigmoid), `task_667d92` (GAP-D: KL bias) | DEFERRED (Stage 5) |
+| **S3b-M4-deferred: AdaMuon** | S3b-S17 | **MISSING** | DEFERRED (Stage 5) |
 
 ### Priority Order
 
 ```text
-START HERE:
-Phase 1 Implementation (S3b-M1)     ─── DGD first (unlocks self-ref), then DMGD/FTRL/Implicit GD/NS in parallel
-    │
-    ├─► Phase 2 Implementation (S3b-M2) ─── independent of Phase 1, run in parallel
-    │
-    ├─► Phase 4 Implementation (S3b-M4) ─── AdamW/AdaMuon/short conv, independent of Phase 3
+S4-M7: Primitive Validation (IMMEDIATE — run first)
     │
     ▼
-Phase 3 Implementation (S3b-M3)     ─── needs DGD impl from S3b-M1 (the castle walls)
+S3b-M1: DGD (Critical Path)
+    │
+    ├─► S3b-S16: AdamW outer-loop (parallel)
+    ├─► S3b-S19: Short Conv1D (parallel)
     │
     ▼
-Hope Architecture (S3b-S20 impl)    ─── the castle, unlocks S4 Phase 2
+S3b-M3: Self-Referential Primitives (needs DGD)
+    │
+    ▼
+S3b-S20: HOPE Composition (the castle, unlocks S4 Phase 2)
+
+                    ┌──────────────────────────────┐
+                    │ S3b-Deferred (Stage 5)       │
+                    │ Post-HOPE: DMGD, FTRL,       │
+                    │ Implicit GD, NS inner,       │
+                    │ Bregman, L_q, sigmoid ret.,   │
+                    │ KL bias, l_p dispatch,        │
+                    │ AdaMuon                       │
+                    └──────────────────────────────┘
 ```
 
 ---
 
-## Open Blockers (HADES `hope_blockers`)
+## Resolved & Deferred Blockers (HADES `hope_blockers`)
 
-Four critical blocking gaps extracted from the NL paper suite during initial graph construction. Three affect the **brain transplant** path (converting a pre-trained Llama into a HOPE model — §7.3). One affects frequency assignment (partially resolved by S3-M5).
+Four blocking gaps were extracted from the NL paper suite during initial graph construction. Two have been empirically resolved through implementation work. Two affect only the **brain transplant** path (converting a pre-trained Llama into HOPE) and are deferred — the from-scratch HOPE training path is the primary path and is unblocked.
 
-These do not block S3b implementation or S4-M7. They must be resolved before **S4-M13** (HOPE Model Config) if the brain transplant path is used. The from-scratch HOPE training path (primary S4 Phase 2 path) is unblocked.
+**Brain transplant is community-scope, not project-scope.** The from-scratch HOPE training path (S4 Phase 2) does not require brain transplant. If community contributors want to explore Llama→HOPE conversion, the two deferred blockers document the open questions.
 
-| Blocker | Paper Section | Severity | Status | Resolution Notes |
-|---------|--------------|----------|--------|-----------------|
-| **How many CMS frequency levels (k)?** | §7.3 | critical | OPEN (empirically resolved) | k=2 tested in S1-M2, k=4 in S1-M3. Empirical default: k=4 `[1,8,64,512]`. Paper does not specify; we chose powers of 2. |
-| **How to assign f_i to each CMS level?** | §7.3 | critical | OPEN (empirically resolved) | S3-M5 (`dynamic_freq.rs`) adds learned sigmoid gates. Fixed default `[1,8,64,512]` from geometric spacing. Paper references Eq 71 but gives no formula. |
-| **Which Llama layers to use for brain transplant?** | §7.3 | critical | OPEN | Paper says "Given k pre-trained MLPs…" without specifying layer indices. Resolution: even spacing, log spacing, or boundary alignment — needs experiment. Blocks brain transplant path only. |
-| **What happens to Llama attention layers in brain transplant?** | §7.3 | critical | OPEN | Paper discusses MLPs only; attention layers unaddressed. HOPE-Attention variant may answer this. Blocks brain transplant path only. |
-
-**Action**: The two empirically resolved blockers (k and f_i) should be marked resolved in HADES once the empirical defaults are documented. The two brain transplant blockers require experiments and are deferred to S4 Phase 2 planning.
+| Blocker | Paper Section | Status | Resolution |
+|---------|--------------|--------|------------|
+| **How many CMS frequency levels (k)?** | §7.3 | **RESOLVED** | k=4 is the empirical default since S1-M3. `[1,8,64,512]` geometric spacing. S3-M5 adds learned gates for dynamic selection. |
+| **How to assign f_i to each CMS level?** | §7.3 | **RESOLVED** | Fixed `[1,8,64,512]` from geometric spacing (S1-M3). S3-M5 (`dynamic_freq.rs`) adds learned sigmoid gates as alternative. |
+| **Which Llama layers to use for brain transplant?** | §7.3 | **DEFERRED** | Brain transplant path only. Paper says "Given k pre-trained MLPs..." without specifying layer indices. Out of scope for primary training path. |
+| **What happens to Llama attention layers in brain transplant?** | §7.3 | **DEFERRED** | Brain transplant path only. Paper discusses MLPs only. Out of scope for primary training path. |
 
 ---
 
@@ -490,20 +524,34 @@ Concrete model configuration proving the build→serve pipeline works end-to-end
 
 ---
 
-### S4-M7: Primitive Validation (PLANNED)
+### S4-M7: Primitive Validation (IMMEDIATE — run before S3b)
 
-Run the toy_60m config end-to-end as a regression checkpoint for the pre-S3b primitive set. This validates that the build→serve pipeline works with existing primitives (Titans LMM + MAG + k=2 CMS + plain SGD outer-loop + byte tokenizer). It does NOT validate the HOPE architecture — that is S4 Phase 2.
+**HADES task**: `task_e4aab3`
 
-Success criteria:
-1. Loss converges (byte-level CE from ~5.5 to <4.0)
-2. No NaN/Inf through 5000 steps
-3. k=2 matches or beats k=1 baseline
-4. Checkpoint save → load → continue with no loss spike
-5. Serve generates coherent byte sequences
+**Elevated to immediate priority per 2026-02-22 committee review.** The build pipeline exists and is idle. Three specific risks need validation before adding DGD/self-referential complexity: (1) Wengert tape memory at 60M scale, (2) CMS 1/sqrt(k) normalization in a real network, (3) MLP inner-loop dominance at scale.
+
+Run `curriculum_100k.json` (d=1024, k=4, 100K steps) or equivalent end-to-end. This validates that the build→serve pipeline works with existing primitives (Titans LMM + MAG + k=4 CMS + plain SGD outer-loop + byte tokenizer). It does NOT validate the HOPE architecture — that is S4 Phase 2.
+
+Success criteria (hard thresholds — pre-committed, do not adjust post-hoc):
+
+| Criterion | Hard Threshold | Stop-the-Line |
+|-----------|---------------|---------------|
+| **Loss convergence** | Validation loss must decrease by ≥15% between step 50K and step 100K | If <10% decrease, pipeline is broken |
+| **No NaN/Inf** | Zero NaN/Inf values in any tensor through full run | Any NaN = immediate stop |
+| **CMS Level 3 gate activity** | Level 3 (slowest, every 512 steps) must fire with non-degenerate gate ≥50 times over the full run | If <25 active fires over full run, CMS is degenerate |
+| **Wengert tape memory scaling** | Memory per token must not exceed 1.1× increase across seq_len 512→2048 | If ≥1.2× increase, tape has quadratic leak |
+| **Checkpoint roundtrip** | Loss after restore must be within 1e-6 of loss before save | Any deviation = serialization bug |
+| **Serve output** | Log generated text after build completes (informational only — coherent text is NOT expected from pre-HOPE primitives) | N/A — this run validates pipeline engineering, not model quality |
+
+Additional deliverables (from committee behavioral probe recommendations):
+- **Per-level diagnostics**: gate activity, memory norms, gradient norms per CMS level logged to JSONL
+- **Wengert tape profiling**: memory consumption and backward-vs-forward time ratio
+- **Forget Gate Probe**: add to `test_cms.rs` — feed contradictory sequence, assert fast levels update faster than slow levels
+- **Curriculum Integration Probe**: per-phase loss tracking at distribution boundaries
 
 **Dependencies**: S4-M6 (model design + config)
-**Note**: Can proceed in parallel with S3b spec work. Low-priority relative to S3b.
-**Status**: NOT STARTED
+**Blocks**: S3b-M1 (validate pipeline before adding DGD complexity)
+**Status**: NOT STARTED — IMMEDIATE PRIORITY
 
 ---
 
@@ -512,6 +560,8 @@ Success criteria:
 These milestones become active as S3b delivers its primitives. They cannot be fully specced until S3b specs are written — the scope below is the known shape.
 
 ### S4-M9: Multi-Block CMS Execution Engine (PLANNED)
+
+**HADES task**: MISSING — create when S3b-M4 (HOPE composition) is delivered
 
 S3-M3 (CMS Variants) built the configuration schema and validation for 5 deployment patterns (Basic, Nested, Sequential, Independent, Hybrid). What is missing is the actual execution engine that runs multiple blocks with independent or hierarchical CMS schedules.
 
@@ -528,6 +578,8 @@ S3-M3 (CMS Variants) built the configuration schema and validation for 5 deploym
 
 ### S4-M10: DGD Inner-Loop Build Path (PLANNED)
 
+**HADES task**: MISSING — create after S3b-M1 is delivered
+
 Replace plain gradient descent in the inner loop with DGD (Delta Gradient Descent). DGD's update depends on both the current input AND the current memory state M — making it fundamentally more expressive than plain GD. The HOPE ablation shows ~1.2 ppl cost for removing it.
 
 **What this delivers**:
@@ -541,6 +593,8 @@ Replace plain gradient descent in the inner loop with DGD (Delta Gradient Descen
 ---
 
 ### S4-M11: Self-Referential Build (PLANNED)
+
+**HADES task**: MISSING — create after S3b-M3 is delivered
 
 Replace fixed W_Q/W_K/W_V projection matrices with memory-derived projections (M_k, M_v, M_q from HOPE §8.1 Eq 79-85). The memory matrices project their own keys, values, and queries — the model's attention is computed from what the memory has learned, not from fixed outer-loop weights.
 
@@ -557,6 +611,8 @@ Replace fixed W_Q/W_K/W_V projection matrices with memory-derived projections (M
 
 ### S4-M12: AdamW / AdaMuon Outer-Loop (PLANNED)
 
+**HADES task**: MISSING — create after S3b-S16 impl is delivered
+
 Replace plain SGD in `build.py` with AdamW or AdaMuon for the outer-loop weight updates. Plain SGD does not scale to real builds. The outer-loop optimizer choice does not violate IS/IS NOT — AdamW applies to the outer (slow) loop parameters, not the inner (fast) memory updates.
 
 **What this delivers**:
@@ -570,6 +626,8 @@ Replace plain SGD in `build.py` with AdamW or AdaMuon for the outer-loop weight 
 ---
 
 ### S4-M13: HOPE Model Config (PLANNED)
+
+**HADES task**: MISSING — create after S4-M10/M11/M12 + S3b-S20 delivered
 
 The full HOPE architecture config: self-referential Titans + DGD inner-loop + k=4 CMS + AdamW outer-loop. This replaces `toy_60m.json` as the primary build target.
 
@@ -585,6 +643,8 @@ The full HOPE architecture config: self-referential Titans + DGD inner-loop + k=
 ---
 
 ### S4-M14: HOPE End-to-End Validation (PLANNED)
+
+**HADES task**: MISSING — create after S4-M13 delivered
 
 Run the `hope_Nm.json` config end-to-end. This is the real build hardening milestone — the HOPE architecture working, not the toy_60m scaffolding.
 
@@ -635,6 +695,26 @@ Replace the hand-written `cms_backward()` gradient path with the Wengert tape-ba
 
 ---
 
+## Behavioral Validation
+
+967 tests validate code correctness (matrix math, gradient parity, serialization roundtrips). Only 1 test (`test_k2_beats_k1_multiscale`) validates learning physics. The following probes address this gap. Each is tied to a specific milestone and validates a distinct learning property.
+
+| Probe | What it validates | When implemented | Location |
+|-------|-------------------|------------------|----------|
+| **Forget Gate Probe** | CMS frequency separation — fast levels update faster than slow levels on contradictory input | S4-M7 | `test_cms.rs` |
+| **Loss Monotonicity Probe** | DGD inner-loop loss decreases monotonically across optimization steps within a single forward pass | S3b-M1 (DGD) | `test_dgd.rs` (new) |
+| **Curriculum Integration Probe** | Model does not catastrophically forget previous distribution at curriculum phase boundaries | S4-M7 | `build.py` logging |
+
+**Forget Gate Probe**: Feed a contradictory sequence (A=1 for N steps, then A=2 for N steps). After the switch, Level 0 (fires every step) should converge to A=2 faster than Level 1 (fires every 8th step). This validates the core CMS claim: higher-frequency levels adapt faster to new information.
+
+**Loss Monotonicity Probe**: When DGD is implemented (S3b-M1), add a runtime assertion that the inner-loop loss decreases monotonically across DGD's optimization steps. If loss oscillates within the inner loop, the test fails even if the matrix math is correct. This directly validates HOPE Eq 88.
+
+**Curriculum Integration Probe**: During S4-M7 validation, log eval loss on BOTH the outgoing and incoming distribution at every curriculum phase boundary. Verify the model does not catastrophically forget — some regression is expected, catastrophic collapse is a bug.
+
+**Policy**: Probes are added going forward for new primitives and validation runs. We are NOT retroactively adding behavioral probes to existing Stage 1-3 primitives as CI gates.
+
+---
+
 ## Dependency Graph
 
 ```
@@ -666,28 +746,98 @@ Stage 1: Algorithm Core ──────────────────�
                     ├─► S4-M4: Serve Script ──── COMPLETE (PR #38)
                     └─► S4-M5: Declared Ckpt ─── COMPLETE (PR #39)
                             └─► S4-M6: Model Design (toy_60m) ── COMPLETE
-                                    └─► S4-M7: Primitive Validation ── PLANNED (parallel with S3b)
-
-── S3b ─────────────────────────────── SPECS COMPLETE, IMPL NOT STARTED
-    │   (all 20 specs written; 4 impl milestones pending)
-    ├─► S3b-M1: Algorithm Knobs (DGD, DMGD, FTRL…) ── START HERE
+                                    │
+                                    ▼
+                    ┌─► S4-M7: Primitive Validation ── ★ IMMEDIATE ★
+                    │       + Forget Gate Probe
+                    │       + Curriculum Integration Probe
+                    │       + Tape profiling
+                    │
+                    ▼
+── S3b-Critical ────────────────────── HOPE PATH (blocked on S4-M7)
+    │
+    ├─► S3b-M1: DGD ──────────────────── START HERE (after S4-M7)
+    │       │   + Loss Monotonicity Probe
     │       └─► S4-M10: DGD Build Path ── PLANNED
     │               └─► S4-M11: Self-Referential Build ── PLANNED (needs S3b-M3)
     │
-    ├─► S3b-M2: Retention & Bias Completion ── (parallel with S3b-M1)
+    ├─► S3b-S16: AdamW outer-loop ─────── (parallel with S3b-M1)
+    │       └─► S4-M12: AdamW Outer-Loop ── PLANNED
     │
-    ├─► S3b-M3: Self-Referential Primitives ── (needs S3b-M1 impl)
+    ├─► S3b-S19: Short Conv1D ─────────── (parallel with S3b-M1)
     │
-    └─► S3b-M4: Outer-Loop & Architectural ── (parallel with S3b-M1)
-            └─► S4-M12: AdamW/AdaMuon Outer-Loop ── PLANNED
-                    │
-                    (S4-M10 + S4-M11 + S4-M12 + S3b-S20)
-                    │
-                    └─► S4-M13: HOPE Model Config ── PLANNED
-                            └─► S4-M14: HOPE End-to-End Validation ── PLANNED
+    ├─► S3b-M3: Self-Referential ──────── (needs S3b-M1 impl)
+    │
+    └─► S3b-S20: HOPE Composition ─────── (needs S3b-M3)
+            │
+            (S4-M10 + S4-M11 + S4-M12 + S3b-S20)
+            │
+            └─► S4-M13: HOPE Model Config ── PLANNED
+                    └─► S4-M14: HOPE End-to-End Validation ── PLANNED
+
+── S3b-Deferred (Stage 5) ─────────── POST-HOPE
+    ├─► DMGD, FTRL, Implicit GD, NS inner
+    ├─► Bregman, L_q, sigmoid-bounded retention
+    ├─► KL bias, l_1 bias, l_p dispatch
+    └─► AdaMuon
 ```
 
-**Stage 2** milestones are sequential. **Stage 3** milestones are independent. **Stage 3b** is spec-first: primitives get spec sheets before implementation; S3b Phase 3 (self-referential) depends on S3b Phase 1 (DGD). **Stage 4 Phase 1** (M1–M8) is complete/planned with existing primitives and runs in parallel with S3b. **Stage 4 Phase 2** (M9–M14) is the real HOPE build — blocked on S3b deliverables; scope cannot be fully locked until S3b specs exist.
+**Stage 2** milestones are sequential. **Stage 3** milestones are independent. **S4-M7** (primitive validation) is immediate priority — it runs BEFORE S3b implementation begins. **S3b-Critical** contains only HOPE-path primitives: DGD → self-ref → HOPE composition + AdamW/Short Conv parallel. **S3b-Deferred** (Stage 5) contains MIRAS design-space completeness work — implemented after the HOPE model is running. **Stage 4 Phase 2** (M9–M14) is the real HOPE build — blocked on S3b-Critical deliverables.
+
+---
+
+## HADES Task Cross-Reference (updated 2026-02-22)
+
+Complete mapping between ROADMAP milestones and HADES Persephone tasks. Use this to avoid rebuilding context across sessions.
+
+### HOPE Critical Path — Task Status
+
+| Step | ROADMAP Milestone | HADES Task Key | HADES Title | Status |
+|------|-------------------|---------------|-------------|--------|
+| 1 | **S4-M7**: Primitive Validation | `task_e4aab3` | S4-M7: Primitive Validation Run | **open** |
+| 2a | **S3b-M1**: DGD | `task_38485e` | GAP-I: Extract DGD as named composable primitive | **open** |
+| 2b | **S3b-S16**: AdamW outer-loop (impl) | — | *MISSING — spec task closed (`task_013b41`)* | needs creation |
+| 2c | **S3b-S19**: Short Conv1D (impl) | — | *MISSING — spec task closed (`task_f903ab`)* | needs creation |
+| 3a | **S3b-M3/S12**: Self-ref projections | `task_929845` | GAP-L: Self-referential Phase 2 — adaptive projection memories | **open** |
+| 3b | **S3b-M3/S13**: Self-generated values | `task_eb31fd` | GAP-M: Self-generated values — v_hat = M_square(v_t) | **open** |
+| 3c | **S3b-M3/S14**: Feature maps | `task_79f2c5` | GAP-E: Feature maps — phi() hook and FeatureMapKind enum | **open** |
+| 3d | **S3b-M3/S15**: Chunkwise self-ref | `task_4a9b1d` | GAP-N: Chunkwise training for self-referential memories | **open** |
+| 4 | **S3b-S20**: HOPE Composition (impl) | — | *MISSING* | needs creation |
+| 5a | **S4-M10**: DGD Build Path | — | *MISSING* | needs creation |
+| 5b | **S4-M11**: Self-Referential Build | — | *MISSING* | needs creation |
+| 5c | **S4-M12**: AdamW Outer-Loop | — | *MISSING* | needs creation |
+| 6 | **S4-M13**: HOPE Model Config | — | *MISSING* | needs creation |
+| 7 | **S4-M14**: HOPE End-to-End Validation | — | *MISSING* | needs creation |
+
+### S3b-Deferred (Stage 5) — Task Status
+
+| ROADMAP Milestone | HADES Task Key | HADES Title | Status |
+|-------------------|---------------|-------------|--------|
+| **S3b-S2**: DMGD | — | *MISSING* | deferred |
+| **S3b-S3**: FTRL | `task_c48b71` | GAP-K: FTRL accumulator integration | **open** |
+| **S3b-S4**: Implicit GD | `task_544d8d` | GAP-J: Implicit GD Cases 4 and 5 | **open** |
+| **S3b-S5**: Newton-Schulz inner | — | *MISSING* | deferred |
+| **S3b-S6**: Bregman retention | `task_60e757` | GAP-F: Bregman retention framework | **open** |
+| **S3b-S7**: L_q norm retention | `task_eb6a4f` | GAP-G: L_q as pluggable RetentionKind variant | **open** |
+| **S3b-S8**: Sigmoid-bounded retention | `task_f18e65` | GAP-H: Sigmoid bounded retention | **open** |
+| **S3b-S9**: l_1 attentional bias | — | *MISSING* | deferred |
+| **S3b-S10**: KL attentional bias | `task_667d92` | GAP-D: Implement KL attentional bias | **open** |
+| **S3b-S11**: Generic l_p dispatch | — | *MISSING* | deferred |
+| **S3b-S17**: AdaMuon | — | *MISSING* | deferred |
+
+### Other Open Tasks (not on HOPE critical path)
+
+| HADES Task Key | Title | Notes |
+|---------------|-------|-------|
+| `task_unimpl_specs` | Spec Audit: Unimplemented Specifications | Tracking task |
+| `task_partial_specs` | Spec Audit: Partially Implemented Specifications | Tracking task |
+| `task_d06657` | GAP-Q: contract.md final reconciliation | Housekeeping |
+| `task_0ecca3` | GAP-C: Unblock TNT Q-K projection integration | Stage 5 |
+| `task_08ca2e` | ShareGPT 90M build — 100K steps | Experimental run |
+| `task_9f1281` | Skip all-masked chunks in loss logging | Build loop fix |
+| `task_f9e744` | Baseline comparison: train matched transformer | Experimental |
+| `task_41186a` | Generate external-notebook curriculum | Data pipeline |
+| `task_97ffb6` | Generate HADES graph-reasoning curriculum | Data pipeline |
 
 ---
 
@@ -699,15 +849,17 @@ Stage 1: Algorithm Core ──────────────────�
 | Stage 1: Algorithm Core | 19 | 778 Rust + 27 Python | COMPLETE |
 | Stage 2: Production Infra | 4 (+M1a, +M1b) | 33 CUDA + 13 dispatch + 6 GPU-resident + 20 edge + 18 serving + 18 distributed | COMPLETE |
 | Stage 3: Extensions | 5 | 22 retention + 35 M3/variants + 26 Atlas + 22 dynamic freq = 105 | COMPLETE |
-| Stage 3b: Primitive Completeness | 20 specs (all written) + 4 impl milestones | — | SPECS COMPLETE, IMPL NOT STARTED |
-| Stage 4 Phase 1: Pipeline Scaffolding | 8 (7 done, 1 planned) | 27 Python + 120 tape/traced/class3 Rust | IN PROGRESS |
-| Stage 4 Phase 2: HOPE Build & Serve | 6 milestones (M9–M14) | — | BLOCKED ON S3b |
+| Stage 3b-Critical: HOPE Path | 3 impl milestones (DGD, self-ref, outer-loop+HOPE) | — | NOT STARTED (blocked on S4-M7) |
+| Stage 3b-Deferred: MIRAS Completeness | 3 impl milestones (algo knobs, retention/bias, AdaMuon) | — | DEFERRED (Stage 5) |
+| Stage 4 Phase 1: Pipeline Scaffolding | 8 (7 done, 1 immediate) | 27 Python + 120 tape/traced/class3 Rust | S4-M7 IMMEDIATE |
+| Stage 4 Phase 2: HOPE Build & Serve | 6 milestones (M9–M14) | — | BLOCKED ON S3b-Critical |
 
-**Current position**: S0–S3 complete. S3b specs complete (all 20 written, `v0.4.0` in HADES `hecate_specs`). S4 Phase 1 pipeline delivered (M1–M6, M8): can build a model on real text data and serve it locally using pre-S3b primitives. Wengert tape is the production gradient path (M8, PRs #55–65). 4 open critical blockers in HADES `hope_blockers` affect brain transplant path only (not from-scratch HOPE training).
+**Current position**: S0–S3 complete. S3b specs complete (all 20 written, `v0.4.0` in HADES `hecate_specs`). S4 Phase 1 pipeline delivered (M1–M6, M8): can build a model on real text data and serve it locally using pre-S3b primitives. Wengert tape is the production gradient path (M8, PRs #55–65). HADES `hope_blockers`: 2 resolved (k and f_i), 2 deferred (brain transplant only).
 
-**Active fronts**:
-1. **S3b implementation** (highest priority): All specs are written — begin S3b-M1 (DGD first, it unblocks S3b-M3). S3b-M2 (retention/bias gaps) and S3b-M4 (outer-loop) are independent and can run in parallel with S3b-M1. S3b-M3 (self-referential) requires S3b-M1 impl to complete first.
-2. **S4-M7** (parallel, low priority): validate the toy_60m pipeline as a regression checkpoint on existing primitives.
-3. **S4 Phase 2** (blocked on S3b-M1 and S3b-M3): the real HOPE build — DGD inner-loop + self-referential projections + AdamW outer-loop — cannot begin until S3b-M1 and S3b-M3 are implemented.
+**Active fronts** (updated 2026-02-22 per committee review):
+1. **S4-M7: Primitive Validation** (IMMEDIATE): Run curriculum_100k config to validate pipeline at scale. Profile Wengert tape memory. Add per-level diagnostics. Implement Forget Gate and Curriculum Integration behavioral probes. **This runs first.**
+2. **S3b-Critical** (after S4-M7): DGD (S3b-M1) first — it unblocks self-referential (S3b-M3). AdamW (S3b-S16) and Short Conv (S3b-S19) run parallel with DGD. HOPE composition (S3b-S20) blocked on S3b-M3.
+3. **S4 Phase 2** (blocked on S3b-Critical): the real HOPE build — DGD inner-loop + self-referential projections + AdamW outer-loop — cannot begin until S3b-Critical is complete.
+4. **S3b-Deferred / Stage 5** (post-HOPE): MIRAS design-space completeness. Retention variants, bias variants, DMGD, FTRL, Implicit GD, NS inner, AdaMuon.
 
 Total test count: 940 Rust + 27 Python = **967 tests** (36 PRs merged; full `cargo test`).

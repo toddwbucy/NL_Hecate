@@ -1202,3 +1202,114 @@ fn test_k4_normalized_stable() {
 
     eprintln!("PASS: k=4 with normalization converges stably to {k4_final:.4}");
 }
+
+// ── Forget gate probe ──────────────────────────────────────────────────
+
+/// Forget gate probe: validates CMS frequency separation under distribution shift.
+///
+/// Phase A (100 steps): Feed constant pattern where all targets = value_a.
+///   Memory adapts to predict value_a at every position.
+/// Phase B (50 steps): Switch targets to value_b (contradictory).
+///   Level 0 (fires every step) adapts faster → larger memory delta.
+///   Level 1 (fires every 8th step) adapts slower → smaller memory delta.
+///
+/// This validates the core CMS invariant: higher-frequency levels respond
+/// faster to distribution shifts, while lower-frequency levels retain prior
+/// knowledge longer.
+///
+/// HADES refs: hope_probes/probe-forget-gate-frequency-separation,
+///             hope_axioms/axiom-cms-frequency-separation
+#[test]
+fn test_forget_gate_probe() {
+    let cfg = k2_config(); // d=8, seq=8, k=2, chunk_sizes=[1,8]
+    let mut params = MAGParams::init(&cfg, 42);
+    let mut conductor = Conductor::new(cfg.k, cfg.chunk_sizes.clone());
+    let mut context = ContextState::new(cfg.k, cfg.swa.d_model);
+    let mut error_buffers: Vec<ErrorBuffer> = (0..cfg.k)
+        .map(|_| ErrorBuffer::new(cfg.swa.d_model))
+        .collect();
+
+    let lr = 0.01;
+    // Derive target values defensively from vocab_size (both must be < vocab_size)
+    let value_a = 3usize % cfg.swa.vocab_size;
+    let value_b = (cfg.swa.vocab_size / 2).max(4); // distant from value_a
+
+    // Same input pattern for both phases — only targets change
+    let input_ids: Vec<usize> = (0..cfg.swa.seq_len)
+        .map(|t| t % cfg.swa.vocab_size)
+        .collect();
+    let target_ids_a: Vec<usize> = vec![value_a; cfg.swa.seq_len];
+    let target_ids_b: Vec<usize> = vec![value_b; cfg.swa.seq_len];
+
+    // Phase A: 100 steps feeding constant targets = value_a
+    for _ in 0..100 {
+        let pulse = conductor.pulse();
+        let (_, cache) = cms_forward(
+            &params, &cfg, &input_ids, &target_ids_a, &pulse, &mut context,
+        );
+        let grads = cms_backward(
+            &params, &cfg, &cache, &input_ids, &target_ids_a, &mut error_buffers,
+        );
+        params.apply_weight_gradients(&grads, lr);
+        for level in 0..cfg.k {
+            if pulse.active_levels[level] && error_buffers[level].steps_accumulated > 0 {
+                error_buffers[level].apply_and_reset(&mut params.levels[level], lr);
+            }
+        }
+        conductor.advance();
+    }
+
+    // Snapshot memory after Phase A
+    let mem_before: Vec<Vec<f32>> = context.memory.iter().map(|m| m.clone()).collect();
+
+    eprintln!("=== Forget Gate Probe ===");
+    for lev in 0..cfg.k {
+        let norm: f32 = mem_before[lev].iter().map(|x| x * x).sum::<f32>().sqrt();
+        eprintln!("Phase A end — Level {lev} memory norm: {norm:.6}");
+    }
+
+    // Phase B: 50 steps feeding contradictory targets = value_b
+    for _ in 0..50 {
+        let pulse = conductor.pulse();
+        let (_, cache) = cms_forward(
+            &params, &cfg, &input_ids, &target_ids_b, &pulse, &mut context,
+        );
+        let grads = cms_backward(
+            &params, &cfg, &cache, &input_ids, &target_ids_b, &mut error_buffers,
+        );
+        params.apply_weight_gradients(&grads, lr);
+        for level in 0..cfg.k {
+            if pulse.active_levels[level] && error_buffers[level].steps_accumulated > 0 {
+                error_buffers[level].apply_and_reset(&mut params.levels[level], lr);
+            }
+        }
+        conductor.advance();
+    }
+
+    // Measure ||M_after - M_before||_F per level
+    let mut deltas = Vec::new();
+    for lev in 0..cfg.k {
+        let delta: f32 = context.memory[lev]
+            .iter()
+            .zip(mem_before[lev].iter())
+            .map(|(a, b)| (a - b) * (a - b))
+            .sum::<f32>()
+            .sqrt();
+        deltas.push(delta);
+        let norm_after: f32 = context.memory[lev].iter().map(|x| x * x).sum::<f32>().sqrt();
+        eprintln!("Phase B end — Level {lev}: delta={delta:.6}, norm={norm_after:.6}");
+    }
+
+    // Level 0 fires every step (50 fires in 50 steps) → adapts faster → larger delta
+    // Level 1 fires every 8th step (~6 fires in 50 steps) → adapts slower → smaller delta
+    // Level 0 should show meaningfully larger delta (with tolerance for float noise)
+    assert!(
+        deltas[0] > deltas[1] + 1e-8,
+        "Level 0 should adapt faster than Level 1: L0_delta={:.6}, L1_delta={:.6}",
+        deltas[0], deltas[1],
+    );
+    eprintln!(
+        "PASS: Level 0 delta ({:.6}) > Level 1 delta ({:.6}) — frequency separation confirmed",
+        deltas[0], deltas[1],
+    );
+}

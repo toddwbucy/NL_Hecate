@@ -1608,6 +1608,21 @@ impl GpuModel {
         Ok(())
     }
 
+    /// Compute Frobenius norm of per-level memory matrices on GPU.
+    /// Returns Vec<f32> of length k. D2H transfer: d*d floats per level,
+    /// but norm is computed Rust-side so Python never sees raw memory.
+    fn memory_norms(&self) -> Vec<f32> {
+        let d = self.context.d;
+        let mut norms = Vec::with_capacity(self.context.memory.len());
+        let mut buf = vec![0.0f32; d * d];
+        for gpu_mem in &self.context.memory {
+            gpu_mem.copy_to_host(&mut buf);
+            let norm = buf.iter().map(|x| x * x).sum::<f32>().sqrt();
+            norms.push(norm);
+        }
+        norms
+    }
+
     /// Read gate biases from GPU: returns Vec of (b_alpha, b_theta, b_eta) per level.
     /// Small D2H transfer: 3 floats per level. Used for monitoring gate behavior.
     fn gate_biases(&self) -> Vec<(f32, f32, f32)> {

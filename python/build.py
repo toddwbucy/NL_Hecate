@@ -465,6 +465,40 @@ def evaluate(gpu_model, bcfg: BuildConfig, val_loader,
     return avg_loss, ppl
 
 
+def evaluate_numpy(gpu_model, bcfg, tokens_np, targets_np,
+                   max_chunks: int = 10) -> tuple[float, float]:
+    """Evaluate on raw numpy arrays (for per-phase curriculum probes).
+
+    Creates a fresh Conductor so eval pulse doesn't corrupt training state.
+    NOTE: Callers must save/restore gpu_model context externally — this
+    function uses whatever context is currently on the model.
+    Returns (avg_loss, perplexity).
+    """
+    conductor = nl_hecate.Conductor(bcfg.k, bcfg.chunk_sizes)
+    total_loss = 0.0
+    n_chunks = 0
+    pos = 0
+
+    for _ in range(max_chunks):
+        if pos + bcfg.seq_len > len(tokens_np):
+            break
+        input_ids = tokens_np[pos:pos + bcfg.seq_len].tolist()
+        raw_targets = targets_np[pos:pos + bcfg.seq_len]
+        target_ids = [int(t) if t >= 0 else bcfg.vocab_size for t in raw_targets]
+        pulse = conductor.pulse()
+        loss, _ = gpu_model.forward(input_ids, target_ids, pulse)
+        if not (math.isnan(loss) or math.isinf(loss)):
+            total_loss += loss
+            n_chunks += 1
+        conductor.advance()
+        pos += bcfg.seq_len
+
+    if n_chunks == 0:
+        return 0.0, 1.0
+    avg = total_loss / n_chunks
+    return avg, math.exp(min(avg, 20.0))
+
+
 # Fixed prompts for sampling at checkpoints (tests different capabilities)
 SAMPLE_PROMPTS = [
     "What is the capital of France?",
@@ -796,6 +830,17 @@ def main():
             "lr": bcfg.lr, "steps": bcfg.steps, "params": params.num_params(),
         })
 
+    # ── S4-M7 validation state ────────────────────────────────────────
+    level_fire_counts = [0] * bcfg.k
+    level_fire_reset_step = resume_step
+    level3_total_fires = 0
+    level3_active_fires = 0
+    level3_prev_fires = 0  # for window delta computation
+    level3_prev_active = 0
+    phase_boundaries = {15000, 25000, 45000, 55000}
+    phase_val_data: dict[str, tuple] = {}  # loaded on first boundary hit
+    min_stories_loss: float | None = None
+
     losses = []
     t_start = time.perf_counter()
     end_step = resume_step + bcfg.steps
@@ -819,6 +864,29 @@ def main():
             if len(input_ids) != bcfg.seq_len:
                 conductor.advance()
                 continue
+
+        # ── S4-M7: Track level fire counts ──────────────────────────────
+        for lev, active in enumerate(pulse.active_levels):
+            if active:
+                level_fire_counts[lev] += 1
+
+        # Level 3 activity monitoring (gate non-degeneracy check)
+        if (bcfg.k >= 4 and len(pulse.active_levels) > 3
+                and pulse.active_levels[3]):
+            level3_total_fires += 1
+            if gpu_model is not None and hasattr(gpu_model, "gate_biases"):
+                biases = gpu_model.gate_biases()
+                if len(biases) > 3:
+                    b_theta_l3 = biases[3][1]  # (b_alpha, b_theta, b_eta)[1]
+                    # Numerically stable softplus: avoids overflow for large b_theta
+                    if b_theta_l3 > 20.0:
+                        theta_val = b_theta_l3
+                    elif b_theta_l3 < -20.0:
+                        theta_val = math.exp(b_theta_l3)
+                    else:
+                        theta_val = math.log1p(math.exp(b_theta_l3))
+                    if theta_val > 0.001:
+                        level3_active_fires += 1
 
         # Compute current learning rate
         use_cosine = (adamw_opt is not None or use_adamw_gpu)
@@ -931,7 +999,30 @@ def main():
             # Gate biases from GPU (small D2H: 3 floats per level)
             if gpu_model is not None and hasattr(gpu_model, "gate_biases"):
                 log_fields["gate_biases"] = gpu_model.gate_biases()
+            # S4-M7: Level fire counts (cumulative since last reset)
+            log_fields["level_fires"] = list(level_fire_counts)
+            # S4-M7: Per-level memory norms (at eval_every to avoid D2H overhead)
+            if (bcfg.eval_every > 0 and step % bcfg.eval_every == 0
+                    and gpu_model is not None
+                    and hasattr(gpu_model, "memory_norms")):
+                log_fields["memory_norms"] = [
+                    round(n, 6) for n in gpu_model.memory_norms()]
             jsonl.log(**log_fields)
+
+        # S4-M7: Level 3 activity event (own cadence, independent of log_every)
+        if (jsonl and bcfg.k >= 4 and step > 0 and step % 1000 == 0):
+            l3_fires_delta = level3_total_fires - level3_prev_fires
+            l3_active_delta = level3_active_fires - level3_prev_active
+            jsonl.log(event="level3_activity", step=step,
+                      fires=l3_fires_delta,
+                      active=l3_active_delta)
+            level3_prev_fires = level3_total_fires
+            level3_prev_active = level3_active_fires
+
+        # Reset level fire counts every 1000 steps (independent of log_every)
+        if step - level_fire_reset_step >= 1000:
+            level_fire_counts = [0] * bcfg.k
+            level_fire_reset_step = step
 
         # Periodic eval on val set
         if (bcfg.eval_every > 0 and val_loader is not None
@@ -960,6 +1051,52 @@ def main():
                 jsonl.log(event="eval", step=step, eval_loss=eval_loss,
                           eval_ppl=eval_ppl, eval_chunks=bcfg.eval_max_chunks)
 
+        # ── S4-M7: Phase boundary curriculum probe ────────────────────
+        if (step in phase_boundaries and gpu_model is not None
+                and use_bpe and bcfg.data_path):
+            # Lazy-load per-phase val data
+            if not phase_val_data:
+                data_dir = Path(bcfg.data_path)
+                for pname in ("stories", "conversation", "reasoning"):
+                    tk = data_dir / f"val_{pname}_tokens.npy"
+                    tg = data_dir / f"val_{pname}_targets.npy"
+                    if tk.exists() and tg.exists():
+                        phase_val_data[pname] = (np.load(tk), np.load(tg))
+                if phase_val_data:
+                    print(f"  [phase probe] Loaded per-phase val data: "
+                          f"{list(phase_val_data.keys())}")
+
+            if phase_val_data:
+                # Save/restore training context around probe eval
+                probe_ctx = gpu_model.to_host_context()
+                gpu_model.reset_context()
+
+                phase_losses = {}
+                for pname, (p_toks, p_tgts) in phase_val_data.items():
+                    pl, _pp = evaluate_numpy(
+                        gpu_model, bcfg, p_toks, p_tgts, max_chunks=10)
+                    phase_losses[pname] = pl
+                    gpu_model.reset_context()  # fresh context per phase
+
+                gpu_model.upload_context(probe_ctx)
+
+                # Track minimum stories loss for catastrophic forgetting check
+                if "stories" in phase_losses and step <= 25000:
+                    sl = phase_losses["stories"]
+                    if min_stories_loss is None or sl < min_stories_loss:
+                        min_stories_loss = sl
+
+                print(f"  [phase probe] step {step}: "
+                      + ", ".join(f"{k}={v:.4f}" for k, v in phase_losses.items()))
+                if jsonl:
+                    log_entry: dict[str, Any] = {
+                        "event": "phase_boundary", "step": step}
+                    if min_stories_loss is not None:
+                        log_entry["min_stories_loss"] = min_stories_loss
+                    for pname, pl in phase_losses.items():
+                        log_entry[f"{pname}_loss"] = pl
+                    jsonl.log(**log_entry)
+
         # Periodic checkpoint
         if bcfg.save_every > 0 and step > 0 and step % bcfg.save_every == 0:
             # Download from GPU if needed
@@ -977,6 +1114,36 @@ def main():
                 nl_hecate.save_build_checkpoint(ckpt_path, params, cfg, conductor, context)
             print(f"  [checkpoint saved: {ckpt_path}]")
 
+            # S4-M7: Checkpoint roundtrip verification
+            if use_gpu:
+                try:
+                    if use_bpe:
+                        v_params, v_cfg = nl_hecate.load_checkpoint(ckpt_path)
+                    else:
+                        v_params, v_cfg, _ = nl_hecate.load_build_checkpoint(ckpt_path)
+                    v_model = nl_hecate.GpuModel.from_params(v_params, v_cfg)
+                    v_ctx = gpu_model.to_host_context()
+                    v_model.upload_context(v_ctx)
+                    # Run forward-only on both models with same data
+                    # Reuse v_ctx for restore (GPU context unchanged between downloads)
+                    train_fwd, _ = gpu_model.forward(input_ids, target_ids, pulse)
+                    verify_fwd, _ = v_model.forward(input_ids, target_ids, pulse)
+                    gpu_model.upload_context(v_ctx)
+                    delta = abs(verify_fwd - train_fwd)
+                    if jsonl:
+                        jsonl.log(event="checkpoint_roundtrip", step=step,
+                                  delta=delta, loss=train_fwd,
+                                  verify_loss=verify_fwd)
+                    if delta > 1e-6:
+                        print(f"  [WARNING] checkpoint roundtrip "
+                              f"delta={delta:.2e}")
+                    else:
+                        print(f"  [checkpoint roundtrip OK, "
+                              f"delta={delta:.2e}]")
+                    del v_model
+                except (OSError, RuntimeError, ValueError) as e:
+                    print(f"  [checkpoint roundtrip failed: {e}]")
+
             # Generate samples at checkpoint time
             if tokenizer is not None and gpu_model is not None:
                 try:
@@ -993,6 +1160,19 @@ def main():
     elapsed = t_end - t_start
     total_tokens = len(losses) * bcfg.seq_len
     tok_per_sec = total_tokens / elapsed if elapsed > 0 else 0
+
+    # ── S4-M7: End-of-run Level 3 activity summary ───────────────────
+    if bcfg.k >= 4:
+        print(f"\n  Level 3 activity: {level3_active_fires} active / "
+              f"{level3_total_fires} total fires")
+        if level3_active_fires < 25:
+            print("  WARNING: Level 3 activity < 25 — STOP THE LINE")
+        elif level3_active_fires < 50:
+            print("  WARNING: Level 3 activity < 50 — below threshold")
+        if jsonl:
+            jsonl.log(event="level3_summary",
+                      total_fires=level3_total_fires,
+                      active_fires=level3_active_fires)
 
     # ── Final checkpoint ──────────────────────────────────────────────
     if gpu_model is not None:
