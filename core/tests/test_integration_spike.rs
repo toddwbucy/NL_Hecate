@@ -72,6 +72,7 @@ fn spike_config_a() -> MAGConfig {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
     }
 }
 
@@ -108,6 +109,7 @@ fn spike_config_b() -> MAGConfig {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
     }
 }
 
@@ -144,6 +146,7 @@ fn spike_config_c() -> MAGConfig {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
     }
 }
 
@@ -743,6 +746,7 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
     }
 }
 

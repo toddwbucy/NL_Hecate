@@ -20,6 +20,7 @@ use crate::trellis::{Trellis, TrellisCache, trellis_read_only, trellis_read_only
 use crate::atlas_omega::{AtlasOmega, AtlasOmegaCache};
 use crate::conductor::{Pulse, ContextState, ErrorBuffer};
 use crate::self_ref::{SelfRefCache, ProjectionKind, self_ref_step, self_ref_step_backward, self_ref_read_only, self_ref_read_only_backward};
+use crate::chunkwise_self_ref::{ChunkwiseSelfRefCache, chunkwise_self_ref_step, chunkwise_self_ref_step_backward};
 use crate::dynamic_freq::{
     FrequencySchedule, FreqGateCache,
     mean_pool, compute_freq_gates, apply_threshold, should_anneal,
@@ -40,6 +41,8 @@ pub enum MemoryCache {
     Atlas(AtlasOmegaCache),
     /// Self-referential Phase 2: all 6 memories (5 projections + main) via DGD.
     SelfRef(SelfRefCache),
+    /// Chunkwise self-referential: frozen M at chunk boundaries (HOPE §8.2).
+    ChunkwiseSelfRef(ChunkwiseSelfRefCache),
 }
 
 /// Cache for MAG forward pass — holds both branches' intermediates.
@@ -298,6 +301,11 @@ pub fn mag_backward(
             // doesn't have fields for them yet. PR 4 adds SelfRefParamGrads to MAGParams
             // and wires them into apply_weight_gradients(). Until then, only the inner-loop
             // (per-token DGD) operates on projection memories; outer-loop learning is deferred.
+            (crate::model::MemoryLevelParams::zeros_like(d), d_emb)
+        }
+        MemoryCache::ChunkwiseSelfRef(csr_cache) => {
+            let (d_emb, _sr_grads) = chunkwise_self_ref_step_backward(csr_cache, &d_y, cfg.self_generated_values);
+            // TODO(PR-4): same as SelfRef — _sr_grads deferred.
             (crate::model::MemoryLevelParams::zeros_like(d), d_emb)
         }
     };
@@ -587,13 +595,21 @@ fn run_level_memory(
         // Phase 2 adaptive projections: self-referential orchestrator
         if cfg.projection_kind == ProjectionKind::Adaptive {
             let mut m_mem = std::mem::take(&mut context.memory[level]);
-            let (y, cache) = self_ref_step(
-                &mut context.self_ref[level], &mut m_mem, input, s, d,
-                cfg.self_generated_values,
-            );
-            // Restore final main memory state to context for chunk boundaries
-            context.memory[level] = m_mem;
-            return (y, Some(MemoryCache::SelfRef(cache)), None, None);
+            if cfg.self_ref_chunk_size > 1 {
+                let (y, cache) = chunkwise_self_ref_step(
+                    &mut context.self_ref[level], &mut m_mem, input, s, d,
+                    cfg.self_ref_chunk_size, cfg.self_generated_values,
+                );
+                context.memory[level] = m_mem;
+                return (y, Some(MemoryCache::ChunkwiseSelfRef(cache)), None, None);
+            } else {
+                let (y, cache) = self_ref_step(
+                    &mut context.self_ref[level], &mut m_mem, input, s, d,
+                    cfg.self_generated_values,
+                );
+                context.memory[level] = m_mem;
+                return (y, Some(MemoryCache::SelfRef(cache)), None, None);
+            }
         }
 
         let initial_m = Some(std::mem::take(&mut context.memory[level]));
@@ -1065,6 +1081,10 @@ pub fn cms_backward(
                 MemoryCache::SelfRef(sr_cache) => {
                     let (d_emb, _sr_grads) = self_ref_step_backward(sr_cache, &d_y_combined, cfg.self_generated_values);
                     // TODO(PR-4): wire _sr_grads into MAGParams (see mag_backward comment).
+                    (crate::model::MemoryLevelParams::zeros_like(d), d_emb)
+                }
+                MemoryCache::ChunkwiseSelfRef(csr_cache) => {
+                    let (d_emb, _sr_grads) = chunkwise_self_ref_step_backward(csr_cache, &d_y_combined, cfg.self_generated_values);
                     (crate::model::MemoryLevelParams::zeros_like(d), d_emb)
                 }
             };

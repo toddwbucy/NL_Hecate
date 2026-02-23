@@ -215,6 +215,7 @@ fn test_moneta_vs_delta() {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
     };
     let cfg_moneta = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
@@ -236,6 +237,7 @@ fn test_moneta_vs_delta() {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
     };
 
     let input_ids: Vec<usize> = (0..swa.seq_len).map(|t| t % swa.vocab_size).collect();

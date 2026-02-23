@@ -643,7 +643,15 @@ pub struct MAGConfig {
     /// Only meaningful when projection_kind == Adaptive.
     #[serde(default)]
     pub self_generated_values: bool,
+    /// Chunkwise self-referential chunk size (HOPE §8.2, Eqs 90-93).
+    /// 1 = sequential (default, bit-identical to self_ref_step).
+    /// C > 1 = freeze M at chunk boundaries for gradient computation.
+    /// Only meaningful when projection_kind == Adaptive.
+    #[serde(default = "default_one")]
+    pub self_ref_chunk_size: usize,
 }
+
+fn default_one() -> usize { 1 }
 
 fn default_sign_sharpness() -> f32 { 10.0 }
 
@@ -723,6 +731,7 @@ impl MAGConfig {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
         }
     }
 
@@ -757,6 +766,7 @@ impl MAGConfig {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
         }
     }
 
@@ -791,6 +801,7 @@ impl MAGConfig {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
         }
     }
 
@@ -826,6 +837,7 @@ impl MAGConfig {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
         }
     }
 
@@ -861,6 +873,7 @@ impl MAGConfig {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
         }
     }
 
@@ -896,6 +909,7 @@ impl MAGConfig {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
         }
     }
 
@@ -930,6 +944,7 @@ impl MAGConfig {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
         }
     }
 
@@ -964,6 +979,7 @@ impl MAGConfig {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
         }
     }
 
@@ -998,6 +1014,7 @@ impl MAGConfig {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
         }
     }
 
@@ -1032,6 +1049,7 @@ impl MAGConfig {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
         }
     }
 
@@ -1076,6 +1094,7 @@ impl MAGConfig {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
         }
     }
 
@@ -1120,6 +1139,7 @@ impl MAGConfig {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
         }
     }
 
@@ -1164,6 +1184,7 @@ impl MAGConfig {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
         }
     }
 
@@ -1208,6 +1229,7 @@ impl MAGConfig {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
         }
     }
 
@@ -1252,6 +1274,7 @@ impl MAGConfig {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
         }
     }
 
@@ -1296,6 +1319,7 @@ impl MAGConfig {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
         }
     }
 
@@ -1331,6 +1355,7 @@ impl MAGConfig {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
         }
     }
 
@@ -1366,6 +1391,7 @@ impl MAGConfig {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
         }
     }
 
@@ -1404,6 +1430,7 @@ impl MAGConfig {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
         }
     }
 
@@ -1442,6 +1469,7 @@ impl MAGConfig {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
         }
     }
 
@@ -1476,6 +1504,7 @@ impl MAGConfig {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
         }
     }
 
@@ -1510,6 +1539,7 @@ impl MAGConfig {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
         }
     }
 
@@ -1544,6 +1574,7 @@ impl MAGConfig {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
         }
     }
 
@@ -1578,6 +1609,7 @@ impl MAGConfig {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
         }
     }
 
@@ -1613,6 +1645,7 @@ impl MAGConfig {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
         }
     }
 
@@ -1647,6 +1680,7 @@ impl MAGConfig {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
         }
     }
 
@@ -1682,6 +1716,7 @@ impl MAGConfig {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
         }
     }
 
@@ -1717,6 +1752,7 @@ impl MAGConfig {
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
+            self_ref_chunk_size: 1,
         }
     }
 }
