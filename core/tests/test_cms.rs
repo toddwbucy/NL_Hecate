@@ -775,20 +775,20 @@ fn test_k2_diagnostics() {
 // ── Stability boundary test ───────────────────────────────────────────
 
 /// Demonstrates that CMS nesting itself is stabilizing: at the SAME aggressive
-/// inner-loop learning rate (b_theta=1.2, softplus≈1.49), k=1 diverges to NaN
-/// while k=2 converges with 98.7% loss reduction.
+/// inner-loop learning rate (b_theta=1.5, softplus≈1.74), k=1 diverges to NaN
+/// while k=2 converges.
 ///
 /// This is a concrete, reproducible result:
 ///   - Same model dimensions (d=32, heads=4, seq=32)
 ///   - Same data (multi-scale temporal patterns)
 ///   - Same outer-loop lr (0.02)
-///   - Same b_theta=1.2 on the active level
+///   - Same b_theta=1.5 on the active level
 ///   - ONLY difference: k=1 (single level) vs k=2 (two CMS levels)
 ///
-/// Empirically measured stability boundary at d=32, lr=0.02:
+/// Empirically measured stability boundary at d=32, lr=0.02 (bf16 projections):
 ///   - b_theta=1.0 (softplus≈1.31): k=1 survives 10K steps
-///   - b_theta=1.2 (softplus≈1.49): k=1 diverges ~step 9K, k=2 converges
 ///   - b_theta=1.5 (softplus≈1.74): k=1 diverges, k=2 remains stable (CMS nesting stabilizes)
+///   (Raised from 1.2 pre-bf16 to 1.5 — bf16 quantization shifts the stability boundary.)
 ///
 /// The mechanism: k=2 distributes the outer-loop gradient across two levels,
 /// providing implicit regularization. The slow level (fires every 8th step)
