@@ -17,6 +17,8 @@
 /// Source: HOPE (2512.24695) §5, §8; Eqs 79-82, 85, 88.
 
 use serde::{Serialize, Deserialize};
+use crate::tensor::{matmul_f32, sigmoid_f32, softplus_f32};
+use crate::dgd::dgd_step;
 
 /// Which projection style to use for memory key/value/query generation.
 ///
@@ -198,6 +200,139 @@ impl SelfRefParamGrads {
     }
 }
 
+/// Self-referential forward pass: all 6 memories updated per token via DGD.
+///
+/// Per-token loop (observe-then-advance, CS-32):
+///   1. Read 5 component memories to get adaptive k/v/q/eta/alpha
+///   2. Reduce d-dim gate outputs to scalars: alpha = sigmoid(mean(alpha_raw)), theta = softplus(mean(eta_raw))
+///   3. Read main memory: y_t = M_mem @ q_t
+///   4. DGD update all 6 memories with shared (alpha_t, theta_t)
+///
+/// Source: HOPE (2512.24695) Eqs 79-82, 85, 88.
+///
+/// - `self_ref`: mutable 5-component projection state (modified in-place)
+/// - `m_mem`: mutable [d*d] main memory matrix (modified in-place)
+/// - `embedded`: input tokens [seq_len * d]
+/// - `seq_len`: number of tokens
+/// - `d`: model dimension
+///
+/// Returns (y [seq_len * d], cache for backward).
+pub fn self_ref_step(
+    self_ref: &mut SelfRefState,
+    m_mem: &mut [f32],
+    embedded: &[f32],
+    seq_len: usize,
+    d: usize,
+) -> (Vec<f32>, SelfRefCache) {
+    debug_assert_eq!(embedded.len(), seq_len * d);
+    debug_assert_eq!(m_mem.len(), d * d);
+    debug_assert!(self_ref.is_active(), "self_ref_step called on empty SelfRefState");
+
+    let dd = d * d;
+    let mut cache = SelfRefCache::new(seq_len, d);
+    cache.embedded = embedded.to_vec();
+
+    // Snapshot initial states (t=0)
+    cache.m_k_states[..dd].copy_from_slice(&self_ref.m_k);
+    cache.m_v_states[..dd].copy_from_slice(&self_ref.m_v);
+    cache.m_q_states[..dd].copy_from_slice(&self_ref.m_q);
+    cache.m_eta_states[..dd].copy_from_slice(&self_ref.m_eta);
+    cache.m_alpha_states[..dd].copy_from_slice(&self_ref.m_alpha);
+    cache.m_mem_states[..dd].copy_from_slice(m_mem);
+
+    let mut y = vec![0.0f32; seq_len * d];
+
+    // Reusable buffers for matmul outputs
+    let mut k_t = vec![0.0f32; d];
+    let mut v_t = vec![0.0f32; d];
+    let mut q_t = vec![0.0f32; d];
+    let mut eta_raw_t = vec![0.0f32; d];
+    let mut alpha_raw_t = vec![0.0f32; d];
+    let mut y_t = vec![0.0f32; d];
+
+    for t in 0..seq_len {
+        let x_t = &embedded[t * d..(t + 1) * d];
+
+        // Step 1: Adaptive projections — read from M_{component, t}
+        matmul_f32(&self_ref.m_k, x_t, &mut k_t, d, d, 1);
+        matmul_f32(&self_ref.m_v, x_t, &mut v_t, d, d, 1);
+        matmul_f32(&self_ref.m_q, x_t, &mut q_t, d, d, 1);
+        matmul_f32(&self_ref.m_eta, x_t, &mut eta_raw_t, d, d, 1);
+        matmul_f32(&self_ref.m_alpha, x_t, &mut alpha_raw_t, d, d, 1);
+
+        // Cache per-token reads
+        cache.k_mem[t * d..(t + 1) * d].copy_from_slice(&k_t);
+        cache.v_mem[t * d..(t + 1) * d].copy_from_slice(&v_t);
+        cache.q_mem[t * d..(t + 1) * d].copy_from_slice(&q_t);
+        cache.eta_raw[t * d..(t + 1) * d].copy_from_slice(&eta_raw_t);
+        cache.alpha_raw[t * d..(t + 1) * d].copy_from_slice(&alpha_raw_t);
+
+        // Step 2: Reduce d-dim gate outputs to scalars
+        let alpha_mean: f32 = alpha_raw_t.iter().sum::<f32>() / d as f32;
+        let eta_mean: f32 = eta_raw_t.iter().sum::<f32>() / d as f32;
+        let alpha_t = sigmoid_f32(alpha_mean);
+        let theta_t = softplus_f32(eta_mean);
+        cache.alpha[t] = alpha_t;
+        cache.theta[t] = theta_t;
+
+        // Step 3: Main memory read — y_t = M_mem @ q_t
+        matmul_f32(m_mem, &q_t, &mut y_t, d, d, 1);
+        y[t * d..(t + 1) * d].copy_from_slice(&y_t);
+        cache.y[t * d..(t + 1) * d].copy_from_slice(&y_t);
+
+        // Step 4: DGD update all 6 memories (Eq 88)
+        // Component memories: keyed by x_t, target v_t
+        dgd_step(&mut self_ref.m_k, x_t, &v_t, alpha_t, theta_t, d);
+        dgd_step(&mut self_ref.m_v, x_t, &v_t, alpha_t, theta_t, d);
+        dgd_step(&mut self_ref.m_q, x_t, &v_t, alpha_t, theta_t, d);
+        dgd_step(&mut self_ref.m_eta, x_t, &v_t, alpha_t, theta_t, d);
+        dgd_step(&mut self_ref.m_alpha, x_t, &v_t, alpha_t, theta_t, d);
+        // Main memory: keyed by adaptive k_t, target v_t
+        dgd_step(m_mem, &k_t, &v_t, alpha_t, theta_t, d);
+
+        // Snapshot updated states (t+1)
+        let off = (t + 1) * dd;
+        cache.m_k_states[off..off + dd].copy_from_slice(&self_ref.m_k);
+        cache.m_v_states[off..off + dd].copy_from_slice(&self_ref.m_v);
+        cache.m_q_states[off..off + dd].copy_from_slice(&self_ref.m_q);
+        cache.m_eta_states[off..off + dd].copy_from_slice(&self_ref.m_eta);
+        cache.m_alpha_states[off..off + dd].copy_from_slice(&self_ref.m_alpha);
+        cache.m_mem_states[off..off + dd].copy_from_slice(m_mem);
+    }
+
+    (y, cache)
+}
+
+/// Read-only forward for frozen self-referential levels.
+///
+/// All 6 memories are frozen (no DGD update). Just reads projections
+/// from the static state and produces output.
+pub fn self_ref_read_only(
+    self_ref: &SelfRefState,
+    m_mem: &[f32],
+    embedded: &[f32],
+    seq_len: usize,
+    d: usize,
+) -> Vec<f32> {
+    debug_assert_eq!(embedded.len(), seq_len * d);
+    debug_assert_eq!(m_mem.len(), d * d);
+
+    let mut y = vec![0.0f32; seq_len * d];
+    let mut q_t = vec![0.0f32; d];
+    let mut y_t = vec![0.0f32; d];
+
+    for t in 0..seq_len {
+        let x_t = &embedded[t * d..(t + 1) * d];
+        // Read q from frozen M_q
+        matmul_f32(&self_ref.m_q, x_t, &mut q_t, d, d, 1);
+        // Read from frozen M_mem
+        matmul_f32(m_mem, &q_t, &mut y_t, d, d, 1);
+        y[t * d..(t + 1) * d].copy_from_slice(&y_t);
+    }
+
+    y
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,6 +385,137 @@ mod tests {
         let grads = SelfRefParamGrads::zeros(4);
         assert_eq!(grads.d_m_k.len(), 16);
         assert!(grads.d_m_k.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn test_self_ref_step_produces_output() {
+        let d = 4;
+        let seq_len = 3;
+        let mut state = SelfRefState::new(d);
+        // Initialize M_k as small identity-like to get nonzero reads
+        for i in 0..d { state.m_k[i * d + i] = 0.1; }
+        for i in 0..d { state.m_v[i * d + i] = 0.1; }
+        for i in 0..d { state.m_q[i * d + i] = 0.1; }
+        for i in 0..d { state.m_eta[i * d + i] = 0.1; }
+        for i in 0..d { state.m_alpha[i * d + i] = 0.1; }
+
+        let mut m_mem = vec![0.0f32; d * d];
+        for i in 0..d { m_mem[i * d + i] = 0.1; }
+
+        let embedded: Vec<f32> = (0..seq_len * d).map(|i| (i as f32) * 0.1).collect();
+
+        let (y, cache) = self_ref_step(&mut state, &mut m_mem, &embedded, seq_len, d);
+        assert_eq!(y.len(), seq_len * d);
+        // Output should be nonzero (M_mem @ q_t with nonzero q from M_q @ x_t)
+        let y_norm: f32 = y.iter().map(|x| x * x).sum();
+        assert!(y_norm > 0.0, "self_ref_step should produce nonzero output");
+        // Cache dimensions
+        assert_eq!(cache.m_k_states.len(), (seq_len + 1) * d * d);
+        assert_eq!(cache.alpha.len(), seq_len);
+    }
+
+    #[test]
+    fn test_adaptive_changes_per_token() {
+        let d = 4;
+        let seq_len = 2;
+        let mut state = SelfRefState::new(d);
+        for i in 0..d { state.m_k[i * d + i] = 0.1; }
+        for i in 0..d { state.m_v[i * d + i] = 0.1; }
+        for i in 0..d { state.m_q[i * d + i] = 0.1; }
+        // Set eta/alpha to produce nonzero gates
+        for i in 0..d { state.m_eta[i * d + i] = 1.0; }
+        for i in 0..d { state.m_alpha[i * d + i] = 1.0; }
+
+        let mut m_mem = vec![0.0f32; d * d];
+        for i in 0..d { m_mem[i * d + i] = 0.1; }
+
+        let embedded: Vec<f32> = (0..seq_len * d).map(|i| (i as f32) * 0.1 + 0.01).collect();
+
+        let (_, cache) = self_ref_step(&mut state, &mut m_mem, &embedded, seq_len, d);
+
+        // M_k at t=0 should differ from M_k at t=1 (DGD update happened)
+        let dd = d * d;
+        let mk0 = &cache.m_k_states[0..dd];
+        let mk1 = &cache.m_k_states[dd..2 * dd];
+        let diff: f32 = mk0.iter().zip(mk1.iter()).map(|(a, b)| (a - b).abs()).sum();
+        assert!(diff > 1e-8, "M_k should change after DGD update, diff={diff}");
+    }
+
+    #[test]
+    fn test_self_ref_read_only_frozen() {
+        let d = 4;
+        let seq_len = 2;
+        let mut state = SelfRefState::new(d);
+        for i in 0..d { state.m_q[i * d + i] = 0.1; }
+        let m_mem = vec![0.1f32; d * d]; // all 0.1
+
+        let embedded: Vec<f32> = (0..seq_len * d).map(|i| (i as f32) * 0.1).collect();
+        let state_before = state.clone();
+
+        let y = self_ref_read_only(&state, &m_mem, &embedded, seq_len, d);
+        assert_eq!(y.len(), seq_len * d);
+
+        // State should be unchanged (frozen)
+        assert_eq!(state.m_q, state_before.m_q);
+        assert_eq!(state.m_k, state_before.m_k);
+    }
+
+    #[test]
+    fn test_phase1_to_phase2_continuity() {
+        // When M_k is initialized as W_K (static projection matrix),
+        // the adaptive read M_k @ x should match the static matmul W_K @ x.
+        let d = 4;
+        let seq_len = 1;
+        let w_k = vec![
+            0.1, 0.2, 0.0, 0.0,
+            0.0, 0.1, 0.3, 0.0,
+            0.0, 0.0, 0.1, 0.2,
+            0.1, 0.0, 0.0, 0.1,
+        ];
+
+        // Phase 2: M_k initialized as W_K
+        let mut state = SelfRefState::new(d);
+        state.m_k.copy_from_slice(&w_k);
+
+        // Do a single matmul: M_k @ x
+        let x = vec![1.0, 2.0, 3.0, 4.0];
+        let mut k_adaptive = vec![0.0f32; d];
+        matmul_f32(&state.m_k, &x, &mut k_adaptive, d, d, 1);
+
+        // Phase 1 equivalent: W_K @ x
+        let mut k_static = vec![0.0f32; d];
+        matmul_f32(&w_k, &x, &mut k_static, d, d, 1);
+
+        // Should be bit-identical
+        assert_eq!(k_adaptive, k_static, "M_k=W_K should give same projection");
+    }
+
+    #[test]
+    fn test_self_ref_step_state_continuity() {
+        // After self_ref_step, calling it again with the mutated state
+        // should produce different output (state carries forward).
+        let d = 4;
+        let seq_len = 2;
+        let mut state = SelfRefState::new(d);
+        for i in 0..d { state.m_k[i * d + i] = 0.1; }
+        for i in 0..d { state.m_v[i * d + i] = 0.1; }
+        for i in 0..d { state.m_q[i * d + i] = 0.1; }
+        for i in 0..d { state.m_eta[i * d + i] = 1.0; }
+        for i in 0..d { state.m_alpha[i * d + i] = 1.0; }
+        let mut m_mem = vec![0.0f32; d * d];
+        for i in 0..d { m_mem[i * d + i] = 0.1; }
+
+        let embedded: Vec<f32> = (0..seq_len * d).map(|i| (i as f32) * 0.1 + 0.01).collect();
+
+        // First call
+        let (y1, _) = self_ref_step(&mut state, &mut m_mem, &embedded, seq_len, d);
+
+        // Second call with same input but mutated state
+        let (y2, _) = self_ref_step(&mut state, &mut m_mem, &embedded, seq_len, d);
+
+        // Outputs should differ because state evolved
+        let diff: f32 = y1.iter().zip(y2.iter()).map(|(a, b)| (a - b).abs()).sum();
+        assert!(diff > 1e-6, "Second call should produce different output due to state evolution, diff={diff}");
     }
 
     #[test]

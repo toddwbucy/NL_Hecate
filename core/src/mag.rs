@@ -19,7 +19,7 @@ use crate::lattice_osr::{LatticeOSR, LatticeCache, lattice_read_only, lattice_re
 use crate::trellis::{Trellis, TrellisCache, trellis_read_only, trellis_read_only_backward};
 use crate::atlas_omega::{AtlasOmega, AtlasOmegaCache};
 use crate::conductor::{Pulse, ContextState, ErrorBuffer};
-use crate::self_ref::SelfRefCache;
+use crate::self_ref::{SelfRefCache, ProjectionKind, self_ref_step, self_ref_read_only};
 use crate::dynamic_freq::{
     FrequencySchedule, FreqGateCache,
     mean_pool, compute_freq_gates, apply_threshold, should_anneal,
@@ -576,6 +576,17 @@ fn run_level_memory(
     context: &mut ContextState,
 ) -> (Vec<f32>, Option<MemoryCache>, Option<Vec<f32>>, Option<Vec<f32>>) {
     if active {
+        // Phase 2 adaptive projections: self-referential orchestrator
+        if cfg.projection_kind == ProjectionKind::Adaptive {
+            let mut m_mem = std::mem::take(&mut context.memory[level]);
+            let (y, cache) = self_ref_step(
+                &mut context.self_ref[level], &mut m_mem, input, s, d,
+            );
+            // Restore final main memory state to context for chunk boundaries
+            context.memory[level] = m_mem;
+            return (y, Some(MemoryCache::SelfRef(cache)), None, None);
+        }
+
         let initial_m = Some(std::mem::take(&mut context.memory[level]));
         let (y_level, mem_cache) = match cfg.memory_rule {
             MemoryRuleKind::DeltaRule => {
@@ -669,6 +680,15 @@ fn run_level_memory(
         };
         (y_level, Some(mem_cache), None, None)
     } else {
+        // Phase 2 frozen: read-only from all 6 memories
+        if cfg.projection_kind == ProjectionKind::Adaptive {
+            let frozen_mem = &context.memory[level];
+            let y = self_ref_read_only(
+                &context.self_ref[level], frozen_mem, input, s, d,
+            );
+            return (y, None, None, Some(frozen_mem.clone()));
+        }
+
         let frozen_ref = &context.memory[level];
         let (y_level, q_mem) = match cfg.memory_rule {
             MemoryRuleKind::Moneta => moneta_read_only(
