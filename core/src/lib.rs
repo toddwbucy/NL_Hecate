@@ -17,6 +17,7 @@ pub mod lattice_osr;
 pub mod trellis;
 pub mod retention;
 pub mod dgd;
+pub mod self_ref;
 pub mod conv1d;
 pub mod mag;
 pub mod mal;

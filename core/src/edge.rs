@@ -10,6 +10,7 @@
 /// is provided externally (benchmarks, serving module).
 
 use crate::model::{MAGConfig, MAGParams, CompositionKind, MemoryRuleKind, HopeVariant, LatticeVariant, AttentionalBias, MomentumKind};
+use crate::self_ref::ProjectionKind;
 use crate::dynamic_freq::FrequencySchedule;
 use crate::retention::default_retention;
 use crate::conductor::{Conductor, ContextState, ErrorBuffer};
@@ -77,6 +78,7 @@ impl EdgeConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
         }
     }
 

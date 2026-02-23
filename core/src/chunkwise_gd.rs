@@ -102,6 +102,7 @@ fn extract_final_state(cache: &MemoryCache, seq_len: usize, d: usize, cfg: &MAGC
         MemoryCache::Atlas(c) => {
             c.m_states[seq_len * d * d..(seq_len + 1) * d * d].to_vec()
         }
+        MemoryCache::SelfRef(_) => unreachable!("SelfRef not supported in chunkwise_gd"),
     }
 }
 
@@ -209,6 +210,7 @@ fn run_chunk_backward(
             use crate::atlas_omega::AtlasOmega;
             AtlasOmega.step_backward(level_params, c, d_y_chunk, embedded_chunk)
         }
+        MemoryCache::SelfRef(_) => unreachable!("SelfRef not supported in chunkwise_gd"),
     }
 }
 

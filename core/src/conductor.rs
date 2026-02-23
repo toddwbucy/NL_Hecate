@@ -6,6 +6,7 @@
 
 use serde::{Serialize, Deserialize};
 use crate::model::MemoryLevelParams;
+use crate::self_ref::{ProjectionKind, SelfRefState};
 use crate::context_stream::{ContextStream, StreamCursor, TokenChunk, RestoreError};
 
 /// Timing pulse generated each step. Read-only after creation.
@@ -142,18 +143,31 @@ pub struct ContextState {
     /// Per-level M matrices, each [d*d] (row-major).
     pub memory: Vec<Vec<f32>>,
     pub d: usize,
+    /// Per-level self-referential state (5 projection memories each).
+    /// Empty SelfRefState when ProjectionKind::Static — zero overhead.
+    pub self_ref: Vec<SelfRefState>,
 }
 
 impl ContextState {
     pub fn new(k: usize, d: usize) -> Self {
+        Self::new_with_projection(k, d, ProjectionKind::Static)
+    }
+
+    /// Create with projection kind: Static → empty SelfRefState, Adaptive → allocated.
+    pub fn new_with_projection(k: usize, d: usize, projection_kind: ProjectionKind) -> Self {
         let memory = (0..k).map(|_| vec![0.0f32; d * d]).collect();
-        ContextState { memory, d }
+        let self_ref = (0..k).map(|_| match projection_kind {
+            ProjectionKind::Static => SelfRefState::empty(d),
+            ProjectionKind::Adaptive => SelfRefState::new(d),
+        }).collect();
+        ContextState { memory, d, self_ref }
     }
 
     /// Create with custom memory size per level (for MLP-based rules like MONETA).
     pub fn new_with_memory_size(k: usize, d: usize, mem_size: usize) -> Self {
         let memory = (0..k).map(|_| vec![0.0f32; mem_size]).collect();
-        ContextState { memory, d }
+        let self_ref = (0..k).map(|_| SelfRefState::empty(d)).collect();
+        ContextState { memory, d, self_ref }
     }
 
     /// Zero all memory matrices in-place. Used at document boundaries
@@ -162,6 +176,9 @@ impl ContextState {
     pub fn reset(&mut self) {
         for m in &mut self.memory {
             m.fill(0.0);
+        }
+        for sr in &mut self.self_ref {
+            sr.reset();
         }
     }
 }

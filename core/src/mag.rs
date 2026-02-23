@@ -19,6 +19,7 @@ use crate::lattice_osr::{LatticeOSR, LatticeCache, lattice_read_only, lattice_re
 use crate::trellis::{Trellis, TrellisCache, trellis_read_only, trellis_read_only_backward};
 use crate::atlas_omega::{AtlasOmega, AtlasOmegaCache};
 use crate::conductor::{Pulse, ContextState, ErrorBuffer};
+use crate::self_ref::SelfRefCache;
 use crate::dynamic_freq::{
     FrequencySchedule, FreqGateCache,
     mean_pool, compute_freq_gates, apply_threshold, should_anneal,
@@ -37,6 +38,8 @@ pub enum MemoryCache {
     Lattice(LatticeCache),
     Trellis(TrellisCache),
     Atlas(AtlasOmegaCache),
+    /// Self-referential Phase 2: all 6 memories (5 projections + main) via DGD.
+    SelfRef(SelfRefCache),
 }
 
 /// Cache for MAG forward pass — holds both branches' intermediates.
@@ -288,6 +291,7 @@ pub fn mag_backward(
         MemoryCache::Atlas(atlas_cache) => {
             AtlasOmega.step_backward(&params.levels[0], atlas_cache, &d_y, &cache.embedded)
         }
+        MemoryCache::SelfRef(_) => unreachable!("SelfRef backward not yet implemented"),
     };
 
     // Accumulate memory parameter gradients into level 0
@@ -1025,6 +1029,7 @@ pub fn cms_backward(
                 MemoryCache::Atlas(atlas_cache) => {
                     AtlasOmega.step_backward(&params.levels[level], atlas_cache, &d_y_combined, &cache.embedded)
                 }
+                MemoryCache::SelfRef(_) => unreachable!("SelfRef backward not yet implemented"),
             };
             grads.levels[level].accumulate(&mem_grads);
             for i in 0..(s * d) {
