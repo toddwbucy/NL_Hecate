@@ -16,6 +16,8 @@ use crate::gpu_buf::GpuBuf;
 use crate::gpu_params::{GpuMAGParams, GpuMemoryLevelParams};
 #[cfg(feature = "cuda")]
 use crate::gpu_backward::GpuMAGGrads;
+#[cfg(feature = "cuda")]
+use crate::conductor::Pulse;
 
 // ══════════════════════════════════════════════════════════════════════
 // Moment buffer structs (mirror GpuMAGParams layout)
@@ -162,12 +164,16 @@ fn adamw_one(
 /// Full AdamW weight update on GPU. Updates all params in-place, advances step counter.
 /// Zero PCIe traffic — everything stays on device.
 ///
+/// Pulse-gated: SWA params always update; CMS level params only update when
+/// the Pulse fires for that level. Per-level step counters drive bias correction.
+///
 /// Returns the pre-clip gradient L2 norm (for logging). Returns 0.0 if clipping disabled.
 #[cfg(feature = "cuda")]
 pub fn gpu_adamw_update(
     params: &mut GpuMAGParams,
     grads: &mut GpuMAGGrads,
     state: &mut GpuAdamWState,
+    pulse: &Pulse,
     lr: f32,
     beta1: f32,
     beta2: f32,
@@ -192,7 +198,7 @@ pub fn gpu_adamw_update(
         0.0
     };
 
-    // ── SWA weights ──────────────────────────────────────────────────
+    // ── SWA weights (always active) ──────────────────────────────────
     let s = &mut state.swa;
     adamw_one(&mut params.swa.w_embed, &grads.d_w_embed, &mut s.m_embed, &mut s.v_embed,
               lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
@@ -207,32 +213,42 @@ pub fn gpu_adamw_update(
     adamw_one(&mut params.swa.w_unembed, &grads.d_w_unembed, &mut s.m_unembed, &mut s.v_unembed,
               lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
 
-    // ── Per-level memory weights ─────────────────────────────────────
+    // ── Per-level memory weights (Pulse-gated) ───────────────────────
     for (i, lg) in grads.levels.iter().enumerate() {
+        if i >= pulse.active_levels.len() || !pulse.active_levels[i] {
+            continue; // Level frozen: no update, no step increment
+        }
+
         let lp = &mut params.levels[i];
         let ml = &mut state.levels[i];
 
+        // Per-level bias correction
+        ml.level_step += 1;
+        let lt = ml.level_step as f32;
+        let lbc1_inv = 1.0 / (1.0 - beta1.powf(lt));
+        let lbc2_inv = 1.0 / (1.0 - beta2.powf(lt));
+
         adamw_one(&mut lp.w_k_mem, &lg.d_w_k_mem, &mut ml.m_w_k_mem, &mut ml.v_w_k_mem,
-                  lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
+                  lr, beta1, beta2, eps, lbc1_inv, lbc2_inv, weight_decay);
         adamw_one(&mut lp.w_v_mem, &lg.d_w_v_mem, &mut ml.m_w_v_mem, &mut ml.v_w_v_mem,
-                  lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
+                  lr, beta1, beta2, eps, lbc1_inv, lbc2_inv, weight_decay);
         adamw_one(&mut lp.w_q_mem, &lg.d_w_q_mem, &mut ml.m_w_q_mem, &mut ml.v_w_q_mem,
-                  lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
+                  lr, beta1, beta2, eps, lbc1_inv, lbc2_inv, weight_decay);
 
         // Gate weights
         adamw_one(&mut lp.w_alpha, &lg.d_w_alpha, &mut ml.m_w_alpha, &mut ml.v_w_alpha,
-                  lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
+                  lr, beta1, beta2, eps, lbc1_inv, lbc2_inv, weight_decay);
         adamw_one(&mut lp.b_alpha, &lg.d_b_alpha, &mut ml.m_b_alpha, &mut ml.v_b_alpha,
-                  lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
+                  lr, beta1, beta2, eps, lbc1_inv, lbc2_inv, weight_decay);
         adamw_one(&mut lp.w_theta, &lg.d_w_theta, &mut ml.m_w_theta, &mut ml.v_w_theta,
-                  lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
+                  lr, beta1, beta2, eps, lbc1_inv, lbc2_inv, weight_decay);
         adamw_one(&mut lp.b_theta, &lg.d_b_theta, &mut ml.m_b_theta, &mut ml.v_b_theta,
-                  lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
+                  lr, beta1, beta2, eps, lbc1_inv, lbc2_inv, weight_decay);
         // TODO(CS-39): clamp b_theta after update to prevent decay divergence
         adamw_one(&mut lp.w_eta, &lg.d_w_eta, &mut ml.m_w_eta, &mut ml.v_w_eta,
-                  lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
+                  lr, beta1, beta2, eps, lbc1_inv, lbc2_inv, weight_decay);
         adamw_one(&mut lp.b_eta, &lg.d_b_eta, &mut ml.m_b_eta, &mut ml.v_b_eta,
-                  lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
+                  lr, beta1, beta2, eps, lbc1_inv, lbc2_inv, weight_decay);
     }
 
     crate::dispatch::cuda_sync();

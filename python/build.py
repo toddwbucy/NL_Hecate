@@ -814,9 +814,9 @@ def main():
     adamw_opt = None
     use_adamw_gpu = (bcfg.optimizer == "adamw_gpu")
     if bcfg.optimizer == "adamw":
-        adamw_opt = AdamW(
-            num_params=params.num_params(), lr=bcfg.lr,
-            beta1=bcfg.beta1, beta2=bcfg.beta2, weight_decay=bcfg.weight_decay,
+        adamw_opt = nl_hecate.FrequencyAwareAdamW(
+            params, beta1=bcfg.beta1, beta2=bcfg.beta2,
+            weight_decay=bcfg.weight_decay,
         )
 
     # Structured logger
@@ -906,17 +906,10 @@ def main():
             # GPU path with SGD: forward + backward + update in one call
             loss = gpu_model.step(input_ids, target_ids, pulse, current_lr)
         elif gpu_model is not None and adamw_opt is not None:
-            # Hybrid GPU+AdamW: GPU forward+backward, Python optimizer
+            # Hybrid GPU+AdamW: GPU forward+backward, Rust frequency-aware optimizer
             loss, grad_params = gpu_model.backward_only(input_ids, target_ids, pulse)
-            p_flat = params.get_flat_weights()
-            g_flat = grad_params.get_flat_weights()
-            if bcfg.max_grad_norm > 0:
-                g_flat, g_norm = clip_grad_norm(g_flat, bcfg.max_grad_norm)
-            else:
-                g_norm = grad_norm(g_flat)
-            p_flat = adamw_opt.step(p_flat, g_flat, current_lr)
-            params.set_flat_weights(p_flat)
-            # Weight tying: sync w_unembed^T → w_embed (same as SGD path)
+            adamw_opt.step(params, grad_params, pulse, current_lr)
+            # Weight tying: sync w_unembed^T → w_embed
             nl_hecate.mag_apply_weight_gradients(params, grad_params, 0.0)
             gpu_model.upload_params(params)
             error_buffers.apply_for_active(params, pulse, current_lr)
@@ -926,14 +919,7 @@ def main():
                 params, cfg, input_ids, target_ids, pulse, context,
                 error_buffers)
             if adamw_opt:
-                p_flat = params.get_flat_weights()
-                g_flat = grads.get_flat_weights()
-                if bcfg.max_grad_norm > 0:
-                    g_flat, g_norm = clip_grad_norm(g_flat, bcfg.max_grad_norm)
-                else:
-                    g_norm = grad_norm(g_flat)
-                p_flat = adamw_opt.step(p_flat, g_flat, current_lr)
-                params.set_flat_weights(p_flat)
+                adamw_opt.step(params, grads, pulse, current_lr)
                 # Weight tying: sync w_unembed^T → w_embed
                 nl_hecate.mag_apply_weight_gradients(params, grads, 0.0)
             else:

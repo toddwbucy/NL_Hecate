@@ -515,9 +515,9 @@ impl MAGParams {
         dict.set_item("w_o", self.inner.swa.w_o.clone())?;
         dict.set_item("w_unembed", self.inner.swa.w_unembed.clone())?;
         // Memory weights (level 0 for backward compat)
-        dict.set_item("w_k_mem", self.inner.levels[0].w_k_mem.clone())?;
-        dict.set_item("w_v_mem", self.inner.levels[0].w_v_mem.clone())?;
-        dict.set_item("w_q_mem", self.inner.levels[0].w_q_mem.clone())?;
+        dict.set_item("w_k_mem", self.inner.levels[0].w_k_mem.master().to_vec())?;
+        dict.set_item("w_v_mem", self.inner.levels[0].w_v_mem.master().to_vec())?;
+        dict.set_item("w_q_mem", self.inner.levels[0].w_q_mem.master().to_vec())?;
         dict.set_item("w_alpha", self.inner.levels[0].w_alpha.clone())?;
         dict.set_item("b_alpha", self.inner.levels[0].b_alpha.clone())?;
         dict.set_item("w_theta", self.inner.levels[0].w_theta.clone())?;
@@ -536,9 +536,9 @@ impl MAGParams {
         flat.extend_from_slice(&self.inner.swa.w_o);
         flat.extend_from_slice(&self.inner.swa.w_unembed);
         for level in &self.inner.levels {
-            flat.extend_from_slice(&level.w_k_mem);
-            flat.extend_from_slice(&level.w_v_mem);
-            flat.extend_from_slice(&level.w_q_mem);
+            flat.extend_from_slice(level.w_k_mem.master());
+            flat.extend_from_slice(level.w_v_mem.master());
+            flat.extend_from_slice(level.w_q_mem.master());
             flat.extend_from_slice(&level.w_alpha);
             flat.extend_from_slice(&level.b_alpha);
             flat.extend_from_slice(&level.w_theta);
@@ -570,6 +570,15 @@ impl MAGParams {
                 offset += n;
             }};
         }
+        // Bf16Storage fields: copy to master, then sync bf16 stored copy
+        macro_rules! copy_bf16 {
+            ($dst:expr) => {{
+                let n = $dst.len();
+                $dst.master_mut().copy_from_slice(&flat[offset..offset + n]);
+                $dst.sync_from_master();
+                offset += n;
+            }};
+        }
         copy_slice!(self.inner.swa.w_embed);
         copy_slice!(self.inner.swa.w_q);
         copy_slice!(self.inner.swa.w_k);
@@ -577,9 +586,9 @@ impl MAGParams {
         copy_slice!(self.inner.swa.w_o);
         copy_slice!(self.inner.swa.w_unembed);
         for level in &mut self.inner.levels {
-            copy_slice!(level.w_k_mem);
-            copy_slice!(level.w_v_mem);
-            copy_slice!(level.w_q_mem);
+            copy_bf16!(level.w_k_mem);
+            copy_bf16!(level.w_v_mem);
+            copy_bf16!(level.w_q_mem);
             copy_slice!(level.w_alpha);
             copy_slice!(level.b_alpha);
             copy_slice!(level.w_theta);
@@ -622,7 +631,7 @@ impl MAGForwardCache {
     d_hidden=None, lp_p=None, sign_sharpness=None, lq_q=None, lambda_local=None, lambda_2=None,
     delta=None, m_slots=None, d_compress=None, lambda_k=None, lambda_v=None,
     retention=None, m3=None, frequency_schedule=None, checkpoint_interval=None,
-    attentional_bias=None, kernel_size=0,
+    attentional_bias=None, kernel_size=0, self_ref_chunk_size=1,
 ))]
 fn mag_create_config(
     d_model: usize,
@@ -653,12 +662,13 @@ fn mag_create_config(
     checkpoint_interval: Option<usize>,
     attentional_bias: Option<&str>,
     kernel_size: usize,
+    self_ref_chunk_size: usize,
 ) -> PyResult<MAGConfig> {
     MAGConfig::new(
         d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled,
         k, chunk_sizes, memory_rule, composition,
         d_hidden, lp_p, sign_sharpness, lq_q, lambda_local, lambda_2, delta, m_slots, d_compress, lambda_k, lambda_v,
-        retention, m3, frequency_schedule, checkpoint_interval, attentional_bias, kernel_size,
+        retention, m3, frequency_schedule, checkpoint_interval, attentional_bias, kernel_size, self_ref_chunk_size,
     )
 }
 
@@ -1521,9 +1531,10 @@ impl GpuModel {
         }
         let state = self.adamw_state.as_mut().unwrap();
 
-        // AdamW update (with grad clipping)
+        // AdamW update (Pulse-gated, with grad clipping)
         let grad_norm = nl_hecate_core::gpu_optimizer::gpu_adamw_update(
             &mut self.params, &mut grads, state,
+            &pulse.inner,
             lr, beta1, beta2, eps, weight_decay, max_grad_norm,
         );
 
@@ -1644,6 +1655,47 @@ impl GpuModel {
     }
 }
 
+// ── FrequencyAwareAdamW (CPU) ─────────────────────────────────────────
+
+/// Frequency-aware AdamW optimizer for the outer loop (CPU path).
+///
+/// Maintains per-CMS-level moment buffers with independent step counters.
+/// SWA and aggregation params always update; CMS level params only update
+/// when the Pulse fires for that level.
+#[pyclass]
+struct FrequencyAwareAdamW {
+    inner: nl_hecate_core::adamw::FrequencyAwareAdamW,
+}
+
+#[pymethods]
+impl FrequencyAwareAdamW {
+    /// Create optimizer state from MAGParams shapes.
+    #[new]
+    #[pyo3(signature = (params, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.1))]
+    fn new(params: &MAGParams, beta1: f32, beta2: f32, eps: f32, weight_decay: f32) -> Self {
+        let config = nl_hecate_core::adamw::AdamWConfig { beta1, beta2, eps, weight_decay };
+        FrequencyAwareAdamW {
+            inner: nl_hecate_core::adamw::FrequencyAwareAdamW::new(&params.inner, config),
+        }
+    }
+
+    /// Pulse-gated AdamW step. SWA params always update; CMS levels only
+    /// update when the Pulse fires for that level.
+    fn step(&mut self, params: &mut MAGParams, grads: &MAGParams, pulse: &Pulse, lr: f32) {
+        self.inner.step(&mut params.inner, &grads.inner, &pulse.inner, lr);
+    }
+
+    /// Get the SWA (global) step count.
+    fn swa_step(&self) -> u32 {
+        self.inner.swa_step()
+    }
+
+    /// Get the level-local step count for a CMS level.
+    fn level_step(&self, level: usize) -> u32 {
+        self.inner.level_step(level)
+    }
+}
+
 // ── Module ───────────────────────────────────────────────────────────
 
 #[pymodule]
@@ -1683,6 +1735,8 @@ fn nl_hecate(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(save_build_checkpoint, m)?)?;
     m.add_function(wrap_pyfunction!(load_checkpoint, m)?)?;
     m.add_function(wrap_pyfunction!(load_build_checkpoint, m)?)?;
+    // CPU frequency-aware AdamW optimizer
+    m.add_class::<FrequencyAwareAdamW>()?;
     // GPU-resident model
     #[cfg(feature = "cuda")]
     m.add_class::<GpuModel>()?;
