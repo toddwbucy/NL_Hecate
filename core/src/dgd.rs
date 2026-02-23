@@ -28,26 +28,35 @@ pub struct DgdGrads {
     pub d_theta: f32,
 }
 
-/// Compute prediction error: `e = M @ k - v`.
+/// Compute prediction error into a pre-allocated buffer: `out = M @ k - v`.
 ///
 /// - `m`: [d, d] memory matrix (row-major).
 /// - `k`: [d] key vector.
 /// - `v`: [d] value vector.
 /// - `d`: dimension.
-///
-/// Returns: [d] error vector.
-pub fn dgd_error(m: &[f32], k: &[f32], v: &[f32], d: usize) -> Vec<f32> {
+/// - `out`: [d] pre-allocated output buffer (overwritten).
+pub fn dgd_error_into(m: &[f32], k: &[f32], v: &[f32], d: usize, out: &mut [f32]) {
     debug_assert_eq!(m.len(), d * d);
     debug_assert_eq!(k.len(), d);
     debug_assert_eq!(v.len(), d);
+    debug_assert_eq!(out.len(), d);
 
-    let mut prediction = vec![0.0f32; d];
-    matmul_f32(m, k, &mut prediction, d, d, 1);
-
+    matmul_f32(m, k, out, d, d, 1);
     for i in 0..d {
-        prediction[i] -= v[i];
+        out[i] -= v[i];
     }
-    prediction
+}
+
+/// Compute prediction error: `e = M @ k - v`.
+///
+/// Allocating wrapper around [`dgd_error_into`]. Prefer the `_into` variant
+/// in hot loops where a buffer can be reused.
+///
+/// Returns: [d] error vector.
+pub fn dgd_error(m: &[f32], k: &[f32], v: &[f32], d: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; d];
+    dgd_error_into(m, k, v, d, &mut out);
+    out
 }
 
 /// Apply DGD update in-place: `M = (1 - alpha) * M - theta * outer(biased_error, k)`.
@@ -180,13 +189,20 @@ pub fn dgd_step_backward(
 
 /// DGD with momentum accumulation (Delta Momentum, HOPE §4.4).
 ///
+/// Accepts a pre-computed (possibly bias-transformed) error vector, so callers
+/// can apply non-L2 attentional biases before passing it in. For L2 semantics,
+/// pass the raw output of [`dgd_error`].
+///
+/// ```text
+/// grad = outer(biased_error, k)
 /// S = beta * S + theta * grad
 /// M = (1 - alpha) * M - S
+/// ```
 ///
 /// - `m`: [d, d] memory matrix, updated in-place.
 /// - `s`: [d, d] momentum accumulator, updated in-place.
+/// - `biased_error`: [d] error vector (raw for L2, or after attentional bias).
 /// - `k`: [d] key vector.
-/// - `v`: [d] value vector.
 /// - `alpha`: retention gate.
 /// - `theta`: learning rate gate.
 /// - `beta`: momentum gate.
@@ -194,8 +210,8 @@ pub fn dgd_step_backward(
 pub fn dgd_momentum_step(
     m: &mut [f32],
     s: &mut [f32],
+    biased_error: &[f32],
     k: &[f32],
-    v: &[f32],
     alpha: f32,
     theta: f32,
     beta: f32,
@@ -203,14 +219,12 @@ pub fn dgd_momentum_step(
 ) {
     debug_assert_eq!(m.len(), d * d);
     debug_assert_eq!(s.len(), d * d);
+    debug_assert_eq!(biased_error.len(), d);
     debug_assert_eq!(k.len(), d);
-    debug_assert_eq!(v.len(), d);
 
-    let error = dgd_error(m, k, v, d);
-
-    // grad = outer(error, k)
+    // grad = outer(biased_error, k)
     let mut grad = vec![0.0f32; d * d];
-    outer_product_f32(&error, k, &mut grad);
+    outer_product_f32(biased_error, k, &mut grad);
 
     // S = beta * S + theta * grad
     for i in 0..(d * d) {
@@ -226,10 +240,16 @@ pub fn dgd_momentum_step(
 
 /// Sherman-Morrison closed-form DGD (HOPE Appendix C, Eq 121).
 ///
+/// **L2-only**: The closed-form derivation assumes the L2 inner objective
+/// `||M k - v||^2`. Non-L2 attentional biases invalidate the Sherman-Morrison
+/// inversion and must use iterative `dgd_step` / `dgd_update` instead.
+///
+/// ```text
 /// eta' = eta / (1 + eta)
 /// M = (I - eta' * k @ k^T) * M + eta' * v @ k^T
+/// ```
 ///
-/// Assumes ||k|| = phi (normalized keys from layer-norm).
+/// Assumes `||k|| = phi` (normalized keys from layer-norm).
 ///
 /// - `m`: [d, d] memory matrix, updated in-place.
 /// - `k`: [d] key vector (normalized).

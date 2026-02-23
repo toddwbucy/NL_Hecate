@@ -4,7 +4,7 @@
 //! Covers: basic I/O, zero gates, momentum, Sherman-Morrison,
 //! FD gradient check, loss monotonicity, and delegation regression.
 
-use nl_hecate_core::dgd::{dgd_error, dgd_update, dgd_step, dgd_step_backward, dgd_momentum_step, dgd_sherman_morrison};
+use nl_hecate_core::dgd::{dgd_error, dgd_error_into, dgd_update, dgd_step, dgd_step_backward, dgd_momentum_step, dgd_sherman_morrison};
 use nl_hecate_core::model::{
     MAGConfig, MAGParams, SWAConfig, CompositionKind, MemoryRuleKind,
     HopeVariant, LatticeVariant, MomentumKind,
@@ -85,7 +85,8 @@ fn test_dgd_momentum_step() {
     let beta = 0.9;
 
     // Step 1: S starts at 0, so S = 0 + theta*grad = theta*grad
-    dgd_momentum_step(&mut m, &mut s, &k, &v, alpha, theta, beta, d);
+    let error1 = dgd_error(&m, &k, &v, d);
+    dgd_momentum_step(&mut m, &mut s, &error1, &k, alpha, theta, beta, d);
 
     // S should be non-zero after step 1
     let s_norm: f32 = s.iter().map(|x| x * x).sum();
@@ -93,7 +94,8 @@ fn test_dgd_momentum_step() {
 
     // Step 2: S should accumulate (beta * S_prev + theta * grad_new)
     let _s_after_1 = s.clone();
-    dgd_momentum_step(&mut m, &mut s, &k, &v, alpha, theta, beta, d);
+    let error2 = dgd_error(&m, &k, &v, d);
+    dgd_momentum_step(&mut m, &mut s, &error2, &k, alpha, theta, beta, d);
 
     // S[0] should be beta * s_after_1[0] + theta * new_grad[0]
     // We just verify it changed and is larger in magnitude (accumulation)
