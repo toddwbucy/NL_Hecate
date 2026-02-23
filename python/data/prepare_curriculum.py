@@ -630,18 +630,20 @@ def main():
 
     # ── Step 5: Concatenate val examples ─────────────────────────────
     print("\nStep 5: Building validation set...")
-    val_all_tokens = []
-    val_all_targets = []
+    val_pools = [("stories", stories_val), ("conversation", conversation_val),
+                 ("reasoning", reasoning_val)]
+    val_total = sum(len(t) for _, pool in val_pools for t, _ in pool)
+    val_tokens = np.empty(val_total, dtype=np.uint32)
+    val_targets = np.empty(val_total, dtype=np.int32)
+    val_pos = 0
     val_counts = {}
-    for name, pool in [("stories", stories_val), ("conversation", conversation_val),
-                       ("reasoning", reasoning_val)]:
+    for name, pool in val_pools:
         for toks, tgts in pool:
-            val_all_tokens.extend(toks)
-            val_all_targets.extend(tgts)
+            n = len(toks)
+            val_tokens[val_pos:val_pos + n] = toks
+            val_targets[val_pos:val_pos + n] = tgts
+            val_pos += n
         val_counts[name] = len(pool)
-
-    val_tokens = np.array(val_all_tokens, dtype=np.uint32)
-    val_targets = np.array(val_all_targets, dtype=np.int32)
     print(f"  Validation: {len(val_tokens):,} tokens "
           f"(stories={val_counts['stories']}, conv={val_counts['conversation']}, "
           f"reasoning={val_counts['reasoning']})")
@@ -701,13 +703,13 @@ def main():
             "<|pad|>": PAD_ID,
         },
         "train": {
-            "total_tokens": int(len(train_tokens)),
+            "total_tokens": len(train_tokens),
             "valid_targets": train_valid,
             "masked_targets": train_masked,
             "mask_ratio": train_masked / max(train_masked + train_valid, 1),
         },
         "val": {
-            "total_tokens": int(len(val_tokens)),
+            "total_tokens": len(val_tokens),
             "valid_targets": val_valid,
             "masked_targets": val_masked,
             "mask_ratio": val_masked / max(val_masked + val_valid, 1),
@@ -744,7 +746,7 @@ def main():
     print(f"  Train tokens:  {len(train_tokens):,}")
     print(f"  Val tokens:    {len(val_tokens):,}")
     print(f"  Train valid:   {train_valid:,} ({train_valid/len(train_tokens):.1%})")
-    print(f"  Schedule:      TinyStories → SE+tulu+Dolly → GSM8K+OpenMath")
+    print("  Schedule:      TinyStories → SE+tulu+Dolly → GSM8K+OpenMath")
     print("=" * 60)
 
 

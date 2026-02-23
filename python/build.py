@@ -1081,7 +1081,8 @@ def main():
                 print(f"  [phase probe] step {step}: "
                       + ", ".join(f"{k}={v:.4f}" for k, v in phase_losses.items()))
                 if jsonl:
-                    log_entry = {"event": "phase_boundary", "step": step}
+                    log_entry = {"event": "phase_boundary", "step": step,
+                                 "min_stories_loss": min_stories_loss}
                     for pname, pl in phase_losses.items():
                         log_entry[f"{pname}_loss"] = pl
                     jsonl.log(**log_entry)
@@ -1114,10 +1115,10 @@ def main():
                     v_ctx = gpu_model.to_host_context()
                     v_model.upload_context(v_ctx)
                     # Run forward-only on both models with same data
-                    saved_ctx_rt = gpu_model.to_host_context()
+                    # Reuse v_ctx for restore (GPU context unchanged between downloads)
                     train_fwd, _ = gpu_model.forward(input_ids, target_ids, pulse)
                     verify_fwd, _ = v_model.forward(input_ids, target_ids, pulse)
-                    gpu_model.upload_context(saved_ctx_rt)
+                    gpu_model.upload_context(v_ctx)
                     delta = abs(verify_fwd - train_fwd)
                     if jsonl:
                         jsonl.log(event="checkpoint_roundtrip", step=step,
