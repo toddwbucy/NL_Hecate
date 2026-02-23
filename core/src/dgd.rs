@@ -246,7 +246,7 @@ pub fn dgd_momentum_step(
 ///
 /// ```text
 /// eta' = eta / (1 + eta)
-/// M = (I - eta' * k @ k^T) * M + eta' * v @ k^T
+/// M = M @ (I - eta' * k @ k^T) + eta' * v @ k^T
 /// ```
 ///
 /// Assumes `||k|| = phi` (normalized keys from layer-norm).
