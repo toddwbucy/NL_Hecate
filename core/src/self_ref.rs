@@ -273,6 +273,8 @@ pub fn self_ref_step(
     let mut eta_raw_t = vec![0.0f32; d];
     let mut alpha_raw_t = vec![0.0f32; d];
     let mut y_t = vec![0.0f32; d];
+    let mut v_hat_buf = vec![0.0f32; d]; // reused for self-gen matmuls
+    let sd = seq_len * d; // precomputed stride for v_hat_targets indexing
 
     for t in 0..seq_len {
         let x_t = &embedded[t * d..(t + 1) * d];
@@ -306,51 +308,45 @@ pub fn self_ref_step(
 
         // Step 3.5: Self-generated value targets (Phase 3, HOPE Eq 84)
         // When enabled, each memory generates its own target: v̂_□ = M_{□,t-1}(v_t).
+        // We write results into cache.v_hat_targets and pass slices to DGD.
         // When disabled, all memories share v_t as target (Phase 2 behavior).
-        let (v_hat_k, v_hat_v, v_hat_q, v_hat_eta, v_hat_alpha, v_hat_mem);
         if self_generated_values {
-            let mut buf = vec![0.0f32; d];
+            let t_off = t * d;
             // v̂_k = M_k @ v_t
-            matmul_f32(&self_ref.m_k, &v_t, &mut buf, d, d, 1);
-            v_hat_k = buf.clone();
-            cache.v_hat_targets[0 * seq_len * d + t * d..0 * seq_len * d + (t + 1) * d].copy_from_slice(&buf);
+            matmul_f32(&self_ref.m_k, &v_t, &mut v_hat_buf, d, d, 1);
+            cache.v_hat_targets[0 * sd + t_off..0 * sd + t_off + d].copy_from_slice(&v_hat_buf);
             // v̂_v = M_v @ v_t
-            matmul_f32(&self_ref.m_v, &v_t, &mut buf, d, d, 1);
-            v_hat_v = buf.clone();
-            cache.v_hat_targets[1 * seq_len * d + t * d..1 * seq_len * d + (t + 1) * d].copy_from_slice(&buf);
+            matmul_f32(&self_ref.m_v, &v_t, &mut v_hat_buf, d, d, 1);
+            cache.v_hat_targets[1 * sd + t_off..1 * sd + t_off + d].copy_from_slice(&v_hat_buf);
             // v̂_q = M_q @ v_t
-            matmul_f32(&self_ref.m_q, &v_t, &mut buf, d, d, 1);
-            v_hat_q = buf.clone();
-            cache.v_hat_targets[2 * seq_len * d + t * d..2 * seq_len * d + (t + 1) * d].copy_from_slice(&buf);
+            matmul_f32(&self_ref.m_q, &v_t, &mut v_hat_buf, d, d, 1);
+            cache.v_hat_targets[2 * sd + t_off..2 * sd + t_off + d].copy_from_slice(&v_hat_buf);
             // v̂_eta = M_eta @ v_t
-            matmul_f32(&self_ref.m_eta, &v_t, &mut buf, d, d, 1);
-            v_hat_eta = buf.clone();
-            cache.v_hat_targets[3 * seq_len * d + t * d..3 * seq_len * d + (t + 1) * d].copy_from_slice(&buf);
+            matmul_f32(&self_ref.m_eta, &v_t, &mut v_hat_buf, d, d, 1);
+            cache.v_hat_targets[3 * sd + t_off..3 * sd + t_off + d].copy_from_slice(&v_hat_buf);
             // v̂_alpha = M_alpha @ v_t
-            matmul_f32(&self_ref.m_alpha, &v_t, &mut buf, d, d, 1);
-            v_hat_alpha = buf.clone();
-            cache.v_hat_targets[4 * seq_len * d + t * d..4 * seq_len * d + (t + 1) * d].copy_from_slice(&buf);
+            matmul_f32(&self_ref.m_alpha, &v_t, &mut v_hat_buf, d, d, 1);
+            cache.v_hat_targets[4 * sd + t_off..4 * sd + t_off + d].copy_from_slice(&v_hat_buf);
             // v̂_mem = M_mem @ v_t
-            matmul_f32(m_mem, &v_t, &mut buf, d, d, 1);
-            v_hat_mem = buf;
-            cache.v_hat_targets[5 * seq_len * d + t * d..5 * seq_len * d + (t + 1) * d].copy_from_slice(&v_hat_mem);
-        } else {
-            v_hat_k = v_t.clone();
-            v_hat_v = v_t.clone();
-            v_hat_q = v_t.clone();
-            v_hat_eta = v_t.clone();
-            v_hat_alpha = v_t.clone();
-            v_hat_mem = v_t.clone();
-        }
+            matmul_f32(m_mem, &v_t, &mut v_hat_buf, d, d, 1);
+            cache.v_hat_targets[5 * sd + t_off..5 * sd + t_off + d].copy_from_slice(&v_hat_buf);
 
-        // Step 4: DGD update all 6 memories (Eq 88)
-        // Key fix: ALL 6 memories use k_t as key (Eq 88), not x_t for components.
-        dgd_step(&mut self_ref.m_k, &k_t, &v_hat_k, alpha_t, theta_t, d);
-        dgd_step(&mut self_ref.m_v, &k_t, &v_hat_v, alpha_t, theta_t, d);
-        dgd_step(&mut self_ref.m_q, &k_t, &v_hat_q, alpha_t, theta_t, d);
-        dgd_step(&mut self_ref.m_eta, &k_t, &v_hat_eta, alpha_t, theta_t, d);
-        dgd_step(&mut self_ref.m_alpha, &k_t, &v_hat_alpha, alpha_t, theta_t, d);
-        dgd_step(m_mem, &k_t, &v_hat_mem, alpha_t, theta_t, d);
+            // Step 4: DGD update all 6 memories (Eq 88) — read targets back from cache
+            dgd_step(&mut self_ref.m_k,     &k_t, &cache.v_hat_targets[0 * sd + t_off..0 * sd + t_off + d], alpha_t, theta_t, d);
+            dgd_step(&mut self_ref.m_v,     &k_t, &cache.v_hat_targets[1 * sd + t_off..1 * sd + t_off + d], alpha_t, theta_t, d);
+            dgd_step(&mut self_ref.m_q,     &k_t, &cache.v_hat_targets[2 * sd + t_off..2 * sd + t_off + d], alpha_t, theta_t, d);
+            dgd_step(&mut self_ref.m_eta,   &k_t, &cache.v_hat_targets[3 * sd + t_off..3 * sd + t_off + d], alpha_t, theta_t, d);
+            dgd_step(&mut self_ref.m_alpha, &k_t, &cache.v_hat_targets[4 * sd + t_off..4 * sd + t_off + d], alpha_t, theta_t, d);
+            dgd_step(m_mem,                 &k_t, &cache.v_hat_targets[5 * sd + t_off..5 * sd + t_off + d], alpha_t, theta_t, d);
+        } else {
+            // Step 4: DGD update all 6 memories (Eq 88), shared v_t target
+            dgd_step(&mut self_ref.m_k,     &k_t, &v_t, alpha_t, theta_t, d);
+            dgd_step(&mut self_ref.m_v,     &k_t, &v_t, alpha_t, theta_t, d);
+            dgd_step(&mut self_ref.m_q,     &k_t, &v_t, alpha_t, theta_t, d);
+            dgd_step(&mut self_ref.m_eta,   &k_t, &v_t, alpha_t, theta_t, d);
+            dgd_step(&mut self_ref.m_alpha, &k_t, &v_t, alpha_t, theta_t, d);
+            dgd_step(m_mem,                 &k_t, &v_t, alpha_t, theta_t, d);
+        }
 
         // Snapshot updated states (t+1)
         let off = (t + 1) * dd;
@@ -508,6 +504,7 @@ pub fn self_ref_step_backward(
 
     // Temp buffers
     let mut dq_t = vec![0.0f32; d];
+    let sd = s * d; // precomputed stride for v_hat_targets indexing
 
     for t in (0..s).rev() {
         let x_t = &cache.embedded[t * d..(t + 1) * d];
@@ -540,7 +537,6 @@ pub fn self_ref_step_backward(
 
         // ── Step 2: Resolve DGD value targets for backward ──
         // Phase 3: v_hat from cache; Phase 2: v_hat == v_t.
-        let sd = s * d;
         let (v_hat_k, v_hat_v, v_hat_q, v_hat_eta, v_hat_alpha, v_hat_mem);
         if self_generated_values {
             v_hat_k     = &cache.v_hat_targets[0 * sd + t * d..0 * sd + (t + 1) * d];
