@@ -1684,6 +1684,10 @@ impl FrequencyAwareAdamW {
 
     /// Pulse-gated AdamW step. SWA params always update; CMS levels only
     /// update when the Pulse fires for that level.
+    ///
+    /// When `max_grad_norm > 0`, clips the global gradient L2 norm in-place
+    /// before applying updates. This mutates `grads` — callers who need the
+    /// original gradient values should clone before calling.
     #[pyo3(signature = (params, grads, pulse, lr, max_grad_norm=0.0))]
     fn step(&mut self, params: &mut MAGParams, grads: &mut MAGParams, pulse: &Pulse,
             lr: f32, max_grad_norm: f32) {

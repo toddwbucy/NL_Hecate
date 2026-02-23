@@ -913,7 +913,8 @@ def main():
             # Weight tying: sync w_unembed^T → w_embed
             nl_hecate.mag_apply_weight_gradients(params, grad_params, 0.0)
             gpu_model.upload_params(params)
-            error_buffers.apply_for_active(params, pulse, current_lr)
+            # Note: error_buffers not used in GPU backward path;
+            # FrequencyAwareAdamW handles pulse-gating internally.
         else:
             # CPU path: tape-based forward + backward (single call)
             loss, grads = nl_hecate.cms_compute_gradients(

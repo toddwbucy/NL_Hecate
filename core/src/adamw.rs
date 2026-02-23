@@ -215,7 +215,7 @@ impl FrequencyAwareAdamW {
             for g in grads.alpha_refl.iter() { norm_sq += (*g as f64) * (*g as f64); }
             for g in grads.persistent_tokens.iter() { norm_sq += (*g as f64) * (*g as f64); }
 
-            let norm = (norm_sq as f32).sqrt();
+            let norm = norm_sq.sqrt() as f32;
             if norm > max_grad_norm {
                 let scale = max_grad_norm / norm;
                 for g in grads.swa.w_embed.iter_mut() { *g *= scale; }
