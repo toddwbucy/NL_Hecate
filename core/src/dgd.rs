@@ -75,14 +75,14 @@ pub fn dgd_update(m: &mut [f32], biased_error: &[f32], k: &[f32], alpha: f32, th
     debug_assert_eq!(biased_error.len(), d);
     debug_assert_eq!(k.len(), d);
 
-    // grad = outer(biased_error, k): [d, d]
-    let mut grad = vec![0.0f32; d * d];
-    outer_product_f32(biased_error, k, &mut grad);
-
-    // M = (1 - alpha) * M - theta * grad
+    // M = (1 - alpha) * M - theta * outer(biased_error, k)
+    // Fused in-place to avoid d*d temporary allocation.
     l2_apply_retention(m, 1.0 - alpha);
-    for i in 0..(d * d) {
-        m[i] -= theta * grad[i];
+    for i in 0..d {
+        let scaled_err = theta * biased_error[i];
+        for j in 0..d {
+            m[i * d + j] -= scaled_err * k[j];
+        }
     }
 }
 
