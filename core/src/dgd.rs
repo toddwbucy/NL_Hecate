@@ -222,13 +222,13 @@ pub fn dgd_momentum_step(
     debug_assert_eq!(biased_error.len(), d);
     debug_assert_eq!(k.len(), d);
 
-    // grad = outer(biased_error, k)
-    let mut grad = vec![0.0f32; d * d];
-    outer_product_f32(biased_error, k, &mut grad);
-
-    // S = beta * S + theta * grad
-    for i in 0..(d * d) {
-        s[i] = beta * s[i] + theta * grad[i];
+    // S = beta * S + theta * outer(biased_error, k) — fused
+    for i in 0..d {
+        let scaled_err = theta * biased_error[i];
+        for j in 0..d {
+            let idx = i * d + j;
+            s[idx] = beta * s[idx] + scaled_err * k[j];
+        }
     }
 
     // M = (1 - alpha) * M - S
