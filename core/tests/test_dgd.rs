@@ -7,7 +7,7 @@
 use nl_hecate_core::dgd::{dgd_error, dgd_error_into, dgd_update, dgd_step, dgd_step_backward, dgd_momentum_step, dgd_sherman_morrison};
 use nl_hecate_core::model::{
     MAGConfig, MAGParams, SWAConfig, CompositionKind, MemoryRuleKind,
-    HopeVariant, LatticeVariant, MomentumKind,
+    HopeVariant, LatticeVariant, MomentumKind, ProjectionKind,
 };
 use nl_hecate_core::dynamic_freq::FrequencySchedule;
 use nl_hecate_core::retention::{RetentionKind, default_retention};
@@ -364,6 +364,8 @@ fn tiny_delta_config() -> MAGConfig {
         kernel_size: 0,
         momentum_kind: MomentumKind::None,
         momentum_d_hidden: 0,
+        projection_kind: ProjectionKind::Static,
+        self_generated_values: false,
     }
 }
 

@@ -8,7 +8,7 @@
 //! A model that learned should achieve significantly lower loss AND correct predictions.
 
 use nl_hecate_core::model::{
-    MAGConfig, MAGParams, SWAConfig, CompositionKind, MemoryRuleKind, HopeVariant, LatticeVariant, MomentumKind,
+    MAGConfig, MAGParams, SWAConfig, CompositionKind, MemoryRuleKind, HopeVariant, LatticeVariant, MomentumKind, ProjectionKind,
 };
 use nl_hecate_core::dynamic_freq::FrequencySchedule;
 use nl_hecate_core::conductor::{Conductor, ContextState, ErrorBuffer, Pulse};
@@ -70,6 +70,8 @@ fn spike_config_a() -> MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
+            self_generated_values: false,
     }
 }
 
@@ -104,6 +106,8 @@ fn spike_config_b() -> MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
+            self_generated_values: false,
     }
 }
 
@@ -138,6 +142,8 @@ fn spike_config_c() -> MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
+            self_generated_values: false,
     }
 }
 
@@ -735,6 +741,8 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
+            self_generated_values: false,
     }
 }
 

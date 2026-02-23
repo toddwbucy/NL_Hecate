@@ -1,6 +1,6 @@
 //! CMS integration tests: multi-step training, error buffer health, falsification.
 
-use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind, CompositionKind, HopeVariant, LatticeVariant, MomentumKind};
+use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind, CompositionKind, HopeVariant, LatticeVariant, MomentumKind, ProjectionKind};
 use nl_hecate_core::dynamic_freq::FrequencySchedule;
 use nl_hecate_core::retention::RetentionKind;
 use nl_hecate_core::mag::{cms_forward, cms_backward};
@@ -218,6 +218,8 @@ fn test_k2_beats_k1() {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
+            self_generated_values: false,
 
         };
     // k=2 config
@@ -240,6 +242,8 @@ fn test_k2_beats_k1() {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
+            self_generated_values: false,
 
         };
 
@@ -426,6 +430,8 @@ fn test_k4_vs_k2_multiscale() {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
+            self_generated_values: false,
 
         };
     let cfg_k4 = MAGConfig {
@@ -447,6 +453,8 @@ fn test_k4_vs_k2_multiscale() {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
+            self_generated_values: false,
 
         };
 
@@ -545,6 +553,8 @@ fn test_k4_diagnostics() {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
+            self_generated_values: false,
 
         };
 
@@ -821,6 +831,8 @@ fn test_cms_stability_boundary() {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
+            self_generated_values: false,
 
         };
     let cfg_k2 = MAGConfig {
@@ -842,6 +854,8 @@ fn test_cms_stability_boundary() {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
+            self_generated_values: false,
 
         };
 
@@ -1037,6 +1051,8 @@ fn test_k4_normalization_magnitude() {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
+            self_generated_values: false,
 
         };
     let params_k4 = MAGParams::init(&cfg_k4, 42);
@@ -1111,6 +1127,8 @@ fn test_k4_uniform_init_stable() {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
+            self_generated_values: false,
 
         };
 
@@ -1171,6 +1189,8 @@ fn test_k4_normalized_stable() {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
+            self_generated_values: false,
 
         };
 

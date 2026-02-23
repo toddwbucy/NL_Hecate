@@ -1,6 +1,6 @@
 //! YAAD integration tests: 2-layer MLP memory with Huber loss and decoupled retention.
 
-use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind, CompositionKind, HopeVariant, LatticeVariant, MomentumKind};
+use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind, CompositionKind, HopeVariant, LatticeVariant, MomentumKind, ProjectionKind};
 use nl_hecate_core::dynamic_freq::FrequencySchedule;
 use nl_hecate_core::retention::RetentionKind;
 use nl_hecate_core::mag::{cms_forward, cms_backward, mag_forward, mag_backward, MemoryCache};
@@ -225,6 +225,8 @@ fn test_yaad_vs_delta() {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
+            self_generated_values: false,
     };
     let cfg_yaad = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
@@ -244,6 +246,8 @@ fn test_yaad_vs_delta() {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            projection_kind: ProjectionKind::Static,
+            self_generated_values: false,
     };
 
     let input_ids: Vec<usize> = (0..swa.seq_len).map(|t| t % swa.vocab_size).collect();
