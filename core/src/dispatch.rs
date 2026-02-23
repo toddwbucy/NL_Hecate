@@ -905,6 +905,75 @@ pub fn hebbian_backward_dispatch(
                           seq_len, d);
 }
 
+// ── DGD (Delta Gradient Descent) dispatch ─────────────────────────
+
+/// DGD forward inner loop dispatch.
+///
+/// Identical recurrence to Delta Rule (L2 attentional bias only), but
+/// dispatches through separate DGD CUDA kernels to allow future
+/// bias-agnostic divergence (CS-33).
+///
+/// Returns (m_states, y) where m_states is [(seq_len+1)*d*d] and y is [seq_len*d].
+pub fn dgd_forward_dispatch(
+    k_mem: &[f32],
+    v_mem: &[f32],
+    q_mem: &[f32],
+    alpha: &[f32],
+    theta: &[f32],
+    m_initial: &[f32],
+    m_states: &mut [f32],
+    y: &mut [f32],
+    seq_len: usize,
+    d: usize,
+) {
+    #[cfg(feature = "cuda")]
+    {
+        if !is_rust_forced() {
+            cuda_dgd_forward(k_mem, v_mem, q_mem, alpha, theta, m_initial,
+                             m_states, y, seq_len, d);
+            return;
+        }
+    }
+    // DGD math is identical to Delta Rule at L2 bias
+    rust_delta_forward(k_mem, v_mem, q_mem, alpha, theta, m_initial,
+                       m_states, y, seq_len, d);
+}
+
+/// DGD backward inner loop dispatch.
+///
+/// Returns gradients on k_mem, v_mem, q_mem, alpha, theta, m_initial.
+pub fn dgd_backward_dispatch(
+    k_mem: &[f32],
+    v_mem: &[f32],
+    q_mem: &[f32],
+    alpha: &[f32],
+    theta: &[f32],
+    m_states: &[f32],
+    d_y: &[f32],
+    d_k_mem: &mut [f32],
+    d_v_mem: &mut [f32],
+    d_q_mem: &mut [f32],
+    d_alpha: &mut [f32],
+    d_theta: &mut [f32],
+    d_m_initial: &mut [f32],
+    seq_len: usize,
+    d: usize,
+) {
+    #[cfg(feature = "cuda")]
+    {
+        if !is_rust_forced() {
+            cuda_dgd_backward(k_mem, v_mem, q_mem, alpha, theta, m_states, d_y,
+                              d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta, d_m_initial,
+                              seq_len, d);
+            return;
+        }
+    }
+    // DGD math is identical to Delta Rule at L2 bias
+    rust_delta_backward(k_mem, v_mem, q_mem, alpha, theta, m_states, d_y,
+                        d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta, d_m_initial,
+                        seq_len, d);
+}
+
 // ── Rust reference inner loops ──────────────────────────────────────
 // Always compiled. Used as fallback when CUDA is absent or force_rust_reference() is set.
 
@@ -1625,6 +1694,105 @@ fn cuda_hebbian_backward(
     dev_dm_init.copy_to_host(d_m_initial);
 }
 
+#[cfg(feature = "cuda")]
+fn cuda_dgd_forward(
+    k_mem: &[f32], v_mem: &[f32], q_mem: &[f32],
+    alpha: &[f32], theta: &[f32], m_initial: &[f32],
+    m_states: &mut [f32], y: &mut [f32],
+    seq_len: usize, d: usize,
+) {
+    let dd = d * d;
+    let dev_km = DevBuf::new(seq_len * d);
+    let dev_vm = DevBuf::new(seq_len * d);
+    let dev_qm = DevBuf::new(seq_len * d);
+    let dev_alpha = DevBuf::new(seq_len);
+    let dev_theta = DevBuf::new(seq_len);
+    let dev_minit = DevBuf::new(dd);
+    let dev_mstates = DevBuf::new((seq_len + 1) * dd);
+    let dev_y = DevBuf::new(seq_len * d);
+
+    dev_km.copy_from_host(k_mem);
+    dev_vm.copy_from_host(v_mem);
+    dev_qm.copy_from_host(q_mem);
+    dev_alpha.copy_from_host(alpha);
+    dev_theta.copy_from_host(theta);
+    dev_minit.copy_from_host(m_initial);
+    dev_mstates.zero();
+    dev_y.zero();
+
+    unsafe {
+        crate::cuda_ffi::dgd_forward_f32_cuda(
+            dev_km.ptr, dev_vm.ptr, dev_qm.ptr,
+            dev_alpha.ptr, dev_theta.ptr, dev_minit.ptr,
+            dev_mstates.ptr, dev_y.ptr,
+            seq_len as i32, d as i32,
+        );
+        let rc = cudaDeviceSynchronize();
+        assert_eq!(rc, 0, "cudaDeviceSynchronize failed after dgd forward (error {rc})");
+    }
+
+    dev_mstates.copy_to_host(m_states);
+    dev_y.copy_to_host(y);
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_dgd_backward(
+    k_mem: &[f32], v_mem: &[f32], q_mem: &[f32],
+    alpha: &[f32], theta: &[f32], m_states: &[f32], d_y: &[f32],
+    d_k_mem: &mut [f32], d_v_mem: &mut [f32], d_q_mem: &mut [f32],
+    d_alpha: &mut [f32], d_theta: &mut [f32], d_m_initial: &mut [f32],
+    seq_len: usize, d: usize,
+) {
+    let dd = d * d;
+    let dev_km = DevBuf::new(seq_len * d);
+    let dev_vm = DevBuf::new(seq_len * d);
+    let dev_qm = DevBuf::new(seq_len * d);
+    let dev_alpha = DevBuf::new(seq_len);
+    let dev_theta = DevBuf::new(seq_len);
+    let dev_mstates = DevBuf::new((seq_len + 1) * dd);
+    let dev_dy = DevBuf::new(seq_len * d);
+    let dev_dkm = DevBuf::new(seq_len * d);
+    let dev_dvm = DevBuf::new(seq_len * d);
+    let dev_dqm = DevBuf::new(seq_len * d);
+    let dev_dalpha = DevBuf::new(seq_len);
+    let dev_dtheta = DevBuf::new(seq_len);
+    let dev_dm_init = DevBuf::new(dd);
+
+    dev_km.copy_from_host(k_mem);
+    dev_vm.copy_from_host(v_mem);
+    dev_qm.copy_from_host(q_mem);
+    dev_alpha.copy_from_host(alpha);
+    dev_theta.copy_from_host(theta);
+    dev_mstates.copy_from_host(m_states);
+    dev_dy.copy_from_host(d_y);
+    dev_dkm.zero();
+    dev_dvm.zero();
+    dev_dqm.zero();
+    dev_dalpha.zero();
+    dev_dtheta.zero();
+    dev_dm_init.zero();
+
+    unsafe {
+        crate::cuda_ffi::dgd_backward_f32_cuda(
+            dev_km.ptr, dev_vm.ptr, dev_qm.ptr,
+            dev_alpha.ptr, dev_theta.ptr, dev_mstates.ptr,
+            dev_dy.ptr as *const f32,
+            dev_dkm.ptr, dev_dvm.ptr, dev_dqm.ptr,
+            dev_dalpha.ptr, dev_dtheta.ptr, dev_dm_init.ptr,
+            seq_len as i32, d as i32,
+        );
+        let rc = cudaDeviceSynchronize();
+        assert_eq!(rc, 0, "cudaDeviceSynchronize failed after dgd backward (error {rc})");
+    }
+
+    dev_dkm.copy_to_host(d_k_mem);
+    dev_dvm.copy_to_host(d_v_mem);
+    dev_dqm.copy_to_host(d_q_mem);
+    dev_dalpha.copy_to_host(d_alpha);
+    dev_dtheta.copy_to_host(d_theta);
+    dev_dm_init.copy_to_host(d_m_initial);
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // Device-to-device dispatch variants (_dd)
 //
@@ -1871,6 +2039,48 @@ pub fn hebbian_backward_dd(
     }
 }
 
+/// DGD forward on device buffers.
+#[cfg(feature = "cuda")]
+pub fn dgd_forward_dd(
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>,
+    m_initial: &GpuSlice<f32>,
+    m_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
+    seq_len: usize, d: usize,
+) {
+    unsafe {
+        crate::cuda_ffi::dgd_forward_f32_cuda(
+            k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
+            alpha.as_ptr(), theta.as_ptr(),
+            m_initial.as_ptr(),
+            m_states.ptr(), y.ptr(),
+            seq_len as i32, d as i32,
+        );
+    }
+}
+
+/// DGD backward on device buffers.
+#[cfg(feature = "cuda")]
+pub fn dgd_backward_dd(
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>,
+    m_states: &GpuBuf<f32>, d_y: &GpuBuf<f32>,
+    d_k_mem: &mut GpuBuf<f32>, d_v_mem: &mut GpuBuf<f32>, d_q_mem: &mut GpuBuf<f32>,
+    d_alpha: &mut GpuBuf<f32>, d_theta: &mut GpuBuf<f32>, d_m_initial: &mut GpuBuf<f32>,
+    seq_len: usize, d: usize,
+) {
+    unsafe {
+        crate::cuda_ffi::dgd_backward_f32_cuda(
+            k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
+            alpha.as_ptr(), theta.as_ptr(), m_states.as_ptr(),
+            d_y.as_ptr(),
+            d_k_mem.ptr(), d_v_mem.ptr(), d_q_mem.ptr(),
+            d_alpha.ptr(), d_theta.ptr(), d_m_initial.ptr(),
+            seq_len as i32, d as i32,
+        );
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // Gradient checkpointing dispatch wrappers
 // ══════════════════════════════════════════════════════════════════════
@@ -1928,6 +2138,26 @@ pub fn hebbian_forward_dd_ckpt(
         crate::cuda_ffi::hebbian_forward_ckpt_f32_cuda(
             k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
             alpha.as_ptr(), m_initial.as_ptr(),
+            m_states.ptr(), y.ptr(),
+            seq_len as i32, d as i32, checkpoint_interval as i32,
+        );
+    }
+}
+
+/// DGD checkpointed forward on device buffers.
+#[cfg(feature = "cuda")]
+pub fn dgd_forward_dd_ckpt(
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>,
+    m_initial: &GpuSlice<f32>,
+    m_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
+    seq_len: usize, d: usize, checkpoint_interval: usize,
+) {
+    unsafe {
+        crate::cuda_ffi::dgd_forward_ckpt_f32_cuda(
+            k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
+            alpha.as_ptr(), theta.as_ptr(),
+            m_initial.as_ptr(),
             m_states.ptr(), y.ptr(),
             seq_len as i32, d as i32, checkpoint_interval as i32,
         );
@@ -2012,6 +2242,34 @@ pub fn hebbian_backward_dd_segment(
             d_m_seed.as_ptr(),
             d_k_mem.ptr(), d_v_mem.ptr(), d_q_mem.ptr(),
             d_alpha.ptr(), d_m_out.ptr(),
+            t_start as i32, t_end as i32, d as i32,
+        );
+    }
+}
+
+/// DGD segment backward on device buffers.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn dgd_backward_dd_segment(
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>,
+    m_states: &GpuBuf<f32>, d_y: &GpuBuf<f32>,
+    d_m_seed: &GpuBuf<f32>,
+    d_k_mem: &mut GpuBuf<f32>, d_v_mem: &mut GpuBuf<f32>, d_q_mem: &mut GpuBuf<f32>,
+    d_alpha: &mut GpuBuf<f32>, d_theta: &mut GpuBuf<f32>, d_m_out: &mut GpuBuf<f32>,
+    t_start: usize, t_end: usize, d: usize,
+) {
+    debug_assert!(t_start < t_end, "segment t_start={t_start} must be < t_end={t_end}");
+    debug_assert!(d > 0, "d must be > 0");
+    debug_assert!(d_m_seed.len() >= d * d, "d_m_seed too small");
+    unsafe {
+        crate::cuda_ffi::dgd_backward_segment_f32_cuda(
+            k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
+            alpha.as_ptr(), theta.as_ptr(),
+            m_states.as_ptr(), d_y.as_ptr(),
+            d_m_seed.as_ptr(),
+            d_k_mem.ptr(), d_v_mem.ptr(), d_q_mem.ptr(),
+            d_alpha.ptr(), d_theta.ptr(), d_m_out.ptr(),
             t_start as i32, t_end as i32, d as i32,
         );
     }

@@ -37,6 +37,8 @@ fn main() {
             .file("kernels/titans_backward.cu")
             .file("kernels/hebbian_forward.cu")
             .file("kernels/hebbian_backward.cu")
+            .file("kernels/dgd_forward.cu")
+            .file("kernels/dgd_backward.cu")
             .file("kernels/embedding.cu")
             .file("kernels/elementwise.cu")
             .file("kernels/cross_entropy.cu")
@@ -54,6 +56,8 @@ fn main() {
         println!("cargo:rerun-if-changed=kernels/titans_backward.cu");
         println!("cargo:rerun-if-changed=kernels/hebbian_forward.cu");
         println!("cargo:rerun-if-changed=kernels/hebbian_backward.cu");
+        println!("cargo:rerun-if-changed=kernels/dgd_forward.cu");
+        println!("cargo:rerun-if-changed=kernels/dgd_backward.cu");
         println!("cargo:rerun-if-changed=kernels/embedding.cu");
         println!("cargo:rerun-if-changed=kernels/elementwise.cu");
         println!("cargo:rerun-if-changed=kernels/cross_entropy.cu");

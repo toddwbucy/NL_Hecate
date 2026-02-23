@@ -59,6 +59,9 @@ pub enum OpaqueKey {
     Trellis,
     AtlasOmega,
 
+    // DGD (Delta Gradient Descent) — HOPE inner-loop optimizer
+    DGD,
+
     // Sliding window attention
     SWA,
 
