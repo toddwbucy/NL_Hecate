@@ -101,6 +101,15 @@ pub enum GpuMemoryCache {
         alpha: GpuBuf<f32>,
         m_states: GpuBuf<f32>,
     },
+    // ── DGD (Delta Gradient Descent) — HOPE inner-loop optimizer ─────
+    DGD {
+        k_mem: GpuBuf<f32>,     // [s, d]
+        v_mem: GpuBuf<f32>,     // [s, d]
+        q_mem: GpuBuf<f32>,     // [s, d]
+        alpha: GpuBuf<f32>,     // [s]
+        theta: GpuBuf<f32>,     // [s]
+        m_states: GpuBuf<f32>,  // [(s+1)*d*d]
+    },
     // ── Checkpointed variants (gradient checkpointing) ──────────────
     DeltaCkpt {
         k_mem: GpuBuf<f32>,
@@ -128,6 +137,15 @@ pub enum GpuMemoryCache {
         q_mem: GpuBuf<f32>,
         alpha: GpuBuf<f32>,
         m_checkpoints: GpuBuf<f32>,
+        checkpoint_interval: usize,
+    },
+    DGDCkpt {
+        k_mem: GpuBuf<f32>,
+        v_mem: GpuBuf<f32>,
+        q_mem: GpuBuf<f32>,
+        alpha: GpuBuf<f32>,
+        theta: GpuBuf<f32>,
+        m_checkpoints: GpuBuf<f32>,  // [num_ckpt * d*d]
         checkpoint_interval: usize,
     },
 }

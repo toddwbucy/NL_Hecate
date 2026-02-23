@@ -249,6 +249,64 @@ extern "C" {
         t_start: i32, t_end: i32, d: i32,
     );
 
+    // ── DGD (Delta Gradient Descent) memory kernels (all f32) ────────
+
+    /// CUDA DGD forward inner loop (all f32).
+    ///
+    /// Same math as Delta Rule (DGD generalizes it), but in a separate
+    /// kernel file for future bias-agnostic extension (CS-33).
+    /// Source: HOPE (2512.24695) Eq 88; core/src/dgd.rs
+    pub(crate) fn dgd_forward_f32_cuda(
+        k_mem: *const f32,
+        v_mem: *const f32,
+        q_mem: *const f32,
+        alpha: *const f32,
+        theta: *const f32,
+        m_initial: *const f32,
+        m_states: *mut f32,
+        y: *mut f32,
+        seq_len: i32,
+        d: i32,
+    );
+
+    /// CUDA DGD backward inner loop (all f32).
+    pub(crate) fn dgd_backward_f32_cuda(
+        k_mem: *const f32,
+        v_mem: *const f32,
+        q_mem: *const f32,
+        alpha: *const f32,
+        theta: *const f32,
+        m_states: *const f32,
+        d_y: *const f32,
+        d_k_mem: *mut f32,
+        d_v_mem: *mut f32,
+        d_q_mem: *mut f32,
+        d_alpha: *mut f32,
+        d_theta: *mut f32,
+        d_m_initial: *mut f32,
+        seq_len: i32,
+        d: i32,
+    );
+
+    /// DGD forward with checkpoint_interval — stores M every C steps.
+    pub(crate) fn dgd_forward_ckpt_f32_cuda(
+        k_mem: *const f32, v_mem: *const f32, q_mem: *const f32,
+        alpha: *const f32, theta: *const f32, m_initial: *const f32,
+        m_states: *mut f32, y: *mut f32,
+        seq_len: i32, d: i32, checkpoint_interval: i32,
+    );
+
+    /// DGD segment backward — operates on [t_start, t_end) with d_m_seed.
+    pub(crate) fn dgd_backward_segment_f32_cuda(
+        k_mem: *const f32, v_mem: *const f32, q_mem: *const f32,
+        alpha: *const f32, theta: *const f32,
+        m_states: *const f32, d_y: *const f32,
+        d_m_seed: *const f32,
+        d_k_mem: *mut f32, d_v_mem: *mut f32, d_q_mem: *mut f32,
+        d_alpha: *mut f32, d_theta: *mut f32, d_m_out: *mut f32,
+        t_start: i32, t_end: i32, d: i32,
+    );
+
     // ── Embedding kernels ─────────────────────────────────────────────
 
     /// Gather rows from embedding table by token ID.
