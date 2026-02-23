@@ -23,6 +23,7 @@ use crate::tensor::{
     outer_product_f32, frobenius_dot_f32,
 };
 use crate::retention::l2_apply_retention;
+use crate::dgd::dgd_error;
 use crate::model::MemoryLevelParams;
 use crate::moneta::{apply_attentional_bias, apply_attentional_bias_backward};
 use crate::tape::OpaqueVjp;
@@ -313,16 +314,11 @@ impl MemoryRule for DeltaRule {
             theta_pre[t] = theta_pre_t;
             theta[t] = softplus_f32(theta_pre_t);
 
-            // prediction = M_t @ k_t
+            // prediction error via DGD primitive: e = M_t @ k_t - v_t
             let m_t = &m_states[t * d * d..(t + 1) * d * d];
-            let mut prediction = vec![0.0f32; d];
-            matmul_f32(m_t, k_t, &mut prediction, d, d, 1);
-
-            // error = prediction - v_t (raw error, stored for backward VJP)
+            let raw_error = dgd_error(m_t, k_t, v_t, d);
             let e_base = t * d;
-            for i in 0..d {
-                error[e_base + i] = prediction[i] - v_t[i];
-            }
+            error[e_base..e_base + d].copy_from_slice(&raw_error);
 
             // Apply attentional bias: L2 → identity, L1 → tanh(a*e), Lp → general
             let biased = apply_attentional_bias(&error[e_base..e_base + d], self.bias, self.sign_sharpness);
