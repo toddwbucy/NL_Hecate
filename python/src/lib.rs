@@ -438,6 +438,10 @@ impl MAGConfig {
                 n_persistent: 0,
                 attentional_bias: bias_kind,
                 kernel_size,
+                momentum_kind: nl_hecate_core::model::MomentumKind::None,
+                momentum_d_hidden: 0,
+                projection_kind: nl_hecate_core::model::ProjectionKind::Static,
+                self_generated_values: false,
             },
         })
     }

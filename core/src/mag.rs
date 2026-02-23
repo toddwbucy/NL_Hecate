@@ -292,7 +292,7 @@ pub fn mag_backward(
             AtlasOmega.step_backward(&params.levels[0], atlas_cache, &d_y, &cache.embedded)
         }
         MemoryCache::SelfRef(sr_cache) => {
-            let (d_emb, _sr_grads) = self_ref_step_backward(sr_cache, &d_y);
+            let (d_emb, _sr_grads) = self_ref_step_backward(sr_cache, &d_y, cfg.self_generated_values);
             // TODO(PR-4): _sr_grads holds dL/dM_{k,0}..dL/dM_{mem,0} — the outer-loop
             // gradients for self-ref initial states. Currently dropped because MAGParams
             // doesn't have fields for them yet. PR 4 adds SelfRefParamGrads to MAGParams
@@ -589,6 +589,7 @@ fn run_level_memory(
             let mut m_mem = std::mem::take(&mut context.memory[level]);
             let (y, cache) = self_ref_step(
                 &mut context.self_ref[level], &mut m_mem, input, s, d,
+                cfg.self_generated_values,
             );
             // Restore final main memory state to context for chunk boundaries
             context.memory[level] = m_mem;
@@ -1062,7 +1063,7 @@ pub fn cms_backward(
                     AtlasOmega.step_backward(&params.levels[level], atlas_cache, &d_y_combined, &cache.embedded)
                 }
                 MemoryCache::SelfRef(sr_cache) => {
-                    let (d_emb, _sr_grads) = self_ref_step_backward(sr_cache, &d_y_combined);
+                    let (d_emb, _sr_grads) = self_ref_step_backward(sr_cache, &d_y_combined, cfg.self_generated_values);
                     // TODO(PR-4): wire _sr_grads into MAGParams (see mag_backward comment).
                     (crate::model::MemoryLevelParams::zeros_like(d), d_emb)
                 }

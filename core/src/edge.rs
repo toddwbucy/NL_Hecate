@@ -79,6 +79,7 @@ impl EdgeConfig {
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
             projection_kind: ProjectionKind::Static,
+            self_generated_values: false,
         }
     }
 
