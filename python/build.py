@@ -1109,7 +1109,7 @@ def main():
                     if use_bpe:
                         v_params, v_cfg = nl_hecate.load_checkpoint(ckpt_path)
                     else:
-                        v_params, v_cfg, _, _ = nl_hecate.load_build_checkpoint(ckpt_path)
+                        v_params, v_cfg, _ = nl_hecate.load_build_checkpoint(ckpt_path)
                     v_model = nl_hecate.GpuModel.from_params(v_params, v_cfg)
                     v_ctx = gpu_model.to_host_context()
                     v_model.upload_context(v_ctx)

@@ -522,7 +522,7 @@ def blend_curriculum(
     tokens_arr = tokens_arr[:write_pos]
     targets_arr = targets_arr[:write_pos]
 
-    for name, count in zip(pool_names, pool_counts):
+    for name, count in zip(pool_names, pool_counts, strict=True):
         print(f"    {name}: {count} examples drawn")
     print(f"    Total: {write_pos:,} tokens")
 
