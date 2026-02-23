@@ -304,7 +304,7 @@ pub fn mag_backward(
             (crate::model::MemoryLevelParams::zeros_like(d), d_emb)
         }
         MemoryCache::ChunkwiseSelfRef(csr_cache) => {
-            let (d_emb, _sr_grads) = chunkwise_self_ref_step_backward(csr_cache, &d_y, cfg.self_generated_values);
+            let (d_emb, _sr_grads) = chunkwise_self_ref_step_backward(csr_cache, &d_y);
             // TODO(PR-4): same as SelfRef — _sr_grads deferred.
             (crate::model::MemoryLevelParams::zeros_like(d), d_emb)
         }
@@ -1084,7 +1084,7 @@ pub fn cms_backward(
                     (crate::model::MemoryLevelParams::zeros_like(d), d_emb)
                 }
                 MemoryCache::ChunkwiseSelfRef(csr_cache) => {
-                    let (d_emb, _sr_grads) = chunkwise_self_ref_step_backward(csr_cache, &d_y_combined, cfg.self_generated_values);
+                    let (d_emb, _sr_grads) = chunkwise_self_ref_step_backward(csr_cache, &d_y_combined);
                     (crate::model::MemoryLevelParams::zeros_like(d), d_emb)
                 }
             };

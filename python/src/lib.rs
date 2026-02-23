@@ -272,7 +272,7 @@ impl MAGConfig {
         d_hidden=None, lp_p=None, sign_sharpness=None, lq_q=None, lambda_local=None, lambda_2=None,
         delta=None, m_slots=None, d_compress=None, lambda_k=None, lambda_v=None,
         retention=None, m3=None, frequency_schedule=None, checkpoint_interval=None,
-        attentional_bias=None, kernel_size=0,
+        attentional_bias=None, kernel_size=0, self_ref_chunk_size=1,
     ))]
     fn new(
         d_model: usize,
@@ -303,6 +303,7 @@ impl MAGConfig {
         checkpoint_interval: Option<usize>,
         attentional_bias: Option<&str>,
         kernel_size: usize,
+        self_ref_chunk_size: usize,
     ) -> PyResult<Self> {
         if d_model != num_heads * head_dim {
             return Err(PyValueError::new_err(format!(
@@ -442,7 +443,7 @@ impl MAGConfig {
                 momentum_d_hidden: 0,
                 projection_kind: nl_hecate_core::model::ProjectionKind::Static,
                 self_generated_values: false,
-                self_ref_chunk_size: 1,
+                self_ref_chunk_size,
             },
         })
     }

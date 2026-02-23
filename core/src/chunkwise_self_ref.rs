@@ -197,7 +197,7 @@ pub fn chunkwise_self_ref_step(
             } else {
                 &v_t[..]
             };
-            dgd_error_into(m_frozen, &k_t, v_target, d, &mut error_buf);
+            crate::dgd::dgd_error_into(m_frozen, &k_t, v_target, d, &mut error_buf);
             dgd_update(m_current, &error_buf, &k_t, alpha_t, theta_t, d);
         }
 
@@ -219,11 +219,6 @@ pub fn chunkwise_self_ref_step(
     };
 
     (y, outer_cache)
-}
-
-/// Helper for `dgd_error_into` that writes into a pre-allocated buffer.
-fn dgd_error_into(m: &[f32], k: &[f32], v: &[f32], d: usize, out: &mut [f32]) {
-    crate::dgd::dgd_error_into(m, k, v, d, out);
 }
 
 /// Frozen DGD backward: splits gradient into retention chain (→ M_prev) and error chain (→ M_frozen).
@@ -341,7 +336,6 @@ struct FrozenDgdGrads {
 pub fn chunkwise_self_ref_step_backward(
     cache: &ChunkwiseSelfRefCache,
     d_y: &[f32],
-    _self_generated_values: bool,
 ) -> (Vec<f32>, SelfRefParamGrads) {
     let c = &cache.inner;
     let s = c.seq_len;
@@ -759,7 +753,7 @@ mod tests {
 
         let (y, cache) = chunkwise_self_ref_step(&mut state, &mut m_mem, &embedded, seq_len, d, 2, false);
         let d_y = simple_dloss(&y);
-        let (d_embedded, grads) = chunkwise_self_ref_step_backward(&cache, &d_y, false);
+        let (d_embedded, grads) = chunkwise_self_ref_step_backward(&cache, &d_y);
 
         assert_eq!(d_embedded.len(), seq_len * d);
         assert_eq!(grads.d_m_k.len(), d * d);
@@ -780,7 +774,7 @@ mod tests {
 
         let (y, cache) = chunkwise_self_ref_step(&mut state, &mut m_mem, &embedded, seq_len, d, 2, false);
         let d_y = simple_dloss(&y);
-        let (d_embedded, grads) = chunkwise_self_ref_step_backward(&cache, &d_y, false);
+        let (d_embedded, grads) = chunkwise_self_ref_step_backward(&cache, &d_y);
 
         assert!(d_embedded.iter().all(|x| x.is_finite()), "d_embedded not finite");
         assert!(grads.d_m_k.iter().all(|x| x.is_finite()), "dM_k not finite");
@@ -800,7 +794,7 @@ mod tests {
 
         let (y, cache) = chunkwise_self_ref_step(&mut state, &mut m_mem, &embedded, seq_len, d, 2, false);
         let d_y = simple_dloss(&y);
-        let (d_embedded, grads) = chunkwise_self_ref_step_backward(&cache, &d_y, false);
+        let (d_embedded, grads) = chunkwise_self_ref_step_backward(&cache, &d_y);
 
         let de_norm: f32 = d_embedded.iter().map(|x| x * x).sum();
         assert!(de_norm > 1e-10, "d_embedded should be nonzero, norm={de_norm}");
@@ -828,7 +822,7 @@ mod tests {
         let (y, cache) = chunkwise_self_ref_step(&mut s, &mut mm, &embedded, seq_len, d, 1, false);
         let loss0 = simple_loss(&y);
         let d_y = simple_dloss(&y);
-        let (d_embedded, _) = chunkwise_self_ref_step_backward(&cache, &d_y, false);
+        let (d_embedded, _) = chunkwise_self_ref_step_backward(&cache, &d_y);
 
         let mut max_err = 0.0f32;
         for idx in 0..embedded.len() {
@@ -864,7 +858,7 @@ mod tests {
         let (y, cache) = chunkwise_self_ref_step(&mut s, &mut mm, &embedded, seq_len, d, 1, false);
         let loss0 = simple_loss(&y);
         let d_y = simple_dloss(&y);
-        let (_, grads) = chunkwise_self_ref_step_backward(&cache, &d_y, false);
+        let (_, grads) = chunkwise_self_ref_step_backward(&cache, &d_y);
 
         let mut max_err = 0.0f32;
         for idx in 0..(d * d) {
@@ -899,7 +893,7 @@ mod tests {
         let (y, cache) = chunkwise_self_ref_step(&mut s, &mut mm, &embedded, seq_len, d, 2, false);
         let loss0 = simple_loss(&y);
         let d_y = simple_dloss(&y);
-        let (d_embedded, _) = chunkwise_self_ref_step_backward(&cache, &d_y, false);
+        let (d_embedded, _) = chunkwise_self_ref_step_backward(&cache, &d_y);
 
         let mut max_err = 0.0f32;
         for idx in 0..embedded.len() {
@@ -1045,7 +1039,7 @@ mod tests {
             last_loss = loss;
 
             let d_y = simple_dloss(&y);
-            let (_, grads) = chunkwise_self_ref_step_backward(&cache, &d_y, false);
+            let (_, grads) = chunkwise_self_ref_step_backward(&cache, &d_y);
 
             // Apply outer-loop gradients to initial states
             for i in 0..d * d {
@@ -1080,7 +1074,7 @@ mod tests {
 
         // Backward should also work
         let d_y = simple_dloss(&y);
-        let (d_embedded, grads) = chunkwise_self_ref_step_backward(&cache, &d_y, false);
+        let (d_embedded, grads) = chunkwise_self_ref_step_backward(&cache, &d_y);
         assert_eq!(d_embedded.len(), seq_len * d);
         assert!(d_embedded.iter().all(|x| x.is_finite()));
         assert!(grads.d_m_k.iter().all(|x| x.is_finite()));
