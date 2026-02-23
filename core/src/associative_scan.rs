@@ -7,6 +7,7 @@
 /// (momentum S only: S update is linear in S, but M depends on S nonlinearly).
 
 use crate::model::{MAGConfig, MemoryLevelParams};
+use crate::bf16::Bf16Storage;
 use crate::delta_rule::MemoryRule;
 use crate::hebbian_rule::HebbianRule;
 use crate::tensor::{matmul_f32, transpose_f32, sigmoid_f32};
@@ -219,9 +220,9 @@ pub fn hebbian_scan_forward(
     let mut w_k_t = vec![0.0f32; dd];
     let mut w_v_t = vec![0.0f32; dd];
     let mut w_q_t = vec![0.0f32; dd];
-    transpose_f32(&level_params.w_k_mem, &mut w_k_t, d, d);
-    transpose_f32(&level_params.w_v_mem, &mut w_v_t, d, d);
-    transpose_f32(&level_params.w_q_mem, &mut w_q_t, d, d);
+    transpose_f32(&level_params.w_k_mem.as_f32(), &mut w_k_t, d, d);
+    transpose_f32(&level_params.w_v_mem.as_f32(), &mut w_v_t, d, d);
+    transpose_f32(&level_params.w_q_mem.as_f32(), &mut w_q_t, d, d);
 
     let mut k_mem = vec![0.0f32; seq_len * d];
     let mut v_mem = vec![0.0f32; seq_len * d];
@@ -406,17 +407,17 @@ pub fn hebbian_scan_backward(
 
     // d_embedded += d_k @ W_K + d_v @ W_V + d_q @ W_Q
     let mut tmp = vec![0.0f32; s * d];
-    matmul_f32(&d_k_mem, &level_params.w_k_mem, &mut tmp, s, d, d);
+    matmul_f32(&d_k_mem, &level_params.w_k_mem.as_f32(), &mut tmp, s, d, d);
     for i in 0..s * d { d_embedded[i] += tmp[i]; }
-    matmul_f32(&d_v_mem, &level_params.w_v_mem, &mut tmp, s, d, d);
+    matmul_f32(&d_v_mem, &level_params.w_v_mem.as_f32(), &mut tmp, s, d, d);
     for i in 0..s * d { d_embedded[i] += tmp[i]; }
-    matmul_f32(&d_q_mem, &level_params.w_q_mem, &mut tmp, s, d, d);
+    matmul_f32(&d_q_mem, &level_params.w_q_mem.as_f32(), &mut tmp, s, d, d);
     for i in 0..s * d { d_embedded[i] += tmp[i]; }
 
     let grads = MemoryLevelParams {
-        w_k_mem: d_w_k_mem,
-        w_v_mem: d_w_v_mem,
-        w_q_mem: d_w_q_mem,
+        w_k_mem: Bf16Storage::from_f32_vec(d_w_k_mem),
+        w_v_mem: Bf16Storage::from_f32_vec(d_w_v_mem),
+        w_q_mem: Bf16Storage::from_f32_vec(d_w_q_mem),
         w_alpha: d_w_alpha,
         b_alpha: d_b_alpha,
         w_theta: vec![],
@@ -808,7 +809,7 @@ mod tests {
             &params.levels[0], &cache, &d_y, &embedded,
         );
 
-        for &v in grads.w_k_mem.iter().chain(grads.w_v_mem.iter()).chain(grads.w_q_mem.iter()) {
+        for &v in grads.w_k_mem.master().iter().chain(grads.w_v_mem.master().iter()).chain(grads.w_q_mem.master().iter()) {
             assert!(v.is_finite(), "Hebbian scan backward gradient not finite");
         }
         for &v in &d_emb {
@@ -837,17 +838,19 @@ mod tests {
         let n_check = 5.min(d * d);
         for idx in 0..n_check {
             let mut lp_plus = params.levels[0].clone();
-            lp_plus.w_k_mem[idx] += eps;
+            lp_plus.w_k_mem.master_mut()[idx] += eps;
+            lp_plus.w_k_mem.sync_from_master();
             let (y_plus, _) = hebbian_scan_forward(&lp_plus, &embedded, s, d, None);
             let loss_plus: f32 = y_plus.iter().sum();
 
             let mut lp_minus = params.levels[0].clone();
-            lp_minus.w_k_mem[idx] -= eps;
+            lp_minus.w_k_mem.master_mut()[idx] -= eps;
+            lp_minus.w_k_mem.sync_from_master();
             let (y_minus, _) = hebbian_scan_forward(&lp_minus, &embedded, s, d, None);
             let loss_minus: f32 = y_minus.iter().sum();
 
             let fd = (loss_plus - loss_minus) / (2.0 * eps);
-            let analytical = grads.w_k_mem[idx];
+            let analytical = grads.w_k_mem.master()[idx];
             let denom = analytical.abs().max(fd.abs()).max(1e-8);
             let rel = (analytical - fd).abs() / denom;
 
@@ -889,9 +892,12 @@ mod tests {
             let (grads, _) = hebbian_scan_backward(&level_params, &cache, &d_y, &embedded);
 
             // Outer-loop weight update (projection weights, not inner-loop memory)
-            for (w, g) in level_params.w_k_mem.iter_mut().zip(grads.w_k_mem.iter()) { *w -= lr * g; }
-            for (w, g) in level_params.w_v_mem.iter_mut().zip(grads.w_v_mem.iter()) { *w -= lr * g; }
-            for (w, g) in level_params.w_q_mem.iter_mut().zip(grads.w_q_mem.iter()) { *w -= lr * g; }
+            for (w, g) in level_params.w_k_mem.master_mut().iter_mut().zip(grads.w_k_mem.master().iter()) { *w -= lr * g; }
+            for (w, g) in level_params.w_v_mem.master_mut().iter_mut().zip(grads.w_v_mem.master().iter()) { *w -= lr * g; }
+            for (w, g) in level_params.w_q_mem.master_mut().iter_mut().zip(grads.w_q_mem.master().iter()) { *w -= lr * g; }
+            level_params.w_k_mem.sync_from_master();
+            level_params.w_v_mem.sync_from_master();
+            level_params.w_q_mem.sync_from_master();
             for (w, g) in level_params.w_alpha.iter_mut().zip(grads.w_alpha.iter()) { *w -= lr * g; }
             for (w, g) in level_params.b_alpha.iter_mut().zip(grads.b_alpha.iter()) { *w -= lr * g; }
         }

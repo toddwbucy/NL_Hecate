@@ -137,9 +137,9 @@ pub fn sync_gradients(
     // Per-level: only sync active levels
     for (level, level_grads) in grads.levels.iter_mut().enumerate() {
         if level < pulse.active_levels.len() && pulse.active_levels[level] {
-            allreduce_and_mean(pg, &mut level_grads.w_k_mem, ws);
-            allreduce_and_mean(pg, &mut level_grads.w_v_mem, ws);
-            allreduce_and_mean(pg, &mut level_grads.w_q_mem, ws);
+            allreduce_and_mean(pg, level_grads.w_k_mem.master_mut(), ws);
+            allreduce_and_mean(pg, level_grads.w_v_mem.master_mut(), ws);
+            allreduce_and_mean(pg, level_grads.w_q_mem.master_mut(), ws);
             allreduce_and_mean(pg, &mut level_grads.w_alpha, ws);
             allreduce_and_mean(pg, &mut level_grads.b_alpha, ws);
             allreduce_and_mean(pg, &mut level_grads.w_theta, ws);

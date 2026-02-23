@@ -88,9 +88,9 @@ fn assert_grads_close(
 
     // Per-level grads
     for (i, (l1, l2)) in g1.levels.iter().zip(g2.levels.iter()).enumerate() {
-        assert_vecs_close(&l1.w_k_mem, &l2.w_k_mem, tol, &format!("{label}/level{i}/w_k_mem"));
-        assert_vecs_close(&l1.w_v_mem, &l2.w_v_mem, tol, &format!("{label}/level{i}/w_v_mem"));
-        assert_vecs_close(&l1.w_q_mem, &l2.w_q_mem, tol, &format!("{label}/level{i}/w_q_mem"));
+        assert_vecs_close(l1.w_k_mem.master(), l2.w_k_mem.master(), tol, &format!("{label}/level{i}/w_k_mem"));
+        assert_vecs_close(l1.w_v_mem.master(), l2.w_v_mem.master(), tol, &format!("{label}/level{i}/w_v_mem"));
+        assert_vecs_close(l1.w_q_mem.master(), l2.w_q_mem.master(), tol, &format!("{label}/level{i}/w_q_mem"));
     }
 }
 

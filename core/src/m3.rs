@@ -8,6 +8,7 @@
 /// Spec: specs/algorithms/optimization_machinery/02_m3.md
 
 use serde::{Serialize, Deserialize};
+use crate::bf16::Bf16Storage;
 use crate::model::{MAGParams, SWAParams, MemoryLevelParams};
 
 // ── Configuration ─────────────────────────────────────────────────────
@@ -423,9 +424,9 @@ pub fn flatten_mag_params(params: &MAGParams) -> Vec<f32> {
 
     // Memory levels
     for level in &params.levels {
-        flat.extend_from_slice(&level.w_k_mem);
-        flat.extend_from_slice(&level.w_v_mem);
-        flat.extend_from_slice(&level.w_q_mem);
+        flat.extend_from_slice(level.w_k_mem.master());
+        flat.extend_from_slice(level.w_v_mem.master());
+        flat.extend_from_slice(level.w_q_mem.master());
         flat.extend_from_slice(&level.w_alpha);
         flat.extend_from_slice(&level.b_alpha);
         flat.extend_from_slice(&level.w_theta);
@@ -479,9 +480,9 @@ pub fn unflatten_to_mag_grads(flat: &[f32], template: &MAGParams) -> MAGParams {
     let mut levels = Vec::with_capacity(template.levels.len());
     for tl in &template.levels {
         levels.push(MemoryLevelParams {
-            w_k_mem: take(flat, &mut offset, tl.w_k_mem.len()),
-            w_v_mem: take(flat, &mut offset, tl.w_v_mem.len()),
-            w_q_mem: take(flat, &mut offset, tl.w_q_mem.len()),
+            w_k_mem: Bf16Storage::from_f32(&take(flat, &mut offset, tl.w_k_mem.len())),
+            w_v_mem: Bf16Storage::from_f32(&take(flat, &mut offset, tl.w_v_mem.len())),
+            w_q_mem: Bf16Storage::from_f32(&take(flat, &mut offset, tl.w_q_mem.len())),
             w_alpha: take(flat, &mut offset, tl.w_alpha.len()),
             b_alpha: take(flat, &mut offset, tl.b_alpha.len()),
             w_theta: take(flat, &mut offset, tl.w_theta.len()),

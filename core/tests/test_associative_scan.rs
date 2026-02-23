@@ -67,7 +67,7 @@ fn test_hebbian_scan_backward_integration() {
     let d_y = vec![1.0f32; s * d];
     let (grads, d_emb) = hebbian_scan_backward(&params.levels[0], &cache, &d_y, &embedded);
 
-    let norm: f32 = grads.w_k_mem.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm: f32 = grads.w_k_mem.master().iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(norm > 1e-10, "gradients should be non-zero");
     assert_eq!(d_emb.len(), s * d);
 }

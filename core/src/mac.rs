@@ -981,12 +981,13 @@ mod tests {
         let (_loss, cache) = mac_forward(&params, &cfg, &input_ids, &target_ids);
         let grads = mac_backward(&params, &cfg, &cache, &input_ids, &target_ids);
 
-        for (name, g) in [
+        let grad_fields: Vec<(&str, &[f32])> = vec![
             ("w_q", &grads.swa.w_q), ("w_k", &grads.swa.w_k),
             ("w_v", &grads.swa.w_v), ("w_o", &grads.swa.w_o),
             ("w_unembed", &grads.swa.w_unembed), ("w_embed", &grads.swa.w_embed),
-            ("w_k_mem", &grads.levels[0].w_k_mem),
-        ] {
+            ("w_k_mem", grads.levels[0].w_k_mem.master()),
+        ];
+        for (name, g) in grad_fields {
             for (i, &val) in g.iter().enumerate() {
                 assert!(val.is_finite(), "mac grad_{name}[{i}] not finite: {val}");
             }
@@ -1003,10 +1004,11 @@ mod tests {
 
         // w_k_mem gradient is attenuated through read_only + concat + attn + step +
         // reflective gate at init, so use a relaxed threshold (1e-12).
-        for (name, g) in [
+        let nonzero_fields: Vec<(&str, &[f32])> = vec![
             ("w_q", &grads.swa.w_q), ("w_o", &grads.swa.w_o),
-            ("w_k_mem", &grads.levels[0].w_k_mem),
-        ] {
+            ("w_k_mem", grads.levels[0].w_k_mem.master()),
+        ];
+        for (name, g) in nonzero_fields {
             let max_abs = g.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
             assert!(max_abs > 1e-12, "mac grad_{name} all zeros (max_abs={max_abs})");
         }

@@ -29,6 +29,7 @@ use crate::tensor::{
 use crate::retention::{l2_apply_retention, l2_retention_gradient, lq_normalize};
 use crate::model::MemoryLevelParams;
 use crate::delta_rule::{MemoryRule, Gates, MemoryError};
+use crate::bf16::Bf16Storage;
 
 // ── MLP State ───────────────────────────────────────────────────────
 
@@ -194,13 +195,16 @@ impl MemoryRule for Moneta {
         let use_lq = (q - 2.0).abs() >= 1e-6;
         debug_assert_eq!(embedded.len(), seq_len * d);
 
+        let w_k_f32 = level_params.w_k_mem.as_f32();
+        let w_v_f32 = level_params.w_v_mem.as_f32();
+        let w_q_f32 = level_params.w_q_mem.as_f32();
         // Project embedded → k_mem, v_mem, q_mem via W^T
         let mut w_k_mem_t = vec![0.0f32; d * d];
         let mut w_v_mem_t = vec![0.0f32; d * d];
         let mut w_q_mem_t = vec![0.0f32; d * d];
-        transpose_f32(&level_params.w_k_mem, &mut w_k_mem_t, d, d);
-        transpose_f32(&level_params.w_v_mem, &mut w_v_mem_t, d, d);
-        transpose_f32(&level_params.w_q_mem, &mut w_q_mem_t, d, d);
+        transpose_f32(&w_k_f32, &mut w_k_mem_t, d, d);
+        transpose_f32(&w_v_f32, &mut w_v_mem_t, d, d);
+        transpose_f32(&w_q_f32, &mut w_q_mem_t, d, d);
 
         let mut k_mem = vec![0.0f32; seq_len * d];
         let mut v_mem = vec![0.0f32; seq_len * d];
@@ -1009,22 +1013,25 @@ impl MemoryRule for Moneta {
 
         // ── Projection backward: k_mem = embedded @ W_K_mem^T ──
         let mut d_embedded = vec![0.0f32; s * d];
+        let w_k_f32 = level_params.w_k_mem.as_f32();
+        let w_v_f32 = level_params.w_v_mem.as_f32();
+        let w_q_f32 = level_params.w_q_mem.as_f32();
 
         let mut d_k_mem_t = vec![0.0f32; d * s];
         transpose_f32(&d_k_mem, &mut d_k_mem_t, s, d);
-        matmul_f32(&d_k_mem_t, embedded, &mut grads.w_k_mem, d, s, d);
+        matmul_f32(&d_k_mem_t, embedded, grads.w_k_mem.master_mut(), d, s, d);
 
         let mut d_v_mem_t = vec![0.0f32; d * s];
         transpose_f32(&d_v_mem, &mut d_v_mem_t, s, d);
-        matmul_f32(&d_v_mem_t, embedded, &mut grads.w_v_mem, d, s, d);
+        matmul_f32(&d_v_mem_t, embedded, grads.w_v_mem.master_mut(), d, s, d);
 
         let mut d_q_mem_t = vec![0.0f32; d * s];
         transpose_f32(&d_q_mem, &mut d_q_mem_t, s, d);
-        matmul_f32(&d_q_mem_t, embedded, &mut grads.w_q_mem, d, s, d);
+        matmul_f32(&d_q_mem_t, embedded, grads.w_q_mem.master_mut(), d, s, d);
 
-        crate::tensor::matmul_acc_f32(&d_k_mem, &level_params.w_k_mem, &mut d_embedded, s, d, d);
-        crate::tensor::matmul_acc_f32(&d_v_mem, &level_params.w_v_mem, &mut d_embedded, s, d, d);
-        crate::tensor::matmul_acc_f32(&d_q_mem, &level_params.w_q_mem, &mut d_embedded, s, d, d);
+        crate::tensor::matmul_acc_f32(&d_k_mem, &w_k_f32, &mut d_embedded, s, d, d);
+        crate::tensor::matmul_acc_f32(&d_v_mem, &w_v_f32, &mut d_embedded, s, d, d);
+        crate::tensor::matmul_acc_f32(&d_q_mem, &w_q_f32, &mut d_embedded, s, d, d);
 
         (grads, d_embedded)
     }
@@ -1234,10 +1241,11 @@ pub fn moneta_read_only(
 
     let w1 = &frozen_m[..w1_size];
     let w2 = &frozen_m[w1_size..w1_size + w2_size];
+    let w_q_f32 = level_params.w_q_mem.as_f32();
 
     // Project embedded → q_mem via W_Q_mem^T
     let mut w_q_mem_t = vec![0.0f32; d * d];
-    transpose_f32(&level_params.w_q_mem, &mut w_q_mem_t, d, d);
+    transpose_f32(&w_q_f32, &mut w_q_mem_t, d, d);
     let mut q_mem = vec![0.0f32; seq_len * d];
     matmul_f32(embedded, &w_q_mem_t, &mut q_mem, seq_len, d, d);
 
@@ -1317,14 +1325,15 @@ pub fn moneta_read_only_backward(
             d_q_mem[t * d + j] = sum;
         }
     }
+    let w_q_f32 = level_params.w_q_mem.as_f32();
 
     // q_mem = embedded @ W_Q_mem^T → d_W_Q_mem, d_embedded
     let mut d_q_mem_t = vec![0.0f32; d * seq_len];
     transpose_f32(&d_q_mem, &mut d_q_mem_t, seq_len, d);
-    matmul_f32(&d_q_mem_t, embedded, &mut grads.w_q_mem, d, seq_len, d);
+    matmul_f32(&d_q_mem_t, embedded, grads.w_q_mem.master_mut(), d, seq_len, d);
 
     let mut d_embedded = vec![0.0f32; seq_len * d];
-    crate::tensor::matmul_acc_f32(&d_q_mem, &level_params.w_q_mem, &mut d_embedded, seq_len, d, d);
+    crate::tensor::matmul_acc_f32(&d_q_mem, &w_q_f32, &mut d_embedded, seq_len, d, d);
 
     (grads, d_embedded)
 }
@@ -1443,8 +1452,8 @@ mod tests {
         let (grads, d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
 
         for (name, g) in [
-            ("w_k_mem", &grads.w_k_mem), ("w_v_mem", &grads.w_v_mem),
-            ("w_q_mem", &grads.w_q_mem), ("w_alpha", &grads.w_alpha),
+            ("w_k_mem", grads.w_k_mem.master()), ("w_v_mem", grads.w_v_mem.master()),
+            ("w_q_mem", grads.w_q_mem.master()), ("w_alpha", &grads.w_alpha),
             ("b_alpha", &grads.b_alpha), ("w_theta", &grads.w_theta),
             ("b_theta", &grads.b_theta),
         ] {
@@ -1471,8 +1480,8 @@ mod tests {
         let (grads, d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
 
         for (name, g) in [
-            ("w_k_mem", &grads.w_k_mem), ("w_v_mem", &grads.w_v_mem),
-            ("w_q_mem", &grads.w_q_mem),
+            ("w_k_mem", grads.w_k_mem.master()), ("w_v_mem", grads.w_v_mem.master()),
+            ("w_q_mem", grads.w_q_mem.master()),
         ] {
             let max_abs = g.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
             assert!(max_abs > 1e-10, "grad_{name} is all zeros (max_abs={max_abs})");
@@ -1494,9 +1503,9 @@ mod tests {
         let d_y = vec![1.0f32; s * d];
         let (grads, d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
 
-        assert_eq!(grads.w_k_mem.len(), d * d);
-        assert_eq!(grads.w_v_mem.len(), d * d);
-        assert_eq!(grads.w_q_mem.len(), d * d);
+        assert_eq!(grads.w_k_mem.master().len(), d * d);
+        assert_eq!(grads.w_v_mem.master().len(), d * d);
+        assert_eq!(grads.w_q_mem.master().len(), d * d);
         assert_eq!(grads.w_alpha.len(), 2 * d);
         assert_eq!(grads.b_alpha.len(), 1);
         assert_eq!(grads.w_theta.len(), 2 * d);
@@ -1577,7 +1586,7 @@ mod tests {
         let (grads, d_emb) = moneta_read_only_backward(
             &params.levels[0], &frozen_m, &q_mem, &d_y, &embedded, s, d, dh,
         );
-        for &v in grads.w_q_mem.iter() {
+        for &v in grads.w_q_mem.master().iter() {
             assert!(v.is_finite(), "read_only_backward grad not finite");
         }
         for &v in d_emb.iter() {

@@ -77,9 +77,9 @@ fn extract_projections(
     let mut w_k_t = vec![0.0f32; d * d];
     let mut w_v_t = vec![0.0f32; d * d];
     let mut w_q_t = vec![0.0f32; d * d];
-    transpose_f32(&params.w_k_mem, &mut w_k_t, d, d);
-    transpose_f32(&params.w_v_mem, &mut w_v_t, d, d);
-    transpose_f32(&params.w_q_mem, &mut w_q_t, d, d);
+    let w_k_f32 = params.w_k_mem.as_f32(); transpose_f32(&w_k_f32, &mut w_k_t, d, d);
+    let w_v_f32 = params.w_v_mem.as_f32(); transpose_f32(&w_v_f32, &mut w_v_t, d, d);
+    let w_q_f32 = params.w_q_mem.as_f32(); transpose_f32(&w_q_f32, &mut w_q_t, d, d);
 
     let mut k_mem = vec![0.0f32; seq_len * d];
     let mut v_mem = vec![0.0f32; seq_len * d];

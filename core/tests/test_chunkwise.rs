@@ -51,7 +51,7 @@ fn test_chunkwise_smoke() {
         &params.levels[0], &cache, &d_y, &embedded, &cfg,
     );
     assert_eq!(d_emb.len(), s * d);
-    let grad_norm: f32 = grads.w_k_mem.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let grad_norm: f32 = grads.w_k_mem.master().iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(grad_norm > 1e-10, "gradients should be non-zero");
 }
 
@@ -140,9 +140,12 @@ fn test_chunkwise_convergence_comparison() {
         let (grads, _) = chunkwise_gd_backward(
             &params_c1.levels[0], &cache, &d_y, &embedded, &cfg,
         );
-        for (w, g) in params_c1.levels[0].w_k_mem.iter_mut().zip(grads.w_k_mem.iter()) { *w -= lr * g; }
-        for (w, g) in params_c1.levels[0].w_v_mem.iter_mut().zip(grads.w_v_mem.iter()) { *w -= lr * g; }
-        for (w, g) in params_c1.levels[0].w_q_mem.iter_mut().zip(grads.w_q_mem.iter()) { *w -= lr * g; }
+        for (w, g) in params_c1.levels[0].w_k_mem.master_mut().iter_mut().zip(grads.w_k_mem.master().iter()) { *w -= lr * g; }
+        for (w, g) in params_c1.levels[0].w_v_mem.master_mut().iter_mut().zip(grads.w_v_mem.master().iter()) { *w -= lr * g; }
+        for (w, g) in params_c1.levels[0].w_q_mem.master_mut().iter_mut().zip(grads.w_q_mem.master().iter()) { *w -= lr * g; }
+        params_c1.levels[0].w_k_mem.sync_from_master();
+        params_c1.levels[0].w_v_mem.sync_from_master();
+        params_c1.levels[0].w_q_mem.sync_from_master();
     }
 
     // Train with C=2 (approximate)
@@ -162,9 +165,12 @@ fn test_chunkwise_convergence_comparison() {
         let (grads, _) = chunkwise_gd_backward(
             &params_c2.levels[0], &cache, &d_y, &embedded, &cfg,
         );
-        for (w, g) in params_c2.levels[0].w_k_mem.iter_mut().zip(grads.w_k_mem.iter()) { *w -= lr * g; }
-        for (w, g) in params_c2.levels[0].w_v_mem.iter_mut().zip(grads.w_v_mem.iter()) { *w -= lr * g; }
-        for (w, g) in params_c2.levels[0].w_q_mem.iter_mut().zip(grads.w_q_mem.iter()) { *w -= lr * g; }
+        for (w, g) in params_c2.levels[0].w_k_mem.master_mut().iter_mut().zip(grads.w_k_mem.master().iter()) { *w -= lr * g; }
+        for (w, g) in params_c2.levels[0].w_v_mem.master_mut().iter_mut().zip(grads.w_v_mem.master().iter()) { *w -= lr * g; }
+        for (w, g) in params_c2.levels[0].w_q_mem.master_mut().iter_mut().zip(grads.w_q_mem.master().iter()) { *w -= lr * g; }
+        params_c2.levels[0].w_k_mem.sync_from_master();
+        params_c2.levels[0].w_v_mem.sync_from_master();
+        params_c2.levels[0].w_q_mem.sync_from_master();
     }
 
     // Both should converge (loss decreased)
@@ -206,7 +212,7 @@ fn test_chunkwise_cms_k2_compatibility() {
         );
         assert_eq!(d_emb.len(), s * d);
 
-        let grad_norm: f32 = grads.w_k_mem.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let grad_norm: f32 = grads.w_k_mem.master().iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!(grad_norm > 1e-10, "level {level} gradients are zero");
     }
 }

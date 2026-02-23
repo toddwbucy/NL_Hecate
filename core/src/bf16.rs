@@ -50,11 +50,37 @@ pub fn bf16_slice_to_f32(src: &[u16]) -> Vec<f32> {
 ///
 /// The inner loop always uses `as_f32()` to get fp32 values — no bf16
 /// computation ever enters the memory update path.
+#[derive(Debug, PartialEq)]
 pub struct Bf16Storage {
     /// bf16-stored weights (used for forward dispatch, checkpoint serialization).
     stored: Vec<u16>,
     /// fp32 master copy (used by optimizer, source of truth for parameters).
     master: Vec<f32>,
+}
+
+impl Clone for Bf16Storage {
+    fn clone(&self) -> Self {
+        Bf16Storage {
+            stored: self.stored.clone(),
+            master: self.master.clone(),
+        }
+    }
+}
+
+impl serde::Serialize for Bf16Storage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Serialize only master (fp32) for checkpoint backward compat.
+        self.master.serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Bf16Storage {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Deserialize as Vec<f32>, reconstruct bf16 stored copy.
+        let master = Vec::<f32>::deserialize(deserializer)?;
+        let stored = f32_slice_to_bf16(&master);
+        Ok(Bf16Storage { stored, master })
+    }
 }
 
 impl Bf16Storage {
@@ -63,6 +89,20 @@ impl Bf16Storage {
         Bf16Storage {
             stored: f32_slice_to_bf16(weights),
             master: weights.to_vec(),
+        }
+    }
+
+    /// Create from owned fp32 vec (avoids double-alloc in init paths).
+    pub fn from_f32_vec(weights: Vec<f32>) -> Self {
+        let stored = f32_slice_to_bf16(&weights);
+        Bf16Storage { stored, master: weights }
+    }
+
+    /// Create zero-initialized storage of length `n` (for gradient allocation).
+    pub fn zeros(n: usize) -> Self {
+        Bf16Storage {
+            stored: vec![0u16; n],
+            master: vec![0.0f32; n],
         }
     }
 
@@ -89,6 +129,25 @@ impl Bf16Storage {
             "bf16 stored/master length mismatch: {} vs {}", self.stored.len(), self.master.len());
         for i in 0..self.master.len() {
             self.stored[i] = f32_to_bf16(self.master[i]);
+        }
+    }
+
+    /// Set a single element in both master and bf16 stored copy.
+    /// Master is also snapped to the bf16-truncated value so that
+    /// `master()[idx] == as_f32()[idx]` (consistent with what forward sees).
+    /// Used by FD gradient checking to perturb individual weights.
+    pub fn set(&mut self, idx: usize, val: f32) {
+        let bf = f32_to_bf16(val);
+        self.stored[idx] = bf;
+        self.master[idx] = bf16_to_f32(bf);
+    }
+
+    /// Snap master to match bf16 stored copy (lossy: truncates master to bf16 precision).
+    /// After this, `master()[i] == as_f32()[i]` for all i.
+    /// Used before FD gradient checking to ensure get_weight reads what forward sees.
+    pub fn snap_master_to_stored(&mut self) {
+        for i in 0..self.master.len() {
+            self.master[i] = bf16_to_f32(self.stored[i]);
         }
     }
 

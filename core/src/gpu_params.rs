@@ -110,9 +110,9 @@ impl GpuMemoryLevelParams {
         let b_q_conv = if has_conv { GpuBuf::from_host(&host.b_q_conv) } else { GpuBuf::zeros(1) };
 
         GpuMemoryLevelParams {
-            w_k_mem: GpuBuf::from_host(&host.w_k_mem),
-            w_v_mem: GpuBuf::from_host(&host.w_v_mem),
-            w_q_mem: GpuBuf::from_host(&host.w_q_mem),
+            w_k_mem: GpuBuf::from_host(host.w_k_mem.master()),
+            w_v_mem: GpuBuf::from_host(host.w_v_mem.master()),
+            w_q_mem: GpuBuf::from_host(host.w_q_mem.master()),
             w_alpha: GpuBuf::from_host(&host.w_alpha),
             b_alpha: GpuBuf::from_host(&host.b_alpha),
             w_theta: GpuBuf::from_host(&host.w_theta),
@@ -130,9 +130,9 @@ impl GpuMemoryLevelParams {
 
     pub fn to_host(&self, d: usize) -> MemoryLevelParams {
         let mut p = MemoryLevelParams::zeros_like(d);
-        self.w_k_mem.copy_to_host(&mut p.w_k_mem);
-        self.w_v_mem.copy_to_host(&mut p.w_v_mem);
-        self.w_q_mem.copy_to_host(&mut p.w_q_mem);
+        self.w_k_mem.copy_to_host(p.w_k_mem.master_mut()); p.w_k_mem.sync_from_master();
+        self.w_v_mem.copy_to_host(p.w_v_mem.master_mut()); p.w_v_mem.sync_from_master();
+        self.w_q_mem.copy_to_host(p.w_q_mem.master_mut()); p.w_q_mem.sync_from_master();
         self.w_alpha.copy_to_host(&mut p.w_alpha);
         self.b_alpha.copy_to_host(&mut p.b_alpha);
         self.w_theta.copy_to_host(&mut p.w_theta);

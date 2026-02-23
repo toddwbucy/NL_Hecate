@@ -459,7 +459,8 @@ pub fn traced_cms_forward(
             let frozen_ref = &context.memory[level];
 
             // Traced q_mem projection: connects gradient back to emb_id via tape
-            let w_q_mem_id = tape.register_param(&params.levels[level].w_q_mem, vec![d, d]);
+            let w_q_f32 = params.levels[level].w_q_mem.as_f32();
+            let w_q_mem_id = tape.register_param(&w_q_f32, vec![d, d]);
             let q_mem_id = traced_matmul_transb(tape, emb_id, w_q_mem_id, s, d, d);
 
             // Call the same read_only function as cms_forward for exact output

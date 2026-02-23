@@ -76,7 +76,7 @@ fn test_profile2_full_nl() {
 
     // Gradients should be non-zero
     let swa_grad_norm: f32 = grads.swa.w_q.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let mem_grad_norm: f32 = grads.levels[0].w_k_mem.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let mem_grad_norm: f32 = grads.levels[0].w_k_mem.master().iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(swa_grad_norm > 0.0, "SWA gradients should be non-zero");
     assert!(mem_grad_norm > 0.0, "memory gradients should be non-zero");
 }

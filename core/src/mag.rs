@@ -773,7 +773,7 @@ pub fn nested_level_outputs(
             if mem_size == d * d && context.memory[level + 1].len() == d * d {
                 let mut new_m = vec![0.0f32; d * d];
                 // Simple linear projection: new_m = W @ old_m (row-major d×d matmul)
-                let w = &params.levels[level + 1].w_k_mem;
+                let w = params.levels[level + 1].w_k_mem.as_f32();
                 let m = &context.memory[level];
                 for i in 0..d {
                     for j in 0..d {
@@ -825,7 +825,7 @@ pub fn sequential_level_outputs(
         for level in 0..slowest {
             if context.memory[level].len() == mem_size && mem_size == d * d {
                 // Project base state through level's own w_k_mem
-                let w = &params.levels[level].w_k_mem;
+                let w = params.levels[level].w_k_mem.as_f32();
                 let mut new_m = vec![0.0f32; d * d];
                 for i in 0..d {
                     for j in 0..d {
@@ -1203,15 +1203,16 @@ mod tests {
         let (_loss, cache) = mag_forward(&params, &cfg, &input_ids, &target_ids);
         let grads = mag_backward(&params, &cfg, &cache, &input_ids, &target_ids);
 
-        for (name, g) in [
+        let grad_fields: Vec<(&str, &[f32])> = vec![
             ("w_q", &grads.swa.w_q), ("w_k", &grads.swa.w_k),
             ("w_v", &grads.swa.w_v), ("w_o", &grads.swa.w_o),
             ("w_unembed", &grads.swa.w_unembed), ("w_embed", &grads.swa.w_embed),
-            ("w_k_mem", &grads.levels[0].w_k_mem), ("w_v_mem", &grads.levels[0].w_v_mem),
-            ("w_q_mem", &grads.levels[0].w_q_mem), ("w_alpha", &grads.levels[0].w_alpha),
+            ("w_k_mem", grads.levels[0].w_k_mem.master()), ("w_v_mem", grads.levels[0].w_v_mem.master()),
+            ("w_q_mem", grads.levels[0].w_q_mem.master()), ("w_alpha", &grads.levels[0].w_alpha),
             ("b_alpha", &grads.levels[0].b_alpha), ("w_theta", &grads.levels[0].w_theta),
             ("b_theta", &grads.levels[0].b_theta),
-        ] {
+        ];
+        for (name, g) in grad_fields {
             for (i, &val) in g.iter().enumerate() {
                 assert!(val.is_finite(), "mag grad_{name}[{i}] not finite: {val}");
             }
@@ -1226,11 +1227,12 @@ mod tests {
         let (_loss, cache) = mag_forward(&params, &cfg, &input_ids, &target_ids);
         let grads = mag_backward(&params, &cfg, &cache, &input_ids, &target_ids);
 
-        for (name, g) in [
+        let nonzero_fields: Vec<(&str, &[f32])> = vec![
             ("w_q", &grads.swa.w_q), ("w_o", &grads.swa.w_o),
-            ("w_k_mem", &grads.levels[0].w_k_mem), ("w_v_mem", &grads.levels[0].w_v_mem),
-            ("w_q_mem", &grads.levels[0].w_q_mem),
-        ] {
+            ("w_k_mem", grads.levels[0].w_k_mem.master()), ("w_v_mem", grads.levels[0].w_v_mem.master()),
+            ("w_q_mem", grads.levels[0].w_q_mem.master()),
+        ];
+        for (name, g) in nonzero_fields {
             let max_abs = g.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
             assert!(max_abs > 1e-10, "mag grad_{name} all zeros (max_abs={max_abs})");
         }
@@ -1331,9 +1333,9 @@ mod tests {
 
         // All gradients should be finite
         for level in 0..cfg.k {
-            for &val in grads.levels[level].w_k_mem.iter()
-                .chain(grads.levels[level].w_v_mem.iter())
-                .chain(grads.levels[level].w_q_mem.iter())
+            for &val in grads.levels[level].w_k_mem.master().iter()
+                .chain(grads.levels[level].w_v_mem.master().iter())
+                .chain(grads.levels[level].w_q_mem.master().iter())
             {
                 assert!(val.is_finite(), "CMS level {level} gradient not finite");
             }
@@ -1360,7 +1362,7 @@ mod tests {
 
         // Both active levels should have non-zero memory gradients
         for level in 0..cfg.k {
-            let norm: f32 = grads.levels[level].w_k_mem.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let norm: f32 = grads.levels[level].w_k_mem.master().iter().map(|x| x * x).sum::<f32>().sqrt();
             assert!(norm > 1e-10, "CMS level {level} w_k_mem grads all zeros");
         }
     }
@@ -1386,11 +1388,11 @@ mod tests {
         let grads = cms_backward(&params, &cfg, &cache, &input_ids, &target_ids, &mut error_buffers);
 
         // Level 0 (active) should have direct grads
-        let l0_norm: f32 = grads.levels[0].w_k_mem.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let l0_norm: f32 = grads.levels[0].w_k_mem.master().iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!(l0_norm > 1e-10, "Active level 0 should have non-zero grads");
 
         // Level 1 (frozen) should have grads in error buffer, not in direct grads
-        let l1_direct_norm: f32 = grads.levels[1].w_k_mem.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let l1_direct_norm: f32 = grads.levels[1].w_k_mem.master().iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!(l1_direct_norm < 1e-12, "Frozen level 1 should have zero direct grads, got {l1_direct_norm}");
 
         // Error buffer should have accumulated the frozen level's grads
@@ -1483,7 +1485,7 @@ mod tests {
 
         // Manually compute what nested re-init would produce for level 1:
         // new_m1 = w_k_mem[1] @ memory[0]
-        let w = &params.levels[1].w_k_mem;
+        let w = params.levels[1].w_k_mem.as_f32();
         let m = &context.memory[0];
         let mut expected_reinit = vec![0.0f32; d * d];
         for i in 0..d {

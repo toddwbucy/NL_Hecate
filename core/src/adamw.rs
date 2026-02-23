@@ -184,9 +184,9 @@ impl FrequencyAwareAdamW {
             let lg = &grads.levels[level];
 
             let level_pairs: Vec<(&mut [f32], &[f32])> = vec![
-                (lp.w_k_mem.as_mut_slice(), lg.w_k_mem.as_slice()),
-                (lp.w_v_mem.as_mut_slice(), lg.w_v_mem.as_slice()),
-                (lp.w_q_mem.as_mut_slice(), lg.w_q_mem.as_slice()),
+                (lp.w_k_mem.master_mut(), lg.w_k_mem.master()),
+                (lp.w_v_mem.master_mut(), lg.w_v_mem.master()),
+                (lp.w_q_mem.master_mut(), lg.w_q_mem.master()),
                 (lp.w_alpha.as_mut_slice(), lg.w_alpha.as_slice()),
                 (lp.b_alpha.as_mut_slice(), lg.b_alpha.as_slice()),
                 (lp.w_theta.as_mut_slice(), lg.w_theta.as_slice()),
@@ -197,6 +197,10 @@ impl FrequencyAwareAdamW {
                 adamw_step_buf(p, g, &mut buf.m, &mut buf.v,
                                lr, c.beta1, c.beta2, c.eps, lbc1_inv, lbc2_inv, c.weight_decay);
             }
+            // Sync bf16 stored copies after optimizer step
+            lp.w_k_mem.sync_from_master();
+            lp.w_v_mem.sync_from_master();
+            lp.w_q_mem.sync_from_master();
         }
 
         // ── CMS aggregation weights (always active, like SWA) ─────────

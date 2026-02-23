@@ -295,7 +295,7 @@ fn test_m3_apply_weight_gradients_m3() {
     // Non-zero gradients
     let mut grads = MAGParams::zeros_like(&mag_cfg);
     grads.swa.w_q.iter_mut().for_each(|v| *v = 0.01);
-    grads.levels[0].w_k_mem.iter_mut().for_each(|v| *v = 0.01);
+    grads.levels[0].w_k_mem.master_mut().iter_mut().for_each(|v| *v = 0.01);
 
     params.apply_weight_gradients_m3(&grads, &mut m3_state, &m3_cfg);
 
