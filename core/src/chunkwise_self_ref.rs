@@ -990,7 +990,6 @@ mod tests {
         // v_hat_k at t=0 and t=1 should both use frozen M_k (snapshot at t=0)
         // Since M_k evolves after t=0 via DGD, if we were using current M,
         // v_hat at t=1 would differ from what frozen M produces.
-        let sd = seq_len * d;
         let v_hat_k_t0 = &cache.inner.v_hat_targets[0..d];
         let v_hat_k_t1 = &cache.inner.v_hat_targets[d..2 * d];
 
