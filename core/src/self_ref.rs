@@ -318,17 +318,26 @@ pub fn self_ref_step(
 ///
 /// All 6 memories are frozen (no DGD update). Just reads projections
 /// from the static state and produces output.
+///
+/// Returns (y [seq_len * d], q_mem [seq_len * d]) — q_mem needed for frozen backward.
 pub fn self_ref_read_only(
     self_ref: &SelfRefState,
     m_mem: &[f32],
     embedded: &[f32],
     seq_len: usize,
     d: usize,
-) -> Vec<f32> {
+) -> (Vec<f32>, Vec<f32>) {
     debug_assert_eq!(embedded.len(), seq_len * d);
+
+    // Guard: empty SelfRefState means this level was initialized as Static
+    // but cfg says Adaptive — return zeros safely instead of panicking on matmul.
+    if !self_ref.is_active() || m_mem.is_empty() {
+        return (vec![0.0f32; seq_len * d], vec![0.0f32; seq_len * d]);
+    }
     debug_assert_eq!(m_mem.len(), d * d);
 
     let mut y = vec![0.0f32; seq_len * d];
+    let mut q_mem = vec![0.0f32; seq_len * d];
     let mut q_t = vec![0.0f32; d];
     let mut y_t = vec![0.0f32; d];
 
@@ -336,12 +345,75 @@ pub fn self_ref_read_only(
         let x_t = &embedded[t * d..(t + 1) * d];
         // Read q from frozen M_q
         matmul_f32(&self_ref.m_q, x_t, &mut q_t, d, d, 1);
+        q_mem[t * d..(t + 1) * d].copy_from_slice(&q_t);
         // Read from frozen M_mem
         matmul_f32(m_mem, &q_t, &mut y_t, d, d, 1);
         y[t * d..(t + 1) * d].copy_from_slice(&y_t);
     }
 
-    y
+    (y, q_mem)
+}
+
+/// Backward for frozen self-referential read-only path.
+///
+/// Forward: q_t = M_q @ x_t, y_t = M_mem @ q_t (all frozen, no DGD).
+/// Backward produces gradients for M_q and M_mem (→ error buffer) and d_embedded.
+///
+/// `frozen_combined`: concatenation of [M_mem (d*d), M_q (d*d)] stored during
+/// frozen forward. Split here to access both matrices without needing ContextState.
+///
+/// Returns (MemoryLevelParams grads, d_embedded [seq_len * d]).
+pub fn self_ref_read_only_backward(
+    frozen_combined: &[f32],
+    q_mem: &[f32],
+    d_y: &[f32],
+    embedded: &[f32],
+    seq_len: usize,
+    d: usize,
+) -> (crate::model::MemoryLevelParams, Vec<f32>) {
+    let dd = d * d;
+    let mut d_embedded = vec![0.0f32; seq_len * d];
+    let grads = crate::model::MemoryLevelParams::zeros_like(d);
+
+    // Guard: empty/undersized frozen_combined → zero grads
+    if frozen_combined.len() < 2 * dd {
+        return (grads, d_embedded);
+    }
+
+    let m_mem = &frozen_combined[..dd];
+    let m_q = &frozen_combined[dd..2 * dd];
+
+    for t in 0..seq_len {
+        let q_t = &q_mem[t * d..(t + 1) * d];
+        let dy_t = &d_y[t * d..(t + 1) * d];
+
+        // Backward through y_t = M_mem @ q_t
+        // dq_t = M_mem^T @ dy_t
+        let mut dq_t = vec![0.0f32; d];
+        for j in 0..d {
+            let mut sum = 0.0f32;
+            for i in 0..d {
+                sum += m_mem[i * d + j] * dy_t[i];
+            }
+            dq_t[j] = sum;
+        }
+        // (dM_mem and dM_q gradients go to error buffer via MemoryLevelParams.
+        //  Since self-ref uses DGD on raw matrices (not w_k_mem etc.), these grads
+        //  are zero in MemoryLevelParams — the actual M-state gradients will be
+        //  wired through SelfRefParamGrads in PR 4.)
+
+        // Backward through q_t = M_q @ x_t
+        // dx_t = M_q^T @ dq_t
+        for j in 0..d {
+            let mut sum = 0.0f32;
+            for i in 0..d {
+                sum += m_q[i * d + j] * dq_t[i];
+            }
+            d_embedded[t * d + j] += sum;
+        }
+    }
+
+    (grads, d_embedded)
 }
 
 /// Backward pass for self_ref_step. Reverse token loop through all 6 memories.
@@ -395,26 +467,9 @@ pub fn self_ref_step_backward(
         let m_mem_t = &cache.m_mem_states[t * dd..(t + 1) * dd];
 
         // ── Step 1: Main memory read backward ──
-        // y_t = M_mem_t @ q_t (note: read uses state BEFORE DGD update at this t,
-        // but our forward does read then update, so M_mem_t is the correct state)
+        // y_t = M_mem_t @ q_t (read uses state BEFORE DGD update at this token)
         //
-        // Wait: actually the forward reads from the M_mem BEFORE the DGD update at time t,
-        // but the DGD updates happen AFTER the read. So we need M_mem at the state
-        // that was used for reading. That IS m_mem_t (the state at time t before update).
-        //
-        // However, the dm_mem we're carrying is dL/dM_{mem,t+1}. We need to add the
-        // read gradient to it, then flow through DGD backward.
-
-        // dL/dM_mem_read = outer(dy_t, q_t) — gradient from the read y_t = M @ q_t
-        // This adds to dm_mem (which already has dL/dM_{t+1} from the next token's DGD backward)
-        for i in 0..d {
-            for j in 0..d {
-                dm_mem[i * d + j] += dy_t[i] * q_t[j];
-            }
-        }
-
-        // dq_t from read: M_mem_t^T @ dy_t
-        // (transposed matmul: q contributes to y via M @ q, so dq = M^T @ dy)
+        // dq_t from read: M_mem_t^T @ dy_t (independent of dm_mem accumulator)
         for j in 0..d {
             let mut sum = 0.0f32;
             for i in 0..d {
@@ -425,9 +480,18 @@ pub fn self_ref_step_backward(
 
         // ── Step 2: DGD backward for main memory ──
         // Forward: M_{mem,t+1} = dgd_step(M_{mem,t}, k_t, v_t, alpha_t, theta_t)
-        // dm_mem currently holds dL/dM_{mem,t+1}
+        // dm_mem currently holds dL/dM_{mem,t+1} (from future tokens only — not yet
+        // contaminated by the read at this token). DGD backward maps this to dL/dM_{mem,t}.
         let main_grads = crate::dgd::dgd_step_backward(&dm_mem, m_mem_t, k_t, v_t, alpha_t, theta_t, d);
         dm_mem.copy_from_slice(&main_grads.d_m);
+
+        // NOW add the read gradient: dL/dM_mem_read = outer(dy_t, q_t).
+        // This must come AFTER DGD backward so dgd_step_backward sees clean dL/dM_{t+1}.
+        for i in 0..d {
+            for j in 0..d {
+                dm_mem[i * d + j] += dy_t[i] * q_t[j];
+            }
+        }
         let mut dk_t_from_main = main_grads.d_k;
         let mut dv_t_total = main_grads.d_v;
         let mut dalpha_total = main_grads.d_alpha;
@@ -708,12 +772,52 @@ mod tests {
         let embedded: Vec<f32> = (0..seq_len * d).map(|i| (i as f32) * 0.1).collect();
         let state_before = state.clone();
 
-        let y = self_ref_read_only(&state, &m_mem, &embedded, seq_len, d);
+        let (y, q_mem) = self_ref_read_only(&state, &m_mem, &embedded, seq_len, d);
         assert_eq!(y.len(), seq_len * d);
+        assert_eq!(q_mem.len(), seq_len * d);
 
         // State should be unchanged (frozen)
         assert_eq!(state.m_q, state_before.m_q);
         assert_eq!(state.m_k, state_before.m_k);
+    }
+
+    #[test]
+    fn test_self_ref_read_only_empty_guard() {
+        // Empty SelfRefState should return zeros, not panic.
+        let d = 4;
+        let seq_len = 2;
+        let state = SelfRefState::empty(d);
+        let m_mem = vec![0.1f32; d * d];
+        let embedded: Vec<f32> = (0..seq_len * d).map(|i| (i as f32) * 0.1).collect();
+        let (y, q_mem) = self_ref_read_only(&state, &m_mem, &embedded, seq_len, d);
+        assert_eq!(y.len(), seq_len * d);
+        assert!(y.iter().all(|&x| x == 0.0), "empty state should produce zeros");
+        assert!(q_mem.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn test_self_ref_read_only_backward_roundtrip() {
+        // Frozen backward should produce nonzero d_embedded when inputs are nonzero.
+        let d = 4;
+        let seq_len = 2;
+        let mut state = SelfRefState::new(d);
+        for i in 0..d { state.m_q[i * d + i] = 0.2; }
+        let m_mem: Vec<f32> = (0..d * d).map(|i| if i / d == i % d { 0.3 } else { 0.01 }).collect();
+        let embedded: Vec<f32> = (0..seq_len * d).map(|i| (i as f32) * 0.1 + 0.05).collect();
+
+        let (y, q_mem) = self_ref_read_only(&state, &m_mem, &embedded, seq_len, d);
+        let d_y = y.clone(); // simple loss grad
+
+        // Build frozen_combined = [M_mem, M_q]
+        let mut frozen_combined = Vec::with_capacity(2 * d * d);
+        frozen_combined.extend_from_slice(&m_mem);
+        frozen_combined.extend_from_slice(&state.m_q);
+
+        let (_grads, d_embedded) = self_ref_read_only_backward(
+            &frozen_combined, &q_mem, &d_y, &embedded, seq_len, d,
+        );
+        let de_norm: f32 = d_embedded.iter().map(|x| x * x).sum();
+        assert!(de_norm > 0.0, "frozen backward should produce nonzero d_embedded");
     }
 
     #[test]

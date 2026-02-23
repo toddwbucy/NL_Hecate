@@ -19,7 +19,7 @@ use crate::lattice_osr::{LatticeOSR, LatticeCache, lattice_read_only, lattice_re
 use crate::trellis::{Trellis, TrellisCache, trellis_read_only, trellis_read_only_backward};
 use crate::atlas_omega::{AtlasOmega, AtlasOmegaCache};
 use crate::conductor::{Pulse, ContextState, ErrorBuffer};
-use crate::self_ref::{SelfRefCache, ProjectionKind, self_ref_step, self_ref_step_backward, self_ref_read_only};
+use crate::self_ref::{SelfRefCache, ProjectionKind, self_ref_step, self_ref_step_backward, self_ref_read_only, self_ref_read_only_backward};
 use crate::dynamic_freq::{
     FrequencySchedule, FreqGateCache,
     mean_pool, compute_freq_gates, apply_threshold, should_anneal,
@@ -293,8 +293,11 @@ pub fn mag_backward(
         }
         MemoryCache::SelfRef(sr_cache) => {
             let (d_emb, _sr_grads) = self_ref_step_backward(sr_cache, &d_y);
-            // SelfRef initial state gradients stored in _sr_grads (wired in PR 4).
-            // Static projection weights (w_k_mem etc.) unused in Adaptive mode → zero grads.
+            // TODO(PR-4): _sr_grads holds dL/dM_{k,0}..dL/dM_{mem,0} — the outer-loop
+            // gradients for self-ref initial states. Currently dropped because MAGParams
+            // doesn't have fields for them yet. PR 4 adds SelfRefParamGrads to MAGParams
+            // and wires them into apply_weight_gradients(). Until then, only the inner-loop
+            // (per-token DGD) operates on projection memories; outer-loop learning is deferred.
             (crate::model::MemoryLevelParams::zeros_like(d), d_emb)
         }
     };
@@ -685,13 +688,17 @@ fn run_level_memory(
         };
         (y_level, Some(mem_cache), None, None)
     } else {
-        // Phase 2 frozen: read-only from all 6 memories
+        // Phase 2 frozen: read-only from all 6 memories.
+        // Store [M_mem, M_q] concatenated in frozen_memories so backward can split.
         if cfg.projection_kind == ProjectionKind::Adaptive {
             let frozen_mem = &context.memory[level];
-            let y = self_ref_read_only(
+            let (y, q_mem) = self_ref_read_only(
                 &context.self_ref[level], frozen_mem, input, s, d,
             );
-            return (y, None, None, Some(frozen_mem.clone()));
+            let mut combined = Vec::with_capacity(2 * d * d);
+            combined.extend_from_slice(frozen_mem);
+            combined.extend_from_slice(&context.self_ref[level].m_q);
+            return (y, None, Some(q_mem), Some(combined));
         }
 
         let frozen_ref = &context.memory[level];
@@ -1056,6 +1063,7 @@ pub fn cms_backward(
                 }
                 MemoryCache::SelfRef(sr_cache) => {
                     let (d_emb, _sr_grads) = self_ref_step_backward(sr_cache, &d_y_combined);
+                    // TODO(PR-4): wire _sr_grads into MAGParams (see mag_backward comment).
                     (crate::model::MemoryLevelParams::zeros_like(d), d_emb)
                 }
             };
@@ -1065,33 +1073,44 @@ pub fn cms_backward(
             }
         } else {
             // Frozen level: read-only backward (rule-aware dispatch)
-            let q_mem = cache.q_mem_per_level[level].as_ref().unwrap();
             let frozen_m = cache.frozen_memories[level].as_ref().unwrap();
-            let (mem_grads, d_embedded_mem) = match cfg.memory_rule {
-                MemoryRuleKind::Moneta => moneta_read_only_backward(
-                    &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.d_hidden,
-                ),
-                MemoryRuleKind::YAAD => yaad_read_only_backward(
-                    &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.d_hidden,
-                ),
-                MemoryRuleKind::MEMORA => memora_read_only_backward(
-                    &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.d_hidden,
-                ),
-                MemoryRuleKind::LatticeOSR => lattice_read_only_backward(
-                    &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.m_slots,
-                ),
-                MemoryRuleKind::Trellis => trellis_read_only_backward(
-                    &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.d_compress,
-                ),
-                _ => delta_rule_read_only_backward(
-                    &params.levels[level],
-                    frozen_m,
-                    q_mem,
-                    &d_y_combined,
-                    &cache.embedded,
-                    s,
-                    d,
-                ),
+
+            // Adaptive frozen levels store [M_mem, M_q] in frozen_memories
+            // and use self_ref_read_only_backward (no SelfRefState needed).
+            let (mem_grads, d_embedded_mem) = if cfg.projection_kind == ProjectionKind::Adaptive {
+                let q_mem = cache.q_mem_per_level[level].as_ref()
+                    .expect("Adaptive frozen level should have q_mem from self_ref_read_only");
+                self_ref_read_only_backward(
+                    frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d,
+                )
+            } else {
+                let q_mem = cache.q_mem_per_level[level].as_ref().unwrap();
+                match cfg.memory_rule {
+                    MemoryRuleKind::Moneta => moneta_read_only_backward(
+                        &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.d_hidden,
+                    ),
+                    MemoryRuleKind::YAAD => yaad_read_only_backward(
+                        &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.d_hidden,
+                    ),
+                    MemoryRuleKind::MEMORA => memora_read_only_backward(
+                        &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.d_hidden,
+                    ),
+                    MemoryRuleKind::LatticeOSR => lattice_read_only_backward(
+                        &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.m_slots,
+                    ),
+                    MemoryRuleKind::Trellis => trellis_read_only_backward(
+                        &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.d_compress,
+                    ),
+                    _ => delta_rule_read_only_backward(
+                        &params.levels[level],
+                        frozen_m,
+                        q_mem,
+                        &d_y_combined,
+                        &cache.embedded,
+                        s,
+                        d,
+                    ),
+                }
             };
             // Frozen level grads go to error buffer, not direct grads
             error_buffers[level].accumulate(&mem_grads);

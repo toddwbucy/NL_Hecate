@@ -27,6 +27,7 @@ use crate::lattice_osr::{LatticeOSR, lattice_read_only};
 use crate::trellis::{Trellis, trellis_read_only};
 use crate::atlas_omega::AtlasOmega;
 use crate::dynamic_freq::{FrequencySchedule, FreqGateCache, should_anneal};
+use crate::self_ref::ProjectionKind;
 
 // ── TracedParamIds: map tape BufIds back to MAGParams fields ────────
 
@@ -309,6 +310,14 @@ pub fn traced_cms_forward(
     let nh = swa_cfg.num_heads;
     let hd = swa_cfg.head_dim;
     let ws = swa_cfg.window_size;
+
+    // TODO(PR-4): Wire OpaqueKey::SelfRef into tape recording + opaque_adapters.
+    // Until then, Adaptive projections are not supported in the traced (tape) path.
+    assert!(
+        cfg.projection_kind != ProjectionKind::Adaptive,
+        "traced_cms_forward: ProjectionKind::Adaptive not yet supported in tape path. \
+         Use cms_forward + cms_backward directly, or wait for PR 4."
+    );
 
     assert_eq!(d, nh * hd);
     assert!(input_ids.len() >= s);
