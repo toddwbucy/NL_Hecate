@@ -26,16 +26,22 @@ conveyance_hypothesis_context_amplification_v4.md
 
 # Training data (binary token files, too large for git)
 python/data/*.bin
-python/data/sharegpt/*.npy
-python/data/sharegpt/tokenizer.json
+python/data/sharegpt/
+python/data/curriculum/
+python/data/phase0/
+python/data/shakedown_1b/
 
 # Checkpoints (model weights)
 python/checkpoints/
 
 # Python
-python/__pycache__/
-python/tests/__pycache__/
+**/__pycache__/
 python/.venv/
+
+# Runtime artifacts
+python/runs/
+python/nohup.out
+python/*.log
 
 # Hermes workspace config
 .hermes/

@@ -1,0 +1,217 @@
+"""BuildConfig and learning rate schedules."""
+
+import argparse
+import json
+import math
+from pathlib import Path
+from typing import Any
+
+
+class BuildConfig:
+    """Validated build configuration. Replaces raw dict parsing.
+
+    Loads from JSON/YAML config file, validates all fields, applies CLI
+    overrides. All fields have sensible defaults for quick experimentation.
+    """
+
+    # Model
+    d_model: int = 64
+    num_heads: int = 4
+    seq_len: int = 32
+    window_size: int = 16
+    vocab_size: int = 256
+    k: int = 1
+    chunk_sizes: list[int] | None = None
+    memory_rule: str = "delta"
+    composition: str = "mag"
+
+    # HOPE (self-referential projections)
+    projection_kind: str = "static"         # "static" or "adaptive"
+    self_generated_values: bool = False      # Phase 3 self-modifying memory
+    self_ref_chunk_size: int = 1             # chunkwise self-ref (1 = sequential)
+    momentum_kind: str = "none"             # "none", "ema", "delta_momentum", "deep_momentum"
+    momentum_d_hidden: int = 0              # momentum MLP hidden dim (0 = d*d matrix)
+
+    # Build
+    lr: float = 0.01
+    steps: int = 500
+    seed: int = 42
+    save_path: str = "checkpoints/model.json"
+    save_every: int = 0
+    log_every: int = 10
+
+    # Optimizer
+    optimizer: str = "sgd"
+    warmup_steps: int = 0
+    weight_decay: float = 0.1
+    beta1: float = 0.9
+    beta2: float = 0.999
+    max_grad_norm: float = 0.0  # 0 = disabled
+
+    # Data
+    data_path: str | None = None
+    data_format: str = "byte"  # "byte" or "sharegpt"
+    doc_starts_path: str | None = None  # byte offsets of document boundaries
+    val_path: str | None = None  # byte-level val corpus
+    val_doc_starts_path: str | None = None  # val doc boundaries
+
+    # Eval
+    eval_every: int = 0  # 0 = disabled; evaluate on val set every N steps
+    eval_max_chunks: int = 100  # max chunks per eval pass
+
+    # Gradient checkpointing (VRAM optimization for memory rules)
+    checkpoint_interval: int | None = None  # None = full trajectory; C = store M every C steps
+
+    # Runtime
+    gpu: bool = True  # GPU by default; --cpu to override
+    load: str | None = None
+    log_file: str | None = None
+
+    def __init__(self, **kwargs: Any):
+        for key, val in kwargs.items():
+            if hasattr(self, key):
+                setattr(self, key, val)
+            else:
+                raise ValueError(f"Unknown config key: {key}")
+        self._validate()
+
+    def _validate(self):
+        if self.d_model <= 0:
+            raise ValueError("d_model must be positive")
+        if self.num_heads <= 0:
+            raise ValueError("num_heads must be positive")
+        if self.d_model % self.num_heads != 0:
+            raise ValueError(
+                f"d_model ({self.d_model}) must be divisible by num_heads ({self.num_heads})")
+        if self.seq_len <= 0:
+            raise ValueError("seq_len must be positive")
+        if self.window_size <= 0:
+            raise ValueError("window_size must be positive")
+        if self.k < 1:
+            raise ValueError("k must be >= 1")
+        if self.optimizer not in ("sgd", "adamw", "adamw_gpu"):
+            raise ValueError(
+                f"optimizer must be 'sgd', 'adamw', or 'adamw_gpu', got '{self.optimizer}'")
+        if self.lr <= 0:
+            raise ValueError("lr must be positive")
+        if self.max_grad_norm < 0:
+            raise ValueError("max_grad_norm must be >= 0")
+        if self.chunk_sizes is None:
+            self.chunk_sizes = [1] * self.k
+        if len(self.chunk_sizes) != self.k:
+            raise ValueError(
+                f"chunk_sizes length {len(self.chunk_sizes)} must match k={self.k}")
+        if self.projection_kind not in ("static", "adaptive"):
+            raise ValueError(
+                f"projection_kind must be 'static' or 'adaptive', got '{self.projection_kind}'")
+        if self.momentum_kind not in ("none", "ema", "delta_momentum", "deep_momentum"):
+            raise ValueError(
+                f"momentum_kind must be 'none', 'ema', 'delta_momentum', or 'deep_momentum', "
+                f"got '{self.momentum_kind}'")
+        if self.self_ref_chunk_size < 1:
+            raise ValueError(
+                f"self_ref_chunk_size must be >= 1, got {self.self_ref_chunk_size}")
+        if self.momentum_d_hidden < 0:
+            raise ValueError(
+                f"momentum_d_hidden must be >= 0, got {self.momentum_d_hidden}")
+        if self.self_generated_values and self.projection_kind != "adaptive":
+            raise ValueError("self_generated_values requires projection_kind='adaptive'")
+        if self.self_ref_chunk_size > 1 and self.projection_kind != "adaptive":
+            raise ValueError("self_ref_chunk_size > 1 requires projection_kind='adaptive'")
+        if self.data_format not in ("byte", "sharegpt"):
+            raise ValueError(
+                f"data_format must be 'byte' or 'sharegpt', got '{self.data_format}'")
+        if self.checkpoint_interval is not None and self.checkpoint_interval < 1:
+            raise ValueError(
+                f"checkpoint_interval must be >= 1 or None, got {self.checkpoint_interval}")
+
+    @property
+    def head_dim(self) -> int:
+        return self.d_model // self.num_heads
+
+    @classmethod
+    def from_file(cls, path: str) -> "BuildConfig":
+        """Load config from JSON file."""
+        with open(path) as f:
+            raw = json.load(f)
+        flat: dict[str, Any] = {}
+        for section in ("model", "build", "data"):
+            if section in raw:
+                sub = raw[section]
+                if section == "data":
+                    if "path" in sub:
+                        flat["data_path"] = sub["path"]
+                    if "format" in sub:
+                        flat["data_format"] = sub["format"]
+                    if "doc_starts" in sub:
+                        flat["doc_starts_path"] = sub["doc_starts"]
+                    if "val_path" in sub:
+                        flat["val_path"] = sub["val_path"]
+                    if "val_doc_starts" in sub:
+                        flat["val_doc_starts_path"] = sub["val_doc_starts"]
+                else:
+                    flat.update(sub)
+        # Top-level overrides (for flat configs)
+        for key in list(raw.keys()):
+            if key not in ("model", "build", "data", "notes", "description"):
+                flat[key] = raw[key]
+        # Rename head_dim if present (derived, not stored)
+        flat.pop("head_dim", None)
+        flat.pop("format", None)
+        # Auto-load vocab_size from meta.json for sharegpt format
+        if flat.get("data_format") == "sharegpt" and "data_path" in flat:
+            meta_path = Path(flat["data_path"]) / "meta.json"
+            if meta_path.exists() and "vocab_size" not in flat:
+                with open(meta_path) as f:
+                    meta = json.load(f)
+                if meta.get("vocab_size") is not None:
+                    flat["vocab_size"] = meta["vocab_size"]
+                else:
+                    raise ValueError(
+                        f"meta.json at {meta_path} missing 'vocab_size' key")
+        return cls(**flat)
+
+    def apply_cli(self, args: argparse.Namespace):
+        """Apply CLI argument overrides (only non-None values)."""
+        mapping = {
+            "data": "data_path", "d_model": "d_model", "num_heads": "num_heads",
+            "seq_len": "seq_len", "window_size": "window_size", "k": "k",
+            "chunk_sizes": "chunk_sizes", "memory_rule": "memory_rule",
+            "composition": "composition", "lr": "lr", "steps": "steps",
+            "seed": "seed", "save_path": "save_path", "save_every": "save_every",
+            "log_every": "log_every", "optimizer": "optimizer",
+            "warmup_steps": "warmup_steps", "weight_decay": "weight_decay",
+            "beta1": "beta1", "beta2": "beta2", "max_grad_norm": "max_grad_norm",
+            "load": "load", "log_file": "log_file",
+            "eval_every": "eval_every", "eval_max_chunks": "eval_max_chunks",
+            "checkpoint_interval": "checkpoint_interval",
+            "projection_kind": "projection_kind",
+            "self_ref_chunk_size": "self_ref_chunk_size",
+            "momentum_kind": "momentum_kind",
+            "momentum_d_hidden": "momentum_d_hidden",
+        }
+        for cli_name, cfg_name in mapping.items():
+            val = getattr(args, cli_name, None)
+            if val is not None:
+                if cli_name == "chunk_sizes" and isinstance(val, str):
+                    val = [int(x) for x in val.split(",") if x]
+                setattr(self, cfg_name, val)
+        # --cpu overrides the default GPU mode
+        if getattr(args, "cpu", False):
+            self.gpu = False
+        elif getattr(args, "gpu", False):
+            self.gpu = True  # backward compat: --gpu still works
+        # store_true with default=None: only override if explicitly passed
+        if getattr(args, "self_generated_values", None) is not None:
+            self.self_generated_values = args.self_generated_values
+        self._validate()
+
+
+def cosine_lr(step: int, warmup_steps: int, total_steps: int, lr_peak: float,
+              lr_min: float = 0.0) -> float:
+    """Cosine annealing with linear warmup."""
+    if step < warmup_steps:
+        return lr_peak * step / max(warmup_steps, 1)
+    progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+    progress = min(progress, 1.0)
+    return lr_min + 0.5 * (lr_peak - lr_min) * (1 + math.cos(math.pi * progress))

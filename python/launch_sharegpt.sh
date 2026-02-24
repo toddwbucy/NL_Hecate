@@ -10,11 +10,12 @@ cd "$(dirname "$0")"
 STEPS=""
 SMOKE=false
 
-for arg in "$@"; do
-    case $arg in
-        --smoke) SMOKE=true ;;
-        --steps=*) STEPS="${arg#*=}" ;;
-        --steps) shift; STEPS="$1" ;;
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --smoke) SMOKE=true; shift ;;
+        --steps=*) STEPS="${1#*=}"; shift ;;
+        --steps) STEPS="${2:?--steps requires a value}"; shift 2 ;;
+        *) shift ;;
     esac
 done
 
@@ -39,29 +40,28 @@ fi
 echo "Step 2: Starting build..."
 echo "------------------------------------------------------------"
 
+mkdir -p runs
+
 if $SMOKE; then
     echo "  Mode: SMOKE TEST (100 steps)"
-    python3 build.py \
+    python3 hecate.py --build \
         --config configs/sharegpt_32k.json \
         --steps 100 \
         --log_every 10 \
         --eval_every 50 \
         --eval_max_chunks 5 \
         --save_every 50 \
-        --gpu \
         --log_file runs/sharegpt_smoke.jsonl
 elif [ -n "$STEPS" ]; then
     echo "  Mode: CUSTOM ($STEPS steps)"
-    python3 build.py \
+    python3 hecate.py --build \
         --config configs/sharegpt_32k.json \
         --steps "$STEPS" \
-        --gpu \
         --log_file runs/sharegpt_32k.jsonl
 else
     echo "  Mode: FULL (100K steps)"
-    nohup python3 -u build.py \
+    nohup python3 -u hecate.py --build \
         --config configs/sharegpt_32k.json \
-        --gpu \
         --log_file runs/sharegpt_32k.jsonl \
         > runs/sharegpt_32k.log 2>&1 &
     PID=$!
