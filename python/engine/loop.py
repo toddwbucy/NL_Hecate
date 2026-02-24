@@ -10,7 +10,7 @@ from typing import Any, Optional
 import nl_hecate
 
 from engine.config import BuildConfig, cosine_lr
-from engine.data import BpeDataLoader, MmapTokenStream
+from engine.data import BpeDataLoader, DEMO_TEXT, MmapTokenStream
 from engine.evaluation import (
     evaluate, evaluate_numpy, print_level_metrics,
     eval_coherence_samples, generate_samples,
@@ -21,14 +21,6 @@ from engine.tokenizer import ByteTokenizer, BpeTokenizer, load_tokenizer
 
 def _encode_bytes(text: str) -> list[int]:
     return list(text.encode("utf-8"))
-
-
-DEMO_TEXT = (
-    "the cat sat on the mat. "
-    "the dog ran in the park. "
-    "birds fly high in the sky. "
-    "fish swim deep in the sea. "
-) * 10
 
 
 def run_build(bcfg: BuildConfig):
@@ -203,9 +195,9 @@ def run_build(bcfg: BuildConfig):
         context = nl_hecate.ContextState(bcfg.k, bcfg.d_model)
     else:
         if isinstance(token_ids, MmapTokenStream):
-            mm = token_ids
-            raw_bytes = bytes(mm._mm[:])
-            mm.close()
+            token_ids.close()
+            with open(bcfg.data_path, "rb") as f:
+                raw_bytes = f.read()
             stream = nl_hecate.VecStream.from_bytes(raw_bytes)
             del raw_bytes
             token_ids = None
@@ -556,7 +548,10 @@ def run_build(bcfg: BuildConfig):
     if gpu_model is not None:
         params = gpu_model.to_host_params()
     os.makedirs(os.path.dirname(bcfg.save_path) or ".", exist_ok=True)
-    nl_hecate.save_checkpoint(bcfg.save_path, params, cfg)
+    if use_bpe:
+        nl_hecate.save_checkpoint(bcfg.save_path, params, cfg)
+    else:
+        nl_hecate.save_build_checkpoint(bcfg.save_path, params, cfg, conductor, context)
 
     # ── Summary ───────────────────────────────────────────────────────
     print(f"\n{'=' * 60}")

@@ -197,7 +197,7 @@ def generate_learning(
             if n_real > 1:
                 shifted = list(seq[1:])
                 n_masked_prefix = seq_len - n_real
-                target_ids = [vocab] * (n_masked_prefix + 1) + shifted[: seq_len - n_masked_prefix - 1]
+                target_ids = [vocab] * n_masked_prefix + shifted[: seq_len - n_masked_prefix]
                 while len(target_ids) < seq_len:
                     target_ids.append(vocab)
                 target_ids[-1] = vocab

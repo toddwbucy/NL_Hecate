@@ -44,13 +44,14 @@ def run_chat(
     mode_label = "stateless (full history)" if stateless else "stateful (CMS memory)"
     if learn:
         mode_label += " + learning"
-    print(f"\n{'\u2500' * 60}")
-    print(f"  NL-Hecate Chat")
+    separator = "\u2500" * 60
+    print(f"\n{separator}")
+    print("  NL-Hecate Chat")
     print(f"  Mode: {mode_label}")
     print(f"  temp={temperature}, top_k={top_k}, max_tokens={max_tokens}")
-    print(f"{'\u2500' * 60}")
+    print(separator)
     print("  Commands: /quit  /clear  /mode  /stats")
-    print(f"{'\u2500' * 60}\n")
+    print(f"{separator}\n")
 
     while True:
         try:
@@ -87,9 +88,9 @@ def run_chat(
             print(f"  Mode: {mode_label}")
             print(f"  History: {len(history_tokens)} tokens, {turn_count} turns")
             if not stateless:
-                print(f"  CMS: memory persists across turns (constant prompt size)")
+                print("  CMS: memory persists across turns (constant prompt size)")
             else:
-                print(f"  No memory: full history re-sent each turn")
+                print("  No memory: full history re-sent each turn")
             print()
             continue
 

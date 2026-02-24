@@ -76,35 +76,48 @@ class BuildConfig:
         self._validate()
 
     def _validate(self):
-        assert self.d_model > 0, "d_model must be positive"
-        assert self.num_heads > 0, "num_heads must be positive"
-        assert self.d_model % self.num_heads == 0, \
-            f"d_model ({self.d_model}) must be divisible by num_heads ({self.num_heads})"
-        assert self.seq_len > 0, "seq_len must be positive"
-        assert self.window_size > 0, "window_size must be positive"
-        assert self.k >= 1, "k must be >= 1"
-        assert self.optimizer in ("sgd", "adamw", "adamw_gpu"), \
-            f"optimizer must be 'sgd', 'adamw', or 'adamw_gpu', got '{self.optimizer}'"
-        assert self.lr > 0, "lr must be positive"
-        assert self.max_grad_norm >= 0, "max_grad_norm must be >= 0"
+        if self.d_model <= 0:
+            raise ValueError("d_model must be positive")
+        if self.num_heads <= 0:
+            raise ValueError("num_heads must be positive")
+        if self.d_model % self.num_heads != 0:
+            raise ValueError(
+                f"d_model ({self.d_model}) must be divisible by num_heads ({self.num_heads})")
+        if self.seq_len <= 0:
+            raise ValueError("seq_len must be positive")
+        if self.window_size <= 0:
+            raise ValueError("window_size must be positive")
+        if self.k < 1:
+            raise ValueError("k must be >= 1")
+        if self.optimizer not in ("sgd", "adamw", "adamw_gpu"):
+            raise ValueError(
+                f"optimizer must be 'sgd', 'adamw', or 'adamw_gpu', got '{self.optimizer}'")
+        if self.lr <= 0:
+            raise ValueError("lr must be positive")
+        if self.max_grad_norm < 0:
+            raise ValueError("max_grad_norm must be >= 0")
         if self.chunk_sizes is None:
             self.chunk_sizes = [1] * self.k
-        assert len(self.chunk_sizes) == self.k, \
-            f"chunk_sizes length {len(self.chunk_sizes)} must match k={self.k}"
-        assert self.projection_kind in ("static", "adaptive"), \
-            f"projection_kind must be 'static' or 'adaptive', got '{self.projection_kind}'"
-        assert self.momentum_kind in ("none", "ema", "delta_momentum", "deep_momentum"), \
-            f"momentum_kind must be 'none', 'ema', 'delta_momentum', or 'deep_momentum', got '{self.momentum_kind}'"
-        assert self.self_ref_chunk_size >= 1, \
-            f"self_ref_chunk_size must be >= 1, got {self.self_ref_chunk_size}"
-        assert self.momentum_d_hidden >= 0, \
-            f"momentum_d_hidden must be >= 0, got {self.momentum_d_hidden}"
-        if self.self_generated_values:
-            assert self.projection_kind == "adaptive", \
-                "self_generated_values requires projection_kind='adaptive'"
-        if self.self_ref_chunk_size > 1:
-            assert self.projection_kind == "adaptive", \
-                "self_ref_chunk_size > 1 requires projection_kind='adaptive'"
+        if len(self.chunk_sizes) != self.k:
+            raise ValueError(
+                f"chunk_sizes length {len(self.chunk_sizes)} must match k={self.k}")
+        if self.projection_kind not in ("static", "adaptive"):
+            raise ValueError(
+                f"projection_kind must be 'static' or 'adaptive', got '{self.projection_kind}'")
+        if self.momentum_kind not in ("none", "ema", "delta_momentum", "deep_momentum"):
+            raise ValueError(
+                f"momentum_kind must be 'none', 'ema', 'delta_momentum', or 'deep_momentum', "
+                f"got '{self.momentum_kind}'")
+        if self.self_ref_chunk_size < 1:
+            raise ValueError(
+                f"self_ref_chunk_size must be >= 1, got {self.self_ref_chunk_size}")
+        if self.momentum_d_hidden < 0:
+            raise ValueError(
+                f"momentum_d_hidden must be >= 0, got {self.momentum_d_hidden}")
+        if self.self_generated_values and self.projection_kind != "adaptive":
+            raise ValueError("self_generated_values requires projection_kind='adaptive'")
+        if self.self_ref_chunk_size > 1 and self.projection_kind != "adaptive":
+            raise ValueError("self_ref_chunk_size > 1 requires projection_kind='adaptive'")
 
     @property
     def head_dim(self) -> int:
@@ -145,7 +158,11 @@ class BuildConfig:
             if meta_path.exists() and "vocab_size" not in flat:
                 with open(meta_path) as f:
                     meta = json.load(f)
-                flat["vocab_size"] = meta["vocab_size"]
+                if meta.get("vocab_size") is not None:
+                    flat["vocab_size"] = meta["vocab_size"]
+                else:
+                    raise ValueError(
+                        f"meta.json at {meta_path} missing 'vocab_size' key")
         return cls(**flat)
 
     def apply_cli(self, args: argparse.Namespace):

@@ -26,7 +26,13 @@ class BpeTokenizer:
     """BPE tokenizer loaded from a tokenizers JSON file."""
 
     def __init__(self, path: str):
-        from tokenizers import Tokenizer
+        try:
+            from tokenizers import Tokenizer
+        except ImportError as e:
+            raise ImportError(
+                "tokenizers package is required to load BPE tokenizers; "
+                "install with: pip install tokenizers"
+            ) from e
         self._tok = Tokenizer.from_file(path)
 
     def encode(self, text: str) -> list[int]:

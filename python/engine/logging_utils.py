@@ -3,6 +3,7 @@
 import json
 import os
 import resource
+import sys
 import time
 
 
@@ -11,9 +12,13 @@ def rss_mb() -> float:
     try:
         with open("/proc/self/statm") as f:
             pages = int(f.read().split()[1])  # resident pages
-        return pages * 4096 / (1024 * 1024)
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        return pages * page_size / (1024 * 1024)
     except Exception:
-        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+        ru_maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if sys.platform == "darwin":
+            return ru_maxrss / (1024 * 1024)  # bytes on macOS
+        return ru_maxrss / 1024.0  # kilobytes on Linux
 
 
 class JSONLLogger:

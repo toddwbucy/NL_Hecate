@@ -39,6 +39,8 @@ fi
 echo "Step 2: Starting build..."
 echo "------------------------------------------------------------"
 
+mkdir -p runs
+
 if $SMOKE; then
     echo "  Mode: SMOKE TEST (100 steps)"
     python3 hecate.py --build \

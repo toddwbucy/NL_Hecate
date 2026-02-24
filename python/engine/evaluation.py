@@ -72,8 +72,6 @@ def evaluate(gpu_model, bcfg, val_loader,
             if gpu_model is not None:
                 loss, _ = gpu_model.forward(input_ids, target_ids, pulse)
             else:
-                loss, _ = nl_hecate.cms_forward(
-                    None, None, input_ids, target_ids, pulse, context)
                 raise NotImplementedError("CPU byte-level eval not yet wired")
 
             if not (math.isnan(loss) or math.isinf(loss)):
@@ -207,5 +205,6 @@ def generate_samples(gpu_model, cfg, tokenizer, step: int,
             "prompt": prompt_text,
             "completion": completion,
             "gen_tokens": len(gen_tokens),
+            "step": step,
         })
     return samples

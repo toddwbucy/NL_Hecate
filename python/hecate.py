@@ -24,6 +24,7 @@ All math stays in Rust. This script is pure orchestration (CS-18).
 """
 
 import argparse
+import os
 import random
 import sys
 import time
@@ -141,6 +142,9 @@ modes:
 
 def _load_model(args):
     """Load checkpoint, tokenizer, and optionally GPU model."""
+    if not os.path.isfile(args.checkpoint):
+        print(f"Error: checkpoint not found: {args.checkpoint}", file=sys.stderr)
+        sys.exit(1)
     print(f"Loading checkpoint: {args.checkpoint}")
     params, cfg = nl_hecate.load_checkpoint(args.checkpoint)
     print(f"  Model: d={cfg.d_model}, heads={cfg.num_heads}, "

@@ -59,8 +59,9 @@ class BpeDataLoader:
         data_path = Path(data_dir)
         self.tokens = np.load(data_path / f"{split}_tokens.npy")
         self.targets = np.load(data_path / f"{split}_targets.npy")
-        assert len(self.tokens) == len(self.targets), \
-            f"tokens ({len(self.tokens)}) != targets ({len(self.targets)})"
+        if len(self.tokens) != len(self.targets):
+            raise ValueError(
+                f"{split} tokens ({len(self.tokens)}) != targets ({len(self.targets)})")
 
         with open(data_path / "meta.json") as f:
             self.meta = json.load(f)
@@ -71,7 +72,8 @@ class BpeDataLoader:
     def next_chunk(self, seq_len: int) -> tuple[list[int], list[int]] | None:
         """Get next chunk of (input_ids, target_ids).
 
-        Returns None if remaining tokens < seq_len (wraps on next call).
+        Wraps position to 0 when remaining tokens < seq_len.
+        Returns None only when total_tokens < seq_len (corpus too short).
         Masked targets (-1) are converted to vocab_size for the kernel.
         """
         if self.position + seq_len > self.total_tokens:
