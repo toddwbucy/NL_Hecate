@@ -57,6 +57,13 @@ class BuildConfig:
     memory_rule: str = "delta"
     composition: str = "mag"
 
+    # HOPE (self-referential projections)
+    projection_kind: str = "static"         # "static" or "adaptive"
+    self_generated_values: bool = False      # Phase 3 self-modifying memory
+    self_ref_chunk_size: int = 1             # chunkwise self-ref (1 = sequential)
+    momentum_kind: str = "none"             # "none", "ema", "delta_momentum", "deep_momentum"
+    momentum_d_hidden: int = 0              # momentum MLP hidden dim (0 = d*d matrix)
+
     # Build
     lr: float = 0.01
     steps: int = 500
@@ -116,6 +123,20 @@ class BuildConfig:
             self.chunk_sizes = [1] * self.k
         assert len(self.chunk_sizes) == self.k, \
             f"chunk_sizes length {len(self.chunk_sizes)} must match k={self.k}"
+        assert self.projection_kind in ("static", "adaptive"), \
+            f"projection_kind must be 'static' or 'adaptive', got '{self.projection_kind}'"
+        assert self.momentum_kind in ("none", "ema", "delta_momentum", "deep_momentum"), \
+            f"momentum_kind must be 'none', 'ema', 'delta_momentum', or 'deep_momentum', got '{self.momentum_kind}'"
+        assert self.self_ref_chunk_size >= 1, \
+            f"self_ref_chunk_size must be >= 1, got {self.self_ref_chunk_size}"
+        assert self.momentum_d_hidden >= 0, \
+            f"momentum_d_hidden must be >= 0, got {self.momentum_d_hidden}"
+        if self.self_generated_values:
+            assert self.projection_kind == "adaptive", \
+                "self_generated_values requires projection_kind='adaptive'"
+        if self.self_ref_chunk_size > 1:
+            assert self.projection_kind == "adaptive", \
+                "self_ref_chunk_size > 1 requires projection_kind='adaptive'"
 
     @property
     def head_dim(self) -> int:
@@ -173,6 +194,10 @@ class BuildConfig:
             "load": "load", "log_file": "log_file",
             "eval_every": "eval_every", "eval_max_chunks": "eval_max_chunks",
             "checkpoint_interval": "checkpoint_interval",
+            "projection_kind": "projection_kind",
+            "self_ref_chunk_size": "self_ref_chunk_size",
+            "momentum_kind": "momentum_kind",
+            "momentum_d_hidden": "momentum_d_hidden",
         }
         for cli_name, cfg_name in mapping.items():
             val = getattr(args, cli_name, None)
@@ -182,6 +207,9 @@ class BuildConfig:
                 setattr(self, cfg_name, val)
         if getattr(args, "gpu", False):
             self.gpu = True
+        # store_true with default=None: only override if explicitly passed
+        if getattr(args, "self_generated_values", None) is not None:
+            self.self_generated_values = args.self_generated_values
         self._validate()
 
 
@@ -559,6 +587,19 @@ def main():
                         help="Evaluate on val set every N steps (0 = disabled)")
     parser.add_argument("--eval_max_chunks", type=int, default=None,
                         help="Max chunks per eval pass (default: 100)")
+    parser.add_argument("--projection_kind", type=str, default=None,
+                        help="Projection kind: 'static' or 'adaptive'")
+    parser.add_argument("--self_generated_values", action="store_true", default=None,
+                        help="Enable Phase 3 self-generated values")
+    parser.add_argument("--no_self_generated_values", action="store_false",
+                        dest="self_generated_values",
+                        help="Disable Phase 3 self-generated values (overrides config)")
+    parser.add_argument("--self_ref_chunk_size", type=int, default=None,
+                        help="Chunkwise self-ref chunk size (1 = sequential)")
+    parser.add_argument("--momentum_kind", type=str, default=None,
+                        help="Momentum kind: 'none', 'ema', 'delta_momentum', 'deep_momentum'")
+    parser.add_argument("--momentum_d_hidden", type=int, default=None,
+                        help="Momentum MLP hidden dim (0 = d*d matrix)")
     args = parser.parse_args()
 
     # ── Build config: file → defaults, then CLI overrides ─────────────
@@ -660,6 +701,11 @@ def main():
         bcfg.k = cfg.k
         bcfg.chunk_sizes = list(cfg.chunk_sizes)
         bcfg.seq_len = cfg.seq_len
+        bcfg.projection_kind = cfg.projection_kind
+        bcfg.momentum_kind = cfg.momentum_kind
+        bcfg.self_generated_values = cfg.self_generated_values
+        bcfg.self_ref_chunk_size = cfg.self_ref_chunk_size
+        bcfg.momentum_d_hidden = cfg.momentum_d_hidden
         print(f"  Resuming from step {resume_step}")
         print(f"  Stream position: {build_state['stream_position']}")
     else:
@@ -676,6 +722,11 @@ def main():
             memory_rule=bcfg.memory_rule,
             composition=bcfg.composition,
             checkpoint_interval=bcfg.checkpoint_interval,
+            projection_kind=bcfg.projection_kind,
+            self_generated_values=bcfg.self_generated_values,
+            self_ref_chunk_size=bcfg.self_ref_chunk_size,
+            momentum_kind=bcfg.momentum_kind,
+            momentum_d_hidden=bcfg.momentum_d_hidden,
         )
         params = nl_hecate.mag_init_params(cfg, bcfg.seed)
 
@@ -688,6 +739,13 @@ def main():
     print(f"  CMS:      chunk_sizes={bcfg.chunk_sizes}")
     if bcfg.checkpoint_interval:
         print(f"  GradCkpt: interval={bcfg.checkpoint_interval}")
+    if bcfg.projection_kind == "adaptive":
+        print(f"  SelfRef:  projection={bcfg.projection_kind}, "
+              f"self_gen={bcfg.self_generated_values}, "
+              f"chunk_size={bcfg.self_ref_chunk_size}")
+    if bcfg.momentum_kind != "none":
+        print(f"  Momentum: kind={bcfg.momentum_kind}, "
+              f"d_hidden={bcfg.momentum_d_hidden}")
     print(f"  Params:   {params.num_params():,}")
     data_len = len(bpe_loader) if use_bpe else len(token_ids)
     print(f"  Data:     {data_len:,} tokens" +
@@ -743,6 +801,12 @@ def main():
             conductor = nl_hecate.Conductor(bcfg.k, bcfg.chunk_sizes)
             conductor.attach_stream(stream)
             context = nl_hecate.ContextState(bcfg.k, bcfg.d_model)
+
+    # Seed self-referential projection initial states from outer-loop params.
+    # Without this, adaptive projections start from zeros every sequence.
+    # Skip when resuming from checkpoint — set_memory() already restored state.
+    if bcfg.projection_kind == "adaptive" and not bcfg.load:
+        context.seed_self_ref(params)
 
     # GPU-resident model: upload params once, all math on device
     gpu_model = None
