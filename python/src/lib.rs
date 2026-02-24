@@ -273,6 +273,7 @@ impl MAGConfig {
         delta=None, m_slots=None, d_compress=None, lambda_k=None, lambda_v=None,
         retention=None, m3=None, frequency_schedule=None, checkpoint_interval=None,
         attentional_bias=None, kernel_size=0, self_ref_chunk_size=1,
+        projection_kind="static", self_generated_values=false,
     ))]
     fn new(
         d_model: usize,
@@ -304,6 +305,8 @@ impl MAGConfig {
         attentional_bias: Option<&str>,
         kernel_size: usize,
         self_ref_chunk_size: usize,
+        projection_kind: &str,
+        self_generated_values: bool,
     ) -> PyResult<Self> {
         if d_model != num_heads * head_dim {
             return Err(PyValueError::new_err(format!(
@@ -444,8 +447,14 @@ impl MAGConfig {
                 kernel_size,
                 momentum_kind: nl_hecate_core::model::MomentumKind::None,
                 momentum_d_hidden: 0,
-                projection_kind: nl_hecate_core::model::ProjectionKind::Static,
-                self_generated_values: false,
+                projection_kind: match projection_kind.to_lowercase().as_str() {
+                    "static" => nl_hecate_core::model::ProjectionKind::Static,
+                    "adaptive" => nl_hecate_core::model::ProjectionKind::Adaptive,
+                    _ => return Err(PyValueError::new_err(format!(
+                        "Unknown projection_kind '{projection_kind}'. Expected: static, adaptive"
+                    ))),
+                },
+                self_generated_values,
                 self_ref_chunk_size,
             },
         })
@@ -557,6 +566,12 @@ impl MAGParams {
             flat.extend_from_slice(&level.b_k_conv);
             flat.extend_from_slice(&level.w_q_conv);
             flat.extend_from_slice(&level.b_q_conv);
+            flat.extend_from_slice(&level.m_k_init);
+            flat.extend_from_slice(&level.m_v_init);
+            flat.extend_from_slice(&level.m_q_init);
+            flat.extend_from_slice(&level.m_eta_init);
+            flat.extend_from_slice(&level.m_alpha_init);
+            flat.extend_from_slice(&level.m_mem_init);
         }
         flat.extend_from_slice(&self.inner.alpha_mem);
         flat.extend_from_slice(&self.inner.alpha_refl);
@@ -610,6 +625,12 @@ impl MAGParams {
             copy_slice!(level.b_k_conv);
             copy_slice!(level.w_q_conv);
             copy_slice!(level.b_q_conv);
+            copy_slice!(level.m_k_init);
+            copy_slice!(level.m_v_init);
+            copy_slice!(level.m_q_init);
+            copy_slice!(level.m_eta_init);
+            copy_slice!(level.m_alpha_init);
+            copy_slice!(level.m_mem_init);
         }
         copy_slice!(self.inner.alpha_mem);
         copy_slice!(self.inner.alpha_refl);
@@ -643,6 +664,7 @@ impl MAGForwardCache {
     delta=None, m_slots=None, d_compress=None, lambda_k=None, lambda_v=None,
     retention=None, m3=None, frequency_schedule=None, checkpoint_interval=None,
     attentional_bias=None, kernel_size=0, self_ref_chunk_size=1,
+    projection_kind="static", self_generated_values=false,
 ))]
 fn mag_create_config(
     d_model: usize,
@@ -674,12 +696,15 @@ fn mag_create_config(
     attentional_bias: Option<&str>,
     kernel_size: usize,
     self_ref_chunk_size: usize,
+    projection_kind: &str,
+    self_generated_values: bool,
 ) -> PyResult<MAGConfig> {
     MAGConfig::new(
         d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled,
         k, chunk_sizes, memory_rule, composition,
         d_hidden, lp_p, sign_sharpness, lq_q, lambda_local, lambda_2, delta, m_slots, d_compress, lambda_k, lambda_v,
         retention, m3, frequency_schedule, checkpoint_interval, attentional_bias, kernel_size, self_ref_chunk_size,
+        projection_kind, self_generated_values,
     )
 }
 
@@ -1103,6 +1128,12 @@ impl ContextState {
     /// Zero all memory matrices in-place. Used at document boundaries.
     fn reset(&mut self) {
         self.inner.reset();
+    }
+
+    /// Seed self-referential state from outer-loop m_*_init parameters.
+    /// No-op when projection_kind is Static (m_*_init fields are empty).
+    fn seed_self_ref(&mut self, params: &MAGParams) {
+        self.inner.seed_self_ref(&params.inner.levels);
     }
 
     #[getter]

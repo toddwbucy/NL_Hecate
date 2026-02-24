@@ -317,6 +317,25 @@ pub struct MemoryLevelParams {
     pub w_q_conv: Vec<f32>,
     /// Conv1D query bias: [d]. Empty when kernel_size=0.
     pub b_q_conv: Vec<f32>,
+    /// Self-referential key projection memory initial state: [d*d].
+    /// Empty when ProjectionKind::Static. Seeds M_k at sequence start.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub m_k_init: Vec<f32>,
+    /// Self-referential value projection memory initial state: [d*d].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub m_v_init: Vec<f32>,
+    /// Self-referential query projection memory initial state: [d*d].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub m_q_init: Vec<f32>,
+    /// Self-referential momentum gate memory initial state: [d*d].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub m_eta_init: Vec<f32>,
+    /// Self-referential retention memory initial state: [d*d].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub m_alpha_init: Vec<f32>,
+    /// Self-referential main projection memory initial state: [d*d].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub m_mem_init: Vec<f32>,
 }
 
 impl MemoryLevelParams {
@@ -363,7 +382,7 @@ impl MemoryLevelParams {
         let w_freq = vec![];
         let b_freq = vec![];
 
-        MemoryLevelParams { w_k_mem, w_v_mem, w_q_mem, w_alpha, b_alpha, w_theta, b_theta, w_eta, b_eta, w_omega, w_freq, b_freq, w_k_conv: vec![], b_k_conv: vec![], w_q_conv: vec![], b_q_conv: vec![] }
+        MemoryLevelParams { w_k_mem, w_v_mem, w_q_mem, w_alpha, b_alpha, w_theta, b_theta, w_eta, b_eta, w_omega, w_freq, b_freq, w_k_conv: vec![], b_k_conv: vec![], w_q_conv: vec![], b_q_conv: vec![], m_k_init: vec![], m_v_init: vec![], m_q_init: vec![], m_eta_init: vec![], m_alpha_init: vec![], m_mem_init: vec![] }
     }
 
     /// Initialize with Xavier-initialized w_omega for Atlas Omega rule.
@@ -416,6 +435,12 @@ impl MemoryLevelParams {
             b_k_conv: vec![],
             w_q_conv: vec![],
             b_q_conv: vec![],
+            m_k_init: vec![],
+            m_v_init: vec![],
+            m_q_init: vec![],
+            m_eta_init: vec![],
+            m_alpha_init: vec![],
+            m_mem_init: vec![],
         }
     }
 
@@ -432,6 +457,12 @@ impl MemoryLevelParams {
             z.w_q_conv = vec![0.0f32; template.w_q_conv.len()];
             z.b_q_conv = vec![0.0f32; template.b_q_conv.len()];
         }
+        if !template.m_k_init.is_empty() { z.m_k_init = vec![0.0f32; template.m_k_init.len()]; }
+        if !template.m_v_init.is_empty() { z.m_v_init = vec![0.0f32; template.m_v_init.len()]; }
+        if !template.m_q_init.is_empty() { z.m_q_init = vec![0.0f32; template.m_q_init.len()]; }
+        if !template.m_eta_init.is_empty() { z.m_eta_init = vec![0.0f32; template.m_eta_init.len()]; }
+        if !template.m_alpha_init.is_empty() { z.m_alpha_init = vec![0.0f32; template.m_alpha_init.len()]; }
+        if !template.m_mem_init.is_empty() { z.m_mem_init = vec![0.0f32; template.m_mem_init.len()]; }
         z
     }
 
@@ -445,6 +476,8 @@ impl MemoryLevelParams {
             + self.w_freq.len() + self.b_freq.len()
             + self.w_k_conv.len() + self.b_k_conv.len()
             + self.w_q_conv.len() + self.b_q_conv.len()
+            + self.m_k_init.len() + self.m_v_init.len() + self.m_q_init.len()
+            + self.m_eta_init.len() + self.m_alpha_init.len() + self.m_mem_init.len()
     }
 
     /// Outer-loop weight update: param -= lr * grad for all projection weights.
@@ -478,6 +511,12 @@ impl MemoryLevelParams {
             step(&mut self.w_q_conv, &grads.w_q_conv, lr);
             step(&mut self.b_q_conv, &grads.b_q_conv, lr);
         }
+        if !self.m_k_init.is_empty() && !grads.m_k_init.is_empty() { debug_assert_eq!(self.m_k_init.len(), grads.m_k_init.len()); step(&mut self.m_k_init, &grads.m_k_init, lr); }
+        if !self.m_v_init.is_empty() && !grads.m_v_init.is_empty() { debug_assert_eq!(self.m_v_init.len(), grads.m_v_init.len()); step(&mut self.m_v_init, &grads.m_v_init, lr); }
+        if !self.m_q_init.is_empty() && !grads.m_q_init.is_empty() { debug_assert_eq!(self.m_q_init.len(), grads.m_q_init.len()); step(&mut self.m_q_init, &grads.m_q_init, lr); }
+        if !self.m_eta_init.is_empty() && !grads.m_eta_init.is_empty() { debug_assert_eq!(self.m_eta_init.len(), grads.m_eta_init.len()); step(&mut self.m_eta_init, &grads.m_eta_init, lr); }
+        if !self.m_alpha_init.is_empty() && !grads.m_alpha_init.is_empty() { debug_assert_eq!(self.m_alpha_init.len(), grads.m_alpha_init.len()); step(&mut self.m_alpha_init, &grads.m_alpha_init, lr); }
+        if !self.m_mem_init.is_empty() && !grads.m_mem_init.is_empty() { debug_assert_eq!(self.m_mem_init.len(), grads.m_mem_init.len()); step(&mut self.m_mem_init, &grads.m_mem_init, lr); }
     }
 
     /// Element-wise accumulate: self += other.
@@ -509,6 +548,12 @@ impl MemoryLevelParams {
             acc(&mut self.w_q_conv, &other.w_q_conv);
             acc(&mut self.b_q_conv, &other.b_q_conv);
         }
+        if !self.m_k_init.is_empty() && !other.m_k_init.is_empty() { debug_assert_eq!(self.m_k_init.len(), other.m_k_init.len()); acc(&mut self.m_k_init, &other.m_k_init); }
+        if !self.m_v_init.is_empty() && !other.m_v_init.is_empty() { debug_assert_eq!(self.m_v_init.len(), other.m_v_init.len()); acc(&mut self.m_v_init, &other.m_v_init); }
+        if !self.m_q_init.is_empty() && !other.m_q_init.is_empty() { debug_assert_eq!(self.m_q_init.len(), other.m_q_init.len()); acc(&mut self.m_q_init, &other.m_q_init); }
+        if !self.m_eta_init.is_empty() && !other.m_eta_init.is_empty() { debug_assert_eq!(self.m_eta_init.len(), other.m_eta_init.len()); acc(&mut self.m_eta_init, &other.m_eta_init); }
+        if !self.m_alpha_init.is_empty() && !other.m_alpha_init.is_empty() { debug_assert_eq!(self.m_alpha_init.len(), other.m_alpha_init.len()); acc(&mut self.m_alpha_init, &other.m_alpha_init); }
+        if !self.m_mem_init.is_empty() && !other.m_mem_init.is_empty() { debug_assert_eq!(self.m_mem_init.len(), other.m_mem_init.len()); acc(&mut self.m_mem_init, &other.m_mem_init); }
     }
 
     /// Frobenius norm across all weight matrices.
@@ -525,7 +570,9 @@ impl MemoryLevelParams {
         for v in [&self.w_alpha, &self.b_alpha, &self.w_theta, &self.b_theta,
                    &self.w_eta, &self.b_eta, &self.w_omega,
                    &self.w_freq, &self.b_freq,
-                   &self.w_k_conv, &self.b_k_conv, &self.w_q_conv, &self.b_q_conv] {
+                   &self.w_k_conv, &self.b_k_conv, &self.w_q_conv, &self.b_q_conv,
+                   &self.m_k_init, &self.m_v_init, &self.m_q_init,
+                   &self.m_eta_init, &self.m_alpha_init, &self.m_mem_init] {
             for &x in v.iter() {
                 sum += x * x;
             }
@@ -1815,6 +1862,15 @@ impl MAGParams {
                 let mut conv_rng = SimpleRng::new(seed.wrapping_add(7000 + level as u64 * 100));
                 level_params.init_conv(d, cfg.kernel_size, &mut conv_rng);
             }
+            // Initialize self-referential projection memory inits for Adaptive mode
+            if cfg.projection_kind == ProjectionKind::Adaptive {
+                level_params.m_k_init = vec![0.0f32; d * d];
+                level_params.m_v_init = vec![0.0f32; d * d];
+                level_params.m_q_init = vec![0.0f32; d * d];
+                level_params.m_eta_init = vec![0.0f32; d * d];
+                level_params.m_alpha_init = vec![0.0f32; d * d];
+                level_params.m_mem_init = vec![0.0f32; d * d];
+            }
             levels.push(level_params);
         }
 
@@ -1855,6 +1911,14 @@ impl MAGParams {
                 z.b_k_conv = vec![0.0f32; d];
                 z.w_q_conv = vec![0.0f32; d * cfg.kernel_size];
                 z.b_q_conv = vec![0.0f32; d];
+            }
+            if cfg.projection_kind == ProjectionKind::Adaptive {
+                z.m_k_init = vec![0.0f32; d * d];
+                z.m_v_init = vec![0.0f32; d * d];
+                z.m_q_init = vec![0.0f32; d * d];
+                z.m_eta_init = vec![0.0f32; d * d];
+                z.m_alpha_init = vec![0.0f32; d * d];
+                z.m_mem_init = vec![0.0f32; d * d];
             }
             z
         }).collect();
@@ -2510,5 +2574,167 @@ mod tests {
         assert_eq!(z.w_k_conv.len(), params.levels[0].w_k_conv.len());
         assert_eq!(z.b_k_conv.len(), params.levels[0].b_k_conv.len());
         assert!(z.w_k_conv.iter().all(|&x| x == 0.0));
+    }
+
+    // ── Self-referential init field tests ─────────────────────────
+
+    fn adaptive_test_config() -> MAGConfig {
+        let mut cfg = MAGConfig::test_config();
+        cfg.projection_kind = ProjectionKind::Adaptive;
+        cfg
+    }
+
+    #[test]
+    fn test_sr_init_fields_adaptive() {
+        let cfg = adaptive_test_config();
+        let d = cfg.swa.d_model;
+        let params = MAGParams::init(&cfg, 42);
+        assert_eq!(params.levels[0].m_k_init.len(), d * d);
+        assert_eq!(params.levels[0].m_v_init.len(), d * d);
+        assert_eq!(params.levels[0].m_q_init.len(), d * d);
+        assert_eq!(params.levels[0].m_eta_init.len(), d * d);
+        assert_eq!(params.levels[0].m_alpha_init.len(), d * d);
+        assert_eq!(params.levels[0].m_mem_init.len(), d * d);
+        // Static config should have empty fields
+        let static_params = MAGParams::init(&MAGConfig::test_config(), 42);
+        assert!(static_params.levels[0].m_k_init.is_empty());
+    }
+
+    #[test]
+    fn test_num_params_includes_init() {
+        let cfg = adaptive_test_config();
+        let d = cfg.swa.d_model;
+        let params = MAGParams::init(&cfg, 42);
+        let static_params = MAGParams::init(&MAGConfig::test_config(), 42);
+        // Adaptive should have 6*d*d more params per level
+        assert_eq!(params.num_params(), static_params.num_params() + 6 * d * d);
+    }
+
+    #[test]
+    fn test_checkpoint_roundtrip_init() {
+        let cfg = adaptive_test_config();
+        let mut params = MAGParams::init(&cfg, 42);
+        // Set some nonzero values
+        params.levels[0].m_k_init[0] = 1.5;
+        params.levels[0].m_mem_init[3] = -0.7;
+        let json = serde_json::to_string(&params).unwrap();
+        let back: MAGParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.levels[0].m_k_init[0], 1.5);
+        assert_eq!(back.levels[0].m_mem_init[3], -0.7);
+        assert_eq!(back.levels[0].m_k_init.len(), params.levels[0].m_k_init.len());
+    }
+
+    #[test]
+    fn test_checkpoint_file_roundtrip_adaptive() {
+        let cfg = adaptive_test_config();
+        let mut params = MAGParams::init(&cfg, 42);
+        params.levels[0].m_k_init[0] = 1.5;
+        params.levels[0].m_v_init[1] = -2.3;
+        params.levels[0].m_mem_init[3] = 0.7;
+
+        let dir = std::env::temp_dir().join("hecate_test_ckpt_adaptive");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("adaptive.json");
+        save_checkpoint(&path, &params, &cfg).unwrap();
+
+        let (loaded, loaded_cfg, _) = load_checkpoint(&path).unwrap();
+        assert_eq!(loaded.levels[0].m_k_init[0], 1.5);
+        assert_eq!(loaded.levels[0].m_v_init[1], -2.3);
+        assert_eq!(loaded.levels[0].m_mem_init[3], 0.7);
+        assert_eq!(loaded.levels[0].m_k_init.len(), cfg.swa.d_model * cfg.swa.d_model);
+        assert_eq!(loaded_cfg.projection_kind, ProjectionKind::Adaptive);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_old_checkpoint_compat() {
+        // Simulate an old checkpoint that has Adaptive-sized params but is missing
+        // the m_*_init keys entirely (as would happen with a pre-wiring checkpoint).
+        let cfg = adaptive_test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let json = serde_json::to_string(&params).unwrap();
+
+        // Parse into a mutable JSON value and strip all m_*_init keys from levels
+        let mut val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        if let Some(levels) = val.get_mut("levels").and_then(|v| v.as_array_mut()) {
+            for level in levels.iter_mut() {
+                if let Some(obj) = level.as_object_mut() {
+                    obj.remove("m_k_init");
+                    obj.remove("m_v_init");
+                    obj.remove("m_q_init");
+                    obj.remove("m_eta_init");
+                    obj.remove("m_alpha_init");
+                    obj.remove("m_mem_init");
+                }
+            }
+        }
+
+        // Deserialize the stripped JSON — #[serde(default)] should give empty vecs
+        let edited_json = serde_json::to_string(&val).unwrap();
+        let back: MAGParams = serde_json::from_str(&edited_json).unwrap();
+        assert!(back.levels[0].m_k_init.is_empty(), "m_k_init should default to empty");
+        assert!(back.levels[0].m_v_init.is_empty(), "m_v_init should default to empty");
+        assert!(back.levels[0].m_q_init.is_empty(), "m_q_init should default to empty");
+        assert!(back.levels[0].m_eta_init.is_empty(), "m_eta_init should default to empty");
+        assert!(back.levels[0].m_alpha_init.is_empty(), "m_alpha_init should default to empty");
+        assert!(back.levels[0].m_mem_init.is_empty(), "m_mem_init should default to empty");
+    }
+
+    #[test]
+    fn test_accumulate_with_init() {
+        let cfg = adaptive_test_config();
+        let grads = MAGParams::zeros_like(&cfg);
+        // Create two gradient sets
+        let mut g1 = grads.clone();
+        g1.levels[0].m_k_init[0] = 1.0;
+        g1.levels[0].m_mem_init[5] = 2.0;
+        let mut g2 = MAGParams::zeros_like(&cfg);
+        g2.levels[0].m_k_init[0] = 3.0;
+        g2.levels[0].m_mem_init[5] = 4.0;
+        // Accumulate
+        let mut acc = MAGParams::zeros_like(&cfg);
+        acc.levels[0].accumulate(&g1.levels[0]);
+        acc.levels[0].accumulate(&g2.levels[0]);
+        assert_eq!(acc.levels[0].m_k_init[0], 4.0);
+        assert_eq!(acc.levels[0].m_mem_init[5], 6.0);
+    }
+
+    #[test]
+    fn test_apply_weight_gradients_init() {
+        let cfg = adaptive_test_config();
+        let mut params = MAGParams::init(&cfg, 42);
+        params.levels[0].m_k_init[0] = 1.0;
+        params.levels[0].m_mem_init[0] = 2.0;
+        let mut grads = MAGParams::zeros_like(&cfg);
+        grads.levels[0].m_k_init[0] = 0.5;
+        grads.levels[0].m_mem_init[0] = 3.0;
+        params.levels[0].apply_weight_gradients(&grads.levels[0], 0.1);
+        // param -= lr * grad → 1.0 - 0.1 * 0.5 = 0.95
+        assert!((params.levels[0].m_k_init[0] - 0.95).abs() < 1e-7);
+        // 2.0 - 0.1 * 3.0 = 1.7
+        assert!((params.levels[0].m_mem_init[0] - 1.7).abs() < 1e-7);
+    }
+
+    #[test]
+    fn test_zeros_like_from_with_init() {
+        let cfg = adaptive_test_config();
+        let d = cfg.swa.d_model;
+        let params = MAGParams::init(&cfg, 42);
+        let z = MemoryLevelParams::zeros_like_from(&params.levels[0], d);
+        assert_eq!(z.m_k_init.len(), d * d);
+        assert_eq!(z.m_mem_init.len(), d * d);
+        assert!(z.m_k_init.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn test_norm_includes_init() {
+        let cfg = adaptive_test_config();
+        let mut p = MAGParams::zeros_like(&cfg);
+        // Zero everywhere — norm should be 0
+        assert_eq!(p.levels[0].norm(), 0.0);
+        // Set one init field — norm should be nonzero
+        p.levels[0].m_k_init[0] = 1.0;
+        assert!(p.levels[0].norm() > 0.0);
+        assert!((p.levels[0].norm() - 1.0).abs() < 1e-7);
     }
 }

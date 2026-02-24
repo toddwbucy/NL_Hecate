@@ -86,6 +86,28 @@ impl SelfRefState {
         }
     }
 
+    /// Create from outer-loop initial states. Falls back to `new(d)` if any
+    /// init has wrong length. Note: 5 fields — m_mem is separate (it's `context.memory[level]`).
+    pub fn from_init(
+        m_k_init: &[f32], m_v_init: &[f32], m_q_init: &[f32],
+        m_eta_init: &[f32], m_alpha_init: &[f32], d: usize,
+    ) -> Self {
+        let dd = d * d;
+        if m_k_init.len() != dd || m_v_init.len() != dd || m_q_init.len() != dd
+            || m_eta_init.len() != dd || m_alpha_init.len() != dd
+        {
+            return SelfRefState::new(d);
+        }
+        SelfRefState {
+            m_k: m_k_init.to_vec(),
+            m_v: m_v_init.to_vec(),
+            m_q: m_q_init.to_vec(),
+            m_eta: m_eta_init.to_vec(),
+            m_alpha: m_alpha_init.to_vec(),
+            d,
+        }
+    }
+
     /// Whether this state has allocated component memories (Adaptive mode).
     pub fn is_active(&self) -> bool {
         !self.m_k.is_empty()

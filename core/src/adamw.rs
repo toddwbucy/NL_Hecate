@@ -54,7 +54,8 @@ struct LevelState {
     /// Order: w_k_mem(0), w_v_mem(1), w_q_mem(2), w_alpha(3), b_alpha(4),
     ///        w_theta(5), b_theta(6), w_eta(7), b_eta(8), w_omega(9),
     ///        w_freq(10), b_freq(11), w_k_conv(12), b_k_conv(13),
-    ///        w_q_conv(14), b_q_conv(15).
+    ///        w_q_conv(14), b_q_conv(15), m_k_init(16), m_v_init(17),
+    ///        m_q_init(18), m_eta_init(19), m_alpha_init(20), m_mem_init(21).
     /// Zero-length fields produce zero-length MomentBufs (no cost).
     bufs: Vec<MomentBuf>,
     /// Number of times this level has actually fired (for bias correction).
@@ -152,6 +153,12 @@ impl FrequencyAwareAdamW {
                 MomentBuf::zeros(lp.b_k_conv.len()),  // 13
                 MomentBuf::zeros(lp.w_q_conv.len()),  // 14
                 MomentBuf::zeros(lp.b_q_conv.len()),  // 15
+                MomentBuf::zeros(lp.m_k_init.len()),     // 16: self-ref key projection init
+                MomentBuf::zeros(lp.m_v_init.len()),     // 17: self-ref value projection init
+                MomentBuf::zeros(lp.m_q_init.len()),     // 18: self-ref query projection init
+                MomentBuf::zeros(lp.m_eta_init.len()),   // 19: self-ref learning rate init
+                MomentBuf::zeros(lp.m_alpha_init.len()), // 20: self-ref retention init
+                MomentBuf::zeros(lp.m_mem_init.len()),   // 21: self-ref main memory init
             ],
             level_step: 0,
         }).collect();
@@ -212,6 +219,12 @@ impl FrequencyAwareAdamW {
                 for g in lg.b_k_conv.iter() { norm_sq += (*g as f64) * (*g as f64); }
                 for g in lg.w_q_conv.iter() { norm_sq += (*g as f64) * (*g as f64); }
                 for g in lg.b_q_conv.iter() { norm_sq += (*g as f64) * (*g as f64); }
+                for g in lg.m_k_init.iter() { norm_sq += (*g as f64) * (*g as f64); }
+                for g in lg.m_v_init.iter() { norm_sq += (*g as f64) * (*g as f64); }
+                for g in lg.m_q_init.iter() { norm_sq += (*g as f64) * (*g as f64); }
+                for g in lg.m_eta_init.iter() { norm_sq += (*g as f64) * (*g as f64); }
+                for g in lg.m_alpha_init.iter() { norm_sq += (*g as f64) * (*g as f64); }
+                for g in lg.m_mem_init.iter() { norm_sq += (*g as f64) * (*g as f64); }
             }
             // Agg grads
             for g in grads.alpha_mem.iter() { norm_sq += (*g as f64) * (*g as f64); }
@@ -245,6 +258,12 @@ impl FrequencyAwareAdamW {
                     for g in lg.b_k_conv.iter_mut() { *g *= scale; }
                     for g in lg.w_q_conv.iter_mut() { *g *= scale; }
                     for g in lg.b_q_conv.iter_mut() { *g *= scale; }
+                    for g in lg.m_k_init.iter_mut() { *g *= scale; }
+                    for g in lg.m_v_init.iter_mut() { *g *= scale; }
+                    for g in lg.m_q_init.iter_mut() { *g *= scale; }
+                    for g in lg.m_eta_init.iter_mut() { *g *= scale; }
+                    for g in lg.m_alpha_init.iter_mut() { *g *= scale; }
+                    for g in lg.m_mem_init.iter_mut() { *g *= scale; }
                 }
                 for g in grads.alpha_mem.iter_mut() { *g *= scale; }
                 for g in grads.alpha_refl.iter_mut() { *g *= scale; }
@@ -305,6 +324,12 @@ impl FrequencyAwareAdamW {
                 (lp.b_k_conv.as_mut_slice(), lg.b_k_conv.as_slice()), // 13
                 (lp.w_q_conv.as_mut_slice(), lg.w_q_conv.as_slice()), // 14
                 (lp.b_q_conv.as_mut_slice(), lg.b_q_conv.as_slice()), // 15
+                (lp.m_k_init.as_mut_slice(), lg.m_k_init.as_slice()),     // 16
+                (lp.m_v_init.as_mut_slice(), lg.m_v_init.as_slice()),     // 17
+                (lp.m_q_init.as_mut_slice(), lg.m_q_init.as_slice()),     // 18
+                (lp.m_eta_init.as_mut_slice(), lg.m_eta_init.as_slice()), // 19
+                (lp.m_alpha_init.as_mut_slice(), lg.m_alpha_init.as_slice()), // 20
+                (lp.m_mem_init.as_mut_slice(), lg.m_mem_init.as_slice()), // 21
             ];
             for (idx, (p, g)) in level_pairs.into_iter().enumerate() {
                 let buf = &mut ls.bufs[idx];
@@ -498,16 +523,17 @@ mod tests {
 
     #[test]
     fn test_adamw_all_level_fields() {
-        // All 16 MemoryLevelParams fields get moment buffers, step updates them.
+        // All 22 MemoryLevelParams fields get moment buffers (16 core + 6 m_*_init).
+        // For Static configs, the 6 m_*_init bufs are zero-length.
         let cfg = test_cfg_k2();
         let mut params = MAGParams::init(&cfg, 42);
         let mut grads = MAGParams::init(&cfg, 99);
         let pulse = Pulse { global_step: 0, active_levels: vec![true, true] };
         let mut opt = FrequencyAwareAdamW::new(&params, AdamWConfig::default());
 
-        // Verify 16 bufs per level
-        assert_eq!(opt.levels[0].bufs.len(), 16);
-        assert_eq!(opt.levels[1].bufs.len(), 16);
+        // Verify 22 bufs per level (16 core + 6 m_*_init)
+        assert_eq!(opt.levels[0].bufs.len(), 22);
+        assert_eq!(opt.levels[1].bufs.len(), 22);
 
         // w_eta (buf 7) should have same len as the param
         assert_eq!(opt.levels[0].bufs[7].m.len(), params.levels[0].w_eta.len());
@@ -611,6 +637,37 @@ mod tests {
     fn test_cosine_lr_peak() {
         let lr = cosine_lr(100, 100, 1000, 4e-4, 0.0);
         assert!((lr - 4e-4).abs() < 1e-8, "At warmup end: lr={lr}");
+    }
+
+    #[test]
+    fn test_adamw_covers_init_fields() {
+        // Create an Adaptive config so m_*_init fields are allocated
+        let mut cfg = test_cfg_k2();
+        cfg.projection_kind = crate::self_ref::ProjectionKind::Adaptive;
+        let d = cfg.swa.d_model;
+
+        let mut params = MAGParams::zeros_like(&cfg);
+        // Set identifiable m_k_init values
+        params.levels[0].m_k_init = vec![10.0f32; d * d];
+        params.levels[1].m_k_init = vec![10.0f32; d * d];
+
+        let mut grads = MAGParams::zeros_like(&cfg);
+        grads.levels[0].m_k_init = vec![1.0f32; d * d];
+        grads.levels[1].m_k_init = vec![1.0f32; d * d];
+
+        let pulse = Pulse {
+            global_step: 0,
+            active_levels: vec![true, true],
+        };
+        let mut opt = FrequencyAwareAdamW::new(&params, AdamWConfig::default());
+        opt.step(&mut params, &mut grads, &pulse, 1e-3, 0.0);
+
+        // m_k_init should have changed from 10.0
+        assert!(
+            (params.levels[0].m_k_init[0] - 10.0).abs() > 1e-8,
+            "m_k_init should be updated by AdamW, got {}",
+            params.levels[0].m_k_init[0]
+        );
     }
 
     #[test]

@@ -170,6 +170,24 @@ impl ContextState {
         ContextState { memory, d, self_ref }
     }
 
+    /// Seed self-referential state from outer-loop m_*_init parameters.
+    /// Copies m_k/v/q/eta/alpha_init → SelfRefState, m_mem_init → memory[level].
+    /// No-op per level when m_k_init is empty (Static mode).
+    pub fn seed_self_ref(&mut self, levels: &[MemoryLevelParams]) {
+        for (i, lp) in levels.iter().enumerate() {
+            if i >= self.self_ref.len() { break; }
+            if !lp.m_k_init.is_empty() {
+                self.self_ref[i] = SelfRefState::from_init(
+                    &lp.m_k_init, &lp.m_v_init, &lp.m_q_init,
+                    &lp.m_eta_init, &lp.m_alpha_init, self.d,
+                );
+            }
+            if !lp.m_mem_init.is_empty() && lp.m_mem_init.len() == self.memory[i].len() {
+                self.memory[i].copy_from_slice(&lp.m_mem_init);
+            }
+        }
+    }
+
     /// Zero all memory matrices in-place. Used at document boundaries
     /// to prevent stale state from leaking across unrelated documents.
     /// Does NOT reset the Conductor step counter — CMS scheduling stays global.
@@ -405,6 +423,42 @@ mod tests {
         assert_eq!(ctx.memory.len(), 2);
         assert_eq!(ctx.memory[0].len(), 16);
         assert_eq!(ctx.d, 4);
+    }
+
+    #[test]
+    fn test_seed_self_ref() {
+        let d = 4;
+        let k = 2;
+        let mut ctx = ContextState::new(k, d);
+
+        // Build MemoryLevelParams with nonzero m_*_init
+        let mut levels = vec![
+            MemoryLevelParams::zeros_like(d),
+            MemoryLevelParams::zeros_like(d),
+        ];
+        // Populate level 0 with identifiable values
+        levels[0].m_k_init = vec![1.0f32; d * d];
+        levels[0].m_v_init = vec![2.0f32; d * d];
+        levels[0].m_q_init = vec![3.0f32; d * d];
+        levels[0].m_eta_init = vec![4.0f32; d * d];
+        levels[0].m_alpha_init = vec![5.0f32; d * d];
+        levels[0].m_mem_init = vec![6.0f32; d * d];
+        // Level 1: leave empty (Static mode) — should be no-op
+
+        ctx.seed_self_ref(&levels);
+
+        // SelfRefState has 5 fields (m_k, m_v, m_q, m_eta, m_alpha)
+        assert_eq!(ctx.self_ref[0].m_k, vec![1.0f32; d * d]);
+        assert_eq!(ctx.self_ref[0].m_v, vec![2.0f32; d * d]);
+        assert_eq!(ctx.self_ref[0].m_q, vec![3.0f32; d * d]);
+        assert_eq!(ctx.self_ref[0].m_eta, vec![4.0f32; d * d]);
+        assert_eq!(ctx.self_ref[0].m_alpha, vec![5.0f32; d * d]);
+        // m_mem_init seeds context.memory[level], not SelfRefState
+        assert_eq!(ctx.memory[0], vec![6.0f32; d * d]);
+
+        // Level 1 should remain zero (empty m_k_init → no-op)
+        assert!(ctx.self_ref[1].m_k.iter().all(|&v| v == 0.0));
+        assert!(ctx.memory[1].iter().all(|&v| v == 0.0));
     }
 
     #[test]

@@ -108,6 +108,8 @@ pub fn level_params_to_flat(p: &MemoryLevelParams, out: &mut Vec<f32>) {
     out.extend_from_slice(&p.b_k_conv);
     out.extend_from_slice(&p.w_q_conv);
     out.extend_from_slice(&p.b_q_conv);
+    // m_*_init fields are NOT serialized here — they're only used in the
+    // direct MemoryLevelParams path for self-ref grads, not the opaque tape path.
 }
 
 /// Reconstruct MemoryLevelParams from a flat slice. Requires knowing d.
@@ -188,6 +190,8 @@ pub fn level_params_from_flat(flat: &[f32], d: usize, kernel_size: usize) -> Mem
         w_k_mem, w_v_mem, w_q_mem, w_alpha, b_alpha, w_theta, b_theta,
         w_eta, b_eta, w_omega, w_freq, b_freq,
         w_k_conv, b_k_conv, w_q_conv, b_q_conv,
+        m_k_init: vec![], m_v_init: vec![], m_q_init: vec![],
+        m_eta_init: vec![], m_alpha_init: vec![], m_mem_init: vec![],
     }
 }
 

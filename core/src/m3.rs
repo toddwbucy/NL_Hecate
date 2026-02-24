@@ -440,6 +440,12 @@ pub fn flatten_mag_params(params: &MAGParams) -> Vec<f32> {
         flat.extend_from_slice(&level.b_k_conv);
         flat.extend_from_slice(&level.w_q_conv);
         flat.extend_from_slice(&level.b_q_conv);
+        flat.extend_from_slice(&level.m_k_init);
+        flat.extend_from_slice(&level.m_v_init);
+        flat.extend_from_slice(&level.m_q_init);
+        flat.extend_from_slice(&level.m_eta_init);
+        flat.extend_from_slice(&level.m_alpha_init);
+        flat.extend_from_slice(&level.m_mem_init);
     }
 
     // CMS aggregation weights
@@ -496,6 +502,12 @@ pub fn unflatten_to_mag_grads(flat: &[f32], template: &MAGParams) -> MAGParams {
             b_k_conv: take(flat, &mut offset, tl.b_k_conv.len()),
             w_q_conv: take(flat, &mut offset, tl.w_q_conv.len()),
             b_q_conv: take(flat, &mut offset, tl.b_q_conv.len()),
+            m_k_init: take(flat, &mut offset, tl.m_k_init.len()),
+            m_v_init: take(flat, &mut offset, tl.m_v_init.len()),
+            m_q_init: take(flat, &mut offset, tl.m_q_init.len()),
+            m_eta_init: take(flat, &mut offset, tl.m_eta_init.len()),
+            m_alpha_init: take(flat, &mut offset, tl.m_alpha_init.len()),
+            m_mem_init: take(flat, &mut offset, tl.m_mem_init.len()),
         });
     }
 
