@@ -417,6 +417,41 @@ fn gpu_memory_backward(
                 level_grads, s, d,
             )
         }
+        // ── DGD: same structure as Delta (uses delta_backward kernels) ──
+        GpuMemoryCache::DGD { k_mem, v_mem, q_mem, alpha, theta, m_states } => {
+            let mut d_k_mem = GpuBuf::zeros(sd);
+            let mut d_v_mem = GpuBuf::zeros(sd);
+            let mut d_q_mem = GpuBuf::zeros(sd);
+            let mut d_alpha = GpuBuf::zeros(s);
+            let mut d_theta = GpuBuf::zeros(s);
+            let mut d_m_initial = GpuBuf::zeros(dd);
+
+            crate::dispatch::delta_backward_dd(
+                k_mem, v_mem, q_mem, alpha, theta,
+                m_states, d_y,
+                &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
+                &mut d_alpha, &mut d_theta, &mut d_m_initial,
+                s, d,
+            );
+
+            accumulate_projection_grads(
+                level_params, embedded,
+                &d_k_mem, &d_v_mem, &d_q_mem,
+                &d_alpha, &d_theta, None,
+                level_grads, s, d,
+            )
+        }
+        GpuMemoryCache::DGDCkpt { k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, checkpoint_interval } => {
+            let c = *checkpoint_interval;
+            let (d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta) =
+                delta_backward_checkpointed(k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, d_y, s, d, c);
+            accumulate_projection_grads(
+                level_params, embedded,
+                &d_k_mem, &d_v_mem, &d_q_mem,
+                &d_alpha, &d_theta, None,
+                level_grads, s, d,
+            )
+        }
     }
 }
 

@@ -51,7 +51,11 @@ impl MomentBuf {
 #[derive(Clone)]
 struct LevelState {
     /// Moment buffers for each parameter buffer in MemoryLevelParams.
-    /// Order: w_k_mem, w_v_mem, w_q_mem, w_alpha, b_alpha, w_theta, b_theta.
+    /// Order: w_k_mem(0), w_v_mem(1), w_q_mem(2), w_alpha(3), b_alpha(4),
+    ///        w_theta(5), b_theta(6), w_eta(7), b_eta(8), w_omega(9),
+    ///        w_freq(10), b_freq(11), w_k_conv(12), b_k_conv(13),
+    ///        w_q_conv(14), b_q_conv(15).
+    /// Zero-length fields produce zero-length MomentBufs (no cost).
     bufs: Vec<MomentBuf>,
     /// Number of times this level has actually fired (for bias correction).
     level_step: u32,
@@ -65,13 +69,25 @@ struct SwaState {
     step: u32,
 }
 
+/// Aggregation parameter optimizer state (always updates, not frequency-gated).
+/// Covers alpha_mem, alpha_refl, persistent_tokens — MAGParams-level fields
+/// that are not per-CMS-level.
+#[derive(Clone)]
+struct AggState {
+    buf_alpha_mem: MomentBuf,
+    buf_alpha_refl: MomentBuf,
+    buf_persistent: MomentBuf,
+}
+
 /// Frequency-aware AdamW: per-level state, Pulse-gated updates.
 ///
 /// SWA parameters always update. CMS level parameters only update when
-/// the Pulse indicates that level is active.
+/// the Pulse indicates that level is active. Aggregation params (alpha_mem,
+/// alpha_refl, persistent_tokens) always update alongside SWA.
 pub struct FrequencyAwareAdamW {
     pub config: AdamWConfig,
     swa: SwaState,
+    agg: AggState,
     levels: Vec<LevelState>,
 }
 
@@ -120,18 +136,33 @@ impl FrequencyAwareAdamW {
 
         let levels = params.levels.iter().map(|lp| LevelState {
             bufs: vec![
-                MomentBuf::zeros(lp.w_k_mem.len()),
-                MomentBuf::zeros(lp.w_v_mem.len()),
-                MomentBuf::zeros(lp.w_q_mem.len()),
-                MomentBuf::zeros(lp.w_alpha.len()),
-                MomentBuf::zeros(lp.b_alpha.len()),
-                MomentBuf::zeros(lp.w_theta.len()),
-                MomentBuf::zeros(lp.b_theta.len()),
+                MomentBuf::zeros(lp.w_k_mem.len()),   // 0
+                MomentBuf::zeros(lp.w_v_mem.len()),   // 1
+                MomentBuf::zeros(lp.w_q_mem.len()),   // 2
+                MomentBuf::zeros(lp.w_alpha.len()),   // 3
+                MomentBuf::zeros(lp.b_alpha.len()),   // 4
+                MomentBuf::zeros(lp.w_theta.len()),   // 5
+                MomentBuf::zeros(lp.b_theta.len()),   // 6
+                MomentBuf::zeros(lp.w_eta.len()),     // 7
+                MomentBuf::zeros(lp.b_eta.len()),     // 8
+                MomentBuf::zeros(lp.w_omega.len()),   // 9
+                MomentBuf::zeros(lp.w_freq.len()),    // 10
+                MomentBuf::zeros(lp.b_freq.len()),    // 11
+                MomentBuf::zeros(lp.w_k_conv.len()),  // 12
+                MomentBuf::zeros(lp.b_k_conv.len()),  // 13
+                MomentBuf::zeros(lp.w_q_conv.len()),  // 14
+                MomentBuf::zeros(lp.b_q_conv.len()),  // 15
             ],
             level_step: 0,
         }).collect();
 
-        FrequencyAwareAdamW { config, swa, levels }
+        let agg = AggState {
+            buf_alpha_mem: MomentBuf::zeros(params.alpha_mem.len()),
+            buf_alpha_refl: MomentBuf::zeros(params.alpha_refl.len()),
+            buf_persistent: MomentBuf::zeros(params.persistent_tokens.len()),
+        };
+
+        FrequencyAwareAdamW { config, swa, agg, levels }
     }
 
     /// Frequency-gated AdamW step. SWA params always update; CMS levels
@@ -139,13 +170,87 @@ impl FrequencyAwareAdamW {
     ///
     /// `grads` contains the gradient for the current step (or accumulated
     /// gradient from the error buffer for frozen levels that just fired).
+    ///
+    /// `max_grad_norm`: if > 0, clips the global gradient L2 norm before
+    /// applying updates (matching gpu_adamw_update behavior).
+    ///
+    /// Returns the pre-clip gradient L2 norm (0.0 if clipping is disabled).
     pub fn step(
         &mut self,
         params: &mut crate::model::MAGParams,
-        grads: &crate::model::MAGParams,
+        grads: &mut crate::model::MAGParams,
         pulse: &Pulse,
         lr: f32,
-    ) {
+        max_grad_norm: f32,
+    ) -> f32 {
+        // ── Global gradient norm clipping ───────────────────────────────
+        let mut grad_norm_out: f32 = 0.0;
+        if max_grad_norm > 0.0 {
+            let mut norm_sq: f64 = 0.0;
+            // SWA grads
+            for g in grads.swa.w_embed.iter() { norm_sq += (*g as f64) * (*g as f64); }
+            for g in grads.swa.w_q.iter() { norm_sq += (*g as f64) * (*g as f64); }
+            for g in grads.swa.w_k.iter() { norm_sq += (*g as f64) * (*g as f64); }
+            for g in grads.swa.w_v.iter() { norm_sq += (*g as f64) * (*g as f64); }
+            for g in grads.swa.w_o.iter() { norm_sq += (*g as f64) * (*g as f64); }
+            for g in grads.swa.w_unembed.iter() { norm_sq += (*g as f64) * (*g as f64); }
+            // Level grads
+            for lg in grads.levels.iter() {
+                for g in lg.w_k_mem.master().iter() { norm_sq += (*g as f64) * (*g as f64); }
+                for g in lg.w_v_mem.master().iter() { norm_sq += (*g as f64) * (*g as f64); }
+                for g in lg.w_q_mem.master().iter() { norm_sq += (*g as f64) * (*g as f64); }
+                for g in lg.w_alpha.iter() { norm_sq += (*g as f64) * (*g as f64); }
+                for g in lg.b_alpha.iter() { norm_sq += (*g as f64) * (*g as f64); }
+                for g in lg.w_theta.iter() { norm_sq += (*g as f64) * (*g as f64); }
+                for g in lg.b_theta.iter() { norm_sq += (*g as f64) * (*g as f64); }
+                for g in lg.w_eta.iter() { norm_sq += (*g as f64) * (*g as f64); }
+                for g in lg.b_eta.iter() { norm_sq += (*g as f64) * (*g as f64); }
+                for g in lg.w_omega.iter() { norm_sq += (*g as f64) * (*g as f64); }
+                for g in lg.w_freq.iter() { norm_sq += (*g as f64) * (*g as f64); }
+                for g in lg.b_freq.iter() { norm_sq += (*g as f64) * (*g as f64); }
+                for g in lg.w_k_conv.iter() { norm_sq += (*g as f64) * (*g as f64); }
+                for g in lg.b_k_conv.iter() { norm_sq += (*g as f64) * (*g as f64); }
+                for g in lg.w_q_conv.iter() { norm_sq += (*g as f64) * (*g as f64); }
+                for g in lg.b_q_conv.iter() { norm_sq += (*g as f64) * (*g as f64); }
+            }
+            // Agg grads
+            for g in grads.alpha_mem.iter() { norm_sq += (*g as f64) * (*g as f64); }
+            for g in grads.alpha_refl.iter() { norm_sq += (*g as f64) * (*g as f64); }
+            for g in grads.persistent_tokens.iter() { norm_sq += (*g as f64) * (*g as f64); }
+
+            let norm = norm_sq.sqrt() as f32;
+            grad_norm_out = norm;
+            if norm > max_grad_norm {
+                let scale = max_grad_norm / norm;
+                for g in grads.swa.w_embed.iter_mut() { *g *= scale; }
+                for g in grads.swa.w_q.iter_mut() { *g *= scale; }
+                for g in grads.swa.w_k.iter_mut() { *g *= scale; }
+                for g in grads.swa.w_v.iter_mut() { *g *= scale; }
+                for g in grads.swa.w_o.iter_mut() { *g *= scale; }
+                for g in grads.swa.w_unembed.iter_mut() { *g *= scale; }
+                for lg in grads.levels.iter_mut() {
+                    for g in lg.w_k_mem.master_mut().iter_mut() { *g *= scale; }
+                    for g in lg.w_v_mem.master_mut().iter_mut() { *g *= scale; }
+                    for g in lg.w_q_mem.master_mut().iter_mut() { *g *= scale; }
+                    for g in lg.w_alpha.iter_mut() { *g *= scale; }
+                    for g in lg.b_alpha.iter_mut() { *g *= scale; }
+                    for g in lg.w_theta.iter_mut() { *g *= scale; }
+                    for g in lg.b_theta.iter_mut() { *g *= scale; }
+                    for g in lg.w_eta.iter_mut() { *g *= scale; }
+                    for g in lg.b_eta.iter_mut() { *g *= scale; }
+                    for g in lg.w_omega.iter_mut() { *g *= scale; }
+                    for g in lg.w_freq.iter_mut() { *g *= scale; }
+                    for g in lg.b_freq.iter_mut() { *g *= scale; }
+                    for g in lg.w_k_conv.iter_mut() { *g *= scale; }
+                    for g in lg.b_k_conv.iter_mut() { *g *= scale; }
+                    for g in lg.w_q_conv.iter_mut() { *g *= scale; }
+                    for g in lg.b_q_conv.iter_mut() { *g *= scale; }
+                }
+                for g in grads.alpha_mem.iter_mut() { *g *= scale; }
+                for g in grads.alpha_refl.iter_mut() { *g *= scale; }
+                for g in grads.persistent_tokens.iter_mut() { *g *= scale; }
+            }
+        }
         let c = &self.config;
 
         // ── SWA params (always active) ────────────────────────────────
@@ -184,13 +289,22 @@ impl FrequencyAwareAdamW {
             let lg = &grads.levels[level];
 
             let level_pairs: Vec<(&mut [f32], &[f32])> = vec![
-                (lp.w_k_mem.master_mut(), lg.w_k_mem.master()),
-                (lp.w_v_mem.master_mut(), lg.w_v_mem.master()),
-                (lp.w_q_mem.master_mut(), lg.w_q_mem.master()),
-                (lp.w_alpha.as_mut_slice(), lg.w_alpha.as_slice()),
-                (lp.b_alpha.as_mut_slice(), lg.b_alpha.as_slice()),
-                (lp.w_theta.as_mut_slice(), lg.w_theta.as_slice()),
-                (lp.b_theta.as_mut_slice(), lg.b_theta.as_slice()),
+                (lp.w_k_mem.master_mut(), lg.w_k_mem.master()),   // 0
+                (lp.w_v_mem.master_mut(), lg.w_v_mem.master()),   // 1
+                (lp.w_q_mem.master_mut(), lg.w_q_mem.master()),   // 2
+                (lp.w_alpha.as_mut_slice(), lg.w_alpha.as_slice()),   // 3
+                (lp.b_alpha.as_mut_slice(), lg.b_alpha.as_slice()),   // 4
+                (lp.w_theta.as_mut_slice(), lg.w_theta.as_slice()),   // 5
+                (lp.b_theta.as_mut_slice(), lg.b_theta.as_slice()),   // 6
+                (lp.w_eta.as_mut_slice(), lg.w_eta.as_slice()),       // 7
+                (lp.b_eta.as_mut_slice(), lg.b_eta.as_slice()),       // 8
+                (lp.w_omega.as_mut_slice(), lg.w_omega.as_slice()),   // 9
+                (lp.w_freq.as_mut_slice(), lg.w_freq.as_slice()),     // 10
+                (lp.b_freq.as_mut_slice(), lg.b_freq.as_slice()),     // 11
+                (lp.w_k_conv.as_mut_slice(), lg.w_k_conv.as_slice()), // 12
+                (lp.b_k_conv.as_mut_slice(), lg.b_k_conv.as_slice()), // 13
+                (lp.w_q_conv.as_mut_slice(), lg.w_q_conv.as_slice()), // 14
+                (lp.b_q_conv.as_mut_slice(), lg.b_q_conv.as_slice()), // 15
             ];
             for (idx, (p, g)) in level_pairs.into_iter().enumerate() {
                 let buf = &mut ls.bufs[idx];
@@ -204,9 +318,29 @@ impl FrequencyAwareAdamW {
         }
 
         // ── CMS aggregation weights (always active, like SWA) ─────────
-        for (a, &da) in params.alpha_mem.iter_mut().zip(grads.alpha_mem.iter()) {
-            *a -= lr * da;
+        // Uses SWA's step counter and bias correction (both always fire).
+        {
+            let agg = &mut self.agg;
+            let ab = &mut agg.buf_alpha_mem;
+            adamw_step_buf(params.alpha_mem.as_mut_slice(), grads.alpha_mem.as_slice(),
+                           &mut ab.m, &mut ab.v, lr, c.beta1, c.beta2, c.eps,
+                           bc1_inv, bc2_inv, c.weight_decay);
+            let ar = &mut agg.buf_alpha_refl;
+            adamw_step_buf(params.alpha_refl.as_mut_slice(), grads.alpha_refl.as_slice(),
+                           &mut ar.m, &mut ar.v, lr, c.beta1, c.beta2, c.eps,
+                           bc1_inv, bc2_inv, c.weight_decay);
+            let pt = &mut agg.buf_persistent;
+            adamw_step_buf(params.persistent_tokens.as_mut_slice(), grads.persistent_tokens.as_slice(),
+                           &mut pt.m, &mut pt.v, lr, c.beta1, c.beta2, c.eps,
+                           bc1_inv, bc2_inv, c.weight_decay);
         }
+
+        grad_norm_out
+    }
+
+    /// Number of CMS levels in the optimizer.
+    pub fn level_count(&self) -> usize {
+        self.levels.len()
     }
 
     /// Get the level-local step count for a CMS level.
@@ -247,7 +381,7 @@ mod tests {
     fn test_adamw_step_basic() {
         let cfg = test_cfg_k2();
         let mut params = MAGParams::init(&cfg, 42);
-        let grads = MAGParams::init(&cfg, 99); // nonzero "gradients"
+        let mut grads = MAGParams::init(&cfg, 99); // nonzero "gradients"
         let pulse = Pulse {
             global_step: 0,
             active_levels: vec![true, true],
@@ -255,7 +389,7 @@ mod tests {
         let mut opt = FrequencyAwareAdamW::new(&params, AdamWConfig::default());
 
         let w0_before = params.swa.w_embed[0];
-        opt.step(&mut params, &grads, &pulse, 1e-3);
+        opt.step(&mut params, &mut grads, &pulse, 1e-3, 0.0);
         let w0_after = params.swa.w_embed[0];
 
         assert!((w0_after - w0_before).abs() > 1e-10,
@@ -269,7 +403,7 @@ mod tests {
     fn test_adamw_frozen_level_no_update() {
         let cfg = test_cfg_k2();
         let mut params = MAGParams::init(&cfg, 42);
-        let grads = MAGParams::init(&cfg, 99);
+        let mut grads = MAGParams::init(&cfg, 99);
 
         // Only Level 0 active, Level 1 frozen
         let pulse = Pulse {
@@ -279,7 +413,7 @@ mod tests {
         let mut opt = FrequencyAwareAdamW::new(&params, AdamWConfig::default());
 
         let l1_w_before = params.levels[1].w_k_mem.clone();
-        opt.step(&mut params, &grads, &pulse, 1e-3);
+        opt.step(&mut params, &mut grads, &pulse, 1e-3, 0.0);
 
         assert_eq!(opt.level_step(0), 1, "Active level should increment");
         assert_eq!(opt.level_step(1), 0, "Frozen level should NOT increment");
@@ -293,14 +427,14 @@ mod tests {
         // for bias correction, not the global step.
         let cfg = test_cfg_k2();
         let mut params = MAGParams::init(&cfg, 42);
-        let grads = MAGParams::init(&cfg, 99);
+        let mut grads = MAGParams::init(&cfg, 99);
         let mut conductor = Conductor::new(2, vec![1, 8]);
         let mut opt = FrequencyAwareAdamW::new(&params, AdamWConfig::default());
 
         // Run 16 global steps
         for _ in 0..16 {
             let pulse = conductor.pulse();
-            opt.step(&mut params, &grads, &pulse, 1e-3);
+            opt.step(&mut params, &mut grads, &pulse, 1e-3, 0.0);
             conductor.advance();
         }
 
@@ -330,7 +464,7 @@ mod tests {
 
         let initial = params.swa.w_embed[0];
         for _ in 0..100 {
-            opt.step(&mut params, &grads, &pulse, 1e-2);
+            opt.step(&mut params, &mut grads, &pulse, 1e-2, 0.0);
         }
         let final_val = params.swa.w_embed[0];
 
@@ -344,7 +478,7 @@ mod tests {
         // Even with all levels frozen, SWA params must update
         let cfg = test_cfg_k2();
         let mut params = MAGParams::init(&cfg, 42);
-        let grads = MAGParams::init(&cfg, 99);
+        let mut grads = MAGParams::init(&cfg, 99);
         let pulse = Pulse {
             global_step: 0,
             active_levels: vec![false, false],
@@ -352,12 +486,116 @@ mod tests {
         let mut opt = FrequencyAwareAdamW::new(&params, AdamWConfig::default());
 
         let before = params.swa.w_embed[0];
-        opt.step(&mut params, &grads, &pulse, 1e-3);
+        opt.step(&mut params, &mut grads, &pulse, 1e-3, 0.0);
         let after = params.swa.w_embed[0];
 
         assert!((after - before).abs() > 1e-10,
             "SWA should update even when all CMS levels are frozen");
         assert_eq!(opt.swa_step(), 1);
+    }
+
+    // ── New field coverage tests ────────────────────────────────────
+
+    #[test]
+    fn test_adamw_all_level_fields() {
+        // All 16 MemoryLevelParams fields get moment buffers, step updates them.
+        let cfg = test_cfg_k2();
+        let mut params = MAGParams::init(&cfg, 42);
+        let mut grads = MAGParams::init(&cfg, 99);
+        let pulse = Pulse { global_step: 0, active_levels: vec![true, true] };
+        let mut opt = FrequencyAwareAdamW::new(&params, AdamWConfig::default());
+
+        // Verify 16 bufs per level
+        assert_eq!(opt.levels[0].bufs.len(), 16);
+        assert_eq!(opt.levels[1].bufs.len(), 16);
+
+        // w_eta (buf 7) should have same len as the param
+        assert_eq!(opt.levels[0].bufs[7].m.len(), params.levels[0].w_eta.len());
+
+        let eta_before = params.levels[0].w_eta[0];
+        opt.step(&mut params, &mut grads, &pulse, 1e-3, 0.0);
+        let eta_after = params.levels[0].w_eta[0];
+        assert!((eta_after - eta_before).abs() > 1e-10,
+            "w_eta should change after step (was {eta_before}, now {eta_after})");
+
+        // w_omega (buf 9) — large buffer (d * 2*d = 8 * 16 = 128)
+        assert_eq!(opt.levels[0].bufs[9].m.len(), params.levels[0].w_omega.len());
+    }
+
+    #[test]
+    fn test_adamw_alpha_mem_moments() {
+        // alpha_mem now uses AdamW (not plain SGD), moment buffers nonzero after step.
+        let cfg = test_cfg_k2();
+        let mut params = MAGParams::init(&cfg, 42);
+        let mut grads = MAGParams::zeros_like(&cfg);
+        grads.alpha_mem[0] = 1.0;
+        let pulse = Pulse { global_step: 0, active_levels: vec![true, true] };
+        let mut opt = FrequencyAwareAdamW::new(&params, AdamWConfig::default());
+
+        let before = params.alpha_mem[0];
+        opt.step(&mut params, &mut grads, &pulse, 1e-2, 0.0);
+        let after = params.alpha_mem[0];
+
+        assert!((after - before).abs() > 1e-10,
+            "alpha_mem should change under AdamW: {before} → {after}");
+        // Moment buffers should be nonzero
+        assert!(opt.agg.buf_alpha_mem.m[0].abs() > 1e-10,
+            "alpha_mem first moment should be nonzero: {}", opt.agg.buf_alpha_mem.m[0]);
+    }
+
+    #[test]
+    fn test_adamw_persistent_tokens() {
+        // persistent_tokens covered by AdamW moments (empty for default config → no crash)
+        let cfg = test_cfg_k2();
+        let mut params = MAGParams::init(&cfg, 42);
+        let mut grads = MAGParams::init(&cfg, 99);
+        let pulse = Pulse { global_step: 0, active_levels: vec![true, true] };
+        let mut opt = FrequencyAwareAdamW::new(&params, AdamWConfig::default());
+
+        // Default config: n_persistent=0 → persistent_tokens is empty
+        assert_eq!(opt.agg.buf_persistent.m.len(), 0);
+
+        // Step should not crash on empty persistent_tokens
+        opt.step(&mut params, &mut grads, &pulse, 1e-3, 0.0);
+    }
+
+    #[test]
+    fn test_adamw_zero_len_fields_noop() {
+        // Fields with len=0 (w_freq, w_k_conv, etc. in default config) don't crash.
+        let cfg = test_cfg_k2();
+        let mut params = MAGParams::init(&cfg, 42);
+        let mut grads = MAGParams::init(&cfg, 99);
+        let pulse = Pulse { global_step: 0, active_levels: vec![true, true] };
+        let mut opt = FrequencyAwareAdamW::new(&params, AdamWConfig::default());
+
+        // w_freq (buf 10) should be empty for Fixed schedule
+        assert_eq!(opt.levels[0].bufs[10].m.len(), 0, "w_freq should be empty");
+        // w_k_conv (buf 12) should be empty for kernel_size=0
+        assert_eq!(opt.levels[0].bufs[12].m.len(), 0, "w_k_conv should be empty");
+
+        // Multiple steps should work fine with zero-length fields
+        for _ in 0..10 {
+            opt.step(&mut params, &mut grads, &pulse, 1e-3, 0.0);
+        }
+        assert_eq!(opt.swa_step(), 10);
+    }
+
+    #[test]
+    fn test_adamw_grad_clip() {
+        let cfg = test_cfg_k2();
+        let mut params = MAGParams::init(&cfg, 42);
+        let mut grads = MAGParams::zeros_like(&cfg);
+        grads.swa.w_embed[0] = 1000.0; // extreme gradient
+        let pulse = Pulse { global_step: 0, active_levels: vec![true, true] };
+        let mut opt = FrequencyAwareAdamW::new(&params, AdamWConfig::default());
+
+        opt.step(&mut params, &mut grads, &pulse, 1e-3, 1.0); // max_grad_norm=1.0
+
+        // Gradient should have been clipped: norm was ~1000, clipped to 1.0
+        assert!(grads.swa.w_embed[0] < 2.0,
+            "gradient should have been clipped, got {}", grads.swa.w_embed[0]);
+        assert!(grads.swa.w_embed[0] > 0.0,
+            "gradient should still be positive after clipping");
     }
 
     // ── cosine_lr tests ──────────────────────────────────────────────

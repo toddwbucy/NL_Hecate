@@ -185,45 +185,6 @@ class BuildConfig:
         self._validate()
 
 
-# ── AdamW optimizer (Python-side, operates on flat weight arrays) ────
-
-class AdamW:
-    """Decoupled weight decay optimizer (Loshchilov & Hutter, 2019).
-
-    Maintains first/second moment estimates per parameter. Works on flat
-    weight arrays from MAGParams.get_weights() / set_weights().
-    """
-
-    def __init__(self, num_params: int, lr: float = 4e-4,
-                 beta1: float = 0.9, beta2: float = 0.999,
-                 eps: float = 1e-8, weight_decay: float = 0.1):
-        self.lr = lr
-        self.beta1 = beta1
-        self.beta2 = beta2
-        self.eps = eps
-        self.weight_decay = weight_decay
-        self.m = [0.0] * num_params  # first moment
-        self.v = [0.0] * num_params  # second moment
-        self.t = 0  # step counter for bias correction
-
-    def step(self, params: list[float], grads: list[float], lr: float) -> list[float]:
-        """One AdamW update. Returns updated params."""
-        self.t += 1
-        b1, b2, eps, wd = self.beta1, self.beta2, self.eps, self.weight_decay
-        bc1 = 1.0 - b1 ** self.t
-        bc2 = 1.0 - b2 ** self.t
-
-        for i in range(len(params)):
-            g = grads[i]
-            self.m[i] = b1 * self.m[i] + (1 - b1) * g
-            self.v[i] = b2 * self.v[i] + (1 - b2) * g * g
-            m_hat = self.m[i] / bc1
-            v_hat = self.v[i] / bc2
-            # AdamW: decoupled weight decay applied to param directly
-            params[i] -= lr * (m_hat / (math.sqrt(v_hat) + eps) + wd * params[i])
-        return params
-
-
 def cosine_lr(step: int, warmup_steps: int, total_steps: int, lr_peak: float,
               lr_min: float = 0.0) -> float:
     """Cosine annealing with linear warmup."""
@@ -232,20 +193,6 @@ def cosine_lr(step: int, warmup_steps: int, total_steps: int, lr_peak: float,
     progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
     progress = min(progress, 1.0)
     return lr_min + 0.5 * (lr_peak - lr_min) * (1 + math.cos(math.pi * progress))
-
-
-def grad_norm(grads: list[float]) -> float:
-    """Compute L2 norm of gradient vector."""
-    return math.sqrt(sum(g * g for g in grads))
-
-
-def clip_grad_norm(grads: list[float], max_norm: float) -> tuple[list[float], float]:
-    """Clip gradient vector to max L2 norm. Returns (clipped_grads, original_norm)."""
-    norm = grad_norm(grads)
-    if norm > max_norm > 0:
-        scale = max_norm / norm
-        return [g * scale for g in grads], norm
-    return grads, norm
 
 
 # ── Byte-level tokenizer ────────────────────────────────────────────
@@ -814,9 +761,9 @@ def main():
     adamw_opt = None
     use_adamw_gpu = (bcfg.optimizer == "adamw_gpu")
     if bcfg.optimizer == "adamw":
-        adamw_opt = AdamW(
-            num_params=params.num_params(), lr=bcfg.lr,
-            beta1=bcfg.beta1, beta2=bcfg.beta2, weight_decay=bcfg.weight_decay,
+        adamw_opt = nl_hecate.FrequencyAwareAdamW(
+            params, beta1=bcfg.beta1, beta2=bcfg.beta2,
+            weight_decay=bcfg.weight_decay,
         )
 
     # Structured logger
@@ -906,39 +853,30 @@ def main():
             # GPU path with SGD: forward + backward + update in one call
             loss = gpu_model.step(input_ids, target_ids, pulse, current_lr)
         elif gpu_model is not None and adamw_opt is not None:
-            # Hybrid GPU+AdamW: GPU forward+backward, Python optimizer
+            # Hybrid GPU+AdamW: GPU forward+backward, Rust frequency-aware optimizer
             loss, grad_params = gpu_model.backward_only(input_ids, target_ids, pulse)
-            p_flat = params.get_flat_weights()
-            g_flat = grad_params.get_flat_weights()
-            if bcfg.max_grad_norm > 0:
-                g_flat, g_norm = clip_grad_norm(g_flat, bcfg.max_grad_norm)
-            else:
-                g_norm = grad_norm(g_flat)
-            p_flat = adamw_opt.step(p_flat, g_flat, current_lr)
-            params.set_flat_weights(p_flat)
-            # Weight tying: sync w_unembed^T → w_embed (same as SGD path)
+            g_norm = adamw_opt.step(params, grad_params, pulse, current_lr,
+                                    max_grad_norm=bcfg.max_grad_norm)
+            # Weight tying: sync w_unembed^T → w_embed
             nl_hecate.mag_apply_weight_gradients(params, grad_params, 0.0)
             gpu_model.upload_params(params)
-            error_buffers.apply_for_active(params, pulse, current_lr)
+            # Note: error_buffers not used in GPU backward path;
+            # FrequencyAwareAdamW handles pulse-gating internally.
         else:
             # CPU path: tape-based forward + backward (single call)
             loss, grads = nl_hecate.cms_compute_gradients(
                 params, cfg, input_ids, target_ids, pulse, context,
                 error_buffers)
             if adamw_opt:
-                p_flat = params.get_flat_weights()
-                g_flat = grads.get_flat_weights()
-                if bcfg.max_grad_norm > 0:
-                    g_flat, g_norm = clip_grad_norm(g_flat, bcfg.max_grad_norm)
-                else:
-                    g_norm = grad_norm(g_flat)
-                p_flat = adamw_opt.step(p_flat, g_flat, current_lr)
-                params.set_flat_weights(p_flat)
+                g_norm = adamw_opt.step(params, grads, pulse, current_lr,
+                                        max_grad_norm=bcfg.max_grad_norm)
                 # Weight tying: sync w_unembed^T → w_embed
                 nl_hecate.mag_apply_weight_gradients(params, grads, 0.0)
+                # FrequencyAwareAdamW handles pulse-gating internally;
+                # skip error_buffers (mirrors GPU hybrid path).
             else:
                 nl_hecate.mag_apply_weight_gradients(params, grads, current_lr)
-            error_buffers.apply_for_active(params, pulse, current_lr)
+                error_buffers.apply_for_active(params, pulse, current_lr)
 
         # NaN/Inf guard
         if math.isnan(loss) or math.isinf(loss):
