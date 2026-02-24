@@ -41,7 +41,7 @@ echo "------------------------------------------------------------"
 
 if $SMOKE; then
     echo "  Mode: SMOKE TEST (100 steps)"
-    python3 build.py \
+    python3 hecate.py --build \
         --config configs/sharegpt_32k.json \
         --steps 100 \
         --log_every 10 \
@@ -52,14 +52,14 @@ if $SMOKE; then
         --log_file runs/sharegpt_smoke.jsonl
 elif [ -n "$STEPS" ]; then
     echo "  Mode: CUSTOM ($STEPS steps)"
-    python3 build.py \
+    python3 hecate.py --build \
         --config configs/sharegpt_32k.json \
         --steps "$STEPS" \
         --gpu \
         --log_file runs/sharegpt_32k.jsonl
 else
     echo "  Mode: FULL (100K steps)"
-    nohup python3 -u build.py \
+    nohup python3 -u hecate.py --build \
         --config configs/sharegpt_32k.json \
         --gpu \
         --log_file runs/sharegpt_32k.jsonl \
