@@ -327,7 +327,7 @@ pub struct MemoryLevelParams {
     /// Self-referential query projection memory initial state: [d*d].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub m_q_init: Vec<f32>,
-    /// Self-referential learning rate memory initial state: [d*d].
+    /// Self-referential momentum gate memory initial state: [d*d].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub m_eta_init: Vec<f32>,
     /// Self-referential retention memory initial state: [d*d].
@@ -2625,6 +2625,28 @@ mod tests {
     }
 
     #[test]
+    fn test_checkpoint_file_roundtrip_adaptive() {
+        let cfg = adaptive_test_config();
+        let mut params = MAGParams::init(&cfg, 42);
+        params.levels[0].m_k_init[0] = 1.5;
+        params.levels[0].m_v_init[1] = -2.3;
+        params.levels[0].m_mem_init[3] = 0.7;
+
+        let dir = std::env::temp_dir().join("hecate_test_ckpt_adaptive");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("adaptive.json");
+        save_checkpoint(&path, &params, &cfg).unwrap();
+
+        let (loaded, loaded_cfg, _) = load_checkpoint(&path).unwrap();
+        assert_eq!(loaded.levels[0].m_k_init[0], 1.5);
+        assert_eq!(loaded.levels[0].m_v_init[1], -2.3);
+        assert_eq!(loaded.levels[0].m_mem_init[3], 0.7);
+        assert_eq!(loaded.levels[0].m_k_init.len(), cfg.swa.d_model * cfg.swa.d_model);
+        assert_eq!(loaded_cfg.projection_kind, ProjectionKind::Adaptive);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn test_old_checkpoint_compat() {
         // Simulate an old checkpoint that has Adaptive-sized params but is missing
         // the m_*_init keys entirely (as would happen with a pre-wiring checkpoint).
@@ -2682,11 +2704,15 @@ mod tests {
         let cfg = adaptive_test_config();
         let mut params = MAGParams::init(&cfg, 42);
         params.levels[0].m_k_init[0] = 1.0;
+        params.levels[0].m_mem_init[0] = 2.0;
         let mut grads = MAGParams::zeros_like(&cfg);
         grads.levels[0].m_k_init[0] = 0.5;
+        grads.levels[0].m_mem_init[0] = 3.0;
         params.levels[0].apply_weight_gradients(&grads.levels[0], 0.1);
         // param -= lr * grad → 1.0 - 0.1 * 0.5 = 0.95
         assert!((params.levels[0].m_k_init[0] - 0.95).abs() < 1e-7);
+        // 2.0 - 0.1 * 3.0 = 1.7
+        assert!((params.levels[0].m_mem_init[0] - 1.7).abs() < 1e-7);
     }
 
     #[test]
