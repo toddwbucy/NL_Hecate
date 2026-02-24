@@ -274,6 +274,7 @@ impl MAGConfig {
         retention=None, m3=None, frequency_schedule=None, checkpoint_interval=None,
         attentional_bias=None, kernel_size=0, self_ref_chunk_size=1,
         projection_kind="static", self_generated_values=false,
+        momentum_kind="none", momentum_d_hidden=0,
     ))]
     fn new(
         d_model: usize,
@@ -307,6 +308,8 @@ impl MAGConfig {
         self_ref_chunk_size: usize,
         projection_kind: &str,
         self_generated_values: bool,
+        momentum_kind: &str,
+        momentum_d_hidden: usize,
     ) -> PyResult<Self> {
         if d_model != num_heads * head_dim {
             return Err(PyValueError::new_err(format!(
@@ -445,8 +448,16 @@ impl MAGConfig {
                 n_persistent: 0,
                 attentional_bias: bias_kind,
                 kernel_size,
-                momentum_kind: nl_hecate_core::model::MomentumKind::None,
-                momentum_d_hidden: 0,
+                momentum_kind: match momentum_kind.to_lowercase().as_str() {
+                    "none" => nl_hecate_core::model::MomentumKind::None,
+                    "ema" => nl_hecate_core::model::MomentumKind::EMA,
+                    "delta_momentum" => nl_hecate_core::model::MomentumKind::DeltaMomentum,
+                    "deep_momentum" => nl_hecate_core::model::MomentumKind::DeepMomentum,
+                    _ => return Err(PyValueError::new_err(format!(
+                        "Unknown momentum_kind '{momentum_kind}'. Expected: none, ema, delta_momentum, deep_momentum"
+                    ))),
+                },
+                momentum_d_hidden,
                 projection_kind: match projection_kind.to_lowercase().as_str() {
                     "static" => nl_hecate_core::model::ProjectionKind::Static,
                     "adaptive" => nl_hecate_core::model::ProjectionKind::Adaptive,
@@ -500,6 +511,28 @@ impl MAGConfig {
     fn k(&self) -> usize { self.inner.k }
     #[getter]
     fn chunk_sizes(&self) -> Vec<usize> { self.inner.chunk_sizes.clone() }
+    #[getter]
+    fn projection_kind(&self) -> &str {
+        match self.inner.projection_kind {
+            nl_hecate_core::model::ProjectionKind::Static => "static",
+            nl_hecate_core::model::ProjectionKind::Adaptive => "adaptive",
+        }
+    }
+    #[getter]
+    fn momentum_kind(&self) -> &str {
+        match self.inner.momentum_kind {
+            nl_hecate_core::model::MomentumKind::None => "none",
+            nl_hecate_core::model::MomentumKind::EMA => "ema",
+            nl_hecate_core::model::MomentumKind::DeltaMomentum => "delta_momentum",
+            nl_hecate_core::model::MomentumKind::DeepMomentum => "deep_momentum",
+        }
+    }
+    #[getter]
+    fn self_generated_values(&self) -> bool { self.inner.self_generated_values }
+    #[getter]
+    fn self_ref_chunk_size(&self) -> usize { self.inner.self_ref_chunk_size }
+    #[getter]
+    fn momentum_d_hidden(&self) -> usize { self.inner.momentum_d_hidden }
 }
 
 // ── MAGParams ──────────────────────────────────────────────────────
@@ -665,6 +698,7 @@ impl MAGForwardCache {
     retention=None, m3=None, frequency_schedule=None, checkpoint_interval=None,
     attentional_bias=None, kernel_size=0, self_ref_chunk_size=1,
     projection_kind="static", self_generated_values=false,
+    momentum_kind="none", momentum_d_hidden=0,
 ))]
 fn mag_create_config(
     d_model: usize,
@@ -698,13 +732,15 @@ fn mag_create_config(
     self_ref_chunk_size: usize,
     projection_kind: &str,
     self_generated_values: bool,
+    momentum_kind: &str,
+    momentum_d_hidden: usize,
 ) -> PyResult<MAGConfig> {
     MAGConfig::new(
         d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled,
         k, chunk_sizes, memory_rule, composition,
         d_hidden, lp_p, sign_sharpness, lq_q, lambda_local, lambda_2, delta, m_slots, d_compress, lambda_k, lambda_v,
         retention, m3, frequency_schedule, checkpoint_interval, attentional_bias, kernel_size, self_ref_chunk_size,
-        projection_kind, self_generated_values,
+        projection_kind, self_generated_values, momentum_kind, momentum_d_hidden,
     )
 }
 

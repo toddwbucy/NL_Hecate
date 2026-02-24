@@ -203,6 +203,8 @@ def generate(
         owns_conductor = True
         if context is None:
             context = nl_hecate.ContextState(cfg.k, cfg.d_model)
+            if params is not None and getattr(cfg, 'projection_kind', 'static') == 'adaptive':
+                context.seed_self_ref(params)
 
     for _ in range(max_tokens):
         # Take last seq_len tokens as context window
@@ -316,6 +318,8 @@ def run_chat(
         )
         if gpu_model is None:
             context = nl_hecate.ContextState(cfg.k, cfg.d_model)
+            if params is not None and getattr(cfg, 'projection_kind', 'static') == 'adaptive':
+                context.seed_self_ref(params)
 
     mode_label = "stateless (full history)" if stateless else "stateful (CMS memory)"
     print(f"\n{'─' * 60}")
@@ -353,6 +357,8 @@ def run_chat(
                 )
                 if gpu_model is None:
                     context = nl_hecate.ContextState(cfg.k, cfg.d_model)
+                    if params is not None and getattr(cfg, 'projection_kind', 'static') == 'adaptive':
+                        context.seed_self_ref(params)
             print("  [conversation cleared]\n")
             continue
 
