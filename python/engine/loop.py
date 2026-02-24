@@ -420,7 +420,9 @@ def run_build(bcfg: BuildConfig):
                 print(f"    [fires] {fires_str}")
                 level_fire_counts = [0] * bcfg.k
             if gpu_model is not None:
+                coherence_ctx = gpu_model.to_host_context()
                 try:
+                    gpu_model.reset_context()
                     samples = eval_coherence_samples(gpu_model, cfg, max_tokens=30,
                                                      tokenizer=tokenizer)
                     for prompt, completion in samples:
@@ -428,6 +430,8 @@ def run_build(bcfg: BuildConfig):
                         print(f"    \"{prompt}\" \u2192 \"{safe}\"")
                 except Exception as e:
                     print(f"    [coherence sample failed: {e}]")
+                finally:
+                    gpu_model.upload_context(coherence_ctx)
             if jsonl:
                 jsonl.log(event="eval", step=step, eval_loss=eval_loss,
                           eval_ppl=eval_ppl, eval_chunks=bcfg.eval_max_chunks)
@@ -497,11 +501,13 @@ def run_build(bcfg: BuildConfig):
                     else:
                         v_params, v_cfg, _ = nl_hecate.load_build_checkpoint(ckpt_path)
                     v_model = nl_hecate.GpuModel.from_params(v_params, v_cfg)
-                    v_ctx = gpu_model.to_host_context()
-                    v_model.upload_context(v_ctx)
+                    # Save context before verification forward passes
+                    rt_ctx = gpu_model.to_host_context()
+                    v_model.upload_context(rt_ctx)
                     train_fwd, _ = gpu_model.forward(input_ids, target_ids, pulse)
                     verify_fwd, _ = v_model.forward(input_ids, target_ids, pulse)
-                    gpu_model.upload_context(v_ctx)
+                    # Restore context after verification (forward modifies M)
+                    gpu_model.upload_context(rt_ctx)
                     delta = abs(verify_fwd - train_fwd)
                     if jsonl:
                         jsonl.log(event="checkpoint_roundtrip", step=step,
@@ -518,7 +524,9 @@ def run_build(bcfg: BuildConfig):
                     print(f"  [checkpoint roundtrip failed: {e}]")
 
             if tokenizer is not None and gpu_model is not None:
+                sample_ctx = gpu_model.to_host_context()
                 try:
+                    gpu_model.reset_context()
                     samples = generate_samples(gpu_model, cfg, tokenizer, step)
                     for s in samples:
                         preview = s["completion"][:80].replace("\n", " ")
@@ -527,6 +535,8 @@ def run_build(bcfg: BuildConfig):
                         jsonl.log(event="sample", step=step, samples=samples)
                 except Exception as e:
                     print(f"  [sample generation failed: {e}]")
+                finally:
+                    gpu_model.upload_context(sample_ctx)
 
     t_end = time.perf_counter()
     elapsed = t_end - t_start

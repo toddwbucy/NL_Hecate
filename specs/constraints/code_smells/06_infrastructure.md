@@ -1,4 +1,4 @@
-# Infrastructure Code Smells (CS-39 through CS-48)
+# Infrastructure Code Smells (CS-39 through CS-49)
 
 ```
 CONTRACT
@@ -15,7 +15,8 @@ CONTRACT
   Trade-off:  Some GPU optimization techniques (checkpointing, DDP) are off-limits.
   Position:   specs/constraints/code_smells/06_infrastructure.md
   Source:     Track A experience; nl_code_smells CS-39 through CS-47;
-              committee review cycle (CS-48)
+              committee review cycle (CS-48);
+              FineWeb-Edu k=4 NaN crash (CS-49)
 ```
 
 ## CS-39: Learnable Decay Parameters Must Be Clamped [CRITICAL]
@@ -217,4 +218,51 @@ FIX:   Each CMS level gets its own retention parameters.
        independently by its own gradient stream.
 SEVERITY: Warning — silent performance degradation, not crash
 TRACE: Committee review cycle; frequency scheduler error buffer analysis
+```
+
+## CS-49: Generation Through Training Model Corrupts Context [CRITICAL]
+
+```
+SMELL: samples = generate(gpu_model, prompt, max_tokens=30)
+       // autoregressive generation through the live training model
+       // without saving and restoring M matrix context
+WHY:   Every forward() call mutates the CMS context (M matrices) — this
+       is by design (memory updates ARE the forward pass). Autoregressive
+       generation runs N forward calls (one per generated token), each
+       modifying M. If this happens through the training model without
+       context isolation, the training M state is overwritten with
+       generation artifacts.
+
+       In NL, this is uniquely dangerous because:
+       - M matrices are inner-loop state that accumulates across the
+         entire build — they represent learned episodic memory
+       - Generation injects random/sampled tokens into M, corrupting
+         the carefully accumulated state
+       - With k=4 (four CMS levels), four M matrices are trashed
+         simultaneously — NaN propagation is near-certain
+       - The corruption is SILENT: no error is raised, training
+         continues on garbage state until NaN appears steps later
+
+       This was discovered when k=4 FineWeb-Edu crashed at step 5001:
+       the eval block ran coherence samples and checkpoint sample
+       generation through the training gpu_model, destroying context.
+       The subsequent roundtrip verification ran forward() on trashed
+       M and produced NaN.
+
+FIX:   ALWAYS bracket generation calls with context save/restore:
+       ctx = gpu_model.to_host_context()
+       try:
+           gpu_model.reset_context()  // clean M for generation
+           samples = generate(gpu_model, ...)
+       finally:
+           gpu_model.upload_context(ctx)  // restore training M
+
+       This applies to ANY operation that runs forward() outside the
+       training loop: eval coherence samples, checkpoint sample
+       generation, interactive probes, curriculum phase probes.
+       The Python tier owns this invariant — the Rust tier correctly
+       mutates M on every forward() as designed (CS-18).
+SEVERITY: CRITICAL — silent context corruption → NaN within steps
+TRACE: FineWeb-Edu k=4 NaN crash at step 5001; gpu_forward.rs copy_final_m;
+       engine/loop.py eval/checkpoint block
 ```
