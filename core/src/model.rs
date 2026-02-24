@@ -457,14 +457,12 @@ impl MemoryLevelParams {
             z.w_q_conv = vec![0.0f32; template.w_q_conv.len()];
             z.b_q_conv = vec![0.0f32; template.b_q_conv.len()];
         }
-        if !template.m_k_init.is_empty() {
-            z.m_k_init = vec![0.0f32; template.m_k_init.len()];
-            z.m_v_init = vec![0.0f32; template.m_v_init.len()];
-            z.m_q_init = vec![0.0f32; template.m_q_init.len()];
-            z.m_eta_init = vec![0.0f32; template.m_eta_init.len()];
-            z.m_alpha_init = vec![0.0f32; template.m_alpha_init.len()];
-            z.m_mem_init = vec![0.0f32; template.m_mem_init.len()];
-        }
+        if !template.m_k_init.is_empty() { z.m_k_init = vec![0.0f32; template.m_k_init.len()]; }
+        if !template.m_v_init.is_empty() { z.m_v_init = vec![0.0f32; template.m_v_init.len()]; }
+        if !template.m_q_init.is_empty() { z.m_q_init = vec![0.0f32; template.m_q_init.len()]; }
+        if !template.m_eta_init.is_empty() { z.m_eta_init = vec![0.0f32; template.m_eta_init.len()]; }
+        if !template.m_alpha_init.is_empty() { z.m_alpha_init = vec![0.0f32; template.m_alpha_init.len()]; }
+        if !template.m_mem_init.is_empty() { z.m_mem_init = vec![0.0f32; template.m_mem_init.len()]; }
         z
     }
 

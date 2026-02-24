@@ -54,7 +54,8 @@ struct LevelState {
     /// Order: w_k_mem(0), w_v_mem(1), w_q_mem(2), w_alpha(3), b_alpha(4),
     ///        w_theta(5), b_theta(6), w_eta(7), b_eta(8), w_omega(9),
     ///        w_freq(10), b_freq(11), w_k_conv(12), b_k_conv(13),
-    ///        w_q_conv(14), b_q_conv(15).
+    ///        w_q_conv(14), b_q_conv(15), m_k_init(16), m_v_init(17),
+    ///        m_q_init(18), m_eta_init(19), m_alpha_init(20), m_mem_init(21).
     /// Zero-length fields produce zero-length MomentBufs (no cost).
     bufs: Vec<MomentBuf>,
     /// Number of times this level has actually fired (for bias correction).
