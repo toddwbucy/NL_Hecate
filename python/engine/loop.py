@@ -167,14 +167,17 @@ def run_build(bcfg: BuildConfig):
     print(f"  Data:     {data_len:,} tokens" +
           (f" (ShareGPT BPE, {bcfg.data_format})" if use_bpe else ""))
     use_gpu = bcfg.gpu and hasattr(nl_hecate, "GpuModel")
+    # Auto-promote adamw → adamw_gpu when on GPU (no reason to round-trip to CPU)
+    if use_gpu and bcfg.optimizer == "adamw":
+        bcfg.optimizer = "adamw_gpu"
     if bcfg.optimizer == "adamw_gpu" and not use_gpu:
         raise RuntimeError(
-            "optimizer=adamw_gpu requires --gpu and a CUDA-enabled build"
+            "optimizer=adamw_gpu requires GPU and a CUDA-enabled build"
         )
     if bcfg.load and use_gpu:
         raise RuntimeError(
             "GPU resume with context restore is not yet implemented. "
-            "Use CPU resume (--gpu omitted) or start a fresh GPU build."
+            "Use CPU resume (--cpu) or start a fresh GPU build."
         )
     print(f"  Build:    {bcfg.steps} steps (from step {resume_step}), lr={bcfg.lr}")
     print(f"  Optimizer: {bcfg.optimizer}" +

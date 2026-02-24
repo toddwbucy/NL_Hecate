@@ -51,20 +51,17 @@ if $SMOKE; then
         --eval_every 50 \
         --eval_max_chunks 5 \
         --save_every 50 \
-        --gpu \
         --log_file runs/sharegpt_smoke.jsonl
 elif [ -n "$STEPS" ]; then
     echo "  Mode: CUSTOM ($STEPS steps)"
     python3 hecate.py --build \
         --config configs/sharegpt_32k.json \
         --steps "$STEPS" \
-        --gpu \
         --log_file runs/sharegpt_32k.jsonl
 else
     echo "  Mode: FULL (100K steps)"
     nohup python3 -u hecate.py --build \
         --config configs/sharegpt_32k.json \
-        --gpu \
         --log_file runs/sharegpt_32k.jsonl \
         > runs/sharegpt_32k.log 2>&1 &
     PID=$!

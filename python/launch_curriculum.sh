@@ -49,13 +49,11 @@ if $SMOKE; then
         --eval_every 50 \
         --eval_max_chunks 5 \
         --save_every 50 \
-        --gpu \
         --log_file runs/curriculum_smoke.jsonl
 else
     echo "  Mode: FULL (100K steps on GPU1)"
     CUDA_VISIBLE_DEVICES=1 nohup python3 -u hecate.py --build \
         --config configs/curriculum_100k.json \
-        --gpu \
         --log_file runs/curriculum_100k.jsonl \
         > runs/curriculum_100k.log 2>&1 &
     PID=$!

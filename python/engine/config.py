@@ -63,7 +63,7 @@ class BuildConfig:
     checkpoint_interval: int | None = None  # None = full trajectory; C = store M every C steps
 
     # Runtime
-    gpu: bool = False
+    gpu: bool = True  # GPU by default; --cpu to override
     load: str | None = None
     log_file: str | None = None
 
@@ -193,8 +193,11 @@ class BuildConfig:
                 if cli_name == "chunk_sizes" and isinstance(val, str):
                     val = [int(x) for x in val.split(",") if x]
                 setattr(self, cfg_name, val)
-        if getattr(args, "gpu", False):
-            self.gpu = True
+        # --cpu overrides the default GPU mode
+        if getattr(args, "cpu", False):
+            self.gpu = False
+        elif getattr(args, "gpu", False):
+            self.gpu = True  # backward compat: --gpu still works
         # store_true with default=None: only override if explicitly passed
         if getattr(args, "self_generated_values", None) is not None:
             self.self_generated_values = args.self_generated_values

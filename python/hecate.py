@@ -6,19 +6,22 @@ No train/eval distinction (CS-10). The only difference is where
 tokens come from: data pipeline (--build) or keyboard (--chat/--prompt).
 
 Usage:
-    # Build (stream data from files)
-    python hecate.py --build --config configs/hope_60m.json --gpu
-    python hecate.py --build --config configs/hope_60m.json --load checkpoints/model_step5000.json --gpu
+    # Build (stream data from files — GPU by default)
+    python hecate.py --build --config configs/hope_60m.json
+    python hecate.py --build --config configs/hope_60m.json --load checkpoints/model_step5000.json
 
     # Chat (interactive, with optional learning)
-    python hecate.py --chat --checkpoint checkpoints/model.json --gpu
-    python hecate.py --chat --checkpoint checkpoints/model.json --gpu --learn --lr 0.0006
+    python hecate.py --chat --checkpoint checkpoints/model.json
+    python hecate.py --chat --checkpoint checkpoints/model.json --learn --lr 0.0006
 
     # One-shot generation
-    python hecate.py --prompt "Once upon a time" --checkpoint checkpoints/model.json --gpu
+    python hecate.py --prompt "Once upon a time" --checkpoint checkpoints/model.json
 
     # Raw REPL
-    python hecate.py --interactive --checkpoint checkpoints/model.json --gpu
+    python hecate.py --interactive --checkpoint checkpoints/model.json
+
+    # Force CPU (when GPU is available but you want CPU anyway)
+    python hecate.py --build --config configs/hope_60m.json --cpu
 
 All math stays in Rust. This script is pure orchestration (CS-18).
 """
@@ -132,8 +135,10 @@ modes:
 
     # ── Runtime ────────────────────────────────────────────────────────
     rt = parser.add_argument_group("runtime")
+    rt.add_argument("--cpu", action="store_true",
+                    help="Force CPU mode (default: GPU when available)")
     rt.add_argument("--gpu", action="store_true",
-                    help="Use GPU-resident model")
+                    help="(deprecated, now the default) Use GPU-resident model")
     rt.add_argument("--seed", type=int, default=None,
                     help="Random seed for reproducible generation")
 
@@ -157,7 +162,8 @@ def _load_model(args):
     print(f"  Tokenizer: {tok_type}")
 
     gpu_model = None
-    if args.gpu and hasattr(nl_hecate, "GpuModel"):
+    use_gpu = not args.cpu and hasattr(nl_hecate, "GpuModel")
+    if use_gpu:
         gpu_model = nl_hecate.GpuModel.from_params(params, cfg)
         print("  Device: GPU")
     else:
