@@ -127,6 +127,10 @@ class BuildConfig:
             f"projection_kind must be 'static' or 'adaptive', got '{self.projection_kind}'"
         assert self.momentum_kind in ("none", "ema", "delta_momentum", "deep_momentum"), \
             f"momentum_kind must be 'none', 'ema', 'delta_momentum', or 'deep_momentum', got '{self.momentum_kind}'"
+        assert self.self_ref_chunk_size >= 1, \
+            f"self_ref_chunk_size must be >= 1, got {self.self_ref_chunk_size}"
+        assert self.momentum_d_hidden >= 0, \
+            f"momentum_d_hidden must be >= 0, got {self.momentum_d_hidden}"
         if self.self_generated_values:
             assert self.projection_kind == "adaptive", \
                 "self_generated_values requires projection_kind='adaptive'"
@@ -792,7 +796,8 @@ def main():
 
     # Seed self-referential projection initial states from outer-loop params.
     # Without this, adaptive projections start from zeros every sequence.
-    if bcfg.projection_kind == "adaptive":
+    # Skip when resuming from checkpoint — set_memory() already restored state.
+    if bcfg.projection_kind == "adaptive" and not bcfg.load:
         context.seed_self_ref(params)
 
     # GPU-resident model: upload params once, all math on device
