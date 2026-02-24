@@ -121,6 +121,9 @@ class BuildConfig:
         if self.data_format not in ("byte", "sharegpt"):
             raise ValueError(
                 f"data_format must be 'byte' or 'sharegpt', got '{self.data_format}'")
+        if self.checkpoint_interval is not None and self.checkpoint_interval < 1:
+            raise ValueError(
+                f"checkpoint_interval must be >= 1 or None, got {self.checkpoint_interval}")
 
     @property
     def head_dim(self) -> int:

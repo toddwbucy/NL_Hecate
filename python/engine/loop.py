@@ -403,14 +403,16 @@ def run_build(bcfg: BuildConfig):
         if (bcfg.eval_every > 0 and val_loader is not None
                 and step > 0 and step % bcfg.eval_every == 0):
             saved_ctx = None
-            if gpu_model is not None:
-                saved_ctx = gpu_model.to_host_context()
-                gpu_model.reset_context()
-            eval_loss, eval_ppl = evaluate(
-                gpu_model, bcfg, val_loader, bcfg.eval_max_chunks,
-                val_doc_starts=val_doc_starts)
-            if gpu_model is not None and saved_ctx is not None:
-                gpu_model.upload_context(saved_ctx)
+            try:
+                if gpu_model is not None:
+                    saved_ctx = gpu_model.to_host_context()
+                    gpu_model.reset_context()
+                eval_loss, eval_ppl = evaluate(
+                    gpu_model, bcfg, val_loader, bcfg.eval_max_chunks,
+                    val_doc_starts=val_doc_starts)
+            finally:
+                if gpu_model is not None and saved_ctx is not None:
+                    gpu_model.upload_context(saved_ctx)
             print(f"  [eval] step {step:5d}  loss={eval_loss:.4f}  ppl={eval_ppl:.1f}")
             if gpu_model is not None and hasattr(gpu_model, "gate_biases"):
                 print_level_metrics(gpu_model, bcfg.k)

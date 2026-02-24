@@ -107,6 +107,8 @@ def evaluate_numpy(gpu_model, bcfg, tokens_np, targets_np,
     function uses whatever context is currently on the model.
     Returns (avg_loss, perplexity).
     """
+    if gpu_model is None:
+        raise ValueError("evaluate_numpy requires a non-None gpu_model")
     conductor = nl_hecate.Conductor(bcfg.k, bcfg.chunk_sizes)
     total_loss = 0.0
     n_chunks = 0

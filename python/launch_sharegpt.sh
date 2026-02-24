@@ -14,7 +14,7 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --smoke) SMOKE=true; shift ;;
         --steps=*) STEPS="${1#*=}"; shift ;;
-        --steps) STEPS="$2"; shift 2 ;;
+        --steps) STEPS="${2:?--steps requires a value}"; shift 2 ;;
         *) shift ;;
     esac
 done
