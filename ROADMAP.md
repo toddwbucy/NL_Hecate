@@ -433,7 +433,7 @@ Phase 2 of the HOPE architecture: all 6 memories (M_k, M_v, M_q, M_eta, M_alpha,
 - Wired into `run_level_memory()` dispatch for MAG/MAC/MAL
 - `MemoryCache::SelfRef` variant for backward dispatch
 - 19 tests (smoke, static-identical, FD gradient checks, read-only backward)
-- **PR 4 (pending)**: Wire `SelfRefParamGrads` into `apply_weight_gradients()`, checkpoint/restore, PyO3 binding
+- **PR 4 (PR #119, merged)**: Wire `SelfRefParamGrads` into outer-loop optimizer — 6 `m_*_init` fields on `MemoryLevelParams`, `SelfRefState::from_init()`, `ContextState::seed_self_ref()`, 4 backward sites wired, AdamW bufs 16→22, PyO3 flat weight serialization, checkpoint roundtrip. 1085 tests.
 
 **GAP-M: Self-generated values (PR #116)** — Delivered:
 - Phase 3 of HOPE architecture: each of 6 memories generates its own DGD target via `v̂_□ = M_{□,t-1}(v_t)` (HOPE Eq 84-85)
@@ -922,12 +922,12 @@ Complete mapping between ROADMAP milestones and HADES Persephone tasks. Use this
 | Stage 4 Phase 1: Pipeline Scaffolding | 8 | 27 Python + 120 tape/traced/class3 Rust + 1 forget gate probe | COMPLETE |
 | Stage 4 Phase 2: HOPE Build & Serve | 6 milestones (M9–M14) | — | BLOCKED ON S3b-Critical |
 
-**Current position**: S0–S3 complete. S3b specs complete (all 20 written, `v0.4.0` in HADES `hecate_specs`). **S3b-Critical implementation in progress**: DGD extracted as standalone primitive (PR #113), DGD CUDA kernel pair (PR #114), self-referential projections forward+backward (PR #115), self-generated values with DGD key fix (PR #116), chunkwise self-referential training (PR #117). **S4 Phase 1 pipeline fully delivered** (M1–M8 all complete): can build a model on real text data and serve it locally using pre-S3b primitives. S4-M7 (primitive validation tooling) delivered via PR #112 — Forget Gate Probe, curriculum pipeline, validation harness, tape profiling all in place. Wengert tape is the production gradient path (M8, PRs #55–65). HADES `hope_blockers`: 2 resolved (k and f_i), 2 deferred (brain transplant only).
+**Current position**: S0–S3 complete. S3b specs complete (all 20 written, `v0.4.0` in HADES `hecate_specs`). **S3b-Critical implementation in progress**: DGD extracted as standalone primitive (PR #113), DGD CUDA kernel pair (PR #114), self-referential projections forward+backward (PR #115), self-generated values with DGD key fix (PR #116), chunkwise self-referential training (PR #117), frequency-aware AdamW outer-loop optimizer (PR #118), SelfRefParamGrads outer-loop wiring (PR #119). **S4 Phase 1 pipeline fully delivered** (M1–M8 all complete): can build a model on real text data and serve it locally using pre-S3b primitives. S4-M7 (primitive validation tooling) delivered via PR #112 — Forget Gate Probe, curriculum pipeline, validation harness, tape profiling all in place. Wengert tape is the production gradient path (M8, PRs #55–65). HADES `hope_blockers`: 2 resolved (k and f_i), 2 deferred (brain transplant only).
 
-**Active fronts** (updated 2026-02-23):
-1. **S3b-Critical** (IN PROGRESS): DGD (S3b-M1) COMPLETE (PR #113). DGD CUDA (S3b-M5) COMPLETE (PR #114). Self-referential projections (GAP-L) COMPLETE (PR #115). Self-generated values + DGD key fix (GAP-M) COMPLETE (PR #116). Chunkwise self-referential training (GAP-N) COMPLETE (PR #117). Next: GAP-E (feature maps), then GAP-L PR 4 (wire SelfRefParamGrads into outer-loop). AdamW (S3b-S16) and Short Conv (S3b-S19) can run in parallel. HOPE composition (S3b-S20) blocked on S3b-M3 completion.
+**Active fronts** (updated 2026-02-24):
+1. **S3b-Critical** (IN PROGRESS): DGD (S3b-M1) COMPLETE (PR #113). DGD CUDA (S3b-M5) COMPLETE (PR #114). Self-referential projections (GAP-L) COMPLETE (PR #115). Self-generated values + DGD key fix (GAP-M) COMPLETE (PR #116). Chunkwise self-referential training (GAP-N) COMPLETE (PR #117). SelfRefParamGrads outer-loop wiring (GAP-O) COMPLETE (PR #119). Frequency-aware AdamW (S3b-S16) COMPLETE (PR #118). Next: GAP-E (feature maps), Short Conv (S3b-S19), HOPE composition (S3b-S20). HOPE build loop (task_30e20a) ready to begin.
 2. **S4 Validation Run**: Run `curriculum_100k.json` end-to-end using the tooling delivered by S4-M7 (PR #112). Validate hard thresholds. This can run in parallel with S3b implementation.
 3. **S4 Phase 2** (blocked on S3b-Critical): the real HOPE build — DGD inner-loop + self-referential projections + AdamW outer-loop — cannot begin until S3b-Critical is complete.
 4. **S3b-Deferred / Stage 5** (post-HOPE): MIRAS design-space completeness. Retention variants, bias variants, DMGD, FTRL, Implicit GD, NS inner, AdaMuon.
 
-Total test count: 1068 Rust + 27 Python = **1095 tests** (42 PRs merged; full `cargo test`).
+Total test count: 1085 Rust + 27 Python = **1112 tests** (43 PRs merged; full `cargo test`).
