@@ -25,12 +25,12 @@ def evaluate(gpu_model, bcfg, val_loader,
              max_chunks: int, val_doc_starts=None) -> tuple[float, float]:
     """Run forward-only on val set. Returns (avg_loss, perplexity).
 
-    Uses a fresh Conductor + ContextState so eval doesn't corrupt
-    training memory. Same forward path as training — no mode flag (CS-10).
+    Uses a fresh Conductor so eval doesn't corrupt training pulse state.
+    Context is managed by the caller (gpu_model.reset_context() / upload_context()).
+    Same forward path as training — no mode flag (CS-10).
     Document boundary resets apply if val_doc_starts is provided.
     """
     conductor = nl_hecate.Conductor(bcfg.k, bcfg.chunk_sizes)
-    context = nl_hecate.ContextState(bcfg.k, bcfg.d_model)
 
     total_loss = 0.0
     n_chunks = 0
@@ -156,10 +156,13 @@ def eval_coherence_samples(gpu_model, cfg, max_tokens: int = 30,
                            tokenizer=None):
     """Generate short completions from fixed prompts to eyeball coherence.
 
+    Requires gpu_model (generate routes to KV-cached path with params=None).
     Uses greedy decoding (temperature=0) for deterministic output.
     If tokenizer is provided (e.g. BpeTokenizer), uses it; otherwise
     falls back to ByteTokenizer for byte-level models.
     """
+    if gpu_model is None:
+        raise ValueError("eval_coherence_samples requires a non-None gpu_model")
     from engine.generation import generate
     from engine.tokenizer import ByteTokenizer
     tok = tokenizer if tokenizer is not None else ByteTokenizer()

@@ -45,7 +45,10 @@ class BpeTokenizer:
 def load_tokenizer(tokenizer_path: str | None = None,
                    data_dir: str | None = None) -> ByteTokenizer | BpeTokenizer:
     """Load the appropriate tokenizer. BPE if path provided, else byte-level."""
-    if tokenizer_path and os.path.exists(tokenizer_path):
+    if tokenizer_path:
+        if not os.path.exists(tokenizer_path):
+            raise FileNotFoundError(
+                f"Tokenizer file not found: {tokenizer_path}")
         return BpeTokenizer(tokenizer_path)
     if data_dir:
         bpe_path = Path(data_dir) / "tokenizer.json"

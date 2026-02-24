@@ -49,7 +49,7 @@ def run_build(bcfg: BuildConfig):
                 print(f"Loaded val set: {len(val_loader):,} tokens")
             else:
                 print("Warning: eval_every set but no val data found, disabling eval")
-                bcfg.eval_every = 0
+                bcfg.eval_every = 0  # safe: bcfg is consumed only by this function
     elif bcfg.data_path:
         if bcfg.data_path.endswith(".bin"):
             fsize = os.path.getsize(bcfg.data_path)
@@ -547,6 +547,8 @@ def run_build(bcfg: BuildConfig):
     # ── Final checkpoint ──────────────────────────────────────────────
     if gpu_model is not None:
         params = gpu_model.to_host_params()
+        if not use_bpe:
+            context = gpu_model.to_host_context()
     os.makedirs(os.path.dirname(bcfg.save_path) or ".", exist_ok=True)
     if use_bpe:
         nl_hecate.save_checkpoint(bcfg.save_path, params, cfg)

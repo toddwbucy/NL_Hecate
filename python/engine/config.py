@@ -118,6 +118,9 @@ class BuildConfig:
             raise ValueError("self_generated_values requires projection_kind='adaptive'")
         if self.self_ref_chunk_size > 1 and self.projection_kind != "adaptive":
             raise ValueError("self_ref_chunk_size > 1 requires projection_kind='adaptive'")
+        if self.data_format not in ("byte", "sharegpt"):
+            raise ValueError(
+                f"data_format must be 'byte' or 'sharegpt', got '{self.data_format}'")
 
     @property
     def head_dim(self) -> int:
