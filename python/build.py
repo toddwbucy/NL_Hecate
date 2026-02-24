@@ -185,45 +185,6 @@ class BuildConfig:
         self._validate()
 
 
-# ── AdamW optimizer (Python-side, operates on flat weight arrays) ────
-
-class AdamW:
-    """Decoupled weight decay optimizer (Loshchilov & Hutter, 2019).
-
-    Maintains first/second moment estimates per parameter. Works on flat
-    weight arrays from MAGParams.get_weights() / set_weights().
-    """
-
-    def __init__(self, num_params: int, lr: float = 4e-4,
-                 beta1: float = 0.9, beta2: float = 0.999,
-                 eps: float = 1e-8, weight_decay: float = 0.1):
-        self.lr = lr
-        self.beta1 = beta1
-        self.beta2 = beta2
-        self.eps = eps
-        self.weight_decay = weight_decay
-        self.m = [0.0] * num_params  # first moment
-        self.v = [0.0] * num_params  # second moment
-        self.t = 0  # step counter for bias correction
-
-    def step(self, params: list[float], grads: list[float], lr: float) -> list[float]:
-        """One AdamW update. Returns updated params."""
-        self.t += 1
-        b1, b2, eps, wd = self.beta1, self.beta2, self.eps, self.weight_decay
-        bc1 = 1.0 - b1 ** self.t
-        bc2 = 1.0 - b2 ** self.t
-
-        for i in range(len(params)):
-            g = grads[i]
-            self.m[i] = b1 * self.m[i] + (1 - b1) * g
-            self.v[i] = b2 * self.v[i] + (1 - b2) * g * g
-            m_hat = self.m[i] / bc1
-            v_hat = self.v[i] / bc2
-            # AdamW: decoupled weight decay applied to param directly
-            params[i] -= lr * (m_hat / (math.sqrt(v_hat) + eps) + wd * params[i])
-        return params
-
-
 def cosine_lr(step: int, warmup_steps: int, total_steps: int, lr_peak: float,
               lr_min: float = 0.0) -> float:
     """Cosine annealing with linear warmup."""
@@ -232,20 +193,6 @@ def cosine_lr(step: int, warmup_steps: int, total_steps: int, lr_peak: float,
     progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
     progress = min(progress, 1.0)
     return lr_min + 0.5 * (lr_peak - lr_min) * (1 + math.cos(math.pi * progress))
-
-
-def grad_norm(grads: list[float]) -> float:
-    """Compute L2 norm of gradient vector."""
-    return math.sqrt(sum(g * g for g in grads))
-
-
-def clip_grad_norm(grads: list[float], max_norm: float) -> tuple[list[float], float]:
-    """Clip gradient vector to max L2 norm. Returns (clipped_grads, original_norm)."""
-    norm = grad_norm(grads)
-    if norm > max_norm > 0:
-        scale = max_norm / norm
-        return [g * scale for g in grads], norm
-    return grads, norm
 
 
 # ── Byte-level tokenizer ────────────────────────────────────────────

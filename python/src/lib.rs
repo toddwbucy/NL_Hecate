@@ -1700,8 +1700,14 @@ impl FrequencyAwareAdamW {
     }
 
     /// Get the level-local step count for a CMS level.
-    fn level_step(&self, level: usize) -> u32 {
-        self.inner.level_step(level)
+    fn level_step(&self, level: usize) -> PyResult<u32> {
+        if level >= self.inner.level_count() {
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "level {level} out of range (optimizer has {} levels)",
+                self.inner.level_count()
+            )));
+        }
+        Ok(self.inner.level_step(level))
     }
 }
 

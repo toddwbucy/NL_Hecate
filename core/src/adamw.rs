@@ -332,6 +332,11 @@ impl FrequencyAwareAdamW {
         }
     }
 
+    /// Number of CMS levels in the optimizer.
+    pub fn level_count(&self) -> usize {
+        self.levels.len()
+    }
+
     /// Get the level-local step count for a CMS level.
     pub fn level_step(&self, level: usize) -> u32 {
         self.levels[level].level_step
@@ -567,6 +572,24 @@ mod tests {
             opt.step(&mut params, &mut grads, &pulse, 1e-3, 0.0);
         }
         assert_eq!(opt.swa_step(), 10);
+    }
+
+    #[test]
+    fn test_adamw_grad_clip() {
+        let cfg = test_cfg_k2();
+        let mut params = MAGParams::init(&cfg, 42);
+        let mut grads = MAGParams::zeros_like(&cfg);
+        grads.swa.w_embed[0] = 1000.0; // extreme gradient
+        let pulse = Pulse { global_step: 0, active_levels: vec![true, true] };
+        let mut opt = FrequencyAwareAdamW::new(&params, AdamWConfig::default());
+
+        opt.step(&mut params, &mut grads, &pulse, 1e-3, 1.0); // max_grad_norm=1.0
+
+        // Gradient should have been clipped: norm was ~1000, clipped to 1.0
+        assert!(grads.swa.w_embed[0] < 2.0,
+            "gradient should have been clipped, got {}", grads.swa.w_embed[0]);
+        assert!(grads.swa.w_embed[0] > 0.0,
+            "gradient should still be positive after clipping");
     }
 
     // ── cosine_lr tests ──────────────────────────────────────────────
