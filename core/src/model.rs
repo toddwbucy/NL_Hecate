@@ -511,14 +511,12 @@ impl MemoryLevelParams {
             step(&mut self.w_q_conv, &grads.w_q_conv, lr);
             step(&mut self.b_q_conv, &grads.b_q_conv, lr);
         }
-        if !self.m_k_init.is_empty() && !grads.m_k_init.is_empty() {
-            step(&mut self.m_k_init, &grads.m_k_init, lr);
-            step(&mut self.m_v_init, &grads.m_v_init, lr);
-            step(&mut self.m_q_init, &grads.m_q_init, lr);
-            step(&mut self.m_eta_init, &grads.m_eta_init, lr);
-            step(&mut self.m_alpha_init, &grads.m_alpha_init, lr);
-            step(&mut self.m_mem_init, &grads.m_mem_init, lr);
-        }
+        if !self.m_k_init.is_empty() && !grads.m_k_init.is_empty() { step(&mut self.m_k_init, &grads.m_k_init, lr); }
+        if !self.m_v_init.is_empty() && !grads.m_v_init.is_empty() { step(&mut self.m_v_init, &grads.m_v_init, lr); }
+        if !self.m_q_init.is_empty() && !grads.m_q_init.is_empty() { step(&mut self.m_q_init, &grads.m_q_init, lr); }
+        if !self.m_eta_init.is_empty() && !grads.m_eta_init.is_empty() { step(&mut self.m_eta_init, &grads.m_eta_init, lr); }
+        if !self.m_alpha_init.is_empty() && !grads.m_alpha_init.is_empty() { step(&mut self.m_alpha_init, &grads.m_alpha_init, lr); }
+        if !self.m_mem_init.is_empty() && !grads.m_mem_init.is_empty() { step(&mut self.m_mem_init, &grads.m_mem_init, lr); }
     }
 
     /// Element-wise accumulate: self += other.
@@ -550,14 +548,12 @@ impl MemoryLevelParams {
             acc(&mut self.w_q_conv, &other.w_q_conv);
             acc(&mut self.b_q_conv, &other.b_q_conv);
         }
-        if !self.m_k_init.is_empty() && !other.m_k_init.is_empty() {
-            acc(&mut self.m_k_init, &other.m_k_init);
-            acc(&mut self.m_v_init, &other.m_v_init);
-            acc(&mut self.m_q_init, &other.m_q_init);
-            acc(&mut self.m_eta_init, &other.m_eta_init);
-            acc(&mut self.m_alpha_init, &other.m_alpha_init);
-            acc(&mut self.m_mem_init, &other.m_mem_init);
-        }
+        if !self.m_k_init.is_empty() && !other.m_k_init.is_empty() { acc(&mut self.m_k_init, &other.m_k_init); }
+        if !self.m_v_init.is_empty() && !other.m_v_init.is_empty() { acc(&mut self.m_v_init, &other.m_v_init); }
+        if !self.m_q_init.is_empty() && !other.m_q_init.is_empty() { acc(&mut self.m_q_init, &other.m_q_init); }
+        if !self.m_eta_init.is_empty() && !other.m_eta_init.is_empty() { acc(&mut self.m_eta_init, &other.m_eta_init); }
+        if !self.m_alpha_init.is_empty() && !other.m_alpha_init.is_empty() { acc(&mut self.m_alpha_init, &other.m_alpha_init); }
+        if !self.m_mem_init.is_empty() && !other.m_mem_init.is_empty() { acc(&mut self.m_mem_init, &other.m_mem_init); }
     }
 
     /// Frobenius norm across all weight matrices.
@@ -2662,7 +2658,6 @@ mod tests {
 
     #[test]
     fn test_accumulate_with_init() {
-        let d = 8;
         let cfg = adaptive_test_config();
         let grads = MAGParams::zeros_like(&cfg);
         // Create two gradient sets
