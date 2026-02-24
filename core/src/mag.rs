@@ -295,18 +295,26 @@ pub fn mag_backward(
             AtlasOmega.step_backward(&params.levels[0], atlas_cache, &d_y, &cache.embedded)
         }
         MemoryCache::SelfRef(sr_cache) => {
-            let (d_emb, _sr_grads) = self_ref_step_backward(sr_cache, &d_y, cfg.self_generated_values);
-            // TODO(PR-4): _sr_grads holds dL/dM_{k,0}..dL/dM_{mem,0} — the outer-loop
-            // gradients for self-ref initial states. Currently dropped because MAGParams
-            // doesn't have fields for them yet. PR 4 adds SelfRefParamGrads to MAGParams
-            // and wires them into apply_weight_gradients(). Until then, only the inner-loop
-            // (per-token DGD) operates on projection memories; outer-loop learning is deferred.
-            (crate::model::MemoryLevelParams::zeros_like(d), d_emb)
+            let (d_emb, sr_grads) = self_ref_step_backward(sr_cache, &d_y, cfg.self_generated_values);
+            let mut level_grads = crate::model::MemoryLevelParams::zeros_like(d);
+            level_grads.m_k_init = sr_grads.d_m_k;
+            level_grads.m_v_init = sr_grads.d_m_v;
+            level_grads.m_q_init = sr_grads.d_m_q;
+            level_grads.m_eta_init = sr_grads.d_m_eta;
+            level_grads.m_alpha_init = sr_grads.d_m_alpha;
+            level_grads.m_mem_init = sr_grads.d_m_mem;
+            (level_grads, d_emb)
         }
         MemoryCache::ChunkwiseSelfRef(csr_cache) => {
-            let (d_emb, _sr_grads) = chunkwise_self_ref_step_backward(csr_cache, &d_y);
-            // TODO(PR-4): same as SelfRef — _sr_grads deferred.
-            (crate::model::MemoryLevelParams::zeros_like(d), d_emb)
+            let (d_emb, sr_grads) = chunkwise_self_ref_step_backward(csr_cache, &d_y);
+            let mut level_grads = crate::model::MemoryLevelParams::zeros_like(d);
+            level_grads.m_k_init = sr_grads.d_m_k;
+            level_grads.m_v_init = sr_grads.d_m_v;
+            level_grads.m_q_init = sr_grads.d_m_q;
+            level_grads.m_eta_init = sr_grads.d_m_eta;
+            level_grads.m_alpha_init = sr_grads.d_m_alpha;
+            level_grads.m_mem_init = sr_grads.d_m_mem;
+            (level_grads, d_emb)
         }
     };
 
@@ -1079,13 +1087,26 @@ pub fn cms_backward(
                     AtlasOmega.step_backward(&params.levels[level], atlas_cache, &d_y_combined, &cache.embedded)
                 }
                 MemoryCache::SelfRef(sr_cache) => {
-                    let (d_emb, _sr_grads) = self_ref_step_backward(sr_cache, &d_y_combined, cfg.self_generated_values);
-                    // TODO(PR-4): wire _sr_grads into MAGParams (see mag_backward comment).
-                    (crate::model::MemoryLevelParams::zeros_like(d), d_emb)
+                    let (d_emb, sr_grads) = self_ref_step_backward(sr_cache, &d_y_combined, cfg.self_generated_values);
+                    let mut level_grads = crate::model::MemoryLevelParams::zeros_like(d);
+                    level_grads.m_k_init = sr_grads.d_m_k;
+                    level_grads.m_v_init = sr_grads.d_m_v;
+                    level_grads.m_q_init = sr_grads.d_m_q;
+                    level_grads.m_eta_init = sr_grads.d_m_eta;
+                    level_grads.m_alpha_init = sr_grads.d_m_alpha;
+                    level_grads.m_mem_init = sr_grads.d_m_mem;
+                    (level_grads, d_emb)
                 }
                 MemoryCache::ChunkwiseSelfRef(csr_cache) => {
-                    let (d_emb, _sr_grads) = chunkwise_self_ref_step_backward(csr_cache, &d_y_combined);
-                    (crate::model::MemoryLevelParams::zeros_like(d), d_emb)
+                    let (d_emb, sr_grads) = chunkwise_self_ref_step_backward(csr_cache, &d_y_combined);
+                    let mut level_grads = crate::model::MemoryLevelParams::zeros_like(d);
+                    level_grads.m_k_init = sr_grads.d_m_k;
+                    level_grads.m_v_init = sr_grads.d_m_v;
+                    level_grads.m_q_init = sr_grads.d_m_q;
+                    level_grads.m_eta_init = sr_grads.d_m_eta;
+                    level_grads.m_alpha_init = sr_grads.d_m_alpha;
+                    level_grads.m_mem_init = sr_grads.d_m_mem;
+                    (level_grads, d_emb)
                 }
             };
             grads.levels[level].accumulate(&mem_grads);
@@ -1234,6 +1255,48 @@ mod tests {
             .map(|t| t % cfg.swa.vocab_size)
             .collect();
         (input_ids, target_ids)
+    }
+
+    #[test]
+    fn test_sr_grads_reach_params() {
+        // Use Adaptive projection so backward produces SelfRefParamGrads.
+        // Must use cms_forward/cms_backward — mag_forward doesn't check projection_kind.
+        let mut cfg = test_config_k2();
+        cfg.projection_kind = crate::self_ref::ProjectionKind::Adaptive;
+        cfg.self_generated_values = false;
+        let mut params = MAGParams::init(&cfg, 42);
+        // Seed m_*_init with nonzero values so backward produces nonzero gradients
+        let d = cfg.swa.d_model;
+        for level in 0..cfg.k {
+            params.levels[level].m_k_init = vec![0.1f32; d * d];
+            params.levels[level].m_v_init = vec![0.1f32; d * d];
+            params.levels[level].m_q_init = vec![0.1f32; d * d];
+            params.levels[level].m_eta_init = vec![0.1f32; d * d];
+            params.levels[level].m_alpha_init = vec![0.1f32; d * d];
+            params.levels[level].m_mem_init = vec![0.1f32; d * d];
+        }
+        let (input_ids, target_ids) = make_test_data_k2(&cfg);
+        let mut context = ContextState::new_with_projection(
+            cfg.k, cfg.swa.d_model, crate::self_ref::ProjectionKind::Adaptive,
+        );
+        // Seed self-ref state from params (m_*_init → SelfRefState)
+        context.seed_self_ref(&params.levels);
+        let pulse = Pulse { global_step: 0, active_levels: vec![true, true] };
+
+        let (loss, cache) = cms_forward(&params, &cfg, &input_ids, &target_ids, &pulse, &mut context);
+        assert!(loss.is_finite(), "Forward loss must be finite: {loss}");
+
+        let mut error_buffers: Vec<ErrorBuffer> = (0..cfg.k)
+            .map(|_| ErrorBuffer::new(cfg.swa.d_model))
+            .collect();
+        let grads = cms_backward(&params, &cfg, &cache, &input_ids, &target_ids, &mut error_buffers);
+
+        // m_k_init gradient should be nonzero (self-ref backward produces gradients)
+        let m_k_norm: f32 = grads.levels[0].m_k_init.iter().map(|g| g * g).sum();
+        assert!(
+            m_k_norm > 0.0,
+            "m_k_init grads should be nonzero after backward, got norm_sq={m_k_norm}"
+        );
     }
 
     #[test]
