@@ -319,22 +319,22 @@ pub struct MemoryLevelParams {
     pub b_q_conv: Vec<f32>,
     /// Self-referential key projection memory initial state: [d*d].
     /// Empty when ProjectionKind::Static. Seeds M_k at sequence start.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub m_k_init: Vec<f32>,
     /// Self-referential value projection memory initial state: [d*d].
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub m_v_init: Vec<f32>,
     /// Self-referential query projection memory initial state: [d*d].
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub m_q_init: Vec<f32>,
     /// Self-referential learning rate memory initial state: [d*d].
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub m_eta_init: Vec<f32>,
     /// Self-referential retention memory initial state: [d*d].
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub m_alpha_init: Vec<f32>,
     /// Self-referential main projection memory initial state: [d*d].
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub m_mem_init: Vec<f32>,
 }
 
@@ -511,12 +511,12 @@ impl MemoryLevelParams {
             step(&mut self.w_q_conv, &grads.w_q_conv, lr);
             step(&mut self.b_q_conv, &grads.b_q_conv, lr);
         }
-        if !self.m_k_init.is_empty() && !grads.m_k_init.is_empty() { step(&mut self.m_k_init, &grads.m_k_init, lr); }
-        if !self.m_v_init.is_empty() && !grads.m_v_init.is_empty() { step(&mut self.m_v_init, &grads.m_v_init, lr); }
-        if !self.m_q_init.is_empty() && !grads.m_q_init.is_empty() { step(&mut self.m_q_init, &grads.m_q_init, lr); }
-        if !self.m_eta_init.is_empty() && !grads.m_eta_init.is_empty() { step(&mut self.m_eta_init, &grads.m_eta_init, lr); }
-        if !self.m_alpha_init.is_empty() && !grads.m_alpha_init.is_empty() { step(&mut self.m_alpha_init, &grads.m_alpha_init, lr); }
-        if !self.m_mem_init.is_empty() && !grads.m_mem_init.is_empty() { step(&mut self.m_mem_init, &grads.m_mem_init, lr); }
+        if !self.m_k_init.is_empty() && !grads.m_k_init.is_empty() { debug_assert_eq!(self.m_k_init.len(), grads.m_k_init.len()); step(&mut self.m_k_init, &grads.m_k_init, lr); }
+        if !self.m_v_init.is_empty() && !grads.m_v_init.is_empty() { debug_assert_eq!(self.m_v_init.len(), grads.m_v_init.len()); step(&mut self.m_v_init, &grads.m_v_init, lr); }
+        if !self.m_q_init.is_empty() && !grads.m_q_init.is_empty() { debug_assert_eq!(self.m_q_init.len(), grads.m_q_init.len()); step(&mut self.m_q_init, &grads.m_q_init, lr); }
+        if !self.m_eta_init.is_empty() && !grads.m_eta_init.is_empty() { debug_assert_eq!(self.m_eta_init.len(), grads.m_eta_init.len()); step(&mut self.m_eta_init, &grads.m_eta_init, lr); }
+        if !self.m_alpha_init.is_empty() && !grads.m_alpha_init.is_empty() { debug_assert_eq!(self.m_alpha_init.len(), grads.m_alpha_init.len()); step(&mut self.m_alpha_init, &grads.m_alpha_init, lr); }
+        if !self.m_mem_init.is_empty() && !grads.m_mem_init.is_empty() { debug_assert_eq!(self.m_mem_init.len(), grads.m_mem_init.len()); step(&mut self.m_mem_init, &grads.m_mem_init, lr); }
     }
 
     /// Element-wise accumulate: self += other.
@@ -548,12 +548,12 @@ impl MemoryLevelParams {
             acc(&mut self.w_q_conv, &other.w_q_conv);
             acc(&mut self.b_q_conv, &other.b_q_conv);
         }
-        if !self.m_k_init.is_empty() && !other.m_k_init.is_empty() { acc(&mut self.m_k_init, &other.m_k_init); }
-        if !self.m_v_init.is_empty() && !other.m_v_init.is_empty() { acc(&mut self.m_v_init, &other.m_v_init); }
-        if !self.m_q_init.is_empty() && !other.m_q_init.is_empty() { acc(&mut self.m_q_init, &other.m_q_init); }
-        if !self.m_eta_init.is_empty() && !other.m_eta_init.is_empty() { acc(&mut self.m_eta_init, &other.m_eta_init); }
-        if !self.m_alpha_init.is_empty() && !other.m_alpha_init.is_empty() { acc(&mut self.m_alpha_init, &other.m_alpha_init); }
-        if !self.m_mem_init.is_empty() && !other.m_mem_init.is_empty() { acc(&mut self.m_mem_init, &other.m_mem_init); }
+        if !self.m_k_init.is_empty() && !other.m_k_init.is_empty() { debug_assert_eq!(self.m_k_init.len(), other.m_k_init.len()); acc(&mut self.m_k_init, &other.m_k_init); }
+        if !self.m_v_init.is_empty() && !other.m_v_init.is_empty() { debug_assert_eq!(self.m_v_init.len(), other.m_v_init.len()); acc(&mut self.m_v_init, &other.m_v_init); }
+        if !self.m_q_init.is_empty() && !other.m_q_init.is_empty() { debug_assert_eq!(self.m_q_init.len(), other.m_q_init.len()); acc(&mut self.m_q_init, &other.m_q_init); }
+        if !self.m_eta_init.is_empty() && !other.m_eta_init.is_empty() { debug_assert_eq!(self.m_eta_init.len(), other.m_eta_init.len()); acc(&mut self.m_eta_init, &other.m_eta_init); }
+        if !self.m_alpha_init.is_empty() && !other.m_alpha_init.is_empty() { debug_assert_eq!(self.m_alpha_init.len(), other.m_alpha_init.len()); acc(&mut self.m_alpha_init, &other.m_alpha_init); }
+        if !self.m_mem_init.is_empty() && !other.m_mem_init.is_empty() { debug_assert_eq!(self.m_mem_init.len(), other.m_mem_init.len()); acc(&mut self.m_mem_init, &other.m_mem_init); }
     }
 
     /// Frobenius norm across all weight matrices.
@@ -2650,10 +2650,12 @@ mod tests {
         // Deserialize the stripped JSON — #[serde(default)] should give empty vecs
         let edited_json = serde_json::to_string(&val).unwrap();
         let back: MAGParams = serde_json::from_str(&edited_json).unwrap();
-        assert!(back.levels[0].m_k_init.is_empty(),
-            "m_k_init should default to empty when missing from JSON");
-        assert!(back.levels[0].m_mem_init.is_empty(),
-            "m_mem_init should default to empty when missing from JSON");
+        assert!(back.levels[0].m_k_init.is_empty(), "m_k_init should default to empty");
+        assert!(back.levels[0].m_v_init.is_empty(), "m_v_init should default to empty");
+        assert!(back.levels[0].m_q_init.is_empty(), "m_q_init should default to empty");
+        assert!(back.levels[0].m_eta_init.is_empty(), "m_eta_init should default to empty");
+        assert!(back.levels[0].m_alpha_init.is_empty(), "m_alpha_init should default to empty");
+        assert!(back.levels[0].m_mem_init.is_empty(), "m_mem_init should default to empty");
     }
 
     #[test]
