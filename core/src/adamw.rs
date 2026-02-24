@@ -173,6 +173,8 @@ impl FrequencyAwareAdamW {
     ///
     /// `max_grad_norm`: if > 0, clips the global gradient L2 norm before
     /// applying updates (matching gpu_adamw_update behavior).
+    ///
+    /// Returns the pre-clip gradient L2 norm (0.0 if clipping is disabled).
     pub fn step(
         &mut self,
         params: &mut crate::model::MAGParams,
@@ -180,8 +182,9 @@ impl FrequencyAwareAdamW {
         pulse: &Pulse,
         lr: f32,
         max_grad_norm: f32,
-    ) {
+    ) -> f32 {
         // ── Global gradient norm clipping ───────────────────────────────
+        let mut grad_norm_out: f32 = 0.0;
         if max_grad_norm > 0.0 {
             let mut norm_sq: f64 = 0.0;
             // SWA grads
@@ -216,6 +219,7 @@ impl FrequencyAwareAdamW {
             for g in grads.persistent_tokens.iter() { norm_sq += (*g as f64) * (*g as f64); }
 
             let norm = norm_sq.sqrt() as f32;
+            grad_norm_out = norm;
             if norm > max_grad_norm {
                 let scale = max_grad_norm / norm;
                 for g in grads.swa.w_embed.iter_mut() { *g *= scale; }
@@ -330,6 +334,8 @@ impl FrequencyAwareAdamW {
                            &mut pt.m, &mut pt.v, lr, c.beta1, c.beta2, c.eps,
                            bc1_inv, bc2_inv, c.weight_decay);
         }
+
+        grad_norm_out
     }
 
     /// Number of CMS levels in the optimizer.

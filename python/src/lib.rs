@@ -529,7 +529,9 @@ impl MAGParams {
     }
 
     /// Flatten all params into a single Vec<f32> for Python-side optimizers.
-    /// Order: SWA(embed,q,k,v,o,unembed) then per-level(k_mem,v_mem,q_mem,alpha,b_alpha,theta,b_theta,eta,b_eta,omega,freq,b_freq,conv).
+    /// Order: SWA(embed,q,k,v,o,unembed), per-level(k_mem,v_mem,q_mem,alpha,
+    /// b_alpha,theta,b_theta,eta,b_eta,omega,freq,b_freq,k_conv,b_k_conv,
+    /// q_conv,b_q_conv), then agg(alpha_mem,alpha_refl,persistent_tokens).
     fn get_flat_weights(&self) -> Vec<f32> {
         let mut flat = Vec::with_capacity(self.inner.num_params());
         flat.extend_from_slice(&self.inner.swa.w_embed);
@@ -556,6 +558,9 @@ impl MAGParams {
             flat.extend_from_slice(&level.w_q_conv);
             flat.extend_from_slice(&level.b_q_conv);
         }
+        flat.extend_from_slice(&self.inner.alpha_mem);
+        flat.extend_from_slice(&self.inner.alpha_refl);
+        flat.extend_from_slice(&self.inner.persistent_tokens);
         flat
     }
 
@@ -606,6 +611,9 @@ impl MAGParams {
             copy_slice!(level.w_q_conv);
             copy_slice!(level.b_q_conv);
         }
+        copy_slice!(self.inner.alpha_mem);
+        copy_slice!(self.inner.alpha_refl);
+        copy_slice!(self.inner.persistent_tokens);
         Ok(())
     }
 }
@@ -1688,10 +1696,12 @@ impl FrequencyAwareAdamW {
     /// When `max_grad_norm > 0`, clips the global gradient L2 norm in-place
     /// before applying updates. This mutates `grads` — callers who need the
     /// original gradient values should clone before calling.
+    ///
+    /// Returns the pre-clip gradient L2 norm (0.0 if clipping is disabled).
     #[pyo3(signature = (params, grads, pulse, lr, max_grad_norm=0.0))]
     fn step(&mut self, params: &mut MAGParams, grads: &mut MAGParams, pulse: &Pulse,
-            lr: f32, max_grad_norm: f32) {
-        self.inner.step(&mut params.inner, &mut grads.inner, &pulse.inner, lr, max_grad_norm);
+            lr: f32, max_grad_norm: f32) -> f32 {
+        self.inner.step(&mut params.inner, &mut grads.inner, &pulse.inner, lr, max_grad_norm)
     }
 
     /// Get the SWA (global) step count.
