@@ -591,6 +591,9 @@ def main():
                         help="Projection kind: 'static' or 'adaptive'")
     parser.add_argument("--self_generated_values", action="store_true", default=None,
                         help="Enable Phase 3 self-generated values")
+    parser.add_argument("--no_self_generated_values", action="store_false",
+                        dest="self_generated_values",
+                        help="Disable Phase 3 self-generated values (overrides config)")
     parser.add_argument("--self_ref_chunk_size", type=int, default=None,
                         help="Chunkwise self-ref chunk size (1 = sequential)")
     parser.add_argument("--momentum_kind", type=str, default=None,
@@ -698,6 +701,11 @@ def main():
         bcfg.k = cfg.k
         bcfg.chunk_sizes = list(cfg.chunk_sizes)
         bcfg.seq_len = cfg.seq_len
+        bcfg.projection_kind = cfg.projection_kind
+        bcfg.momentum_kind = cfg.momentum_kind
+        bcfg.self_generated_values = cfg.self_generated_values
+        bcfg.self_ref_chunk_size = cfg.self_ref_chunk_size
+        bcfg.momentum_d_hidden = cfg.momentum_d_hidden
         print(f"  Resuming from step {resume_step}")
         print(f"  Stream position: {build_state['stream_position']}")
     else:
