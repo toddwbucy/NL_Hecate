@@ -2632,13 +2632,34 @@ mod tests {
 
     #[test]
     fn test_old_checkpoint_compat() {
-        // JSON without m_*_init fields should deserialize with defaults (empty vecs)
-        let cfg = MAGConfig::test_config(); // Static
+        // Simulate an old checkpoint that has Adaptive-sized params but is missing
+        // the m_*_init keys entirely (as would happen with a pre-wiring checkpoint).
+        let cfg = adaptive_test_config();
         let params = MAGParams::init(&cfg, 42);
         let json = serde_json::to_string(&params).unwrap();
-        // The JSON won't have m_*_init because they're empty and #[serde(default)]
-        let back: MAGParams = serde_json::from_str(&json).unwrap();
-        assert!(back.levels[0].m_k_init.is_empty());
+
+        // Parse into a mutable JSON value and strip all m_*_init keys from levels
+        let mut val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        if let Some(levels) = val.get_mut("levels").and_then(|v| v.as_array_mut()) {
+            for level in levels.iter_mut() {
+                if let Some(obj) = level.as_object_mut() {
+                    obj.remove("m_k_init");
+                    obj.remove("m_v_init");
+                    obj.remove("m_q_init");
+                    obj.remove("m_eta_init");
+                    obj.remove("m_alpha_init");
+                    obj.remove("m_mem_init");
+                }
+            }
+        }
+
+        // Deserialize the stripped JSON — #[serde(default)] should give empty vecs
+        let edited_json = serde_json::to_string(&val).unwrap();
+        let back: MAGParams = serde_json::from_str(&edited_json).unwrap();
+        assert!(back.levels[0].m_k_init.is_empty(),
+            "m_k_init should default to empty when missing from JSON");
+        assert!(back.levels[0].m_mem_init.is_empty(),
+            "m_mem_init should default to empty when missing from JSON");
     }
 
     #[test]

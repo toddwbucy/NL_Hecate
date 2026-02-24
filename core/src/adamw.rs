@@ -152,12 +152,12 @@ impl FrequencyAwareAdamW {
                 MomentBuf::zeros(lp.b_k_conv.len()),  // 13
                 MomentBuf::zeros(lp.w_q_conv.len()),  // 14
                 MomentBuf::zeros(lp.b_q_conv.len()),  // 15
-                MomentBuf::zeros(lp.m_k_init.len()),  // 16
-                MomentBuf::zeros(lp.m_v_init.len()),  // 17
-                MomentBuf::zeros(lp.m_q_init.len()),  // 18
-                MomentBuf::zeros(lp.m_eta_init.len()), // 19
-                MomentBuf::zeros(lp.m_alpha_init.len()), // 20
-                MomentBuf::zeros(lp.m_mem_init.len()), // 21
+                MomentBuf::zeros(lp.m_k_init.len()),     // 16: self-ref key projection init
+                MomentBuf::zeros(lp.m_v_init.len()),     // 17: self-ref value projection init
+                MomentBuf::zeros(lp.m_q_init.len()),     // 18: self-ref query projection init
+                MomentBuf::zeros(lp.m_eta_init.len()),   // 19: self-ref learning rate init
+                MomentBuf::zeros(lp.m_alpha_init.len()), // 20: self-ref retention init
+                MomentBuf::zeros(lp.m_mem_init.len()),   // 21: self-ref main memory init
             ],
             level_step: 0,
         }).collect();

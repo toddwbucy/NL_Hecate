@@ -92,7 +92,12 @@ impl SelfRefState {
         m_k_init: &[f32], m_v_init: &[f32], m_q_init: &[f32],
         m_eta_init: &[f32], m_alpha_init: &[f32], d: usize,
     ) -> Self {
-        if m_k_init.len() != d * d { return SelfRefState::new(d); }
+        let dd = d * d;
+        if m_k_init.len() != dd || m_v_init.len() != dd || m_q_init.len() != dd
+            || m_eta_init.len() != dd || m_alpha_init.len() != dd
+        {
+            return SelfRefState::new(d);
+        }
         SelfRefState {
             m_k: m_k_init.to_vec(),
             m_v: m_v_init.to_vec(),
