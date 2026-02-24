@@ -53,18 +53,21 @@ pub struct GpuLevelGrads {
 impl GpuMAGGrads {
     /// Download GPU gradients to host as a MAGParams (same struct, gradient values).
     pub fn to_host(&self, cfg: &crate::model::MAGConfig) -> crate::model::MAGParams {
-        let d = cfg.swa.d_model;
-        let v = cfg.swa.vocab_size;
-        let mut swa = crate::model::SWAParams::zeros_like(&cfg.swa);
-        self.d_w_embed.copy_to_host(&mut swa.w_embed);
-        self.d_w_q.copy_to_host(&mut swa.w_q);
-        self.d_w_k.copy_to_host(&mut swa.w_k);
-        self.d_w_v.copy_to_host(&mut swa.w_v);
-        self.d_w_o.copy_to_host(&mut swa.w_o);
-        self.d_w_unembed.copy_to_host(&mut swa.w_unembed);
+        // Use config-aware constructor so all fields (including m_*_init for
+        // adaptive projections, w_freq for learned schedules, etc.) are properly
+        // sized. Fields not computed on GPU remain zero — the CPU optimizer
+        // applies zero gradients harmlessly.
+        let mut result = crate::model::MAGParams::zeros_like(cfg);
 
-        let levels: Vec<_> = self.levels.iter().enumerate().map(|(i, lg)| {
-            let mut lp = crate::model::MemoryLevelParams::zeros_like(d);
+        self.d_w_embed.copy_to_host(&mut result.swa.w_embed);
+        self.d_w_q.copy_to_host(&mut result.swa.w_q);
+        self.d_w_k.copy_to_host(&mut result.swa.w_k);
+        self.d_w_v.copy_to_host(&mut result.swa.w_v);
+        self.d_w_o.copy_to_host(&mut result.swa.w_o);
+        self.d_w_unembed.copy_to_host(&mut result.swa.w_unembed);
+
+        for (i, lg) in self.levels.iter().enumerate() {
+            let lp = &mut result.levels[i];
             lg.d_w_k_mem.copy_to_host(lp.w_k_mem.master_mut()); lp.w_k_mem.sync_from_master();
             lg.d_w_v_mem.copy_to_host(lp.w_v_mem.master_mut()); lp.w_v_mem.sync_from_master();
             lg.d_w_q_mem.copy_to_host(lp.w_q_mem.master_mut()); lp.w_q_mem.sync_from_master();
@@ -74,13 +77,10 @@ impl GpuMAGGrads {
             lg.d_b_theta.copy_to_host(&mut lp.b_theta);
             lg.d_w_eta.copy_to_host(&mut lp.w_eta);
             lg.d_b_eta.copy_to_host(&mut lp.b_eta);
-            // w_omega not in GPU grads (gate backward TODO), keep zeros
-            lp
-        }).collect();
+            // w_omega, m_*_init, w_freq, w_*_conv: not in GPU grads yet, stay zero
+        }
 
-        // TODO: GPU kernels don't yet compute alpha_mem/alpha_refl gradients.
-        // These are small [k] vectors — GPU-side aggregation backward is a Stage 3 task.
-        crate::model::MAGParams { swa, levels, alpha_mem: vec![0.0f32; cfg.k], alpha_refl: vec![0.0f32; cfg.k], persistent_tokens: vec![0.0f32; cfg.n_persistent * cfg.swa.d_model] }
+        result
     }
 }
 
