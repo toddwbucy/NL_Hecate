@@ -251,7 +251,6 @@ def run_build(bcfg: BuildConfig):
 
     # ── S4-M7 validation state ────────────────────────────────────────
     level_fire_counts = [0] * bcfg.k
-    level_fire_reset_step = resume_step
     level3_total_fires = 0
     level3_active_fires = 0
     level3_prev_fires = 0
@@ -419,6 +418,7 @@ def run_build(bcfg: BuildConfig):
             if bcfg.k > 1:
                 fires_str = "  ".join(f"L{i}:{level_fire_counts[i]}" for i in range(bcfg.k))
                 print(f"    [fires] {fires_str}")
+                level_fire_counts = [0] * bcfg.k
             if gpu_model is not None:
                 try:
                     samples = eval_coherence_samples(gpu_model, cfg, max_tokens=30,
@@ -431,10 +431,6 @@ def run_build(bcfg: BuildConfig):
             if jsonl:
                 jsonl.log(event="eval", step=step, eval_loss=eval_loss,
                           eval_ppl=eval_ppl, eval_chunks=bcfg.eval_max_chunks)
-
-        if step - level_fire_reset_step >= 1000:
-            level_fire_counts = [0] * bcfg.k
-            level_fire_reset_step = step
 
         # ── S4-M7: Phase boundary curriculum probe ────────────────────
         if (step in phase_boundaries and gpu_model is not None
