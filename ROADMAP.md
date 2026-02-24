@@ -508,18 +508,14 @@ S4 Phase 2: HOPE Build & Serve ───────────── IN PROGRE
 
 ---
 
-## Resolved & Deferred Blockers (HADES `hope_blockers`)
+## Resolved Blockers (HADES `hope_blockers`)
 
-Four blocking gaps were extracted from the NL paper suite during initial graph construction. Two have been empirically resolved through implementation work. Two affect only the **brain transplant** path (converting a pre-trained Llama into HOPE) and are deferred — the from-scratch HOPE training path is the primary path and is unblocked.
-
-**Brain transplant is community-scope, not project-scope.** The from-scratch HOPE training path (S4 Phase 2) does not require brain transplant. If community contributors want to explore Llama→HOPE conversion, the two deferred blockers document the open questions.
+Four blocking gaps were extracted from the NL paper suite during initial graph construction. Two have been empirically resolved through implementation work. Two related to the brain transplant path (converting pre-trained weights to HOPE) have been moved to `docs/explorations/brain_transplant.md` — they do not apply to the ab initio training path.
 
 | Blocker | Paper Section | Status | Resolution |
 |---------|--------------|--------|------------|
 | **How many CMS frequency levels (k)?** | §7.3 | **RESOLVED** | k=4 is the empirical default since S1-M3. `[1,8,64,512]` geometric spacing. S3-M5 adds learned gates for dynamic selection. |
 | **How to assign f_i to each CMS level?** | §7.3 | **RESOLVED** | Fixed `[1,8,64,512]` from geometric spacing (S1-M3). S3-M5 (`dynamic_freq.rs`) adds learned sigmoid gates as alternative. |
-| **Which Llama layers to use for brain transplant?** | §7.3 | **DEFERRED** | Brain transplant path only. Paper says "Given k pre-trained MLPs..." without specifying layer indices. Out of scope for primary training path. |
-| **What happens to Llama attention layers in brain transplant?** | §7.3 | **DEFERRED** | Brain transplant path only. Paper discusses MLPs only. Out of scope for primary training path. |
 
 ---
 
@@ -940,14 +936,15 @@ Complete mapping between ROADMAP milestones and HADES Persephone tasks. Use this
 | Stage 4 Phase 1: Pipeline Scaffolding | 8 | 27 Python + 120 tape/traced/class3 Rust + 1 forget gate probe | COMPLETE |
 | Stage 4 Phase 2: HOPE Build & Serve | 6 milestones (M9–M14) | — | M10-M13 COMPLETE, M14 IN PROGRESS, M9 deferred |
 
-**Current position** (updated 2026-02-24): S0–S3 complete. S3b-Critical complete (all HOPE-path primitives delivered, GAP-E feature maps remaining). S4 Phase 1 complete (M1–M8). **S4 Phase 2 active**: M10 (DGD build path, PR #120), M11 (self-referential build, PRs #115-121), M12 (AdamW outer-loop, PR #118), M13 (HOPE model config, PR #120) all COMPLETE. **M14 (end-to-end validation) IN PROGRESS**: Phase 0 build running on GPU0 (TinyStories 100K steps, d=512, k=4, loss 10.37→4.3 at step 2000). Unified `hecate.py` entry point with GPU-default paradigm (PR #122, draft).
+**Current position** (updated 2026-02-24): S0–S3 complete. S3b-Critical complete (all HOPE-path primitives delivered, GAP-E feature maps remaining). S4 Phase 1 complete (M1–M8). **S4 Phase 2 active**: M10 (DGD build path, PR #120), M11 (self-referential build, PRs #115-121), M12 (AdamW outer-loop, PR #118), M13 (HOPE model config, PR #120) all COMPLETE. **M14 (end-to-end validation) IN PROGRESS**: Phase 0 build running on GPU0 (TinyStories 100K steps, d=512, k=4, loss 10.37→3.78 at step 5000). Unified `hecate.py` entry point with GPU-default paradigm (PR #122, merged).
 
-**HADES graph state**: 7 probes registered in `hope_probes` (forget gate, loss monotonicity, slow-gradient-zero, fast-gradient-nonzero, self-modification-matches-eq88, frozen-state-structural, transplant-integrity). 3 axioms in `hope_axioms` (CMS frequency separation, container-is, container-is-not). 50 tasks closed, 16 open. `hope_blockers`: 2 resolved (k and f_i), 2 deferred (brain transplant only).
+**HADES graph state**: 7 probes registered in `hope_probes` (forget gate, loss monotonicity, slow-gradient-zero, fast-gradient-nonzero, self-modification-matches-eq88, frozen-state-structural, transplant-integrity). 3 axioms in `hope_axioms` (CMS frequency separation, container-is, container-is-not). 50 tasks closed, 16 open. `hope_blockers`: 2 resolved (k and f_i).
 
 **Active fronts**:
 1. **S4-M14 End-to-End Validation** (IN PROGRESS): Phase 0 build running. Post-run: `python validate_run.py runs/phase0_100k.jsonl` checks all 6 hard thresholds.
-2. **PR #122** (DRAFT): Unify build.py + serve.py into hecate.py + engine/ package. GPU-default paradigm. In review.
-3. **GAP-E** (open): Feature maps — `phi(k)` hook and `FeatureMapKind` enum. Last S3b-M3 sub-task.
-4. **S3b-Deferred / Stage 5** (post-HOPE): MIRAS design-space completeness. Retention variants, bias variants, DMGD, FTRL, Implicit GD, NS inner, AdaMuon.
+2. **Curriculum & Data Spec Design**: Applying spec-first rigor to dataset curation. Every dataset requires a hypothesis node in HADES with expected gate behavior.
+3. **Behavioral Probe Execution**: Forget gate probe and DGD monotonicity probe against Phase 0 checkpoint.
+4. **GAP-E** (open): Feature maps — `phi(k)` hook and `FeatureMapKind` enum. Last S3b-M3 sub-task.
+5. **S3b-Deferred / Stage 5** (post-HOPE): MIRAS design-space completeness. Retention variants, bias variants, DMGD, FTRL, Implicit GD, NS inner, AdaMuon.
 
-Total test count: 1379 Rust + 27 Python = **1,406 tests** (121 PRs merged; full `cargo test`).
+Total test count: 1379 Rust + 27 Python = **1,406 tests** (122 PRs merged; full `cargo test`).

@@ -1,8 +1,8 @@
 # NL_Hecate
 
-**Spec-first Rust implementation of the Nested Learning research program**
+**Ab initio Rust implementation of the Nested Learning research program**
 
-Stage 0-2 complete, Stage 3 in progress | ~921 tests | Apache 2.0
+Stages 0–3 complete, Stage 4 active | 1,406 tests | Phase 0 build running | Apache 2.0
 
 ---
 
@@ -10,23 +10,24 @@ Stage 0-2 complete, Stage 3 in progress | ~921 tests | Apache 2.0
 
 NL_Hecate implements the [Nested Learning](https://arxiv.org/abs/2512.24695) research program from the Mirrokni/Behrouz group at Google Research. These papers describe self-modifying neural networks where **optimization IS the forward pass** — there is no train/eval distinction, no external optimizer, no epochs. The memory updates itself at every token, at test time, as part of inference.
 
-This is a **specification-first** implementation: every component traces to a paper equation, and 48 enforced constraints (code smells CS-01 through CS-48) prevent architectural drift. The codebase replaces what PyTorch provides (autograd, optimizer, DataLoader, `model.train()`/`model.eval()`) with a single unified forward pass that handles both learning and inference.
+This is an **ab initio research platform**: models are trained from scratch to study how memory structure emerges from a blank slate. The codebase replaces what PyTorch provides (autograd, optimizer, DataLoader, `model.train()`/`model.eval()`) with a single unified forward pass that handles both learning and inference.
+
+This is a **specification-first** implementation: every component traces to a paper equation via the HADES knowledge graph, and 48 enforced constraints (code smells CS-01 through CS-48) prevent architectural drift.
 
 **Name origin**: Hecate — goddess of crossroads and thresholds — standing at the boundary between conventional ML frameworks and what the NL papers describe.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  Python Tier   PyO3 bindings, orchestration, config     │
-│                No math. Forward→backward→sync→apply.    │
-├─────────────────────────────────────────────────────────┤
-│  Rust Tier     All math, control flow, Wengert tape AD   │
-│                Trait system enforces valid compositions  │
-├─────────────────────────────────────────────────────────┤
-│  CUDA Tier     Kernel pairs (forward + backward)        │
-│                Opaque to AD. Hand-written gradients.    │
-└─────────────────────────────────────────────────────────┘
+Python Tier   PyO3 bindings, orchestration, config
+              hecate.py + engine/ package
+              No math. Forward, backward, sync, apply.
+
+Rust Tier     All math, control flow, Wengert tape AD
+              Trait system enforces valid compositions
+
+CUDA Tier     Kernel pairs (forward + backward)
+              Opaque to AD. Hand-written gradients.
 ```
 
 **Kernel-pair pattern**: Every hot operation has three implementations — (1) Rust reference (portable, AD-compatible), (2) CUDA forward kernel, (3) CUDA backward kernel with analytical gradients from the papers. The Wengert tape (`core/src/tape.rs`) records operations during forward and replays in reverse for gradients. CUDA kernels are registered as opaque VJP blocks with hand-written backward functions.
@@ -46,7 +47,7 @@ Every memory update rule is specified by four orthogonal choices:
 | **Retention** | L2 decay, KL divergence, elastic net, sphere normalization (all pluggable via `RetentionKind`) |
 | **Algorithm** | GD, GD+momentum, Newton-Schulz, FTRL |
 
-Eight named variants implement specific knob combinations: **Titans LMM**, **Delta Rule**, **Hebbian**, **MONETA**, **YAAD**, **MEMORA**, **Lattice OSR**, **Trellis**.
+Nine named variants implement specific knob combinations: **Titans LMM**, **Delta Rule**, **Hebbian**, **MONETA**, **YAAD**, **MEMORA**, **Lattice OSR**, **Trellis**, **Atlas Omega**.
 
 ### [Titans](https://arxiv.org/abs/2501.00663) Composition Patterns
 
@@ -59,6 +60,10 @@ Eight named variants implement specific knob combinations: **Titans LMM**, **Del
 ### Continuous Memory System (CMS)
 
 4 frequency levels with periods [1, 8, 64, 512]. A **Conductor** generates a **Pulse** each step declaring which levels are active. Level 0 fires every token; Level 3 fires every 512th. Output normalization: 1/sqrt(k) for k > 2.
+
+### HOPE Self-Referential Pipeline
+
+The [HOPE](https://arxiv.org/abs/2512.24695) architecture adds self-modification: memory matrices produce their own key/value/query projections via DGD (Depth-wise Gradient Descent), an inner-loop optimizer. Self-generated values (`v_hat = M @ v_t`) and chunkwise frozen snapshots enable the model to modify its own projection geometry during the forward pass.
 
 ### State Lifetimes (Rust ownership enforced)
 
@@ -73,9 +78,13 @@ Eight named variants implement specific knob combinations: **Titans LMM**, **Del
 | Stage | Description | Tests | Status |
 |-------|-------------|-------|--------|
 | **Stage 0** | Foundation — AD spike, SWA pipeline, Delta Rule + MAG | 202 | Complete |
-| **Stage 1** | Algorithm Core — all 8 Miras rules, 3 compositions, CMS k=1/2/4, 5 parallelization strategies, ContextStream, 100K stability sweep, PyO3 bindings | 805 | Complete |
-| **Stage 2** | Production Infra — CUDA kernel pairs, multi-GPU sync, serving, edge deployment, architecture dispatch | ~131 | Complete |
-| **Stage 3** | Extensions — pluggable retention (done), M3 optimizer, CMS variants | 22 | In progress (1/5) |
+| **Stage 1** | Algorithm Core — all 9 Miras rules, 3 compositions, CMS k=1/2/4, 6 parallelization strategies, ContextStream, 100K stability sweep, PyO3 bindings | 805 | Complete |
+| **Stage 2** | Production Infra — CUDA kernel pairs (Delta/Titans/Hebbian/DGD), multi-GPU sync, serving, edge deployment, architecture dispatch | ~131 | Complete |
+| **Stage 3** | Extensions — pluggable retention, M3 optimizer, CMS variants, Atlas Omega, dynamic frequency scheduling | 105 | Complete |
+| **Stage 3b** | Primitive Completeness — 20 specs, DGD + CUDA kernel, self-referential projections, chunkwise training, FrequencyAwareAdamW, Conv1D, HOPE composition wiring | ~114 | Complete (GAP-E feature maps remaining) |
+| **Stage 4** | Build and Serve — pipeline (M1-M8), HOPE build path (M10-M13), unified hecate.py + engine/ package | 27 Python | Phase 2 active |
+
+**Current**: Phase 0 TinyStories 100K build running on GPU (d=512, k=4 CMS, Titans LMM + MAG, adaptive projections, DGD, adamw_gpu). Loss: 10.37 to 3.78 at step 5K. CMS gate biases differentiating across all 4 levels.
 
 See [ROADMAP.md](ROADMAP.md) for per-milestone detail and [PROGRESS_REPORT.md](PROGRESS_REPORT.md) for the executive summary.
 
@@ -109,6 +118,24 @@ cargo build --release --features edge
 cargo build --release --features edge --target wasm32-unknown-unknown --lib
 ```
 
+### Python (build + serve)
+
+```bash
+cd python
+python -m venv .venv && source .venv/bin/activate
+pip install maturin
+maturin develop --release --features cuda
+
+# Build a model
+python hecate.py --build --config configs/phase0_warmup.json
+
+# Chat with a checkpoint
+python hecate.py --chat --checkpoint checkpoints/model.json
+
+# One-shot generation
+python hecate.py --prompt "Once upon a time" --checkpoint checkpoints/model.json
+```
+
 ### Feature Flags
 
 | Feature | What it enables |
@@ -125,23 +152,26 @@ See [docs/build_matrix.md](docs/build_matrix.md) for the full feature combinatio
 
 ```
 NL_Hecate/
-├── specs/                    # Specification suite (read specs/contract.md first)
-│   ├── contract.md           #   Top-level architecture contract
-│   ├── algorithms/           #   Memory rules, composition, retention, parallelization
-│   ├── infrastructure/       #   Differentiation, scheduling, distribution, serving
-│   └── constraints/          #   48 code smell constraints (CS-01 through CS-48)
-├── core/                     # Rust core crate (nl-hecate-core)
-│   ├── src/                  #   31 modules: rules, compositions, retention, CMS, dispatch, ...
-│   ├── kernels/              #   8 CUDA kernels (4 forward + 4 backward)
-│   ├── tests/                #   Integration test suites
-│   └── benches/              #   Criterion benchmarks (edge throughput)
-├── python/                   # PyO3 bindings (nl_hecate Python package, Maturin build)
-│   ├── src/lib.rs            #   PyO3 module: all 8 rules + 3 compositions
-│   └── tests/                #   27 Python tests
-├── docs/                     # Build matrix, architecture dispatch docs
-├── ROADMAP.md                # Milestone-level progress tracking
-├── PROGRESS_REPORT.md        # Executive summary with key discoveries
-└── LICENSE                   # Apache 2.0
+  specs/                    Specification suite (read specs/contract.md first)
+    contract.md               Top-level architecture contract
+    algorithms/               Memory rules, composition, retention, parallelization
+    infrastructure/           Differentiation, scheduling, distribution, serving
+    constraints/              48 code smell constraints (CS-01 through CS-48)
+  core/                     Rust core crate (nl-hecate-core)
+    src/                      50,725 lines: rules, compositions, retention, CMS, dispatch
+    kernels/                  8 CUDA kernels (4 forward + 4 backward)
+    tests/                    1,379 tests
+    benches/                  Criterion benchmarks (edge throughput)
+  python/                   PyO3 bindings + orchestration
+    src/lib.rs                PyO3 module: all 9 rules + 3 compositions
+    engine/                   Build loop, generation, evaluation, config, data, chat
+    hecate.py                 Unified entry point (--build, --chat, --prompt, --interactive)
+    validate_run.py           Post-run validation (6 quantitative thresholds)
+    tests/                    27 Python tests
+  docs/                     Build matrix, architecture dispatch, committee responses
+  ROADMAP.md                Milestone-level progress tracking
+  PROGRESS_REPORT.md        Executive summary with current build status
+  LICENSE                   Apache 2.0
 ```
 
 ## Paper References
@@ -149,12 +179,12 @@ NL_Hecate/
 All components trace to equations in these papers:
 
 | Paper | ArXiv | What NL_Hecate uses from it |
-|-------|-------|-----------------------------|
+|-------|-------|----------------------------|
 | **Titans**: Learning to Memorize at Test Time | [2501.00663](https://arxiv.org/abs/2501.00663) | Delta Rule, Titans LMM, Hebbian, MAG/MAL/MAC |
 | **Miras**: It's All Connected | [2504.13173](https://arxiv.org/abs/2504.13173) | 4-knob framework, MONETA, YAAD, MEMORA |
-| **HOPE / Nested Learning** | [2512.24695](https://arxiv.org/abs/2512.24695) | Self-modifying forward pass, CMS frequency scheduling |
+| **HOPE / Nested Learning** | [2512.24695](https://arxiv.org/abs/2512.24695) | Self-modifying forward pass, CMS frequency scheduling, DGD, self-referential projections |
 | **Lattice**: Learning to Efficiently Compress Memory | [2504.05646](https://arxiv.org/abs/2504.05646) | Lattice OSR, orthogonal state recurrence |
-| **ATLAS**: Learning to Optimally Memorize | [2505.23735](https://arxiv.org/abs/2505.23735) | Atlas Omega rule (stub, Stage 3) |
+| **ATLAS**: Learning to Optimally Memorize | [2505.23735](https://arxiv.org/abs/2505.23735) | Atlas Omega rule (state-independent omega, batch parallel) |
 | **TNT**: Improving Chunkwise Training | [2511.07343](https://arxiv.org/abs/2511.07343) | TNT hierarchical parallelization strategy |
 | **Trellis**: Compress Key-Value Memory | [2512.23852](https://arxiv.org/abs/2512.23852) | Trellis two-pass KV compression |
 
