@@ -2,8 +2,8 @@
 
 ```text
 CONTRACT
-  Purpose:    Initialize CMS levels with pretrained Llama-3.2-1B MLP blocks
-              per HOPE paper section 7.3. This converts a pretrained transformer
+  Purpose:    Initialize CMS levels with pre-trained Llama-3.2-1B MLP blocks
+              per HOPE paper section 7.3. This converts a pre-trained transformer
               into a continual learner by placing its MLP blocks at different CMS
               frequencies, then running continual pre-training.
   Expects:    Llama-3.2-1B weights (HuggingFace), FineWeb-Edu tokenized with
@@ -25,7 +25,7 @@ CONTRACT
 
 HOPE section 7.3 "Ad-hoc Level Stacking: Initializing CMS with Pre-Trained Models":
 
-Given a CMS with {MLP^(f_i)}_{i=1}^{k}, and a set of pretrained MLP
+Given a CMS with {MLP^(f_i)}_{i=1}^{k}, and a set of pre-trained MLP
 blocks {MLP_pretrained_i}_{i=1}^{k}, use Equation 71 to update
 {MLP^(f_i)} in different levels; use the trained parameters
 of {MLP_pretrained_i} as the initial state of CMS blocks:
@@ -35,7 +35,7 @@ MLP_0^(f_i) = MLP_pretrained_i
 ```
 
 The key insight: setting eta_t^(l) toward 0 keeps updated memory close to
-initial state (directly using pretrained blocks without adaptation). Higher
+initial state (directly using pre-trained blocks without adaptation). Higher
 eta allows the block to adapt to its level's context flow. This is the
 mechanism that converts a static transformer into a continual learner.
 
@@ -265,7 +265,7 @@ Python function to load Llama MLP weights into NL_Hecate params:
 ```python
 def load_llama_donor(donor_path, cfg):
     """Load extracted Llama MLP weights into MAGParams."""
-    donor = torch.load(donor_path)
+    donor = torch.load(donor_path, weights_only=True)
     params = nl_hecate.mag_init_params(cfg, seed=42)
 
     for level in range(cfg.k):
@@ -328,11 +328,11 @@ tokens of continual pre-training; we scale proportionally to our data budget.
 | Component | Size (fp32) | Notes |
 |---|---|---|
 | Embeddings (128K x 2048) | ~1,000 MB | Fresh init, tied embed/unembed |
-| SWA (Q/K/V/O) | 128 MB | 32 heads x 4 x 2048 x 64 |
+| SWA (Q/K/V/O) | 64 MB  | 32 heads x 4 x 2048 x 64 |
 | 4 MLP levels | 768 MB | 4 x 3 x 8192 x 2048 x 4B |
 | Gate biases (k=4) | < 1 MB | b_alpha, b_theta, b_eta |
 | Unembed (tied) | 0 MB | Shares embedding weight |
-| **Model params total** | **~1.9 GB** | Embedding dominates at 128K vocab |
+| **Model params total** | **~1.8 GB** | Embedding dominates at 128K vocab |
 | AdamW moments (2x) | ~3.8 GB | m + v buffers |
 | Activations + gradients | ~3-4 GB | seq_len=512, batch=1 |
 | **Total VRAM** | **~9-10 GB** | Fits single 3090 (24GB) |
