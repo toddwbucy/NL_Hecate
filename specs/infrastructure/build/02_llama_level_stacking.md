@@ -30,7 +30,9 @@ blocks {MLP_pretrained_i}_{i=1}^{k}, use Equation 71 to update
 {MLP^(f_i)} in different levels; use the trained parameters
 of {MLP_pretrained_i} as the initial state of CMS blocks:
 
-    MLP_0^(f_i) = MLP_pretrained_i
+```text
+MLP_0^(f_i) = MLP_pretrained_i
+```
 
 The key insight: setting eta_t^(l) toward 0 keeps updated memory close to
 initial state (directly using pretrained blocks without adaptation). Higher
@@ -468,7 +470,7 @@ SwiGLU kernels have **no hard dimension limits**:
    config JSON. Default `[0, 5, 10, 15]` (evenly spaced, diverse representations).
    No Rust changes needed when this is adjusted -- Rust just receives weight tensors.
 
-3. **Tokenizer**: Llama 3 (tiktoken, 128,256 vocab) for this experiment to match
+2. **Tokenizer**: Llama 3 (tiktoken, 128,256 vocab) for this experiment to match
    the donor model. Python-configurable via `"tokenizer"` and `"vocab_size"` in
    the build config; different experiments can swap to a smaller vocabulary
    (e.g., 32K Mistral tokenizer saves ~750MB embedding VRAM) with no Rust changes.
@@ -476,7 +478,7 @@ SwiGLU kernels have **no hard dimension limits**:
 
 ### Deferred to Implementation (Python-tier, no Rust changes)
 
-2. **Donor weight freeze strategy**: All options are Python optimizer logic --
+1. **Donor weight freeze strategy**: All options are Python optimizer logic --
    Rust computes gradients, Python decides what to do with them. Deferred until
    we see what GPU0 (Option 2 theta-floor run) shows about level learning dynamics.
 
