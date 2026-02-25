@@ -15,7 +15,7 @@ CONTRACT
               Full state snapshot/restore adds ~200ms per eval block.
   Trade-off:  Heavier eval vs actually measuring the right thing.
   Position:   specs/infrastructure/build/eval_methodology.md
-  Source:     CS-10 (no mode distinction), FineWeb-Edu k=1/k=4 runs (Feb 2025)
+  Source:     CS-10 (no mode distinction), FineWeb-Edu k=1/k=4 runs (Feb 2026)
 ```
 
 ## Problem Statement
@@ -182,12 +182,11 @@ accumulated M from training chunks isn't contributing to generation quality.
 This is the correct fix — full state snapshot with zero information loss.
 The AdamW state is just two Vec<f32> (m and v buffers) plus a step counter.
 
-**Option B (acceptable for now)**: Accept that AdamW moments will be slightly
-perturbed by the eval probes. After restoring params + context, the AdamW
-moments reflect the eval's gradient history, not the training run's. At eval
-frequency (every 5K steps), this perturbation is negligible — the moments
-will reconverge within ~100 steps. Use this approach until Option A is
-implemented.
+**Option B (implemented)**: Call `gpu_model.reset_optimizer()` after probes to
+clear the corrupted AdamW moments entirely. This zeroes both m/v buffers and
+the step counter, so the next training step lazy-reinitializes them. At eval
+frequency (every 5K steps), the moments reconverge within ~100 steps.
+Option A remains recommended for future implementation.
 
 ### Snapshot Pseudocode
 
@@ -204,7 +203,8 @@ def full_restore(gpu_model, snapshot):
     """Restore complete model state from snapshot."""
     gpu_model.upload_params(snapshot["params"])
     gpu_model.upload_context(snapshot["context"])
-    # gpu_model.upload_adamw(snapshot["adamw"])  # Option A
+    # gpu_model.upload_adamw(snapshot["adamw"])  # Option A (future)
+    # For now: call gpu_model.reset_optimizer() after probes (Option B)
 ```
 
 ## Integration into Build Loop
@@ -235,11 +235,12 @@ try:
         log_within_generation(jsonl, step, prompt, tokens, losses, gnorms)
 
     # Probe 2: cross-exposure adaptation (one prompt, two runs)
-    gpu_model.upload_context(snapshot["context"])  # restore context only
-    # DON'T restore params — they carry learning from Probe 1
-    # Actually: restore everything, then do the two-run test cleanly
+    full_restore(gpu_model, snapshot)  # clean start for Probe 2
+    gpu_model.reset_optimizer()
+    result = probe_cross_exposure(gpu_model, cfg, prompt_ids, ...)
 finally:
     full_restore(gpu_model, snapshot)
+    gpu_model.reset_optimizer()  # probes corrupt AdamW moments
 ```
 
 **Probe frequency**: Probes 1 and 2 at every `eval_every`. Probe 3 at every

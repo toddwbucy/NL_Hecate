@@ -11,7 +11,7 @@ CONTRACT
               No code that violates a smell passes review.
               Smells trace to paper axioms or empirical lessons.
   Cost:       Review overhead. Some smells require custom lints.
-  Trade-off:  47 rules is a lot. But each one was discovered the hard way
+  Trade-off:  50 rules is a lot. But each one was discovered the hard way
               (either from paper analysis or from bugs during implementation).
               The cost of enforcement is lower than the cost of debugging
               framework-contaminated code.

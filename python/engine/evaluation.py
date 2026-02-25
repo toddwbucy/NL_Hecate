@@ -73,7 +73,7 @@ def probe_within_generation(gpu_model, cfg, prompt_ids, tokenizer,
         # Simple linear regression for slope
         mean_x = (n - 1) / 2.0
         mean_y = sum(losses) / n
-        num = sum((i - mean_x) * (l - mean_y) for i, l in enumerate(losses))
+        num = sum((i - mean_x) * (v - mean_y) for i, v in enumerate(losses))
         den = sum((i - mean_x) ** 2 for i in range(n))
         slope = num / den if den > 0 else 0.0
     else:
@@ -327,7 +327,7 @@ def eval_coherence_samples(gpu_model, cfg, max_tokens: int = 30,
     """Generate short completions from fixed prompts to eyeball coherence.
 
     Requires gpu_model (generate routes to KV-cached path with params=None).
-    Uses greedy decoding (temperature=0) for deterministic output.
+    Uses temperature=0.7 sampling for varied output.
     If tokenizer is provided (e.g. BpeTokenizer), uses it; otherwise
     falls back to ByteTokenizer for byte-level models.
     """

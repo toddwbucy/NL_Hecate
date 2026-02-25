@@ -117,8 +117,13 @@ def run_build(bcfg: BuildConfig):
             # Extract step from filename (e.g. model_step25000.json → 25000)
             import re
             m = re.search(r'step(\d+)', bcfg.load)
-            resume_step = int(m.group(1)) if m else 0
-            print(f"  Resuming from step {resume_step} (BPE checkpoint)")
+            if m:
+                resume_step = int(m.group(1))
+                print(f"  Resuming from step {resume_step} (BPE checkpoint)")
+            else:
+                resume_step = 0
+                print(f"  WARNING: no step in filename '{bcfg.load}', "
+                      f"resuming from step 0")
         else:
             params, cfg, build_state = nl_hecate.load_build_checkpoint(bcfg.load)
             if build_state is None:
@@ -504,16 +509,17 @@ def run_build(bcfg: BuildConfig):
 
             if phase_val_data:
                 probe_ctx = gpu_model.to_host_context()
-                gpu_model.reset_context()
-
-                phase_losses = {}
-                for pname, (p_toks, p_tgts) in phase_val_data.items():
-                    pl, _pp = evaluate_numpy(
-                        gpu_model, bcfg, p_toks, p_tgts, max_chunks=10)
-                    phase_losses[pname] = pl
+                try:
                     gpu_model.reset_context()
 
-                gpu_model.upload_context(probe_ctx)
+                    phase_losses = {}
+                    for pname, (p_toks, p_tgts) in phase_val_data.items():
+                        pl, _pp = evaluate_numpy(
+                            gpu_model, bcfg, p_toks, p_tgts, max_chunks=10)
+                        phase_losses[pname] = pl
+                        gpu_model.reset_context()
+                finally:
+                    gpu_model.upload_context(probe_ctx)
 
                 if "stories" in phase_losses and step <= 25000:
                     sl = phase_losses["stories"]
@@ -555,11 +561,13 @@ def run_build(bcfg: BuildConfig):
                     v_model = nl_hecate.GpuModel.from_params(v_params, v_cfg)
                     # Save context before verification forward passes
                     rt_ctx = gpu_model.to_host_context()
-                    v_model.upload_context(rt_ctx)
-                    train_fwd, _ = gpu_model.forward(input_ids, target_ids, pulse)
-                    verify_fwd, _ = v_model.forward(input_ids, target_ids, pulse)
-                    # Restore context after verification (forward modifies M)
-                    gpu_model.upload_context(rt_ctx)
+                    try:
+                        v_model.upload_context(rt_ctx)
+                        train_fwd, _ = gpu_model.forward(input_ids, target_ids, pulse)
+                        verify_fwd, _ = v_model.forward(input_ids, target_ids, pulse)
+                    finally:
+                        # Restore context after verification (forward modifies M)
+                        gpu_model.upload_context(rt_ctx)
                     delta = abs(verify_fwd - train_fwd)
                     if jsonl:
                         jsonl.log(event="checkpoint_roundtrip", step=step,
@@ -593,7 +601,7 @@ def run_build(bcfg: BuildConfig):
                             max_tokens=128, temperature=0.7, lr=bcfg.lr)
                         gen_text = tokenizer.decode(tokens[len(prompt_ids):])
                         preview = gen_text[:80].replace("\n", " ")
-                        valid = [l for l in losses if not math.isnan(l)]
+                        valid = [v for v in losses if not math.isnan(v)]
                         avg_loss = sum(valid) / len(valid) if valid else float('nan')
                         n_gen = len(tokens) - len(prompt_ids)
                         print(f"  [sample] {prompt_text[:40]}... → {preview}...")
