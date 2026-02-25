@@ -274,7 +274,8 @@ SMELL: ctx = [PAD] * (seq_len - len(prompt)) + prompt
        // left-pad short prompts with PAD token (id=2) to fill seq_len
 WHY:   In NL, the memory inner loop processes EVERY token — there is no
        attention mask, no "padding is invisible" assumption. Each position
-       updates M via the Titans recurrence: M_new = α·M - θ·dM.
+       updates M via the Titans recurrence: M_new = α·M - θ·dM
+       (Titans 2501.00663 Eq 3; HOPE 2512.24695 §3 Eq 28).
 
        When 29+ identical tokens are fed into the memory, the recurrence
        becomes a fixed-point iteration on a single (q_t, k_t) pair. For

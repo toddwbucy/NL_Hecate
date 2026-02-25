@@ -65,19 +65,20 @@ def probe_within_generation(gpu_model, cfg, prompt_ids, tokenizer,
 
     gen_text = tokenizer.decode(tokens[len(prompt_ids):]) if tokenizer else ""
 
-    # Compute summary stats
-    n = len(losses)
+    # Compute summary stats (filter NaN before aggregation)
+    valid_losses = [v for v in losses if not math.isnan(v)]
+    n = len(valid_losses)
     if n >= 10:
-        first10 = sum(losses[:10]) / 10
-        last10 = sum(losses[-10:]) / 10
+        first10 = sum(valid_losses[:10]) / 10
+        last10 = sum(valid_losses[-10:]) / 10
         # Simple linear regression for slope
         mean_x = (n - 1) / 2.0
-        mean_y = sum(losses) / n
-        num = sum((i - mean_x) * (v - mean_y) for i, v in enumerate(losses))
+        mean_y = sum(valid_losses) / n
+        num = sum((i - mean_x) * (v - mean_y) for i, v in enumerate(valid_losses))
         den = sum((i - mean_x) ** 2 for i in range(n))
         slope = num / den if den > 0 else 0.0
     else:
-        first10 = sum(losses) / max(len(losses), 1)
+        first10 = sum(valid_losses) / max(n, 1)
         last10 = first10
         slope = 0.0
 
@@ -119,7 +120,8 @@ def probe_cross_exposure(gpu_model, cfg, prompt_ids, tokenizer,
         conductor=make_conductor(), lr=lr,
     )
     text1 = tokenizer.decode(tokens1[len(prompt_ids):]) if tokenizer else ""
-    avg1 = sum(losses1) / max(len(losses1), 1)
+    valid1 = [v for v in losses1 if math.isfinite(v)]
+    avg1 = sum(valid1) / len(valid1) if valid1 else float("nan")
 
     # Run 2: reset context but KEEP updated params
     gpu_model.reset_context()
@@ -129,10 +131,11 @@ def probe_cross_exposure(gpu_model, cfg, prompt_ids, tokenizer,
         conductor=make_conductor(), lr=lr,
     )
     text2 = tokenizer.decode(tokens2[len(prompt_ids):]) if tokenizer else ""
-    avg2 = sum(losses2) / max(len(losses2), 1)
+    valid2 = [v for v in losses2 if math.isfinite(v)]
+    avg2 = sum(valid2) / len(valid2) if valid2 else float("nan")
 
     improvement = avg1 - avg2
-    improvement_pct = (improvement / avg1 * 100) if avg1 > 0 else 0.0
+    improvement_pct = (improvement / avg1 * 100) if (math.isfinite(avg1) and avg1 > 0) else float("nan")
 
     return {
         "run1_avg_loss": avg1,
@@ -144,7 +147,7 @@ def probe_cross_exposure(gpu_model, cfg, prompt_ids, tokenizer,
     }
 
 
-def probe_context_value(gpu_model, cfg, prompt_ids, snapshot, tokenizer,
+def probe_context_value(gpu_model, cfg, prompt_ids, snapshot,
                         max_tokens=30, temperature=0.7, lr=0.0006,
                         conductor_factory=None):
     """Probe 3: Does accumulated training context help generation?
@@ -168,11 +171,13 @@ def probe_context_value(gpu_model, cfg, prompt_ids, snapshot, tokenizer,
         max_tokens=max_tokens, temperature=temperature,
         conductor=make_conductor(), lr=lr,
     )
-    cold_avg = sum(cold_losses) / max(len(cold_losses), 1)
+    valid_cold = [v for v in cold_losses if math.isfinite(v)]
+    cold_avg = sum(valid_cold) / len(valid_cold) if valid_cold else float("nan")
 
     # Restore params (cold run modified them), keep training context
     gpu_model.upload_params(snapshot["params"])
     gpu_model.upload_context(snapshot["context"])
+    gpu_model.reset_optimizer()  # cold run corrupts AdamW moments
 
     # Warm start: accumulated training M
     _, warm_losses, _ = generate_learning(
@@ -180,7 +185,8 @@ def probe_context_value(gpu_model, cfg, prompt_ids, snapshot, tokenizer,
         max_tokens=max_tokens, temperature=temperature,
         conductor=make_conductor(), lr=lr,
     )
-    warm_avg = sum(warm_losses) / max(len(warm_losses), 1)
+    valid_warm = [v for v in warm_losses if math.isfinite(v)]
+    warm_avg = sum(valid_warm) / len(valid_warm) if valid_warm else float("nan")
 
     return {
         "cold_avg_loss": cold_avg,

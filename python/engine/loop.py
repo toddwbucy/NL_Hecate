@@ -142,6 +142,26 @@ def run_build(bcfg: BuildConfig):
         bcfg.self_generated_values = cfg.self_generated_values
         bcfg.self_ref_chunk_size = cfg.self_ref_chunk_size
         bcfg.momentum_d_hidden = cfg.momentum_d_hidden
+        # Apply theta clamps from BuildConfig onto loaded cfg (allows
+        # adding clamps to an existing checkpoint that didn't have them).
+        # MAGConfig is frozen, so rebuild if clamps changed.
+        if bcfg.theta_floor is not None or bcfg.theta_ceil is not None:
+            cfg = nl_hecate.MAGConfig(
+                d_model=cfg.d_model, num_heads=cfg.num_heads,
+                head_dim=cfg.head_dim, seq_len=cfg.seq_len,
+                window_size=cfg.window_size, vocab_size=cfg.vocab_size,
+                memory_enabled=cfg.memory_enabled, k=cfg.k,
+                chunk_sizes=list(cfg.chunk_sizes),
+                memory_rule=cfg.memory_rule, composition=cfg.composition,
+                checkpoint_interval=bcfg.checkpoint_interval,
+                projection_kind=cfg.projection_kind,
+                self_generated_values=cfg.self_generated_values,
+                self_ref_chunk_size=cfg.self_ref_chunk_size,
+                momentum_kind=cfg.momentum_kind,
+                momentum_d_hidden=cfg.momentum_d_hidden,
+                theta_floor=bcfg.theta_floor,
+                theta_ceil=bcfg.theta_ceil,
+            )
     else:
         cfg = nl_hecate.MAGConfig(
             d_model=bcfg.d_model,
@@ -161,6 +181,8 @@ def run_build(bcfg: BuildConfig):
             self_ref_chunk_size=bcfg.self_ref_chunk_size,
             momentum_kind=bcfg.momentum_kind,
             momentum_d_hidden=bcfg.momentum_d_hidden,
+            theta_floor=bcfg.theta_floor,
+            theta_ceil=bcfg.theta_ceil,
         )
         params = nl_hecate.mag_init_params(cfg, bcfg.seed)
 
@@ -180,6 +202,8 @@ def run_build(bcfg: BuildConfig):
     if bcfg.momentum_kind != "none":
         print(f"  Momentum: kind={bcfg.momentum_kind}, "
               f"d_hidden={bcfg.momentum_d_hidden}")
+    if bcfg.theta_floor is not None or bcfg.theta_ceil is not None:
+        print(f"  θ clamps: floor={bcfg.theta_floor}, ceil={bcfg.theta_ceil}")
     print(f"  Params:   {params.num_params():,}")
     data_len = len(bpe_loader) if use_bpe else len(token_ids)
     print(f"  Data:     {data_len:,} tokens" +
@@ -466,6 +490,7 @@ def run_build(bcfg: BuildConfig):
 
                     # Probe 2: cross-exposure adaptation (first prompt only)
                     full_restore(gpu_model, snapshot)
+                    gpu_model.reset_optimizer()  # probe1 corrupts AdamW moments
                     prompt_text = EVAL_PROMPTS[0]
                     prompt_ids = tokenizer.encode(prompt_text)
                     xresult = probe_cross_exposure(
@@ -616,7 +641,7 @@ def run_build(bcfg: BuildConfig):
                     prompt_text = EVAL_PROMPTS[0]
                     prompt_ids = tokenizer.encode(prompt_text)
                     cresult = probe_context_value(
-                        gpu_model, cfg, prompt_ids, ckpt_snapshot, tokenizer,
+                        gpu_model, cfg, prompt_ids, ckpt_snapshot,
                         max_tokens=30, temperature=0.7, lr=bcfg.lr)
                     print(f"  [probe3] cold={cresult['cold_avg_loss']:.4f} "
                           f"warm={cresult['warm_avg_loss']:.4f} "

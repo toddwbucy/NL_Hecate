@@ -67,7 +67,7 @@ Three areas where Python cannot reach existing Rust primitives:
 --   "static"   → ProjectionKind::Static  (Phase 1: standard projections)
 --   "adaptive" → ProjectionKind::Adaptive (Phase 2+: memory-based projections)
 --   "none"     → MomentumKind::None
---   "ema"      → MomentumKind::Ema
+--   "ema"      → MomentumKind::EMA
 
 -- Validation:
 --   self_generated_values requires projection_kind == "adaptive"
@@ -101,6 +101,7 @@ momentum_d_hidden: int = 0                 -- momentum MLP hidden dim
 ## Config JSON Schema
 
 ```text
+-- Pseudocode (not valid JSON — // comments used for annotation only).
 -- Reference: configs/hope_60m.json
 -- Layout follows existing config convention (model/build/data sections).
 

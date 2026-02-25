@@ -1,6 +1,6 @@
 # Eval Methodology for Non-Stationary Models
 
-```
+```text
 CONTRACT
   Purpose:    Define how to measure a model that learns during inference.
               Conventional eval (freeze weights, run forward, measure loss)
@@ -50,7 +50,7 @@ show it because eval tests a mode the model was never designed for.
 **Question**: Does the model get better at predicting tokens as it generates?
 
 **Method**:
-```
+```text
 1. Save full state (params + context + adamw_state)
 2. reset_context()
 3. Run generate_learning(prompt, max_tokens=60)
@@ -90,7 +90,7 @@ loop — important failure mode to detect).
 the same prompt, because it learned from the first exposure?
 
 **Method**:
-```
+```text
 1. Save full state
 2. reset_context()
 3. Run generate_learning(prompt, max_tokens=30) → output_1, losses_1
@@ -138,7 +138,7 @@ also contributes. Compare:
 **Question**: Does memory accumulated during training help generation?
 
 **Method**:
-```
+```text
 1. Save full state (which includes accumulated training context)
 2. Cold start: reset_context() → generate_learning(prompt) → losses_cold
 3. Restore full state

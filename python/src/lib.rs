@@ -1635,6 +1635,9 @@ impl GpuModel {
                      eps: f32, weight_decay: f32, max_grad_norm: f32) -> PyResult<(f32, f32, Vec<f32>)> {
         let s = self.cfg.swa.seq_len;
         let v = self.cfg.swa.vocab_size;
+        if s == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err("seq_len must be > 0"));
+        }
         if input_ids.len() != s || target_ids.len() != s {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 format!("input/target length must be seq_len {}", s)));
