@@ -27,7 +27,7 @@
   },
   "data": {
     "path": "data/fineweb_edu_llama3",
-    "format": "byte"
+    "format": "sharegpt"
   },
   "donor_layers": [0, 5, 10, 15],
   "donor_weights": "checkpoints/llama_mlp_donor.pt",

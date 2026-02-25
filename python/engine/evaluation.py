@@ -120,7 +120,7 @@ def probe_cross_exposure(gpu_model, cfg, prompt_ids, tokenizer,
         conductor=make_conductor(), lr=lr,
     )
     text1 = tokenizer.decode(tokens1[len(prompt_ids):]) if tokenizer else ""
-    valid1 = [v for v in losses1 if not math.isnan(v)]
+    valid1 = [v for v in losses1 if not (math.isnan(v) or math.isinf(v))]
     avg1 = sum(valid1) / max(len(valid1), 1)
 
     # Run 2: reset context but KEEP updated params
@@ -131,7 +131,7 @@ def probe_cross_exposure(gpu_model, cfg, prompt_ids, tokenizer,
         conductor=make_conductor(), lr=lr,
     )
     text2 = tokenizer.decode(tokens2[len(prompt_ids):]) if tokenizer else ""
-    valid2 = [v for v in losses2 if not math.isnan(v)]
+    valid2 = [v for v in losses2 if not (math.isnan(v) or math.isinf(v))]
     avg2 = sum(valid2) / max(len(valid2), 1)
 
     improvement = avg1 - avg2
@@ -171,7 +171,7 @@ def probe_context_value(gpu_model, cfg, prompt_ids, snapshot,
         max_tokens=max_tokens, temperature=temperature,
         conductor=make_conductor(), lr=lr,
     )
-    valid_cold = [v for v in cold_losses if not math.isnan(v)]
+    valid_cold = [v for v in cold_losses if not (math.isnan(v) or math.isinf(v))]
     cold_avg = sum(valid_cold) / max(len(valid_cold), 1)
 
     # Restore params (cold run modified them) and optimizer state, keep training context
@@ -185,7 +185,7 @@ def probe_context_value(gpu_model, cfg, prompt_ids, snapshot,
         max_tokens=max_tokens, temperature=temperature,
         conductor=make_conductor(), lr=lr,
     )
-    valid_warm = [v for v in warm_losses if not math.isnan(v)]
+    valid_warm = [v for v in warm_losses if not (math.isnan(v) or math.isinf(v))]
     warm_avg = sum(valid_warm) / max(len(valid_warm), 1)
 
     return {

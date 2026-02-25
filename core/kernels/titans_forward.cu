@@ -30,6 +30,13 @@ static inline void check_cuda_launch(const char* kernel_name, int d, int smem_by
     }
 }
 
+static inline void check_cuda_alloc(const char* tag, cudaError_t err) {
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[NL_Hecate FATAL] %s: %s\n", tag, cudaGetErrorString(err));
+        abort();
+    }
+}
+
 __global__ void titans_forward_kernel(
     const float* __restrict__ k_mem,      // [seq_len, d]
     const float* __restrict__ v_mem,      // [seq_len, d]
@@ -229,8 +236,10 @@ extern "C" void titans_forward_ckpt_f32_cuda(
     // Allocate M and S workspaces
     float* m_work = nullptr;
     float* s_work = nullptr;
-    cudaMalloc(&m_work, dd * sizeof(float));
-    cudaMalloc(&s_work, dd * sizeof(float));
+    check_cuda_alloc("titans_forward_ckpt: cudaMalloc m_work",
+                     cudaMalloc(&m_work, dd * sizeof(float)));
+    check_cuda_alloc("titans_forward_ckpt: cudaMalloc s_work",
+                     cudaMalloc(&s_work, dd * sizeof(float)));
 
     titans_forward_ckpt_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, eta,
@@ -238,7 +247,8 @@ extern "C" void titans_forward_ckpt_f32_cuda(
         m_work, s_work, seq_len, d, checkpoint_interval);
     check_cuda_launch("titans_forward_ckpt_kernel", d, smem_bytes);
 
-    cudaDeviceSynchronize();
+    check_cuda_alloc("titans_forward_ckpt: cudaDeviceSynchronize",
+                     cudaDeviceSynchronize());
     cudaFree(m_work);
     cudaFree(s_work);
 }

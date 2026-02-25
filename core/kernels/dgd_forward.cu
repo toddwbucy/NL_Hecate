@@ -39,6 +39,13 @@ static inline void check_cuda_launch(const char* kernel_name, int d, int smem_by
     }
 }
 
+static inline void check_cuda_alloc(const char* tag, cudaError_t err) {
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[NL_Hecate FATAL] %s: %s\n", tag, cudaGetErrorString(err));
+        abort();
+    }
+}
+
 __global__ void dgd_forward_kernel(
     const float* __restrict__ k_mem,      // [seq_len, d]
     const float* __restrict__ v_mem,      // [seq_len, d]
@@ -218,14 +225,16 @@ extern "C" void dgd_forward_ckpt_f32_cuda(
     int smem_bytes = 2 * d * sizeof(float);
 
     float* m_work = nullptr;
-    cudaMalloc(&m_work, dd * sizeof(float));
+    check_cuda_alloc("dgd_forward_ckpt: cudaMalloc m_work",
+                     cudaMalloc(&m_work, dd * sizeof(float)));
 
     dgd_forward_ckpt_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_initial,
         m_states, y, m_work, seq_len, d, checkpoint_interval);
     check_cuda_launch("dgd_forward_ckpt_kernel", d, smem_bytes);
 
-    cudaDeviceSynchronize();
+    check_cuda_alloc("dgd_forward_ckpt: cudaDeviceSynchronize",
+                     cudaDeviceSynchronize());
     cudaFree(m_work);
 }
 

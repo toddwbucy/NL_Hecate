@@ -249,6 +249,7 @@ fn initial_memory_state(cfg: &MAGConfig, d: usize) -> Vec<f32> {
         MemoryRuleKind::Trellis => {
             vec![0.0f32; 2 * cfg.d_compress * d]
         }
+        MemoryRuleKind::SwiGluMlp => vec![],
         _ => vec![0.0f32; d * d],
     }
 }

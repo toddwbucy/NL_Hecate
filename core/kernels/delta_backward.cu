@@ -41,6 +41,13 @@ static inline void check_cuda_launch(const char* kernel_name, int d, int smem_by
     }
 }
 
+static inline void check_cuda_alloc(const char* tag, cudaError_t err) {
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[NL_Hecate FATAL] %s: %s\n", tag, cudaGetErrorString(err));
+        abort();
+    }
+}
+
 __global__ void delta_backward_kernel(
     const float* __restrict__ k_mem,      // [seq_len, d]
     const float* __restrict__ v_mem,      // [seq_len, d]
@@ -406,7 +413,8 @@ extern "C" void delta_backward_segment_f32_cuda(
 
     // Allocate d_M workspace in global memory
     float* d_M_work = nullptr;
-    cudaMalloc(&d_M_work, dd * sizeof(float));
+    check_cuda_alloc("delta_backward_segment: cudaMalloc d_M_work",
+                     cudaMalloc(&d_M_work, dd * sizeof(float)));
 
     delta_backward_segment_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_states, d_y,
@@ -415,7 +423,8 @@ extern "C" void delta_backward_segment_f32_cuda(
         d_M_work, t_start, t_end, d);
     check_cuda_launch("delta_backward_segment_kernel", d, smem_bytes);
 
-    cudaDeviceSynchronize();
+    check_cuda_alloc("delta_backward_segment: cudaDeviceSynchronize",
+                     cudaDeviceSynchronize());
     cudaFree(d_M_work);
 }
 
@@ -444,7 +453,8 @@ extern "C" void delta_backward_f32_cuda(
 
     // Allocate d_M workspace in global memory
     float* d_M_work = nullptr;
-    cudaMalloc(&d_M_work, dd * sizeof(float));
+    check_cuda_alloc("delta_backward: cudaMalloc d_M_work",
+                     cudaMalloc(&d_M_work, dd * sizeof(float)));
 
     delta_backward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_states, d_y,
@@ -452,6 +462,7 @@ extern "C" void delta_backward_f32_cuda(
         d_M_work, seq_len, d);
     check_cuda_launch("delta_backward_kernel", d, smem_bytes);
 
-    cudaDeviceSynchronize();
+    check_cuda_alloc("delta_backward: cudaDeviceSynchronize",
+                     cudaDeviceSynchronize());
     cudaFree(d_M_work);
 }
