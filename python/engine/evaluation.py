@@ -1,4 +1,4 @@
-"""Evaluation utilities: val loss, coherence samples, checkpoint-time generation."""
+"""Evaluation utilities: val loss, learning probes, checkpoint-time generation."""
 
 import math
 
@@ -13,12 +13,180 @@ SAMPLE_PROMPTS = [
     "Write a short poem about the ocean.",
 ]
 
-# Short prompts for eval-time coherence check (byte-level friendly)
+# Eval prompts matched to FineWeb-Edu domain (educational text)
 EVAL_PROMPTS = [
-    "Once upon a time",
-    "The meaning of life is",
-    "In the beginning",
+    "The process of",
+    "In mathematics,",
+    "Scientists discovered that",
+    "The history of",
 ]
+
+
+# ── Full state snapshot/restore (CS-49 superset) ─────────────────
+
+def full_snapshot(gpu_model):
+    """Save complete model state for later restoration.
+
+    Captures params (outer-loop) and context (inner-loop M matrices).
+    AdamW moment buffers are NOT captured (Option B from eval spec) —
+    the minor perturbation reconverges within ~100 training steps.
+    """
+    return {
+        "params": gpu_model.to_host_params(),
+        "context": gpu_model.to_host_context(),
+    }
+
+
+def full_restore(gpu_model, snapshot):
+    """Restore complete model state from snapshot."""
+    gpu_model.upload_params(snapshot["params"])
+    gpu_model.upload_context(snapshot["context"])
+
+
+# ── Learning probes (CS-10 compliant eval) ────────────────────────
+
+def probe_within_generation(gpu_model, cfg, prompt_ids, tokenizer,
+                            max_tokens=60, temperature=0.7, lr=0.0006,
+                            conductor=None):
+    """Probe 1: Does the model learn during generation?
+
+    Runs generate_learning() and returns per-token loss trajectory.
+    The model updates params on every generated token — if loss decreases
+    over the span, the NL mechanism is working.
+    """
+    from engine.generation import generate_learning
+
+    gpu_model.reset_context()
+    tokens, losses, gnorms = generate_learning(
+        gpu_model, cfg, list(prompt_ids),
+        max_tokens=max_tokens, temperature=temperature,
+        conductor=conductor, lr=lr,
+    )
+
+    gen_text = tokenizer.decode(tokens[len(prompt_ids):]) if tokenizer else ""
+
+    # Compute summary stats
+    n = len(losses)
+    if n >= 10:
+        first10 = sum(losses[:10]) / 10
+        last10 = sum(losses[-10:]) / 10
+        # Simple linear regression for slope
+        mean_x = (n - 1) / 2.0
+        mean_y = sum(losses) / n
+        num = sum((i - mean_x) * (v - mean_y) for i, v in enumerate(losses))
+        den = sum((i - mean_x) ** 2 for i in range(n))
+        slope = num / den if den > 0 else 0.0
+    else:
+        first10 = sum(losses) / max(len(losses), 1)
+        last10 = first10
+        slope = 0.0
+
+    return {
+        "token_losses": losses,
+        "token_grad_norms": gnorms,
+        "generated_text": gen_text,
+        "loss_slope": slope,
+        "loss_first10_avg": first10,
+        "loss_last10_avg": last10,
+        "n_tokens": n,
+    }
+
+
+def probe_cross_exposure(gpu_model, cfg, prompt_ids, tokenizer,
+                         max_tokens=30, temperature=0.7, lr=0.0006,
+                         conductor_factory=None):
+    """Probe 2: Does the model adapt across repeated exposures?
+
+    Runs generate_learning() twice on the same prompt WITHOUT restoring
+    params between runs (only resets context). If run 2 produces lower
+    loss, the outer-loop updates from run 1 transferred.
+
+    This is the definitive NL test — no transformer can do this.
+    """
+    from engine.generation import generate_learning
+
+    def make_conductor():
+        if conductor_factory:
+            return conductor_factory()
+        return nl_hecate.Conductor(
+            cfg.k, list(cfg.chunk_sizes) if hasattr(cfg, 'chunk_sizes') else [1] * cfg.k)
+
+    # Run 1: cold start
+    gpu_model.reset_context()
+    tokens1, losses1, _ = generate_learning(
+        gpu_model, cfg, list(prompt_ids),
+        max_tokens=max_tokens, temperature=temperature,
+        conductor=make_conductor(), lr=lr,
+    )
+    text1 = tokenizer.decode(tokens1[len(prompt_ids):]) if tokenizer else ""
+    avg1 = sum(losses1) / max(len(losses1), 1)
+
+    # Run 2: reset context but KEEP updated params
+    gpu_model.reset_context()
+    tokens2, losses2, _ = generate_learning(
+        gpu_model, cfg, list(prompt_ids),
+        max_tokens=max_tokens, temperature=temperature,
+        conductor=make_conductor(), lr=lr,
+    )
+    text2 = tokenizer.decode(tokens2[len(prompt_ids):]) if tokenizer else ""
+    avg2 = sum(losses2) / max(len(losses2), 1)
+
+    improvement = avg1 - avg2
+    improvement_pct = (improvement / avg1 * 100) if avg1 > 0 else 0.0
+
+    return {
+        "run1_avg_loss": avg1,
+        "run2_avg_loss": avg2,
+        "improvement": improvement,
+        "improvement_pct": improvement_pct,
+        "run1_text": text1,
+        "run2_text": text2,
+    }
+
+
+def probe_context_value(gpu_model, cfg, prompt_ids, snapshot, tokenizer,
+                        max_tokens=30, temperature=0.7, lr=0.0006,
+                        conductor_factory=None):
+    """Probe 3: Does accumulated training context help generation?
+
+    Compares generate_learning() with fresh M (cold) vs accumulated
+    training M (warm). If warm produces lower loss, the memory built
+    during training is contributing to generation quality.
+    """
+    from engine.generation import generate_learning
+
+    def make_conductor():
+        if conductor_factory:
+            return conductor_factory()
+        return nl_hecate.Conductor(
+            cfg.k, list(cfg.chunk_sizes) if hasattr(cfg, 'chunk_sizes') else [1] * cfg.k)
+
+    # Cold start: fresh M
+    gpu_model.reset_context()
+    _, cold_losses, _ = generate_learning(
+        gpu_model, cfg, list(prompt_ids),
+        max_tokens=max_tokens, temperature=temperature,
+        conductor=make_conductor(), lr=lr,
+    )
+    cold_avg = sum(cold_losses) / max(len(cold_losses), 1)
+
+    # Restore params (cold run modified them), keep training context
+    gpu_model.upload_params(snapshot["params"])
+    gpu_model.upload_context(snapshot["context"])
+
+    # Warm start: accumulated training M
+    _, warm_losses, _ = generate_learning(
+        gpu_model, cfg, list(prompt_ids),
+        max_tokens=max_tokens, temperature=temperature,
+        conductor=make_conductor(), lr=lr,
+    )
+    warm_avg = sum(warm_losses) / max(len(warm_losses), 1)
+
+    return {
+        "cold_avg_loss": cold_avg,
+        "warm_avg_loss": warm_avg,
+        "context_benefit": cold_avg - warm_avg,
+    }
 
 
 def evaluate(gpu_model, bcfg, val_loader,
@@ -159,7 +327,7 @@ def eval_coherence_samples(gpu_model, cfg, max_tokens: int = 30,
     """Generate short completions from fixed prompts to eyeball coherence.
 
     Requires gpu_model (generate routes to KV-cached path with params=None).
-    Uses greedy decoding (temperature=0) for deterministic output.
+    Uses temperature=0.7 sampling for varied output.
     If tokenizer is provided (e.g. BpeTokenizer), uses it; otherwise
     falls back to ByteTokenizer for byte-level models.
     """
@@ -173,7 +341,7 @@ def eval_coherence_samples(gpu_model, cfg, max_tokens: int = 30,
         prompt_ids = tok.encode(prompt)
         out_ids = generate(
             params=None, cfg=cfg, prompt_tokens=prompt_ids,
-            max_tokens=max_tokens, temperature=0.0,
+            max_tokens=max_tokens, temperature=0.7,
             gpu_model=gpu_model,
         )
         gen_text = tok.decode(out_ids[len(prompt_ids):])

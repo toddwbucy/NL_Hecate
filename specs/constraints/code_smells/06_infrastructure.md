@@ -1,4 +1,4 @@
-# Infrastructure Code Smells (CS-39 through CS-48)
+# Infrastructure Code Smells (CS-39 through CS-50)
 
 ```
 CONTRACT
@@ -15,7 +15,8 @@ CONTRACT
   Trade-off:  Some GPU optimization techniques (checkpointing, DDP) are off-limits.
   Position:   specs/constraints/code_smells/06_infrastructure.md
   Source:     Track A experience; nl_code_smells CS-39 through CS-47;
-              committee review cycle (CS-48)
+              committee review cycle (CS-48);
+              FineWeb-Edu k=4 NaN crash (CS-49)
 ```
 
 ## CS-39: Learnable Decay Parameters Must Be Clamped [CRITICAL]
@@ -217,4 +218,100 @@ FIX:   Each CMS level gets its own retention parameters.
        independently by its own gradient stream.
 SEVERITY: Warning — silent performance degradation, not crash
 TRACE: Committee review cycle; frequency scheduler error buffer analysis
+```
+
+## CS-49: Generation Through Training Model Corrupts Context [CRITICAL]
+
+```
+SMELL: samples = generate(gpu_model, prompt, max_tokens=30)
+       // autoregressive generation through the live training model
+       // without saving and restoring M matrix context
+WHY:   Every forward() call mutates the CMS context (M matrices) — this
+       is by design (memory updates ARE the forward pass). Autoregressive
+       generation runs N forward calls (one per generated token), each
+       modifying M. If this happens through the training model without
+       context isolation, the training M state is overwritten with
+       generation artifacts.
+
+       In NL, this is uniquely dangerous because:
+       - M matrices are inner-loop state that accumulates across the
+         entire build — they represent learned episodic memory
+       - Generation injects random/sampled tokens into M, corrupting
+         the carefully accumulated state
+       - With k=4 (four CMS levels), four M matrices are trashed
+         simultaneously — NaN propagation is near-certain
+       - The corruption is SILENT: no error is raised, training
+         continues on garbage state until NaN appears steps later
+
+       This was discovered when k=4 FineWeb-Edu crashed at step 5001:
+       the eval block ran coherence samples and checkpoint sample
+       generation through the training gpu_model, destroying context.
+       The subsequent roundtrip verification ran forward() on trashed
+       M and produced NaN.
+
+FIX:   ALWAYS bracket generation calls with context save/restore:
+       ctx = gpu_model.to_host_context()
+       try:
+           gpu_model.reset_context()  // clean M for generation
+           samples = generate(gpu_model, ...)
+       finally:
+           gpu_model.upload_context(ctx)  // restore training M
+
+       This applies to ANY operation that runs forward() outside the
+       training loop: eval coherence samples, checkpoint sample
+       generation, interactive probes, curriculum phase probes.
+       The Python tier owns this invariant — the Rust tier correctly
+       mutates M on every forward() as designed (CS-18).
+SEVERITY: CRITICAL — silent context corruption → NaN within steps
+TRACE: FineWeb-Edu k=4 NaN crash at step 5001; gpu_forward.rs copy_final_m;
+       engine/loop.py eval/checkpoint block
+```
+
+## CS-50: Left-Padding With Untrained Tokens Causes Memory Divergence [CRITICAL]
+
+```
+SMELL: ctx = [PAD] * (seq_len - len(prompt)) + prompt
+       // left-pad short prompts with PAD token (id=2) to fill seq_len
+WHY:   In NL, the memory inner loop processes EVERY token — there is no
+       attention mask, no "padding is invisible" assumption. Each position
+       updates M via the Titans recurrence: M_new = α·M - θ·dM.
+
+       When 29+ identical tokens are fed into the memory, the recurrence
+       becomes a fixed-point iteration on a single (q_t, k_t) pair. For
+       tokens whose embeddings produce ||q_t||² large enough that
+       θ·||q_t||² > (1 - α)/2, the iteration diverges — M elements grow
+       without bound, producing NaN in logits at subsequent positions.
+
+       Special tokens (0=<|im_start|>, 1=<|im_end|>, 2=<|pad|>) are
+       particularly vulnerable because:
+       - Their embeddings are shaped by narrow distributional context
+         (always at turn boundaries in ChatML, or never seen at all for PAD)
+       - The W_K_mem / W_V_mem projections of these embeddings may produce
+         vectors with unusual norm profiles
+       - 508 identical PADs means 508 identical memory updates — any
+         instability in the recurrence is amplified 508×
+
+       Discovered in FineWeb-Edu k=4 probes: generate_learning() left-padded
+       short eval prompts with PAD=2. All probe losses were NaN. The model
+       generated tokens ("Zap") from the last position (which hadn't
+       diverged yet), but cross-entropy at diverged positions was NaN.
+
+       The threshold is sharp: 28 identical special tokens → OK,
+       29 identical special tokens → NaN at positions 29+. Regular tokens
+       (id ≥ 3) do NOT trigger this even at 512 repetitions.
+
+FIX:   Never left-pad with special tokens. Use the prompt's first token
+       (if id ≥ 3) or a common BPE token (id=3) as padding:
+       safe_pad = prompt[0] if prompt[0] >= 3 else 3
+       ctx = [safe_pad] * pad_len + prompt
+
+       This ensures padding uses tokens the model has been trained on,
+       with embedding values that produce stable memory dynamics.
+
+       Long-term: consider adding gradient clipping or norm clamping
+       inside the Titans inner loop to prevent memory divergence on
+       ANY repeated input, not just special tokens.
+SEVERITY: CRITICAL — guaranteed NaN for any short prompt with PAD left-padding
+TRACE: FineWeb-Edu k=4 probe NaN; diag_nan threshold test (28→29 transition);
+       engine/generation.py generate_learning/generate_cached/generate
 ```
