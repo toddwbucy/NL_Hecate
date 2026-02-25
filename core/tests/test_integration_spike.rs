@@ -73,6 +73,9 @@ fn spike_config_a() -> MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+        intermediate_size: 0,
     }
 }
 
@@ -110,6 +113,9 @@ fn spike_config_b() -> MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+        intermediate_size: 0,
     }
 }
 
@@ -147,6 +153,9 @@ fn spike_config_c() -> MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+        intermediate_size: 0,
     }
 }
 
@@ -178,6 +187,7 @@ fn context_memory_size(cfg: &MAGConfig) -> usize {
         }
         MemoryRuleKind::LatticeOSR => cfg.m_slots * d,
         MemoryRuleKind::Trellis => 2 * cfg.d_compress * d,
+        MemoryRuleKind::SwiGluMlp => 0, // no inner-loop M state
     }
 }
 
@@ -708,6 +718,10 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
                 // d_compress > 0, d_compress <= d_model, lambda_k/v for decay
                 (0, 2.0, 2.0, 0.0, 0.0, 1.0, 0, 4, 0.01, 0.01)
             }
+            MemoryRuleKind::SwiGluMlp => {
+                // SwiGluMlp: no attentional bias parameters (MLP handles everything)
+                (0, 2.0, 2.0, 0.0, 0.0, 1.0, 0, 0, 0.0, 0.0)
+            }
         };
 
     MAGConfig {
@@ -747,6 +761,10 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+        // SwiGluMlp requires intermediate_size > 0; other rules don't use it.
+        intermediate_size: if rule == MemoryRuleKind::SwiGluMlp { 4 * swa.d_model } else { 0 },
     }
 }
 
@@ -762,6 +780,7 @@ fn rule_family(rule: &MemoryRuleKind) -> &'static str {
         | MemoryRuleKind::MEMORA => "mlp",
         MemoryRuleKind::LatticeOSR
         | MemoryRuleKind::Trellis => "compression",
+        MemoryRuleKind::SwiGluMlp => "swiglu",
     }
 }
 

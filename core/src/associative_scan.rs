@@ -437,6 +437,7 @@ pub fn hebbian_scan_backward(
         m_eta_init: vec![],
         m_alpha_init: vec![],
         m_mem_init: vec![],
+        gate_proj: vec![], up_proj: vec![], down_proj: vec![],
     };
 
     (grads, d_embedded)

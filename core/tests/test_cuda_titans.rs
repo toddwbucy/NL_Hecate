@@ -375,3 +375,43 @@ fn test_cuda_titans_forward_deterministic() {
 
     assert_eq!(y1, y2, "CUDA titans forward should be deterministic");
 }
+
+// ── Large-d test (validates shared memory overflow fix) ───────────
+
+#[test]
+fn test_cuda_titans_forward_large_d() {
+    // d=128 → M+S = 2×128×128×4 = 128KB, would have overflowed shared memory
+    let d = 128;
+    let seq_len = 4;
+    let dd = d * d;
+
+    let k_mem = rand_buf(seq_len * d, 5000);
+    let v_mem = rand_buf(seq_len * d, 5100);
+    let q_mem = rand_buf(seq_len * d, 5200);
+    let alpha = vec![0.05f32; seq_len];
+    let theta = vec![0.01f32; seq_len];
+    let eta = vec![0.9f32; seq_len];
+    let m_initial = vec![0.0f32; dd];
+    let s_initial = vec![0.0f32; dd];
+
+    let (m_rust, s_rust, y_rust) = rust_titans_forward(
+        &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
+        &m_initial, &s_initial, seq_len, d);
+
+    let mut m_cuda = vec![0.0f32; (seq_len + 1) * dd];
+    let mut s_cuda = vec![0.0f32; (seq_len + 1) * dd];
+    let mut y_cuda = vec![0.0f32; seq_len * d];
+    titans_forward_dispatch(
+        &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
+        &m_initial, &s_initial, &mut m_cuda, &mut s_cuda, &mut y_cuda,
+        seq_len, d);
+
+    check_close("titans_large_d_y", &y_rust, &y_cuda, 1e-4);
+    check_close("titans_large_d_m", &m_rust, &m_cuda, 1e-4);
+    check_close("titans_large_d_s", &s_rust, &s_cuda, 1e-4);
+
+    // Verify M is non-zero
+    let m_final = &m_cuda[seq_len * dd..];
+    let m_norm: f32 = m_final.iter().map(|x| x * x).sum::<f32>().sqrt();
+    assert!(m_norm > 1e-6, "M_final should be non-zero at d=128, got ‖M‖={m_norm}");
+}

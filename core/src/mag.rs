@@ -18,6 +18,7 @@ use crate::memora::{MEMORA, MEMORACache, memora_read_only, memora_read_only_back
 use crate::lattice_osr::{LatticeOSR, LatticeCache, lattice_read_only, lattice_read_only_backward};
 use crate::trellis::{Trellis, TrellisCache, trellis_read_only, trellis_read_only_backward};
 use crate::atlas_omega::{AtlasOmega, AtlasOmegaCache};
+use crate::swiglu_mlp::{SwiGluMlp, SwiGluMlpCache};
 use crate::conductor::{Pulse, ContextState, ErrorBuffer};
 use crate::self_ref::{SelfRefCache, ProjectionKind, self_ref_step, self_ref_step_backward, self_ref_read_only, self_ref_read_only_backward};
 use crate::chunkwise_self_ref::{ChunkwiseSelfRefCache, chunkwise_self_ref_step, chunkwise_self_ref_step_backward};
@@ -39,6 +40,8 @@ pub enum MemoryCache {
     Lattice(LatticeCache),
     Trellis(TrellisCache),
     Atlas(AtlasOmegaCache),
+    /// SwiGLU MLP (HOPE §7.3): no M state, outer-loop AdamW weights.
+    SwiGlu(SwiGluMlpCache),
     /// Self-referential Phase 2: all 6 memories (5 projections + main) via DGD.
     SelfRef(SelfRefCache),
     /// Chunkwise self-referential: frozen M at chunk boundaries (HOPE §8.2).
@@ -115,6 +118,11 @@ pub fn mag_forward(
         MemoryRuleKind::TitansLMM => {
             let (y, cache) = TitansLMM::from_cfg(cfg).step(&params.levels[0], &embedded, s, d, None);
             (y, MemoryCache::Titans(cache))
+        }
+        MemoryRuleKind::SwiGluMlp => {
+            let (y, cache) = SwiGluMlp::from_cfg(cfg).step(&params.levels[0], &embedded, s, d, None);
+            // No M state — context.memory stays empty
+            (y, MemoryCache::SwiGlu(cache))
         }
         MemoryRuleKind::HebbianRule => {
             let (y, cache) = HebbianRule.step(&params.levels[0], &embedded, s, d, None);
@@ -293,6 +301,9 @@ pub fn mag_backward(
         }
         MemoryCache::Atlas(atlas_cache) => {
             AtlasOmega.step_backward(&params.levels[0], atlas_cache, &d_y, &cache.embedded)
+        }
+        MemoryCache::SwiGlu(swiglu_cache) => {
+            SwiGluMlp::from_cfg(cfg).step_backward(&params.levels[0], swiglu_cache, &d_y, &cache.embedded)
         }
         MemoryCache::SelfRef(sr_cache) => {
             let (d_emb, sr_grads) = self_ref_step_backward(sr_cache, &d_y, cfg.self_generated_values);
@@ -599,6 +610,9 @@ fn run_level_memory(
     active: bool,
     context: &mut ContextState,
 ) -> (Vec<f32>, Option<MemoryCache>, Option<Vec<f32>>, Option<Vec<f32>>) {
+    // SwiGluMlp is stateless (no inner-loop M) — always runs the active path.
+    // Frozen-level read-only path assumes a stored M matrix, which doesn't exist for SwiGluMlp.
+    let active = active || matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp);
     if active {
         // Phase 2 adaptive projections: self-referential orchestrator
         if cfg.projection_kind == ProjectionKind::Adaptive {
@@ -629,7 +643,7 @@ fn run_level_memory(
                 (y, MemoryCache::Delta(cache))
             }
             MemoryRuleKind::TitansLMM => {
-                let (y, cache) = TitansLMM::from_cfg(cfg).step(&params.levels[level], input, s, d, initial_m);
+                let (y, cache) = TitansLMM::from_cfg_level(cfg, level).step(&params.levels[level], input, s, d, initial_m);
                 let m_final_start = s * d * d;
                 context.memory[level] = cache.m_states[m_final_start..m_final_start + d * d].to_vec();
                 (y, MemoryCache::Titans(cache))
@@ -709,6 +723,11 @@ fn run_level_memory(
                 let m_final_start = s * d * d;
                 context.memory[level] = cache.m_states[m_final_start..m_final_start + d * d].to_vec();
                 (y, MemoryCache::Atlas(cache))
+            }
+            MemoryRuleKind::SwiGluMlp => {
+                // No inner-loop M state — context.memory[level] stays empty (already is)
+                let (y, cache) = SwiGluMlp::from_cfg(cfg).step(&params.levels[level], input, s, d, None);
+                (y, MemoryCache::SwiGlu(cache))
             }
         };
         (y_level, Some(mem_cache), None, None)
@@ -1058,7 +1077,7 @@ pub fn cms_backward(
                     DeltaRule::from_cfg(cfg).step_backward(&params.levels[level], delta_cache, &d_y_combined, &cache.embedded)
                 }
                 MemoryCache::Titans(titans_cache) => {
-                    TitansLMM::from_cfg(cfg).step_backward(&params.levels[level], titans_cache, &d_y_combined, &cache.embedded)
+                    TitansLMM::from_cfg_level(cfg, level).step_backward(&params.levels[level], titans_cache, &d_y_combined, &cache.embedded)
                 }
                 MemoryCache::Hebbian(hebbian_cache) => {
                     HebbianRule.step_backward(&params.levels[level], hebbian_cache, &d_y_combined, &cache.embedded)
@@ -1085,6 +1104,9 @@ pub fn cms_backward(
                 }
                 MemoryCache::Atlas(atlas_cache) => {
                     AtlasOmega.step_backward(&params.levels[level], atlas_cache, &d_y_combined, &cache.embedded)
+                }
+                MemoryCache::SwiGlu(swiglu_cache) => {
+                    SwiGluMlp::from_cfg(cfg).step_backward(&params.levels[level], swiglu_cache, &d_y_combined, &cache.embedded)
                 }
                 MemoryCache::SelfRef(sr_cache) => {
                     let (d_emb, sr_grads) = self_ref_step_backward(sr_cache, &d_y_combined, cfg.self_generated_values);

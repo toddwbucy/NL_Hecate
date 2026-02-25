@@ -446,6 +446,10 @@ pub fn flatten_mag_params(params: &MAGParams) -> Vec<f32> {
         flat.extend_from_slice(&level.m_eta_init);
         flat.extend_from_slice(&level.m_alpha_init);
         flat.extend_from_slice(&level.m_mem_init);
+        // SwiGluMlp-specific: empty for all other rules
+        flat.extend_from_slice(&level.gate_proj);
+        flat.extend_from_slice(&level.up_proj);
+        flat.extend_from_slice(&level.down_proj);
     }
 
     // CMS aggregation weights
@@ -508,6 +512,9 @@ pub fn unflatten_to_mag_grads(flat: &[f32], template: &MAGParams) -> MAGParams {
             m_eta_init: take(flat, &mut offset, tl.m_eta_init.len()),
             m_alpha_init: take(flat, &mut offset, tl.m_alpha_init.len()),
             m_mem_init: take(flat, &mut offset, tl.m_mem_init.len()),
+            gate_proj: take(flat, &mut offset, tl.gate_proj.len()),
+            up_proj: take(flat, &mut offset, tl.up_proj.len()),
+            down_proj: take(flat, &mut offset, tl.down_proj.len()),
         });
     }
 

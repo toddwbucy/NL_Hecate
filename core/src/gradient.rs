@@ -1256,6 +1256,7 @@ mod tests {
                 let m_t = &c.m_states[s * d * d..(s + 1) * d * d];
                 m_t.iter().map(|x| x * x).sum::<f32>().sqrt()
             }
+            crate::mag::MemoryCache::SwiGlu(_) => 0.0, // SwiGluMlp: no M state to check
             crate::mag::MemoryCache::SelfRef(_) => unreachable!("SelfRef in gradient check"),
             crate::mag::MemoryCache::ChunkwiseSelfRef(_) => unreachable!("ChunkwiseSelfRef in gradient check"),
         };

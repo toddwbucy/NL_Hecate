@@ -78,6 +78,9 @@ pub enum OpaqueKey {
 
     // Self-referential Phase 2: all 6 memories (5 projections + main)
     SelfRef,
+
+    // HOPE §7.3 ad-hoc level stacking: SwiGLU MLP with outer-loop AdamW
+    SwiGluMlp,
 }
 
 /// Backward function for an opaque block.

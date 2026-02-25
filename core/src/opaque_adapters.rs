@@ -192,6 +192,7 @@ pub fn level_params_from_flat(flat: &[f32], d: usize, kernel_size: usize) -> Mem
         w_k_conv, b_k_conv, w_q_conv, b_q_conv,
         m_k_init: vec![], m_v_init: vec![], m_q_init: vec![],
         m_eta_init: vec![], m_alpha_init: vec![], m_mem_init: vec![],
+        gate_proj: vec![], up_proj: vec![], down_proj: vec![],
     }
 }
 
@@ -371,6 +372,8 @@ pub fn titans_lmm_opaque_backward(
         bias, sign_sharpness,
         momentum_kind,
         momentum_d_hidden: 0,
+        theta_floor: 0.0,
+        theta_ceil: f32::MAX,
     };
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
@@ -1364,6 +1367,7 @@ pub fn register_opaque_vjps() -> HashMap<OpaqueKey, OpaqueBackwardFn> {
     registry.insert(OpaqueKey::AtlasOmega, atlas_omega_opaque_backward as OpaqueBackwardFn);
     registry.insert(OpaqueKey::SWA, swa_opaque_backward as OpaqueBackwardFn);
     registry.insert(OpaqueKey::DGD, dgd_opaque_backward as OpaqueBackwardFn);
+    registry.insert(OpaqueKey::SwiGluMlp, crate::swiglu_mlp::swiglu_opaque_backward as OpaqueBackwardFn);
 
     // Frozen variants
     registry.insert(OpaqueKey::FrozenDeltaRule, frozen_delta_rule_backward as OpaqueBackwardFn);
@@ -1439,8 +1443,10 @@ mod tests {
     #[test]
     fn test_register_opaque_vjps_all_keys() {
         let registry = register_opaque_vjps();
-        // All 20 keys should be registered (10 active + 1 DGD + 9 frozen)
-        assert_eq!(registry.len(), 20);
+        // All 21 keys should be registered (11 active + 1 DGD + 9 frozen)
+        // Active: DeltaRule, TitansLMM, HebbianRule, Moneta, YAAD, MEMORA,
+        //         LatticeOSR, Trellis, AtlasOmega, SWA, SwiGluMlp (11)
+        assert_eq!(registry.len(), 21);
         assert!(registry.contains_key(&OpaqueKey::DeltaRule));
         assert!(registry.contains_key(&OpaqueKey::TitansLMM));
         assert!(registry.contains_key(&OpaqueKey::HebbianRule));
@@ -1579,6 +1585,8 @@ mod tests {
             sign_sharpness: 10.0,
             momentum_kind: crate::model::MomentumKind::DeltaMomentum,
             momentum_d_hidden: 0,
+            theta_floor: 0.0,
+            theta_ceil: f32::MAX,
         };
         assert_opaque_roundtrip(&rule, 4, 3);
     }

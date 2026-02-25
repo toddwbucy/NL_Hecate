@@ -9,6 +9,10 @@
 // All fp32. Recomputes forward intermediates (prediction, error) from cached
 // M_t states rather than storing them — saves memory.
 //
+// NOTE: d_M lives in global memory (allocated via cudaMalloc in C wrapper),
+// NOT shared memory. At d=512, d_M[d*d] = 1MB — exceeds GPU smem limits.
+// Only small buffers (prediction[d], error[d], d_error[d], reduce_buf) in smem.
+//
 // Reverse loop (t = s-1 down to 0):
 //   d_M += outer(d_y_t, q_t)                    (from readout y = M @ q)
 //   d_q_t[j] = sum_i M_{t+1}[i,j] * d_y_t[i]   (matvec transpose)
@@ -25,7 +29,24 @@
 // This file is compiled by nvcc into machine code (opaque to AD).
 
 #include <cuda_runtime.h>
-#include <float.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+static inline void check_cuda_launch(const char* kernel_name, int d, int smem_bytes) {
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[NL_Hecate FATAL] %s launch failed (d=%d, smem=%d): %s\n",
+                kernel_name, d, smem_bytes, cudaGetErrorString(err));
+        abort();
+    }
+}
+
+static inline void check_cuda_alloc(const char* tag, cudaError_t err) {
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[NL_Hecate FATAL] %s: %s\n", tag, cudaGetErrorString(err));
+        abort();
+    }
+}
 
 __global__ void delta_backward_kernel(
     const float* __restrict__ k_mem,      // [seq_len, d]
@@ -41,23 +62,18 @@ __global__ void delta_backward_kernel(
     float* __restrict__ d_alpha,          // [seq_len]
     float* __restrict__ d_theta,          // [seq_len]
     float* __restrict__ d_m_initial,      // [d*d]
+    float* __restrict__ d_M,              // [d*d] — gradient accumulator in global memory
     int seq_len, int d)
 {
     int tid = threadIdx.x;
     int dd = d * d;
 
-    // Shared memory layout:
-    //   d_M[d*d]        — accumulated gradient on memory state
-    //   prediction[d]   — recomputed M_t @ k_t
-    //   error[d]        — recomputed prediction - v
-    //   d_error[d]      — gradient on error
-    //   reduce_buf[blockDim.x] — for parallel reduction
+    // Shared memory: only small working buffers
     extern __shared__ float smem[];
-    float* d_M = smem;                               // [d*d]
-    float* prediction = smem + dd;                    // [d]
-    float* error_buf = smem + dd + d;                 // [d]
-    float* d_error = smem + dd + 2 * d;               // [d]
-    float* reduce_buf = smem + dd + 3 * d;            // [blockDim.x]
+    float* prediction = smem;                    // [d]
+    float* error_buf = smem + d;                 // [d]
+    float* d_error = smem + 2 * d;               // [d]
+    float* reduce_buf = smem + 3 * d;            // [blockDim.x]
 
     // Initialize d_M = 0
     for (int idx = tid; idx < dd; idx += blockDim.x) {
@@ -229,18 +245,17 @@ __global__ void delta_backward_segment_kernel(
     float* __restrict__ d_alpha,
     float* __restrict__ d_theta,
     float* __restrict__ d_m_out,          // [d*d] — d_M to propagate to earlier segment
+    float* __restrict__ d_M,              // [d*d] — gradient accumulator in global memory
     int t_start, int t_end, int d)
 {
     int tid = threadIdx.x;
     int dd = d * d;
-    int seg_len = t_end - t_start;
 
     extern __shared__ float smem[];
-    float* d_M = smem;
-    float* prediction = smem + dd;
-    float* error_buf = smem + dd + d;
-    float* d_error = smem + dd + 2 * d;
-    float* reduce_buf = smem + dd + 3 * d;
+    float* prediction = smem;
+    float* error_buf = smem + d;
+    float* d_error = smem + 2 * d;
+    float* reduce_buf = smem + 3 * d;
 
     // Initialize d_M from seed (not zeros)
     for (int idx = tid; idx < dd; idx += blockDim.x) {
@@ -393,13 +408,24 @@ extern "C" void delta_backward_segment_f32_cuda(
     dim3 grid(1);
     dim3 block(block_size);
 
-    int smem_bytes = (dd + 3 * d + block_size) * sizeof(float);
+    // Shared: prediction[d] + error[d] + d_error[d] + reduce_buf[block_size]
+    int smem_bytes = (3 * d + block_size) * sizeof(float);
+
+    // Allocate d_M workspace in global memory
+    float* d_M_work = nullptr;
+    check_cuda_alloc("delta_backward_segment: cudaMalloc d_M_work",
+                     cudaMalloc(&d_M_work, dd * sizeof(float)));
 
     delta_backward_segment_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_states, d_y,
         d_m_seed,
         d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta, d_m_out,
-        t_start, t_end, d);
+        d_M_work, t_start, t_end, d);
+    check_cuda_launch("delta_backward_segment_kernel", d, smem_bytes);
+
+    check_cuda_alloc("delta_backward_segment: cudaDeviceSynchronize",
+                     cudaDeviceSynchronize());
+    check_cuda_alloc("cudaFree d_M_work", cudaFree(d_M_work));
 }
 
 extern "C" void delta_backward_f32_cuda(
@@ -422,11 +448,21 @@ extern "C" void delta_backward_f32_cuda(
     dim3 grid(1);
     dim3 block(block_size);
 
-    // Shared memory: d_M[d*d] + prediction[d] + error[d] + d_error[d] + reduce_buf[block_size]
-    int smem_bytes = (dd + 3 * d + block_size) * sizeof(float);
+    // Shared: prediction[d] + error[d] + d_error[d] + reduce_buf[block_size]
+    int smem_bytes = (3 * d + block_size) * sizeof(float);
+
+    // Allocate d_M workspace in global memory
+    float* d_M_work = nullptr;
+    check_cuda_alloc("delta_backward: cudaMalloc d_M_work",
+                     cudaMalloc(&d_M_work, dd * sizeof(float)));
 
     delta_backward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_states, d_y,
         d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta, d_m_initial,
-        seq_len, d);
+        d_M_work, seq_len, d);
+    check_cuda_launch("delta_backward_kernel", d, smem_bytes);
+
+    check_cuda_alloc("delta_backward: cudaDeviceSynchronize",
+                     cudaDeviceSynchronize());
+    check_cuda_alloc("cudaFree d_M_work", cudaFree(d_M_work));
 }

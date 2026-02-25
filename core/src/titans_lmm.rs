@@ -40,6 +40,9 @@ pub struct TitansLMM {
     pub sign_sharpness: f32,
     pub momentum_kind: crate::model::MomentumKind,
     pub momentum_d_hidden: usize,
+    /// Per-level theta floor/ceil (CS-39 training wheels). 0.0/MAX = no clamp.
+    pub theta_floor: f32,
+    pub theta_ceil: f32,
 }
 
 impl TitansLMM {
@@ -50,17 +53,25 @@ impl TitansLMM {
             sign_sharpness: 10.0,
             momentum_kind: crate::model::MomentumKind::EMA,
             momentum_d_hidden: 0,
+            theta_floor: 0.0,
+            theta_ceil: f32::MAX,
         }
     }
-    /// Construct from MAGConfig fields.
-    pub fn from_cfg(cfg: &crate::model::MAGConfig) -> Self {
+    /// Construct from MAGConfig fields for a specific CMS level.
+    pub fn from_cfg_level(cfg: &crate::model::MAGConfig, level: usize) -> Self {
         let mk = crate::momentum::effective_momentum_kind(cfg.momentum_kind, cfg.memory_rule);
         TitansLMM {
             bias: cfg.attentional_bias,
             sign_sharpness: cfg.sign_sharpness,
             momentum_kind: mk,
             momentum_d_hidden: cfg.momentum_d_hidden,
+            theta_floor: cfg.theta_floor.get(level).copied().unwrap_or(0.0),
+            theta_ceil: cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX),
         }
+    }
+    /// Construct from MAGConfig fields (backward compat — no level clamp).
+    pub fn from_cfg(cfg: &crate::model::MAGConfig) -> Self {
+        Self::from_cfg_level(cfg, 0)
     }
 }
 
@@ -252,7 +263,7 @@ impl MemoryRule for TitansLMM {
                 theta_pre_t += concat_t[i] * level_params.w_theta[i];
             }
             theta_pre[t] = theta_pre_t;
-            theta[t] = softplus_f32(theta_pre_t);
+            theta[t] = softplus_f32(theta_pre_t).clamp(self.theta_floor, self.theta_ceil);
 
             // eta_t = sigmoid(concat @ w_eta + b_eta) — NEW: momentum gate
             let mut eta_pre_t = level_params.b_eta[0];
@@ -480,8 +491,11 @@ impl MemoryRule for TitansLMM {
             let d_alpha_pre = d_alpha_scalar * sig_deriv;
 
             // ── Gate backward: theta_t = softplus(theta_pre_t) ──
+            // Clamp gradient mask: zero gradient when theta was at floor or ceil (CS-39)
+            let theta_raw = softplus_f32(theta_pre_t);
+            let clamp_mask = if theta_raw <= self.theta_floor || theta_raw >= self.theta_ceil { 0.0 } else { 1.0 };
             let softplus_deriv = sigmoid_f32(theta_pre_t);
-            let d_theta_pre = d_theta_scalar * softplus_deriv;
+            let d_theta_pre = d_theta_scalar * softplus_deriv * clamp_mask;
 
             // ── Gate backward: eta_t = sigmoid(eta_pre_t) ──
             let eta_sig_deriv = eta_t * (1.0 - eta_t);
@@ -802,7 +816,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = TitansLMM { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0 };
+        let rule = TitansLMM { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0, theta_floor: 0.0, theta_ceil: f32::MAX };
         let (y, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for (i, &v) in y.iter().enumerate() {
             assert!(v.is_finite(), "L1 y[{i}] not finite: {v}");
@@ -814,7 +828,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = TitansLMM { bias: crate::model::AttentionalBias::Lp(3.0), sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0 };
+        let rule = TitansLMM { bias: crate::model::AttentionalBias::Lp(3.0), sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0, theta_floor: 0.0, theta_ceil: f32::MAX };
         let (y, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for (i, &v) in y.iter().enumerate() {
             assert!(v.is_finite(), "Lp(3) y[{i}] not finite: {v}");
@@ -826,7 +840,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = TitansLMM { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0 };
+        let rule = TitansLMM { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0, theta_floor: 0.0, theta_ceil: f32::MAX };
         let (y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let d_y = vec![1.0f32; y.len()];
         let (grads, d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
@@ -878,6 +892,8 @@ mod tests {
             sign_sharpness: 10.0,
             momentum_kind: crate::model::MomentumKind::DeltaMomentum,
             momentum_d_hidden: 0,
+            theta_floor: 0.0,
+            theta_ceil: f32::MAX,
         };
         let (y_delta, cache_delta) = delta_rule.step(&params.levels[0], &embedded, s, d, None);
 
@@ -910,6 +926,8 @@ mod tests {
             sign_sharpness: 10.0,
             momentum_kind: crate::model::MomentumKind::DeepMomentum,
             momentum_d_hidden: 4 * d,
+            theta_floor: 0.0,
+            theta_ceil: f32::MAX,
         };
         let (y_deep, cache_deep) = deep_rule.step(&params.levels[0], &embedded, s, d, None);
 

@@ -263,20 +263,19 @@ model -- these are two independent datasets on disk.
 Python function to load Llama MLP weights into NL_Hecate params:
 
 ```python
-def load_llama_donor(donor_path, cfg):
+def load_llama_donor(donor_path, params, cfg, k):
     """Load extracted Llama MLP weights into MAGParams."""
     donor = torch.load(donor_path, weights_only=True)
-    params = nl_hecate.mag_init_params(cfg, seed=42)
 
-    for level in range(cfg.k):
+    for level in range(k):
         level_data = donor[f"level_{level}"]
         params.set_level_mlp(
-            level=level,
-            gate_proj=level_data["gate_proj"].numpy().flatten().tolist(),
-            up_proj=level_data["up_proj"].numpy().flatten().tolist(),
-            down_proj=level_data["down_proj"].numpy().flatten().tolist(),
+            cfg,
+            level,
+            level_data["gate_proj"].float().numpy().flatten().tolist(),
+            level_data["up_proj"].float().numpy().flatten().tolist(),
+            level_data["down_proj"].float().numpy().flatten().tolist(),
         )
-    return params
 ```
 
 ## Build Config
@@ -328,7 +327,7 @@ tokens of continual pre-training; we scale proportionally to our data budget.
 | Component | Size (fp32) | Notes |
 |---|---|---|
 | Embeddings (128K x 2048) | ~1,000 MB | Fresh init, tied embed/unembed |
-| SWA (Q/K/V/O) | 64 MB  | 32 heads x 4 x 2048 x 64 |
+| SWA (Q/K/V/O) | 64 MB | 32 heads x 4 x 2048 x 64 |
 | 4 MLP levels | 768 MB | 4 x 3 x 8192 x 2048 x 4B |
 | Gate biases (k=4) | < 1 MB | b_alpha, b_theta, b_eta |
 | Unembed (tied) | 0 MB | Shares embedding weight |

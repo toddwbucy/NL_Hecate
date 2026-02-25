@@ -19,10 +19,32 @@
 // Single block: tokens processed sequentially, threads parallelize across M's d² elements.
 // All fp32 (no bf16). Memory state M MUST be fp32 per NL spec.
 //
+// NOTE: M lives in global memory (m_states), NOT shared memory.
+// At d=512, M[d*d] = 1MB — far exceeds GPU shared memory limits (48-100KB).
+// Only small working buffers (prediction[d], error[d]) use shared memory.
+//
 // Spec: specs/infrastructure/cuda/02_dgd_kernels.md
 // Source: HOPE (2512.24695) Eq 88, Eq 121; core/src/dgd.rs
 
 #include <cuda_runtime.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+static inline void check_cuda_launch(const char* kernel_name, int d, int smem_bytes) {
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[NL_Hecate FATAL] %s launch failed (d=%d, smem=%d): %s\n",
+                kernel_name, d, smem_bytes, cudaGetErrorString(err));
+        abort();
+    }
+}
+
+static inline void check_cuda_alloc(const char* tag, cudaError_t err) {
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[NL_Hecate FATAL] %s: %s\n", tag, cudaGetErrorString(err));
+        abort();
+    }
+}
 
 __global__ void dgd_forward_kernel(
     const float* __restrict__ k_mem,      // [seq_len, d]
@@ -38,24 +60,14 @@ __global__ void dgd_forward_kernel(
     int tid = threadIdx.x;
     int dd = d * d;
 
-    // Shared memory layout:
-    //   M_current[d*d]   — current memory matrix
-    //   prediction[d]    — M @ k result
-    //   error[d]         — prediction - v
+    // Shared memory: only small working buffers
     extern __shared__ float smem[];
-    float* M = smem;                    // [d*d]
-    float* prediction = smem + dd;      // [d]
-    float* error_buf = smem + dd + d;   // [d]
+    float* prediction = smem;           // [d]
+    float* error_buf = smem + d;        // [d]
 
-    // Load M_0 into shared memory
+    // Store M_0 to m_states from m_initial
     for (int idx = tid; idx < dd; idx += blockDim.x) {
-        M[idx] = m_initial[idx];
-    }
-    __syncthreads();
-
-    // Store M_0 to m_states
-    for (int idx = tid; idx < dd; idx += blockDim.x) {
-        m_states[idx] = M[idx];
+        m_states[idx] = m_initial[idx];
     }
     __syncthreads();
 
@@ -66,12 +78,14 @@ __global__ void dgd_forward_kernel(
         const float* q_t = q_mem + t * d;
         float alpha_t = alpha[t];
         float theta_t = theta[t];
+        int m_t_off = t * dd;
+        int m_next_off = (t + 1) * dd;
 
-        // ── prediction[i] = sum_j M[i,j] * k_t[j] ──
+        // ── prediction[i] = sum_j M_t[i,j] * k_t[j] ──
         if (tid < d) {
             float sum = 0.0f;
             for (int j = 0; j < d; j++) {
-                sum += M[tid * d + j] * k_t[j];
+                sum += m_states[m_t_off + tid * d + j] * k_t[j];
             }
             prediction[tid] = sum;
         }
@@ -83,26 +97,21 @@ __global__ void dgd_forward_kernel(
         }
         __syncthreads();
 
-        // ── M[i,j] = (1-alpha_t) * M[i,j] - theta_t * error[i] * k_t[j] ──
+        // ── M_{t+1}[i,j] = (1-alpha_t) * M_t[i,j] - theta_t * error[i] * k_t[j] ──
         float retention = 1.0f - alpha_t;
         for (int idx = tid; idx < dd; idx += blockDim.x) {
             int i = idx / d;
             int j = idx % d;
-            M[idx] = retention * M[idx] - theta_t * error_buf[i] * k_t[j];
+            m_states[m_next_off + idx] = retention * m_states[m_t_off + idx]
+                                         - theta_t * error_buf[i] * k_t[j];
         }
         __syncthreads();
 
-        // ── Store M_{t+1} to m_states ──
-        int m_off = (t + 1) * dd;
-        for (int idx = tid; idx < dd; idx += blockDim.x) {
-            m_states[m_off + idx] = M[idx];
-        }
-
-        // ── y_t[i] = sum_j M[i,j] * q_t[j] ──
+        // ── y_t[i] = sum_j M_{t+1}[i,j] * q_t[j] ──
         if (tid < d) {
             float sum = 0.0f;
             for (int j = 0; j < d; j++) {
-                sum += M[tid * d + j] * q_t[j];
+                sum += m_states[m_next_off + tid * d + j] * q_t[j];
             }
             y[t * d + tid] = sum;
         }
@@ -113,6 +122,7 @@ __global__ void dgd_forward_kernel(
 // ══════════════════════════════════════════════════════════════════════
 // Checkpointed variant: stores M only every C steps + final state.
 // m_states sized [(num_checkpoints)*d*d], indexed by checkpoint index.
+// M workspace allocated via cudaMalloc in C wrapper.
 // ══════════════════════════════════════════════════════════════════════
 
 __global__ void dgd_forward_ckpt_kernel(
@@ -124,25 +134,25 @@ __global__ void dgd_forward_ckpt_kernel(
     const float* __restrict__ m_initial,
     float* __restrict__ m_states,         // [num_ckpt * d*d]
     float* __restrict__ y,
+    float* __restrict__ m_work,           // [d*d] — working M in global memory
     int seq_len, int d, int checkpoint_interval)
 {
     int tid = threadIdx.x;
     int dd = d * d;
 
     extern __shared__ float smem[];
-    float* M = smem;
-    float* prediction = smem + dd;
-    float* error_buf = smem + dd + d;
+    float* prediction = smem;
+    float* error_buf = smem + d;
 
-    // Load M_0
+    // Load M_0 into workspace
     for (int idx = tid; idx < dd; idx += blockDim.x) {
-        M[idx] = m_initial[idx];
+        m_work[idx] = m_initial[idx];
     }
     __syncthreads();
 
     // Store M_0 as checkpoint 0
     for (int idx = tid; idx < dd; idx += blockDim.x) {
-        m_states[idx] = M[idx];
+        m_states[idx] = m_work[idx];
     }
     __syncthreads();
 
@@ -159,7 +169,7 @@ __global__ void dgd_forward_ckpt_kernel(
         if (tid < d) {
             float sum = 0.0f;
             for (int j = 0; j < d; j++) {
-                sum += M[tid * d + j] * k_t[j];
+                sum += m_work[tid * d + j] * k_t[j];
             }
             prediction[tid] = sum;
         }
@@ -174,7 +184,7 @@ __global__ void dgd_forward_ckpt_kernel(
         for (int idx = tid; idx < dd; idx += blockDim.x) {
             int i = idx / d;
             int j = idx % d;
-            M[idx] = retention * M[idx] - theta_t * error_buf[i] * k_t[j];
+            m_work[idx] = retention * m_work[idx] - theta_t * error_buf[i] * k_t[j];
         }
         __syncthreads();
 
@@ -182,7 +192,7 @@ __global__ void dgd_forward_ckpt_kernel(
         if (((t + 1) % checkpoint_interval == 0) || (t + 1 == seq_len)) {
             int off = ckpt_idx * dd;
             for (int idx = tid; idx < dd; idx += blockDim.x) {
-                m_states[off + idx] = M[idx];
+                m_states[off + idx] = m_work[idx];
             }
             ckpt_idx++;
         }
@@ -191,7 +201,7 @@ __global__ void dgd_forward_ckpt_kernel(
         if (tid < d) {
             float sum = 0.0f;
             for (int j = 0; j < d; j++) {
-                sum += M[tid * d + j] * q_t[j];
+                sum += m_work[tid * d + j] * q_t[j];
             }
             y[t * d + tid] = sum;
         }
@@ -212,11 +222,20 @@ extern "C" void dgd_forward_ckpt_f32_cuda(
     dim3 grid(1);
     dim3 block(block_size);
 
-    int smem_bytes = (dd + 2 * d) * sizeof(float);
+    int smem_bytes = 2 * d * sizeof(float);
+
+    float* m_work = nullptr;
+    check_cuda_alloc("dgd_forward_ckpt: cudaMalloc m_work",
+                     cudaMalloc(&m_work, dd * sizeof(float)));
 
     dgd_forward_ckpt_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_initial,
-        m_states, y, seq_len, d, checkpoint_interval);
+        m_states, y, m_work, seq_len, d, checkpoint_interval);
+    check_cuda_launch("dgd_forward_ckpt_kernel", d, smem_bytes);
+
+    check_cuda_alloc("dgd_forward_ckpt: cudaDeviceSynchronize",
+                     cudaDeviceSynchronize());
+    check_cuda_alloc("cudaFree m_work", cudaFree(m_work));
 }
 
 extern "C" void dgd_forward_f32_cuda(
@@ -227,16 +246,15 @@ extern "C" void dgd_forward_f32_cuda(
 {
     int dd = d * d;
     int block_size = (dd < 1024) ? dd : 1024;
-    // Ensure block_size >= d for the matvec operations
     if (block_size < d) block_size = d;
 
     dim3 grid(1);
     dim3 block(block_size);
 
-    // Shared memory: M[d*d] + prediction[d] + error[d]
-    int smem_bytes = (dd + 2 * d) * sizeof(float);
+    int smem_bytes = 2 * d * sizeof(float);
 
     dgd_forward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_initial,
         m_states, y, seq_len, d);
+    check_cuda_launch("dgd_forward_kernel", d, smem_bytes);
 }

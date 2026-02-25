@@ -433,6 +433,9 @@ fn test_k1_learned_is_noop() {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+        intermediate_size: 0,
     };
     let params = MAGParams::init(&cfg, 42);
     let d = cfg.swa.d_model;
@@ -563,6 +566,9 @@ fn test_anneal_uses_fixed_schedule() {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+        intermediate_size: 0,
     };
 
     let params = MAGParams::init(&cfg, 42);

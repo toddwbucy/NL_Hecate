@@ -102,6 +102,8 @@ fn extract_final_state(cache: &MemoryCache, seq_len: usize, d: usize, cfg: &MAGC
         MemoryCache::Atlas(c) => {
             c.m_states[seq_len * d * d..(seq_len + 1) * d * d].to_vec()
         }
+        // SwiGluMlp has no inner-loop M state — return empty vec (context.memory stays empty)
+        MemoryCache::SwiGlu(_) => vec![],
         MemoryCache::SelfRef(_) => unreachable!("SelfRef not supported in chunkwise_gd"),
         MemoryCache::ChunkwiseSelfRef(_) => unreachable!("ChunkwiseSelfRef not supported in chunkwise_gd"),
     }
@@ -172,6 +174,11 @@ fn run_chunk(
             let (y, cache) = AtlasOmega.step(level_params, embedded_chunk, chunk_len, d, initial_m);
             (y, MemoryCache::Atlas(cache))
         }
+        MemoryRuleKind::SwiGluMlp => {
+            use crate::swiglu_mlp::SwiGluMlp;
+            let (y, cache) = SwiGluMlp::from_cfg(cfg).step(level_params, embedded_chunk, chunk_len, d, None);
+            (y, MemoryCache::SwiGlu(cache))
+        }
     }
 }
 
@@ -210,6 +217,10 @@ fn run_chunk_backward(
         MemoryCache::Atlas(c) => {
             use crate::atlas_omega::AtlasOmega;
             AtlasOmega.step_backward(level_params, c, d_y_chunk, embedded_chunk)
+        }
+        MemoryCache::SwiGlu(c) => {
+            use crate::swiglu_mlp::SwiGluMlp;
+            SwiGluMlp::from_cfg(cfg).step_backward(level_params, c, d_y_chunk, embedded_chunk)
         }
         MemoryCache::SelfRef(_) => unreachable!("SelfRef not supported in chunkwise_gd"),
         MemoryCache::ChunkwiseSelfRef(_) => unreachable!("ChunkwiseSelfRef not supported in chunkwise_gd"),

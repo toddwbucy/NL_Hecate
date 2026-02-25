@@ -112,18 +112,12 @@ def run_build(bcfg: BuildConfig):
     if bcfg.load:
         print(f"Loading checkpoint: {bcfg.load}")
         if use_bpe:
-            # BPE checkpoints: params + cfg only, no build state
+            # BPE checkpoints: params + cfg only, no build state.
+            # Conductor and data position are NOT restored — this is a warm-start,
+            # not a true resume. Step count restarts from 0 to avoid desync.
             params, cfg = nl_hecate.load_checkpoint(bcfg.load)
-            # Extract step from filename (e.g. model_step25000.json → 25000)
-            import re
-            m = re.search(r'step(\d+)', bcfg.load)
-            if m:
-                resume_step = int(m.group(1))
-                print(f"  Resuming from step {resume_step} (BPE checkpoint)")
-            else:
-                resume_step = 0
-                print(f"  WARNING: no step in filename '{bcfg.load}', "
-                      f"resuming from step 0")
+            resume_step = 0
+            print(f"  Loaded BPE checkpoint as warm-start (conductor/data state reset, step=0)")
         else:
             params, cfg, build_state = nl_hecate.load_build_checkpoint(bcfg.load)
             if build_state is None:
@@ -159,6 +153,7 @@ def run_build(bcfg: BuildConfig):
                 self_ref_chunk_size=cfg.self_ref_chunk_size,
                 momentum_kind=cfg.momentum_kind,
                 momentum_d_hidden=cfg.momentum_d_hidden,
+                intermediate_size=bcfg.intermediate_size,
                 theta_floor=bcfg.theta_floor,
                 theta_ceil=bcfg.theta_ceil,
             )
@@ -183,8 +178,12 @@ def run_build(bcfg: BuildConfig):
             momentum_d_hidden=bcfg.momentum_d_hidden,
             theta_floor=bcfg.theta_floor,
             theta_ceil=bcfg.theta_ceil,
+            intermediate_size=bcfg.intermediate_size,
         )
         params = nl_hecate.mag_init_params(cfg, bcfg.seed)
+        if bcfg.donor_weights is not None:
+            from engine.donor import load_llama_donor
+            load_llama_donor(bcfg.donor_weights, params, cfg, bcfg.k)
 
     print(f"\n{'=' * 60}")
     print("NL-Hecate Build")
@@ -202,6 +201,10 @@ def run_build(bcfg: BuildConfig):
     if bcfg.momentum_kind != "none":
         print(f"  Momentum: kind={bcfg.momentum_kind}, "
               f"d_hidden={bcfg.momentum_d_hidden}")
+    if bcfg.intermediate_size:
+        print(f"  SwiGLU:   intermediate_size={bcfg.intermediate_size}")
+    if bcfg.donor_weights:
+        print(f"  Donor:    {bcfg.donor_weights}")
     if bcfg.theta_floor is not None or bcfg.theta_ceil is not None:
         print(f"  θ clamps: floor={bcfg.theta_floor}, ceil={bcfg.theta_ceil}")
     print(f"  Params:   {params.num_params():,}")
@@ -638,6 +641,7 @@ def run_build(bcfg: BuildConfig):
 
                     # Probe 3: accumulated context vs cold start (first prompt)
                     full_restore(gpu_model, ckpt_snapshot)
+                    gpu_model.reset_optimizer()  # prior probes/samples corrupt AdamW moments
                     prompt_text = EVAL_PROMPTS[0]
                     prompt_ids = tokenizer.encode(prompt_text)
                     cresult = probe_context_value(

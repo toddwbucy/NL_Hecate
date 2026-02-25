@@ -27,6 +27,7 @@ use crate::memora::{MEMORA, memora_read_only, memora_read_only_backward};
 use crate::lattice_osr::{LatticeOSR, lattice_read_only, lattice_read_only_backward};
 use crate::trellis::{Trellis, trellis_read_only, trellis_read_only_backward};
 use crate::atlas_omega::AtlasOmega;
+use crate::swiglu_mlp::SwiGluMlp;
 use crate::conductor::{Pulse, ContextState, ErrorBuffer};
 use crate::mag::MemoryCache;
 
@@ -97,6 +98,10 @@ fn dispatch_memory_step(
             let (y, cache) = AtlasOmega.step(level_params, embedded, s, d, initial_m);
             (y, MemoryCache::Atlas(cache))
         }
+        MemoryRuleKind::SwiGluMlp => {
+            let (y, cache) = SwiGluMlp::from_cfg(cfg).step(level_params, embedded, s, d, None);
+            (y, MemoryCache::SwiGlu(cache))
+        }
     }
 }
 
@@ -134,6 +139,9 @@ fn dispatch_memory_backward(
         }
         MemoryCache::Atlas(c) => {
             AtlasOmega.step_backward(level_params, c, d_y, embedded)
+        }
+        MemoryCache::SwiGlu(c) => {
+            SwiGluMlp::from_cfg(cfg).step_backward(level_params, c, d_y, embedded)
         }
         MemoryCache::SelfRef(_) => unreachable!("SelfRef backward not yet implemented"),
         MemoryCache::ChunkwiseSelfRef(_) => unreachable!("ChunkwiseSelfRef backward not yet implemented"),
@@ -478,6 +486,8 @@ pub fn persist_memory_state(
             let start = s * d * d;
             *context_mem = c.m_states[start..start + d * d].to_vec();
         }
+        // SwiGluMlp has no inner-loop M state — nothing to persist
+        MemoryCache::SwiGlu(_) => {}
         MemoryCache::SelfRef(_) => unreachable!("SelfRef context extract not yet implemented"),
         MemoryCache::ChunkwiseSelfRef(_) => unreachable!("ChunkwiseSelfRef context extract not yet implemented"),
     }
@@ -498,6 +508,10 @@ fn dispatch_read_only(
         MemoryRuleKind::MEMORA => memora_read_only(level_params, embedded, frozen_ref, s, d, cfg.d_hidden),
         MemoryRuleKind::LatticeOSR => lattice_read_only(level_params, embedded, frozen_ref, s, d, cfg.m_slots),
         MemoryRuleKind::Trellis => trellis_read_only(level_params, embedded, frozen_ref, s, d, cfg.d_compress),
+        MemoryRuleKind::SwiGluMlp => panic!(
+            "MAL dispatch_read_only reached SwiGluMlp — SwiGluMlp has no M state and must \
+             always run the active path. Check that MAL caller uses effective_active for SwiGluMlp."
+        ),
         _ => delta_rule_read_only(level_params, embedded, frozen_ref, s, d),
     }
 }
@@ -519,6 +533,10 @@ fn dispatch_read_only_backward(
         MemoryRuleKind::MEMORA => memora_read_only_backward(level_params, frozen_m, q_mem, d_y, embedded, s, d, cfg.d_hidden),
         MemoryRuleKind::LatticeOSR => lattice_read_only_backward(level_params, frozen_m, q_mem, d_y, embedded, s, d, cfg.m_slots),
         MemoryRuleKind::Trellis => trellis_read_only_backward(level_params, frozen_m, q_mem, d_y, embedded, s, d, cfg.d_compress),
+        MemoryRuleKind::SwiGluMlp => panic!(
+            "MAL dispatch_read_only_backward reached SwiGluMlp — SwiGluMlp has no M state and \
+             must always run the active path. Check that MAL caller uses effective_active for SwiGluMlp."
+        ),
         _ => delta_rule_read_only_backward(level_params, frozen_m, q_mem, d_y, embedded, s, d),
     }
 }
@@ -561,7 +579,10 @@ pub fn cms_mal_forward(
     let mut y_per_level: Vec<Vec<f32>> = Vec::with_capacity(cfg.k);
 
     for level in 0..cfg.k {
-        if pulse.active_levels[level] {
+        // SwiGluMlp is stateless — always runs the active path (no M to read from).
+        let effective_active = pulse.active_levels[level]
+            || matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp);
+        if effective_active {
             let initial_m = Some(std::mem::take(&mut context.memory[level]));
             let (y_level, mem_cache) = dispatch_memory_step(
                 cfg, &params.levels[level], &embedded, s, d, initial_m,
@@ -803,7 +824,9 @@ pub fn cms_mal_backward(
     }
 
     for level in 0..cfg.k {
-        if cache.pulse.active_levels[level] {
+        // Use cache presence (not pulse) as the gate — SwiGluMlp always populates the cache
+        // even on nominally frozen levels, because it ran the active path in forward.
+        if cache.memory_caches[level].is_some() {
             let mem_cache = cache.memory_caches[level].as_ref().unwrap();
             let (mem_grads, d_embedded_mem) = dispatch_memory_backward(
                 cfg, &params.levels[level], mem_cache, &d_m_t, &cache.embedded,

@@ -19,6 +19,7 @@ use crate::memora::{MEMORA, memora_read_only, memora_read_only_backward};
 use crate::lattice_osr::{LatticeOSR, lattice_read_only, lattice_read_only_backward};
 use crate::trellis::{Trellis, trellis_read_only, trellis_read_only_backward};
 use crate::atlas_omega::AtlasOmega;
+use crate::swiglu_mlp::SwiGluMlp;
 use crate::conductor::{Pulse, ContextState, ErrorBuffer};
 use crate::mag::MemoryCache;
 
@@ -105,6 +106,10 @@ fn read_only_dispatch(
         MemoryRuleKind::MEMORA => memora_read_only(level_params, embedded, m_state, s, d, cfg.d_hidden),
         MemoryRuleKind::LatticeOSR => lattice_read_only(level_params, embedded, m_state, s, d, cfg.m_slots),
         MemoryRuleKind::Trellis => trellis_read_only(level_params, embedded, m_state, s, d, cfg.d_compress),
+        MemoryRuleKind::SwiGluMlp => panic!(
+            "MAC read_only_dispatch reached SwiGluMlp — SwiGluMlp has no M state and must \
+             always run the active path. Check that MAC caller forces active=true for SwiGluMlp."
+        ),
         _ => delta_rule_read_only(level_params, embedded, m_state, s, d),
     }
 }
@@ -126,6 +131,10 @@ fn read_only_backward_dispatch(
         MemoryRuleKind::MEMORA => memora_read_only_backward(level_params, frozen_m, q_mem, d_y, embedded, s, d, cfg.d_hidden),
         MemoryRuleKind::LatticeOSR => lattice_read_only_backward(level_params, frozen_m, q_mem, d_y, embedded, s, d, cfg.m_slots),
         MemoryRuleKind::Trellis => trellis_read_only_backward(level_params, frozen_m, q_mem, d_y, embedded, s, d, cfg.d_compress),
+        MemoryRuleKind::SwiGluMlp => panic!(
+            "MAC read_only_backward_dispatch reached SwiGluMlp — SwiGluMlp has no M state and \
+             must always run the active path. Check that MAC caller forces active=true for SwiGluMlp."
+        ),
         _ => delta_rule_read_only_backward(level_params, frozen_m, q_mem, d_y, embedded, s, d),
     }
 }
@@ -181,6 +190,10 @@ fn step_dispatch(
             let (y, c) = AtlasOmega.step(level_params, input, s, d, initial_m);
             (y, MemoryCache::Atlas(c))
         }
+        MemoryRuleKind::SwiGluMlp => {
+            let (y, c) = SwiGluMlp::from_cfg(cfg).step(level_params, input, s, d, None);
+            (y, MemoryCache::SwiGlu(c))
+        }
     }
 }
 
@@ -217,6 +230,7 @@ fn step_backward_dispatch(
             rule.step_backward(level_params, c, d_y, input)
         }
         MemoryCache::Atlas(c) => AtlasOmega.step_backward(level_params, c, d_y, input),
+        MemoryCache::SwiGlu(c) => SwiGluMlp::from_cfg(cfg).step_backward(level_params, c, d_y, input),
         MemoryCache::SelfRef(_) => unreachable!("SelfRef backward not yet implemented"),
         MemoryCache::ChunkwiseSelfRef(_) => unreachable!("ChunkwiseSelfRef backward not yet implemented"),
     }
@@ -235,6 +249,7 @@ fn initial_memory_state(cfg: &MAGConfig, d: usize) -> Vec<f32> {
         MemoryRuleKind::Trellis => {
             vec![0.0f32; 2 * cfg.d_compress * d]
         }
+        MemoryRuleKind::SwiGluMlp => vec![],
         _ => vec![0.0f32; d * d],
     }
 }

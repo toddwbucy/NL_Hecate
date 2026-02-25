@@ -1,321 +1,300 @@
 # NL_Hecate Progress Report
 
-**Project**: NL_Hecate — Nested Learning implementation in Rust + Wengert tape AD + CUDA
-**Status**: All stages COMPLETE (S0-S3). 5/5 Stage 3 milestones delivered.
+**Date**: 2026-02-24
+**Branch**: `main`
+**Build**: Phase 0 TinyStories 100K running on GPU0 (step ~5,200, loss ~3.8 train / 4.4 val)
 
 ---
 
-## Executive Summary
+## Project Scope
 
-NL_Hecate implements the Nested Learning research program (Mirrokni/Behrouz, Google Research) in Rust with Wengert tape AD and CUDA kernels. The project built the essential forward/backward/optimize pipeline — 8 memory rules, 3 composition patterns, 5 parallelization strategies, CUDA kernel pairs, multi-GPU sync, serving, and edge deployment — that replaces PyTorch's training/inference stack with a unified self-modifying forward pass.
+NL_Hecate implements the Nested Learning (NL) research program from the Mirrokni/Behrouz group at Google Research. Self-modifying neural networks where optimization IS the forward pass — no train/eval distinction, no external optimizer, no epochs.
 
-An integration spike (17 tests) validates the thesis end-to-end: the full VecStream -> Conductor -> cms_forward -> cms_backward -> apply pipeline learns a repeating token pattern, achieving 100% prediction accuracy across 3 representative configs. The serving path (Session::process_chunk) produces identical behavior to the raw loop.
-
-**Total test count**: 940 Rust + 27 Python = **967 total**
-**PRs merged**: 36
-**Codebase**: ~28K lines Rust source + ~11K lines Rust tests + ~1.3K lines CUDA + ~1.2K lines Python
+Three-tier architecture: Python (orchestration) / Rust (all math, Wengert tape AD) / CUDA (kernel pairs for hot paths).
 
 ---
 
-## Stage Summary
+## Codebase At a Glance
+
+| Metric | Count |
+|--------|-------|
+| Rust source (`core/src/`) | 50,725 lines |
+| Rust tests (`core/tests/`) | 14,078 lines |
+| CUDA kernels (`core/kernels/`) | 3,724 lines |
+| Python (`python/`) | 3,413 lines |
+| Spec documents (`specs/`) | 73 files |
+| Rust tests passing | 1,379 |
+| Python tests passing | 27 |
+| **Total tests** | **1,406** |
+| PRs merged | 122 |
+| HADES tasks closed | 50 |
+| HADES tasks open | 16 |
+| Total commits (since Feb 10) | 329 |
+| Lines inserted (since Feb 10) | 106,850 |
+| Lines deleted (since Feb 10) | 12,163 |
+
+---
+
+## Current Assessment
+
+### Code Confidence: ~80%
+
+The Rust tier (50,725 lines, 1,379 tests) implements all 9 MIRAS memory rules, 3 composition patterns, CMS k=1/2/4 frequency scheduling, the Wengert tape AD system, CUDA kernel pairs, and the full HOPE self-referential pipeline. Every algorithm traces to paper equations via the HADES knowledge graph. This tier is high-confidence — it has been validated through unit tests, finite-difference gradient checking, CUDA-vs-Rust tolerance tests, and integration spikes.
+
+The Python tier (3,413 lines, 27 tests) provides orchestration: build loop, generation, evaluation, data loading, and the unified `hecate.py` entry point. This tier is functional — it drives a live GPU build right now — but has been validated primarily through the running build itself rather than through systematic testing. The `engine/` package was extracted from monolithic scripts during PR #122 and has been through 4 rounds of code review (CodeRabbit + manual), but the real validation of these Python primitives will come through experimentation.
+
+### The Remaining 20%: Experimental Validation Through Data
+
+We are at the inflection point where further confidence cannot come from more unit tests or code review. The architecture is built. The primitives are defined. What we need now is to exercise them against diverse data and observe behavior.
+
+**What experimentation will validate:**
+
+- **CMS frequency scheduling**: Do 4 levels at [1, 8, 64, 512] produce meaningfully different memory dynamics across data domains? The gate biases are learning (L0 theta=0.033, L3 theta=0.0005 at step 5K), but we need curriculum diversity to confirm they specialize.
+- **Self-referential projections**: Adaptive projections via DGD are wired and running, but do they learn to differentiate key/value/query projections across content types? Only varied curricula will tell.
+- **Composition patterns**: MAG is the default, but MAL and MAC exist. Which composition best serves which data regime?
+- **Memory retention**: Does the L2 default suffice, or do specific data patterns expose the need for KL/ElasticNet/Sphere retention?
+- **Outer-loop optimizer**: FrequencyAwareAdamW with per-level bias correction — does this produce the right gradient cadence, or do some levels need different learning rate profiles?
+
+**This means the next phase is dataset curation and curricula design**, not more Rust/CUDA implementation. The code is the instrument — we need to play it.
+
+---
+
+## Completed Stages
 
 ### Stage 0: Foundation (COMPLETE)
 
-**Phase 0: AD Spike** (57/57 tests, archived to Acheron)
-- Originally proved Enzyme differentiates through Rust trait dispatch
-- Superseded by Wengert tape AD (no custom toolchain, no ICE crashes)
-- Spike archived to `Acheron/enzyme-archive/`
+Validated toolchain end-to-end. AD spike (originally Enzyme, archived to Acheron after 22 ICE crashes — Wengert tape superseded). SWA attention pipeline (Rust + CUDA + Python). Delta Rule + MAG composition with gradient flow validation.
 
-**Track Zero-A: Pure SWA Attention** (67 tests)
-- Rust core: forward/backward, 6 weight matrices gradient-checked vs FD
-- CUDA kernels: SWA forward+backward pair, feature-gated dispatch, warp reduction
-- PyO3 bindings: Maturin build, Python API
-- PyTorch regression baseline: validates Rust matches PyTorch
+- 3 milestones, 202 tests
 
-**Track Zero-B: Delta Rule + MAG** (98 tests)
-- MemoryRule trait, DeltaRule impl, MAG dual-branch composition, sigmoid gating
-- 7 memory weight matrices gradient-checked
-- Gate bias init: b_alpha=3.0 (sigmoid~0.95), b_theta=-4.6 (softplus~0.01)
+### Stage 1: Algorithm Core (COMPLETE)
 
-### Stage 1: Algorithm Core (COMPLETE — 778 Rust + 27 Python = 805 tests)
+All algorithms from the NL paper suite. 9 MIRAS memory rules, 3 composition patterns, CMS k=1/2/4 scheduling, 6 parallelization strategies, ContextStream, 100K stability sweep.
 
-All 22 milestones delivered. This is the mathematical heart of the system — everything that PyTorch's autograd + optimizer + DataLoader + model.train()/model_eval() does, reimplemented as a single self-modifying forward pass.
+- 19 milestones, 805 tests (778 Rust + 27 Python)
+- Rules: Delta, Titans LMM, Hebbian, MONETA, YAAD, MEMORA, Lattice OSR, Trellis, Atlas Omega
+- Compositions: MAG (parallel), MAL (sequential+residual), MAC (full causal)
+- CMS: 4 frequency levels [1, 8, 64, 512], Conductor/Pulse scheduling
+- Full PyO3 bindings for all rules + compositions
 
-**Memory Rules (9/9)**:
-- Delta Rule (GD, matrix structure, L2 bias)
-- Titans LMM (GD+momentum, eta gate, momentum accumulator S)
-- Hebbian Rule (direct correlation, no gradient descent)
-- MONETA (2-layer MLP, l_p bias, elastic net retention)
-- YAAD (Huber loss, decoupled local+global retention)
-- MEMORA (KL-softmax bias, emergence-based retention)
-- Lattice OSR (orthogonal state recurrence, slot-based compression)
-- Trellis (two-pass KV compression, separate key/value decay)
-- Atlas Omega (state-independent learned omega, batch-parallelizable)
+### Stage 2: Production Infrastructure (COMPLETE)
 
-**Composition Patterns (3/3)**:
-- MAG: Memory gates attention output via sigmoid (parallel branches)
-- MAL: Memory preprocesses input for attention (sequential, residual)
-- MAC: Memory provides context, attention processes assembled input
+- **S2-M1**: CUDA kernel pairs for Delta/Titans/Hebbian (6 `.cu` files). Multi-arch fat binary (sm_86/89/90 + PTX). GPU-resident model with zero PCIe forward/backward/update.
+- **S2-M2**: CMS-aware multi-GPU gradient sync (only active levels allreduce). MockProcessGroup for testing.
+- **S2-M3**: Serving non-stationary models. Session struct, LatencyTracker (p99), checkpoint/restore.
+- **S2-M4**: Edge deployment. d=64 ~34k tok/s on x86_64, wasm32 validated.
+- Integration spike: 16/16 pass.
 
-**CMS Frequency Scheduling**:
-- k=1 (single level), k=2 (two-frequency), k=4 (full hierarchy: 1/8/64/512)
-- Conductor/Pulse timing, ErrorBuffer gradient accumulation, ContextState persistence
-- 1/sqrt(k) output normalization for k>2
+### Stage 3: Extensions (COMPLETE)
 
-**Parallelization Strategies (5/5)**:
-- Chunkwise GD (baseline)
-- Associative Scan (parallel prefix)
-- TNT Hierarchical (chunk+inter-chunk)
-- Lattice GLA (gated linear attention)
-- Atlas Parallel (batch omega precomputation + sequential recurrence)
+- **S3-M1**: Pluggable retention (RetentionKind enum: L2, KL, ElasticNet, Sphere). PR #31.
+- **S3-M2**: M3 multi-scale optimizer (k momentum accumulators + error buffers). PR #32.
+- **S3-M3**: CMS deployment variants (5 patterns: Basic/Nested/Sequential/Independent/Hybrid). PR #32.
+- **S3-M4**: Atlas Omega (9th MIRAS variant, state-independent omega, batch parallel). PR #35.
+- **S3-M5**: Dynamic frequency scheduling (learned sigmoid gates, straight-through estimator). PR #36.
 
-**Infrastructure**:
-- ContextStream: replaces DataLoader (no epochs, monotonic cursor, checkpoint-serializable)
-- 100K stability sweep across all rule/composition/k combinations
-- PyO3 bindings for all rules + compositions
+### Stage 3b: Primitive Completeness — Specs (ALL 20 COMPLETE)
 
-### Stage 2: Production Infrastructure (COMPLETE — S2-M1 through S2-M4)
+All 20 spec sheets written and stored in HADES (`hecate_specs` collection, status `v0.4.0`):
 
-**S2-M1: CUDA Kernel Pairs + Compilation** (PRs #25, #29)
-- Forward + backward kernels for SWA, Delta Rule, Titans LMM, Hebbian
-- Composition dispatch kernels for MAG/MAL/MAC
-- Multi-architecture fat binary (sm_86/89/90 SASS + PTX fallback)
-- Backend enum + detect_gpu() + force_rust_reference() override
-- Forward tolerance: 1e-5, backward: 1e-4 per-element vs Rust reference
+- Phase 1 (5 specs): DGD, DMGD, FTRL, Implicit GD, Newton-Schulz inner
+- Phase 2 (6 specs): Bregman, L_q norm, sigmoid-bounded retention, l_1/KL/l_p bias
+- Phase 3 (4 specs): Self-referential projections/values/feature maps, chunkwise self-ref
+- Phase 4 (5 specs): AdamW outer-loop, AdaMuon, Atlas Omega, Short Conv1D, HOPE composition
 
-**S2-M2: CMS-Aware Multi-GPU Gradient Sync** (PR #26)
-- Replaces DDP: only active CMS levels synchronized (not all parameters every step)
-- MockProcessGroup for testing without real multi-GPU hardware
-- AllReduce averaging + ErrorBuffer integration for frozen levels
+### Stage 3b-Critical: HOPE Path (9/10 milestones delivered)
 
-**S2-M3: Serving Non-Stationary Models** (PR #27)
-- Session struct: per-user isolated ContextState + Conductor
-- Two modes: Test (bounded) and Stream (unbounded via ContextStream) — no mode flag (CS-10)
-- process_chunk calls cms_forward directly — same path as build (CS-18)
-- LatencyTracker: average/worst/p99 for SLA validation
-- Checkpoint/restore with pulse_id verification
+| Milestone | PR | Status |
+|-----------|-----|--------|
+| S3b-M1: DGD (inner-loop optimizer) | #113 | COMPLETE |
+| S3b-M5: DGD CUDA kernel pair | #114 | COMPLETE |
+| GAP-L: Self-referential projections (M_k, M_v, M_q) | #115 | COMPLETE |
+| GAP-M: Self-generated values + DGD key alignment | #116 | COMPLETE |
+| GAP-N: Chunkwise self-referential training | #117 | COMPLETE |
+| S3b-S16: Frequency-aware AdamW outer-loop | #118 | COMPLETE |
+| GAP-O: SelfRefParamGrads outer-loop wiring | #119 | COMPLETE |
+| HOPE build config wiring | #120 | COMPLETE |
+| Fix GPU backward grad shape mismatch | #121 | COMPLETE |
+| GAP-E: Feature maps (phi(k) hook) | — | NOT STARTED |
 
-**S2-M4: Edge Deployment** (PR #28)
-- Zero-dependency micro models (d <= 128) on CPU
-- Three profiles: inner-loop only, full NL, WASM (wasm32-unknown-unknown validated)
-- ~34k tok/s on x86_64 for d=64 (exceeds 18k target)
-- No custom toolchain required — compiles on standard Rust
+### Stage 4 Phase 1: Pipeline (COMPLETE — M1 through M8)
 
-### Stage 3: Extensions (COMPLETE — 5/5 milestones)
+Full build-to-serve pipeline operational:
 
-**S3-M1: Pluggable Retention** (PR #31)
-- Extracted retention mechanisms from inline code in all 8 memory rules into `core/src/retention.rs`
-- `RetentionKind` enum: L2WeightDecay, KLDivergence, ElasticNet (NEW), SphereNormalization
-- 6 free functions + 2 in-place variants for zero-alloc hot paths
-- `RetentionKind` field added to `MAGConfig` (24 constructors, all test files updated)
-- Cross-rule retention swapping enabled (e.g. DeltaRule+ElasticNet) — CS-36 compliance
-- PyO3 `retention` kwarg for Python-side configuration
-- 22 dedicated retention tests + 17 inline unit tests
+- Weight serialization, stateful PyO3 bindings, checkpoint format with schema migration
+- Unified `hecate.py` entry point with `engine/` package (PR #122)
+- GPU-default paradigm: `--cpu` flag instead of `--gpu`, adamw auto-promotes to adamw_gpu
+- Primitive validation tooling (forget gate probe, curriculum pipeline, tape profiling)
+- Wengert tape integration (production gradient path, 5 phases across PRs #55-65)
+- ShareGPT data pipeline (PR #44)
+- Post-run validation script (`validate_run.py`) with 6 quantitative thresholds
 
-**S3-M2: M3 Multi-Scale Optimizer** (PR #32)
-- CMS applied to the optimizer: k momentum accumulators at k frequency levels
-- `M3Config` + `M3State` + `m3_step()` core function with per-level EMA + error accumulation
-- Newton-Schulz orthogonalization (opt-in, 5-iteration convergence to orthogonal matrix)
-- Flatten/unflatten helpers for MAGParams ↔ flat Vec<f32>
-- `apply_weight_gradients_m3()` on MAGParams, integrated with distributed_step
-- 20 tests (unit, error buffering, integration, edge cases)
+### Partial Specs Implementation (PS-* sweep, completed 2026-02-22)
 
-**S3-M3: CMS Deployment Variants** (PR #32)
-- Configuration schema + validation for 5 CMS deployment patterns
-- `CMSVariant` enum (Basic, Nested, Sequential, Independent, Hybrid)
-- `BlockConfig` + `MultiBlockConfig` with per-variant constructors and validation
-- Nested requires M3 config, Sequential validates non-decreasing k, Hybrid requires mix
-- 15 tests (construction, validation, helpers)
+Systematic sweep closing gaps between specs and implementation:
 
-**S3-M4: Atlas Omega Rule** (PR #35)
-- 9th MIRAS variant: state-independent learned omega function `omega(k,v) = W_omega @ silu(concat(k_mem, v_mem))`
-- `core/src/atlas_omega.rs` (~700 lines): full forward + backward with d_M/d_S recurrences + d_W_omega gradient through silu chain rule
-- `atlas_parallel.rs` rewritten: batch omega precomputation + sequential M/S recurrence
-- Full dispatch wiring: MAG, MAL, MAC, chunkwise_gd, TNT (carry-forward path, not outer-product)
-- `w_omega` field on MemoryLevelParams, Xavier init for Atlas
-- Integration sweep expanded to 9 rules × 3 compositions × 3 k-values (72 combos)
-- 12 unit tests + chunkwise macro tests + TNT macro tests
-
-**S3-M5: Dynamic Frequency Scheduling** (PR #36)
-- CMS frequencies were hardcoded `[1, 8, 64, 512]` — pure modular arithmetic. This adds learned sigmoid gates per level
-- `core/src/dynamic_freq.rs` (~420 lines): `FrequencySchedule` enum (Fixed/Learned), `LearnedFreqConfig`, `FreqGateCache`
-- Per-level gate: `sigmoid(embedded_mean @ w_freq_l + b_freq_l)` → hard threshold (> 0.5) → active/inactive
-- Straight-through estimator: forward uses hard threshold, backward flows through sigmoid (standard for binary gates)
-- Level 0 always forced active (spec invariant); higher levels start with more negative b_freq bias (fire less often)
-- `FrequencySchedule` on `MAGConfig` (default: Fixed = zero behavioral change for all existing code)
-- `w_freq`/`b_freq` on `MemoryLevelParams` (empty vecs for Fixed, [d]+[1] per level for Learned)
-- CMS integration: gate override in `cms_forward`, surrogate gradient in `cms_backward`
-- PyO3 `frequency_schedule` kwarg: "fixed", "learned", or dict with threshold/anneal_steps
-- 22 tests (unit, integration, gradient FD check, edge cases)
-
-### Integration Spike: End-to-End Validation
-
-**17 tests** validating that the full pipeline actually learns a predictable pattern.
-
-**Stage 1 tests (12)**: VecStream -> Conductor -> cms_forward -> cms_backward -> apply loop for 500 steps. Three configs (DeltaRule+MAG, TitansLMM+MAL, HebbianRule+MAG) all converge from random-chance loss (2.77) to near-zero, achieving 100% prediction accuracy on a repeating [0..8] token pattern.
-
-**Stage 2 tests (5)**: Serving Session path produces identical behavior to raw loop. Checkpoint/restore yields identical loss trajectory. CUDA dispatch stub validates feature gating.
+| Tier | Tasks | PRs |
+|------|-------|-----|
+| PS-TA (Surgical) | Smooth tanh sign, l_p dispatch, FrequencyAwareAdamW, bf16 storage | #92-95 |
+| PS-TB (Medium) | Lattice OSR variants, MAC persistent tokens, MAL persistent tokens, FTRL accumulator, Newton-Schulz inner, TNT Q-K projection, Lattice GLA | #97-103 |
+| PS-TC (Architectural) | Marker traits, CompositionPattern trait, HOPE level-level composition | #90-91, #96 |
+| PS-BLK (Building blocks) | Conv1D fields/eta gate, L_q retention, momentum module, Conv1D preprocessing | #105-108 |
+| PS-FINAL | contract.md reconciliation v0.4.0 to v0.4.1 | #109 |
 
 ---
 
-## Key Discoveries
+## Live Build: Phase 0 TinyStories 100K
 
-### 1. CMS Stabilization via Nesting
+**Config**: d=512, heads=8, seq_len=512, k=4 CMS, Titans LMM + MAG, adaptive projection, adamw_gpu
 
-The most significant finding: multi-level CMS nesting provides **implicit regularization** that extends the stable operating range of inner-loop learning rates.
+**5K Eval Checkpoint** (first validation gate):
 
-| b_theta | softplus(b_theta) | k=1 | k=2 |
-|---|---|---|---|
-| 0.0 | 0.69 | converges (0.149) | converges (0.150, tie) |
-| 1.0 | 1.31 | converges | converges (0.056) |
-| **1.2** | **1.49** | **NaN at step ~9K** | **converges (0.055)** |
-| 1.5 | 1.74 | NaN at step ~8.5K | NaN |
+| Metric | Value | Threshold | Status |
+|--------|-------|-----------|--------|
+| Loss decrease | 63% (10.37 → 3.78) | ≥15% | PASS |
+| NaN/Inf | None | 0 | PASS |
+| Checkpoint roundtrip | delta=0.00e+00 | < 1e-6 | PASS |
+| RSS memory | 4,081 MB stable | — | Healthy |
 
-### 2. Inner Loop IS the Forward Pass
+**Gate biases at step 5K** (all 4 CMS levels alive and differentiating):
 
-The serving module proves the central NL thesis: there is no train/eval distinction. Session::process_chunk calls cms_forward — the exact same function used during build. Memory self-modifies during inference. Per-token latency is O(1) with respect to context length because memory matrices are fixed-size (d times d).
+| Level | alpha (forget) | theta (lr) | eta (momentum) | M norm |
+|-------|---------------|------------|----------------|--------|
+| L0 | 0.9024 | 0.0325 | 0.7525 | 3.0275 |
+| L1 | 0.9792 | 0.0045 | 0.8729 | 0.6793 |
+| L2 | 0.9888 | 0.0014 | 0.9233 | 0.0271 |
+| L3 | 0.9933 | 0.0005 | 0.9525 | 0.0024 |
 
-### 3. MLP Rules: Inner Loop Dominates
+The gates show the expected gradient: higher levels retain more (alpha closer to 1), learn slower (theta smaller), and have lower memory norms (fewer updates accumulated). This is the CMS frequency separation working as designed.
 
-For MONETA/YAAD/MEMORA (MLP-based memory structure), the outer-loop SGD barely affects loss. The MLP inner loop is expressive enough to fit without outer-loop weight changes. This suggests MLP memory rules may be more suitable for pure serving (no outer-loop needed) than matrix rules.
-
-### 4. Learning Rate Scales as 1/sqrt(d)
-
-The integration spike revealed that outer-loop learning rate must scale with model dimension. At d=8, lr=0.01 (used by d=64 unit tests) produces negligible weight changes — SWA gradient norm of 0.024, memory gradients ~1e-7. Scaling to lr=0.5 achieved convergence from 2.77 to 0.0007 in 500 steps. The relationship is approximately lr proportional to 1/sqrt(d).
-
-### 5. Additive Level Composition Scaling
-
-y_combined = SUM(level outputs) grows linearly with k. At k=4, the summed signal pushes sigmoid into saturation. Fixed with 1/sqrt(k) normalization (variance-preserving, applied only for k>2).
+**Generation at 5K**: Repetitive ("time", "Timmy", "mom") — mode-collapsed on high-frequency TinyStories tokens, expected at this stage. Coherent structure will emerge in the 10K-25K range as memory accumulates and lower-frequency levels engage.
 
 ---
 
-## Architecture
+## HOPE Architecture Status
 
-```text
-core/src/                          (~28,000 lines, 33 modules)
-  tensor.rs        — SIMD-friendly primitives, RNG, sigmoid, softplus
-  swa.rs           — Sliding Window Attention forward/backward
-  model.rs         — SWAConfig/Params, MAGConfig/Params, MemoryLevelParams
-  forward.rs       — SWA forward pass
-  backward.rs      — SWA backward pass
-  gradient.rs      — FD gradient checking, MAG/CMS/MAL/MAC gradient computation
-  delta_rule.rs    — MemoryRule trait + DeltaRule (GD, matrix, L2)
-  titans_lmm.rs    — TitansLMM (GD+momentum, eta gate)
-  hebbian_rule.rs  — HebbianRule (direct correlation)
-  moneta.rs        — MONETA (MLP, l_p, elastic net)
-  yaad.rs          — YAAD (Huber, decoupled retention)
-  memora.rs        — MEMORA (KL-softmax, emergence)
-  lattice_osr.rs   — Lattice OSR (orthogonal state recurrence)
-  trellis.rs       — Trellis (two-pass KV compression)
-  atlas_omega.rs   — Atlas Omega (state-independent omega, learned W_omega)
-  retention.rs     — Pluggable retention (L2/KL/ElasticNet/Sphere) + in-place variants
-  m3.rs            — M3 multi-scale optimizer (CMS on optimizer itself)
-  cms_variants.rs  — CMS deployment variant schemas (Basic/Nested/Sequential/Independent/Hybrid)
-  dynamic_freq.rs  — Dynamic frequency scheduling (learned gates, straight-through estimator)
-  mag.rs           — MAG composition + CMS forward/backward
-  mal.rs           — MAL composition
-  mac.rs           — MAC composition
-  dispatch.rs      — CPU/CUDA feature-gated dispatch
-  conductor.rs     — Conductor/Pulse/ContextState/ErrorBuffer
-  context_stream.rs — ContextStream trait + VecStream
-  parallel.rs      — Parallelization strategy configs
-  chunkwise_gd.rs  — Chunkwise GD parallelization
-  associative_scan.rs — Parallel prefix scan
-  tnt.rs           — TNT hierarchical parallelization
-  lattice_gla.rs   — Gated linear attention
-  atlas_parallel.rs — Atlas memory-optimized parallel
-  serving.rs       — Session/LatencyTracker/Checkpoint (feature: serving)
-  distributed.rs   — CMS-aware multi-GPU sync (feature: distributed)
-  edge.rs          — Edge deployment profiles (feature: edge)
-  cuda_ffi.rs      — CUDA FFI bindings (feature: cuda)
+### Built (Rust tier)
 
-core/kernels/                      (~1,250 lines, 8 kernel files)
-  swa_forward.cu / swa_backward.cu
-  delta_forward.cu / delta_backward.cu
-  titans_forward.cu / titans_backward.cu
-  hebbian_forward.cu / hebbian_backward.cu
+- DGD inner-loop optimizer (`core/src/dgd.rs`) + CUDA kernel pair
+- Self-referential projections: all 6 memories (M_k, M_v, M_q, M_eta, M_alpha, M_mem) produce adaptive projections via DGD
+- Self-generated values: `v_hat = M @ v_t` (HOPE Eq 84-85)
+- Chunkwise self-referential training: frozen M snapshots at chunk boundaries (HOPE section 8.2, Eqs 90-93)
+- Frequency-aware AdamW outer-loop: per-level bias correction counters
+- SelfRefParamGrads wired into outer-loop optimizer (16 to 22 AdamW buffers)
+- Conv1D key/query preprocessing
+- All dispatch wiring (MAG/MAL/MAC, gradient.rs, chunkwise_gd.rs)
 
-core/tests/                        (~11,000 lines, 29 test files)
+### Built (Python tier)
 
-python/                            (~1,200 lines)
-  nl_hecate/       — PyO3 bindings (all rules + compositions)
-  tests/           — PyTorch baseline + binding tests (27 tests)
-```
+- HOPE build config fields wired through to Rust (PR #120)
+- GPU backward grad shape fix for adaptive projections (PR #121)
+- Unified hecate.py entry point with GPU-default (PR #122, merged)
+- engine/ package: config, tokenizer, data, generation, evaluation, logging, loop, chat
+- Post-run validation with quantitative thresholds (`validate_run.py`)
+
+### Remaining Code Work (deferred to post-experimentation as needed)
+
+1. **GAP-E**: Feature maps — `phi(k)` hook and `FeatureMapKind` enum
+2. **S3b-S19**: Short Conv1D implementation (spec complete, PS-BLK-04 wired the fields)
+3. **S3b-S20**: HOPE composition pattern (the castle that uses all the pieces)
+
+These are real gaps, but they are not blocking the current experimental program. The existing primitives (Titans LMM + MAG + CMS k=4 + adaptive projections + DGD + AdamW) are sufficient to run meaningful experiments. Feature maps and HOPE composition will be prioritized based on what experimentation reveals.
 
 ---
 
-## PR History
+## What Is Next: Dataset Curation and Curricula
 
-| PR | Title | Stage |
-|---|---|---|
-| #1 | Phase 0: Enzyme spike test suite | S0 |
-| #2 | Phase 0 spike complete: 57/57 pass, OUTCOME 1 GO | S0 |
-| #3 | Track Zero-A Phase 1: Rust core with SWA forward/backward | S0 |
-| #4 | Track Zero-A Phase 2: CUDA SWA kernel pair | S0 |
-| #5 | Track Zero-A Phase 3: PyO3 Python bindings | S0 |
-| #6 | Track Zero-A Phase 4: PyTorch regression baseline | S0 |
-| #7 | Track Zero-B Phase 1: Delta Rule + MAG composition | S0 |
-| #8 | Track Zero-B Phase 2: PyO3 bindings + PyTorch MAG baseline | S0 |
-| #9 | CMS k=2 — multi-level memory scheduling | S0 |
-| #10 | CMS k=4 — full frequency hierarchy | S0 |
-| #11 | Titans LMM: GD+momentum memory rule | S1 |
-| #12 | CMS output normalization (1/sqrt(k) for k>2) | S1 |
-| #13 | Stability boundary test | S1 |
-| #14 | Hebbian rule implementation | S1 |
-| #15 | MONETA: MLP memory rule | S1 |
-| #16 | YAAD: Huber decoupled retention | S1 |
-| #17 | MEMORA: KL-softmax emergence | S1 |
-| #18 | Lattice OSR: orthogonal state recurrence | S1 |
-| #19 | Trellis: two-pass KV compression | S1 |
-| #20 | Update PyO3 bindings for all MIRAS rules | S1 |
-| #21 | MAC/MAL composition patterns | S1 |
-| #22 | ContextStream implementation | S1 |
-| #23 | 100K stability sweep expansion | S1 |
-| #24 | Parallelization strategies (5/5) | S1 |
-| #25 | CUDA kernel pairs (S2-M1) | S2 |
-| #26 | CMS-aware multi-GPU gradient sync (S2-M2) | S2 |
-| #27 | Serving non-stationary models (S2-M3) | S2 |
-| #28 | Edge deployment for zero-dependency micro models (S2-M4) | S2 |
-| #29 | Multi-arch CUDA dispatch + build matrix (S2-M1 Phase 5) | S2 |
-| #30 | Update progress report and integration spike tests | S2 |
-| #31 | Pluggable retention trait — MIRAS Knob #3 (S3-M1) | S3 |
-| #32 | M3 multi-scale optimizer + CMS deployment variants (S3-M2/M3) | S3 |
-| #33 | (closed — agent-generated, rejected) | — |
-| #34 | (closed — agent-generated, rejected) | — |
-| #35 | Atlas Omega memory rule — 9th MIRAS variant (S3-M4) | S3 |
-| #36 | Dynamic frequency scheduling with learned CMS level gates (S3-M5) | S3 |
+The codebase provides a complete set of Python-tier primitives for experimentation:
+
+- `hecate.py --build` with JSON config files
+- `engine/config.py`: BuildConfig with all HOPE fields exposed
+- `engine/data.py`: MmapTokenStream (byte), BpeDataLoader (ShareGPT)
+- `engine/evaluation.py`: val loss, coherence samples, per-phase curriculum probes
+- `validate_run.py`: post-run quantitative validation
+
+**Immediate priorities:**
+
+1. **Complete Phase 0 build** (100K steps TinyStories) — validate loss convergence, Level 3 activity, checkpoint roundtrip. This is the baseline.
+
+2. **Dataset curation** — Assemble diverse corpora that exercise different memory regimes:
+   - Short-context factual (tests L0/L1 fast memory)
+   - Long-range dependency (tests L2/L3 slow memory)
+   - Mixed-domain (tests CMS frequency separation across content types)
+   - Structured reasoning (tests whether self-referential projections specialize)
+
+3. **Curriculum design** — Phase-structured builds that progress through data regimes:
+   - Phase 0: TinyStories (simple narratives, baseline) — IN PROGRESS
+   - Phase 1: Mixed narrative + conversation (ShareGPT blend)
+   - Phase 2+: Domain-specific curricula based on Phase 0/1 observations
+
+4. **Experimental instrumentation** — The build loop already logs gate biases, memory norms, level fires, and per-phase probe losses to JSONL. Analysis tooling (beyond `validate_run.py`) will be built as experiments demand it.
+
+5. **Remaining code work** — GAP-E (feature maps) and HOPE composition will be scheduled based on experimental findings. If the current primitives plateau, these become the next engineering sprint.
 
 ---
 
-## Metrics
+## HADES Knowledge Graph (NL Database)
 
-| Metric | Value |
-|---|---|
-| Total tests | 967 (940 Rust + 27 Python) |
-| Rust tests (verified) | 671 lib + 269 external = 940 passed, 0 failed |
-| Python tests | 27 |
-| PRs merged | 36 (34 active + 2 closed) |
-| Spec files | 48 |
-| Lines of Rust (core/src) | ~28,000 |
-| Lines of Rust (core/tests) | ~11,000 |
-| Lines of CUDA (kernels) | ~1,250 |
-| Lines of Python (bindings+tests) | ~1,200 |
-| Memory rules | 9/9 |
-| Composition patterns | 3/3 |
-| Parallelization strategies | 6/6 |
-| CMS levels validated | k=1, k=2, k=4 |
-| MIRAS knobs exercised | All 4 (Structure, Bias, Retention, Algorithm) |
-| Edge throughput (d=64) | ~34k tok/s |
-| Integration spike | 17/17 pass, Outcome 1 (GO) |
+| Collection Type | Count |
+|----------------|-------|
+| Databases | 1 (NL) |
+| Collections | 73 |
+| Documents | ~1,699 |
+| Per-paper equation collections | 7 papers decomposed |
+| Code smell constraints | 48 (CS-01 through CS-48) |
+| Spec nodes (hecate_specs) | 70 |
+| Trace edges (nl_hecate_trace_edges) | 94 |
+| Persephone tasks | 66 (50 closed, 16 open) |
 
 ---
 
-## What's Next
+## Open Tasks (16)
 
-All four stages (S0–S3) are complete. The system has 9 memory rules, 3 composition patterns, 6 parallelization strategies, pluggable retention, a multi-scale optimizer (M3), CMS deployment variant schemas, Atlas Omega with full parallelization, and dynamic frequency scheduling with learned gates. 967 tests, 0 failures.
+### HOPE Critical Path
+- `task_79f2c5`: GAP-E — Feature maps (phi() hook)
+- `task_d06657`: GAP-Q — contract.md final reconciliation
 
-- ~~**S3-M1: Pluggable Retention**~~ — COMPLETE (PR #31)
-- ~~**S3-M2: M3 Multi-Scale Optimizer**~~ — COMPLETE (PR #32)
-- ~~**S3-M3: CMS Deployment Variants**~~ — COMPLETE (PR #32)
-- ~~**S3-M4: Atlas Omega Rule**~~ — COMPLETE (PR #35)
-- ~~**S3-M5: Dynamic Frequency Scheduling**~~ — COMPLETE (PR #36)
+### Stage 5 Deferred (MIRAS Completeness)
+- `task_c48b71`: GAP-K — FTRL accumulator
+- `task_544d8d`: GAP-J — Implicit GD Cases 4 and 5
+- `task_f18e65`: GAP-H — Sigmoid bounded retention
+- `task_eb6a4f`: GAP-G — L_q as RetentionKind variant
+- `task_60e757`: GAP-F — Bregman retention framework
+- `task_667d92`: GAP-D — KL attentional bias
+- `task_0ecca3`: GAP-C — TNT Q-K projection integration
+
+### Experimental / Data
+- `task_08ca2e`: HOPE NLM Phase 0+1 Training (current build)
+- `task_41186a`: Generate external-notebook curriculum
+- `task_97ffb6`: Generate HADES graph-reasoning curriculum
+- `task_f9e744`: Baseline transformer comparison
+
+### Infrastructure
+- `task_f6d9f4`: M3 Optimizer M-squared sign reversal (verify/fix)
+- `task_9f1281`: Skip all-masked chunks in loss logging
+- `task_unimpl_specs` / `task_partial_specs`: Tracking tasks
+
+---
+
+## PR History (122 PRs)
+
+| PR Range | Stage | Description |
+|----------|-------|-------------|
+| #1-8 | S0 | Foundation: AD spike, SWA pipeline, memory intro |
+| #9-24 | S1 | Algorithm core: 9 rules, 3 compositions, CMS, parallelization |
+| #25-29 | S2 | Production infra: CUDA kernels, multi-GPU, serving, edge |
+| #31-36 | S3 | Extensions: retention, M3, CMS variants, Atlas, dynamic freq |
+| #37-39 | S4-M1..M5 | Pipeline: serialization, PyO3, build/serve scripts, checkpoint format |
+| #40-41 | S2-M1a/b | SWA head_dim fix, GPU-resident model |
+| #42-43 | S4-M6..M7 | Model design, primitive validation |
+| #44 | S4-M8 | ShareGPT data pipeline |
+| #49-65 | S4-M8 | Wengert tape integration (5 phases) |
+| #67 | S3-M5 | Gradient checkpointing |
+| #86-89 | S3b specs | Late spec sheets + hecate_specs graph coverage |
+| #90-109 | PS-* sweep | Partial specs implementation (27 PRs in 48 hours) |
+| #110-112 | GAP-A/B, S4-M7 | MemoryRule associated type, bf16 storage, validation run |
+| #113-114 | S3b-M1/M5 | DGD extraction + CUDA kernel pair |
+| #115-117 | S3b-M3 | Self-referential: projections, self-gen values, chunkwise |
+| #118-119 | S3b-S16 | Frequency-aware AdamW + SelfRefParamGrads wiring |
+| #120-121 | S4 Phase 2 | HOPE build config, GPU grad shape fix |
+| #122 | Infra | Unify build/serve to hecate.py + engine/ (MERGED) |

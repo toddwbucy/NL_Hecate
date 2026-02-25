@@ -275,6 +275,8 @@ impl MAGConfig {
         attentional_bias=None, kernel_size=0, self_ref_chunk_size=1,
         projection_kind="static", self_generated_values=false,
         momentum_kind="none", momentum_d_hidden=0,
+        theta_floor=None, theta_ceil=None,
+        intermediate_size=0,
     ))]
     fn new(
         d_model: usize,
@@ -310,6 +312,9 @@ impl MAGConfig {
         self_generated_values: bool,
         momentum_kind: &str,
         momentum_d_hidden: usize,
+        theta_floor: Option<Vec<f32>>,
+        theta_ceil: Option<Vec<f32>>,
+        intermediate_size: usize,
     ) -> PyResult<Self> {
         if d_model != num_heads * head_dim {
             return Err(PyValueError::new_err(format!(
@@ -353,8 +358,9 @@ impl MAGConfig {
             "lattice" => MemoryRuleKind::LatticeOSR,
             "trellis" => MemoryRuleKind::Trellis,
             "atlas" | "atlas_omega" => MemoryRuleKind::AtlasOmega,
+            "swiglu_mlp" | "swiglu" => MemoryRuleKind::SwiGluMlp,
             _ => return Err(PyValueError::new_err(format!(
-                "Unknown memory_rule '{memory_rule}'. Expected: delta, titans, hebbian, moneta, yaad, memora, lattice, trellis, atlas, atlas_omega"
+                "Unknown memory_rule '{memory_rule}'. Expected: delta, titans, hebbian, moneta, yaad, memora, lattice, trellis, atlas, atlas_omega, swiglu_mlp"
             ))),
         };
         let ret_kind = match retention {
@@ -467,6 +473,9 @@ impl MAGConfig {
                 },
                 self_generated_values,
                 self_ref_chunk_size,
+                theta_floor: theta_floor.unwrap_or_default(),
+                theta_ceil: theta_ceil.unwrap_or_default(),
+                intermediate_size,
             },
         })
     }
@@ -505,8 +514,11 @@ impl MAGConfig {
             MemoryRuleKind::LatticeOSR => "lattice",
             MemoryRuleKind::Trellis => "trellis",
             MemoryRuleKind::AtlasOmega => "atlas",
+            MemoryRuleKind::SwiGluMlp => "swiglu_mlp",
         }
     }
+    #[getter]
+    fn intermediate_size(&self) -> usize { self.inner.intermediate_size }
     #[getter]
     fn k(&self) -> usize { self.inner.k }
     #[getter]
@@ -533,6 +545,10 @@ impl MAGConfig {
     fn self_ref_chunk_size(&self) -> usize { self.inner.self_ref_chunk_size }
     #[getter]
     fn momentum_d_hidden(&self) -> usize { self.inner.momentum_d_hidden }
+    #[getter]
+    fn theta_floor(&self) -> Vec<f32> { self.inner.theta_floor.clone() }
+    #[getter]
+    fn theta_ceil(&self) -> Vec<f32> { self.inner.theta_ceil.clone() }
 }
 
 // ── MAGParams ──────────────────────────────────────────────────────
@@ -605,6 +621,10 @@ impl MAGParams {
             flat.extend_from_slice(&level.m_eta_init);
             flat.extend_from_slice(&level.m_alpha_init);
             flat.extend_from_slice(&level.m_mem_init);
+            // SwiGluMlp-specific: empty for all other rules
+            flat.extend_from_slice(&level.gate_proj);
+            flat.extend_from_slice(&level.up_proj);
+            flat.extend_from_slice(&level.down_proj);
         }
         flat.extend_from_slice(&self.inner.alpha_mem);
         flat.extend_from_slice(&self.inner.alpha_refl);
@@ -664,10 +684,59 @@ impl MAGParams {
             copy_slice!(level.m_eta_init);
             copy_slice!(level.m_alpha_init);
             copy_slice!(level.m_mem_init);
+            // SwiGluMlp-specific: empty for all other rules
+            copy_slice!(level.gate_proj);
+            copy_slice!(level.up_proj);
+            copy_slice!(level.down_proj);
         }
         copy_slice!(self.inner.alpha_mem);
         copy_slice!(self.inner.alpha_refl);
         copy_slice!(self.inner.persistent_tokens);
+        Ok(())
+    }
+
+    /// Load MLP weights into a specific CMS level (SwiGluMlp rule).
+    /// gate: [intermediate x d_model], up: same, down: [d_model x intermediate].
+    fn set_level_mlp(
+        &mut self,
+        cfg: &MAGConfig,
+        level: usize,
+        gate: Vec<f32>,
+        up: Vec<f32>,
+        down: Vec<f32>,
+    ) -> PyResult<()> {
+        if level >= self.inner.levels.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "level {level} out of range (k={})", self.inner.levels.len()
+            )));
+        }
+        let d = cfg.inner.swa.d_model;
+        let inter = cfg.inner.intermediate_size;
+        if inter == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "set_level_mlp: intermediate_size is 0 — configure MAGConfig with intermediate_size > 0 for SwiGluMlp"
+            ));
+        }
+        let expected_gate = inter * d;
+        let expected_down = d * inter;
+        if gate.len() != expected_gate {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "gate shape mismatch: expected {inter}×{d}={expected_gate} elements, got {}", gate.len()
+            )));
+        }
+        if up.len() != expected_gate {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "up shape mismatch: expected {inter}×{d}={expected_gate} elements, got {}", up.len()
+            )));
+        }
+        if down.len() != expected_down {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "down shape mismatch: expected {d}×{inter}={expected_down} elements, got {}", down.len()
+            )));
+        }
+        self.inner.levels[level].gate_proj = gate;
+        self.inner.levels[level].up_proj = up;
+        self.inner.levels[level].down_proj = down;
         Ok(())
     }
 }
@@ -699,6 +768,8 @@ impl MAGForwardCache {
     attentional_bias=None, kernel_size=0, self_ref_chunk_size=1,
     projection_kind="static", self_generated_values=false,
     momentum_kind="none", momentum_d_hidden=0,
+    theta_floor=None, theta_ceil=None,
+    intermediate_size=0,
 ))]
 fn mag_create_config(
     d_model: usize,
@@ -734,6 +805,9 @@ fn mag_create_config(
     self_generated_values: bool,
     momentum_kind: &str,
     momentum_d_hidden: usize,
+    theta_floor: Option<Vec<f32>>,
+    theta_ceil: Option<Vec<f32>>,
+    intermediate_size: usize,
 ) -> PyResult<MAGConfig> {
     MAGConfig::new(
         d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled,
@@ -741,6 +815,7 @@ fn mag_create_config(
         d_hidden, lp_p, sign_sharpness, lq_q, lambda_local, lambda_2, delta, m_slots, d_compress, lambda_k, lambda_v,
         retention, m3, frequency_schedule, checkpoint_interval, attentional_bias, kernel_size, self_ref_chunk_size,
         projection_kind, self_generated_values, momentum_kind, momentum_d_hidden,
+        theta_floor, theta_ceil, intermediate_size,
     )
 }
 
@@ -961,6 +1036,7 @@ fn parse_block_config(d: &Bound<'_, PyDict>) -> PyResult<RustBlockConfig> {
         "lattice" => MemoryRuleKind::LatticeOSR,
         "trellis" => MemoryRuleKind::Trellis,
         "atlas" | "atlas_omega" => MemoryRuleKind::AtlasOmega,
+        "swiglu_mlp" | "swiglu" => MemoryRuleKind::SwiGluMlp,
         _ => return Err(PyValueError::new_err(format!(
             "Unknown memory_rule '{rule_str}'"
         ))),
