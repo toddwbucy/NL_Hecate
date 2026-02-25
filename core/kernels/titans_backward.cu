@@ -5,8 +5,23 @@
 //
 // Grid=(1), Block=(min(d*d, 1024)).
 // All fp32.
+//
+// NOTE: d_M and d_S live in global memory (allocated via cudaMalloc in C wrapper),
+// NOT shared memory. At d=512, d_M+d_S = 2MB — far exceeds GPU smem limits.
+// Only small buffers (prediction[d], error[d], d_error[d], reduce_buf) in smem.
 
 #include <cuda_runtime.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+static inline void check_cuda_launch(const char* kernel_name, int d, int smem_bytes) {
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[NL_Hecate FATAL] %s launch failed (d=%d, smem=%d): %s\n",
+                kernel_name, d, smem_bytes, cudaGetErrorString(err));
+        abort();
+    }
+}
 
 __global__ void titans_backward_kernel(
     const float* __restrict__ k_mem,
@@ -26,19 +41,19 @@ __global__ void titans_backward_kernel(
     float* __restrict__ d_eta,
     float* __restrict__ d_m_initial,
     float* __restrict__ d_s_initial,
+    float* __restrict__ d_M,              // [d*d] — gradient accumulator in global memory
+    float* __restrict__ d_S,              // [d*d] — gradient accumulator in global memory
     int seq_len, int d)
 {
     int tid = threadIdx.x;
     int dd = d * d;
 
-    // Shared: d_M[d*d] + d_S[d*d] + prediction[d] + error[d] + d_error[d] + reduce_buf[blockDim.x]
+    // Shared: prediction[d] + error[d] + d_error[d] + reduce_buf[blockDim.x]
     extern __shared__ float smem[];
-    float* d_M = smem;
-    float* d_S = smem + dd;
-    float* prediction = smem + 2 * dd;
-    float* error_buf = smem + 2 * dd + d;
-    float* d_error = smem + 2 * dd + 2 * d;
-    float* reduce_buf = smem + 2 * dd + 3 * d;
+    float* prediction = smem;
+    float* error_buf = smem + d;
+    float* d_error = smem + 2 * d;
+    float* reduce_buf = smem + 3 * d;
 
     // Init d_M = 0, d_S = 0
     for (int idx = tid; idx < dd; idx += blockDim.x) {
@@ -229,18 +244,18 @@ __global__ void titans_backward_segment_kernel(
     float* __restrict__ d_eta,
     float* __restrict__ d_m_out,
     float* __restrict__ d_s_out,
+    float* __restrict__ d_M,              // [d*d] — gradient accumulator in global memory
+    float* __restrict__ d_S,              // [d*d] — gradient accumulator in global memory
     int t_start, int t_end, int d)
 {
     int tid = threadIdx.x;
     int dd = d * d;
 
     extern __shared__ float smem[];
-    float* d_M = smem;
-    float* d_S = smem + dd;
-    float* prediction = smem + 2 * dd;
-    float* error_buf = smem + 2 * dd + d;
-    float* d_error = smem + 2 * dd + 2 * d;
-    float* reduce_buf = smem + 2 * dd + 3 * d;
+    float* prediction = smem;
+    float* error_buf = smem + d;
+    float* d_error = smem + 2 * d;
+    float* reduce_buf = smem + 3 * d;
 
     // Init from seeds
     for (int idx = tid; idx < dd; idx += blockDim.x) {
@@ -421,7 +436,13 @@ extern "C" void titans_backward_segment_f32_cuda(
     dim3 grid(1);
     dim3 block(block_size);
 
-    int smem_bytes = (2 * dd + 3 * d + block_size) * sizeof(float);
+    int smem_bytes = (3 * d + block_size) * sizeof(float);
+
+    // Allocate d_M and d_S workspaces
+    float* d_M_work = nullptr;
+    float* d_S_work = nullptr;
+    cudaMalloc(&d_M_work, dd * sizeof(float));
+    cudaMalloc(&d_S_work, dd * sizeof(float));
 
     titans_backward_segment_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, eta,
@@ -430,7 +451,12 @@ extern "C" void titans_backward_segment_f32_cuda(
         d_k_mem, d_v_mem, d_q_mem,
         d_alpha, d_theta, d_eta,
         d_m_out, d_s_out,
-        t_start, t_end, d);
+        d_M_work, d_S_work, t_start, t_end, d);
+    check_cuda_launch("titans_backward_segment_kernel", d, smem_bytes);
+
+    cudaDeviceSynchronize();
+    cudaFree(d_M_work);
+    cudaFree(d_S_work);
 }
 
 extern "C" void titans_backward_f32_cuda(
@@ -453,8 +479,13 @@ extern "C" void titans_backward_f32_cuda(
     dim3 grid(1);
     dim3 block(block_size);
 
-    // Shared: d_M[d*d] + d_S[d*d] + prediction[d] + error[d] + d_error[d] + reduce_buf[block_size]
-    int smem_bytes = (2 * dd + 3 * d + block_size) * sizeof(float);
+    int smem_bytes = (3 * d + block_size) * sizeof(float);
+
+    // Allocate d_M and d_S workspaces
+    float* d_M_work = nullptr;
+    float* d_S_work = nullptr;
+    cudaMalloc(&d_M_work, dd * sizeof(float));
+    cudaMalloc(&d_S_work, dd * sizeof(float));
 
     titans_backward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, eta,
@@ -462,5 +493,10 @@ extern "C" void titans_backward_f32_cuda(
         d_k_mem, d_v_mem, d_q_mem,
         d_alpha, d_theta, d_eta,
         d_m_initial, d_s_initial,
-        seq_len, d);
+        d_M_work, d_S_work, seq_len, d);
+    check_cuda_launch("titans_backward_kernel", d, smem_bytes);
+
+    cudaDeviceSynchronize();
+    cudaFree(d_M_work);
+    cudaFree(d_S_work);
 }

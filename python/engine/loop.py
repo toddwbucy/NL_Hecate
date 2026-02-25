@@ -112,18 +112,12 @@ def run_build(bcfg: BuildConfig):
     if bcfg.load:
         print(f"Loading checkpoint: {bcfg.load}")
         if use_bpe:
-            # BPE checkpoints: params + cfg only, no build state
+            # BPE checkpoints: params + cfg only, no build state.
+            # Conductor and data position are NOT restored — this is a warm-start,
+            # not a true resume. Step count restarts from 0 to avoid desync.
             params, cfg = nl_hecate.load_checkpoint(bcfg.load)
-            # Extract step from filename (e.g. model_step25000.json → 25000)
-            import re
-            m = re.search(r'step(\d+)', bcfg.load)
-            if m:
-                resume_step = int(m.group(1))
-                print(f"  Resuming from step {resume_step} (BPE checkpoint)")
-            else:
-                resume_step = 0
-                print(f"  WARNING: no step in filename '{bcfg.load}', "
-                      f"resuming from step 0")
+            resume_step = 0
+            print(f"  Loaded BPE checkpoint as warm-start (conductor/data state reset, step=0)")
         else:
             params, cfg, build_state = nl_hecate.load_build_checkpoint(bcfg.load)
             if build_state is None:

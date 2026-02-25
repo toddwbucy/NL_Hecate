@@ -5,8 +5,22 @@
 //
 // Grid=(1), Block=(min(d*d, 1024)).
 // All fp32.
+//
+// NOTE: d_M lives in global memory (allocated via cudaMalloc in C wrapper),
+// NOT shared memory. At d=512, d_M[d*d] = 1MB — exceeds GPU smem limits.
 
 #include <cuda_runtime.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+static inline void check_cuda_launch(const char* kernel_name, int d, int smem_bytes) {
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[NL_Hecate FATAL] %s launch failed (d=%d, smem=%d): %s\n",
+                kernel_name, d, smem_bytes, cudaGetErrorString(err));
+        abort();
+    }
+}
 
 __global__ void hebbian_backward_kernel(
     const float* __restrict__ k_mem,
@@ -20,15 +34,15 @@ __global__ void hebbian_backward_kernel(
     float* __restrict__ d_q_mem,
     float* __restrict__ d_alpha,
     float* __restrict__ d_m_initial,
+    float* __restrict__ d_M,              // [d*d] — gradient accumulator in global memory
     int seq_len, int d)
 {
     int tid = threadIdx.x;
     int dd = d * d;
 
-    // Shared: d_M[d*d] + reduce_buf[blockDim.x]
+    // Shared: only reduce_buf[blockDim.x]
     extern __shared__ float smem[];
-    float* d_M = smem;
-    float* reduce_buf = smem + dd;
+    float* reduce_buf = smem;
 
     // Init d_M = 0
     for (int idx = tid; idx < dd; idx += blockDim.x) {
@@ -130,14 +144,14 @@ __global__ void hebbian_backward_segment_kernel(
     float* __restrict__ d_q_mem,
     float* __restrict__ d_alpha,
     float* __restrict__ d_m_out,
+    float* __restrict__ d_M,              // [d*d] — gradient accumulator in global memory
     int t_start, int t_end, int d)
 {
     int tid = threadIdx.x;
     int dd = d * d;
 
     extern __shared__ float smem[];
-    float* d_M = smem;
-    float* reduce_buf = smem + dd;
+    float* reduce_buf = smem;
 
     // Init from seed
     for (int idx = tid; idx < dd; idx += blockDim.x) {
@@ -239,13 +253,21 @@ extern "C" void hebbian_backward_segment_f32_cuda(
     dim3 grid(1);
     dim3 block(block_size);
 
-    int smem_bytes = (dd + block_size) * sizeof(float);
+    // Shared: reduce_buf[block_size] only
+    int smem_bytes = block_size * sizeof(float);
+
+    float* d_M_work = nullptr;
+    cudaMalloc(&d_M_work, dd * sizeof(float));
 
     hebbian_backward_segment_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, m_states, d_y,
         d_m_seed,
         d_k_mem, d_v_mem, d_q_mem, d_alpha, d_m_out,
-        t_start, t_end, d);
+        d_M_work, t_start, t_end, d);
+    check_cuda_launch("hebbian_backward_segment_kernel", d, smem_bytes);
+
+    cudaDeviceSynchronize();
+    cudaFree(d_M_work);
 }
 
 extern "C" void hebbian_backward_f32_cuda(
@@ -266,11 +288,18 @@ extern "C" void hebbian_backward_f32_cuda(
     dim3 grid(1);
     dim3 block(block_size);
 
-    // Shared: d_M[d*d] + reduce_buf[block_size]
-    int smem_bytes = (dd + block_size) * sizeof(float);
+    // Shared: reduce_buf[block_size] only
+    int smem_bytes = block_size * sizeof(float);
+
+    float* d_M_work = nullptr;
+    cudaMalloc(&d_M_work, dd * sizeof(float));
 
     hebbian_backward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, m_states, d_y,
         d_k_mem, d_v_mem, d_q_mem, d_alpha, d_m_initial,
-        seq_len, d);
+        d_M_work, seq_len, d);
+    check_cuda_launch("hebbian_backward_kernel", d, smem_bytes);
+
+    cudaDeviceSynchronize();
+    cudaFree(d_M_work);
 }
