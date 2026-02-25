@@ -212,9 +212,10 @@ STRUCT MemoryLevelParams {
 --    w_q_conv, b_q_conv,
 --    m_k_init, m_v_init, m_q_init, m_eta_init, m_alpha_init, m_mem_init]
 --
--- This preserves backward compatibility: old checkpoints that load via
--- flat weights have fewer elements; the new fields initialize to their
--- default (identity-like) values on first use.
+-- Note: old checkpoints serialized before this spec are NOT directly
+-- loadable via flat-weight vectors (size mismatch). A migration step is
+-- required: load old weights into a params object (new fields zero-init),
+-- then re-save. New checkpoints from this spec forward are fully portable.
 ```
 
 ## Interaction with Python build.py

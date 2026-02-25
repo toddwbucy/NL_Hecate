@@ -67,7 +67,7 @@ Three areas where Python cannot reach existing Rust primitives:
 --   "static"   → ProjectionKind::Static  (Phase 1: standard projections)
 --   "adaptive" → ProjectionKind::Adaptive (Phase 2+: memory-based projections)
 --   "none"     → MomentumKind::None
---   "ema"      → MomentumKind::Ema
+--   "ema"      → MomentumKind::EMA
 
 -- Validation:
 --   self_generated_values requires projection_kind == "adaptive"

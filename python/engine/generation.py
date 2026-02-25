@@ -11,14 +11,17 @@ IM_END = 1    # <|im_end|>
 PAD = 2       # <|pad|>
 
 
-def _safe_pad_token(prompt_tokens: list[int]) -> int:
+def _safe_pad_token(prompt_tokens: list[int], vocab_size: int) -> int:
     """Choose a padding token that avoids special-token memory instability (CS-50).
 
     Special tokens (id 0-2) cause Titans inner loop divergence when 29+
     identical tokens appear. Use the prompt's first regular token, or
-    fallback to token 3 (first BPE token after specials).
+    fallback to token 3 (first BPE token after specials), clamped to vocab
+    bounds for safety with small vocabularies.
     """
-    return prompt_tokens[0] if prompt_tokens and prompt_tokens[0] >= 3 else 3
+    if prompt_tokens and prompt_tokens[0] >= 3:
+        return prompt_tokens[0]
+    return min(3, vocab_size - 1)
 
 
 def _sample_token(logits: list[float], vocab: int, temperature: float,
@@ -98,7 +101,7 @@ def generate_cached(
         conductor = nl_hecate.Conductor(
             cfg.k, list(cfg.chunk_sizes) if hasattr(cfg, 'chunk_sizes') else [1] * cfg.k)
 
-    safe_pad = _safe_pad_token(prompt_tokens)
+    safe_pad = _safe_pad_token(prompt_tokens, vocab)
 
     try:
         # Pad/truncate prompt to seq_len for prefill
@@ -188,7 +191,7 @@ def generate_learning(
             grad_norms.append(gnorm)
             print(f"  [learn] prompt chunk: loss={loss:.4f} gnorm={gnorm:.4f}")
 
-    safe_pad = _safe_pad_token(prompt_tokens)
+    safe_pad = _safe_pad_token(prompt_tokens, vocab)
 
     # Phase 2: Generate tokens
     for i in range(max_tokens):
@@ -294,7 +297,7 @@ def generate(
             if params is not None and getattr(cfg, 'projection_kind', 'static') == 'adaptive':
                 context.seed_self_ref(params)
 
-    safe_pad = _safe_pad_token(prompt_tokens)
+    safe_pad = _safe_pad_token(prompt_tokens, vocab)
 
     for _ in range(max_tokens):
         # Take last seq_len tokens as context window

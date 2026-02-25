@@ -120,7 +120,8 @@ def probe_cross_exposure(gpu_model, cfg, prompt_ids, tokenizer,
         conductor=make_conductor(), lr=lr,
     )
     text1 = tokenizer.decode(tokens1[len(prompt_ids):]) if tokenizer else ""
-    avg1 = sum(losses1) / max(len(losses1), 1)
+    valid1 = [v for v in losses1 if not math.isnan(v)]
+    avg1 = sum(valid1) / max(len(valid1), 1)
 
     # Run 2: reset context but KEEP updated params
     gpu_model.reset_context()
@@ -130,7 +131,8 @@ def probe_cross_exposure(gpu_model, cfg, prompt_ids, tokenizer,
         conductor=make_conductor(), lr=lr,
     )
     text2 = tokenizer.decode(tokens2[len(prompt_ids):]) if tokenizer else ""
-    avg2 = sum(losses2) / max(len(losses2), 1)
+    valid2 = [v for v in losses2 if not math.isnan(v)]
+    avg2 = sum(valid2) / max(len(valid2), 1)
 
     improvement = avg1 - avg2
     improvement_pct = (improvement / avg1 * 100) if avg1 > 0 else 0.0
@@ -169,11 +171,13 @@ def probe_context_value(gpu_model, cfg, prompt_ids, snapshot,
         max_tokens=max_tokens, temperature=temperature,
         conductor=make_conductor(), lr=lr,
     )
-    cold_avg = sum(cold_losses) / max(len(cold_losses), 1)
+    valid_cold = [v for v in cold_losses if not math.isnan(v)]
+    cold_avg = sum(valid_cold) / max(len(valid_cold), 1)
 
     # Restore params (cold run modified them), keep training context
     gpu_model.upload_params(snapshot["params"])
     gpu_model.upload_context(snapshot["context"])
+    gpu_model.reset_optimizer()  # cold run corrupts AdamW moments
 
     # Warm start: accumulated training M
     _, warm_losses, _ = generate_learning(
@@ -181,7 +185,8 @@ def probe_context_value(gpu_model, cfg, prompt_ids, snapshot,
         max_tokens=max_tokens, temperature=temperature,
         conductor=make_conductor(), lr=lr,
     )
-    warm_avg = sum(warm_losses) / max(len(warm_losses), 1)
+    valid_warm = [v for v in warm_losses if not math.isnan(v)]
+    warm_avg = sum(valid_warm) / max(len(valid_warm), 1)
 
     return {
         "cold_avg_loss": cold_avg,

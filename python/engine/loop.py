@@ -202,7 +202,7 @@ def run_build(bcfg: BuildConfig):
     if bcfg.momentum_kind != "none":
         print(f"  Momentum: kind={bcfg.momentum_kind}, "
               f"d_hidden={bcfg.momentum_d_hidden}")
-    if bcfg.theta_floor:
+    if bcfg.theta_floor is not None or bcfg.theta_ceil is not None:
         print(f"  θ clamps: floor={bcfg.theta_floor}, ceil={bcfg.theta_ceil}")
     print(f"  Params:   {params.num_params():,}")
     data_len = len(bpe_loader) if use_bpe else len(token_ids)
@@ -490,6 +490,7 @@ def run_build(bcfg: BuildConfig):
 
                     # Probe 2: cross-exposure adaptation (first prompt only)
                     full_restore(gpu_model, snapshot)
+                    gpu_model.reset_optimizer()  # probe1 corrupts AdamW moments
                     prompt_text = EVAL_PROMPTS[0]
                     prompt_ids = tokenizer.encode(prompt_text)
                     xresult = probe_cross_exposure(

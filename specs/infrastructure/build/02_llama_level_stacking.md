@@ -1,9 +1,9 @@
 # Llama-3.2-1B Ad-hoc Level Stacking
 
-```
+```text
 CONTRACT
-  Purpose:    Initialize CMS levels with pre-trained Llama-3.2-1B MLP blocks
-              per HOPE paper section 7.3. This converts a pre-trained transformer
+  Purpose:    Initialize CMS levels with pretrained Llama-3.2-1B MLP blocks
+              per HOPE paper section 7.3. This converts a pretrained transformer
               into a continual learner by placing its MLP blocks at different CMS
               frequencies, then running continual pre-training.
   Expects:    Llama-3.2-1B weights (HuggingFace), FineWeb-Edu tokenized with
@@ -25,7 +25,7 @@ CONTRACT
 
 HOPE section 7.3 "Ad-hoc Level Stacking: Initializing CMS with Pre-Trained Models":
 
-Given a CMS with {MLP^(f_i)}_{i=1}^{k}, and a set of pre-trained MLP
+Given a CMS with {MLP^(f_i)}_{i=1}^{k}, and a set of pretrained MLP
 blocks {MLP_pretrained_i}_{i=1}^{k}, use Equation 71 to update
 {MLP^(f_i)} in different levels; use the trained parameters
 of {MLP_pretrained_i} as the initial state of CMS blocks:
@@ -33,7 +33,7 @@ of {MLP_pretrained_i} as the initial state of CMS blocks:
     MLP_0^(f_i) = MLP_pretrained_i
 
 The key insight: setting eta_t^(l) toward 0 keeps updated memory close to
-initial state (directly using pre-trained blocks without adaptation). Higher
+initial state (directly using pretrained blocks without adaptation). Higher
 eta allows the block to adapt to its level's context flow. This is the
 mechanism that converts a static transformer into a continual learner.
 
@@ -93,7 +93,7 @@ update at f=1, f=8, f=64, f=512 instead of all at f=0.
 
 **Concrete mapping per CMS level**:
 
-```
+```text
 Level 0 (f=1, every chunk):    Llama layer  0 MLP
 Level 1 (f=8, every 8 chunks): Llama layer  5 MLP
 Level 2 (f=64):                Llama layer 10 MLP
@@ -119,7 +119,7 @@ features, slow level gets high-level abstractions.
 
 The full model structure after transplant:
 
-```
+```text
 Input tokens (Llama 3 tokenizer, 128K vocab)
     |
 Embeddings (fresh init, d=2048, vocab=128,256)
@@ -394,7 +394,7 @@ __global__ void swiglu_fuse_backward(
 ### Forward/Backward Orchestration (per level, all tokens batched)
 
 **Forward** -- X is [seq_len × d_model]:
-```
+```text
 gate_out  = cuBLAS_sgemm(X, gate_proj.T)          // [seq_len × intermediate]
 up_out    = cuBLAS_sgemm(X, up_proj.T)             // [seq_len × intermediate]
 fused     = swiglu_fuse_forward(gate_out, up_out)  // [seq_len × intermediate]
@@ -402,7 +402,7 @@ Y         = cuBLAS_sgemm(fused, down_proj.T)        // [seq_len × d_model]
 ```
 
 **Backward** -- given d_Y [seq_len × d_model]:
-```
+```text
 d_fused      = cuBLAS_sgemm(d_Y, down_proj)        // [seq_len × intermediate]
 d_down_proj  = cuBLAS_sgemm(fused.T, d_Y)          // [intermediate × d_model]
 d_gate, d_up = swiglu_fuse_backward(d_fused, ...)
