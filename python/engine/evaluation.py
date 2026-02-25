@@ -66,7 +66,7 @@ def probe_within_generation(gpu_model, cfg, prompt_ids, tokenizer,
     gen_text = tokenizer.decode(tokens[len(prompt_ids):]) if tokenizer else ""
 
     # Compute summary stats (filter NaN before aggregation)
-    valid_losses = [v for v in losses if not math.isnan(v)]
+    valid_losses = [v for v in losses if math.isfinite(v)]
     n = len(valid_losses)
     if n >= 10:
         first10 = sum(valid_losses[:10]) / 10

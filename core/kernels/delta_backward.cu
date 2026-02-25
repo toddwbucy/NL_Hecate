@@ -425,7 +425,7 @@ extern "C" void delta_backward_segment_f32_cuda(
 
     check_cuda_alloc("delta_backward_segment: cudaDeviceSynchronize",
                      cudaDeviceSynchronize());
-    cudaFree(d_M_work);
+    check_cuda_alloc("cudaFree d_M_work", cudaFree(d_M_work));
 }
 
 extern "C" void delta_backward_f32_cuda(
@@ -464,5 +464,5 @@ extern "C" void delta_backward_f32_cuda(
 
     check_cuda_alloc("delta_backward: cudaDeviceSynchronize",
                      cudaDeviceSynchronize());
-    cudaFree(d_M_work);
+    check_cuda_alloc("cudaFree d_M_work", cudaFree(d_M_work));
 }

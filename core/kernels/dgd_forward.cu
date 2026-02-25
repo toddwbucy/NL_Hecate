@@ -235,7 +235,7 @@ extern "C" void dgd_forward_ckpt_f32_cuda(
 
     check_cuda_alloc("dgd_forward_ckpt: cudaDeviceSynchronize",
                      cudaDeviceSynchronize());
-    cudaFree(m_work);
+    check_cuda_alloc("cudaFree m_work", cudaFree(m_work));
 }
 
 extern "C" void dgd_forward_f32_cuda(
