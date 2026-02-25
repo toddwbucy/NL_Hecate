@@ -135,7 +135,7 @@ def probe_cross_exposure(gpu_model, cfg, prompt_ids, tokenizer,
     avg2 = sum(valid2) / len(valid2) if valid2 else float("nan")
 
     improvement = avg1 - avg2
-    improvement_pct = (improvement / avg1 * 100) if (math.isfinite(avg1) and avg1 > 0) else 0.0
+    improvement_pct = (improvement / avg1 * 100) if (math.isfinite(avg1) and avg1 > 0) else float("nan")
 
     return {
         "run1_avg_loss": avg1,
