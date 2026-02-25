@@ -88,11 +88,14 @@ def generate_cached(
         conductor = nl_hecate.Conductor(
             cfg.k, list(cfg.chunk_sizes) if hasattr(cfg, 'chunk_sizes') else [1] * cfg.k)
 
+    # Safe padding token (avoids special token memory instability)
+    safe_pad = prompt_tokens[0] if prompt_tokens and prompt_tokens[0] >= 3 else 3
+
     try:
         # Pad/truncate prompt to seq_len for prefill
         ctx = seq[-seq_len:]
         while len(ctx) < seq_len:
-            ctx = [PAD, *ctx]
+            ctx = [safe_pad, *ctx]
 
         # Prefill: process full prompt, populate KV cache
         pulse = conductor.pulse()
@@ -176,6 +179,10 @@ def generate_learning(
             grad_norms.append(gnorm)
             print(f"  [learn] prompt chunk: loss={loss:.4f} gnorm={gnorm:.4f}")
 
+    # Choose safe padding token: first prompt token (avoids PAD=2 memory instability
+    # where 29+ identical special tokens cause NaN in Titans inner loop).
+    safe_pad = prompt_tokens[0] if prompt_tokens and prompt_tokens[0] >= 3 else 3
+
     # Phase 2: Generate tokens
     for i in range(max_tokens):
         # Build context window from tail of sequence
@@ -184,7 +191,7 @@ def generate_learning(
         # Left-pad if shorter than seq_len
         pad_len = seq_len - len(ctx)
         if pad_len > 0:
-            ctx = [PAD] * pad_len + ctx
+            ctx = [safe_pad] * pad_len + ctx
 
         # Target: shifted by 1, last position masked (vocab_size = OOV, skipped by kernel)
         if len(seq) >= seq_len + 1:
@@ -210,6 +217,12 @@ def generate_learning(
             beta1, beta2, eps, weight_decay, max_grad_norm,
         )
         conductor.advance()
+
+        # NaN early-stop: once loss goes NaN, params are corrupted and
+        # all subsequent steps will also NaN. Break and return partial results.
+        if math.isnan(loss) or math.isinf(loss):
+            break
+
         losses.append(loss)
         grad_norms.append(gnorm)
 
@@ -274,12 +287,15 @@ def generate(
             if params is not None and getattr(cfg, 'projection_kind', 'static') == 'adaptive':
                 context.seed_self_ref(params)
 
+    # Safe padding token (avoids special token memory instability)
+    safe_pad = prompt_tokens[0] if prompt_tokens and prompt_tokens[0] >= 3 else 3
+
     for _ in range(max_tokens):
         # Take last seq_len tokens as context window
         ctx = seq[-seq_len:]
         # Pad if shorter than seq_len
         while len(ctx) < seq_len:
-            ctx = [PAD, *ctx]
+            ctx = [safe_pad, *ctx]
 
         # Forward pass — target_ids unused for generation, use ctx as dummy
         if use_cms:

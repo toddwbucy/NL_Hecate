@@ -14,6 +14,9 @@ from engine.data import BpeDataLoader, DEMO_TEXT, MmapTokenStream
 from engine.evaluation import (
     evaluate, evaluate_numpy, print_level_metrics,
     eval_coherence_samples, generate_samples,
+    full_snapshot, full_restore,
+    probe_within_generation, probe_cross_exposure, probe_context_value,
+    EVAL_PROMPTS, SAMPLE_PROMPTS,
 )
 from engine.logging_utils import JSONLLogger, rss_mb
 from engine.tokenizer import ByteTokenizer, BpeTokenizer, load_tokenizer
@@ -105,13 +108,25 @@ def run_build(bcfg: BuildConfig):
 
     # ── Resume from checkpoint or init fresh ──────────────────────────
     resume_step = 0
+    build_state = None
     if bcfg.load:
-        print(f"Loading build checkpoint: {bcfg.load}")
-        params, cfg, build_state = nl_hecate.load_build_checkpoint(bcfg.load)
-        if build_state is None:
-            print("Error: checkpoint has no build state (not a build checkpoint)")
-            return
-        resume_step = build_state["global_step"]
+        print(f"Loading checkpoint: {bcfg.load}")
+        if use_bpe:
+            # BPE checkpoints: params + cfg only, no build state
+            params, cfg = nl_hecate.load_checkpoint(bcfg.load)
+            # Extract step from filename (e.g. model_step25000.json → 25000)
+            import re
+            m = re.search(r'step(\d+)', bcfg.load)
+            resume_step = int(m.group(1)) if m else 0
+            print(f"  Resuming from step {resume_step} (BPE checkpoint)")
+        else:
+            params, cfg, build_state = nl_hecate.load_build_checkpoint(bcfg.load)
+            if build_state is None:
+                print("Error: checkpoint has no build state (not a build checkpoint)")
+                return
+            resume_step = build_state["global_step"]
+            print(f"  Resuming from step {resume_step}")
+            print(f"  Stream position: {build_state['stream_position']}")
         bcfg.d_model = cfg.d_model
         bcfg.num_heads = cfg.num_heads
         bcfg.k = cfg.k
@@ -122,8 +137,6 @@ def run_build(bcfg: BuildConfig):
         bcfg.self_generated_values = cfg.self_generated_values
         bcfg.self_ref_chunk_size = cfg.self_ref_chunk_size
         bcfg.momentum_d_hidden = cfg.momentum_d_hidden
-        print(f"  Resuming from step {resume_step}")
-        print(f"  Stream position: {build_state['stream_position']}")
     else:
         cfg = nl_hecate.MAGConfig(
             d_model=bcfg.d_model,
@@ -174,9 +187,9 @@ def run_build(bcfg: BuildConfig):
         raise RuntimeError(
             "optimizer=adamw_gpu requires GPU and a CUDA-enabled build"
         )
-    if bcfg.load and use_gpu:
+    if bcfg.load and use_gpu and not use_bpe:
         raise RuntimeError(
-            "GPU resume with context restore is not yet implemented. "
+            "GPU resume with context restore is not yet implemented for byte-level builds. "
             "Use CPU resume (--cpu) or start a fresh GPU build."
         )
     print(f"  Build:    {bcfg.steps} steps (from step {resume_step}), lr={bcfg.lr}")
@@ -206,7 +219,7 @@ def run_build(bcfg: BuildConfig):
             token_ids = None
         else:
             stream = nl_hecate.VecStream(token_ids)
-        if bcfg.load:
+        if bcfg.load and build_state is not None:
             conductor = nl_hecate.Conductor(bcfg.k, bcfg.chunk_sizes)
             conductor.attach_stream(stream)
             conductor.restore_from_dict(build_state)
@@ -419,19 +432,58 @@ def run_build(bcfg: BuildConfig):
                 fires_str = "  ".join(f"L{i}:{level_fire_counts[i]}" for i in range(bcfg.k))
                 print(f"    [fires] {fires_str}")
                 level_fire_counts = [0] * bcfg.k
-            if gpu_model is not None:
-                coherence_ctx = gpu_model.to_host_context()
+            # ── Learning probes (CS-10: model learns during eval) ─────
+            if gpu_model is not None and tokenizer is not None:
+                snapshot = full_snapshot(gpu_model)
                 try:
-                    gpu_model.reset_context()
-                    samples = eval_coherence_samples(gpu_model, cfg, max_tokens=30,
-                                                     tokenizer=tokenizer)
-                    for prompt, completion in samples:
-                        safe = completion.replace("\n", "\\n")
-                        print(f"    \"{prompt}\" \u2192 \"{safe}\"")
+                    # Probe 1: within-generation learning curve
+                    # Restore between probes: step_generate modifies params
+                    for prompt_text in EVAL_PROMPTS:
+                        full_restore(gpu_model, snapshot)
+                        gpu_model.reset_optimizer()
+                        prompt_ids = tokenizer.encode(prompt_text)
+                        result = probe_within_generation(
+                            gpu_model, cfg, prompt_ids, tokenizer,
+                            max_tokens=60, temperature=0.7, lr=bcfg.lr)
+                        preview = result["generated_text"][:60].replace("\n", "\\n")
+                        print(f"    [probe1] \"{prompt_text}\" → \"{preview}\"")
+                        print(f"      loss: {result['loss_first10_avg']:.4f} → "
+                              f"{result['loss_last10_avg']:.4f}  "
+                              f"slope={result['loss_slope']:.6f}")
+                        if jsonl:
+                            jsonl.log(event="learning_probe",
+                                      probe="within_generation", step=step,
+                                      prompt=prompt_text,
+                                      loss_first10=result["loss_first10_avg"],
+                                      loss_last10=result["loss_last10_avg"],
+                                      loss_slope=result["loss_slope"],
+                                      n_tokens=result["n_tokens"])
+
+                    # Probe 2: cross-exposure adaptation (first prompt only)
+                    full_restore(gpu_model, snapshot)
+                    prompt_text = EVAL_PROMPTS[0]
+                    prompt_ids = tokenizer.encode(prompt_text)
+                    xresult = probe_cross_exposure(
+                        gpu_model, cfg, prompt_ids, tokenizer,
+                        max_tokens=30, temperature=0.7, lr=bcfg.lr)
+                    print(f"    [probe2] \"{prompt_text}\" "
+                          f"run1={xresult['run1_avg_loss']:.4f} → "
+                          f"run2={xresult['run2_avg_loss']:.4f}  "
+                          f"Δ={xresult['improvement']:.4f} "
+                          f"({xresult['improvement_pct']:.1f}%)")
+                    if jsonl:
+                        jsonl.log(event="learning_probe",
+                                  probe="cross_exposure", step=step,
+                                  prompt=prompt_text,
+                                  run1_loss=xresult["run1_avg_loss"],
+                                  run2_loss=xresult["run2_avg_loss"],
+                                  improvement=xresult["improvement"],
+                                  improvement_pct=xresult["improvement_pct"])
                 except Exception as e:
-                    print(f"    [coherence sample failed: {e}]")
+                    print(f"    [learning probe failed: {e}]")
                 finally:
-                    gpu_model.upload_context(coherence_ctx)
+                    full_restore(gpu_model, snapshot)
+                    gpu_model.reset_optimizer()  # probes corrupt AdamW moments
             if jsonl:
                 jsonl.log(event="eval", step=step, eval_loss=eval_loss,
                           eval_ppl=eval_ppl, eval_chunks=bcfg.eval_max_chunks)
@@ -523,20 +575,55 @@ def run_build(bcfg: BuildConfig):
                 except (OSError, RuntimeError, ValueError) as e:
                     print(f"  [checkpoint roundtrip failed: {e}]")
 
+            # ── Checkpoint learning samples + Probe 3 ─────────────────
             if tokenizer is not None and gpu_model is not None:
-                sample_ctx = gpu_model.to_host_context()
+                ckpt_snapshot = full_snapshot(gpu_model)
                 try:
-                    gpu_model.reset_context()
-                    samples = generate_samples(gpu_model, cfg, tokenizer, step)
-                    for s in samples:
-                        preview = s["completion"][:80].replace("\n", " ")
-                        print(f"  [sample] {s['prompt'][:40]}... \u2192 {preview}...")
+                    # Learning samples (generate_learning, not frozen)
+                    # Restore between samples: each 128-step generate_learning
+                    # heavily modifies params toward one prompt's pattern.
+                    from engine.generation import generate_learning
+                    for prompt_text in SAMPLE_PROMPTS:
+                        full_restore(gpu_model, ckpt_snapshot)
+                        gpu_model.reset_optimizer()
+                        gpu_model.reset_context()
+                        prompt_ids = tokenizer.encode(prompt_text)
+                        tokens, losses, _ = generate_learning(
+                            gpu_model, cfg, prompt_ids,
+                            max_tokens=128, temperature=0.7, lr=bcfg.lr)
+                        gen_text = tokenizer.decode(tokens[len(prompt_ids):])
+                        preview = gen_text[:80].replace("\n", " ")
+                        valid = [l for l in losses if not math.isnan(l)]
+                        avg_loss = sum(valid) / len(valid) if valid else float('nan')
+                        n_gen = len(tokens) - len(prompt_ids)
+                        print(f"  [sample] {prompt_text[:40]}... → {preview}...")
+                        print(f"    avg_loss={avg_loss:.4f} over {n_gen} tokens"
+                              f" ({len(valid)}/{len(losses)} valid)")
                     if jsonl:
-                        jsonl.log(event="sample", step=step, samples=samples)
+                        jsonl.log(event="sample", step=step,
+                                  mode="learning", n_prompts=len(SAMPLE_PROMPTS))
+
+                    # Probe 3: accumulated context vs cold start (first prompt)
+                    full_restore(gpu_model, ckpt_snapshot)
+                    prompt_text = EVAL_PROMPTS[0]
+                    prompt_ids = tokenizer.encode(prompt_text)
+                    cresult = probe_context_value(
+                        gpu_model, cfg, prompt_ids, ckpt_snapshot, tokenizer,
+                        max_tokens=30, temperature=0.7, lr=bcfg.lr)
+                    print(f"  [probe3] cold={cresult['cold_avg_loss']:.4f} "
+                          f"warm={cresult['warm_avg_loss']:.4f} "
+                          f"benefit={cresult['context_benefit']:.4f}")
+                    if jsonl:
+                        jsonl.log(event="learning_probe",
+                                  probe="context_value", step=step,
+                                  cold_loss=cresult["cold_avg_loss"],
+                                  warm_loss=cresult["warm_avg_loss"],
+                                  context_benefit=cresult["context_benefit"])
                 except Exception as e:
-                    print(f"  [sample generation failed: {e}]")
+                    print(f"  [checkpoint samples/probe3 failed: {e}]")
                 finally:
-                    gpu_model.upload_context(sample_ctx)
+                    full_restore(gpu_model, ckpt_snapshot)
+                    gpu_model.reset_optimizer()  # probes corrupt AdamW moments
 
     t_end = time.perf_counter()
     elapsed = t_end - t_start

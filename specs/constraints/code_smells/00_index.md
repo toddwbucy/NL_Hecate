@@ -2,7 +2,7 @@
 
 ```
 CONTRACT
-  Purpose:    49 code smells define what NL_Hecate code must NOT look like.
+  Purpose:    50 code smells define what NL_Hecate code must NOT look like.
               These are the immune system — if code violates a smell, it
               introduces foreign concepts from conventional ML frameworks.
               Organized into 6 categories below.
@@ -42,12 +42,12 @@ CONTRACT
   -- MIRAS design space constraints
   -- "Don't force same attentional bias, don't restrict memory structure"
 
-06_infrastructure.md  CS-39 through CS-49
+06_infrastructure.md  CS-39 through CS-50
   -- Implementation-level constraints from Track A experience
   -- "Clamp decay, opt-in AD, DDP inflates, compile can't trace"
 ```
 
-## Quick Reference: All 49 Smells
+## Quick Reference: All 50 Smells
 
 ```
 ONTOLOGICAL (13 smells):
@@ -98,7 +98,7 @@ MIRAS (4 smells):
   CS-35  Don't assume GD is the only memory algorithm
   CS-36  Don't restrict retention to quadratic/linear only
 
-INFRASTRUCTURE (11 smells):
+INFRASTRUCTURE (12 smells):
   CS-39  Learnable decay parameters must be clamped [CRITICAL]
   CS-40  Differentiation is opt-in, not opt-out [CRITICAL]
   CS-41  GPU utilization != throughput
@@ -110,6 +110,7 @@ INFRASTRUCTURE (11 smells):
   CS-47  In-place modification destroys reproducibility [CRITICAL]
   CS-48  Shared retention parameters across CMS levels
   CS-49  Generation through training model corrupts context [CRITICAL]
+  CS-50  Left-padding with untrained tokens causes memory divergence [CRITICAL]
 ```
 
 ## Enforcement Strategy
@@ -132,7 +133,7 @@ LEVEL 3: Semantic (review-required)
   -- Semi-automated: review checklist
 
 LEVEL 4: Runtime (test-required)
-  -- CS-32, CS-39, CS-40, CS-42, CS-43, CS-44, CS-45, CS-46, CS-47, CS-49
+  -- CS-32, CS-39, CS-40, CS-42, CS-43, CS-44, CS-45, CS-46, CS-47, CS-49, CS-50
   -- Enforce: invariant probes, runtime assertions, integration tests
   -- Automated: test suite includes smell-specific tests
 ```

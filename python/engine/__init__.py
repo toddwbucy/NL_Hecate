@@ -15,6 +15,8 @@ from engine.generation import (
 from engine.evaluation import (
     evaluate, evaluate_numpy, print_level_metrics,
     eval_coherence_samples, generate_samples,
+    full_snapshot, full_restore,
+    probe_within_generation, probe_cross_exposure, probe_context_value,
     SAMPLE_PROMPTS, EVAL_PROMPTS,
 )
 from engine.logging_utils import JSONLLogger, rss_mb
@@ -35,6 +37,8 @@ __all__ = [
     # evaluation
     "evaluate", "evaluate_numpy", "print_level_metrics",
     "eval_coherence_samples", "generate_samples",
+    "full_snapshot", "full_restore",
+    "probe_within_generation", "probe_cross_exposure", "probe_context_value",
     "SAMPLE_PROMPTS", "EVAL_PROMPTS",
     # logging
     "JSONLLogger", "rss_mb",

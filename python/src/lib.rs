@@ -1626,10 +1626,78 @@ impl GpuModel {
         Ok((loss, grad_norm))
     }
 
+    /// Full GPU build step with AdamW optimizer that also returns last-position logits.
+    /// Used for continuous outer-loop learning during generation (CS-10).
+    /// Returns (loss, grad_norm, last_logits) where last_logits is Vec<f32> of length vocab_size.
+    #[pyo3(signature = (input_ids, target_ids, pulse, lr, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.1, max_grad_norm=1.0))]
+    fn step_generate(&mut self, input_ids: Vec<usize>, target_ids: Vec<usize>,
+                     pulse: &Pulse, lr: f32, beta1: f32, beta2: f32,
+                     eps: f32, weight_decay: f32, max_grad_norm: f32) -> PyResult<(f32, f32, Vec<f32>)> {
+        let s = self.cfg.swa.seq_len;
+        let v = self.cfg.swa.vocab_size;
+        if input_ids.len() != s || target_ids.len() != s {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("input/target length must be seq_len {}", s)));
+        }
+        if let Some(&max_id) = input_ids.iter().max() {
+            if max_id >= v {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("input_ids contains {} >= vocab_size {}", max_id, v)));
+            }
+        }
+
+        // Forward
+        let (loss, cache) = nl_hecate_core::gpu_forward::gpu_cms_forward(
+            &self.params, &self.cfg, &input_ids, &target_ids,
+            &pulse.inner, &mut self.context,
+        );
+
+        // Extract last-position logits BEFORE backward consumes cache
+        let last_logits_slice = cache.logits.slice((s - 1) * v, v);
+        let mut last_logits = vec![0.0f32; v];
+        last_logits_slice.copy_to_host(&mut last_logits);
+
+        // Backward
+        let mut grads = nl_hecate_core::gpu_backward::gpu_cms_backward(
+            &self.params, &self.cfg, &cache,
+        );
+
+        // Lazy-init AdamW state
+        if self.adamw_state.is_none() {
+            self.adamw_state = Some(
+                nl_hecate_core::gpu_optimizer::GpuAdamWState::from_params(&self.params)
+            );
+        }
+        let state = self.adamw_state.as_mut().unwrap();
+
+        // AdamW update (Pulse-gated, with grad clipping)
+        let grad_norm = nl_hecate_core::gpu_optimizer::gpu_adamw_update(
+            &mut self.params, &mut grads, state,
+            &pulse.inner,
+            lr, beta1, beta2, eps, weight_decay, max_grad_norm,
+        );
+
+        // Weight tying: sync w_unembed^T → w_embed
+        nl_hecate_core::gpu_backward::gpu_sync_embed_weights(
+            &mut self.params,
+            self.cfg.swa.d_model,
+            self.cfg.swa.vocab_size,
+        );
+
+        Ok((loss, grad_norm, last_logits))
+    }
+
     /// Get current AdamW optimizer step count.
     #[getter]
     fn adamw_step(&self) -> u32 {
         self.adamw_state.as_ref().map_or(0, |s| s.step)
+    }
+
+    /// Reset AdamW optimizer state (moments and step counter).
+    /// Next step_adamw/step_generate call will re-initialize from scratch.
+    /// Use after learning probes to prevent corrupted moments from affecting training.
+    fn reset_optimizer(&mut self) {
+        self.adamw_state = None;
     }
 
     /// Prefill: process full prompt, populate KV cache, return last-position logits.
