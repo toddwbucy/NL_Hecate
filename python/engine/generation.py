@@ -187,6 +187,8 @@ def generate_learning(
                 beta1, beta2, eps, weight_decay, max_grad_norm,
             )
             conductor.advance()
+            if math.isnan(loss) or math.isinf(loss):
+                return seq, losses, grad_norms
             losses.append(loss)
             grad_norms.append(gnorm)
             print(f"  [learn] prompt chunk: loss={loss:.4f} gnorm={gnorm:.4f}")

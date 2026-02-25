@@ -76,7 +76,7 @@ Each Llama MLP block has three weight matrices (no bias):
 - `up_proj`: (8192, 2048) -- linear path
 - `down_proj`: (2048, 8192) -- projection back
 
-Forward: `output = down_proj(silu(gate_proj(x)) * up_proj(x))`
+Forward: `output = down_proj(silu(gate_proj(x)) * up_proj(x))`  <!-- Llama-3.2-1B architecture (Meta AI, 2024); SwiGLU activation from Shazeer 2020 -->
 
 ### The Transplant: What Goes Where
 
@@ -135,7 +135,7 @@ CMS Level 1 MLP (from Llama layer 5, updates every 8 chunks)
 CMS Level 2 MLP (from Llama layer 10, updates every 64 chunks)
 CMS Level 3 MLP (from Llama layer 15, updates every 512 chunks)
     |
-Output = 1/sqrt(k) * sum(level_outputs)  [CMS normalization]
+Output = 1/sqrt(k) * sum(level_outputs)  [CMS normalization; HOPE 2512.24695 §4]
     |
 Unembed logits
 ```

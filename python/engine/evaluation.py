@@ -135,7 +135,7 @@ def probe_cross_exposure(gpu_model, cfg, prompt_ids, tokenizer,
     avg2 = sum(valid2) / max(len(valid2), 1)
 
     improvement = avg1 - avg2
-    improvement_pct = (improvement / avg1 * 100) if avg1 > 0 else 0.0
+    improvement_pct = (improvement / avg1 * 100) if (math.isfinite(avg1) and avg1 > 0) else float("nan")
 
     return {
         "run1_avg_loss": avg1,
@@ -178,6 +178,7 @@ def probe_context_value(gpu_model, cfg, prompt_ids, snapshot,
     gpu_model.upload_params(snapshot["params"])
     gpu_model.reset_optimizer()
     gpu_model.upload_context(snapshot["context"])
+    gpu_model.reset_optimizer()  # cold run corrupts AdamW moments
 
     # Warm start: accumulated training M
     _, warm_losses, _ = generate_learning(
