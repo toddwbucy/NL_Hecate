@@ -159,33 +159,36 @@ extern "C" void swiglu_backward_f32_cuda(
 
     // Step 1: d_fused = d_Y @ down_proj
     // d_fused[seq_len × inter] = d_Y[seq_len × d_model] @ down_proj[d_model × inter]
-    // col-major: (inter × seq_len) = down_proj.T(inter × d_model) @ d_Y.T(d_model × seq_len)
-    // = sgemm(OP_T, OP_N, inter, seq_len, d_model, alpha, down_proj, d_model, d_Y, d_model, 0, d_fused, inter)
+    // Row-major trick: down_proj[d×inter] with lda=inter → cuBLAS sees down_proj.T (= col-major [inter×d]).
+    // transN uses down_proj.T. d_Y[seq×d] with lda=d → cuBLAS sees d_Y.T; transN uses d_Y.T.
+    // Result d_fused.T[inter×seq] = down_proj.T[inter×d] @ d_Y.T[d×seq]. Written as d_fused_rm[seq×inter]. ✓
+    // lda (transN): lda >= m=inter ✓. ldb (transN): ldb >= k=d_model ✓.
     check_cublas_bwd(
         cublasSgemm(h,
-            CUBLAS_OP_T, CUBLAS_OP_N,
+            CUBLAS_OP_N, CUBLAS_OP_N,
             intermediate, seq_len, d_model,
             &alpha1,
-            dDownProj, d_model,
+            dDownProj, intermediate,
             ddY, d_model,
             &beta0,
             dDFused, intermediate),
         "d_fused = d_Y @ down_proj");
 
-    // Step 2: d_down_proj = fused.T @ d_Y  → stored as [d_model × inter]
-    // d_down_proj[d_model × inter] row-major = d_Y.T[d_model × seq_len] @ fused[seq_len × inter]
-    // col-major: (inter × d_model) = fused.T(inter × seq_len) @ d_Y(seq_len × d_model) ...
-    // Actually want: d_down_proj(d_model × inter) = d_Y.T @ fused
-    // = sgemm(OP_N, OP_T, d_model, inter, seq_len, alpha, d_Y, d_model, fused, inter, 0, d_down_proj, d_model)
+    // Step 2: d_down_proj = d_Y.T @ fused  → stored as [d_model × inter]
+    // d_down_proj.T[inter × d] = fused.T[inter×seq] @ d_Y[seq×d]
+    // Row-major trick: fused[seq×inter] with lda=inter → cuBLAS sees fused.T (= col-major [inter×seq]); transN.
+    // d_Y[seq×d] with lda=d → cuBLAS sees d_Y.T; transT gives d_Y itself.
+    // Result d_down_proj.T[inter×d] (m_c=inter, n_c=d, ldc=inter). Written to d_down_proj_rm[d×inter] ✓
+    // lda (transN): lda >= m=inter ✓. ldb (transT): ldb >= n=d_model ✓.
     check_cublas_bwd(
         cublasSgemm(h,
             CUBLAS_OP_N, CUBLAS_OP_T,
-            d_model, intermediate, seq_len,
+            intermediate, d_model, seq_len,
             &alpha1,
-            ddY, d_model,
             dFused, intermediate,
+            ddY, d_model,
             &beta0,
-            dDDownProj, d_model),
+            dDDownProj, intermediate),
         "d_down_proj");
 
     // Step 3: elementwise backward through SiLU gate fusion
@@ -197,41 +200,48 @@ extern "C" void swiglu_backward_f32_cuda(
     check_cuda_bwd(cudaGetLastError(), "swiglu_fuse_backward_kernel");
 
     // Step 4: d_gate_proj = d_gate_out.T @ X → stored as [inter × d_model]
-    // = sgemm(OP_N, OP_T, inter, d_model, seq_len, alpha, d_gate_out, inter, X, d_model, 0, d_gate_proj, inter)
+    // d_gate_proj.T[d×inter] = X.T[d×seq] @ d_gate_out[seq×inter]
+    // X[seq×d] with lda=d → cuBLAS sees X.T (col-major [d×seq]); transN uses X.T.
+    // d_gate_out[seq×inter] with lda=inter → cuBLAS sees d_gate_out.T; transT gives d_gate_out.
+    // Result d_gate_proj.T[d×inter] (m_c=d, n_c=inter, ldc=d). Written to d_gate_proj_rm[inter×d] ✓
+    // lda (transN): lda >= m=d_model ✓. ldb (transT): ldb >= n=inter ✓.
     check_cublas_bwd(
         cublasSgemm(h,
             CUBLAS_OP_N, CUBLAS_OP_T,
-            intermediate, d_model, seq_len,
+            d_model, intermediate, seq_len,
             &alpha1,
-            dDGateOut, intermediate,
             dX_dev, d_model,
+            dDGateOut, intermediate,
             &beta0,
-            dDGateProj, intermediate),
+            dDGateProj, d_model),
         "d_gate_proj");
 
-    // Step 5: d_up_proj = d_up_out.T @ X  (same layout)
+    // Step 5: d_up_proj = d_up_out.T @ X  (same layout as d_gate_proj)
     check_cublas_bwd(
         cublasSgemm(h,
             CUBLAS_OP_N, CUBLAS_OP_T,
-            intermediate, d_model, seq_len,
+            d_model, intermediate, seq_len,
             &alpha1,
-            dDUpOut, intermediate,
             dX_dev, d_model,
+            dDUpOut, intermediate,
             &beta0,
-            dDUpProj, intermediate),
+            dDUpProj, d_model),
         "d_up_proj");
 
     // Step 6a: d_X = d_gate_out @ gate_proj
     // d_X[seq_len × d_model] = d_gate_out[seq_len × inter] @ gate_proj[inter × d_model]
-    // col-major: (d_model × seq_len) = gate_proj.T(d_model × inter) @ d_gate_out.T(inter × seq_len)
-    // = sgemm(OP_T, OP_N, d_model, seq_len, inter, alpha, gate_proj, inter, d_gate_out, inter, 0, d_X, d_model)
+    // d_X.T[d×seq] = gate_proj.T[d×inter] @ d_gate_out.T[inter×seq]
+    // gate_proj[inter×d] with lda=d_model → cuBLAS sees gate_proj.T (col-major [d×inter]); transN uses gate_proj.T.
+    // d_gate_out[seq×inter] with lda=inter → cuBLAS sees d_gate_out.T; transN uses d_gate_out.T.
+    // Result d_X.T[d×seq] (m_c=d, n_c=seq, ldc=d_model). Written to d_X_rm[seq×d] ✓
+    // lda (transN): lda >= m=d_model ✓. ldb (transN): ldb >= k=inter ✓.
     float* dDX = (float*)dev_alloc_bwd(szX, "dDX");
     check_cublas_bwd(
         cublasSgemm(h,
-            CUBLAS_OP_T, CUBLAS_OP_N,
+            CUBLAS_OP_N, CUBLAS_OP_N,
             d_model, seq_len, intermediate,
             &alpha1,
-            dGateProj, intermediate,
+            dGateProj, d_model,
             dDGateOut, intermediate,
             &beta0,
             dDX, d_model),
@@ -240,10 +250,10 @@ extern "C" void swiglu_backward_f32_cuda(
     // Step 6b: d_X += d_up_out @ up_proj  (beta=1 to accumulate)
     check_cublas_bwd(
         cublasSgemm(h,
-            CUBLAS_OP_T, CUBLAS_OP_N,
+            CUBLAS_OP_N, CUBLAS_OP_N,
             d_model, seq_len, intermediate,
             &alpha1,
-            dUpProj, intermediate,
+            dUpProj, d_model,
             dDUpOut, intermediate,
             &beta1,
             dDX, d_model),

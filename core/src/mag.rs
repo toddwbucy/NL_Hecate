@@ -610,6 +610,9 @@ fn run_level_memory(
     active: bool,
     context: &mut ContextState,
 ) -> (Vec<f32>, Option<MemoryCache>, Option<Vec<f32>>, Option<Vec<f32>>) {
+    // SwiGluMlp is stateless (no inner-loop M) — always runs the active path.
+    // Frozen-level read-only path assumes a stored M matrix, which doesn't exist for SwiGluMlp.
+    let active = active || matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp);
     if active {
         // Phase 2 adaptive projections: self-referential orchestrator
         if cfg.projection_kind == ProjectionKind::Adaptive {

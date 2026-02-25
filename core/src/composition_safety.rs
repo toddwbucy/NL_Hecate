@@ -89,7 +89,7 @@ pub fn validate_composition(
 
     // ── Memory Structure × Retention ────────────────────────────────
     // MLP rules + KL/ElasticNet/Sphere: not validated (MIRAS Table 2)
-    let is_mlp = matches!(rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD | MemoryRuleKind::MEMORA);
+    let is_mlp = matches!(rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD | MemoryRuleKind::MEMORA | MemoryRuleKind::SwiGluMlp);
     if is_mlp && matches!(retention, RetentionKind::SphereNormalization) {
         errors.push(CompositionError {
             axis_a: "MLP memory structure",

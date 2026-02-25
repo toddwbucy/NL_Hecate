@@ -763,7 +763,8 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
             self_ref_chunk_size: 1,
             theta_floor: vec![],
             theta_ceil: vec![],
-        intermediate_size: 0,
+        // SwiGluMlp requires intermediate_size > 0; other rules don't use it.
+        intermediate_size: if rule == MemoryRuleKind::SwiGluMlp { 4 * swa.d_model } else { 0 },
     }
 }
 

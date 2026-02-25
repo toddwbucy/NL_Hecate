@@ -794,6 +794,7 @@ mod tests {
         assert_eq!(default_retention(MemoryRuleKind::Moneta), RetentionKind::L2WeightDecay);
         assert_eq!(default_retention(MemoryRuleKind::YAAD), RetentionKind::L2WeightDecay);
         assert_eq!(default_retention(MemoryRuleKind::Trellis), RetentionKind::L2WeightDecay);
+        assert_eq!(default_retention(MemoryRuleKind::SwiGluMlp), RetentionKind::L2WeightDecay);
         assert_eq!(default_retention(MemoryRuleKind::MEMORA), RetentionKind::KLDivergence);
         assert_eq!(default_retention(MemoryRuleKind::LatticeOSR), RetentionKind::SphereNormalization);
     }

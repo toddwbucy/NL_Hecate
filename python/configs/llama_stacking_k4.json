@@ -10,8 +10,7 @@
     "chunk_sizes": [1, 8, 64, 512],
     "memory_rule": "swiglu_mlp",
     "composition": "mag",
-    "intermediate_size": 8192,
-    "donor_layers": [0, 5, 10, 15]
+    "intermediate_size": 8192
   },
   "build": {
     "lr": 0.0003,
@@ -30,6 +29,7 @@
     "path": "data/fineweb_edu_llama3",
     "format": "byte"
   },
+  "donor_layers": [0, 5, 10, 15],
   "donor_weights": "checkpoints/llama_mlp_donor.pt",
   "notes": "HOPE §7.3 ad-hoc level stacking: Llama-3.2-1B MLP blocks as CMS levels. GPU1 target."
 }

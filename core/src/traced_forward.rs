@@ -446,13 +446,12 @@ pub fn traced_cms_forward(
     let mut frozen_w_q_mem_ids: Vec<Option<BufId>> = Vec::with_capacity(cfg.k);
 
     for level in 0..cfg.k {
-        // SwiGluMlp uses MLP-specific flat (gate ++ up ++ down) instead of
-        // the standard field layout — standard fields are all empty for this rule.
+        // SwiGluMlp: combine standard fields (b_alpha, b_theta, b_eta gate biases are outer-loop
+        // params that need gradients) with the MLP weight matrices (gate_proj, up_proj, down_proj).
+        // Standard fields (w_k_mem etc.) are empty for SwiGluMlp — no allocation overhead.
         let lp_flat = if cfg.memory_rule == MemoryRuleKind::SwiGluMlp {
             let lp = &params.levels[level];
-            let mut flat = Vec::with_capacity(
-                lp.gate_proj.len() + lp.up_proj.len() + lp.down_proj.len()
-            );
+            let mut flat = level_params_grads_to_flat(lp); // standard fields: gate biases + empty vecs
             flat.extend_from_slice(&lp.gate_proj);
             flat.extend_from_slice(&lp.up_proj);
             flat.extend_from_slice(&lp.down_proj);

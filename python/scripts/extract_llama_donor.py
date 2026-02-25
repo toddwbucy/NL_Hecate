@@ -42,6 +42,14 @@ def extract_donor(
     )
     model.eval()
 
+    num_model_layers = len(model.model.layers)
+    for layer_idx in donor_layers:
+        if layer_idx < 0 or layer_idx >= num_model_layers:
+            raise ValueError(
+                f"donor_layers index {layer_idx} out of range "
+                f"(model has {num_model_layers} layers, valid range 0..{num_model_layers - 1})"
+            )
+
     donor: dict[str, dict[str, torch.Tensor]] = {}
     for level_idx, layer_idx in enumerate(donor_layers):
         mlp = model.model.layers[layer_idx].mlp

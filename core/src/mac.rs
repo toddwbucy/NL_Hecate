@@ -106,6 +106,10 @@ fn read_only_dispatch(
         MemoryRuleKind::MEMORA => memora_read_only(level_params, embedded, m_state, s, d, cfg.d_hidden),
         MemoryRuleKind::LatticeOSR => lattice_read_only(level_params, embedded, m_state, s, d, cfg.m_slots),
         MemoryRuleKind::Trellis => trellis_read_only(level_params, embedded, m_state, s, d, cfg.d_compress),
+        MemoryRuleKind::SwiGluMlp => panic!(
+            "MAC read_only_dispatch reached SwiGluMlp — SwiGluMlp has no M state and must \
+             always run the active path. Check that MAC caller forces active=true for SwiGluMlp."
+        ),
         _ => delta_rule_read_only(level_params, embedded, m_state, s, d),
     }
 }
@@ -127,6 +131,10 @@ fn read_only_backward_dispatch(
         MemoryRuleKind::MEMORA => memora_read_only_backward(level_params, frozen_m, q_mem, d_y, embedded, s, d, cfg.d_hidden),
         MemoryRuleKind::LatticeOSR => lattice_read_only_backward(level_params, frozen_m, q_mem, d_y, embedded, s, d, cfg.m_slots),
         MemoryRuleKind::Trellis => trellis_read_only_backward(level_params, frozen_m, q_mem, d_y, embedded, s, d, cfg.d_compress),
+        MemoryRuleKind::SwiGluMlp => panic!(
+            "MAC read_only_backward_dispatch reached SwiGluMlp — SwiGluMlp has no M state and \
+             must always run the active path. Check that MAC caller forces active=true for SwiGluMlp."
+        ),
         _ => delta_rule_read_only_backward(level_params, frozen_m, q_mem, d_y, embedded, s, d),
     }
 }

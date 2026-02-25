@@ -144,14 +144,16 @@ extern "C" void swiglu_forward_f32_cuda(
     host_to_dev(dDownProj, down_proj, szDown, "H2D down_proj");
 
     // gate_buf = X @ gate_proj.T
-    // cuBLAS col-major: result(inter × seq_len) = gate_proj(inter × d) @ X.T(d × seq_len)
-    // = sgemm(OP_N, OP_T, inter, seq_len, d_model, alpha, gate_proj, inter, X, d_model, 0, gate_buf, inter)
+    // Row-major trick: gate_proj[inter×d] with lda=d_model → cuBLAS sees gate_proj.T (col-major [d×inter]).
+    // transa=T transposes it back to gate_proj. X[seq×d] with lda=d_model → cuBLAS sees X.T; transb=N uses X.T.
+    // Result gate_buf.T[inter×seq] = gate_proj[inter×d] @ X.T[d×seq]. Written as gate_buf_rm[seq×inter]. ✓
+    // lda constraint (transa=T): lda >= k=d_model ✓. ldb (transb=N): ldb >= k=d_model ✓.
     check_cublas(
         cublasSgemm(h,
-            CUBLAS_OP_N, CUBLAS_OP_T,
+            CUBLAS_OP_T, CUBLAS_OP_N,
             intermediate, seq_len, d_model,
             &alpha1,
-            dGateProj, intermediate,
+            dGateProj, d_model,
             dX, d_model,
             &beta0,
             dGateBuf, intermediate),
@@ -160,10 +162,10 @@ extern "C" void swiglu_forward_f32_cuda(
     // up_buf = X @ up_proj.T  (same layout)
     check_cublas(
         cublasSgemm(h,
-            CUBLAS_OP_N, CUBLAS_OP_T,
+            CUBLAS_OP_T, CUBLAS_OP_N,
             intermediate, seq_len, d_model,
             &alpha1,
-            dUpProj, intermediate,
+            dUpProj, d_model,
             dX, d_model,
             &beta0,
             dUpBuf, intermediate),
@@ -176,16 +178,16 @@ extern "C" void swiglu_forward_f32_cuda(
     check_cuda(cudaGetLastError(), "swiglu_fuse_kernel launch");
 
     // Y = fused @ down_proj.T
-    // fused[seq_len × inter], down_proj[d_model × inter]
-    // result Y[seq_len × d_model]
-    // col-major: Y(d_model × seq_len) = down_proj(d_model × inter) @ fused.T(inter × seq_len)
-    // = sgemm(OP_N, OP_T, d_model, seq_len, inter, alpha, down_proj, d_model, fused, inter, 0, Y, d_model)
+    // down_proj[d×inter] with lda=inter → cuBLAS sees down_proj.T (col-major [inter×d]).
+    // transa=T transposes back to down_proj[d×inter]. fused[seq×inter] with lda=inter → cuBLAS sees fused.T; transb=N uses fused.T.
+    // Result Y.T[d×seq] = down_proj[d×inter] @ fused.T[inter×seq]. Written as Y_rm[seq×d]. ✓
+    // lda constraint (transa=T): lda >= k=inter ✓. ldb (transb=N): ldb >= k=inter ✓.
     check_cublas(
         cublasSgemm(h,
-            CUBLAS_OP_N, CUBLAS_OP_T,
+            CUBLAS_OP_T, CUBLAS_OP_N,
             d_model, seq_len, intermediate,
             &alpha1,
-            dDownProj, d_model,
+            dDownProj, intermediate,
             dFusedBuf, intermediate,
             &beta0,
             dY, d_model),

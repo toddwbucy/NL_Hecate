@@ -159,6 +159,7 @@ def run_build(bcfg: BuildConfig):
                 self_ref_chunk_size=cfg.self_ref_chunk_size,
                 momentum_kind=cfg.momentum_kind,
                 momentum_d_hidden=cfg.momentum_d_hidden,
+                intermediate_size=bcfg.intermediate_size,
                 theta_floor=bcfg.theta_floor,
                 theta_ceil=bcfg.theta_ceil,
             )
@@ -210,7 +211,7 @@ def run_build(bcfg: BuildConfig):
         print(f"  SwiGLU:   intermediate_size={bcfg.intermediate_size}")
     if bcfg.donor_weights:
         print(f"  Donor:    {bcfg.donor_weights}")
-    if bcfg.theta_floor:
+    if bcfg.theta_floor is not None or bcfg.theta_ceil is not None:
         print(f"  θ clamps: floor={bcfg.theta_floor}, ceil={bcfg.theta_ceil}")
     print(f"  Params:   {params.num_params():,}")
     data_len = len(bpe_loader) if use_bpe else len(token_ids)

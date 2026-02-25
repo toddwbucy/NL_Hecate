@@ -709,6 +709,30 @@ impl MAGParams {
                 "level {level} out of range (k={})", self.inner.levels.len()
             )));
         }
+        let d = self.cfg.swa.d_model;
+        let inter = self.cfg.intermediate_size;
+        if inter == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "set_level_mlp: intermediate_size is 0 — configure MAGConfig with intermediate_size > 0 for SwiGluMlp"
+            ));
+        }
+        let expected_gate = inter * d;
+        let expected_down = d * inter;
+        if gate.len() != expected_gate {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "gate shape mismatch: expected {inter}×{d}={expected_gate} elements, got {}", gate.len()
+            )));
+        }
+        if up.len() != expected_gate {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "up shape mismatch: expected {inter}×{d}={expected_gate} elements, got {}", up.len()
+            )));
+        }
+        if down.len() != expected_down {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "down shape mismatch: expected {d}×{inter}={expected_down} elements, got {}", down.len()
+            )));
+        }
         self.inner.levels[level].gate_proj = gate;
         self.inner.levels[level].up_proj = up;
         self.inner.levels[level].down_proj = down;
