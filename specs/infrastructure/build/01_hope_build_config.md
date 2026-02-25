@@ -101,6 +101,7 @@ momentum_d_hidden: int = 0                 -- momentum MLP hidden dim
 ## Config JSON Schema
 
 ```text
+-- Pseudocode (not valid JSON — // comments used for annotation only).
 -- Reference: configs/hope_60m.json
 -- Layout follows existing config convention (model/build/data sections).
 

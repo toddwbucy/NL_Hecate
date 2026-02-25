@@ -28,8 +28,9 @@ CONTRACT
   Trade-off:  Storing initial states in MAGParams makes them visible to the
               optimizer and checkpoint system. The alternative (storing them
               separately) would require custom plumbing everywhere. The cost
-              is 6*d² per level — for d=128, k=4, this is 384KB total, which
-              is negligible compared to the 3×d² per-level projection matrices.
+              is 6*d² per level — for d=128, k=4 levels, init states alone are
+              ~1.5MB (6 × 128² × 4 × 4B) and ~3MB including gradient accumulators.
+              Comparable to the 3×d² per-level projection matrices (also ~384KB/level).
   Position:   specs/algorithms/self_referential/04_self_ref_param_wiring.md
               Parent: 00_interface.md (self-referential projections)
               Cross-ref: specs/algorithms/optimization_machinery/08_adamw_outer.md
@@ -117,7 +118,7 @@ STRUCT MemoryLevelParams {
 
 ## CMS Frequency Gating
 
-<!-- HADES: hope_equations/eq-071-arch-variant2 (§6 Eq 71, per-level gating); nl_code_smells/CS-27; nl_code_smells/CS-28 -->
+<!-- HADES: hope_equations/eq-071-arch-variant2 (HOPE 2512.24695 §6 Eq 71, per-level gating); nl_code_smells/CS-27; nl_code_smells/CS-28 -->
 ```text
 -- Self-ref initial states are per-level outer_loop_params, subject to
 -- the same frequency gating as w_k_mem, w_v_mem, etc. (CS-27/28).

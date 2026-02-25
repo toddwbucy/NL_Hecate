@@ -65,19 +65,20 @@ def probe_within_generation(gpu_model, cfg, prompt_ids, tokenizer,
 
     gen_text = tokenizer.decode(tokens[len(prompt_ids):]) if tokenizer else ""
 
-    # Compute summary stats
-    n = len(losses)
+    # Compute summary stats (filter NaN before aggregation)
+    valid_losses = [v for v in losses if not math.isnan(v)]
+    n = len(valid_losses)
     if n >= 10:
-        first10 = sum(losses[:10]) / 10
-        last10 = sum(losses[-10:]) / 10
+        first10 = sum(valid_losses[:10]) / 10
+        last10 = sum(valid_losses[-10:]) / 10
         # Simple linear regression for slope
         mean_x = (n - 1) / 2.0
-        mean_y = sum(losses) / n
-        num = sum((i - mean_x) * (v - mean_y) for i, v in enumerate(losses))
+        mean_y = sum(valid_losses) / n
+        num = sum((i - mean_x) * (v - mean_y) for i, v in enumerate(valid_losses))
         den = sum((i - mean_x) ** 2 for i in range(n))
         slope = num / den if den > 0 else 0.0
     else:
-        first10 = sum(losses) / max(len(losses), 1)
+        first10 = sum(valid_losses) / max(n, 1)
         last10 = first10
         slope = 0.0
 
@@ -144,7 +145,7 @@ def probe_cross_exposure(gpu_model, cfg, prompt_ids, tokenizer,
     }
 
 
-def probe_context_value(gpu_model, cfg, prompt_ids, snapshot, tokenizer,
+def probe_context_value(gpu_model, cfg, prompt_ids, snapshot,
                         max_tokens=30, temperature=0.7, lr=0.0006,
                         conductor_factory=None):
     """Probe 3: Does accumulated training context help generation?
