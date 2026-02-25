@@ -120,8 +120,8 @@ def probe_cross_exposure(gpu_model, cfg, prompt_ids, tokenizer,
         conductor=make_conductor(), lr=lr,
     )
     text1 = tokenizer.decode(tokens1[len(prompt_ids):]) if tokenizer else ""
-    valid1 = [v for v in losses1 if not math.isnan(v)]
-    avg1 = sum(valid1) / max(len(valid1), 1)
+    valid1 = [v for v in losses1 if math.isfinite(v)]
+    avg1 = sum(valid1) / len(valid1) if valid1 else float("nan")
 
     # Run 2: reset context but KEEP updated params
     gpu_model.reset_context()
@@ -131,11 +131,11 @@ def probe_cross_exposure(gpu_model, cfg, prompt_ids, tokenizer,
         conductor=make_conductor(), lr=lr,
     )
     text2 = tokenizer.decode(tokens2[len(prompt_ids):]) if tokenizer else ""
-    valid2 = [v for v in losses2 if not math.isnan(v)]
-    avg2 = sum(valid2) / max(len(valid2), 1)
+    valid2 = [v for v in losses2 if math.isfinite(v)]
+    avg2 = sum(valid2) / len(valid2) if valid2 else float("nan")
 
     improvement = avg1 - avg2
-    improvement_pct = (improvement / avg1 * 100) if avg1 > 0 else 0.0
+    improvement_pct = (improvement / avg1 * 100) if (math.isfinite(avg1) and avg1 > 0) else 0.0
 
     return {
         "run1_avg_loss": avg1,
@@ -171,8 +171,8 @@ def probe_context_value(gpu_model, cfg, prompt_ids, snapshot,
         max_tokens=max_tokens, temperature=temperature,
         conductor=make_conductor(), lr=lr,
     )
-    valid_cold = [v for v in cold_losses if not math.isnan(v)]
-    cold_avg = sum(valid_cold) / max(len(valid_cold), 1)
+    valid_cold = [v for v in cold_losses if math.isfinite(v)]
+    cold_avg = sum(valid_cold) / len(valid_cold) if valid_cold else float("nan")
 
     # Restore params (cold run modified them), keep training context
     gpu_model.upload_params(snapshot["params"])
@@ -185,8 +185,8 @@ def probe_context_value(gpu_model, cfg, prompt_ids, snapshot,
         max_tokens=max_tokens, temperature=temperature,
         conductor=make_conductor(), lr=lr,
     )
-    valid_warm = [v for v in warm_losses if not math.isnan(v)]
-    warm_avg = sum(valid_warm) / max(len(valid_warm), 1)
+    valid_warm = [v for v in warm_losses if math.isfinite(v)]
+    warm_avg = sum(valid_warm) / len(valid_warm) if valid_warm else float("nan")
 
     return {
         "cold_avg_loss": cold_avg,
