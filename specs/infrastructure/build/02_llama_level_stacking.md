@@ -396,21 +396,22 @@ __global__ void swiglu_fuse_backward(
 
 **Forward** -- X is [seq_len × d_model]:
 ```text
-gate_out  = cuBLAS_sgemm(X, gate_proj.T)          // [seq_len × intermediate]
-up_out    = cuBLAS_sgemm(X, up_proj.T)             // [seq_len × intermediate]
-fused     = swiglu_fuse_forward(gate_out, up_out)  // [seq_len × intermediate]
-Y         = cuBLAS_sgemm(fused, down_proj.T)        // [seq_len × d_model]
+gate_out            = cuBLAS_sgemm(X, gate_proj.T)              // [seq_len × intermediate] -- retain for bwd
+up_out              = cuBLAS_sgemm(X, up_proj.T)                // [seq_len × intermediate] -- retain for bwd
+fused, gate_cache   = swiglu_fuse_forward(gate_out, up_out)     // [seq_len × intermediate], sigmoid cache -- retain for bwd
+Y                   = cuBLAS_sgemm(fused, down_proj.T)          // [seq_len × d_model]
+// Retained for backward: gate_out, up_out, gate_cache, fused, X
 ```
 
 **Backward** -- given d_Y [seq_len × d_model]:
 ```text
-d_fused      = cuBLAS_sgemm(d_Y, down_proj)        // [seq_len × intermediate]
-d_down_proj  = cuBLAS_sgemm(fused.T, d_Y)          // [intermediate × d_model]
-d_gate, d_up = swiglu_fuse_backward(d_fused, ...)
-d_gate_proj  = cuBLAS_sgemm(d_gate.T, X)           // [intermediate × d_model]
-d_up_proj    = cuBLAS_sgemm(d_up.T, X)             // [intermediate × d_model]
-d_X          = cuBLAS_sgemm(d_gate, gate_proj)      // [seq_len × d_model]
-d_X         += cuBLAS_sgemm(d_up, up_proj)          // accumulate
+d_fused      = cuBLAS_sgemm(d_Y, down_proj)                         // [seq_len × intermediate]
+d_down_proj  = cuBLAS_sgemm(d_Y.T, fused)                           // [d_model × intermediate]
+d_gate, d_up = swiglu_fuse_backward(d_fused, gate_out, up_out, gate_cache)
+d_gate_proj  = cuBLAS_sgemm(d_gate.T, X)                            // [intermediate × d_model]
+d_up_proj    = cuBLAS_sgemm(d_up.T, X)                              // [intermediate × d_model]
+d_X          = cuBLAS_sgemm(d_gate, gate_proj)                      // [seq_len × d_model]
+d_X         += cuBLAS_sgemm(d_up, up_proj)                          // accumulate
 ```
 
 ### Dimension Constraints
