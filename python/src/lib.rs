@@ -699,6 +699,7 @@ impl MAGParams {
     /// gate: [intermediate x d_model], up: same, down: [d_model x intermediate].
     fn set_level_mlp(
         &mut self,
+        cfg: &MAGConfig,
         level: usize,
         gate: Vec<f32>,
         up: Vec<f32>,
@@ -709,8 +710,8 @@ impl MAGParams {
                 "level {level} out of range (k={})", self.inner.levels.len()
             )));
         }
-        let d = self.cfg.swa.d_model;
-        let inter = self.cfg.intermediate_size;
+        let d = cfg.inner.swa.d_model;
+        let inter = cfg.inner.intermediate_size;
         if inter == 0 {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "set_level_mlp: intermediate_size is 0 — configure MAGConfig with intermediate_size > 0 for SwiGluMlp"

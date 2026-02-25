@@ -30,7 +30,9 @@ blocks {MLP_pretrained_i}_{i=1}^{k}, use Equation 71 to update
 {MLP^(f_i)} in different levels; use the trained parameters
 of {MLP_pretrained_i} as the initial state of CMS blocks:
 
-    MLP_0^(f_i) = MLP_pretrained_i
+```text
+MLP_0^(f_i) = MLP_pretrained_i
+```
 
 The key insight: setting eta_t^(l) toward 0 keeps updated memory close to
 initial state (directly using pre-trained blocks without adaptation). Higher

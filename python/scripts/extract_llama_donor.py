@@ -44,6 +44,10 @@ def extract_donor(
 
     num_model_layers = len(model.model.layers)
     for layer_idx in donor_layers:
+        if not isinstance(layer_idx, int):
+            raise ValueError(
+                f"donor_layers entries must be int, got {type(layer_idx).__name__}: {layer_idx!r}"
+            )
         if layer_idx < 0 or layer_idx >= num_model_layers:
             raise ValueError(
                 f"donor_layers index {layer_idx} out of range "

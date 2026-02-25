@@ -463,7 +463,11 @@ pub fn traced_cms_forward(
 
         level_param_ids.push(lp_id);
 
-        if pulse.active_levels[level] {
+        // SwiGluMlp is stateless (no inner-loop M) — always use the active path.
+        let effective_active = pulse.active_levels[level]
+            || matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp);
+
+        if effective_active {
             // Active level: run rule.step(), record opaque, extract final M.
             let initial_m = Some(std::mem::take(&mut context.memory[level]));
 
@@ -505,6 +509,11 @@ pub fn traced_cms_forward(
                 ),
                 MemoryRuleKind::Trellis => trellis_read_only(
                     &params.levels[level], &embedded, frozen_ref, s, d, cfg.d_compress,
+                ),
+                // SwiGluMlp has no M state — must always run via effective_active path above.
+                MemoryRuleKind::SwiGluMlp => unreachable!(
+                    "SwiGluMlp has no frozen read-only path; \
+                     inactive levels must run via the active path (effective_active=true)"
                 ),
                 // Delta, Titans, Hebbian, Atlas — all use matrix M: y = M @ q
                 _ => delta_rule_read_only(

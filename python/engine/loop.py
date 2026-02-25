@@ -189,7 +189,7 @@ def run_build(bcfg: BuildConfig):
         params = nl_hecate.mag_init_params(cfg, bcfg.seed)
         if bcfg.donor_weights is not None:
             from engine.donor import load_llama_donor
-            load_llama_donor(bcfg.donor_weights, params, bcfg.k)
+            load_llama_donor(bcfg.donor_weights, params, cfg, bcfg.k)
 
     print(f"\n{'=' * 60}")
     print("NL-Hecate Build")
@@ -499,6 +499,7 @@ def run_build(bcfg: BuildConfig):
 
                     # Probe 2: cross-exposure adaptation (first prompt only)
                     full_restore(gpu_model, snapshot)
+                    gpu_model.reset_optimizer()  # probe1 corrupts AdamW moments
                     prompt_text = EVAL_PROMPTS[0]
                     prompt_ids = tokenizer.encode(prompt_text)
                     xresult = probe_cross_exposure(
@@ -646,6 +647,7 @@ def run_build(bcfg: BuildConfig):
 
                     # Probe 3: accumulated context vs cold start (first prompt)
                     full_restore(gpu_model, ckpt_snapshot)
+                    gpu_model.reset_optimizer()  # prior probes/samples corrupt AdamW moments
                     prompt_text = EVAL_PROMPTS[0]
                     prompt_ids = tokenizer.encode(prompt_text)
                     cresult = probe_context_value(
