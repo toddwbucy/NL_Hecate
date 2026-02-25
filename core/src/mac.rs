@@ -19,6 +19,7 @@ use crate::memora::{MEMORA, memora_read_only, memora_read_only_backward};
 use crate::lattice_osr::{LatticeOSR, lattice_read_only, lattice_read_only_backward};
 use crate::trellis::{Trellis, trellis_read_only, trellis_read_only_backward};
 use crate::atlas_omega::AtlasOmega;
+use crate::swiglu_mlp::SwiGluMlp;
 use crate::conductor::{Pulse, ContextState, ErrorBuffer};
 use crate::mag::MemoryCache;
 
@@ -181,6 +182,10 @@ fn step_dispatch(
             let (y, c) = AtlasOmega.step(level_params, input, s, d, initial_m);
             (y, MemoryCache::Atlas(c))
         }
+        MemoryRuleKind::SwiGluMlp => {
+            let (y, c) = SwiGluMlp::from_cfg(cfg).step(level_params, input, s, d, None);
+            (y, MemoryCache::SwiGlu(c))
+        }
     }
 }
 
@@ -217,6 +222,7 @@ fn step_backward_dispatch(
             rule.step_backward(level_params, c, d_y, input)
         }
         MemoryCache::Atlas(c) => AtlasOmega.step_backward(level_params, c, d_y, input),
+        MemoryCache::SwiGlu(c) => SwiGluMlp::from_cfg(cfg).step_backward(level_params, c, d_y, input),
         MemoryCache::SelfRef(_) => unreachable!("SelfRef backward not yet implemented"),
         MemoryCache::ChunkwiseSelfRef(_) => unreachable!("ChunkwiseSelfRef backward not yet implemented"),
     }

@@ -30,6 +30,7 @@ pub mod tnt;
 pub mod lattice_gla;
 pub mod atlas_omega;
 pub mod atlas_parallel;
+pub mod swiglu_mlp;
 #[cfg(feature = "internal")]
 pub mod gradient;
 #[cfg(not(feature = "internal"))]

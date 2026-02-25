@@ -294,3 +294,36 @@ fn test_cuda_hebbian_forward_d16() {
     check_close("hebbian_d16_y", &y_rust, &y_cuda, 1e-4);
     check_close("hebbian_d16_m", &m_rust, &m_cuda, 1e-4);
 }
+
+// ── Large-d test (validates shared memory overflow fix) ───────────
+
+#[test]
+fn test_cuda_hebbian_forward_large_d() {
+    // d=128 → M[128*128] = 64KB, would have overflowed shared memory (limit 48KB)
+    let d = 128;
+    let seq_len = 4;
+    let dd = d * d;
+
+    let k_mem = rand_buf(seq_len * d, 5000);
+    let v_mem = rand_buf(seq_len * d, 5100);
+    let q_mem = rand_buf(seq_len * d, 5200);
+    let alpha = vec![0.05f32; seq_len];
+    let m_initial = vec![0.0f32; dd];
+
+    let (m_rust, y_rust) = rust_hebbian_forward(
+        &k_mem, &v_mem, &q_mem, &alpha, &m_initial, seq_len, d);
+
+    let mut m_cuda = vec![0.0f32; (seq_len + 1) * dd];
+    let mut y_cuda = vec![0.0f32; seq_len * d];
+    hebbian_forward_dispatch(
+        &k_mem, &v_mem, &q_mem, &alpha, &m_initial,
+        &mut m_cuda, &mut y_cuda, seq_len, d);
+
+    check_close("hebbian_large_d_y", &y_rust, &y_cuda, 1e-4);
+    check_close("hebbian_large_d_m", &m_rust, &m_cuda, 1e-4);
+
+    // Verify M is non-zero
+    let m_final = &m_cuda[seq_len * dd..];
+    let m_norm: f32 = m_final.iter().map(|x| x * x).sum::<f32>().sqrt();
+    assert!(m_norm > 1e-6, "M_final should be non-zero at d=128, got ‖M‖={m_norm}");
+}

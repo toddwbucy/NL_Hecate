@@ -32,6 +32,15 @@ class BuildConfig:
     momentum_kind: str = "none"             # "none", "ema", "delta_momentum", "deep_momentum"
     momentum_d_hidden: int = 0              # momentum MLP hidden dim (0 = d*d matrix)
 
+    # Per-level theta gate clamps (empty = unclamped, CS-39 style)
+    theta_floor: list[float] | None = None  # per-level softplus lower bound
+    theta_ceil: list[float] | None = None   # per-level softplus upper bound
+
+    # SwiGluMlp / Llama level stacking (HOPE §7.3)
+    intermediate_size: int = 0             # 0 for matrix rules; 8192 for Llama-3.2-1B
+    donor_layers: list[int] | None = None  # which Llama layers to transplant (e.g. [0,5,10,15])
+    donor_weights: str | None = None       # path to extracted donor weights .pt file
+
     # Build
     lr: float = 0.01
     steps: int = 500
@@ -121,6 +130,12 @@ class BuildConfig:
         if self.data_format not in ("byte", "sharegpt"):
             raise ValueError(
                 f"data_format must be 'byte' or 'sharegpt', got '{self.data_format}'")
+        if self.theta_floor is not None and len(self.theta_floor) != self.k:
+            raise ValueError(
+                f"theta_floor length {len(self.theta_floor)} must match k={self.k}")
+        if self.theta_ceil is not None and len(self.theta_ceil) != self.k:
+            raise ValueError(
+                f"theta_ceil length {len(self.theta_ceil)} must match k={self.k}")
         if self.checkpoint_interval is not None and self.checkpoint_interval < 1:
             raise ValueError(
                 f"checkpoint_interval must be >= 1 or None, got {self.checkpoint_interval}")

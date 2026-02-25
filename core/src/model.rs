@@ -69,6 +69,9 @@ pub enum MemoryRuleKind {
     LatticeOSR,
     Trellis,
     AtlasOmega,
+    /// HOPE §7.3 ad-hoc level stacking: SwiGLU MLP with outer-loop AdamW.
+    /// No inner-loop M state — gate_proj/up_proj/down_proj are the memory.
+    SwiGluMlp,
 }
 
 /// MIRAS Knob 2: Attentional bias (loss function for memory updates).
@@ -336,6 +339,15 @@ pub struct MemoryLevelParams {
     /// Self-referential main projection memory initial state: [d*d].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub m_mem_init: Vec<f32>,
+    /// SwiGluMlp gate projection: [intermediate x d_model]. Empty for all other rules.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gate_proj: Vec<f32>,
+    /// SwiGluMlp up projection: [intermediate x d_model]. Empty for all other rules.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub up_proj: Vec<f32>,
+    /// SwiGluMlp down projection: [d_model x intermediate]. Empty for all other rules.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub down_proj: Vec<f32>,
 }
 
 impl MemoryLevelParams {
@@ -382,7 +394,7 @@ impl MemoryLevelParams {
         let w_freq = vec![];
         let b_freq = vec![];
 
-        MemoryLevelParams { w_k_mem, w_v_mem, w_q_mem, w_alpha, b_alpha, w_theta, b_theta, w_eta, b_eta, w_omega, w_freq, b_freq, w_k_conv: vec![], b_k_conv: vec![], w_q_conv: vec![], b_q_conv: vec![], m_k_init: vec![], m_v_init: vec![], m_q_init: vec![], m_eta_init: vec![], m_alpha_init: vec![], m_mem_init: vec![] }
+        MemoryLevelParams { w_k_mem, w_v_mem, w_q_mem, w_alpha, b_alpha, w_theta, b_theta, w_eta, b_eta, w_omega, w_freq, b_freq, w_k_conv: vec![], b_k_conv: vec![], w_q_conv: vec![], b_q_conv: vec![], m_k_init: vec![], m_v_init: vec![], m_q_init: vec![], m_eta_init: vec![], m_alpha_init: vec![], m_mem_init: vec![], gate_proj: vec![], up_proj: vec![], down_proj: vec![] }
     }
 
     /// Initialize with Xavier-initialized w_omega for Atlas Omega rule.
@@ -441,6 +453,9 @@ impl MemoryLevelParams {
             m_eta_init: vec![],
             m_alpha_init: vec![],
             m_mem_init: vec![],
+            gate_proj: vec![],
+            up_proj: vec![],
+            down_proj: vec![],
         }
     }
 
@@ -463,6 +478,9 @@ impl MemoryLevelParams {
         if !template.m_eta_init.is_empty() { z.m_eta_init = vec![0.0f32; template.m_eta_init.len()]; }
         if !template.m_alpha_init.is_empty() { z.m_alpha_init = vec![0.0f32; template.m_alpha_init.len()]; }
         if !template.m_mem_init.is_empty() { z.m_mem_init = vec![0.0f32; template.m_mem_init.len()]; }
+        if !template.gate_proj.is_empty() { z.gate_proj = vec![0.0f32; template.gate_proj.len()]; }
+        if !template.up_proj.is_empty() { z.up_proj = vec![0.0f32; template.up_proj.len()]; }
+        if !template.down_proj.is_empty() { z.down_proj = vec![0.0f32; template.down_proj.len()]; }
         z
     }
 
@@ -478,6 +496,7 @@ impl MemoryLevelParams {
             + self.w_q_conv.len() + self.b_q_conv.len()
             + self.m_k_init.len() + self.m_v_init.len() + self.m_q_init.len()
             + self.m_eta_init.len() + self.m_alpha_init.len() + self.m_mem_init.len()
+            + self.gate_proj.len() + self.up_proj.len() + self.down_proj.len()
     }
 
     /// Outer-loop weight update: param -= lr * grad for all projection weights.
@@ -517,6 +536,9 @@ impl MemoryLevelParams {
         if !self.m_eta_init.is_empty() && !grads.m_eta_init.is_empty() { debug_assert_eq!(self.m_eta_init.len(), grads.m_eta_init.len()); step(&mut self.m_eta_init, &grads.m_eta_init, lr); }
         if !self.m_alpha_init.is_empty() && !grads.m_alpha_init.is_empty() { debug_assert_eq!(self.m_alpha_init.len(), grads.m_alpha_init.len()); step(&mut self.m_alpha_init, &grads.m_alpha_init, lr); }
         if !self.m_mem_init.is_empty() && !grads.m_mem_init.is_empty() { debug_assert_eq!(self.m_mem_init.len(), grads.m_mem_init.len()); step(&mut self.m_mem_init, &grads.m_mem_init, lr); }
+        if !self.gate_proj.is_empty() && !grads.gate_proj.is_empty() { debug_assert_eq!(self.gate_proj.len(), grads.gate_proj.len()); step(&mut self.gate_proj, &grads.gate_proj, lr); }
+        if !self.up_proj.is_empty() && !grads.up_proj.is_empty() { debug_assert_eq!(self.up_proj.len(), grads.up_proj.len()); step(&mut self.up_proj, &grads.up_proj, lr); }
+        if !self.down_proj.is_empty() && !grads.down_proj.is_empty() { debug_assert_eq!(self.down_proj.len(), grads.down_proj.len()); step(&mut self.down_proj, &grads.down_proj, lr); }
     }
 
     /// Element-wise accumulate: self += other.
@@ -554,6 +576,9 @@ impl MemoryLevelParams {
         if !self.m_eta_init.is_empty() && !other.m_eta_init.is_empty() { debug_assert_eq!(self.m_eta_init.len(), other.m_eta_init.len()); acc(&mut self.m_eta_init, &other.m_eta_init); }
         if !self.m_alpha_init.is_empty() && !other.m_alpha_init.is_empty() { debug_assert_eq!(self.m_alpha_init.len(), other.m_alpha_init.len()); acc(&mut self.m_alpha_init, &other.m_alpha_init); }
         if !self.m_mem_init.is_empty() && !other.m_mem_init.is_empty() { debug_assert_eq!(self.m_mem_init.len(), other.m_mem_init.len()); acc(&mut self.m_mem_init, &other.m_mem_init); }
+        if !self.gate_proj.is_empty() && !other.gate_proj.is_empty() { debug_assert_eq!(self.gate_proj.len(), other.gate_proj.len()); acc(&mut self.gate_proj, &other.gate_proj); }
+        if !self.up_proj.is_empty() && !other.up_proj.is_empty() { debug_assert_eq!(self.up_proj.len(), other.up_proj.len()); acc(&mut self.up_proj, &other.up_proj); }
+        if !self.down_proj.is_empty() && !other.down_proj.is_empty() { debug_assert_eq!(self.down_proj.len(), other.down_proj.len()); acc(&mut self.down_proj, &other.down_proj); }
     }
 
     /// Frobenius norm across all weight matrices.
@@ -572,7 +597,8 @@ impl MemoryLevelParams {
                    &self.w_freq, &self.b_freq,
                    &self.w_k_conv, &self.b_k_conv, &self.w_q_conv, &self.b_q_conv,
                    &self.m_k_init, &self.m_v_init, &self.m_q_init,
-                   &self.m_eta_init, &self.m_alpha_init, &self.m_mem_init] {
+                   &self.m_eta_init, &self.m_alpha_init, &self.m_mem_init,
+                   &self.gate_proj, &self.up_proj, &self.down_proj] {
             for &x in v.iter() {
                 sum += x * x;
             }
@@ -696,11 +722,35 @@ pub struct MAGConfig {
     /// Only meaningful when projection_kind == Adaptive.
     #[serde(default = "default_one")]
     pub self_ref_chunk_size: usize,
+    /// Per-level theta (inner-loop lr) floor after softplus activation (CS-39).
+    /// Prevents higher CMS levels from collapsing to near-zero learning rate.
+    /// Length must match `k`. Default: all zeros (no floor).
+    #[serde(default)]
+    pub theta_floor: Vec<f32>,
+    /// Per-level theta (inner-loop lr) ceiling after softplus activation (CS-39).
+    /// Prevents any level from overshooting. Default: empty (no ceiling).
+    #[serde(default)]
+    pub theta_ceil: Vec<f32>,
+    /// SwiGluMlp intermediate (hidden) dimension. 0 for all matrix-memory rules.
+    /// Typically 4*d_model (e.g., 8192 for d=2048 — Llama-3.2-1B MLP size).
+    #[serde(default)]
+    pub intermediate_size: usize,
 }
 
 fn default_one() -> usize { 1 }
 
 fn default_sign_sharpness() -> f32 { 10.0 }
+
+impl MAGConfig {
+    /// Clamp a post-softplus theta value using per-level floor/ceil (CS-39).
+    /// Returns theta unchanged if no floor/ceil is configured for this level.
+    #[inline]
+    pub fn clamp_theta(&self, level: usize, theta: f32) -> f32 {
+        let floor = self.theta_floor.get(level).copied().unwrap_or(0.0);
+        let ceil = self.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
+        theta.clamp(floor, ceil)
+    }
+}
 
 /// Default gate bias init values per level index.
 fn default_b_alpha(level: usize) -> f32 {
@@ -779,6 +829,9 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
         }
     }
 
@@ -814,6 +867,9 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
         }
     }
 
@@ -849,6 +905,9 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
         }
     }
 
@@ -885,6 +944,9 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
         }
     }
 
@@ -921,6 +983,9 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
         }
     }
 
@@ -957,6 +1022,9 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
         }
     }
 
@@ -992,6 +1060,9 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
         }
     }
 
@@ -1027,6 +1098,9 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
         }
     }
 
@@ -1062,6 +1136,9 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
         }
     }
 
@@ -1097,6 +1174,9 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
         }
     }
 
@@ -1142,6 +1222,9 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
         }
     }
 
@@ -1187,6 +1270,9 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
         }
     }
 
@@ -1232,6 +1318,9 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
         }
     }
 
@@ -1277,6 +1366,9 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
         }
     }
 
@@ -1322,6 +1414,9 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
         }
     }
 
@@ -1367,6 +1462,9 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
         }
     }
 
@@ -1403,6 +1501,9 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
         }
     }
 
@@ -1439,6 +1540,9 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
         }
     }
 
@@ -1478,6 +1582,9 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
         }
     }
 
@@ -1517,6 +1624,9 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
         }
     }
 
@@ -1552,6 +1662,9 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
         }
     }
 
@@ -1587,6 +1700,9 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
         }
     }
 
@@ -1622,6 +1738,9 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
         }
     }
 
@@ -1657,6 +1776,9 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
         }
     }
 
@@ -1693,6 +1815,9 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
         }
     }
 
@@ -1728,6 +1853,9 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
         }
     }
 
@@ -1764,6 +1892,9 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
         }
     }
 
@@ -1800,6 +1931,9 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
         }
     }
 }
@@ -1871,6 +2005,23 @@ impl MAGParams {
                 level_params.m_alpha_init = vec![0.0f32; d * d];
                 level_params.m_mem_init = vec![0.0f32; d * d];
             }
+            // Initialize SwiGluMlp projections with Xavier scaling
+            if cfg.memory_rule == MemoryRuleKind::SwiGluMlp {
+                let inter = cfg.intermediate_size;
+                assert!(inter > 0, "intermediate_size must be > 0 for SwiGluMlp rule");
+                let gate_scale = (2.0 / (d + inter) as f32).sqrt();
+                let down_scale = (2.0 / (inter + d) as f32).sqrt();
+                let mut mlp_rng = SimpleRng::new(seed.wrapping_add(11000 + level as u64 * 300));
+                let mut gp = vec![0.0f32; inter * d];
+                mlp_rng.fill_uniform(&mut gp, gate_scale);
+                level_params.gate_proj = gp;
+                let mut up = vec![0.0f32; inter * d];
+                mlp_rng.fill_uniform(&mut up, gate_scale);
+                level_params.up_proj = up;
+                let mut dp = vec![0.0f32; d * inter];
+                mlp_rng.fill_uniform(&mut dp, down_scale);
+                level_params.down_proj = dp;
+            }
             levels.push(level_params);
         }
 
@@ -1919,6 +2070,12 @@ impl MAGParams {
                 z.m_eta_init = vec![0.0f32; d * d];
                 z.m_alpha_init = vec![0.0f32; d * d];
                 z.m_mem_init = vec![0.0f32; d * d];
+            }
+            if cfg.memory_rule == MemoryRuleKind::SwiGluMlp {
+                let inter = cfg.intermediate_size;
+                z.gate_proj = vec![0.0f32; inter * d];
+                z.up_proj = vec![0.0f32; inter * d];
+                z.down_proj = vec![0.0f32; d * inter];
             }
             z
         }).collect();

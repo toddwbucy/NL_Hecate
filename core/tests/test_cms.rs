@@ -221,6 +221,9 @@ fn test_k2_beats_k1() {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
 
         };
     // k=2 config
@@ -246,6 +249,9 @@ fn test_k2_beats_k1() {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
 
         };
 
@@ -435,6 +441,9 @@ fn test_k4_vs_k2_multiscale() {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
 
         };
     let cfg_k4 = MAGConfig {
@@ -459,6 +468,9 @@ fn test_k4_vs_k2_multiscale() {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
 
         };
 
@@ -560,6 +572,9 @@ fn test_k4_diagnostics() {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
 
         };
 
@@ -839,6 +854,9 @@ fn test_cms_stability_boundary() {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
 
         };
     let cfg_k2 = MAGConfig {
@@ -863,6 +881,9 @@ fn test_cms_stability_boundary() {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
 
         };
 
@@ -1061,6 +1082,9 @@ fn test_k4_normalization_magnitude() {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
 
         };
     let params_k4 = MAGParams::init(&cfg_k4, 42);
@@ -1138,6 +1162,9 @@ fn test_k4_uniform_init_stable() {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
 
         };
 
@@ -1201,6 +1228,9 @@ fn test_k4_normalized_stable() {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+            intermediate_size: 0,
 
         };
 

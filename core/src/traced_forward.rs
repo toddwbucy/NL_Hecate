@@ -26,6 +26,7 @@ use crate::memora::{MEMORA, memora_read_only};
 use crate::lattice_osr::{LatticeOSR, lattice_read_only};
 use crate::trellis::{Trellis, trellis_read_only};
 use crate::atlas_omega::AtlasOmega;
+use crate::swiglu_mlp::SwiGluMlp;
 use crate::dynamic_freq::{FrequencySchedule, FreqGateCache, should_anneal};
 use crate::self_ref::ProjectionKind;
 
@@ -269,6 +270,8 @@ fn active_opaque_key(rule: MemoryRuleKind) -> OpaqueKey {
         MemoryRuleKind::LatticeOSR => OpaqueKey::LatticeOSR,
         MemoryRuleKind::Trellis => OpaqueKey::Trellis,
         MemoryRuleKind::AtlasOmega => OpaqueKey::AtlasOmega,
+        // SwiGluMlp has no inner-loop M state — active and frozen are identical
+        MemoryRuleKind::SwiGluMlp => OpaqueKey::SwiGluMlp,
     }
 }
 
@@ -284,6 +287,8 @@ fn frozen_opaque_key(rule: MemoryRuleKind) -> OpaqueKey {
         MemoryRuleKind::LatticeOSR => OpaqueKey::FrozenLatticeOSR,
         MemoryRuleKind::Trellis => OpaqueKey::FrozenTrellis,
         MemoryRuleKind::AtlasOmega => OpaqueKey::FrozenAtlasOmega,
+        // SwiGluMlp has no M state — frozen path reuses the active backward
+        MemoryRuleKind::SwiGluMlp => OpaqueKey::SwiGluMlp,
     }
 }
 
@@ -441,7 +446,20 @@ pub fn traced_cms_forward(
     let mut frozen_w_q_mem_ids: Vec<Option<BufId>> = Vec::with_capacity(cfg.k);
 
     for level in 0..cfg.k {
-        let lp_flat = level_params_grads_to_flat(&params.levels[level]);
+        // SwiGluMlp uses MLP-specific flat (gate ++ up ++ down) instead of
+        // the standard field layout — standard fields are all empty for this rule.
+        let lp_flat = if cfg.memory_rule == MemoryRuleKind::SwiGluMlp {
+            let lp = &params.levels[level];
+            let mut flat = Vec::with_capacity(
+                lp.gate_proj.len() + lp.up_proj.len() + lp.down_proj.len()
+            );
+            flat.extend_from_slice(&lp.gate_proj);
+            flat.extend_from_slice(&lp.up_proj);
+            flat.extend_from_slice(&lp.down_proj);
+            flat
+        } else {
+            level_params_grads_to_flat(&params.levels[level])
+        };
         let lp_id = tape.register_param(&lp_flat, vec![lp_flat.len()]);
 
         level_param_ids.push(lp_id);
@@ -1014,6 +1032,36 @@ fn traced_active_level(
             tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved);
 
             (y, MemoryCache::Atlas(cache), final_m, y_id)
+        }
+        MemoryRuleKind::SwiGluMlp => {
+            // SwiGluMlp: no inner-loop M state. Weights are gate/up/down_proj only.
+            // saved layout matches swiglu_opaque_backward in swiglu_mlp.rs:
+            //   saved[0] = meta [seq_len, d, inter]
+            //   saved[1] = lp_id (already contains gate ++ up ++ down flat)
+            //   saved[2] = emb_in (embedded input)
+            //   saved[3] = x_id  (cache.x — copy of embedded)
+            //   saved[4] = gate_out_id
+            //   saved[5] = up_out_id
+            //   saved[6] = fused_id
+            //   saved[7] = gate_cache_id
+            let inter = cfg.intermediate_size;
+            let (y, cache) = SwiGluMlp { intermediate_size: inter }
+                .step_cpu(level_params, embedded, s, d);
+
+            let meta_id = tape.alloc(vec![s as f32, d as f32, inter as f32], vec![]);
+            let emb_saved = tape.alloc(embedded.to_vec(), vec![s, d]);
+            let x_id = tape.alloc(cache.x.clone(), vec![]);
+            let gate_out_id = tape.alloc(cache.gate_out.clone(), vec![]);
+            let up_out_id = tape.alloc(cache.up_out.clone(), vec![]);
+            let fused_id = tape.alloc(cache.fused.clone(), vec![]);
+            let gc_id = tape.alloc(cache.gate_cache.clone(), vec![]);
+
+            let y_id = tape.alloc(y.clone(), vec![s, d]);
+            let saved = vec![meta_id, lp_id, emb_saved, x_id, gate_out_id, up_out_id, fused_id, gc_id];
+            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved);
+
+            // No M state — return empty vec
+            (y, MemoryCache::SwiGlu(cache), vec![], y_id)
         }
     }
 }

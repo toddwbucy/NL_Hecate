@@ -27,6 +27,7 @@ use crate::memora::{MEMORA, memora_read_only, memora_read_only_backward};
 use crate::lattice_osr::{LatticeOSR, lattice_read_only, lattice_read_only_backward};
 use crate::trellis::{Trellis, trellis_read_only, trellis_read_only_backward};
 use crate::atlas_omega::AtlasOmega;
+use crate::swiglu_mlp::SwiGluMlp;
 use crate::conductor::{Pulse, ContextState, ErrorBuffer};
 use crate::mag::MemoryCache;
 
@@ -97,6 +98,10 @@ fn dispatch_memory_step(
             let (y, cache) = AtlasOmega.step(level_params, embedded, s, d, initial_m);
             (y, MemoryCache::Atlas(cache))
         }
+        MemoryRuleKind::SwiGluMlp => {
+            let (y, cache) = SwiGluMlp::from_cfg(cfg).step(level_params, embedded, s, d, None);
+            (y, MemoryCache::SwiGlu(cache))
+        }
     }
 }
 
@@ -134,6 +139,9 @@ fn dispatch_memory_backward(
         }
         MemoryCache::Atlas(c) => {
             AtlasOmega.step_backward(level_params, c, d_y, embedded)
+        }
+        MemoryCache::SwiGlu(c) => {
+            SwiGluMlp::from_cfg(cfg).step_backward(level_params, c, d_y, embedded)
         }
         MemoryCache::SelfRef(_) => unreachable!("SelfRef backward not yet implemented"),
         MemoryCache::ChunkwiseSelfRef(_) => unreachable!("ChunkwiseSelfRef backward not yet implemented"),
@@ -478,6 +486,8 @@ pub fn persist_memory_state(
             let start = s * d * d;
             *context_mem = c.m_states[start..start + d * d].to_vec();
         }
+        // SwiGluMlp has no inner-loop M state — nothing to persist
+        MemoryCache::SwiGlu(_) => {}
         MemoryCache::SelfRef(_) => unreachable!("SelfRef context extract not yet implemented"),
         MemoryCache::ChunkwiseSelfRef(_) => unreachable!("ChunkwiseSelfRef context extract not yet implemented"),
     }

@@ -250,7 +250,7 @@ mod tests {
             MemoryRuleKind::HebbianRule, MemoryRuleKind::Moneta,
             MemoryRuleKind::YAAD, MemoryRuleKind::MEMORA,
             MemoryRuleKind::LatticeOSR, MemoryRuleKind::Trellis,
-            MemoryRuleKind::AtlasOmega,
+            MemoryRuleKind::AtlasOmega, MemoryRuleKind::SwiGluMlp,
         ] {
             assert!(strategy_supported(rule, ParallelStrategy::Sequential),
                 "Sequential should be supported by {:?}", rule);

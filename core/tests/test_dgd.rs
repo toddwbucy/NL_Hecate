@@ -367,6 +367,9 @@ fn tiny_delta_config() -> MAGConfig {
         projection_kind: ProjectionKind::Static,
         self_generated_values: false,
         self_ref_chunk_size: 1,
+        theta_floor: vec![],
+        theta_ceil: vec![],
+        intermediate_size: 0,
     }
 }
 

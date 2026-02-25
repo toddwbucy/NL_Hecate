@@ -253,6 +253,7 @@ fn rule_name(rule: MemoryRuleKind) -> &'static str {
         MemoryRuleKind::LatticeOSR => "LatticeOSR",
         MemoryRuleKind::Trellis => "Trellis",
         MemoryRuleKind::AtlasOmega => "AtlasOmega",
+        MemoryRuleKind::SwiGluMlp => "SwiGluMlp",
     }
 }
 
@@ -433,7 +434,7 @@ mod tests {
             MemoryRuleKind::HebbianRule, MemoryRuleKind::Moneta,
             MemoryRuleKind::YAAD, MemoryRuleKind::MEMORA,
             MemoryRuleKind::LatticeOSR, MemoryRuleKind::Trellis,
-            MemoryRuleKind::AtlasOmega,
+            MemoryRuleKind::AtlasOmega, MemoryRuleKind::SwiGluMlp,
         ] {
             let retention = crate::retention::default_retention(rule);
             let result = validate_composition(

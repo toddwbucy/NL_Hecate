@@ -147,6 +147,8 @@ fn memory_state_size(cfg: &MAGConfig) -> usize {
             let dk = cfg.d_compress;
             dk * d + d * dk // S_K + S_V
         }
+        // SwiGluMlp has no inner-loop M state
+        MemoryRuleKind::SwiGluMlp => 0,
     }
 }
 

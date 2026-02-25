@@ -61,6 +61,9 @@ fn tiny_config(rule: MemoryRuleKind, retention: RetentionKind) -> MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            theta_floor: vec![],
+            theta_ceil: vec![],
+        intermediate_size: 0,
     }
 }
 
@@ -76,6 +79,7 @@ fn context_memory_size(cfg: &MAGConfig) -> usize {
         | MemoryRuleKind::MEMORA => cfg.d_hidden * d + d * cfg.d_hidden,
         MemoryRuleKind::LatticeOSR => cfg.m_slots * d,
         MemoryRuleKind::Trellis => 2 * cfg.d_compress * d,
+        MemoryRuleKind::SwiGluMlp => 0, // no inner-loop M state
     }
 }
 

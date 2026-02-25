@@ -183,8 +183,12 @@ def run_build(bcfg: BuildConfig):
             momentum_d_hidden=bcfg.momentum_d_hidden,
             theta_floor=bcfg.theta_floor,
             theta_ceil=bcfg.theta_ceil,
+            intermediate_size=bcfg.intermediate_size,
         )
         params = nl_hecate.mag_init_params(cfg, bcfg.seed)
+        if bcfg.donor_weights is not None:
+            from engine.donor import load_llama_donor
+            load_llama_donor(bcfg.donor_weights, params, bcfg.k)
 
     print(f"\n{'=' * 60}")
     print("NL-Hecate Build")
@@ -202,6 +206,10 @@ def run_build(bcfg: BuildConfig):
     if bcfg.momentum_kind != "none":
         print(f"  Momentum: kind={bcfg.momentum_kind}, "
               f"d_hidden={bcfg.momentum_d_hidden}")
+    if bcfg.intermediate_size:
+        print(f"  SwiGLU:   intermediate_size={bcfg.intermediate_size}")
+    if bcfg.donor_weights:
+        print(f"  Donor:    {bcfg.donor_weights}")
     if bcfg.theta_floor:
         print(f"  θ clamps: floor={bcfg.theta_floor}, ceil={bcfg.theta_ceil}")
     print(f"  Params:   {params.num_params():,}")
