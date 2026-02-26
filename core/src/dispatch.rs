@@ -732,7 +732,12 @@ pub fn delta_forward_dispatch(
 ) {
     #[cfg(feature = "cuda")]
     {
-        if !is_rust_forced() {
+        // Gate CUDA path: CUDA inner kernels don't implement per-step m_norm_max
+        // clamping (that's handled by the standalone m_norm_clamp_f32_cuda called
+        // once per level after the forward pass). Fall back to Rust when an
+        // active clamp is requested via this parameter.
+        let clamp_enabled = m_norm_max > 0.0 && m_norm_max < f32::MAX;
+        if !is_rust_forced() && !clamp_enabled {
             cuda_delta_forward(k_mem, v_mem, q_mem, alpha, theta, m_initial,
                                m_states, y, seq_len, d);
             return;
@@ -797,7 +802,9 @@ pub fn titans_forward_dispatch(
 ) {
     #[cfg(feature = "cuda")]
     {
-        if !is_rust_forced() {
+        // Gate CUDA path when active clamp requested — see delta_forward_dispatch.
+        let clamp_enabled = m_norm_max > 0.0 && m_norm_max < f32::MAX;
+        if !is_rust_forced() && !clamp_enabled {
             cuda_titans_forward(k_mem, v_mem, q_mem, alpha, theta, eta,
                                 m_initial, s_initial, m_states, s_states, y,
                                 seq_len, d);
@@ -868,7 +875,9 @@ pub fn hebbian_forward_dispatch(
 ) {
     #[cfg(feature = "cuda")]
     {
-        if !is_rust_forced() {
+        // Gate CUDA path when active clamp requested — see delta_forward_dispatch.
+        let clamp_enabled = m_norm_max > 0.0 && m_norm_max < f32::MAX;
+        if !is_rust_forced() && !clamp_enabled {
             cuda_hebbian_forward(k_mem, v_mem, q_mem, alpha, m_initial,
                                  m_states, y, seq_len, d);
             return;
