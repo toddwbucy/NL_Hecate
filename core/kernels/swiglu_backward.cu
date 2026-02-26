@@ -201,6 +201,8 @@ __global__ void swiglu_fuse_backward_kernel(
 // (allocated once on first call per config, never freed). Weights and saved
 // activations are H2D every call. Output grads d_X, d_gate_proj, d_up_proj,
 // d_down_proj are D2H after computation.
+// NOT thread-safe for concurrent calls — Wengert tape guarantees sequential
+// execution of all CMS levels so buffer reuse is safe during training.
 extern "C" void swiglu_backward_f32_cuda(
     const float* d_Y,          // host: [seq_len × d_model]   upstream gradient
     const float* X,            // host: [seq_len × d_model]   input from forward
@@ -226,7 +228,7 @@ extern "C" void swiglu_backward_f32_cuda(
     size_t szGate = (size_t)intermediate * d_model * sizeof(float);
     size_t szDown = (size_t)d_model * intermediate * sizeof(float);
     size_t szBuf  = (size_t)seq_len * intermediate * sizeof(float);
-    int N         = seq_len * intermediate;
+    size_t N      = (size_t)seq_len * intermediate;
 
     // Ensure persistent device buffers are allocated (first call only)
     ensure_bwd_pool(d_model, intermediate, seq_len);
@@ -278,7 +280,7 @@ extern "C" void swiglu_backward_f32_cuda(
 
     // Step 3: elementwise backward through SiLU gate fusion
     int block = 256;
-    int grid  = (N + block - 1) / block;
+    int grid  = (int)((N + block - 1) / block);
     swiglu_fuse_backward_kernel<<<grid, block>>>(
         g_bwd_pool.dDFused, g_bwd_pool.dGateBuf, g_bwd_pool.dUpBuf, g_bwd_pool.dCacheBuf,
         g_bwd_pool.dDGateOut, g_bwd_pool.dDUpOut, N);

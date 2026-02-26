@@ -163,6 +163,8 @@ __global__ void swiglu_fuse_kernel(
 // (allocated once on first call per config, never freed). Weights are
 // H2D every call (they change after each AdamW step). gate_buf, up_buf,
 // fused_buf, cache_buf are output host buffers populated for the backward pass.
+// NOT thread-safe for concurrent calls — Wengert tape guarantees sequential
+// execution of all CMS levels so buffer reuse is safe during training.
 extern "C" void swiglu_forward_f32_cuda(
     const float* X,           // host: [seq_len × d_model]
     const float* gate_proj,   // host: [intermediate × d_model]  (row-major)
@@ -184,7 +186,7 @@ extern "C" void swiglu_forward_f32_cuda(
     size_t szDown = (size_t)d_model * intermediate * sizeof(float);
     size_t szX    = (size_t)seq_len * d_model * sizeof(float);
     size_t szBuf  = (size_t)seq_len * intermediate * sizeof(float);
-    int N         = seq_len * intermediate;
+    size_t N      = (size_t)seq_len * intermediate;
 
     // Ensure persistent device buffers are allocated (first call only)
     ensure_fwd_pool(d_model, intermediate, seq_len);
@@ -225,7 +227,7 @@ extern "C" void swiglu_forward_f32_cuda(
 
     // SiLU gate fusion: fused = silu(gate) * up, save sigmoid in cache
     int block = 256;
-    int grid  = (N + block - 1) / block;
+    int grid  = (int)((N + block - 1) / block);
     swiglu_fuse_kernel<<<grid, block>>>(
         g_fwd_pool.dGateBuf, g_fwd_pool.dUpBuf,
         g_fwd_pool.dFusedBuf, g_fwd_pool.dCacheBuf, N);
