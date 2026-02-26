@@ -476,6 +476,17 @@ pub fn swiglu_opaque_backward(
     level_params.up_proj = up_proj;
     level_params.down_proj = down_proj;
 
+    assert_eq!(saved[3].len(), seq_len * d,
+        "swiglu_opaque_backward: saved[3] (x) len {} != seq_len*d {}", saved[3].len(), seq_len * d);
+    assert_eq!(saved[4].len(), seq_len * inter,
+        "swiglu_opaque_backward: saved[4] (gate_out) len {} != seq_len*inter {}", saved[4].len(), seq_len * inter);
+    assert_eq!(saved[5].len(), seq_len * inter,
+        "swiglu_opaque_backward: saved[5] (up_out) len {} != seq_len*inter {}", saved[5].len(), seq_len * inter);
+    assert_eq!(saved[6].len(), seq_len * inter,
+        "swiglu_opaque_backward: saved[6] (fused) len {} != seq_len*inter {}", saved[6].len(), seq_len * inter);
+    assert_eq!(saved[7].len(), seq_len * inter,
+        "swiglu_opaque_backward: saved[7] (gate_cache) len {} != seq_len*inter {}", saved[7].len(), seq_len * inter);
+
     let cache = SwiGluMlpCache {
         seq_len,
         d,
