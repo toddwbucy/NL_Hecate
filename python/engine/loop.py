@@ -139,7 +139,13 @@ def run_build(bcfg: BuildConfig):
         # Apply theta clamps from BuildConfig onto loaded cfg (allows
         # adding clamps to an existing checkpoint that didn't have them).
         # MAGConfig is frozen, so rebuild if clamps changed.
-        if bcfg.theta_floor is not None or bcfg.theta_ceil is not None:
+        if bcfg.theta_floor is not None or bcfg.theta_ceil is not None or bcfg.m_norm_max is not None:
+            # Use bcfg value when explicitly set; fall back to loaded cfg so we
+            # never silently wipe clamp values that were already baked into the
+            # checkpoint (e.g. resuming without --m_norm_max still preserves it).
+            theta_floor = bcfg.theta_floor if bcfg.theta_floor is not None else list(cfg.theta_floor)
+            theta_ceil  = bcfg.theta_ceil  if bcfg.theta_ceil  is not None else list(cfg.theta_ceil)
+            m_norm_max  = bcfg.m_norm_max  if bcfg.m_norm_max  is not None else list(cfg.m_norm_max)
             cfg = nl_hecate.MAGConfig(
                 d_model=cfg.d_model, num_heads=cfg.num_heads,
                 head_dim=cfg.head_dim, seq_len=cfg.seq_len,
@@ -154,8 +160,9 @@ def run_build(bcfg: BuildConfig):
                 momentum_kind=cfg.momentum_kind,
                 momentum_d_hidden=cfg.momentum_d_hidden,
                 intermediate_size=bcfg.intermediate_size,
-                theta_floor=bcfg.theta_floor,
-                theta_ceil=bcfg.theta_ceil,
+                theta_floor=theta_floor,
+                theta_ceil=theta_ceil,
+                m_norm_max=m_norm_max,
             )
     else:
         cfg = nl_hecate.MAGConfig(
@@ -179,6 +186,7 @@ def run_build(bcfg: BuildConfig):
             theta_floor=bcfg.theta_floor,
             theta_ceil=bcfg.theta_ceil,
             intermediate_size=bcfg.intermediate_size,
+            m_norm_max=bcfg.m_norm_max,
         )
         params = nl_hecate.mag_init_params(cfg, bcfg.seed)
         if bcfg.donor_weights is not None:
@@ -207,6 +215,8 @@ def run_build(bcfg: BuildConfig):
         print(f"  Donor:    {bcfg.donor_weights}")
     if bcfg.theta_floor is not None or bcfg.theta_ceil is not None:
         print(f"  θ clamps: floor={bcfg.theta_floor}, ceil={bcfg.theta_ceil}")
+    if len(cfg.m_norm_max) > 0:
+        print(f"  M-norm:   max={list(cfg.m_norm_max)}")
     print(f"  Params:   {params.num_params():,}")
     data_len = len(bpe_loader) if use_bpe else len(token_ids)
     print(f"  Data:     {data_len:,} tokens" +
@@ -306,6 +316,8 @@ def run_build(bcfg: BuildConfig):
 
     losses = []
     t_start = time.perf_counter()
+    t_window_start = t_start
+    window_step_start = resume_step
     end_step = resume_step + bcfg.steps
 
     for step in range(resume_step, end_step):
@@ -407,7 +419,18 @@ def run_build(bcfg: BuildConfig):
         log_this = (step % bcfg.log_every == 0 or step == end_step - 1
                     or (step < 100 and step % 10 == 0))
         if log_this:
+            t_now = time.perf_counter()
+            window_steps = (step + 1) - window_step_start  # steps [window_start, step] inclusive
+            dt = t_now - t_window_start
+            if window_steps > 0 and dt > 0:
+                tok_per_sec = window_steps * bcfg.seq_len / dt
+            else:
+                tok_per_sec = 0.0
+            t_window_start = t_now
+            window_step_start = step + 1  # next window starts after this step
             msg = f"  step {step:5d}  loss={loss:.4f}  ppl={ppl:.1f}"
+            if tok_per_sec > 0:
+                msg += f"  tok/s={tok_per_sec:.0f}"
             if g_norm > 0:
                 msg += f"  gnorm={g_norm:.4f}"
             if adamw_opt or use_adamw_gpu:

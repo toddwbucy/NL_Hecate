@@ -257,7 +257,7 @@ pub fn gpu_cms_forward(
             let (y_level, mem_cache) = gpu_memory_forward(
                 &params.levels[level], cfg, &embedded,
                 &mut context.memory[level],
-                s, d,
+                s, d, level,
             );
             y_per_level.push(y_level);
             memory_caches.push(Some(mem_cache));
@@ -365,6 +365,7 @@ fn gpu_memory_forward(
     context_m: &mut GpuBuf<f32>,   // [d*d] — updated with final M
     s: usize,
     d: usize,
+    level: usize,
 ) -> (GpuBuf<f32>, GpuMemoryCache) {
     let dd = d * d;
 
@@ -400,6 +401,7 @@ fn gpu_memory_forward(
     }
 
     let m_initial = context_m.slice(0, dd);
+    let m_norm_max = cfg.max_m_norm(level);
 
     match (cfg.checkpoint_interval, cfg.memory_rule) {
         // ── Full-trajectory paths (checkpoint_interval=None, current behavior) ──
@@ -412,6 +414,7 @@ fn gpu_memory_forward(
             );
             crate::dispatch::cuda_sync();
             copy_final_m(&m_states, context_m, s * dd, dd);
+            unsafe { crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d as i32, m_norm_max); }
             (y, GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states })
         }
         (None, MemoryRuleKind::TitansLMM) => {
@@ -427,6 +430,7 @@ fn gpu_memory_forward(
             );
             crate::dispatch::cuda_sync();
             copy_final_m(&m_states, context_m, s * dd, dd);
+            unsafe { crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d as i32, m_norm_max); }
             (y, GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states, s_states })
         }
         (None, MemoryRuleKind::HebbianRule) => {
@@ -438,6 +442,7 @@ fn gpu_memory_forward(
             );
             crate::dispatch::cuda_sync();
             copy_final_m(&m_states, context_m, s * dd, dd);
+            unsafe { crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d as i32, m_norm_max); }
             (y, GpuMemoryCache::Hebbian { k_mem, v_mem, q_mem, alpha, m_states })
         }
         // ── Checkpointed paths (checkpoint_interval=Some(c)) ──
@@ -451,6 +456,7 @@ fn gpu_memory_forward(
             );
             crate::dispatch::cuda_sync();
             copy_final_m(&m_checkpoints, context_m, (num_ckpt - 1) * dd, dd);
+            unsafe { crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d as i32, m_norm_max); }
             (y, GpuMemoryCache::DeltaCkpt { k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, checkpoint_interval: c })
         }
         (Some(c), MemoryRuleKind::TitansLMM) => {
@@ -467,6 +473,7 @@ fn gpu_memory_forward(
             );
             crate::dispatch::cuda_sync();
             copy_final_m(&m_checkpoints, context_m, (num_ckpt - 1) * dd, dd);
+            unsafe { crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d as i32, m_norm_max); }
             (y, GpuMemoryCache::TitansCkpt { k_mem, v_mem, q_mem, alpha, theta, eta, m_checkpoints, s_checkpoints, checkpoint_interval: c })
         }
         (Some(c), MemoryRuleKind::HebbianRule) => {
@@ -479,6 +486,7 @@ fn gpu_memory_forward(
             );
             crate::dispatch::cuda_sync();
             copy_final_m(&m_checkpoints, context_m, (num_ckpt - 1) * dd, dd);
+            unsafe { crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d as i32, m_norm_max); }
             (y, GpuMemoryCache::HebbianCkpt { k_mem, v_mem, q_mem, alpha, m_checkpoints, checkpoint_interval: c })
         }
         _ => panic!("GPU-resident forward only supports DeltaRule, TitansLMM, HebbianRule. Got {:?}", cfg.memory_rule),
@@ -765,7 +773,7 @@ pub fn gpu_prefill_forward(
             let (y_level, _mem_cache) = gpu_memory_forward(
                 &params.levels[level], cfg, &embedded,
                 &mut context.memory[level],
-                s, d,
+                s, d, level,
             );
             y_per_level.push(y_level);
         } else {
@@ -953,7 +961,7 @@ pub fn gpu_single_token_forward(
             let (y_level, _mem_cache) = gpu_memory_forward(
                 &params.levels[level], cfg, &ws.embedded,
                 &mut context.memory[level],
-                1, d,
+                1, d, level,
             );
             y_per_level.push(y_level);
         } else {

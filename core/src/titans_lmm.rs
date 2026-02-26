@@ -43,6 +43,8 @@ pub struct TitansLMM {
     /// Per-level theta floor/ceil (CS-39 training wheels). 0.0/MAX = no clamp.
     pub theta_floor: f32,
     pub theta_ceil: f32,
+    /// M Frobenius norm ceiling (straight-through). f32::MAX = disabled.
+    pub m_norm_max: f32,
 }
 
 impl TitansLMM {
@@ -55,6 +57,7 @@ impl TitansLMM {
             momentum_d_hidden: 0,
             theta_floor: 0.0,
             theta_ceil: f32::MAX,
+            m_norm_max: f32::MAX,
         }
     }
     /// Construct from MAGConfig fields for a specific CMS level.
@@ -67,6 +70,7 @@ impl TitansLMM {
             momentum_d_hidden: cfg.momentum_d_hidden,
             theta_floor: cfg.theta_floor.get(level).copied().unwrap_or(0.0),
             theta_ceil: cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX),
+            m_norm_max: cfg.max_m_norm(level),
         }
     }
     /// Construct from MAGConfig fields (backward compat — no level clamp).
@@ -321,6 +325,17 @@ impl MemoryRule for TitansLMM {
             l2_apply_retention(&mut m_states[m_next_off..m_next_off + d * d], 1.0 - alpha[t]);
             for i in 0..(d * d) {
                 m_states[m_next_off + i] += s_states[s_next_off + i];
+            }
+
+            // M-norm clamp (straight-through) — prevents memory divergence
+            if self.m_norm_max < f32::MAX {
+                let slice = &mut m_states[m_next_off..m_next_off + d * d];
+                let norm_sq: f32 = slice.iter().map(|x| x * x).sum();
+                let norm = norm_sq.sqrt();
+                if norm > self.m_norm_max {
+                    let scale = self.m_norm_max / norm;
+                    for x in slice.iter_mut() { *x *= scale; }
+                }
             }
 
             // y_t = M_{t+1} @ q_t
@@ -816,7 +831,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = TitansLMM { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0, theta_floor: 0.0, theta_ceil: f32::MAX };
+        let rule = TitansLMM { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0, theta_floor: 0.0, theta_ceil: f32::MAX, m_norm_max: f32::MAX };
         let (y, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for (i, &v) in y.iter().enumerate() {
             assert!(v.is_finite(), "L1 y[{i}] not finite: {v}");
@@ -828,7 +843,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = TitansLMM { bias: crate::model::AttentionalBias::Lp(3.0), sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0, theta_floor: 0.0, theta_ceil: f32::MAX };
+        let rule = TitansLMM { bias: crate::model::AttentionalBias::Lp(3.0), sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0, theta_floor: 0.0, theta_ceil: f32::MAX, m_norm_max: f32::MAX };
         let (y, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for (i, &v) in y.iter().enumerate() {
             assert!(v.is_finite(), "Lp(3) y[{i}] not finite: {v}");
@@ -840,7 +855,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = TitansLMM { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0, theta_floor: 0.0, theta_ceil: f32::MAX };
+        let rule = TitansLMM { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0, theta_floor: 0.0, theta_ceil: f32::MAX, m_norm_max: f32::MAX };
         let (y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let d_y = vec![1.0f32; y.len()];
         let (grads, d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
@@ -894,6 +909,7 @@ mod tests {
             momentum_d_hidden: 0,
             theta_floor: 0.0,
             theta_ceil: f32::MAX,
+            m_norm_max: f32::MAX,
         };
         let (y_delta, cache_delta) = delta_rule.step(&params.levels[0], &embedded, s, d, None);
 
@@ -928,6 +944,7 @@ mod tests {
             momentum_d_hidden: 4 * d,
             theta_floor: 0.0,
             theta_ceil: f32::MAX,
+            m_norm_max: f32::MAX,
         };
         let (y_deep, cache_deep) = deep_rule.step(&params.levels[0], &embedded, s, d, None);
 

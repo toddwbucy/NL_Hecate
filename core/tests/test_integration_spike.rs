@@ -76,6 +76,7 @@ fn spike_config_a() -> MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
         intermediate_size: 0,
+        m_norm_max: vec![],
     }
 }
 
@@ -116,6 +117,7 @@ fn spike_config_b() -> MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
         intermediate_size: 0,
+        m_norm_max: vec![],
     }
 }
 
@@ -156,6 +158,7 @@ fn spike_config_c() -> MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
         intermediate_size: 0,
+        m_norm_max: vec![],
     }
 }
 
@@ -724,6 +727,7 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
             }
         };
 
+    let d_model = swa.d_model;
     MAGConfig {
         swa,
         memory_enabled: true,
@@ -764,7 +768,8 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
             theta_floor: vec![],
             theta_ceil: vec![],
         // SwiGluMlp requires intermediate_size > 0; other rules don't use it.
-        intermediate_size: if rule == MemoryRuleKind::SwiGluMlp { 4 * swa.d_model } else { 0 },
+        intermediate_size: if rule == MemoryRuleKind::SwiGluMlp { 4 * d_model } else { 0 },
+        m_norm_max: vec![],
     }
 }
 
