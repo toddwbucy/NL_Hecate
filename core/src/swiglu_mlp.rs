@@ -394,14 +394,14 @@ impl OpaqueVjp for SwiGluMlp {
     ) -> (Vec<f32>, BufId, BufId, BufId) {
         let inter = self.intermediate_size;
 
-        // Run forward
-        let (y, cache) = self.step_cpu(level_params, embedded, seq_len, d);
+        // Run forward — dispatch to CUDA when available; step_cpu is fatal at d=2048
+        let (y, cache) = self.step(level_params, embedded, seq_len, d, None::<Vec<f32>>);
 
         // Allocate input IDs for embedded + level_params (will receive gradients)
         let emb_in = tape.alloc(embedded.to_vec(), vec![seq_len, d]);
 
         // Flatten gate_proj, up_proj, down_proj into a single level_params buffer
-        let mut lp_flat = Vec::with_capacity(inter * d * 3 + d * inter);
+        let mut lp_flat = Vec::with_capacity(3 * inter * d);
         lp_flat.extend_from_slice(&level_params.gate_proj);
         lp_flat.extend_from_slice(&level_params.up_proj);
         lp_flat.extend_from_slice(&level_params.down_proj);
@@ -427,9 +427,11 @@ impl OpaqueVjp for SwiGluMlp {
 
 /// Opaque backward adapter for SwiGluMlp.
 ///
-/// saved layout:
+/// saved layout (matches traced_active_level in traced_forward.rs):
 ///   saved[0] = [seq_len, d, inter]     metadata
-///   saved[1] = gate_proj ++ up_proj ++ down_proj  (lp_flat)
+///   saved[1] = lp_id buffer:  gate_proj ++ up_proj ++ down_proj
+///              (SwiGluMlp stores only its three projection matrices — no
+///               standard MemoryLevelParams prefix, unlike other rules)
 ///   saved[2] = embedded  [seq*d]
 ///   saved[3] = x         [seq*d]       (copy of embedded stored in cache)
 ///   saved[4] = gate_out  [seq*inter]
@@ -441,20 +443,49 @@ pub fn swiglu_opaque_backward(
     saved: &[&[f32]],
     d_inputs: &mut [Vec<f32>],
 ) {
+    // Fail-fast shape checks before touching any buffer.
+    assert_eq!(saved.len(), 8,
+        "swiglu_opaque_backward: expected 8 saved tensors, got {}", saved.len());
+    assert_eq!(d_outputs.len(), 1,
+        "swiglu_opaque_backward: expected 1 output gradient, got {}", d_outputs.len());
+
     let seq_len = saved[0][0] as usize;
     let d = saved[0][1] as usize;
     let inter = saved[0][2] as usize;
 
+    assert_eq!(d_outputs[0].len(), seq_len * d,
+        "swiglu_opaque_backward: d_outputs[0] len {} != seq_len*d {}", d_outputs[0].len(), seq_len * d);
+    assert_eq!(saved[2].len(), seq_len * d,
+        "swiglu_opaque_backward: saved[2] (embedded) len {} != seq_len*d {}", saved[2].len(), seq_len * d);
+
+    // lp_flat = [gate_proj | up_proj | down_proj] — no standard-fields prefix.
+    // record_on_tape stores only the three SwiGLU projection matrices.
     let lp_flat = saved[1];
-    let gate_proj = lp_flat[..inter * d].to_vec();
-    let up_proj = lp_flat[inter * d..2 * inter * d].to_vec();
-    let down_proj = lp_flat[2 * inter * d..2 * inter * d + d * inter].to_vec();
+    assert_eq!(
+        lp_flat.len(), 3 * inter * d,
+        "swiglu_opaque_backward: lp_flat len {} != 3*inter*d {}",
+        lp_flat.len(), 3 * inter * d
+    );
+    let gate_proj = lp_flat[0..inter * d].to_vec();
+    let up_proj   = lp_flat[inter * d..2 * inter * d].to_vec();
+    let down_proj = lp_flat[2 * inter * d..3 * inter * d].to_vec();
 
     // Reconstruct a minimal MemoryLevelParams with just the MLP fields
     let mut level_params = MemoryLevelParams::zeros_like(d);
     level_params.gate_proj = gate_proj;
     level_params.up_proj = up_proj;
     level_params.down_proj = down_proj;
+
+    assert_eq!(saved[3].len(), seq_len * d,
+        "swiglu_opaque_backward: saved[3] (x) len {} != seq_len*d {}", saved[3].len(), seq_len * d);
+    assert_eq!(saved[4].len(), seq_len * inter,
+        "swiglu_opaque_backward: saved[4] (gate_out) len {} != seq_len*inter {}", saved[4].len(), seq_len * inter);
+    assert_eq!(saved[5].len(), seq_len * inter,
+        "swiglu_opaque_backward: saved[5] (up_out) len {} != seq_len*inter {}", saved[5].len(), seq_len * inter);
+    assert_eq!(saved[6].len(), seq_len * inter,
+        "swiglu_opaque_backward: saved[6] (fused) len {} != seq_len*inter {}", saved[6].len(), seq_len * inter);
+    assert_eq!(saved[7].len(), seq_len * inter,
+        "swiglu_opaque_backward: saved[7] (gate_cache) len {} != seq_len*inter {}", saved[7].len(), seq_len * inter);
 
     let cache = SwiGluMlpCache {
         seq_len,
@@ -468,15 +499,25 @@ pub fn swiglu_opaque_backward(
     };
 
     let rule = SwiGluMlp { intermediate_size: inter };
+    // Dispatch to CUDA backward when compiled with cuda feature (uses cuBLAS).
+    // For large d (e.g. d=2048, inter=8192) this is critical — the CPU fallback
+    // uses naive O(m*k*n) matmul which is ~100x slower than cuBLAS at scale.
+    #[cfg(feature = "cuda")]
+    let (param_grads, d_embedded) = rule.step_backward_cuda(&level_params, &cache, d_outputs[0], saved[2]);
+    #[cfg(not(feature = "cuda"))]
     let (param_grads, d_embedded) = rule.step_backward_cpu(&level_params, &cache, d_outputs[0], saved[2]);
 
     // d_inputs[0] = d_embedded (flows to embedding lookup backward)
     d_inputs[0] = d_embedded;
-    // d_inputs[1] = flat level_params grads (gate_proj, up_proj, down_proj)
-    let mut lp_grads = Vec::with_capacity(inter * d * 2 + d * inter);
+
+    // d_inputs[1] must match lp_id buffer layout: [gate_proj | up_proj | down_proj].
+    // Size must equal saved[1].len() (checked by accumulate_grad).
+    let mut lp_grads = Vec::with_capacity(3 * inter * d);
     lp_grads.extend_from_slice(&param_grads.gate_proj);
     lp_grads.extend_from_slice(&param_grads.up_proj);
     lp_grads.extend_from_slice(&param_grads.down_proj);
+    assert_eq!(lp_grads.len(), saved[1].len(),
+        "swiglu_opaque_backward: lp_grads len {} != saved[1] len {}", lp_grads.len(), saved[1].len());
     d_inputs[1] = lp_grads;
 }
 

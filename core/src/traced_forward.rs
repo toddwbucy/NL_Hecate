@@ -1053,8 +1053,10 @@ fn traced_active_level(
             //   saved[6] = fused_id
             //   saved[7] = gate_cache_id
             let inter = cfg.intermediate_size;
-            let (y, cache) = SwiGluMlp { intermediate_size: inter }
-                .step_cpu(level_params, embedded, s, d);
+            let rule = SwiGluMlp { intermediate_size: inter };
+            // Use trait step() which dispatches to CUDA when built with the cuda feature.
+            // Calling step_cpu() directly is fatal at d=2048 (17B ops per naive matmul).
+            let (y, cache) = rule.step(level_params, embedded, s, d, None::<Vec<f32>>);
 
             let meta_id = tape.alloc(vec![s as f32, d as f32, inter as f32], vec![]);
             let emb_saved = tape.alloc(embedded.to_vec(), vec![s, d]);
