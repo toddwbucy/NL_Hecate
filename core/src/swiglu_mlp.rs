@@ -429,12 +429,9 @@ impl OpaqueVjp for SwiGluMlp {
 ///
 /// saved layout (matches traced_active_level in traced_forward.rs):
 ///   saved[0] = [seq_len, d, inter]     metadata
-///   saved[1] = lp_id buffer:  standard_fields ++ gate_proj ++ up_proj ++ down_proj
-///              standard_fields = level_params_to_flat output (no MLP projections):
-///                w_k_mem(d²) + w_v_mem(d²) + w_q_mem(d²) +
-///                w_alpha(2d) + b_alpha(1) + w_theta(2d) + b_theta(1) +
-///                w_eta(2d) + b_eta(1) + w_omega(2d²)
-///                = 5d² + 6d + 3  (no freq/conv fields for SwiGluMlp)
+///   saved[1] = lp_id buffer:  gate_proj ++ up_proj ++ down_proj
+///              (SwiGluMlp stores only its three projection matrices — no
+///               standard MemoryLevelParams prefix, unlike other rules)
 ///   saved[2] = embedded  [seq*d]
 ///   saved[3] = x         [seq*d]       (copy of embedded stored in cache)
 ///   saved[4] = gate_out  [seq*inter]
@@ -450,15 +447,17 @@ pub fn swiglu_opaque_backward(
     let d = saved[0][1] as usize;
     let inter = saved[0][2] as usize;
 
-    // Standard-fields prefix size in lp_flat (SwiGluMlp has no freq/conv fields).
-    // Layout matches level_params_to_flat: w_{k,v,q}_mem(d²×3) + w_{alpha,theta,eta}(2d×3) +
-    // b_{alpha,theta,eta}(1×3) + w_omega(2d²) = 5d² + 6d + 3.
-    let std_offset = 5 * d * d + 6 * d + 3;
-
+    // lp_flat = [gate_proj | up_proj | down_proj] — no standard-fields prefix.
+    // record_on_tape stores only the three SwiGLU projection matrices.
     let lp_flat = saved[1];
-    let gate_proj = lp_flat[std_offset..std_offset + inter * d].to_vec();
-    let up_proj   = lp_flat[std_offset + inter * d..std_offset + 2 * inter * d].to_vec();
-    let down_proj = lp_flat[std_offset + 2 * inter * d..std_offset + 3 * inter * d].to_vec();
+    debug_assert!(
+        lp_flat.len() >= 3 * inter * d,
+        "swiglu_opaque_backward: lp_flat too short: {} < {}",
+        lp_flat.len(), 3 * inter * d
+    );
+    let gate_proj = lp_flat[0..inter * d].to_vec();
+    let up_proj   = lp_flat[inter * d..2 * inter * d].to_vec();
+    let down_proj = lp_flat[2 * inter * d..3 * inter * d].to_vec();
 
     // Reconstruct a minimal MemoryLevelParams with just the MLP fields
     let mut level_params = MemoryLevelParams::zeros_like(d);
@@ -489,10 +488,9 @@ pub fn swiglu_opaque_backward(
     // d_inputs[0] = d_embedded (flows to embedding lookup backward)
     d_inputs[0] = d_embedded;
 
-    // d_inputs[1] must match lp_id buffer layout: zero-pad the standard-fields
-    // prefix, then append gate_proj/up_proj/down_proj gradients.
+    // d_inputs[1] must match lp_id buffer layout: [gate_proj | up_proj | down_proj].
     // Size must equal saved[1].len() (checked by accumulate_grad).
-    let mut lp_grads = vec![0.0f32; std_offset];
+    let mut lp_grads = Vec::with_capacity(3 * inter * d);
     lp_grads.extend_from_slice(&param_grads.gate_proj);
     lp_grads.extend_from_slice(&param_grads.up_proj);
     lp_grads.extend_from_slice(&param_grads.down_proj);
