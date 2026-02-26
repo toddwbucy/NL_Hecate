@@ -55,8 +55,10 @@ struct LevelState {
     ///        w_theta(5), b_theta(6), w_eta(7), b_eta(8), w_omega(9),
     ///        w_freq(10), b_freq(11), w_k_conv(12), b_k_conv(13),
     ///        w_q_conv(14), b_q_conv(15), m_k_init(16), m_v_init(17),
-    ///        m_q_init(18), m_eta_init(19), m_alpha_init(20), m_mem_init(21).
+    ///        m_q_init(18), m_eta_init(19), m_alpha_init(20), m_mem_init(21),
+    ///        gate_proj(22), up_proj(23), down_proj(24).
     /// Zero-length fields produce zero-length MomentBufs (no cost).
+    /// Non-SwiGluMlp levels have empty gate/up/down proj → bufs 22-24 are zero-length.
     bufs: Vec<MomentBuf>,
     /// Number of times this level has actually fired (for bias correction).
     level_step: u32,
@@ -159,6 +161,9 @@ impl FrequencyAwareAdamW {
                 MomentBuf::zeros(lp.m_eta_init.len()),   // 19: self-ref learning rate init
                 MomentBuf::zeros(lp.m_alpha_init.len()), // 20: self-ref retention init
                 MomentBuf::zeros(lp.m_mem_init.len()),   // 21: self-ref main memory init
+                MomentBuf::zeros(lp.gate_proj.len()),    // 22: SwiGluMlp gate projection
+                MomentBuf::zeros(lp.up_proj.len()),      // 23: SwiGluMlp up projection
+                MomentBuf::zeros(lp.down_proj.len()),    // 24: SwiGluMlp down projection
             ],
             level_step: 0,
         }).collect();
@@ -225,6 +230,9 @@ impl FrequencyAwareAdamW {
                 for g in lg.m_eta_init.iter() { norm_sq += (*g as f64) * (*g as f64); }
                 for g in lg.m_alpha_init.iter() { norm_sq += (*g as f64) * (*g as f64); }
                 for g in lg.m_mem_init.iter() { norm_sq += (*g as f64) * (*g as f64); }
+                for g in lg.gate_proj.iter() { norm_sq += (*g as f64) * (*g as f64); }
+                for g in lg.up_proj.iter() { norm_sq += (*g as f64) * (*g as f64); }
+                for g in lg.down_proj.iter() { norm_sq += (*g as f64) * (*g as f64); }
             }
             // Agg grads
             for g in grads.alpha_mem.iter() { norm_sq += (*g as f64) * (*g as f64); }
@@ -264,6 +272,9 @@ impl FrequencyAwareAdamW {
                     for g in lg.m_eta_init.iter_mut() { *g *= scale; }
                     for g in lg.m_alpha_init.iter_mut() { *g *= scale; }
                     for g in lg.m_mem_init.iter_mut() { *g *= scale; }
+                    for g in lg.gate_proj.iter_mut() { *g *= scale; }
+                    for g in lg.up_proj.iter_mut() { *g *= scale; }
+                    for g in lg.down_proj.iter_mut() { *g *= scale; }
                 }
                 for g in grads.alpha_mem.iter_mut() { *g *= scale; }
                 for g in grads.alpha_refl.iter_mut() { *g *= scale; }
@@ -329,7 +340,10 @@ impl FrequencyAwareAdamW {
                 (lp.m_q_init.as_mut_slice(), lg.m_q_init.as_slice()),     // 18
                 (lp.m_eta_init.as_mut_slice(), lg.m_eta_init.as_slice()), // 19
                 (lp.m_alpha_init.as_mut_slice(), lg.m_alpha_init.as_slice()), // 20
-                (lp.m_mem_init.as_mut_slice(), lg.m_mem_init.as_slice()), // 21
+                (lp.m_mem_init.as_mut_slice(), lg.m_mem_init.as_slice()),   // 21
+                (lp.gate_proj.as_mut_slice(), lg.gate_proj.as_slice()),     // 22: SwiGluMlp gate
+                (lp.up_proj.as_mut_slice(), lg.up_proj.as_slice()),         // 23: SwiGluMlp up
+                (lp.down_proj.as_mut_slice(), lg.down_proj.as_slice()),     // 24: SwiGluMlp down
             ];
             for (idx, (p, g)) in level_pairs.into_iter().enumerate() {
                 let buf = &mut ls.bufs[idx];
@@ -531,9 +545,9 @@ mod tests {
         let pulse = Pulse { global_step: 0, active_levels: vec![true, true] };
         let mut opt = FrequencyAwareAdamW::new(&params, AdamWConfig::default());
 
-        // Verify 22 bufs per level (16 core + 6 m_*_init)
-        assert_eq!(opt.levels[0].bufs.len(), 22);
-        assert_eq!(opt.levels[1].bufs.len(), 22);
+        // Verify 25 bufs per level (16 core + 6 m_*_init + 3 SwiGluMlp projections)
+        assert_eq!(opt.levels[0].bufs.len(), 25);
+        assert_eq!(opt.levels[1].bufs.len(), 25);
 
         // w_eta (buf 7) should have same len as the param
         assert_eq!(opt.levels[0].bufs[7].m.len(), params.levels[0].w_eta.len());

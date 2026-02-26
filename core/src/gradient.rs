@@ -347,7 +347,21 @@ pub fn tape_compute_gradients(
         let mut level_grads = Vec::with_capacity(cfg.k);
         for level in 0..cfg.k {
             let lp_grad_flat = tape.get_param_grad(param_ids.level_params[level]);
-            let mut lp_grad = level_params_from_flat(&lp_grad_flat, d, cfg.kernel_size);
+            // SwiGluMlp: lp_flat layout is standard_fields ++ gate_proj ++ up_proj ++ down_proj.
+            // The standard auto-detection in level_params_from_flat misidentifies the
+            // MLP projection data as conv1d weights (49152 = 2*d*(ks+1) for ks=383).
+            // Slice off the standard prefix and extract MLP grads explicitly.
+            let mut lp_grad = if cfg.memory_rule == crate::model::MemoryRuleKind::SwiGluMlp {
+                let inter = cfg.intermediate_size;
+                let std_size = 5 * d * d + 6 * d + 3; // standard fields, no freq/conv
+                let mut lp = level_params_from_flat(&lp_grad_flat[..std_size], d, 0);
+                lp.gate_proj = lp_grad_flat[std_size..std_size + inter * d].to_vec();
+                lp.up_proj   = lp_grad_flat[std_size + inter * d..std_size + 2 * inter * d].to_vec();
+                lp.down_proj = lp_grad_flat[std_size + 2 * inter * d..std_size + 3 * inter * d].to_vec();
+                lp
+            } else {
+                level_params_from_flat(&lp_grad_flat, d, cfg.kernel_size)
+            };
 
             // For frozen levels, the w_q_mem was registered as a separate param.
             // Merge its gradient into the level's w_q_mem field.

@@ -13,6 +13,13 @@
 // Grid=ceil(n/256), Block=256. One thread per parameter.
 // Bias correction factors are precomputed on host and passed as args
 // to avoid per-thread powf() calls.
+//
+// Source: HOPE (2512.24695) §4.1-4.2, §6 Eq 71; Loshchilov & Hutter 2019.
+// Constraint: CS-27, CS-28 — this kernel is intentionally frequency-agnostic.
+//   It executes the AdamW update math for a single parameter buffer.
+//   CMS frequency scheduling (which levels fire, when) is the caller's
+//   responsibility — enforced by FrequencyAwareAdamW in adamw.rs.
+//   Do not call this kernel directly except through that integration layer.
 
 #include <cuda_runtime.h>
 #include <math.h>
