@@ -925,6 +925,11 @@ pub fn hebbian_backward_dispatch(
 /// dispatches through separate DGD CUDA kernels to allow future
 /// bias-agnostic divergence (CS-33).
 ///
+/// Note: `m_norm_max` is intentionally omitted. DGD shares recurrence with
+/// Delta Rule at L2 bias; if DGD behavior diverges in the future, revisit
+/// this API at that point. For now, clamping is handled by the standalone
+/// `m_norm_clamp_f32_cuda` called once per level after the forward pass.
+///
 /// Returns (m_states, y) where m_states is [(seq_len+1)*d*d] and y is [seq_len*d].
 pub fn dgd_forward_dispatch(
     k_mem: &[f32],
@@ -989,6 +994,22 @@ pub fn dgd_backward_dispatch(
 // ── Rust reference inner loops ──────────────────────────────────────
 // Always compiled. Used as fallback when CUDA is absent or force_rust_reference() is set.
 
+/// Clamp M-state slice to Frobenius norm ceiling (straight-through).
+///
+/// Straight-through: the clamp Jacobian is treated as identity during backward,
+/// which is the standard practice for gradient clipping (same as CS-39/CS-44).
+/// No-op when m_norm_max is 0.0 or f32::MAX (disabled).
+#[inline]
+fn clamp_m_norm(slice: &mut [f32], m_norm_max: f32) {
+    if m_norm_max > 0.0 && m_norm_max < f32::MAX {
+        let norm = slice.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > m_norm_max {
+            let scale = m_norm_max / norm;
+            for x in slice.iter_mut() { *x *= scale; }
+        }
+    }
+}
+
 /// Rust reference Delta Rule forward inner loop.
 fn rust_delta_forward(
     k_mem: &[f32], v_mem: &[f32], q_mem: &[f32],
@@ -1025,15 +1046,7 @@ fn rust_delta_forward(
             }
         }
 
-        // M-norm clamp (straight-through) — prevents memory divergence
-        if m_norm_max > 0.0 && m_norm_max < f32::MAX {
-            let slice = &mut m_states[m_next..m_next + dd];
-            let norm = slice.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if norm > m_norm_max {
-                let scale = m_norm_max / norm;
-                for x in slice.iter_mut() { *x *= scale; }
-            }
-        }
+        clamp_m_norm(&mut m_states[m_next..m_next + dd], m_norm_max);
 
         // y = M_{t+1} @ q
         for i in 0..d {
@@ -1184,15 +1197,7 @@ fn rust_titans_forward(
             m_states[m_next + i] = retention * m_states[m_t + i] + s_states[s_next + i];
         }
 
-        // M-norm clamp (straight-through) — prevents memory divergence
-        if m_norm_max > 0.0 && m_norm_max < f32::MAX {
-            let slice = &mut m_states[m_next..m_next + dd];
-            let norm = slice.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if norm > m_norm_max {
-                let scale = m_norm_max / norm;
-                for x in slice.iter_mut() { *x *= scale; }
-            }
-        }
+        clamp_m_norm(&mut m_states[m_next..m_next + dd], m_norm_max);
 
         // y = M_{t+1} @ q
         for i in 0..d {
@@ -1342,15 +1347,7 @@ fn rust_hebbian_forward(
             }
         }
 
-        // M-norm clamp (straight-through) — prevents memory divergence
-        if m_norm_max > 0.0 && m_norm_max < f32::MAX {
-            let slice = &mut m_states[m_next..m_next + dd];
-            let norm = slice.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if norm > m_norm_max {
-                let scale = m_norm_max / norm;
-                for x in slice.iter_mut() { *x *= scale; }
-            }
-        }
+        clamp_m_norm(&mut m_states[m_next..m_next + dd], m_norm_max);
 
         // y = M_{t+1} @ q
         for i in 0..d {
