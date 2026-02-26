@@ -32,6 +32,7 @@
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <mutex>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -106,9 +107,12 @@ static struct {
                 nullptr, nullptr, nullptr, nullptr,
                 0, 0, 0};
 
+static std::mutex g_bwd_pool_mutex;
+
 // Ensure the persistent buffer pool is allocated for the given dimensions.
 // Frees and re-allocates if dimensions changed (only happens during config changes).
 static void ensure_bwd_pool(int d, int inter, int seq_len) {
+    std::lock_guard<std::mutex> lock(g_bwd_pool_mutex);
     if (g_bwd_pool.ddY != nullptr
             && g_bwd_pool.d == d
             && g_bwd_pool.inter == inter

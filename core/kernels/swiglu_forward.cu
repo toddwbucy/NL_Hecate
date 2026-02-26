@@ -32,6 +32,7 @@
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <mutex>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -87,9 +88,12 @@ static struct {
 } g_fwd_pool = {nullptr, nullptr, nullptr, nullptr, nullptr,
                 nullptr, nullptr, nullptr, nullptr, 0, 0, 0};
 
+static std::mutex g_fwd_pool_mutex;
+
 // Ensure the persistent buffer pool is allocated for the given dimensions.
 // Frees and re-allocates if dimensions changed (only happens during config changes).
 static void ensure_fwd_pool(int d, int inter, int seq_len) {
+    std::lock_guard<std::mutex> lock(g_fwd_pool_mutex);
     if (g_fwd_pool.dGateProj != nullptr
             && g_fwd_pool.d == d
             && g_fwd_pool.inter == inter
@@ -250,5 +254,5 @@ extern "C" void swiglu_forward_f32_cuda(
     check_cuda(cudaMemcpy(up_buf,   g_fwd_pool.dUpBuf,    szBuf, cudaMemcpyDeviceToHost), "D2H up_buf");
     check_cuda(cudaMemcpy(fused_buf,g_fwd_pool.dFusedBuf, szBuf, cudaMemcpyDeviceToHost), "D2H fused_buf");
     check_cuda(cudaMemcpy(cache_buf,g_fwd_pool.dCacheBuf, szBuf, cudaMemcpyDeviceToHost), "D2H cache_buf");
-    // Note: dGateProj, dUpProj, dDownProj remain on device (reused by backward)
+    // Note: weights remain in g_fwd_pool on device; backward has its own pool (swiglu_backward.cu)
 }
