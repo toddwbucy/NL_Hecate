@@ -54,7 +54,7 @@ fn test_mag_with_cuda_delta_inner_loop() {
     delta_forward_dispatch(
         &delta_cache.k_mem, &delta_cache.v_mem, &delta_cache.q_mem,
         &delta_cache.alpha, &delta_cache.theta, &m_initial,
-        &mut m_cuda, &mut y_cuda, seq_len, d);
+        &mut m_cuda, &mut y_cuda, seq_len, d, f32::MAX);
 
     // Compare: CUDA inner loop should match Rust inner loop from MAG
     check_close("mag_delta_y", &delta_cache.y, &y_cuda, 1e-5);
@@ -99,7 +99,7 @@ fn test_cms_k2_cuda_delta_level0() {
     delta_forward_dispatch(
         &delta_cache.k_mem, &delta_cache.v_mem, &delta_cache.q_mem,
         &delta_cache.alpha, &delta_cache.theta, &m_initial,
-        &mut m_cuda, &mut y_cuda, seq_len, d);
+        &mut m_cuda, &mut y_cuda, seq_len, d, f32::MAX);
 
     check_close("cms_k2_l0_y", &delta_cache.y, &y_cuda, 1e-5);
     check_close("cms_k2_l0_m", &delta_cache.m_states, &m_cuda, 1e-5);
@@ -179,7 +179,7 @@ fn test_mal_with_cuda_titans_inner_loop() {
         &titans_cache.k_mem, &titans_cache.v_mem, &titans_cache.q_mem,
         &titans_cache.alpha, &titans_cache.theta, &titans_cache.eta,
         &m_initial, &s_initial,
-        &mut m_cuda, &mut s_cuda, &mut y_cuda, seq_len, d);
+        &mut m_cuda, &mut s_cuda, &mut y_cuda, seq_len, d, f32::MAX);
 
     check_close("mal_titans_y", &titans_cache.y, &y_cuda, 1e-5);
     check_close("mal_titans_m", &titans_cache.m_states, &m_cuda, 1e-5);
@@ -223,7 +223,7 @@ fn test_cuda_rust_loss_parity_mag_delta() {
     delta_forward_dispatch(
         &delta_cache.k_mem, &delta_cache.v_mem, &delta_cache.q_mem,
         &delta_cache.alpha, &delta_cache.theta, &m_initial,
-        &mut m_cuda, &mut y_cuda, seq_len, d);
+        &mut m_cuda, &mut y_cuda, seq_len, d, f32::MAX);
 
     check_close("parity_y_step50", &delta_cache.y, &y_cuda, 1e-5);
     eprintln!("  Loss: {loss_0:.4} -> {loss_50:.4} (50 steps) ✓");

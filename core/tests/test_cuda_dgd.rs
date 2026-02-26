@@ -543,7 +543,7 @@ fn test_cuda_dgd_matches_delta_dispatch() {
     let mut y_delta = vec![0.0f32; seq_len * d];
     delta_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_initial,
-        &mut m_delta, &mut y_delta, seq_len, d);
+        &mut m_delta, &mut y_delta, seq_len, d, f32::MAX);
 
     check_close("dgd_vs_delta_y", &y_dgd, &y_delta, 1e-5);
     check_close("dgd_vs_delta_m", &m_dgd, &m_delta, 1e-5);

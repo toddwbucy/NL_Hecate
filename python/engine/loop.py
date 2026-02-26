@@ -215,8 +215,8 @@ def run_build(bcfg: BuildConfig):
         print(f"  Donor:    {bcfg.donor_weights}")
     if bcfg.theta_floor is not None or bcfg.theta_ceil is not None:
         print(f"  θ clamps: floor={bcfg.theta_floor}, ceil={bcfg.theta_ceil}")
-    if bcfg.m_norm_max is not None:
-        print(f"  M-norm:   max={bcfg.m_norm_max}")
+    if len(cfg.m_norm_max) > 0:
+        print(f"  M-norm:   max={list(cfg.m_norm_max)}")
     print(f"  Params:   {params.num_params():,}")
     data_len = len(bpe_loader) if use_bpe else len(token_ids)
     print(f"  Data:     {data_len:,} tokens" +

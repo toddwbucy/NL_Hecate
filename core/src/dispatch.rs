@@ -728,6 +728,7 @@ pub fn delta_forward_dispatch(
     y: &mut [f32],
     seq_len: usize,
     d: usize,
+    m_norm_max: f32,
 ) {
     #[cfg(feature = "cuda")]
     {
@@ -738,7 +739,7 @@ pub fn delta_forward_dispatch(
         }
     }
     rust_delta_forward(k_mem, v_mem, q_mem, alpha, theta, m_initial,
-                       m_states, y, seq_len, d, f32::MAX);
+                       m_states, y, seq_len, d, m_norm_max);
 }
 
 /// Delta Rule backward inner loop dispatch.
@@ -792,6 +793,7 @@ pub fn titans_forward_dispatch(
     y: &mut [f32],
     seq_len: usize,
     d: usize,
+    m_norm_max: f32,
 ) {
     #[cfg(feature = "cuda")]
     {
@@ -804,7 +806,7 @@ pub fn titans_forward_dispatch(
     }
     rust_titans_forward(k_mem, v_mem, q_mem, alpha, theta, eta,
                         m_initial, s_initial, m_states, s_states, y,
-                        seq_len, d, f32::MAX);
+                        seq_len, d, m_norm_max);
 }
 
 /// Titans LMM backward inner loop dispatch.
@@ -1015,7 +1017,7 @@ fn rust_delta_forward(
         }
 
         // M-norm clamp (straight-through) — prevents memory divergence
-        if m_norm_max < f32::MAX {
+        if m_norm_max > 0.0 && m_norm_max < f32::MAX {
             let slice = &mut m_states[m_next..m_next + dd];
             let norm = slice.iter().map(|x| x * x).sum::<f32>().sqrt();
             if norm > m_norm_max {
@@ -1174,7 +1176,7 @@ fn rust_titans_forward(
         }
 
         // M-norm clamp (straight-through) — prevents memory divergence
-        if m_norm_max < f32::MAX {
+        if m_norm_max > 0.0 && m_norm_max < f32::MAX {
             let slice = &mut m_states[m_next..m_next + dd];
             let norm = slice.iter().map(|x| x * x).sum::<f32>().sqrt();
             if norm > m_norm_max {
@@ -1332,7 +1334,7 @@ fn rust_hebbian_forward(
         }
 
         // M-norm clamp (straight-through) — prevents memory divergence
-        if m_norm_max < f32::MAX {
+        if m_norm_max > 0.0 && m_norm_max < f32::MAX {
             let slice = &mut m_states[m_next..m_next + dd];
             let norm = slice.iter().map(|x| x * x).sum::<f32>().sqrt();
             if norm > m_norm_max {
