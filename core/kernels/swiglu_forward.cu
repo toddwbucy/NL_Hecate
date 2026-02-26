@@ -323,7 +323,12 @@ extern "C" void swiglu_forward_f32_cuda_dd(
 
     // SiLU gate fusion: fused = silu(gate) * up, save sigmoid in cache
     int block = 256;
-    int grid  = (int)((N + block - 1) / block);
+    size_t grid_sz = (N + (size_t)block - 1) / (size_t)block;
+    if (grid_sz > (size_t)INT_MAX) {
+        fprintf(stderr, "[NL_Hecate FATAL] swiglu_fwd_dd grid overflow: %zu\n", grid_sz);
+        abort();
+    }
+    int grid = (int)grid_sz;
     swiglu_fuse_kernel<<<grid, block>>>(
         gate_buf, up_buf, fused_buf, cache_buf, N);
     check_cuda(cudaGetLastError(), "swiglu_fuse_kernel dd launch");
