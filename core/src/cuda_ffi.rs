@@ -424,4 +424,53 @@ extern "C" {
         logits: *const f32, target_ids: *const i32, d_logits: *mut f32,
         seq_len: i32, vocab: i32, inv_count: f32,
     );
+
+    // ── SwiGLU MLP device-to-device kernels ────────────────────────────
+    // Zero-PCIe variants used in the GPU training path. All pointers are
+    // device memory. Caller provides pre-allocated GpuBuf<f32> buffers.
+    // No cudaDeviceSynchronize inside — caller syncs via dispatch::cuda_sync().
+
+    /// SwiGLU forward (device-to-device, no H2D/D2H, no persistent pool).
+    ///
+    /// X, gate_proj, up_proj, down_proj: device inputs.
+    /// Y: device output [seq_len × d_model].
+    /// gate_buf, up_buf, fused_buf, cache_buf: device scratch saved for backward.
+    pub(crate) fn swiglu_forward_f32_cuda_dd(
+        x: *const f32,
+        gate_proj: *const f32,
+        up_proj: *const f32,
+        down_proj: *const f32,
+        y: *mut f32,
+        gate_buf: *mut f32,
+        up_buf: *mut f32,
+        fused_buf: *mut f32,
+        cache_buf: *mut f32,
+        seq_len: i32,
+        d_model: i32,
+        intermediate: i32,
+    );
+
+    /// SwiGLU backward (device-to-device, no H2D/D2H).
+    ///
+    /// All forward activations (fused_buf, gate_buf, up_buf, cache_buf) are
+    /// device pointers from GpuMemoryCache::SwiGlu. Output grads
+    /// d_x, d_gate_proj, d_up_proj, d_down_proj written with beta=0 (fresh).
+    pub(crate) fn swiglu_backward_f32_cuda_dd(
+        d_y: *const f32,
+        x: *const f32,
+        gate_proj: *const f32,
+        up_proj: *const f32,
+        down_proj: *const f32,
+        fused_buf: *const f32,
+        gate_buf: *const f32,
+        up_buf: *const f32,
+        cache_buf: *const f32,
+        d_x: *mut f32,
+        d_gate_proj: *mut f32,
+        d_up_proj: *mut f32,
+        d_down_proj: *mut f32,
+        seq_len: i32,
+        d_model: i32,
+        intermediate: i32,
+    );
 }

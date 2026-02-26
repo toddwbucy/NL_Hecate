@@ -148,6 +148,13 @@ pub enum GpuMemoryCache {
         m_checkpoints: GpuBuf<f32>,  // [num_ckpt * d*d]
         checkpoint_interval: usize,
     },
+    /// SwiGLU MLP — no M state. All activations saved for weight grad computation.
+    SwiGlu {
+        gate_buf:  GpuBuf<f32>,   // [s × inter]
+        up_buf:    GpuBuf<f32>,   // [s × inter]
+        fused_buf: GpuBuf<f32>,   // [s × inter]
+        cache_buf: GpuBuf<f32>,   // [s × inter] sigmoid(gate_out)
+    },
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -252,7 +259,11 @@ pub fn gpu_cms_forward(
     let mut y_per_level = Vec::with_capacity(cfg.k);
 
     for level in 0..cfg.k {
-        if pulse.active_levels[level] {
+        // SwiGLU is always active regardless of pulse (no M state to update).
+        // Mirrors CPU path in mag.rs: let active = active || matches!(cfg.memory_rule, SwiGluMlp).
+        let effective_active = pulse.active_levels[level]
+            || matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp);
+        if effective_active {
             // Active level: compute projections, gates, and memory update on GPU.
             let (y_level, mem_cache) = gpu_memory_forward(
                 &params.levels[level], cfg, &embedded,
@@ -489,7 +500,29 @@ fn gpu_memory_forward(
             unsafe { crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d as i32, m_norm_max); }
             (y, GpuMemoryCache::HebbianCkpt { k_mem, v_mem, q_mem, alpha, m_checkpoints, checkpoint_interval: c })
         }
-        _ => panic!("GPU-resident forward only supports DeltaRule, TitansLMM, HebbianRule. Got {:?}", cfg.memory_rule),
+        // ── SwiGLU: stateless MLP, no M state, no m_norm_clamp ──────────
+        (_, MemoryRuleKind::SwiGluMlp) => {
+            let inter = cfg.intermediate_size;
+            let mut gate_buf  = GpuBuf::zeros(s * inter);
+            let mut up_buf    = GpuBuf::zeros(s * inter);
+            let mut fused_buf = GpuBuf::zeros(s * inter);
+            let mut cache_buf = GpuBuf::zeros(s * inter);
+            let mut y = GpuBuf::zeros(s * d);
+            unsafe {
+                crate::cuda_ffi::swiglu_forward_f32_cuda_dd(
+                    embedded.as_ptr(),
+                    level_params.gate_proj.as_ptr(),
+                    level_params.up_proj.as_ptr(),
+                    level_params.down_proj.as_ptr(),
+                    y.ptr(),
+                    gate_buf.ptr(), up_buf.ptr(), fused_buf.ptr(), cache_buf.ptr(),
+                    s as i32, d as i32, inter as i32,
+                );
+            }
+            // context_m is unused for SwiGLU (no M state) — not updated.
+            (y, GpuMemoryCache::SwiGlu { gate_buf, up_buf, fused_buf, cache_buf })
+        }
+        _ => panic!("GPU-resident forward only supports DeltaRule, TitansLMM, HebbianRule, DGD, SwiGluMlp. Got {:?}", cfg.memory_rule),
     }
 }
 

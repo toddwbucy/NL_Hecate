@@ -47,6 +47,11 @@ pub struct GpuLevelGrads {
     pub d_b_theta: GpuBuf<f32>,
     pub d_w_eta: GpuBuf<f32>,
     pub d_b_eta: GpuBuf<f32>,
+    // SwiGluMlp weight grads. zeros(1) for non-SwiGLU levels.
+    pub d_gate_proj: GpuBuf<f32>,
+    pub d_up_proj:   GpuBuf<f32>,
+    pub d_down_proj: GpuBuf<f32>,
+    pub has_mlp: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -77,6 +82,11 @@ impl GpuMAGGrads {
             lg.d_b_theta.copy_to_host(&mut lp.b_theta);
             lg.d_w_eta.copy_to_host(&mut lp.w_eta);
             lg.d_b_eta.copy_to_host(&mut lp.b_eta);
+            if lg.has_mlp {
+                lg.d_gate_proj.copy_to_host(&mut lp.gate_proj);
+                lg.d_up_proj.copy_to_host(&mut lp.up_proj);
+                lg.d_down_proj.copy_to_host(&mut lp.down_proj);
+            }
             // w_omega, m_*_init, w_freq, w_*_conv: not in GPU grads yet, stay zero
         }
 
@@ -86,7 +96,10 @@ impl GpuMAGGrads {
 
 #[cfg(feature = "cuda")]
 impl GpuLevelGrads {
-    fn zeros(d: usize) -> Self {
+    /// Allocate zero-initialized gradient buffers for one CMS level.
+    /// For SwiGLU levels, pass inter = cfg.intermediate_size.
+    /// For matrix rules (Delta/Titans/Hebbian/DGD), pass inter = 0.
+    fn zeros_mlp(d: usize, inter: usize) -> Self {
         GpuLevelGrads {
             d_w_k_mem: GpuBuf::zeros(d * d),
             d_w_v_mem: GpuBuf::zeros(d * d),
@@ -97,6 +110,10 @@ impl GpuLevelGrads {
             d_b_theta: GpuBuf::zeros(1),
             d_w_eta: GpuBuf::zeros(2 * d),
             d_b_eta: GpuBuf::zeros(1),
+            d_gate_proj: GpuBuf::zeros(if inter > 0 { inter * d } else { 1 }),
+            d_up_proj:   GpuBuf::zeros(if inter > 0 { inter * d } else { 1 }),
+            d_down_proj: GpuBuf::zeros(if inter > 0 { d * inter } else { 1 }),
+            has_mlp: inter > 0,
         }
     }
 }
@@ -133,7 +150,10 @@ pub fn gpu_cms_backward(
         d_w_v: GpuBuf::zeros(d * d),
         d_w_o: GpuBuf::zeros(d * d),
         d_w_unembed: GpuBuf::zeros(d * v),
-        levels: (0..cfg.k).map(|_| GpuLevelGrads::zeros(d)).collect(),
+        levels: {
+            let inter = if cfg.memory_rule == MemoryRuleKind::SwiGluMlp { cfg.intermediate_size } else { 0 };
+            (0..cfg.k).map(|_| GpuLevelGrads::zeros_mlp(d, inter)).collect()
+        },
     };
 
     // ── Stage 7: Cross-entropy backward ──────────────────────────────
@@ -451,6 +471,30 @@ fn gpu_memory_backward(
                 &d_alpha, &d_theta, None,
                 level_grads, s, d,
             )
+        }
+        // ── SwiGLU: stateless MLP, direct weight grads ───────────────
+        GpuMemoryCache::SwiGlu { gate_buf, up_buf, fused_buf, cache_buf } => {
+            let inter = cfg.intermediate_size;
+            let mut d_x = GpuBuf::zeros(s * d);
+            unsafe {
+                crate::cuda_ffi::swiglu_backward_f32_cuda_dd(
+                    d_y.as_ptr(),
+                    embedded.as_ptr(),
+                    level_params.gate_proj.as_ptr(),
+                    level_params.up_proj.as_ptr(),
+                    level_params.down_proj.as_ptr(),
+                    fused_buf.as_ptr(),
+                    gate_buf.as_ptr(),
+                    up_buf.as_ptr(),
+                    cache_buf.as_ptr(),
+                    d_x.ptr(),
+                    level_grads.d_gate_proj.ptr(),
+                    level_grads.d_up_proj.ptr(),
+                    level_grads.d_down_proj.ptr(),
+                    s as i32, d as i32, inter as i32,
+                );
+            }
+            d_x  // d_embedded contribution (accumulated into d_embedded_mem by caller)
         }
     }
 }

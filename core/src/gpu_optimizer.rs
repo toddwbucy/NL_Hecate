@@ -49,6 +49,11 @@ struct MomentLevel {
     /// Level-local step counter for per-level bias correction.
     /// Counts how many times this level has actually fired, not global steps.
     level_step: u32,
+    // SwiGluMlp moment buffers. zeros(1) for non-SwiGLU levels.
+    m_gate_proj: GpuBuf<f32>,  v_gate_proj: GpuBuf<f32>,
+    m_up_proj:   GpuBuf<f32>,  v_up_proj:   GpuBuf<f32>,
+    m_down_proj: GpuBuf<f32>,  v_down_proj: GpuBuf<f32>,
+    has_mlp: bool,
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -108,6 +113,13 @@ impl GpuAdamWState {
             m_b_eta: GpuBuf::zeros(lp.b_eta.len()),
             v_b_eta: GpuBuf::zeros(lp.b_eta.len()),
             level_step: 0,
+            m_gate_proj: GpuBuf::zeros(lp.gate_proj.len().max(1)),
+            v_gate_proj: GpuBuf::zeros(lp.gate_proj.len().max(1)),
+            m_up_proj:   GpuBuf::zeros(lp.up_proj.len().max(1)),
+            v_up_proj:   GpuBuf::zeros(lp.up_proj.len().max(1)),
+            m_down_proj: GpuBuf::zeros(lp.down_proj.len().max(1)),
+            v_down_proj: GpuBuf::zeros(lp.down_proj.len().max(1)),
+            has_mlp: lp.has_mlp,
         }).collect();
 
         // Max buffer for norm reduction: find largest param buffer across all weights.
@@ -122,6 +134,11 @@ impl GpuAdamWState {
                          &lp.w_alpha, &lp.b_alpha, &lp.w_theta, &lp.b_theta,
                          &lp.w_eta, &lp.b_eta] {
                 max_len = max_len.max(buf.len());
+            }
+            if lp.has_mlp {
+                for buf in [&lp.gate_proj, &lp.up_proj, &lp.down_proj] {
+                    max_len = max_len.max(buf.len());
+                }
             }
         }
         let max_partials = max_len / 256 + 1;
@@ -250,6 +267,19 @@ pub fn gpu_adamw_update(
                   lr, beta1, beta2, eps, lbc1_inv, lbc2_inv, weight_decay);
         adamw_one(&mut lp.b_eta, &lg.d_b_eta, &mut ml.m_b_eta, &mut ml.v_b_eta,
                   lr, beta1, beta2, eps, lbc1_inv, lbc2_inv, weight_decay);
+
+        // SwiGluMlp projection weights (Pulse-gated: same level step as matrix rules)
+        if ml.has_mlp {
+            adamw_one(&mut lp.gate_proj, &lg.d_gate_proj,
+                      &mut ml.m_gate_proj, &mut ml.v_gate_proj,
+                      lr, beta1, beta2, eps, lbc1_inv, lbc2_inv, weight_decay);
+            adamw_one(&mut lp.up_proj, &lg.d_up_proj,
+                      &mut ml.m_up_proj, &mut ml.v_up_proj,
+                      lr, beta1, beta2, eps, lbc1_inv, lbc2_inv, weight_decay);
+            adamw_one(&mut lp.down_proj, &lg.d_down_proj,
+                      &mut ml.m_down_proj, &mut ml.v_down_proj,
+                      lr, beta1, beta2, eps, lbc1_inv, lbc2_inv, weight_decay);
+        }
     }
 
     crate::dispatch::cuda_sync();
@@ -306,6 +336,11 @@ fn gpu_grad_norm(grads: &GpuMAGGrads, state: &mut GpuAdamWState) -> f32 {
         accum(&lg.d_b_theta);
         accum(&lg.d_w_eta);
         accum(&lg.d_b_eta);
+        if lg.has_mlp {
+            accum(&lg.d_gate_proj);
+            accum(&lg.d_up_proj);
+            accum(&lg.d_down_proj);
+        }
     }
 
     (total_sq).sqrt() as f32
@@ -340,6 +375,11 @@ fn gpu_scale_grads(grads: &mut GpuMAGGrads, scale: f32) {
         scale_buf(&mut lg.d_b_theta);
         scale_buf(&mut lg.d_w_eta);
         scale_buf(&mut lg.d_b_eta);
+        if lg.has_mlp {
+            scale_buf(&mut lg.d_gate_proj);
+            scale_buf(&mut lg.d_up_proj);
+            scale_buf(&mut lg.d_down_proj);
+        }
     }
 
     crate::dispatch::cuda_sync();

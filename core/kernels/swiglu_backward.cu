@@ -366,3 +366,142 @@ extern "C" void swiglu_backward_f32_cuda(
     check_cuda_bwd(cudaMemcpy(d_down_proj, g_bwd_pool.dDDownProj, szDown, cudaMemcpyDeviceToHost), "D2H d_down_proj");
     // Note: dGateProj, dUpProj, dDownProj remain on device (reused on next call)
 }
+
+// ── Device-to-device variant ───────────────────────────────────────────
+//
+// ALL pointers are DEVICE pointers (pre-allocated GpuBuf<f32> from Rust).
+// No pool allocation, no H2D/D2H copies, no cudaDeviceSynchronize.
+// Caller (gpu_backward.rs) provides caller-managed device buffers and syncs
+// via dispatch::cuda_sync() after gpu_cms_backward.
+// Reuses get_cublas_handle_bwd() — same shared handle, no new allocations.
+// Scratch buffers (dDFused, dDGateOut, dDUpOut) are allocated locally on device
+// for the duration of this call — these are small (seq × inter) intermediate grads.
+extern "C" void swiglu_backward_f32_cuda_dd(
+    const float* d_Y,          // device: [seq_len × d_model]   upstream gradient
+    const float* X,            // device: [seq_len × d_model]   input from forward
+    const float* gate_proj,    // device: [intermediate × d_model]
+    const float* up_proj,      // device: [intermediate × d_model]
+    const float* down_proj,    // device: [d_model × intermediate]
+    const float* fused_buf,    // device: [seq_len × intermediate] fused from forward
+    const float* gate_buf,     // device: [seq_len × intermediate] gate_out from forward
+    const float* up_buf,       // device: [seq_len × intermediate] up_out from forward
+    const float* cache_buf,    // device: [seq_len × intermediate] sigmoid from forward
+    float* d_X,                // device: [seq_len × d_model]   output grad
+    float* d_gate_proj,        // device: [intermediate × d_model] output grad
+    float* d_up_proj,          // device: [intermediate × d_model] output grad
+    float* d_down_proj,        // device: [d_model × intermediate] output grad
+    int seq_len,
+    int d_model,
+    int intermediate)
+{
+    if (seq_len <= 0 || d_model <= 0 || intermediate <= 0) {
+        fprintf(stderr,
+                "[NL_Hecate FATAL] swiglu_bwd_dd invalid dims: seq_len=%d d_model=%d intermediate=%d\n",
+                seq_len, d_model, intermediate);
+        abort();
+    }
+    cublasHandle_t h = get_cublas_handle_bwd();
+    const float alpha1 = 1.0f, beta0 = 0.0f, beta1 = 1.0f;
+
+    size_t szBuf = (size_t)seq_len * intermediate * sizeof(float);
+    size_t N     = (size_t)seq_len * intermediate;
+
+    // Allocate local scratch buffers for intermediate gradients
+    float* dDFused   = nullptr;
+    float* dDGateOut = nullptr;
+    float* dDUpOut   = nullptr;
+    check_cuda_bwd(cudaMalloc((void**)&dDFused,   szBuf), "alloc dDFused dd");
+    check_cuda_bwd(cudaMalloc((void**)&dDGateOut, szBuf), "alloc dDGateOut dd");
+    check_cuda_bwd(cudaMalloc((void**)&dDUpOut,   szBuf), "alloc dDUpOut dd");
+
+    // Step 1: d_fused = d_Y @ down_proj
+    check_cublas_bwd(
+        cublasSgemm(h,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            intermediate, seq_len, d_model,
+            &alpha1,
+            down_proj, intermediate,
+            d_Y, d_model,
+            &beta0,
+            dDFused, intermediate),
+        "d_fused dd");
+
+    // Step 2: d_down_proj = fused.T @ d_Y → [d_model × inter]
+    check_cublas_bwd(
+        cublasSgemm(h,
+            CUBLAS_OP_N, CUBLAS_OP_T,
+            intermediate, d_model, seq_len,
+            &alpha1,
+            fused_buf, intermediate,
+            d_Y, d_model,
+            &beta0,
+            d_down_proj, intermediate),
+        "d_down_proj dd");
+
+    // Step 3: elementwise backward through SiLU gate fusion
+    int block = 256;
+    size_t grid_sz = (N + (size_t)block - 1) / (size_t)block;
+    if (grid_sz > (size_t)INT_MAX) {
+        fprintf(stderr, "[NL_Hecate FATAL] swiglu_bwd_dd grid overflow: %zu\n", grid_sz);
+        abort();
+    }
+    int grid = (int)grid_sz;
+    swiglu_fuse_backward_kernel<<<grid, block>>>(
+        dDFused, gate_buf, up_buf, cache_buf,
+        dDGateOut, dDUpOut, N);
+    check_cuda_bwd(cudaGetLastError(), "swiglu_fuse_backward_kernel dd");
+
+    // Step 4: d_gate_proj = d_gate_out.T @ X → [inter × d_model]
+    check_cublas_bwd(
+        cublasSgemm(h,
+            CUBLAS_OP_N, CUBLAS_OP_T,
+            d_model, intermediate, seq_len,
+            &alpha1,
+            X, d_model,
+            dDGateOut, intermediate,
+            &beta0,
+            d_gate_proj, d_model),
+        "d_gate_proj dd");
+
+    // Step 5: d_up_proj = d_up_out.T @ X (same layout as d_gate_proj)
+    check_cublas_bwd(
+        cublasSgemm(h,
+            CUBLAS_OP_N, CUBLAS_OP_T,
+            d_model, intermediate, seq_len,
+            &alpha1,
+            X, d_model,
+            dDUpOut, intermediate,
+            &beta0,
+            d_up_proj, d_model),
+        "d_up_proj dd");
+
+    // Step 6a: d_X = d_gate_out @ gate_proj
+    check_cublas_bwd(
+        cublasSgemm(h,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            d_model, seq_len, intermediate,
+            &alpha1,
+            gate_proj, d_model,
+            dDGateOut, intermediate,
+            &beta0,
+            d_X, d_model),
+        "d_X = d_gate @ gate_proj dd");
+
+    // Step 6b: d_X += d_up_out @ up_proj  (beta=1 to accumulate)
+    check_cublas_bwd(
+        cublasSgemm(h,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            d_model, seq_len, intermediate,
+            &alpha1,
+            up_proj, d_model,
+            dDUpOut, intermediate,
+            &beta1,
+            d_X, d_model),
+        "d_X += d_up @ up_proj dd");
+
+    // Free local scratch buffers
+    cudaFree(dDFused);
+    cudaFree(dDGateOut);
+    cudaFree(dDUpOut);
+    // No cudaDeviceSynchronize — caller syncs via dispatch::cuda_sync()
+}
