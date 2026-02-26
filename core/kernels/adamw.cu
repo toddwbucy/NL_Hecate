@@ -23,6 +23,7 @@
 
 #include <cuda_runtime.h>
 #include <math.h>
+#include <stdio.h>
 
 extern "C" {
 
@@ -60,7 +61,7 @@ __global__ void adamw_kernel(
     }
 }
 
-void adamw_update_cuda(
+cudaError_t adamw_update_cuda(
     float* w, const float* g, float* m, float* v,
     int n,
     float lr, float beta1, float beta2,
@@ -75,6 +76,7 @@ void adamw_update_cuda(
     if (err != cudaSuccess) {
         fprintf(stderr, "adamw_update_cuda: kernel launch failed: %s\n", cudaGetErrorString(err));
     }
+    return err;
 }
 
 // ── Gradient norm squared: partial reduction per block ─────────────
@@ -108,7 +110,7 @@ __global__ void grad_norm_sq_kernel(
     }
 }
 
-void grad_norm_sq_cuda(
+cudaError_t grad_norm_sq_cuda(
     const float* g, float* partial_sums,
     int n, int* out_num_blocks)
 {
@@ -120,6 +122,7 @@ void grad_norm_sq_cuda(
     if (err != cudaSuccess) {
         fprintf(stderr, "grad_norm_sq_cuda: kernel launch failed: %s\n", cudaGetErrorString(err));
     }
+    return err;
 }
 
 // ── Scale gradient buffer: g[i] *= scale ───────────────────────────
@@ -132,7 +135,7 @@ __global__ void grad_scale_kernel(float* __restrict__ g, float scale, int n) {
     }
 }
 
-void grad_scale_cuda(float* g, float scale, int n) {
+cudaError_t grad_scale_cuda(float* g, float scale, int n) {
     int block = 256;
     int grid = (n + block - 1) / block;
     grad_scale_kernel<<<grid, block>>>(g, scale, n);
@@ -140,6 +143,7 @@ void grad_scale_cuda(float* g, float scale, int n) {
     if (err != cudaSuccess) {
         fprintf(stderr, "grad_scale_cuda: kernel launch failed: %s\n", cudaGetErrorString(err));
     }
+    return err;
 }
 
 } // extern "C"

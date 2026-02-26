@@ -153,12 +153,13 @@ fn adamw_one(
     debug_assert_eq!(w.len(), g.len());
     debug_assert_eq!(w.len(), m.len());
     debug_assert_eq!(w.len(), v.len());
-    unsafe {
+    let err = unsafe {
         crate::cuda_ffi::adamw_update_cuda(
             w.ptr(), g.as_ptr(), m.ptr(), v.ptr(),
             n, lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay,
-        );
-    }
+        )
+    };
+    assert_eq!(err, 0, "adamw_update_cuda failed with cudaError_t={}", err);
 }
 
 /// Full AdamW weight update on GPU. Updates all params in-place, advances step counter.
@@ -271,12 +272,13 @@ fn gpu_grad_norm(grads: &GpuMAGGrads, state: &mut GpuAdamWState) -> f32 {
         let n = g.len() as i32;
         if n == 0 { return; }
         let mut num_blocks: i32 = 0;
-        unsafe {
+        let err = unsafe {
             crate::cuda_ffi::grad_norm_sq_cuda(
                 g.as_ptr(), state.norm_scratch.ptr(),
                 n, &mut num_blocks,
-            );
-        }
+            )
+        };
+        assert_eq!(err, 0, "grad_norm_sq_cuda failed with cudaError_t={}", err);
         crate::dispatch::cuda_sync();
         let nb = num_blocks as usize;
         state.norm_scratch.slice(0, nb).copy_to_host(&mut state.norm_host[..nb]);
@@ -315,9 +317,10 @@ fn gpu_scale_grads(grads: &mut GpuMAGGrads, scale: f32) {
     let scale_buf = |g: &mut GpuBuf<f32>| {
         let n = g.len() as i32;
         if n == 0 { return; }
-        unsafe {
-            crate::cuda_ffi::grad_scale_cuda(g.ptr(), scale, n);
-        }
+        let err = unsafe {
+            crate::cuda_ffi::grad_scale_cuda(g.ptr(), scale, n)
+        };
+        assert_eq!(err, 0, "grad_scale_cuda failed with cudaError_t={}", err);
     };
 
     scale_buf(&mut grads.d_w_embed);
