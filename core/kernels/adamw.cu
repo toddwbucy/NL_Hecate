@@ -13,9 +13,17 @@
 // Grid=ceil(n/256), Block=256. One thread per parameter.
 // Bias correction factors are precomputed on host and passed as args
 // to avoid per-thread powf() calls.
+//
+// Source: HOPE (2512.24695) §4.1-4.2, §6 Eq 71; Loshchilov & Hutter 2019.
+// Constraint: CS-27, CS-28 — this kernel is intentionally frequency-agnostic.
+//   It executes the AdamW update math for a single parameter buffer.
+//   CMS frequency scheduling (which levels fire, when) is the caller's
+//   responsibility — enforced by FrequencyAwareAdamW in adamw.rs.
+//   Do not call this kernel directly except through that integration layer.
 
 #include <cuda_runtime.h>
 #include <math.h>
+#include <stdio.h>
 
 extern "C" {
 
@@ -53,7 +61,7 @@ __global__ void adamw_kernel(
     }
 }
 
-void adamw_update_cuda(
+cudaError_t adamw_update_cuda(
     float* w, const float* g, float* m, float* v,
     int n,
     float lr, float beta1, float beta2,
@@ -64,6 +72,11 @@ void adamw_update_cuda(
     int grid = (n + block - 1) / block;
     adamw_kernel<<<grid, block>>>(w, g, m, v, n,
         lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "adamw_update_cuda: kernel launch failed: %s\n", cudaGetErrorString(err));
+    }
+    return err;
 }
 
 // ── Gradient norm squared: partial reduction per block ─────────────
@@ -97,7 +110,7 @@ __global__ void grad_norm_sq_kernel(
     }
 }
 
-void grad_norm_sq_cuda(
+cudaError_t grad_norm_sq_cuda(
     const float* g, float* partial_sums,
     int n, int* out_num_blocks)
 {
@@ -105,6 +118,11 @@ void grad_norm_sq_cuda(
     int grid = (n + block - 1) / block;
     *out_num_blocks = grid;
     grad_norm_sq_kernel<<<grid, block, block * sizeof(float)>>>(g, partial_sums, n);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "grad_norm_sq_cuda: kernel launch failed: %s\n", cudaGetErrorString(err));
+    }
+    return err;
 }
 
 // ── Scale gradient buffer: g[i] *= scale ───────────────────────────
@@ -117,10 +135,15 @@ __global__ void grad_scale_kernel(float* __restrict__ g, float scale, int n) {
     }
 }
 
-void grad_scale_cuda(float* g, float scale, int n) {
+cudaError_t grad_scale_cuda(float* g, float scale, int n) {
     int block = 256;
     int grid = (n + block - 1) / block;
     grad_scale_kernel<<<grid, block>>>(g, scale, n);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "grad_scale_cuda: kernel launch failed: %s\n", cudaGetErrorString(err));
+    }
+    return err;
 }
 
 } // extern "C"

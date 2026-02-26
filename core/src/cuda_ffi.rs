@@ -392,7 +392,7 @@ extern "C" {
         lr: f32, beta1: f32, beta2: f32,
         eps: f32, bc1_inv: f32, bc2_inv: f32,
         weight_decay: f32,
-    );
+    ) -> u32;  // cudaError_t: 0 = cudaSuccess
 
     /// Partial reduction for gradient L2 norm squared.
     /// Writes ceil(n/256) partial sums to partial_sums buffer.
@@ -400,7 +400,7 @@ extern "C" {
     pub(crate) fn grad_norm_sq_cuda(
         g: *const f32, partial_sums: *mut f32,
         n: i32, out_num_blocks: *mut i32,
-    );
+    ) -> u32;  // cudaError_t: 0 = cudaSuccess
 
     /// Iterative GPU-side reduction of partial sums to a single scalar.
     /// Uses ping-pong between buf_a and buf_b. Result in buf_a[0].
@@ -408,7 +408,7 @@ extern "C" {
     pub(crate) fn reduce_sum_cuda(buf_a: *mut f32, buf_b: *mut f32, n: i32);
 
     /// Scale gradient buffer in-place: g[i] *= scale.
-    pub(crate) fn grad_scale_cuda(g: *mut f32, scale: f32, n: i32);
+    pub(crate) fn grad_scale_cuda(g: *mut f32, scale: f32, n: i32) -> u32;  // cudaError_t: 0 = cudaSuccess
 
     // ── Cross-entropy kernels ─────────────────────────────────────────
 
