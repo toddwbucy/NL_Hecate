@@ -222,6 +222,12 @@ extern "C" void swiglu_backward_f32_cuda(
     int d_model,
     int intermediate)
 {
+    if (seq_len <= 0 || d_model <= 0 || intermediate <= 0) {
+        fprintf(stderr,
+                "[NL_Hecate FATAL] swiglu_bwd invalid dims: seq_len=%d d_model=%d intermediate=%d\n",
+                seq_len, d_model, intermediate);
+        abort();
+    }
     cublasHandle_t h = get_cublas_handle_bwd();
     const float alpha1 = 1.0f, beta0 = 0.0f, beta1 = 1.0f;
 
