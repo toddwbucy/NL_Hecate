@@ -85,6 +85,11 @@ pub struct GpuMemoryLevelParams {
     pub w_q_conv: GpuBuf<f32>,
     pub b_q_conv: GpuBuf<f32>,
     pub has_conv: bool,
+    // SwiGluMlp projections. zeros(1) dummy for all non-SwiGLU levels.
+    pub gate_proj: GpuBuf<f32>,   // [inter × d]
+    pub up_proj:   GpuBuf<f32>,   // [inter × d]
+    pub down_proj: GpuBuf<f32>,   // [d × inter]
+    pub has_mlp: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -109,6 +114,11 @@ impl GpuMemoryLevelParams {
         let w_q_conv = if has_conv { GpuBuf::from_host(&host.w_q_conv) } else { GpuBuf::zeros(1) };
         let b_q_conv = if has_conv { GpuBuf::from_host(&host.b_q_conv) } else { GpuBuf::zeros(1) };
 
+        let has_mlp   = !host.gate_proj.is_empty();
+        let gate_proj = if has_mlp { GpuBuf::from_host(&host.gate_proj) } else { GpuBuf::zeros(1) };
+        let up_proj   = if has_mlp { GpuBuf::from_host(&host.up_proj)   } else { GpuBuf::zeros(1) };
+        let down_proj = if has_mlp { GpuBuf::from_host(&host.down_proj) } else { GpuBuf::zeros(1) };
+
         GpuMemoryLevelParams {
             w_k_mem: GpuBuf::from_host(host.w_k_mem.master()),
             w_v_mem: GpuBuf::from_host(host.w_v_mem.master()),
@@ -125,6 +135,8 @@ impl GpuMemoryLevelParams {
             has_freq,
             w_k_conv, b_k_conv, w_q_conv, b_q_conv,
             has_conv,
+            gate_proj, up_proj, down_proj,
+            has_mlp,
         }
     }
 
@@ -155,6 +167,14 @@ impl GpuMemoryLevelParams {
             self.b_k_conv.copy_to_host(&mut p.b_k_conv);
             self.w_q_conv.copy_to_host(&mut p.w_q_conv);
             self.b_q_conv.copy_to_host(&mut p.b_q_conv);
+        }
+        if self.has_mlp {
+            p.gate_proj = vec![0.0f32; self.gate_proj.len()];
+            p.up_proj   = vec![0.0f32; self.up_proj.len()];
+            p.down_proj = vec![0.0f32; self.down_proj.len()];
+            self.gate_proj.copy_to_host(&mut p.gate_proj);
+            self.up_proj.copy_to_host(&mut p.up_proj);
+            self.down_proj.copy_to_host(&mut p.down_proj);
         }
         p
     }

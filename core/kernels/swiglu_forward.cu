@@ -264,3 +264,80 @@ extern "C" void swiglu_forward_f32_cuda(
     check_cuda(cudaMemcpy(cache_buf,g_fwd_pool.dCacheBuf, szBuf, cudaMemcpyDeviceToHost), "D2H cache_buf");
     // Note: weights remain in g_fwd_pool on device; backward has its own pool (swiglu_backward.cu)
 }
+
+// ── Device-to-device variant ───────────────────────────────────────────
+//
+// ALL pointers are DEVICE pointers (pre-allocated GpuBuf<f32> from Rust).
+// No pool allocation, no H2D/D2H copies, no cudaDeviceSynchronize.
+// Caller (gpu_forward.rs) provides caller-managed device buffers and syncs
+// via dispatch::cuda_sync() after the full CMS level loop.
+// Reuses get_cublas_handle_fwd() — same shared handle, no new allocations.
+extern "C" void swiglu_forward_f32_cuda_dd(
+    const float* X,           // device: [seq_len × d_model]
+    const float* gate_proj,   // device: [intermediate × d_model]  (row-major)
+    const float* up_proj,     // device: [intermediate × d_model]  (row-major)
+    const float* down_proj,   // device: [d_model × intermediate]  (row-major)
+    float* Y,                 // device: [seq_len × d_model]  (output)
+    float* gate_buf,          // device: [seq_len × intermediate]  (saved for bwd)
+    float* up_buf,            // device: [seq_len × intermediate]  (saved for bwd)
+    float* fused_buf,         // device: [seq_len × intermediate]  (saved for bwd)
+    float* cache_buf,         // device: [seq_len × intermediate]  (sigmoid, saved for bwd)
+    int seq_len,
+    int d_model,
+    int intermediate)
+{
+    if (seq_len <= 0 || d_model <= 0 || intermediate <= 0) {
+        fprintf(stderr,
+                "[NL_Hecate FATAL] swiglu_fwd_dd invalid dims: seq_len=%d d_model=%d intermediate=%d\n",
+                seq_len, d_model, intermediate);
+        abort();
+    }
+    cublasHandle_t h = get_cublas_handle_fwd();
+    const float alpha1 = 1.0f, beta0 = 0.0f;
+
+    size_t N = (size_t)seq_len * intermediate;
+
+    // gate_buf = X @ gate_proj.T
+    check_cublas(
+        cublasSgemm(h,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            intermediate, seq_len, d_model,
+            &alpha1,
+            gate_proj, d_model,
+            X, d_model,
+            &beta0,
+            gate_buf, intermediate),
+        "gate gemm dd");
+
+    // up_buf = X @ up_proj.T
+    check_cublas(
+        cublasSgemm(h,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            intermediate, seq_len, d_model,
+            &alpha1,
+            up_proj, d_model,
+            X, d_model,
+            &beta0,
+            up_buf, intermediate),
+        "up gemm dd");
+
+    // SiLU gate fusion: fused = silu(gate) * up, save sigmoid in cache
+    int block = 256;
+    int grid  = (int)((N + block - 1) / block);
+    swiglu_fuse_kernel<<<grid, block>>>(
+        gate_buf, up_buf, fused_buf, cache_buf, N);
+    check_cuda(cudaGetLastError(), "swiglu_fuse_kernel dd launch");
+
+    // Y = fused @ down_proj.T
+    check_cublas(
+        cublasSgemm(h,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            d_model, seq_len, intermediate,
+            &alpha1,
+            down_proj, intermediate,
+            fused_buf, intermediate,
+            &beta0,
+            Y, d_model),
+        "down gemm dd");
+    // No cudaDeviceSynchronize — caller syncs via dispatch::cuda_sync()
+}
