@@ -394,8 +394,8 @@ impl OpaqueVjp for SwiGluMlp {
     ) -> (Vec<f32>, BufId, BufId, BufId) {
         let inter = self.intermediate_size;
 
-        // Run forward
-        let (y, cache) = self.step_cpu(level_params, embedded, seq_len, d);
+        // Run forward — dispatch to CUDA when available; step_cpu is fatal at d=2048
+        let (y, cache) = self.step(level_params, embedded, seq_len, d, None::<Vec<f32>>);
 
         // Allocate input IDs for embedded + level_params (will receive gradients)
         let emb_in = tape.alloc(embedded.to_vec(), vec![seq_len, d]);
@@ -427,9 +427,14 @@ impl OpaqueVjp for SwiGluMlp {
 
 /// Opaque backward adapter for SwiGluMlp.
 ///
-/// saved layout:
+/// saved layout (matches traced_active_level in traced_forward.rs):
 ///   saved[0] = [seq_len, d, inter]     metadata
-///   saved[1] = gate_proj ++ up_proj ++ down_proj  (lp_flat)
+///   saved[1] = lp_id buffer:  standard_fields ++ gate_proj ++ up_proj ++ down_proj
+///              standard_fields = level_params_to_flat output (no MLP projections):
+///                w_k_mem(d²) + w_v_mem(d²) + w_q_mem(d²) +
+///                w_alpha(2d) + b_alpha(1) + w_theta(2d) + b_theta(1) +
+///                w_eta(2d) + b_eta(1) + w_omega(2d²)
+///                = 5d² + 6d + 3  (no freq/conv fields for SwiGluMlp)
 ///   saved[2] = embedded  [seq*d]
 ///   saved[3] = x         [seq*d]       (copy of embedded stored in cache)
 ///   saved[4] = gate_out  [seq*inter]
@@ -445,10 +450,15 @@ pub fn swiglu_opaque_backward(
     let d = saved[0][1] as usize;
     let inter = saved[0][2] as usize;
 
+    // Standard-fields prefix size in lp_flat (SwiGluMlp has no freq/conv fields).
+    // Layout matches level_params_to_flat: w_{k,v,q}_mem(d²×3) + w_{alpha,theta,eta}(2d×3) +
+    // b_{alpha,theta,eta}(1×3) + w_omega(2d²) = 5d² + 6d + 3.
+    let std_offset = 5 * d * d + 6 * d + 3;
+
     let lp_flat = saved[1];
-    let gate_proj = lp_flat[..inter * d].to_vec();
-    let up_proj = lp_flat[inter * d..2 * inter * d].to_vec();
-    let down_proj = lp_flat[2 * inter * d..2 * inter * d + d * inter].to_vec();
+    let gate_proj = lp_flat[std_offset..std_offset + inter * d].to_vec();
+    let up_proj   = lp_flat[std_offset + inter * d..std_offset + 2 * inter * d].to_vec();
+    let down_proj = lp_flat[std_offset + 2 * inter * d..std_offset + 3 * inter * d].to_vec();
 
     // Reconstruct a minimal MemoryLevelParams with just the MLP fields
     let mut level_params = MemoryLevelParams::zeros_like(d);
@@ -468,12 +478,21 @@ pub fn swiglu_opaque_backward(
     };
 
     let rule = SwiGluMlp { intermediate_size: inter };
+    // Dispatch to CUDA backward when compiled with cuda feature (uses cuBLAS).
+    // For large d (e.g. d=2048, inter=8192) this is critical — the CPU fallback
+    // uses naive O(m*k*n) matmul which is ~100x slower than cuBLAS at scale.
+    #[cfg(feature = "cuda")]
+    let (param_grads, d_embedded) = rule.step_backward_cuda(&level_params, &cache, d_outputs[0], saved[2]);
+    #[cfg(not(feature = "cuda"))]
     let (param_grads, d_embedded) = rule.step_backward_cpu(&level_params, &cache, d_outputs[0], saved[2]);
 
     // d_inputs[0] = d_embedded (flows to embedding lookup backward)
     d_inputs[0] = d_embedded;
-    // d_inputs[1] = flat level_params grads (gate_proj, up_proj, down_proj)
-    let mut lp_grads = Vec::with_capacity(inter * d * 2 + d * inter);
+
+    // d_inputs[1] must match lp_id buffer layout: zero-pad the standard-fields
+    // prefix, then append gate_proj/up_proj/down_proj gradients.
+    // Size must equal saved[1].len() (checked by accumulate_grad).
+    let mut lp_grads = vec![0.0f32; std_offset];
     lp_grads.extend_from_slice(&param_grads.gate_proj);
     lp_grads.extend_from_slice(&param_grads.up_proj);
     lp_grads.extend_from_slice(&param_grads.down_proj);
