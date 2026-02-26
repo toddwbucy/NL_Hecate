@@ -140,6 +140,12 @@ def run_build(bcfg: BuildConfig):
         # adding clamps to an existing checkpoint that didn't have them).
         # MAGConfig is frozen, so rebuild if clamps changed.
         if bcfg.theta_floor is not None or bcfg.theta_ceil is not None or bcfg.m_norm_max is not None:
+            # Use bcfg value when explicitly set; fall back to loaded cfg so we
+            # never silently wipe clamp values that were already baked into the
+            # checkpoint (e.g. resuming without --m_norm_max still preserves it).
+            theta_floor = bcfg.theta_floor if bcfg.theta_floor is not None else list(cfg.theta_floor)
+            theta_ceil  = bcfg.theta_ceil  if bcfg.theta_ceil  is not None else list(cfg.theta_ceil)
+            m_norm_max  = bcfg.m_norm_max  if bcfg.m_norm_max  is not None else list(cfg.m_norm_max)
             cfg = nl_hecate.MAGConfig(
                 d_model=cfg.d_model, num_heads=cfg.num_heads,
                 head_dim=cfg.head_dim, seq_len=cfg.seq_len,
@@ -154,9 +160,9 @@ def run_build(bcfg: BuildConfig):
                 momentum_kind=cfg.momentum_kind,
                 momentum_d_hidden=cfg.momentum_d_hidden,
                 intermediate_size=bcfg.intermediate_size,
-                theta_floor=bcfg.theta_floor,
-                theta_ceil=bcfg.theta_ceil,
-                m_norm_max=bcfg.m_norm_max,
+                theta_floor=theta_floor,
+                theta_ceil=theta_ceil,
+                m_norm_max=m_norm_max,
             )
     else:
         cfg = nl_hecate.MAGConfig(
@@ -414,9 +420,10 @@ def run_build(bcfg: BuildConfig):
                     or (step < 100 and step % 10 == 0))
         if log_this:
             t_now = time.perf_counter()
-            window_steps = step - window_step_start
-            if window_steps > 0:
-                tok_per_sec = window_steps * bcfg.seq_len / (t_now - t_window_start)
+            window_steps = step - window_step_start + 1  # inclusive
+            dt = t_now - t_window_start
+            if window_steps > 1 and dt > 0:
+                tok_per_sec = window_steps * bcfg.seq_len / dt
             else:
                 tok_per_sec = 0.0
             t_window_start = t_now

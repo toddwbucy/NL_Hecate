@@ -437,9 +437,11 @@ extern "C" void titans_backward_segment_f32_cuda(
     // forward due to prediction/error reconstruction. At d=512, block_size=1024
     // leaves only 64 regs/thread — too few. Using d=512 gives 128 regs/thread.
     int block_size = (d < 1024) ? d : 1024;
+    // Round DOWN to largest power-of-2 ≤ block_size (floor, not ceil).
+    // "while (rounded < block_size)" rounds UP: for non-power-of-2 d like
+    // d=768 it overshoots to 1024 > d, wasting shared memory slots.
     int rounded = 1;
-    while (rounded < block_size) rounded <<= 1;
-    if (rounded > 1024) rounded = 1024;
+    while ((rounded << 1) <= block_size) rounded <<= 1;
     block_size = rounded;
 
     dim3 grid(1);
@@ -485,9 +487,11 @@ extern "C" void titans_backward_f32_cuda(
     // forward due to prediction/error reconstruction. At d=512, block_size=1024
     // leaves only 64 regs/thread — too few. Using d=512 gives 128 regs/thread.
     int block_size = (d < 1024) ? d : 1024;
+    // Round DOWN to largest power-of-2 ≤ block_size (floor, not ceil).
+    // "while (rounded < block_size)" rounds UP: for non-power-of-2 d like
+    // d=768 it overshoots to 1024 > d, wasting shared memory slots.
     int rounded = 1;
-    while (rounded < block_size) rounded <<= 1;
-    if (rounded > 1024) rounded = 1024;
+    while ((rounded << 1) <= block_size) rounded <<= 1;
     block_size = rounded;
 
     dim3 grid(1);

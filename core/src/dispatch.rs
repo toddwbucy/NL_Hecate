@@ -862,6 +862,7 @@ pub fn hebbian_forward_dispatch(
     y: &mut [f32],
     seq_len: usize,
     d: usize,
+    m_norm_max: f32,
 ) {
     #[cfg(feature = "cuda")]
     {
@@ -872,7 +873,7 @@ pub fn hebbian_forward_dispatch(
         }
     }
     rust_hebbian_forward(k_mem, v_mem, q_mem, alpha, m_initial,
-                         m_states, y, seq_len, d);
+                         m_states, y, seq_len, d, m_norm_max);
 }
 
 /// Hebbian Rule backward inner loop dispatch.
@@ -1308,7 +1309,7 @@ fn rust_hebbian_forward(
     k_mem: &[f32], v_mem: &[f32], q_mem: &[f32],
     alpha: &[f32], m_initial: &[f32],
     m_states: &mut [f32], y: &mut [f32],
-    seq_len: usize, d: usize,
+    seq_len: usize, d: usize, m_norm_max: f32,
 ) {
     let dd = d * d;
     m_states[..dd].copy_from_slice(m_initial);
@@ -1327,6 +1328,16 @@ fn rust_hebbian_forward(
             for j in 0..d {
                 m_states[m_next + i * d + j] =
                     retention * m_states[m_t + i * d + j] + v_t[i] * k_t[j];
+            }
+        }
+
+        // M-norm clamp (straight-through) — prevents memory divergence
+        if m_norm_max < f32::MAX {
+            let slice = &mut m_states[m_next..m_next + dd];
+            let norm = slice.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > m_norm_max {
+                let scale = m_norm_max / norm;
+                for x in slice.iter_mut() { *x *= scale; }
             }
         }
 

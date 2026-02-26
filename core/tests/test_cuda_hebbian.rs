@@ -68,7 +68,7 @@ fn test_cuda_hebbian_forward_matches_rust() {
     let mut y_cuda = vec![0.0f32; seq_len * d];
     hebbian_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &m_initial,
-        &mut m_cuda, &mut y_cuda, seq_len, d);
+        &mut m_cuda, &mut y_cuda, seq_len, d, f32::MAX);
 
     check_close("hebbian_fwd_y", &y_rust, &y_cuda, 1e-5);
     check_close("hebbian_fwd_m", &m_rust, &m_cuda, 1e-5);
@@ -92,7 +92,7 @@ fn test_cuda_hebbian_forward_seq_len_1() {
     let mut y_cuda = vec![0.0f32; d];
     hebbian_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &m_initial,
-        &mut m_cuda, &mut y_cuda, 1, d);
+        &mut m_cuda, &mut y_cuda, 1, d, f32::MAX);
 
     check_close("hebbian_seq1_y", &y_rust, &y_cuda, 1e-5);
 }
@@ -116,7 +116,7 @@ fn test_cuda_hebbian_forward_nonzero_initial() {
     let mut y_cuda = vec![0.0f32; seq_len * d];
     hebbian_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &m_initial,
-        &mut m_cuda, &mut y_cuda, seq_len, d);
+        &mut m_cuda, &mut y_cuda, seq_len, d, f32::MAX);
 
     check_close("hebbian_nonzero_y", &y_rust, &y_cuda, 1e-5);
     check_close("hebbian_nonzero_m", &m_rust, &m_cuda, 1e-5);
@@ -221,7 +221,7 @@ fn test_cuda_hebbian_backward_nonzero() {
     let mut y = vec![0.0f32; seq_len * d];
     hebbian_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &m_initial,
-        &mut m_states, &mut y, seq_len, d);
+        &mut m_states, &mut y, seq_len, d, f32::MAX);
 
     let d_y = vec![1.0f32; seq_len * d];
     let mut dk = vec![0.0f32; seq_len * d];
@@ -259,13 +259,13 @@ fn test_cuda_hebbian_forward_deterministic() {
     let mut m1 = vec![0.0f32; (seq_len + 1) * dd];
     hebbian_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &m_initial,
-        &mut m1, &mut y1, seq_len, d);
+        &mut m1, &mut y1, seq_len, d, f32::MAX);
 
     let mut y2 = vec![0.0f32; seq_len * d];
     let mut m2 = vec![0.0f32; (seq_len + 1) * dd];
     hebbian_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &m_initial,
-        &mut m2, &mut y2, seq_len, d);
+        &mut m2, &mut y2, seq_len, d, f32::MAX);
 
     assert_eq!(y1, y2, "CUDA hebbian forward should be deterministic");
 }
@@ -289,7 +289,7 @@ fn test_cuda_hebbian_forward_d16() {
     let mut y_cuda = vec![0.0f32; seq_len * d];
     hebbian_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &m_initial,
-        &mut m_cuda, &mut y_cuda, seq_len, d);
+        &mut m_cuda, &mut y_cuda, seq_len, d, f32::MAX);
 
     check_close("hebbian_d16_y", &y_rust, &y_cuda, 1e-4);
     check_close("hebbian_d16_m", &m_rust, &m_cuda, 1e-4);
@@ -317,7 +317,7 @@ fn test_cuda_hebbian_forward_large_d() {
     let mut y_cuda = vec![0.0f32; seq_len * d];
     hebbian_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &m_initial,
-        &mut m_cuda, &mut y_cuda, seq_len, d);
+        &mut m_cuda, &mut y_cuda, seq_len, d, f32::MAX);
 
     check_close("hebbian_large_d_y", &y_rust, &y_cuda, 1e-4);
     check_close("hebbian_large_d_m", &m_rust, &m_cuda, 1e-4);

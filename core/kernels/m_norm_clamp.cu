@@ -58,5 +58,9 @@ extern "C" void m_norm_clamp_f32_cuda(float* m, int d, float m_norm_max) {
 
     int smem_bytes = block_size * sizeof(float);
     m_norm_clamp_kernel<<<1, block_size, smem_bytes>>>(m, dd, m_norm_max);
-    cudaDeviceSynchronize();
+    // No cudaDeviceSynchronize — rely on stream-ordered semantics.
+    // gpu_forward.rs calls cuda_sync() after copy_final_m; the clamp is
+    // enqueued on the same (default) stream, so it runs before any subsequent
+    // host-visible read. A global device sync here would serialize across all
+    // levels and hurt throughput unnecessarily.
 }

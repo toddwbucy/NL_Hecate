@@ -330,7 +330,11 @@ fn test_titans_m_norm_clamp_cpu() {
 
     let d: usize = 16;
     let seq_len: usize = 32;
-    let m_norm_max_val = 5.0_f32;
+    // Cap must be below the unclamped run's max ‖M‖ so the constraint is live.
+    // A preliminary control run (below) confirms the unclamped max is ~0.0026 at
+    // this d/seq_len, so we set the cap to 0.001 (< unclamped) to guarantee
+    // the clamp fires and is not vacuous.
+    let m_norm_max_val = 0.001_f32;
 
     let cfg = MAGConfig {
         swa: SWAConfig {
@@ -393,4 +397,29 @@ fn test_titans_m_norm_clamp_cpu() {
     }
 
     eprintln!("test_titans_m_norm_clamp_cpu: loss={loss:.4}, all M norms ≤ {m_norm_max_val} ✓");
+
+    // Control: same inputs with clamp disabled (m_norm_max=[]) must push ‖M‖_F
+    // above the cap, proving the earlier assertion tested a live constraint.
+    let cfg_no_clamp = MAGConfig {
+        m_norm_max: vec![],  // disabled
+        ..cfg.clone()
+    };
+    let params_nc = MAGParams::init(&cfg_no_clamp, 42);
+    let (_, cache_nc) = mag_forward(&params_nc, &cfg_no_clamp, &input_ids, &target_ids);
+    let titans_nc = match &cache_nc.memory_cache {
+        MemoryCache::Titans(c) => c,
+        _ => panic!("Expected Titans cache in control run"),
+    };
+    let max_unclamped = (1..=seq_len)
+        .map(|t| {
+            let slice = &titans_nc.m_states[t * dd..(t + 1) * dd];
+            slice.iter().map(|x| x * x).sum::<f32>().sqrt()
+        })
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_unclamped > m_norm_max_val,
+        "Control run (no clamp) should exceed m_norm_max={m_norm_max_val}, \
+         but max ‖M‖={max_unclamped:.6}. The clamp test may be vacuous."
+    );
+    eprintln!("Control (no clamp): max ‖M‖={max_unclamped:.6} > {m_norm_max_val} ✓ (clamp was live)");
 }

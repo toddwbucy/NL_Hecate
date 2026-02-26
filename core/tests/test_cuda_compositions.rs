@@ -143,7 +143,7 @@ fn test_cms_mixed_delta_hebbian() {
         hebbian_forward_dispatch(
             &heb_cache.k_mem, &heb_cache.v_mem, &heb_cache.q_mem,
             &heb_cache.alpha, &m_initial,
-            &mut m_cuda, &mut y_cuda, seq_len, d);
+            &mut m_cuda, &mut y_cuda, seq_len, d, f32::MAX);
 
         check_close(&format!("cms_heb_l{level}_y"), &heb_cache.y, &y_cuda, 1e-5);
         check_close(&format!("cms_heb_l{level}_m"), &heb_cache.m_states, &m_cuda, 1e-5);
