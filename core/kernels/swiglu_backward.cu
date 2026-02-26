@@ -30,6 +30,7 @@
 //
 // Spec: specs/infrastructure/build/02_llama_level_stacking.md
 
+#include <climits>
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <mutex>
@@ -177,9 +178,9 @@ __global__ void swiglu_fuse_backward_kernel(
     const float* __restrict__ gate_cache,  // [N] sigmoid(gate) from forward
     float* __restrict__ d_gate_out,        // [N] output: grad w.r.t. gate_out
     float* __restrict__ d_up_out,          // [N] output: grad w.r.t. up_out
-    int N)
+    size_t N)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
 
     float df  = d_fused_in[i];
@@ -280,7 +281,12 @@ extern "C" void swiglu_backward_f32_cuda(
 
     // Step 3: elementwise backward through SiLU gate fusion
     int block = 256;
-    int grid  = (int)((N + block - 1) / block);
+    size_t grid_sz = (N + (size_t)block - 1) / (size_t)block;
+    if (grid_sz > (size_t)INT_MAX) {
+        fprintf(stderr, "[NL_Hecate FATAL] swiglu_bwd grid overflow: %zu\n", grid_sz);
+        abort();
+    }
+    int grid = (int)grid_sz;
     swiglu_fuse_backward_kernel<<<grid, block>>>(
         g_bwd_pool.dDFused, g_bwd_pool.dGateBuf, g_bwd_pool.dUpBuf, g_bwd_pool.dCacheBuf,
         g_bwd_pool.dDGateOut, g_bwd_pool.dDUpOut, N);
