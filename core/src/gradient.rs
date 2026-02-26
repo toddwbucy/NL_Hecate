@@ -354,6 +354,13 @@ pub fn tape_compute_gradients(
             let mut lp_grad = if cfg.memory_rule == crate::model::MemoryRuleKind::SwiGluMlp {
                 let inter = cfg.intermediate_size;
                 let std_size = 5 * d * d + 6 * d + 3; // standard fields, no freq/conv
+                let required = std_size + 3 * inter * d;
+                assert!(
+                    lp_grad_flat.len() >= required,
+                    "tape_compute_gradients: SwiGluMlp lp_grad_flat too short: \
+                     got {} expected >= {} (d={}, inter={})",
+                    lp_grad_flat.len(), required, d, inter
+                );
                 let mut lp = level_params_from_flat(&lp_grad_flat[..std_size], d, 0);
                 lp.gate_proj = lp_grad_flat[std_size..std_size + inter * d].to_vec();
                 lp.up_proj   = lp_grad_flat[std_size + inter * d..std_size + 2 * inter * d].to_vec();

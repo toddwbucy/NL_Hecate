@@ -71,6 +71,10 @@ void adamw_update_cuda(
     int grid = (n + block - 1) / block;
     adamw_kernel<<<grid, block>>>(w, g, m, v, n,
         lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "adamw_update_cuda: kernel launch failed: %s\n", cudaGetErrorString(err));
+    }
 }
 
 // ── Gradient norm squared: partial reduction per block ─────────────
@@ -112,6 +116,10 @@ void grad_norm_sq_cuda(
     int grid = (n + block - 1) / block;
     *out_num_blocks = grid;
     grad_norm_sq_kernel<<<grid, block, block * sizeof(float)>>>(g, partial_sums, n);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "grad_norm_sq_cuda: kernel launch failed: %s\n", cudaGetErrorString(err));
+    }
 }
 
 // ── Scale gradient buffer: g[i] *= scale ───────────────────────────
@@ -128,6 +136,10 @@ void grad_scale_cuda(float* g, float scale, int n) {
     int block = 256;
     int grid = (n + block - 1) / block;
     grad_scale_kernel<<<grid, block>>>(g, scale, n);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "grad_scale_cuda: kernel launch failed: %s\n", cudaGetErrorString(err));
+    }
 }
 
 } // extern "C"
