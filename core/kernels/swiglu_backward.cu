@@ -118,22 +118,22 @@ static void ensure_bwd_pool(int d, int inter, int seq_len) {
 
     // Free stale buffers if any
     if (g_bwd_pool.ddY != nullptr) {
-        cudaFree(g_bwd_pool.ddY);
-        cudaFree(g_bwd_pool.dXFwd);
-        cudaFree(g_bwd_pool.dGateProj);
-        cudaFree(g_bwd_pool.dUpProj);
-        cudaFree(g_bwd_pool.dDownProj);
-        cudaFree(g_bwd_pool.dFused);
-        cudaFree(g_bwd_pool.dGateBuf);
-        cudaFree(g_bwd_pool.dUpBuf);
-        cudaFree(g_bwd_pool.dCacheBuf);
-        cudaFree(g_bwd_pool.dDFused);
-        cudaFree(g_bwd_pool.dDGateOut);
-        cudaFree(g_bwd_pool.dDUpOut);
-        cudaFree(g_bwd_pool.dDX);
-        cudaFree(g_bwd_pool.dDGateProj);
-        cudaFree(g_bwd_pool.dDUpProj);
-        cudaFree(g_bwd_pool.dDDownProj);
+        check_cuda_bwd(cudaFree(g_bwd_pool.ddY),        "free ddY");
+        check_cuda_bwd(cudaFree(g_bwd_pool.dXFwd),      "free dXFwd");
+        check_cuda_bwd(cudaFree(g_bwd_pool.dGateProj),  "free gate_proj");
+        check_cuda_bwd(cudaFree(g_bwd_pool.dUpProj),    "free up_proj");
+        check_cuda_bwd(cudaFree(g_bwd_pool.dDownProj),  "free down_proj");
+        check_cuda_bwd(cudaFree(g_bwd_pool.dFused),     "free fused");
+        check_cuda_bwd(cudaFree(g_bwd_pool.dGateBuf),   "free gate_buf");
+        check_cuda_bwd(cudaFree(g_bwd_pool.dUpBuf),     "free up_buf");
+        check_cuda_bwd(cudaFree(g_bwd_pool.dCacheBuf),  "free cache_buf");
+        check_cuda_bwd(cudaFree(g_bwd_pool.dDFused),    "free dDFused");
+        check_cuda_bwd(cudaFree(g_bwd_pool.dDGateOut),  "free dDGateOut");
+        check_cuda_bwd(cudaFree(g_bwd_pool.dDUpOut),    "free dDUpOut");
+        check_cuda_bwd(cudaFree(g_bwd_pool.dDX),        "free dDX");
+        check_cuda_bwd(cudaFree(g_bwd_pool.dDGateProj), "free dDGateProj");
+        check_cuda_bwd(cudaFree(g_bwd_pool.dDUpProj),   "free dDUpProj");
+        check_cuda_bwd(cudaFree(g_bwd_pool.dDDownProj), "free dDDownProj");
         g_bwd_pool.ddY = nullptr;
     }
 

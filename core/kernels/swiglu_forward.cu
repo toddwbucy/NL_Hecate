@@ -99,15 +99,15 @@ static void ensure_fwd_pool(int d, int inter, int seq_len) {
 
     // Free stale buffers if any
     if (g_fwd_pool.dGateProj != nullptr) {
-        cudaFree(g_fwd_pool.dGateProj);
-        cudaFree(g_fwd_pool.dUpProj);
-        cudaFree(g_fwd_pool.dDownProj);
-        cudaFree(g_fwd_pool.dX);
-        cudaFree(g_fwd_pool.dY);
-        cudaFree(g_fwd_pool.dGateBuf);
-        cudaFree(g_fwd_pool.dUpBuf);
-        cudaFree(g_fwd_pool.dFusedBuf);
-        cudaFree(g_fwd_pool.dCacheBuf);
+        check_cuda(cudaFree(g_fwd_pool.dGateProj), "free gate_proj");
+        check_cuda(cudaFree(g_fwd_pool.dUpProj),   "free up_proj");
+        check_cuda(cudaFree(g_fwd_pool.dDownProj), "free down_proj");
+        check_cuda(cudaFree(g_fwd_pool.dX),        "free X");
+        check_cuda(cudaFree(g_fwd_pool.dY),        "free Y");
+        check_cuda(cudaFree(g_fwd_pool.dGateBuf),  "free gate_buf");
+        check_cuda(cudaFree(g_fwd_pool.dUpBuf),    "free up_buf");
+        check_cuda(cudaFree(g_fwd_pool.dFusedBuf), "free fused_buf");
+        check_cuda(cudaFree(g_fwd_pool.dCacheBuf), "free cache_buf");
         g_fwd_pool.dGateProj = nullptr;
     }
 
