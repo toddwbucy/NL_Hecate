@@ -420,14 +420,14 @@ def run_build(bcfg: BuildConfig):
                     or (step < 100 and step % 10 == 0))
         if log_this:
             t_now = time.perf_counter()
-            window_steps = step - window_step_start + 1  # inclusive
+            window_steps = (step + 1) - window_step_start  # steps [window_start, step] inclusive
             dt = t_now - t_window_start
-            if window_steps > 1 and dt > 0:
+            if window_steps > 0 and dt > 0:
                 tok_per_sec = window_steps * bcfg.seq_len / dt
             else:
                 tok_per_sec = 0.0
             t_window_start = t_now
-            window_step_start = step
+            window_step_start = step + 1  # next window starts after this step
             msg = f"  step {step:5d}  loss={loss:.4f}  ppl={ppl:.1f}"
             if tok_per_sec > 0:
                 msg += f"  tok/s={tok_per_sec:.0f}"
