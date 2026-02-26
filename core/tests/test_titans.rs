@@ -225,6 +225,7 @@ fn test_titans_vs_delta() {
             theta_floor: vec![],
             theta_ceil: vec![],
         intermediate_size: 0,
+        m_norm_max: vec![],
     };
     let cfg_titans = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
@@ -250,6 +251,7 @@ fn test_titans_vs_delta() {
             theta_floor: vec![],
             theta_ceil: vec![],
         intermediate_size: 0,
+        m_norm_max: vec![],
     };
 
     let input_ids: Vec<usize> = (0..swa.seq_len).map(|t| t % swa.vocab_size).collect();
@@ -315,4 +317,80 @@ fn test_titans_k2_multiscale() {
     assert!(final_loss.is_finite(), "Final loss not finite");
     assert!(final_loss < initial,
         "Loss should decrease: initial={initial:.4}, final={final_loss:.4}");
+}
+
+/// Verify M-norm clamping: adversarial large-magnitude inputs must not push ‖M‖_F above m_norm_max.
+///
+/// Uses a config with m_norm_max=5.0 on a d=16 model. Every stored M_t slice (t≥1)
+/// must satisfy ‖M_t‖_F ≤ 5.0 + ε. Verifies the straight-through CPU path in TitansLMM.
+#[test]
+fn test_titans_m_norm_clamp_cpu() {
+    use nl_hecate_core::model::{SWAConfig, AttentionalBias};
+    use nl_hecate_core::retention::default_retention;
+
+    let d: usize = 16;
+    let seq_len: usize = 32;
+    let m_norm_max_val = 5.0_f32;
+
+    let cfg = MAGConfig {
+        swa: SWAConfig {
+            d_model: d, num_heads: 2, head_dim: d / 2,
+            seq_len, window_size: seq_len, vocab_size: 256,
+        },
+        memory_enabled: true,
+        composition: CompositionKind::MAG,
+        memory_rule: MemoryRuleKind::TitansLMM,
+        k: 1,
+        chunk_sizes: vec![1],
+        d_hidden: 0, lp_p: 2.0, sign_sharpness: 10.0, lq_q: 2.0,
+        lambda_local: 0.0, lambda_2: 0.0, delta: 1.0, m_slots: 0, d_compress: 0,
+        lambda_k: 0.0, lambda_v: 0.0,
+        parallel: None,
+        retention: default_retention(MemoryRuleKind::TitansLMM),
+        m3: None,
+        frequency_schedule: FrequencySchedule::Fixed,
+        checkpoint_interval: None,
+        hope_variant: HopeVariant::FreqGated,
+        lattice_variant: LatticeVariant::Decode,
+        n_persistent: 0,
+        attentional_bias: AttentionalBias::L2,
+        kernel_size: 0,
+        momentum_kind: MomentumKind::None,
+        momentum_d_hidden: 0,
+        projection_kind: ProjectionKind::Static,
+        self_generated_values: false,
+        self_ref_chunk_size: 1,
+        theta_floor: vec![],
+        theta_ceil: vec![],
+        intermediate_size: 0,
+        m_norm_max: vec![m_norm_max_val],
+    };
+
+    let params = MAGParams::init(&cfg, 42);
+    let input_ids: Vec<usize> = (0..seq_len).map(|t| t % cfg.swa.vocab_size).collect();
+    let target_ids: Vec<usize> = (1..=seq_len).map(|t| t % cfg.swa.vocab_size).collect();
+
+    let (loss, cache_outer) = mag_forward(&params, &cfg, &input_ids, &target_ids);
+    assert!(loss.is_finite(), "Loss should be finite with m_norm_max clamping");
+
+    // Extract TitansLMM cache and verify per-step M-state norms
+    let titans_cache = match &cache_outer.memory_cache {
+        MemoryCache::Titans(c) => c,
+        _ => panic!("Expected Titans cache"),
+    };
+
+    let dd = d * d;
+    assert_eq!(titans_cache.m_states.len(), (seq_len + 1) * dd);
+
+    let eps = 1e-4_f32;
+    for t in 1..=seq_len {  // M_0 is the initial state (before any clamping)
+        let slice = &titans_cache.m_states[t * dd..(t + 1) * dd];
+        let norm: f32 = slice.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            norm <= m_norm_max_val + eps,
+            "‖M_{t}‖_F = {norm:.6} exceeds m_norm_max={m_norm_max_val} at t={t}"
+        );
+    }
+
+    eprintln!("test_titans_m_norm_clamp_cpu: loss={loss:.4}, all M norms ≤ {m_norm_max_val} ✓");
 }

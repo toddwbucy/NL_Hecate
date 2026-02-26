@@ -49,6 +49,7 @@ fn make_test_config(rule: MemoryRuleKind) -> MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
         intermediate_size: 0,
+        m_norm_max: vec![],
     }
 }
 

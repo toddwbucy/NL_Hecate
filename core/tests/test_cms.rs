@@ -224,6 +224,7 @@ fn test_k2_beats_k1() {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
 
         };
     // k=2 config
@@ -252,6 +253,7 @@ fn test_k2_beats_k1() {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
 
         };
 
@@ -444,6 +446,7 @@ fn test_k4_vs_k2_multiscale() {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
 
         };
     let cfg_k4 = MAGConfig {
@@ -471,6 +474,7 @@ fn test_k4_vs_k2_multiscale() {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
 
         };
 
@@ -575,6 +579,7 @@ fn test_k4_diagnostics() {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
 
         };
 
@@ -857,6 +862,7 @@ fn test_cms_stability_boundary() {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
 
         };
     let cfg_k2 = MAGConfig {
@@ -884,6 +890,7 @@ fn test_cms_stability_boundary() {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
 
         };
 
@@ -1085,6 +1092,7 @@ fn test_k4_normalization_magnitude() {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
 
         };
     let params_k4 = MAGParams::init(&cfg_k4, 42);
@@ -1165,6 +1173,7 @@ fn test_k4_uniform_init_stable() {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
 
         };
 
@@ -1231,6 +1240,7 @@ fn test_k4_normalized_stable() {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
 
         };
 

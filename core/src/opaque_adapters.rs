@@ -374,6 +374,7 @@ pub fn titans_lmm_opaque_backward(
         momentum_d_hidden: 0,
         theta_floor: 0.0,
         theta_ceil: f32::MAX,
+        m_norm_max: f32::MAX,
     };
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
@@ -1587,6 +1588,7 @@ mod tests {
             momentum_d_hidden: 0,
             theta_floor: 0.0,
             theta_ceil: f32::MAX,
+            m_norm_max: f32::MAX,
         };
         assert_opaque_roundtrip(&rule, 4, 3);
     }

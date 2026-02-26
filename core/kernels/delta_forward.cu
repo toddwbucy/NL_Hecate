@@ -247,7 +247,6 @@ extern "C" void delta_forward_f32_cuda(
 {
     int dd = d * d;
     int block_size = (dd < 1024) ? dd : 1024;
-    // Ensure block_size >= d for the matvec operations
     if (block_size < d) block_size = d;
 
     dim3 grid(1);

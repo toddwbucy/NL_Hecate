@@ -277,6 +277,7 @@ impl MAGConfig {
         momentum_kind="none", momentum_d_hidden=0,
         theta_floor=None, theta_ceil=None,
         intermediate_size=0,
+        m_norm_max=None,
     ))]
     fn new(
         d_model: usize,
@@ -315,6 +316,7 @@ impl MAGConfig {
         theta_floor: Option<Vec<f32>>,
         theta_ceil: Option<Vec<f32>>,
         intermediate_size: usize,
+        m_norm_max: Option<Vec<f32>>,
     ) -> PyResult<Self> {
         if d_model != num_heads * head_dim {
             return Err(PyValueError::new_err(format!(
@@ -476,6 +478,7 @@ impl MAGConfig {
                 theta_floor: theta_floor.unwrap_or_default(),
                 theta_ceil: theta_ceil.unwrap_or_default(),
                 intermediate_size,
+                m_norm_max: m_norm_max.unwrap_or_default(),
             },
         })
     }
@@ -549,6 +552,8 @@ impl MAGConfig {
     fn theta_floor(&self) -> Vec<f32> { self.inner.theta_floor.clone() }
     #[getter]
     fn theta_ceil(&self) -> Vec<f32> { self.inner.theta_ceil.clone() }
+    #[getter]
+    fn m_norm_max(&self) -> Vec<f32> { self.inner.m_norm_max.clone() }
 }
 
 // ── MAGParams ──────────────────────────────────────────────────────
@@ -770,6 +775,7 @@ impl MAGForwardCache {
     momentum_kind="none", momentum_d_hidden=0,
     theta_floor=None, theta_ceil=None,
     intermediate_size=0,
+    m_norm_max=None,
 ))]
 fn mag_create_config(
     d_model: usize,
@@ -808,6 +814,7 @@ fn mag_create_config(
     theta_floor: Option<Vec<f32>>,
     theta_ceil: Option<Vec<f32>>,
     intermediate_size: usize,
+    m_norm_max: Option<Vec<f32>>,
 ) -> PyResult<MAGConfig> {
     MAGConfig::new(
         d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled,
@@ -815,7 +822,7 @@ fn mag_create_config(
         d_hidden, lp_p, sign_sharpness, lq_q, lambda_local, lambda_2, delta, m_slots, d_compress, lambda_k, lambda_v,
         retention, m3, frequency_schedule, checkpoint_interval, attentional_bias, kernel_size, self_ref_chunk_size,
         projection_kind, self_generated_values, momentum_kind, momentum_d_hidden,
-        theta_floor, theta_ceil, intermediate_size,
+        theta_floor, theta_ceil, intermediate_size, m_norm_max,
     )
 }
 

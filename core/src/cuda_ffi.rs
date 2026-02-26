@@ -307,6 +307,12 @@ extern "C" {
         t_start: i32, t_end: i32, d: i32,
     );
 
+    // ── M-norm clamp ──────────────────────────────────────────────────
+
+    /// Frobenius-norm clamp for M state (called once per training step).
+    /// No-op if m_norm_max <= 0 or >= 1e30.
+    pub(crate) fn m_norm_clamp_f32_cuda(m: *mut f32, d: i32, m_norm_max: f32);
+
     // ── Embedding kernels ─────────────────────────────────────────────
 
     /// Gather rows from embedding table by token ID.

@@ -111,6 +111,7 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
             theta_floor: vec![],
             theta_ceil: vec![],
         intermediate_size: 0,
+        m_norm_max: vec![],
     }
 }
 

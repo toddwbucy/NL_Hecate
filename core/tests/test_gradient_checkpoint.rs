@@ -49,6 +49,7 @@ fn make_config(rule: MemoryRuleKind, checkpoint_interval: Option<usize>) -> MAGC
             theta_floor: vec![],
             theta_ceil: vec![],
         intermediate_size: 0,
+        m_norm_max: vec![],
     }
 }
 

@@ -398,8 +398,10 @@ extern "C" void delta_backward_segment_f32_cuda(
     int t_start, int t_end, int d)
 {
     int dd = d * d;
-    int block_size = (dd < 1024) ? dd : 1024;
-    if (block_size < d) block_size = d;
+    // Cap at d (not dd): backward kernels require ~2× more registers than
+    // forward due to prediction/error reconstruction. At d=512, block_size=1024
+    // leaves only 64 regs/thread — too few. Using d=512 gives 128 regs/thread.
+    int block_size = (d < 1024) ? d : 1024;
     int rounded = 1;
     while (rounded < block_size) rounded <<= 1;
     if (rounded > 1024) rounded = 1024;
@@ -437,8 +439,10 @@ extern "C" void delta_backward_f32_cuda(
     int seq_len, int d)
 {
     int dd = d * d;
-    int block_size = (dd < 1024) ? dd : 1024;
-    if (block_size < d) block_size = d;
+    // Cap at d (not dd): backward kernels require ~2× more registers than
+    // forward due to prediction/error reconstruction. At d=512, block_size=1024
+    // leaves only 64 regs/thread — too few. Using d=512 gives 128 regs/thread.
+    int block_size = (d < 1024) ? d : 1024;
     // Round up to next power of 2 for tree reduction correctness
     int rounded = 1;
     while (rounded < block_size) rounded <<= 1;

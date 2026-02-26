@@ -36,6 +36,9 @@ class BuildConfig:
     theta_floor: list[float] | None = None  # per-level softplus lower bound
     theta_ceil: list[float] | None = None   # per-level softplus upper bound
 
+    # Per-level M Frobenius norm ceiling (empty = disabled)
+    m_norm_max: list[float] | None = None   # straight-through clamp after M update
+
     # SwiGluMlp / Llama level stacking (HOPE §7.3)
     intermediate_size: int = 0             # 0 for matrix rules; 8192 for Llama-3.2-1B
     donor_layers: list[int] | None = None  # which Llama layers to transplant (e.g. [0,5,10,15])
@@ -136,6 +139,9 @@ class BuildConfig:
         if self.theta_ceil is not None and len(self.theta_ceil) != self.k:
             raise ValueError(
                 f"theta_ceil length {len(self.theta_ceil)} must match k={self.k}")
+        if self.m_norm_max is not None and len(self.m_norm_max) != self.k:
+            raise ValueError(
+                f"m_norm_max length {len(self.m_norm_max)} must match k={self.k}")
         if self.checkpoint_interval is not None and self.checkpoint_interval < 1:
             raise ValueError(
                 f"checkpoint_interval must be >= 1 or None, got {self.checkpoint_interval}")

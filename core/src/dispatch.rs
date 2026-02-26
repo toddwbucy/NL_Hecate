@@ -738,7 +738,7 @@ pub fn delta_forward_dispatch(
         }
     }
     rust_delta_forward(k_mem, v_mem, q_mem, alpha, theta, m_initial,
-                       m_states, y, seq_len, d);
+                       m_states, y, seq_len, d, f32::MAX);
 }
 
 /// Delta Rule backward inner loop dispatch.
@@ -804,7 +804,7 @@ pub fn titans_forward_dispatch(
     }
     rust_titans_forward(k_mem, v_mem, q_mem, alpha, theta, eta,
                         m_initial, s_initial, m_states, s_states, y,
-                        seq_len, d);
+                        seq_len, d, f32::MAX);
 }
 
 /// Titans LMM backward inner loop dispatch.
@@ -936,7 +936,7 @@ pub fn dgd_forward_dispatch(
     }
     // DGD math is identical to Delta Rule at L2 bias
     rust_delta_forward(k_mem, v_mem, q_mem, alpha, theta, m_initial,
-                       m_states, y, seq_len, d);
+                       m_states, y, seq_len, d, f32::MAX);
 }
 
 /// DGD backward inner loop dispatch.
@@ -982,7 +982,7 @@ fn rust_delta_forward(
     k_mem: &[f32], v_mem: &[f32], q_mem: &[f32],
     alpha: &[f32], theta: &[f32], m_initial: &[f32],
     m_states: &mut [f32], y: &mut [f32],
-    seq_len: usize, d: usize,
+    seq_len: usize, d: usize, m_norm_max: f32,
 ) {
     let dd = d * d;
     m_states[..dd].copy_from_slice(m_initial);
@@ -1010,6 +1010,16 @@ fn rust_delta_forward(
             for j in 0..d {
                 m_states[m_next + i * d + j] =
                     retention * m_states[m_t + i * d + j] - theta_t * err_i * k_t[j];
+            }
+        }
+
+        // M-norm clamp (straight-through) — prevents memory divergence
+        if m_norm_max < f32::MAX {
+            let slice = &mut m_states[m_next..m_next + dd];
+            let norm = slice.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > m_norm_max {
+                let scale = m_norm_max / norm;
+                for x in slice.iter_mut() { *x *= scale; }
             }
         }
 
@@ -1121,7 +1131,7 @@ fn rust_titans_forward(
     alpha: &[f32], theta: &[f32], eta: &[f32],
     m_initial: &[f32], s_initial: &[f32],
     m_states: &mut [f32], s_states: &mut [f32], y: &mut [f32],
-    seq_len: usize, d: usize,
+    seq_len: usize, d: usize, m_norm_max: f32,
 ) {
     let dd = d * d;
     m_states[..dd].copy_from_slice(m_initial);
@@ -1160,6 +1170,16 @@ fn rust_titans_forward(
         let retention = 1.0 - alpha_t;
         for i in 0..dd {
             m_states[m_next + i] = retention * m_states[m_t + i] + s_states[s_next + i];
+        }
+
+        // M-norm clamp (straight-through) — prevents memory divergence
+        if m_norm_max < f32::MAX {
+            let slice = &mut m_states[m_next..m_next + dd];
+            let norm = slice.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > m_norm_max {
+                let scale = m_norm_max / norm;
+                for x in slice.iter_mut() { *x *= scale; }
+            }
         }
 
         // y = M_{t+1} @ q

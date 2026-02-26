@@ -229,6 +229,7 @@ fn test_lattice_vs_delta() {
             theta_floor: vec![],
             theta_ceil: vec![],
         intermediate_size: 0,
+        m_norm_max: vec![],
     };
     let cfg_lattice = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
@@ -254,6 +255,7 @@ fn test_lattice_vs_delta() {
             theta_floor: vec![],
             theta_ceil: vec![],
         intermediate_size: 0,
+        m_norm_max: vec![],
     };
 
     let input_ids: Vec<usize> = (0..swa.seq_len).map(|t| t % swa.vocab_size).collect();

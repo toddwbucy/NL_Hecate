@@ -731,6 +731,11 @@ pub struct MAGConfig {
     /// Prevents any level from overshooting. Default: empty (no ceiling).
     #[serde(default)]
     pub theta_ceil: Vec<f32>,
+    /// Per-level M Frobenius norm ceiling (straight-through in backward).
+    /// When ‖M‖_F exceeds this value after the M update, M is rescaled to m_norm_max.
+    /// Empty = disabled (legacy behavior). Recommended: 100.0 for d=512 titans.
+    #[serde(default)]
+    pub m_norm_max: Vec<f32>,
     /// SwiGluMlp intermediate (hidden) dimension. 0 for all matrix-memory rules.
     /// Typically 4*d_model (e.g., 8192 for d=2048 — Llama-3.2-1B MLP size).
     #[serde(default)]
@@ -749,6 +754,14 @@ impl MAGConfig {
         let floor = self.theta_floor.get(level).copied().unwrap_or(0.0);
         let ceil = self.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
         theta.clamp(floor, ceil)
+    }
+
+    /// Returns the M Frobenius norm ceiling for `level`, or f32::MAX if unset/zero.
+    /// When the ceiling is f32::MAX, the clamp is effectively disabled.
+    #[inline]
+    pub fn max_m_norm(&self, level: usize) -> f32 {
+        let v = self.m_norm_max.get(level).copied().unwrap_or(0.0);
+        if v > 0.0 { v } else { f32::MAX }
     }
 }
 
@@ -832,6 +845,7 @@ impl MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
         }
     }
 
@@ -870,6 +884,7 @@ impl MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
         }
     }
 
@@ -908,6 +923,7 @@ impl MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
         }
     }
 
@@ -947,6 +963,7 @@ impl MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
         }
     }
 
@@ -986,6 +1003,7 @@ impl MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
         }
     }
 
@@ -1025,6 +1043,7 @@ impl MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
         }
     }
 
@@ -1063,6 +1082,7 @@ impl MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
         }
     }
 
@@ -1101,6 +1121,7 @@ impl MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
         }
     }
 
@@ -1139,6 +1160,7 @@ impl MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
         }
     }
 
@@ -1177,6 +1199,7 @@ impl MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
         }
     }
 
@@ -1225,6 +1248,7 @@ impl MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
         }
     }
 
@@ -1273,6 +1297,7 @@ impl MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
         }
     }
 
@@ -1321,6 +1346,7 @@ impl MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
         }
     }
 
@@ -1369,6 +1395,7 @@ impl MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
         }
     }
 
@@ -1417,6 +1444,7 @@ impl MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
         }
     }
 
@@ -1465,6 +1493,7 @@ impl MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
         }
     }
 
@@ -1504,6 +1533,7 @@ impl MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
         }
     }
 
@@ -1543,6 +1573,7 @@ impl MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
         }
     }
 
@@ -1585,6 +1616,7 @@ impl MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
         }
     }
 
@@ -1627,6 +1659,7 @@ impl MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
         }
     }
 
@@ -1665,6 +1698,7 @@ impl MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
         }
     }
 
@@ -1703,6 +1737,7 @@ impl MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
         }
     }
 
@@ -1741,6 +1776,7 @@ impl MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
         }
     }
 
@@ -1779,6 +1815,7 @@ impl MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
         }
     }
 
@@ -1818,6 +1855,7 @@ impl MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
         }
     }
 
@@ -1856,6 +1894,7 @@ impl MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
         }
     }
 
@@ -1895,6 +1934,7 @@ impl MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
         }
     }
 
@@ -1934,6 +1974,7 @@ impl MAGConfig {
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
+            m_norm_max: vec![],
         }
     }
 }

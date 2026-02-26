@@ -436,6 +436,7 @@ fn test_k1_learned_is_noop() {
             theta_floor: vec![],
             theta_ceil: vec![],
         intermediate_size: 0,
+        m_norm_max: vec![],
     };
     let params = MAGParams::init(&cfg, 42);
     let d = cfg.swa.d_model;
@@ -569,6 +570,7 @@ fn test_anneal_uses_fixed_schedule() {
             theta_floor: vec![],
             theta_ceil: vec![],
         intermediate_size: 0,
+        m_norm_max: vec![],
     };
 
     let params = MAGParams::init(&cfg, 42);
