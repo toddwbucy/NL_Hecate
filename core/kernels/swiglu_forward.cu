@@ -329,8 +329,13 @@ extern "C" void swiglu_forward_f32_cuda_dd(
         abort();
     }
     int grid = (int)grid_sz;
+    if (N > (size_t)INT_MAX) {
+        fprintf(stderr, "[NL_Hecate FATAL] swiglu_fwd_dd N overflow: %zu\n", N);
+        abort();
+    }
+    int N_i = (int)N;
     swiglu_fuse_kernel<<<grid, block>>>(
-        gate_buf, up_buf, fused_buf, cache_buf, N);
+        gate_buf, up_buf, fused_buf, cache_buf, N_i);
     check_cuda(cudaGetLastError(), "swiglu_fuse_kernel dd launch");
 
     // Y = fused @ down_proj.T
