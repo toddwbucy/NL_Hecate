@@ -443,16 +443,27 @@ pub fn swiglu_opaque_backward(
     saved: &[&[f32]],
     d_inputs: &mut [Vec<f32>],
 ) {
+    // Fail-fast shape checks before touching any buffer.
+    assert_eq!(saved.len(), 8,
+        "swiglu_opaque_backward: expected 8 saved tensors, got {}", saved.len());
+    assert_eq!(d_outputs.len(), 1,
+        "swiglu_opaque_backward: expected 1 output gradient, got {}", d_outputs.len());
+
     let seq_len = saved[0][0] as usize;
     let d = saved[0][1] as usize;
     let inter = saved[0][2] as usize;
 
+    assert_eq!(d_outputs[0].len(), seq_len * d,
+        "swiglu_opaque_backward: d_outputs[0] len {} != seq_len*d {}", d_outputs[0].len(), seq_len * d);
+    assert_eq!(saved[2].len(), seq_len * d,
+        "swiglu_opaque_backward: saved[2] (embedded) len {} != seq_len*d {}", saved[2].len(), seq_len * d);
+
     // lp_flat = [gate_proj | up_proj | down_proj] — no standard-fields prefix.
     // record_on_tape stores only the three SwiGLU projection matrices.
     let lp_flat = saved[1];
-    assert!(
-        lp_flat.len() >= 3 * inter * d,
-        "swiglu_opaque_backward: lp_flat too short: {} < {}",
+    assert_eq!(
+        lp_flat.len(), 3 * inter * d,
+        "swiglu_opaque_backward: lp_flat len {} != 3*inter*d {}",
         lp_flat.len(), 3 * inter * d
     );
     let gate_proj = lp_flat[0..inter * d].to_vec();
@@ -494,6 +505,8 @@ pub fn swiglu_opaque_backward(
     lp_grads.extend_from_slice(&param_grads.gate_proj);
     lp_grads.extend_from_slice(&param_grads.up_proj);
     lp_grads.extend_from_slice(&param_grads.down_proj);
+    assert_eq!(lp_grads.len(), saved[1].len(),
+        "swiglu_opaque_backward: lp_grads len {} != saved[1] len {}", lp_grads.len(), saved[1].len());
     d_inputs[1] = lp_grads;
 }
 
