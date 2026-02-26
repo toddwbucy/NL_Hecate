@@ -401,7 +401,7 @@ impl OpaqueVjp for SwiGluMlp {
         let emb_in = tape.alloc(embedded.to_vec(), vec![seq_len, d]);
 
         // Flatten gate_proj, up_proj, down_proj into a single level_params buffer
-        let mut lp_flat = Vec::with_capacity(inter * d * 3 + d * inter);
+        let mut lp_flat = Vec::with_capacity(3 * inter * d);
         lp_flat.extend_from_slice(&level_params.gate_proj);
         lp_flat.extend_from_slice(&level_params.up_proj);
         lp_flat.extend_from_slice(&level_params.down_proj);
@@ -450,7 +450,7 @@ pub fn swiglu_opaque_backward(
     // lp_flat = [gate_proj | up_proj | down_proj] — no standard-fields prefix.
     // record_on_tape stores only the three SwiGLU projection matrices.
     let lp_flat = saved[1];
-    debug_assert!(
+    assert!(
         lp_flat.len() >= 3 * inter * d,
         "swiglu_opaque_backward: lp_flat too short: {} < {}",
         lp_flat.len(), 3 * inter * d
