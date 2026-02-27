@@ -153,9 +153,9 @@ class BpeDataLoader:
             )
 
         pos = cursor.get("position", 0)
-        if pos > self.total_tokens:
+        if pos < 0 or pos > self.total_tokens:
             raise CursorOutOfBounds(
-                f"Cursor position {pos:,} exceeds dataset size {self.total_tokens:,}."
+                f"Cursor position {pos:,} is out of bounds for dataset size {self.total_tokens:,}."
             )
 
         # Validate content hash immediately using the stored seq_len.

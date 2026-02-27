@@ -60,10 +60,11 @@ holds them. Each new turn sends only new tokens. The cursor advances.
 
 ```json
 {
-  "position":      <uint64>,   // byte offset into flat token array
+  "position":      <uint64>,   // token index into flat token array (not byte offset)
   "total_tokens":  <uint64>,   // length of the array (integrity check)
-  "content_hash":  <uint64>,   // FNV-1a hash of last chunk's input_ids
+  "content_hash":  <uint32>,   // FNV-1a 32-bit hash of last chunk's input_ids
   "chunk_id":      <uint64>,   // monotonic chunk counter (matches Conductor pulse)
+  "seq_len":       <uint64>,   // last chunk length; stored explicitly for post-wrap hash replay
   "dataset_path":  <string>    // absolute path of the numpy file (human readable)
 }
 ```
@@ -87,8 +88,9 @@ class BpeDataLoader:
             {
               "position":     self.position,
               "total_tokens": self.total_tokens,
-              "content_hash": <fnv1a of last chunk>,   # 0 if no chunk served yet
+              "content_hash": <fnv1a_32 of last chunk>,  # 0 if no chunk served yet
               "chunk_id":     self._chunk_id,
+              "seq_len":      self._seq_len,             # 0 if no chunk served yet
               "dataset_path": str(self._path.resolve()),
             }
         """
