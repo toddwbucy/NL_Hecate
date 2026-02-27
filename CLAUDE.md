@@ -199,6 +199,139 @@ hades --database NL db aql "
 "
 ```
 
+## Development Workflow (MANDATORY — the HADES graph is the validation gate, not bookkeeping)
+
+The HADES MCP server (`hades_*` tools) drives every step. Use them directly — never shell out to the `hades` CLI when a tool exists.
+
+### Session start — always first
+```
+hades_task_usage(database="NL")   # briefing: open tasks, last session context
+```
+
+---
+
+### Step 1 — Task
+```python
+hades_task_create(database="NL", title="...", type="task", priority="high|medium|low")
+hades_task_start(database="NL", key="task_xxx")   # open → in_progress
+```
+
+---
+
+### Step 2 — Spec (write before touching code)
+Research the constraints first:
+```python
+hades_query(text="<concept>", database="NL")                     # find relevant equations/smells/axioms
+hades_arxiv_abstract(query="<concept>", database="NL")           # search 2.8M paper abstracts
+hades_arxiv_info(arxiv_id="2512.24695")                          # paper metadata
+hades_db_aql(query="FOR doc IN nl_code_smells FILTER ...", database="NL")  # query specific smells
+```
+
+Write `specs/<category>/<NN>_<name>.md` with a full CONTRACT block.
+
+Register the spec in the graph immediately after writing:
+```python
+# Ingest the spec file itself (embeds text, enables semantic search over specs)
+hades_ingest(target="specs/<category>/<NN>_<name>.md", database="NL",
+             id="<name>-spec", force=True)
+
+# Insert spec metadata node
+hades_db_insert(collection="hecate_specs", database="NL", data='''{
+  "_key": "<name>", "title": "...", "category": "...", "version": "0.4.0",
+  "path": "<relative/path.md>", "purpose": "...",
+  "paper_source": ["2512.24695"], "traced_to_equations": ["hope_equations/eq-NNN-..."],
+  "status": "v0.4.0"
+}''')
+
+# Insert trace edges (one per referenced equation)
+hades_db_insert(collection="nl_hecate_trace_edges", database="NL", data='''{
+  "_from": "hecate_specs/<name>", "_to": "hope_equations/eq-NNN-...", "rel": "implements"
+}''')
+```
+
+---
+
+### Step 3 — Code
+Implement against the spec file only. No features beyond spec scope.
+
+---
+
+### Step 4 — PR
+Submit pull request. Then transition the task:
+```python
+hades_task_review(database="NL", key="task_xxx")   # in_progress → in_review
+```
+
+---
+
+### Step 5 — Review loop (NEVER merge during this loop)
+```
+a. Wait 10 min after each push
+b. gh api repos/toddwbucy/NL_Hecate/pulls/N/comments   # check ALL comments
+c. Fix every comment → commit → push
+d. Wait 10 min → check again
+e. Repeat until CodeRabbit posts NO new actionable comments
+```
+Use across sessions if needed:
+```python
+hades_task_handoff(database="NL", key="task_xxx", done="...", remaining="...")
+```
+
+---
+
+### Step 6 — Graph gate (the acceptance test — must pass before merge)
+Ingest all new/modified source files. The `--claims` flag creates compliance edges atomically:
+```python
+hades_ingest(target="core/src/foo.rs", database="NL", id="foo-rs",
+             force=True, claims="CS-32:behavioral,CS-40:architectural")
+```
+
+Verify compliance — every required smell must have an edge:
+```python
+hades_db_aql(database="NL", query="""
+  FOR e IN nl_smell_compliance_edges
+    FILTER e._from == "arxiv_metadata/foo-rs"
+    RETURN {smell: e._to, enforcement: e.enforcement}
+""")
+```
+
+Check chunk/embedding health:
+```python
+hades_db_health(database="NL")
+```
+
+Add richer edges if needed (after ingest):
+```python
+hades_link(source_id="foo-rs", smell="CS-44", enforcement="architectural",
+           database="NL", summary="...", methods=["fn_name"])
+```
+
+**If any required smell is missing or violated → DO NOT MERGE. Fix and restart from Step 5.**
+
+---
+
+### Step 7 — Merge
+Only after graph gate passes clean. Squash merge to main. Close the task:
+```python
+hades_task_close(database="NL", key="task_xxx")
+```
+
+---
+
+### Binaries and artifacts
+When a compiled binary or artifact is produced (`.so`, `.whl`, CUDA fat binary):
+```python
+hades_db_insert(collection="hecate_artifacts", database="NL", data='''{
+  "_key": "<name>", "artifact_type": "wheel|so|fatbin",
+  "path": "relative/path", "produced_by_task": "persephone_tasks/task_xxx",
+  "build_hash": "<git-sha>", "created_at": "epoch:NNN",
+  "size_bytes": NNN, "notes": "..."
+}''')
+```
+Do NOT embed binary content. Link the artifact node to its source task.
+
+---
+
 ## When Working in This Repo
 
 - **Read `specs/contract.md` first** — it's the architectural overview and entry point
