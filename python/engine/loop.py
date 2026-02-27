@@ -141,7 +141,7 @@ def run_build(bcfg: BuildConfig):
                     print(f"  ERROR: cursor mismatch — {e}")
                     return
             else:
-                print(f"  Loaded checkpoint as warm-start (no cursor sidecar — data position reset to 0)")
+                print("  Loaded checkpoint as warm-start (no cursor sidecar — data position reset to 0)")
         else:
             params, cfg, build_state = nl_hecate.load_build_checkpoint(bcfg.load)
             if build_state is None:

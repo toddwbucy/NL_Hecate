@@ -20,7 +20,8 @@ edge = []
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-safetensors = "0.3"
+safetensors = "0.6"
+memmap2 = "0.9"
 
 [dev-dependencies]
 paste = "1"

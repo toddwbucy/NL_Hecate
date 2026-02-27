@@ -25,7 +25,8 @@ def convert_one(src: Path, dst: Path) -> None:
     try:
         params, cfg, build_state = nl_hecate.load_build_checkpoint(str(src))
         has_build_state = build_state is not None
-    except Exception:
+    except Exception as e:
+        print(f"  (load_build_checkpoint failed: {e}, retrying as params-only)", flush=True)
         params, cfg = nl_hecate.load_checkpoint(str(src))
         has_build_state = False
         build_state = None
@@ -35,13 +36,12 @@ def convert_one(src: Path, dst: Path) -> None:
     print(f"Writing  {dst} ...", flush=True)
     t0 = time.time()
     if has_build_state:
-        # Re-use the conductor/context from the build state via save_build_checkpoint
-        # We pass a dummy conductor/context here — the build_state dict will be embedded.
-        # Actually, save_checkpoint embeds build_state as JSON in __metadata__.
-        # We need to use the Rust-level save_build_checkpoint.
-        # Since we have the build_state dict, serialize via nl_hecate:
+        # WARNING: build_state (conductor position, stream cursor, context) cannot be
+        # round-tripped through Python — the Rust binding exposes no save_build_checkpoint.
+        # The converted checkpoint contains params + config only; resuming from it
+        # will reset the training cursor to step 0.
+        print("  WARNING: build_state not preserved in conversion — converted checkpoint is params-only")
         nl_hecate.save_checkpoint(str(dst), params, cfg)
-        print("  Note: build_state not preserved in conversion (use --build flag to resume)")
     else:
         nl_hecate.save_checkpoint(str(dst), params, cfg)
     save_time = time.time() - t0
@@ -49,20 +49,12 @@ def convert_one(src: Path, dst: Path) -> None:
     print(f"  Saved  {dst_mb:.0f} MB in {save_time:.1f}s  ({src.stat().st_size / dst.stat().st_size:.1f}x smaller)")
 
     # Copy cursor sidecar if it exists
-    for sidecar_suffix in [".json.cursor.json", ".cursor.json"]:
-        sidecar_src = Path(str(src) + sidecar_suffix.lstrip(src.suffix))
-        old_style = src.with_suffix(sidecar_suffix) if not sidecar_suffix.startswith(src.suffix) else None
-        # Try common sidecar patterns
-        for candidate in [
-            Path(str(src) + ".cursor.json"),
-            src.parent / (src.name + ".cursor.json"),
-        ]:
-            if candidate.exists():
-                sidecar_dst = Path(str(dst) + ".cursor.json")
-                import shutil
-                shutil.copy2(candidate, sidecar_dst)
-                print(f"  Copied cursor sidecar → {sidecar_dst.name}")
-                break
+    import shutil
+    sidecar_candidate = Path(str(src) + ".cursor.json")
+    if sidecar_candidate.exists():
+        sidecar_dst = Path(str(dst) + ".cursor.json")
+        shutil.copy2(sidecar_candidate, sidecar_dst)
+        print(f"  Copied cursor sidecar → {sidecar_dst.name}")
 
 
 def main():

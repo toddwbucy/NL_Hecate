@@ -24,6 +24,8 @@
 use std::io::{self, Write};
 use std::path::Path;
 
+use memmap2::Mmap;
+
 use crate::bf16::Bf16Storage;
 use crate::model::{BuildResumeState, MAGConfig, MAGParams, MemoryLevelParams, SWAParams};
 
@@ -181,7 +183,12 @@ pub fn save_safetensors(
 pub fn load_safetensors(
     path: &Path,
 ) -> io::Result<(MAGParams, MAGConfig, Option<BuildResumeState>)> {
-    let bytes = std::fs::read(path)?;
+    let file = std::fs::File::open(path)?;
+    // SAFETY: The file is read-only after training completes; no concurrent writes
+    // while the mmap is live. Pages are loaded on-demand by the OS — avoids the
+    // ~3.4 GB peak heap that std::fs::read would require for a 1.7 GB checkpoint.
+    let mmap = unsafe { Mmap::map(&file)? };
+    let bytes: &[u8] = &mmap;
 
     // ── Parse header ──────────────────────────────────────────────────
     if bytes.len() < 8 {
@@ -191,9 +198,13 @@ pub fn load_safetensors(
     if bytes.len() < 8 + header_len {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "safetensors: truncated header"));
     }
-    // Trim space padding before JSON parse
-    let header_json = bytes[8..8 + header_len].trim_ascii_end();
-    let header: serde_json::Value = serde_json::from_slice(header_json)
+    // Trim space padding (our saver pads with 0x20 to 8-byte alignment).
+    // Use trim_end() on str rather than trim_ascii_end() on &[u8] to stay
+    // compatible with Rust < 1.80 (trim_ascii_end stabilised in 1.80.0).
+    let header_slice = std::str::from_utf8(&bytes[8..8 + header_len])
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let header_json = header_slice.trim_end();
+    let header: serde_json::Value = serde_json::from_str(header_json)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     // ── Extract __metadata__ ─────────────────────────────────────────
@@ -398,10 +409,8 @@ mod tests {
         assert!(bytes.len() > 8 + header_len, "data region must follow header");
 
         // Header JSON should contain __metadata__ and tensor descriptors
-        let header_json = &bytes[8..8 + header_len];
-        let header: serde_json::Value = serde_json::from_slice(
-            header_json.trim_ascii_end()
-        ).unwrap();
+        let header_slice = std::str::from_utf8(&bytes[8..8 + header_len]).unwrap();
+        let header: serde_json::Value = serde_json::from_str(header_slice.trim_end()).unwrap();
         assert!(header.get("__metadata__").is_some());
         assert!(header.get("embed.weight").is_some());
 
