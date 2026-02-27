@@ -102,7 +102,9 @@ class BpeDataLoader:
             CursorMismatchError  if total_tokens mismatch (wrong dataset)
             CursorMismatchError  if content_hash mismatch (corruption or
                                  wrong file at same path)
-            CursorOutOfBounds    if position > total_tokens
+            CursorMismatchError  if content_hash non-zero but unverifiable
+                                 (malformed cursor: pos < seq_len)
+            CursorOutOfBounds    if position < 0 or position > total_tokens
         """
 ```
 

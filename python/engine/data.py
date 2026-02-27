@@ -143,7 +143,8 @@ class BpeDataLoader:
         Raises:
             CursorMismatchError: total_tokens mismatch (wrong dataset)
             CursorMismatchError: content_hash mismatch (corruption / wrong file)
-            CursorOutOfBounds:   position > total_tokens
+            CursorMismatchError: content_hash non-zero but unverifiable (malformed cursor)
+            CursorOutOfBounds:   position < 0 or position > total_tokens
         """
         saved_total = cursor.get("total_tokens", 0)
         if saved_total != self.total_tokens:
@@ -164,7 +165,12 @@ class BpeDataLoader:
         saved_hash = cursor.get("content_hash", 0)
         seq_len    = cursor.get("seq_len", 0)
         chunk_id   = cursor.get("chunk_id", 0)
-        if saved_hash != 0 and seq_len > 0 and pos >= seq_len:
+        if saved_hash != 0:
+            if seq_len <= 0 or pos < seq_len:
+                raise CursorMismatchError(
+                    f"Malformed cursor: content_hash is non-zero ({saved_hash:#010x}) "
+                    f"but pos={pos:,} < seq_len={seq_len:,} — cannot verify integrity."
+                )
             last_chunk = self.tokens[pos - seq_len : pos].tolist()
             actual_hash = _fnv1a_32(last_chunk)
             if actual_hash != saved_hash:
