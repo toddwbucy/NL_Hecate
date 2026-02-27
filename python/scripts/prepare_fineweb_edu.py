@@ -10,9 +10,9 @@ Unlike ShareGPT: no ChatML wrapping, no loss masking. Every token is a
 valid next-token prediction target (standard LM objective).
 
 Usage:
-    python data/prepare_fineweb_edu.py
-    python data/prepare_fineweb_edu.py --target_tokens 100_000_000
-    python data/prepare_fineweb_edu.py --min_score 4 --output data/fineweb_edu
+    python scripts/prepare_fineweb_edu.py
+    python scripts/prepare_fineweb_edu.py --target_tokens 100_000_000
+    python scripts/prepare_fineweb_edu.py --min_score 4 --output data/fineweb_edu
 """
 
 import argparse

@@ -12,8 +12,8 @@ sees easy grammar before harder content. No special separator tokens —
 the boundary array is the sole signal for document resets.
 
 Usage:
-    python data/prepare_shakedown.py --output data/shakedown_1b
-    python data/prepare_shakedown.py \
+    python scripts/prepare_shakedown.py --output data/shakedown_1b
+    python scripts/prepare_shakedown.py \
         --tinystories /path/to/stories_raw.txt \
         --cosmopedia /path/to/data.parquet \
         --output data/shakedown_1b \

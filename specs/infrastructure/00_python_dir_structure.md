@@ -75,8 +75,8 @@ python/
 │   ├── profile_tape.py
 │   ├── baseline_pytorch.py
 │   ├── launch_curriculum.sh
-│   ├── launch_sharegpt.sh
-│   └── validate_run.py
+│   └── launch_sharegpt.sh
+├── validate_run.py        # operational validation tool (keep at root)
 ├── configs/               # JSON build configurations
 ├── data/                  # token corpora and data subdirectories (no scripts)
 │   ├── fineweb_edu/
@@ -116,17 +116,23 @@ python/
 | `baseline_pytorch.py` | `scripts/baseline_pytorch.py` | Research/profiling script |
 | `launch_curriculum.sh` | `scripts/launch_curriculum.sh` | Launch script |
 | `launch_sharegpt.sh` | `scripts/launch_sharegpt.sh` | Launch script |
-| `validate_run.py` | `scripts/validate_run.py` | Operational script |
 | `logs/*.log` | `runs/llama_stacking_k4/` | Consolidated artifact sink |
 
 ## Path Reference Updates
 
-No source code path references require updates because:
-1. `engine/config.py` `BuildConfig` has `log_file: str | None = None` — the value is set at
-   runtime by config JSON, not hardcoded
-2. All existing config JSON files already use `runs/` as the `log_file` prefix
-3. No Python module imports from `data/prepare_*` (those are standalone scripts)
-4. `engine/loop.py` and `hecate.py` contain no hardcoded `logs/` references
+Updates required after the move:
+1. `engine/config.py` `BuildConfig` has `log_file: str | None = None` — no change needed;
+   value is set at runtime by config JSON, not hardcoded
+2. All existing config JSON files already use `runs/` as the `log_file` prefix — no change needed
+3. `engine/loop.py` and `hecate.py` contain no hardcoded `logs/` references — no change needed
+4. `tests/test_baseline.py`: `sys.path.insert` updated to point to `scripts/` for `baseline_pytorch`
+5. `scripts/profile_step.py`: `sys.path.insert` added to resolve `engine.*` from `python/` root
+6. `scripts/launch_sharegpt.sh`: `cd` changed to `python/` root; `data/prepare_sharegpt.py`
+   updated to `scripts/prepare_sharegpt.py`
+7. `scripts/launch_curriculum.sh`: `cd` changed to `python/` root; `data/prepare_curriculum.py`
+   updated to `scripts/prepare_curriculum.py`
+8. Docstring usage examples in all moved prepare scripts updated from `data/prepare_*` to
+   `scripts/prepare_*`
 
-The only log-file path change is that the two `.log` files from `logs/` are moved to
-`runs/llama_stacking_k4/` to keep them co-located with the JSONL for that run.
+`validate_run.py` is kept at `python/` root (not moved to `scripts/`) as an operational tool
+invoked directly by developers from the project root.

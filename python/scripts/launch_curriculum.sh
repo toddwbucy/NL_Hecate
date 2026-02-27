@@ -6,7 +6,8 @@
 # Runs on GPU1 (CUDA_VISIBLE_DEVICES=1) so it can run alongside ShareGPT on GPU0.
 
 set -euo pipefail
-cd "$(dirname "$0")"
+# cd to python/ root (parent of scripts/) so hecate.py, configs/, data/ resolve correctly
+cd "$(dirname "$0")/.."
 
 SMOKE=false
 for arg in "$@"; do
@@ -24,7 +25,7 @@ if [ ! -f "data/curriculum/meta.json" ]; then
     echo ""
     echo "Step 1: Preparing curriculum data..."
     echo "------------------------------------------------------------"
-    python3 data/prepare_curriculum.py \
+    python3 scripts/prepare_curriculum.py \
         --tokenizer data/sharegpt/tokenizer.json \
         --output data/curriculum
     echo ""

@@ -14,7 +14,13 @@ Usage:
     CUDA_VISIBLE_DEVICES=2 python profile_step.py
 """
 
+import os
+import sys
 import time
+
+# Add python/ root to sys.path so engine/ is importable from scripts/
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
 import nl_hecate
 from engine.config import BuildConfig
 from engine.data import BpeDataLoader

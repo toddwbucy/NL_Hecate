@@ -27,8 +27,8 @@ Tool call format (XML, maps to actual MCP tool signatures):
   </tool_result>
 
 Usage:
-  python data/prepare_sft.py
-  python data/prepare_sft.py --target_tokens 15_000_000 --output data/sft_phase2
+  python scripts/prepare_sft.py
+  python scripts/prepare_sft.py --target_tokens 15_000_000 --output data/sft_phase2
 """
 
 import argparse

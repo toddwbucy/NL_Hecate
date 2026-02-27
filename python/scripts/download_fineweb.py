@@ -7,9 +7,9 @@ concatenates text, encodes to UTF-8 bytes, and saves as a flat binary file where
 byte IS a token ID (vocab_size=256).
 
 Usage:
-    python data/download_fineweb.py                    # default: 100M bytes
-    python data/download_fineweb.py --target_bytes 50_000_000
-    python data/download_fineweb.py --output data/fineweb_50m.bin
+    python scripts/download_fineweb.py                    # default: 100M bytes
+    python scripts/download_fineweb.py --target_bytes 50_000_000
+    python scripts/download_fineweb.py --output data/fineweb_50m.bin
 """
 
 import argparse
