@@ -282,7 +282,7 @@ def main():
     print(f"  Train tokens:  {len(train_input):,}")
     print(f"  Val tokens:    {len(val_input):,}")
     print(f"  Documents:     {len(train_docs) + len(val_docs):,}")
-    print(f"  Mask ratio:    0.0% (all tokens are valid targets)")
+    print("  Mask ratio:    0.0% (all tokens are valid targets)")
     print(f"{'=' * 60}")
 
 

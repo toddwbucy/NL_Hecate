@@ -44,6 +44,12 @@ are organized across scripts, data, runs, and engine modules.
 - `checkpoints/` is explicitly excluded from this reorganization — it is an untracked runtime
   artifact directory managed by the build loop, not a source layout concern.
 
+**Source**:
+- Internal infrastructure migration. No paper equations traced. Motivated by organic growth of
+  `python/` as the project scaled from single-experiment to multi-experiment. Canonical layout
+  follows the principle that data, scripts, and run artifacts are three distinct concerns and
+  should not share directories.
+
 ---
 
 ## Directory Layout (post-migration canonical state)

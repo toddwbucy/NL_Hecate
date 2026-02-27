@@ -713,7 +713,7 @@ def main() -> None:
     print(f"    Learnable:    {n_train - n_masked_train:,}  ({1 - mask_ratio:.1%} of train)")
     print(f"    Masked:       {n_masked_train:,}  ({mask_ratio:.1%} of train)")
     print(f"  Val tokens:     {n_val:,}")
-    print(f"  Sources:")
+    print("  Sources:")
     print(f"    magicoder:    {len(mag_tok):,}")
     print(f"    metamath:     {len(math_tok):,}")
     print(f"    xlam:         {len(xl_tok):,}")

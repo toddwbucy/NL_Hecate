@@ -74,6 +74,8 @@ def profile_config(config_path: str, label: str, n_steps: int = 50,
         # Data load
         td0 = time.perf_counter()
         chunk = loader.next_chunk(bcfg.seq_len)
+        if chunk is None:
+            raise RuntimeError(f"Dataset too short for seq_len={bcfg.seq_len}")
         input_ids, target_ids = chunk
         td1 = time.perf_counter()
 
