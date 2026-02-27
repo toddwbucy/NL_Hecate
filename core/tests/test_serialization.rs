@@ -192,7 +192,7 @@ fn test_config_with_parallel() {
 fn test_save_load_checkpoint() {
     let dir = std::env::temp_dir().join("nl_hecate_test_checkpoint");
     std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("test_ckpt.json");
+    let path = dir.join("test_ckpt.safetensors");
 
     let cfg = MAGConfig::test_config_k2();
     let params = MAGParams::init(&cfg, 42);

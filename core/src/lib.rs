@@ -4,6 +4,7 @@ pub mod tape;
 pub mod opaque_adapters;
 pub mod swa;
 pub mod model;
+pub mod checkpoint;
 pub mod forward;
 pub mod backward;
 pub mod delta_rule;
