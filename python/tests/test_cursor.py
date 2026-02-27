@@ -161,11 +161,43 @@ def test_sidecar_written_and_read(tmp_path):
 # ── fnv1a hash consistency ────────────────────────────────────────────────────
 
 def test_fnv1a_deterministic():
-    """Same token list always produces the same hash."""
+    """Same token list always produces the same hash (two independent calls)."""
     tokens = [1, 2, 3, 4, 5]
-    assert _fnv1a_32(tokens) == _fnv1a_32(tokens)
+    h1 = _fnv1a_32(tokens)
+    h2 = _fnv1a_32(list(tokens))   # new list object
+    assert h1 == h2
 
 
 def test_fnv1a_different_inputs_differ():
     """Different token lists produce different hashes (probabilistic)."""
     assert _fnv1a_32([1, 2, 3]) != _fnv1a_32([3, 2, 1])
+
+
+# ── Wrap-around correctness ───────────────────────────────────────────────────
+
+def test_restore_after_wrap(tmp_path):
+    """restore() is correct after position wraps to 0.
+
+    seq_len = pos // chunk_id breaks after a wrap (e.g. pos=64, chunk_id=3
+    gives seq_len=21 instead of 64). Storing seq_len explicitly in the cursor
+    avoids this. This test would fail with the old derivation.
+    """
+    _make_dataset(tmp_path, n_tokens=128)
+    loader = BpeDataLoader(str(tmp_path))
+    seq_len = 64
+
+    loader.next_chunk(seq_len)   # pos=64,  chunk_id=1
+    loader.next_chunk(seq_len)   # pos=128, chunk_id=2
+    loader.next_chunk(seq_len)   # wraps: pos=64, chunk_id=3
+
+    cursor = loader.cursor()
+    assert cursor["position"] == 64
+    assert cursor["chunk_id"] == 3
+    assert cursor["seq_len"]  == 64   # stored, not derived
+
+    loader2 = BpeDataLoader(str(tmp_path))
+    loader2.restore(cursor)           # must not raise
+
+    assert loader2.position  == 64
+    assert loader2._chunk_id == 3
+    assert loader2._seq_len  == 64

@@ -91,6 +91,7 @@ class BpeDataLoader:
         self.total_tokens = len(self.tokens)
         self._chunk_id = 0
         self._last_hash = 0
+        self._seq_len = 0   # last seq_len passed to next_chunk; stored in cursor
 
     def next_chunk(self, seq_len: int) -> tuple[list[int], list[int]] | None:
         """Get next chunk of (input_ids, target_ids).
@@ -115,6 +116,7 @@ class BpeDataLoader:
 
         self._last_hash = _fnv1a_32(input_ids)
         self._chunk_id += 1
+        self._seq_len = seq_len
         self.position = end
         return input_ids, target_ids
 
@@ -123,12 +125,15 @@ class BpeDataLoader:
 
         The content_hash is a FNV-1a hash of the last chunk served.
         On restore, this is checked to detect wrong dataset or corruption.
+        seq_len is stored explicitly — recovery from pos//chunk_id breaks
+        after position wraps.
         """
         return {
             "position":     self.position,
             "total_tokens": self.total_tokens,
             "content_hash": self._last_hash,
             "chunk_id":     self._chunk_id,
+            "seq_len":      self._seq_len,
             "dataset_path": str(self._path),
         }
 
@@ -153,24 +158,25 @@ class BpeDataLoader:
                 f"Cursor position {pos:,} exceeds dataset size {self.total_tokens:,}."
             )
 
-        # Validate content hash immediately by re-reading the last chunk.
-        # seq_len is recoverable: all chunks are uniform, so seq_len = pos // chunk_id.
+        # Validate content hash immediately using the stored seq_len.
+        # seq_len is stored explicitly in the cursor (not derived from pos//chunk_id,
+        # which breaks after position wraps).
         saved_hash = cursor.get("content_hash", 0)
+        seq_len    = cursor.get("seq_len", 0)
         chunk_id   = cursor.get("chunk_id", 0)
-        if saved_hash != 0 and chunk_id > 0 and pos > 0:
-            seq_len = pos // chunk_id
-            if seq_len > 0:
-                last_chunk = self.tokens[pos - seq_len : pos].tolist()
-                actual_hash = _fnv1a_32(last_chunk)
-                if actual_hash != saved_hash:
-                    raise CursorMismatchError(
-                        f"Content hash mismatch at position {pos:,}: "
-                        f"expected {saved_hash:#010x}, got {actual_hash:#010x}. "
-                        "Wrong dataset or corrupted file?"
-                    )
+        if saved_hash != 0 and seq_len > 0 and pos >= seq_len:
+            last_chunk = self.tokens[pos - seq_len : pos].tolist()
+            actual_hash = _fnv1a_32(last_chunk)
+            if actual_hash != saved_hash:
+                raise CursorMismatchError(
+                    f"Content hash mismatch at position {pos:,}: "
+                    f"expected {saved_hash:#010x}, got {actual_hash:#010x}. "
+                    "Wrong dataset or corrupted file?"
+                )
 
-        self.position  = pos
-        self._chunk_id = chunk_id
+        self.position   = pos
+        self._chunk_id  = chunk_id
+        self._seq_len   = seq_len
         self._last_hash = saved_hash
 
     def __len__(self) -> int:

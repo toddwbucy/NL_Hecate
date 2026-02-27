@@ -1,6 +1,6 @@
 # ContextStream Cursor Serialization
 
-```
+```text
 CONTRACT
   Purpose:    A checkpoint must save three things: params + M state + cursor.
               Currently checkpoints save params + M state. The cursor is missing.
@@ -111,7 +111,7 @@ class BpeDataLoader:
 Sidecar path: `<checkpoint_path>.cursor.json`
 
 Examples:
-```
+```text
 checkpoints/model_step30000.json         ← params + M state
 checkpoints/model_step30000.json.cursor.json   ← cursor
 ```
