@@ -11,7 +11,7 @@ from typing import Any, Optional
 import nl_hecate
 
 from engine.config import BuildConfig, cosine_lr
-from engine.data import BpeDataLoader, CursorMismatchError, DEMO_TEXT, MmapTokenStream
+from engine.data import BpeDataLoader, CursorMismatchError, CursorOutOfBounds, DEMO_TEXT, MmapTokenStream
 from engine.evaluation import (
     evaluate, evaluate_numpy, print_level_metrics,
     eval_coherence_samples, generate_samples,
@@ -137,7 +137,7 @@ def run_build(bcfg: BuildConfig):
                     bpe_loader.restore(cursor)
                     print(f"  Resuming from step {resume_step}")
                     print(f"  Stream position: {cursor['position']:,} / {cursor['total_tokens']:,} tokens")
-                except CursorMismatchError as e:
+                except (CursorMismatchError, CursorOutOfBounds) as e:
                     print(f"  ERROR: cursor mismatch — {e}")
                     return
             else:

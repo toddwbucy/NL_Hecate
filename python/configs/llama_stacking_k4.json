@@ -5,7 +5,7 @@
     "head_dim": 64,
     "seq_len": 512,
     "window_size": 512,
-    "vocab_size": 128256,
+    "vocab_size": 32000,
     "k": 4,
     "chunk_sizes": [1, 8, 64, 512],
     "memory_rule": "swiglu_mlp",
@@ -26,7 +26,7 @@
     "seed": 42
   },
   "data": {
-    "path": "data/fineweb_edu_llama3",
+    "path": "data/fineweb_edu",
     "format": "sharegpt"
   },
   "donor_layers": [0, 5, 10, 15],

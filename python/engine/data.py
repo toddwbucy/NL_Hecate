@@ -5,6 +5,26 @@ import mmap
 from pathlib import Path
 
 
+class CursorMismatchError(Exception):
+    """Raised when a cursor sidecar does not match the current dataset."""
+    pass
+
+
+class CursorOutOfBounds(Exception):
+    """Raised when cursor position exceeds the current dataset size."""
+    pass
+
+
+def _fnv1a_32(tokens: list[int]) -> int:
+    """FNV-1a 32-bit hash over a list of token IDs. Integrity canary only."""
+    h = 0x811c9dc5
+    for tok in tokens:
+        for byte in tok.to_bytes(4, "little"):
+            h ^= byte
+            h = (h * 0x01000193) & 0xFFFFFFFF
+    return h
+
+
 DEMO_TEXT = (
     "the cat sat on the mat. "
     "the dog ran in the park. "
@@ -57,7 +77,8 @@ class BpeDataLoader:
     def __init__(self, data_dir: str, split: str = "train"):
         import numpy as np
         data_path = Path(data_dir)
-        self.tokens = np.load(data_path / f"{split}_tokens.npy")
+        self._path = (data_path / f"{split}_tokens.npy").resolve()
+        self.tokens = np.load(self._path)
         self.targets = np.load(data_path / f"{split}_targets.npy")
         if len(self.tokens) != len(self.targets):
             raise ValueError(
@@ -68,6 +89,8 @@ class BpeDataLoader:
         self.vocab_size = self.meta["vocab_size"]
         self.position = 0
         self.total_tokens = len(self.tokens)
+        self._chunk_id = 0
+        self._last_hash = 0
 
     def next_chunk(self, seq_len: int) -> tuple[list[int], list[int]] | None:
         """Get next chunk of (input_ids, target_ids).
@@ -90,8 +113,65 @@ class BpeDataLoader:
         for t in raw_targets:
             target_ids.append(int(t) if t >= 0 else self.vocab_size)
 
+        self._last_hash = _fnv1a_32(input_ids)
+        self._chunk_id += 1
         self.position = end
         return input_ids, target_ids
+
+    def cursor(self) -> dict:
+        """Return a serializable cursor capturing exact stream position.
+
+        The content_hash is a FNV-1a hash of the last chunk served.
+        On restore, this is checked to detect wrong dataset or corruption.
+        """
+        return {
+            "position":     self.position,
+            "total_tokens": self.total_tokens,
+            "content_hash": self._last_hash,
+            "chunk_id":     self._chunk_id,
+            "dataset_path": str(self._path),
+        }
+
+    def restore(self, cursor: dict) -> None:
+        """Seek to saved cursor position and validate dataset integrity.
+
+        Raises:
+            CursorMismatchError: total_tokens mismatch (wrong dataset)
+            CursorMismatchError: content_hash mismatch (corruption / wrong file)
+            CursorOutOfBounds:   position > total_tokens
+        """
+        saved_total = cursor.get("total_tokens", 0)
+        if saved_total != self.total_tokens:
+            raise CursorMismatchError(
+                f"Dataset size mismatch: checkpoint has {saved_total:,} tokens, "
+                f"current dataset has {self.total_tokens:,}. Wrong dataset?"
+            )
+
+        pos = cursor.get("position", 0)
+        if pos > self.total_tokens:
+            raise CursorOutOfBounds(
+                f"Cursor position {pos:,} exceeds dataset size {self.total_tokens:,}."
+            )
+
+        # Validate content hash immediately by re-reading the last chunk.
+        # seq_len is recoverable: all chunks are uniform, so seq_len = pos // chunk_id.
+        saved_hash = cursor.get("content_hash", 0)
+        chunk_id   = cursor.get("chunk_id", 0)
+        if saved_hash != 0 and chunk_id > 0 and pos > 0:
+            seq_len = pos // chunk_id
+            if seq_len > 0:
+                last_chunk = self.tokens[pos - seq_len : pos].tolist()
+                actual_hash = _fnv1a_32(last_chunk)
+                if actual_hash != saved_hash:
+                    raise CursorMismatchError(
+                        f"Content hash mismatch at position {pos:,}: "
+                        f"expected {saved_hash:#010x}, got {actual_hash:#010x}. "
+                        "Wrong dataset or corrupted file?"
+                    )
+
+        self.position  = pos
+        self._chunk_id = chunk_id
+        self._last_hash = saved_hash
 
     def __len__(self) -> int:
         return self.total_tokens
