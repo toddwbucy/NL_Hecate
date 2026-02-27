@@ -1,6 +1,7 @@
 """Build loop: stateful CMS training with optional GPU acceleration."""
 
 import gc
+import json
 import math
 import os
 import time
@@ -10,7 +11,7 @@ from typing import Any, Optional
 import nl_hecate
 
 from engine.config import BuildConfig, cosine_lr
-from engine.data import BpeDataLoader, DEMO_TEXT, MmapTokenStream
+from engine.data import BpeDataLoader, CursorMismatchError, DEMO_TEXT, MmapTokenStream
 from engine.evaluation import (
     evaluate, evaluate_numpy, print_level_metrics,
     eval_coherence_samples, generate_samples,
@@ -24,6 +25,14 @@ from engine.tokenizer import ByteTokenizer, BpeTokenizer, load_tokenizer
 
 def _encode_bytes(text: str) -> list[int]:
     return list(text.encode("utf-8"))
+
+
+def _safetensors_path(path_str: str) -> str:
+    """Convert .json checkpoint path to .safetensors (transparent migration).
+    Non-.json paths are returned unchanged."""
+    if path_str.endswith(".json"):
+        return path_str[:-5] + ".safetensors"
+    return path_str
 
 
 def run_build(bcfg: BuildConfig):
@@ -112,12 +121,27 @@ def run_build(bcfg: BuildConfig):
     if bcfg.load:
         print(f"Loading checkpoint: {bcfg.load}")
         if use_bpe:
-            # BPE checkpoints: params + cfg only, no build state.
-            # Conductor and data position are NOT restored — this is a warm-start,
-            # not a true resume. Step count restarts from 0 to avoid desync.
-            params, cfg = nl_hecate.load_checkpoint(bcfg.load)
-            resume_step = 0
-            print(f"  Loaded BPE checkpoint as warm-start (conductor/data state reset, step=0)")
+            # BPE path: try build checkpoint first, fall back to serving checkpoint.
+            # If a cursor sidecar exists, this is a true resume (same data, same run).
+            # If no sidecar, this is a warm-start (different run / donor weights).
+            try:
+                params, cfg, build_state = nl_hecate.load_build_checkpoint(bcfg.load)
+                resume_step = build_state["global_step"] if build_state else 0
+            except Exception:
+                params, cfg = nl_hecate.load_checkpoint(bcfg.load)
+                resume_step = 0
+            sidecar = Path(str(bcfg.load) + ".cursor.json")
+            if sidecar.exists() and bpe_loader is not None:
+                cursor = json.loads(sidecar.read_text())
+                try:
+                    bpe_loader.restore(cursor)
+                    print(f"  Resuming from step {resume_step}")
+                    print(f"  Stream position: {cursor['position']:,} / {cursor['total_tokens']:,} tokens")
+                except CursorMismatchError as e:
+                    print(f"  ERROR: cursor mismatch — {e}")
+                    return
+            else:
+                print(f"  Loaded checkpoint as warm-start (no cursor sidecar — data position reset to 0)")
         else:
             params, cfg, build_state = nl_hecate.load_build_checkpoint(bcfg.load)
             if build_state is None:
@@ -593,13 +617,16 @@ def run_build(bcfg: BuildConfig):
             if gpu_model is not None:
                 params = gpu_model.to_host_params()
                 context = gpu_model.to_host_context()
-            p = Path(bcfg.save_path)
+            p = Path(_safetensors_path(bcfg.save_path))
             ckpt_path = str(p.with_stem(f"{p.stem}_step{step}"))
             os.makedirs(os.path.dirname(ckpt_path) or ".", exist_ok=True)
             if use_bpe:
                 nl_hecate.save_checkpoint(ckpt_path, params, cfg)
             else:
                 nl_hecate.save_build_checkpoint(ckpt_path, params, cfg, conductor, context)
+            if bpe_loader is not None:
+                sidecar = Path(str(ckpt_path) + ".cursor.json")
+                sidecar.write_text(json.dumps(bpe_loader.cursor(), indent=2))
             print(f"  [checkpoint saved: {ckpt_path}]")
 
             # S4-M7: Checkpoint roundtrip verification
@@ -707,11 +734,15 @@ def run_build(bcfg: BuildConfig):
         params = gpu_model.to_host_params()
         if not use_bpe:
             context = gpu_model.to_host_context()
-    os.makedirs(os.path.dirname(bcfg.save_path) or ".", exist_ok=True)
+    final_path = _safetensors_path(bcfg.save_path)
+    os.makedirs(os.path.dirname(final_path) or ".", exist_ok=True)
     if use_bpe:
-        nl_hecate.save_checkpoint(bcfg.save_path, params, cfg)
+        nl_hecate.save_checkpoint(final_path, params, cfg)
     else:
-        nl_hecate.save_build_checkpoint(bcfg.save_path, params, cfg, conductor, context)
+        nl_hecate.save_build_checkpoint(final_path, params, cfg, conductor, context)
+    if bpe_loader is not None:
+        sidecar = Path(str(final_path) + ".cursor.json")
+        sidecar.write_text(json.dumps(bpe_loader.cursor(), indent=2))
 
     # ── Summary ───────────────────────────────────────────────────────
     print(f"\n{'=' * 60}")
@@ -725,7 +756,7 @@ def run_build(bcfg: BuildConfig):
         avg_first = sum(losses[:10]) / min(10, len(losses))
         avg_last = sum(losses[-10:]) / min(10, len(losses))
         print(f"  Avg loss:  first10={avg_first:.4f}, last10={avg_last:.4f}")
-    print(f"  Saved:     {bcfg.save_path}")
+    print(f"  Saved:     {final_path}")
     print(f"{'=' * 60}")
 
     if jsonl:
