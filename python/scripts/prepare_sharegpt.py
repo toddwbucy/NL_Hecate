@@ -8,9 +8,9 @@ on user turns.
 
 Usage:
     pip install datasets tokenizers numpy
-    python data/prepare_sharegpt.py
-    python data/prepare_sharegpt.py --vocab_size 32000 --output data/sharegpt
-    python data/prepare_sharegpt.py --test  # unit tests only, no download
+    python scripts/prepare_sharegpt.py
+    python scripts/prepare_sharegpt.py --vocab_size 32000 --output data/sharegpt
+    python scripts/prepare_sharegpt.py --test  # unit tests only, no download
 
 Output files:
     tokenizer.json     — trained BPE tokenizer (HuggingFace tokenizers format)

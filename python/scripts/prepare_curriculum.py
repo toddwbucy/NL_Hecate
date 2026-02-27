@@ -24,7 +24,7 @@ Uses the same tokenizer as ShareGPT (data/sharegpt/tokenizer.json) for
 clean A/B comparison.  Output format matches BpeDataLoader expectations.
 
 Usage:
-    python data/prepare_curriculum.py \\
+    python scripts/prepare_curriculum.py \\
         --tokenizer data/sharegpt/tokenizer.json \\
         --output data/curriculum
 """

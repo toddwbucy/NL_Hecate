@@ -13,9 +13,9 @@ Output: data/fineweb_edu_llama3/
   meta.json   — {"vocab_size": 128256, "train_tokens": N, "val_tokens": M}
 
 Usage:
-    python data/prepare_fineweb_edu_llama3.py
-    python data/prepare_fineweb_edu_llama3.py --target_tokens 100_000_000
-    python data/prepare_fineweb_edu_llama3.py --output data/fineweb_edu_llama3
+    python scripts/prepare_fineweb_edu_llama3.py
+    python scripts/prepare_fineweb_edu_llama3.py --target_tokens 100_000_000
+    python scripts/prepare_fineweb_edu_llama3.py --output data/fineweb_edu_llama3
 """
 
 from __future__ import annotations

@@ -5,9 +5,9 @@ import math
 torch = __import__("pytest").importorskip("torch")
 import nl_hecate
 
-# Import from baseline module (parent dir)
+# Import from baseline module (scripts/ dir)
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 from baseline_pytorch import (
     load_weights_from_rust,
     forward_pytorch,

@@ -5,7 +5,8 @@
 # --smoke: Run a quick 100-step smoke test instead of the full 100K run.
 
 set -euo pipefail
-cd "$(dirname "$0")"
+# cd to python/ root (parent of scripts/) so hecate.py, configs/, data/ resolve correctly
+cd "$(dirname "$0")/.."
 
 STEPS=""
 SMOKE=false
@@ -28,7 +29,7 @@ if [ ! -f "data/sharegpt/meta.json" ]; then
     echo ""
     echo "Step 1: Preparing ShareGPT data..."
     echo "------------------------------------------------------------"
-    python3 data/prepare_sharegpt.py
+    python3 scripts/prepare_sharegpt.py
     echo ""
 else
     echo ""
