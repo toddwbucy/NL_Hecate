@@ -112,11 +112,19 @@ carry useful signal.
 
 ### Definition: Excess Same-Token Rate (ESTR) at Lag L
 
-> **Paper trace**: The lag values [1, 8, 64, 512] are the CMS frequency periods
-> from HOPE (2512.24695) §3, `hope_equations/eq-097-hope-cms-chain`. The 4096-lag
-> background is an internal diagnostic baseline. ESTR is a custom proxy metric —
-> not from the HOPE paper — chosen because full-vocabulary PPMI is computationally
-> infeasible at V=32K and flat at all lags for BPE-tokenized corpora.
+> **Paper trace**:
+> - **Lag values [1, 8, 64, 512]**: CMS frequency periods from HOPE (2512.24695) §3,
+>   HADES: `hope_equations/eq-097-hope-cms-chain`, `hope_equations/eq-093-freq-transfer`
+> - **Background lag 4096**: Internal diagnostic baseline — no paper source. Chosen as
+>   a lag beyond most document boundaries so topic-frequency bias is the only remaining
+>   signal.
+> - **ESTR formula** (`same_rate / expected_collision - 1`): Custom proxy metric. The
+>   expected collision rate `sum_v P(v)^2` is the standard birthday-problem self-overlap
+>   (Cover & Thomas, *Elements of Information Theory*, §2.4). No HADES record — ESTR
+>   is not from the NL paper set.
+> - **Pass-criterion ratio 2.0×**: Empirically calibrated threshold, not from any paper.
+>   Chosen so C4 (ratio=7.86×) clearly passes and FineWeb-Edu (ratio=1.00×) clearly
+>   fails. No HADES record.
 
 For a tokenized corpus stream X = [x_0, x_1, ...], define the **Excess
 Same-Token Rate at lag L** as:
@@ -156,12 +164,12 @@ all lags. ESTR with stop-word exclusion isolates content-word repetition
 ```rust
 // Stop-word-excluded same-token rate (practical ESTR estimation)
 // Implemented in python/tools/lag_mi.py::_compute_estr
-fn compute_estr_practical(
+fn compute_estr_practical<R: Rng + ?Sized>(
     tokens: &[u32],
     lag: usize,
     exclude_top_n: usize,  // default: 200
     n_samples: usize,       // default: 500_000
-    rng: &mut Rng,
+    rng: &mut R,
 ) -> f64 {
     let freq = np_bincount(tokens);
     let stop_ids: HashSet<u32> = argsort_desc(&freq)[..exclude_top_n].collect();
@@ -202,8 +210,14 @@ fn passes_selection(estr: &HashMap<usize, f64>, threshold: f64) -> bool {
     let estr_512 = estr[&512];           // L3 CMS period — the signal lag
     let estr_bg  = estr[&4096];          // background / null reference
 
-    // Non-positive background forces FAIL: ambiguous / broken metric
-    let bg_safe = estr_bg.max(1e-12);
+    // Non-positive background is an immediate FAIL: estr_bg ≤ 0 means the
+    // metric produced no meaningful background signal (broken computation or
+    // degenerate corpus). Clamping to 1e-12 would produce a huge ratio and
+    // incorrectly PASS a corpus with zero/negative background.
+    if estr_bg <= 0.0 {
+        return false;
+    }
+    let bg_safe = estr_bg.max(1e-12);    // defensive floor (unreachable after guard)
     let ratio = estr_512 / bg_safe;
 
     // PASS: signal exists AND exceeds threshold × background
