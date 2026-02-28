@@ -234,32 +234,42 @@ impl GpuMAGParams {
 // ══════════════════════════════════════════════════════════════════════
 
 /// Per-level M matrices resident on GPU. Persists across steps.
-/// For matrix rules (Delta/Titans/Hebbian): each level has d*d floats.
+///
+/// With batch_size > 1 each level buffer holds [batch_size * d*d] floats:
+/// slot b's M matrix occupies bytes [b*d*d .. (b+1)*d*d] within the buffer.
+/// Slot 0 is the "primary" context used for checkpointing and inference.
+///
+/// For matrix rules (Delta/Titans/Hebbian): each level has batch_size * d*d floats.
 #[cfg(feature = "cuda")]
 pub struct GpuContextState {
-    /// Per-level M matrices on GPU. Each is [d*d] (or mem_size for MLP rules).
+    /// Per-level M matrices on GPU. Each is [batch_size * d*d].
     pub memory: Vec<GpuBuf<f32>>,
     pub d: usize,
+    pub batch_size: usize,
 }
 
 #[cfg(feature = "cuda")]
 impl GpuContextState {
-    /// Initialize zero M matrices for k levels, each d*d.
-    pub fn new(k: usize, d: usize) -> Self {
-        let memory = (0..k).map(|_| GpuBuf::zeros(d * d)).collect();
-        GpuContextState { memory, d }
+    /// Initialize zero M matrices for k levels, each [batch_size * d*d].
+    pub fn new(k: usize, d: usize, batch_size: usize) -> Self {
+        let memory = (0..k).map(|_| GpuBuf::zeros(batch_size * d * d)).collect();
+        GpuContextState { memory, d, batch_size }
     }
 
-    /// Download to host ContextState (for checkpoint).
+    /// Download slot-0 M to host ContextState (for checkpoint / inference).
+    /// Only the primary context (slot 0) is exported — sufficient for restore.
     pub fn to_host(&self, k: usize) -> crate::conductor::ContextState {
+        let dd = self.d * self.d;
         let mut ctx = crate::conductor::ContextState::new(k, self.d);
         for (i, gpu_mem) in self.memory.iter().enumerate() {
-            gpu_mem.copy_to_host(&mut ctx.memory[i]);
+            // Copy only slot-0: first d*d floats of the [batch_size * d*d] buffer.
+            gpu_mem.slice(0, dd).copy_to_host(&mut ctx.memory[i]);
         }
         ctx
     }
 
     /// Zero all memory matrices on GPU in-place (cudaMemset).
+    /// Zeros all batch_size * d*d floats per level.
     /// Used at document boundaries — same semantics as ContextState::reset().
     pub fn reset(&mut self) {
         for buf in &self.memory {
@@ -267,11 +277,29 @@ impl GpuContextState {
         }
     }
 
-    /// Upload from host ContextState (for restore).
-    pub fn from_host_context(host: &crate::conductor::ContextState) -> Self {
-        let memory = host.memory.iter()
-            .map(|m| GpuBuf::from_host(m))
-            .collect();
-        GpuContextState { memory, d: host.d }
+    /// Upload from host ContextState and broadcast to all batch_size slots.
+    /// Used for checkpoint restore: host M is written to every slot so all
+    /// batch elements start from the same saved context.
+    pub fn from_host_context(host: &crate::conductor::ContextState, batch_size: usize) -> Self {
+        let d = host.d;
+        let dd = d * d;
+        let bytes = dd * 4;
+        let memory = host.memory.iter().map(|m| {
+            let mut buf = GpuBuf::<f32>::zeros(batch_size * dd);
+            // Upload host M once, then D2D-copy to all slots.
+            let slot0 = GpuBuf::<f32>::from_host(m);
+            for b in 0..batch_size {
+                unsafe {
+                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        (buf.ptr() as *mut u8).add(b * bytes) as *mut std::ffi::c_void,
+                        slot0.as_ptr() as *const std::ffi::c_void,
+                        bytes,
+                    );
+                    assert_eq!(rc, 0, "from_host_context D2D copy failed for slot {b}");
+                }
+            }
+            buf
+        }).collect();
+        GpuContextState { memory, d, batch_size }
     }
 }

@@ -1503,13 +1503,17 @@ struct GpuModel {
 #[cfg(feature = "cuda")]
 #[pymethods]
 impl GpuModel {
-    /// Create a GPU-resident model from a MAGConfig and random seed.
-    /// All parameters are uploaded to GPU once.
+    /// Create a GPU-resident model from a MAGConfig, random seed, and batch_size.
+    /// All parameters are uploaded to GPU once. batch_size determines how many
+    /// independent M-state slots are allocated in GpuContextState.
     #[new]
-    fn new(cfg: &MAGConfig, seed: u64) -> PyResult<Self> {
+    #[pyo3(signature = (cfg, seed, batch_size=1))]
+    fn new(cfg: &MAGConfig, seed: u64, batch_size: usize) -> PyResult<Self> {
         let host_params = nl_hecate_core::model::MAGParams::init(&cfg.inner, seed);
         let gpu_params = nl_hecate_core::gpu_params::GpuMAGParams::from_host(&host_params);
-        let gpu_context = nl_hecate_core::gpu_params::GpuContextState::new(cfg.inner.k, cfg.inner.swa.d_model);
+        let gpu_context = nl_hecate_core::gpu_params::GpuContextState::new(
+            cfg.inner.k, cfg.inner.swa.d_model, batch_size,
+        );
         Ok(GpuModel {
             params: gpu_params,
             context: gpu_context,
@@ -1521,10 +1525,14 @@ impl GpuModel {
     }
 
     /// Create from existing host params (e.g., loaded from checkpoint).
+    /// batch_size controls how many M-state slots are allocated for batched training.
     #[staticmethod]
-    fn from_params(params: &MAGParams, cfg: &MAGConfig) -> PyResult<Self> {
+    #[pyo3(signature = (params, cfg, batch_size=1))]
+    fn from_params(params: &MAGParams, cfg: &MAGConfig, batch_size: usize) -> PyResult<Self> {
         let gpu_params = nl_hecate_core::gpu_params::GpuMAGParams::from_host(&params.inner);
-        let gpu_context = nl_hecate_core::gpu_params::GpuContextState::new(cfg.inner.k, cfg.inner.swa.d_model);
+        let gpu_context = nl_hecate_core::gpu_params::GpuContextState::new(
+            cfg.inner.k, cfg.inner.swa.d_model, batch_size,
+        );
         Ok(GpuModel {
             params: gpu_params,
             context: gpu_context,
@@ -1857,7 +1865,7 @@ impl GpuModel {
                 ctx.inner.memory.len(), ctx.inner.d, self.cfg.k, self.cfg.swa.d_model
             )));
         }
-        self.context = nl_hecate_core::gpu_params::GpuContextState::from_host_context(&ctx.inner);
+        self.context = nl_hecate_core::gpu_params::GpuContextState::from_host_context(&ctx.inner, self.context.batch_size);
         Ok(())
     }
 

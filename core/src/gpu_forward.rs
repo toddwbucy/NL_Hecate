@@ -432,9 +432,9 @@ fn gpu_memory_forward(
         );
     }
 
-    // Broadcast context_m [dd] → batch_m_initial [bs * dd]
-    let batch_m_initial = broadcast_m_initial(context_m, bs, dd);
-    let m_initial_slice = batch_m_initial.slice(0, bs * dd);
+    // context_m is [bs * dd] — slot b's initial M occupies offset b*dd.
+    // No broadcast: pass context_m directly; the kernel reads m_initial + b*dd per element.
+    let m_initial_slice = context_m.slice(0, bs * dd);
     let m_norm_max = cfg.max_m_norm(level);
 
     match (cfg.checkpoint_interval, cfg.memory_rule) {
@@ -447,15 +447,22 @@ fn gpu_memory_forward(
                 &m_initial_slice, &mut m_states, &mut y, s, d, bs,
             );
             crate::dispatch::cuda_sync();
-            // Carry forward element-0's final M: at offset s*dd in the first batch element
-            copy_final_m(&m_states, context_m, s * dd, dd);
-            unsafe { crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d_i32, m_norm_max); }
+            // Copy all bs slots' final M back: element b's final M at m_states offset b*(s+1)*dd + s*dd.
+            copy_final_m_batch(&m_states, context_m, s, dd, bs);
+            for b in 0..bs {
+                unsafe {
+                    crate::cuda_ffi::m_norm_clamp_f32_cuda(
+                        (context_m.ptr() as *mut u8).add(b * dd * 4) as *mut f32,
+                        d_i32, m_norm_max,
+                    );
+                }
+            }
             (y, GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states })
         }
         (None, MemoryRuleKind::TitansLMM) => {
             // Compute eta gate for all bs*s tokens (Titans uses 3 gates: alpha, theta, eta)
             let eta = compute_eta(level_params, &k_mem, &v_mem, bs * s, d);
-            // s_initial is all-zeros per batch element; broadcast batch_m_initial already covers M
+            // s_initial: all-zeros per batch element (bs * dd floats)
             let batch_s_initial = GpuBuf::zeros(bs * dd);
             let s_initial_slice = batch_s_initial.slice(0, bs * dd);
             let mut m_states = GpuBuf::zeros(bs * (s + 1) * dd);
@@ -467,8 +474,15 @@ fn gpu_memory_forward(
                 &mut m_states, &mut s_states, &mut y, s, d, bs,
             );
             crate::dispatch::cuda_sync();
-            copy_final_m(&m_states, context_m, s * dd, dd);
-            unsafe { crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d_i32, m_norm_max); }
+            copy_final_m_batch(&m_states, context_m, s, dd, bs);
+            for b in 0..bs {
+                unsafe {
+                    crate::cuda_ffi::m_norm_clamp_f32_cuda(
+                        (context_m.ptr() as *mut u8).add(b * dd * 4) as *mut f32,
+                        d_i32, m_norm_max,
+                    );
+                }
+            }
             (y, GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states, s_states })
         }
         (None, MemoryRuleKind::HebbianRule) => {
@@ -480,7 +494,8 @@ fn gpu_memory_forward(
                 &m_initial_slice, &mut m_states, &mut y, s, d,
             );
             crate::dispatch::cuda_sync();
-            copy_final_m(&m_states, context_m, s * dd, dd);
+            // Hebbian is bs=1 only (asserted above), single slot copy.
+            copy_final_m_batch(&m_states, context_m, s, dd, 1);
             unsafe { crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d_i32, m_norm_max); }
             (y, GpuMemoryCache::Hebbian { k_mem, v_mem, q_mem, alpha, m_states })
         }
@@ -563,28 +578,39 @@ fn gpu_memory_forward(
     }
 }
 
-/// Broadcast a single M matrix [dd] into a batch buffer [batch_size * dd] via D2D copies.
+/// Copy all batch elements' final M back to their respective context slots.
 ///
-/// All B batch elements start with an identical copy of the context M. After the forward
-/// pass, element-0's final M is written back to context via copy_final_m.
+/// Element b's final M is at m_states offset: `b * (seq_len+1) * dd + seq_len * dd`
+/// It is written to context_m at offset: `b * dd`
+///
+/// This replaces the old `copy_final_m` (element-0 only) with a full batch copy.
+/// Preserves sequential context continuity: each slot sees its own stream across steps.
 #[cfg(feature = "cuda")]
-fn broadcast_m_initial(context_m: &GpuBuf<f32>, batch_size: usize, dd: usize) -> GpuBuf<f32> {
-    let mut batch_m = GpuBuf::<f32>::zeros(batch_size * dd);
+fn copy_final_m_batch(
+    states: &GpuBuf<f32>,
+    context_m: &mut GpuBuf<f32>,
+    seq_len: usize,
+    dd: usize,
+    batch_size: usize,
+) {
     let bytes = dd * 4;
     for b in 0..batch_size {
+        let src_offset = (b * (seq_len + 1) + seq_len) * dd;
+        let dst_offset = b * dd;
+        let m_final = states.slice(src_offset, dd);
         unsafe {
             let rc = gpu_buf_memcpy_d2d(
-                (batch_m.ptr() as *mut u8).add(b * bytes) as *mut std::ffi::c_void,
-                context_m.as_ptr() as *const std::ffi::c_void,
+                (context_m.ptr() as *mut u8).add(dst_offset * 4) as *mut std::ffi::c_void,
+                m_final.as_ptr() as *const std::ffi::c_void,
                 bytes,
             );
-            assert_eq!(rc, 0, "broadcast_m_initial D2D copy failed for batch element {b}");
+            assert_eq!(rc, 0, "copy_final_m_batch D2D failed for slot {b}");
         }
     }
-    batch_m
 }
 
-/// Copy final M state from states buffer to context (D2D).
+/// Copy final M state from a checkpointed states buffer to context (D2D).
+/// Used only for checkpointed paths (bs=1 only).
 #[cfg(feature = "cuda")]
 #[inline]
 fn copy_final_m(states: &GpuBuf<f32>, context_m: &mut GpuBuf<f32>, offset: usize, dd: usize) {
