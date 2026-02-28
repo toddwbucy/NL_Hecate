@@ -77,6 +77,9 @@ class BuildConfig:
     # Gradient checkpointing (VRAM optimization for memory rules)
     checkpoint_interval: int | None = None  # None = full trajectory; C = store M every C steps
 
+    # Batching
+    batch_size: int = 1  # number of sequences per step (GPU batching)
+
     # Runtime
     gpu: bool = True  # GPU by default; --cpu to override
     load: str | None = None
@@ -148,6 +151,8 @@ class BuildConfig:
         if self.checkpoint_interval is not None and self.checkpoint_interval < 1:
             raise ValueError(
                 f"checkpoint_interval must be >= 1 or None, got {self.checkpoint_interval}")
+        if self.batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {self.batch_size}")
 
     @property
     def head_dim(self) -> int:
@@ -209,6 +214,7 @@ class BuildConfig:
             "load": "load", "log_file": "log_file",
             "eval_every": "eval_every", "eval_max_chunks": "eval_max_chunks",
             "checkpoint_interval": "checkpoint_interval",
+            "batch_size": "batch_size",
             "projection_kind": "projection_kind",
             "self_ref_chunk_size": "self_ref_chunk_size",
             "momentum_kind": "momentum_kind",

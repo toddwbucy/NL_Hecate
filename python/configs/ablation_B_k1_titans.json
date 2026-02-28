@@ -22,7 +22,8 @@
 
   "build": {
     "lr": 0.0004,
-    "steps": 100000,
+    "batch_size": 8,
+    "steps": 25000,
     "optimizer": "adamw_gpu",
     "warmup_steps": 200,
     "weight_decay": 0.1,
@@ -31,7 +32,7 @@
     "max_grad_norm": 1.0,
     "seed": 42,
     "save_path": "checkpoints/ablation_B.json",
-    "save_every": 5000,
+    "save_every": 2500,
     "log_every": 10,
     "eval_every": 1000,
     "eval_max_chunks": 100,

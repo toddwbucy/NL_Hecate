@@ -27,6 +27,7 @@ extern "C" {
         num_heads: i32,
         head_dim: i32,
         window_size: i32,
+        batch_size: i32,
     );
 
     /// CUDA SWA backward kernel (bf16 inputs, f32 gradients).
@@ -63,6 +64,7 @@ extern "C" {
         num_heads: i32,
         head_dim: i32,
         window_size: i32,
+        batch_size: i32,
     );
 
     // ── Delta Rule memory kernels (all f32) ─────────────────────────
@@ -83,6 +85,7 @@ extern "C" {
         y: *mut f32,
         seq_len: i32,
         d: i32,
+        batch_size: i32,
     );
 
     /// CUDA DeltaRule backward inner loop (all f32).
@@ -106,6 +109,7 @@ extern "C" {
         d_m_initial: *mut f32,
         seq_len: i32,
         d: i32,
+        batch_size: i32,
     );
 
     // ── Titans LMM memory kernels (all f32) ─────────────────────────
@@ -127,6 +131,7 @@ extern "C" {
         y: *mut f32,
         seq_len: i32,
         d: i32,
+        batch_size: i32,
     );
 
     /// CUDA TitansLMM backward inner loop (all f32).
@@ -150,6 +155,7 @@ extern "C" {
         d_s_initial: *mut f32,
         seq_len: i32,
         d: i32,
+        batch_size: i32,
     );
 
     // ── Hebbian Rule memory kernels (all f32) ───────────────────────

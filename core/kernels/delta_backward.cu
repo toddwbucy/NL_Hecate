@@ -49,24 +49,40 @@ static inline void check_cuda_alloc(const char* tag, cudaError_t err) {
 }
 
 __global__ void delta_backward_kernel(
-    const float* __restrict__ k_mem,      // [seq_len, d]
-    const float* __restrict__ v_mem,      // [seq_len, d]
-    const float* __restrict__ q_mem,      // [seq_len, d]
-    const float* __restrict__ alpha,      // [seq_len]
-    const float* __restrict__ theta,      // [seq_len]
-    const float* __restrict__ m_states,   // [(seq_len+1)*d*d]
-    const float* __restrict__ d_y,        // [seq_len, d]
-    float* __restrict__ d_k_mem,          // [seq_len, d]
-    float* __restrict__ d_v_mem,          // [seq_len, d]
-    float* __restrict__ d_q_mem,          // [seq_len, d]
-    float* __restrict__ d_alpha,          // [seq_len]
-    float* __restrict__ d_theta,          // [seq_len]
-    float* __restrict__ d_m_initial,      // [d*d]
-    float* __restrict__ d_M,              // [d*d] — gradient accumulator in global memory
+    const float* __restrict__ k_mem,      // [batch_size, seq_len, d]
+    const float* __restrict__ v_mem,      // [batch_size, seq_len, d]
+    const float* __restrict__ q_mem,      // [batch_size, seq_len, d]
+    const float* __restrict__ alpha,      // [batch_size, seq_len]
+    const float* __restrict__ theta,      // [batch_size, seq_len]
+    const float* __restrict__ m_states,   // [batch_size, (seq_len+1)*d*d]
+    const float* __restrict__ d_y,        // [batch_size, seq_len, d]
+    float* __restrict__ d_k_mem,          // [batch_size, seq_len, d]
+    float* __restrict__ d_v_mem,          // [batch_size, seq_len, d]
+    float* __restrict__ d_q_mem,          // [batch_size, seq_len, d]
+    float* __restrict__ d_alpha,          // [batch_size, seq_len]
+    float* __restrict__ d_theta,          // [batch_size, seq_len]
+    float* __restrict__ d_m_initial,      // [d*d] — summed across batch (atomicAdd)
+    float* __restrict__ d_M,              // [batch_size, d*d] — per-batch gradient accumulator
     int seq_len, int d)
 {
+    int b = blockIdx.x;   // batch index
     int tid = threadIdx.x;
     int dd = d * d;
+
+    // Offset all per-batch pointers to this batch element's slice
+    k_mem      += b * seq_len * d;
+    v_mem      += b * seq_len * d;
+    q_mem      += b * seq_len * d;
+    alpha      += b * seq_len;
+    theta      += b * seq_len;
+    m_states   += b * (seq_len + 1) * dd;
+    d_y        += b * seq_len * d;
+    d_k_mem    += b * seq_len * d;
+    d_v_mem    += b * seq_len * d;
+    d_q_mem    += b * seq_len * d;
+    d_alpha    += b * seq_len;
+    d_theta    += b * seq_len;
+    d_M        += b * dd;  // each batch element has its own d_M workspace
 
     // Shared memory: only small working buffers
     extern __shared__ float smem[];
@@ -217,9 +233,10 @@ __global__ void delta_backward_kernel(
         __syncthreads();
     }
 
-    // ── Store d_m_initial ──
+    // ── Accumulate d_m_initial across batch elements (atomicAdd) ──
+    // d_m_initial is shared across all batch blocks; each block adds its contribution.
     for (int idx = tid; idx < dd; idx += blockDim.x) {
-        d_m_initial[idx] = d_M[idx];
+        atomicAdd(&d_m_initial[idx], d_M[idx]);
     }
 }
 
@@ -438,7 +455,7 @@ extern "C" void delta_backward_f32_cuda(
     const float* d_y,
     float* d_k_mem, float* d_v_mem, float* d_q_mem,
     float* d_alpha, float* d_theta, float* d_m_initial,
-    int seq_len, int d)
+    int seq_len, int d, int batch_size)
 {
     int dd = d * d;
     // Cap at d (not dd): backward kernels require ~2× more registers than
@@ -451,16 +468,20 @@ extern "C" void delta_backward_f32_cuda(
     if (rounded > 1024) rounded = 1024;
     block_size = rounded;
 
-    dim3 grid(1);
+    dim3 grid(batch_size);
     dim3 block(block_size);
 
     // Shared: prediction[d] + error[d] + d_error[d] + reduce_buf[block_size]
     int smem_bytes = (3 * d + block_size) * sizeof(float);
 
-    // Allocate d_M workspace in global memory
+    // Allocate per-batch d_M workspaces (batch_size * dd floats, contiguous)
+    // Each batch block uses its own slice: d_M_work + b*dd.
+    // d_m_initial is zeroed by caller and accumulated via atomicAdd across batches.
     float* d_M_work = nullptr;
     check_cuda_alloc("delta_backward: cudaMalloc d_M_work",
-                     cudaMalloc(&d_M_work, dd * sizeof(float)));
+                     cudaMalloc(&d_M_work, (size_t)batch_size * dd * sizeof(float)));
+    check_cuda_alloc("delta_backward: cudaMemset d_M_work",
+                     cudaMemset(d_M_work, 0, (size_t)batch_size * dd * sizeof(float)));
 
     delta_backward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_states, d_y,
