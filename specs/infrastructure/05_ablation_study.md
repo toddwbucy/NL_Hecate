@@ -143,10 +143,10 @@ The **only** differences between runs are:
 **A → B** tests whether any memory module helps vs no-memory SWA (memory benefit
 question). Expected: Run B better than Run A by ≥3%.
 
-**B → C** tests whether multi-scale CMS (k=4) adds value over single-level (k=1)
-when the inner-loop optimizer is identical (delta/standard GD in both).
-Wait — B uses titans, C uses delta. The CORRECT comparison is B vs D for
-single-vs-multi DGD, and A vs B for no-memory vs k=1 DGD.
+**B → C** is a mixed comparison (B=titans/k=1, C=delta/k=4) and is not the primary
+axis. The cleanest comparisons are A→B (memory on/off at k=1) and B→D (k=1 vs k=4
+under identical DGD optimizer). C is included to isolate the optimizer contribution
+at k=4 scale via the C vs D axis.
 
 **C vs D** tests the inner-loop optimizer: state-independent GD (delta rule,
 `M_{t+1} = M_t + θ·v⊗k`) vs state-dependent DGD (TitansLMM,
