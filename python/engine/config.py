@@ -32,6 +32,9 @@ class BuildConfig:
     momentum_kind: str = "none"             # "none", "ema", "delta_momentum", "deep_momentum"
     momentum_d_hidden: int = 0              # momentum MLP hidden dim (0 = d*d matrix)
 
+    # Memory enable flag (False = SWA-only baseline, no CMS memory modules)
+    memory_enabled: bool = True
+
     # Per-level theta gate clamps (empty = unclamped, CS-39 style)
     theta_floor: list[float] | None = None  # per-level softplus lower bound
     theta_ceil: list[float] | None = None   # per-level softplus upper bound

@@ -196,7 +196,7 @@ def run_build(bcfg: BuildConfig):
             seq_len=bcfg.seq_len,
             window_size=bcfg.window_size,
             vocab_size=bcfg.vocab_size,
-            memory_enabled=True,
+            memory_enabled=bcfg.memory_enabled,
             k=bcfg.k,
             chunk_sizes=bcfg.chunk_sizes,
             memory_rule=bcfg.memory_rule,
