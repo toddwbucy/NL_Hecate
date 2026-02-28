@@ -2318,6 +2318,44 @@ pub fn dgd_backward_dd_segment(
     }
 }
 
+/// Gate backward: accumulate d_w_alpha/theta/eta and d_b_alpha/theta/eta on device.
+///
+/// `d_theta`/`theta` and `d_eta`/`eta` are Option — pass None for rules without that gate.
+/// When has_theta=0/has_eta=0, kernel skips the corresponding computation.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn gate_backward_dd(
+    d_alpha: &GpuBuf<f32>, alpha: &GpuBuf<f32>,
+    d_theta: Option<&GpuBuf<f32>>, theta: Option<&GpuBuf<f32>>,
+    d_eta:   Option<&GpuBuf<f32>>, eta:   Option<&GpuBuf<f32>>,
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>,
+    d_w_alpha: &mut GpuBuf<f32>, d_b_alpha: &mut GpuBuf<f32>,
+    d_w_theta: &mut GpuBuf<f32>, d_b_theta: &mut GpuBuf<f32>,
+    d_w_eta:   &mut GpuBuf<f32>, d_b_eta:   &mut GpuBuf<f32>,
+    T: usize, d: usize,
+) {
+    let has_theta = d_theta.is_some() as i32;
+    let has_eta   = d_eta.is_some() as i32;
+    let null: *const f32 = std::ptr::null();
+    let null_mut: *mut f32 = std::ptr::null_mut();
+    unsafe {
+        crate::cuda_ffi::gate_backward_cuda(
+            d_alpha.as_ptr(), alpha.as_ptr(),
+            d_theta.map(|b| b.as_ptr()).unwrap_or(null),
+            theta.map(|b| b.as_ptr()).unwrap_or(null),
+            d_eta.map(|b| b.as_ptr()).unwrap_or(null),
+            eta.map(|b| b.as_ptr()).unwrap_or(null),
+            k_mem.as_ptr(), v_mem.as_ptr(),
+            d_w_alpha.ptr(), d_b_alpha.ptr(),
+            if has_theta == 1 { d_w_theta.ptr() } else { null_mut },
+            if has_theta == 1 { d_b_theta.ptr() } else { null_mut },
+            if has_eta   == 1 { d_w_eta.ptr() }   else { null_mut },
+            if has_eta   == 1 { d_b_eta.ptr() }    else { null_mut },
+            T as i32, d as i32, has_theta, has_eta,
+        );
+    }
+}
+
 /// Synchronize the CUDA device (wait for all pending kernel launches).
 #[cfg(feature = "cuda")]
 pub fn cuda_sync() {
