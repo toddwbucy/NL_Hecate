@@ -384,6 +384,21 @@ extern "C" {
         seq_len: i32, d: i32, activation: i32,
     );
 
+    /// Gate backward: accumulate d_w_alpha/theta/eta and d_b_alpha/theta/eta.
+    /// has_theta=1 enables theta computation; has_eta=1 enables eta (Titans).
+    /// When has_theta=0 or has_eta=0, corresponding pointer args are ignored.
+    /// sigmoid(logit_theta) recovered as 1 - exp(-theta) — no logit cache needed.
+    pub(crate) fn gate_backward_cuda(
+        d_alpha: *const f32, alpha: *const f32,
+        d_theta: *const f32, theta: *const f32,
+        d_eta: *const f32,   eta: *const f32,
+        k_mem: *const f32, v_mem: *const f32,
+        d_w_alpha: *mut f32, d_b_alpha: *mut f32,
+        d_w_theta: *mut f32, d_b_theta: *mut f32,
+        d_w_eta: *mut f32,   d_b_eta: *mut f32,
+        T: i32, D: i32, has_theta: i32, has_eta: i32,
+    );
+
     /// Simple SAXPY: y[i] += alpha * x[i]. For small buffers.
     pub(crate) fn saxpy_cuda(alpha: f32, x: *const f32, y: *mut f32, n: i32);
 

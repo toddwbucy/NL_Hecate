@@ -350,8 +350,9 @@ fn gpu_memory_backward(
 
             accumulate_projection_grads(
                 level_params, embedded,
+                k_mem, v_mem, alpha, Some(theta), None,
                 &d_k_mem, &d_v_mem, &d_q_mem,
-                &d_alpha, &d_theta, None,
+                &d_alpha, Some(&d_theta), None,
                 level_grads, s, d, batch_size,
             )
         }
@@ -376,8 +377,9 @@ fn gpu_memory_backward(
 
             accumulate_projection_grads(
                 level_params, embedded,
+                k_mem, v_mem, alpha, Some(theta), Some(eta),
                 &d_k_mem, &d_v_mem, &d_q_mem,
-                &d_alpha, &d_theta, Some(&d_eta),
+                &d_alpha, Some(&d_theta), Some(&d_eta),
                 level_grads, s, d, batch_size,
             )
         }
@@ -398,11 +400,12 @@ fn gpu_memory_backward(
                 s, d,
             );
 
-            // Hebbian has no theta — pass None for d_theta
+            // Hebbian has no theta or eta — pass None
             accumulate_projection_grads(
                 level_params, embedded,
+                k_mem, v_mem, alpha, None, None,
                 &d_k_mem, &d_v_mem, &d_q_mem,
-                &d_alpha, &GpuBuf::zeros(s), None,
+                &d_alpha, None, None,
                 level_grads, s, d, 1,
             )
         }
@@ -413,8 +416,9 @@ fn gpu_memory_backward(
                 delta_backward_checkpointed(k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, d_y, s, d, c);
             accumulate_projection_grads(
                 level_params, embedded,
+                k_mem, v_mem, alpha, Some(theta), None,
                 &d_k_mem, &d_v_mem, &d_q_mem,
-                &d_alpha, &d_theta, None,
+                &d_alpha, Some(&d_theta), None,
                 level_grads, s, d, 1,
             )
         }
@@ -424,8 +428,9 @@ fn gpu_memory_backward(
                 titans_backward_checkpointed(k_mem, v_mem, q_mem, alpha, theta, eta, m_checkpoints, s_checkpoints, d_y, s, d, c);
             accumulate_projection_grads(
                 level_params, embedded,
+                k_mem, v_mem, alpha, Some(theta), Some(eta),
                 &d_k_mem, &d_v_mem, &d_q_mem,
-                &d_alpha, &d_theta, Some(&d_eta),
+                &d_alpha, Some(&d_theta), Some(&d_eta),
                 level_grads, s, d, 1,
             )
         }
@@ -435,8 +440,9 @@ fn gpu_memory_backward(
                 hebbian_backward_checkpointed(k_mem, v_mem, q_mem, alpha, m_checkpoints, d_y, s, d, c);
             accumulate_projection_grads(
                 level_params, embedded,
+                k_mem, v_mem, alpha, None, None,
                 &d_k_mem, &d_v_mem, &d_q_mem,
-                &d_alpha, &GpuBuf::zeros(s), None,
+                &d_alpha, None, None,
                 level_grads, s, d, 1,
             )
         }
@@ -459,8 +465,9 @@ fn gpu_memory_backward(
 
             accumulate_projection_grads(
                 level_params, embedded,
+                k_mem, v_mem, alpha, Some(theta), None,
                 &d_k_mem, &d_v_mem, &d_q_mem,
-                &d_alpha, &d_theta, None,
+                &d_alpha, Some(&d_theta), None,
                 level_grads, s, d, batch_size,
             )
         }
@@ -470,8 +477,9 @@ fn gpu_memory_backward(
                 delta_backward_checkpointed(k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, d_y, s, d, c);
             accumulate_projection_grads(
                 level_params, embedded,
+                k_mem, v_mem, alpha, Some(theta), None,
                 &d_k_mem, &d_v_mem, &d_q_mem,
-                &d_alpha, &d_theta, None,
+                &d_alpha, Some(&d_theta), None,
                 level_grads, s, d, 1,
             )
         }
@@ -751,17 +759,23 @@ fn hebbian_backward_checkpointed(
 ///   d_w_v_mem = d_v_mem^T @ embedded
 ///   d_w_q_mem = d_q_mem^T @ embedded
 ///   d_embedded += d_k_mem @ w_k_mem + d_v_mem @ w_v_mem + d_q_mem @ w_q_mem
-///   d_w_alpha/d_b_alpha and d_w_theta/d_b_theta from gate backward
+///   d_w_alpha/d_b_alpha, d_w_theta/d_b_theta, d_w_eta/d_b_eta from gate_backward_dd
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 fn accumulate_projection_grads(
     level_params: &GpuMemoryLevelParams,
     embedded: &GpuBuf<f32>,
+    k_mem: &GpuBuf<f32>,               // gate inputs (forward cache)
+    v_mem: &GpuBuf<f32>,
+    alpha: &GpuBuf<f32>,               // gate outputs (forward cache)
+    theta: Option<&GpuBuf<f32>>,       // softplus output; None for Hebbian
+    eta: Option<&GpuBuf<f32>>,         // sigmoid output; None for Delta/Hebbian/DGD
     d_k_mem: &GpuBuf<f32>,
     d_v_mem: &GpuBuf<f32>,
     d_q_mem: &GpuBuf<f32>,
-    _d_alpha: &GpuBuf<f32>,  // per-token gate grads (gate backward handled separately)
-    _d_theta: &GpuBuf<f32>,
-    _d_eta: Option<&GpuBuf<f32>>,
+    d_alpha: &GpuBuf<f32>,             // per-token upstream gate gradients
+    d_theta: Option<&GpuBuf<f32>>,
+    d_eta: Option<&GpuBuf<f32>>,
     level_grads: &mut GpuLevelGrads,
     s: usize,
     d: usize,
@@ -781,14 +795,19 @@ fn accumulate_projection_grads(
     crate::dispatch::cublas_matmul_acc_dd(d_v_mem, &level_params.w_v_mem, &mut d_embedded, bs_s, d, d);
     crate::dispatch::cublas_matmul_acc_dd(d_q_mem, &level_params.w_q_mem, &mut d_embedded, bs_s, d, d);
 
-    // Gate backward (alpha, theta, eta) is complex — involves per-token dot products
-    // with concat(k_mem, v_mem). For now, gate weight grads are approximated by
-    // accumulating the per-token scalar grads. Full gate backward requires additional
-    // CUDA kernels for the chain rule through gate_compute. This is left as a
-    // follow-up optimization — the inner loop grads (d_k_mem, d_v_mem, d_q_mem)
-    // dominate the gradient signal for projection weights.
-    //
-    // TODO: Implement gate_backward_dd for d_w_alpha, d_b_alpha, d_w_theta, etc.
+    // Gate backward: accumulate d_w_alpha/theta/eta and d_b_alpha/theta/eta.
+    // sigmoid(logit_theta) recovered from softplus output as 1 - exp(-theta).
+    // No forward changes required — cached gate outputs suffice.
+    crate::dispatch::gate_backward_dd(
+        d_alpha, alpha,
+        d_theta, theta,
+        d_eta,   eta,
+        k_mem, v_mem,
+        &mut level_grads.d_w_alpha, &mut level_grads.d_b_alpha,
+        &mut level_grads.d_w_theta, &mut level_grads.d_b_theta,
+        &mut level_grads.d_w_eta,   &mut level_grads.d_b_eta,
+        bs_s, d,
+    );
 
     d_embedded
 }
