@@ -43,6 +43,7 @@ import argparse
 import json
 import sys
 import time
+from array import array as _array
 from pathlib import Path
 
 import numpy as np
@@ -98,7 +99,10 @@ def _stream_tokens_hf(
         sys.exit("datasets not installed. Run: pip install datasets")
 
     eos_id = tokenizer.eos_token_id or 2
-    tokens: list[int] = []
+    # Use array.array instead of list to avoid OOM at 100M-token scale:
+    # list[int] holds Python int objects (~28 bytes each); array.array('I')
+    # stores raw 4-byte unsigned ints — ~7× lower peak memory.
+    tokens: _array = _array("I")
     t0 = time.time()
 
     load_kwargs: dict = {"split": split, "streaming": True, "trust_remote_code": False}
@@ -130,7 +134,8 @@ def _stream_tokens_hf(
     if verbose:
         print()  # newline after \r progress
 
-    return np.array(tokens[:sample_tokens], dtype=np.uint32)
+    arr = np.frombuffer(tokens, dtype=np.uint32, count=min(sample_tokens, len(tokens)))
+    return arr.copy()
 
 
 # ---------------------------------------------------------------------------

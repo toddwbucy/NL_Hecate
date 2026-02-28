@@ -112,6 +112,12 @@ carry useful signal.
 
 ### Definition: Excess Same-Token Rate (ESTR) at Lag L
 
+> **Paper trace**: The lag values [1, 8, 64, 512] are the CMS frequency periods
+> from HOPE (2512.24695) §3, `hope_equations/eq-097-hope-cms-chain`. The 4096-lag
+> background is an internal diagnostic baseline. ESTR is a custom proxy metric —
+> not from the HOPE paper — chosen because full-vocabulary PPMI is computationally
+> infeasible at V=32K and flat at all lags for BPE-tokenized corpora.
+
 For a tokenized corpus stream X = [x_0, x_1, ...], define the **Excess
 Same-Token Rate at lag L** as:
 
@@ -219,7 +225,7 @@ python tools/lag_mi.py \
 ```
 
 The script streams from HuggingFace datasets (no full download required). It
-tokenizes with LLaMA-3 tokenizer (`meta-llama/Meta-Llama-3-8B` tokenizer,
+tokenizes with LLaMA-3 tokenizer (`hf-internal-testing/llama-tokenizer` tokenizer,
 `vocab_size=32000`, same as the build configs).
 
 ### D2: Corpus evaluation results in HADES
@@ -267,7 +273,7 @@ Merge the corpus selection outcome into the existing node:
   "corpus_selection": {
     "selected": "<name>",
     "evaluated": ["c4", "pg19", ...],
-    "nmi_results": {...},
+    "estr_results": {...},
     "selection_date": "2026-XX-XX",
     "shard_path": "python/data/<name>/"
   }
@@ -309,7 +315,7 @@ experiment.
    For 100M tokens at ~4 bytes/token this is 400MB of data transfer, not 180GB.
 
 2. **Tokenizer must match**: The lag-MI is computed over the *same token IDs* that
-   the build run will see. Use `meta-llama/Meta-Llama-3-8B` tokenizer with
+   the build run will see. Use `hf-internal-testing/llama-tokenizer` tokenizer with
    `add_bos_token=False, add_eos_token=False` to match `python/engine/data.py`.
 
 3. **Do not shuffle before lag-MI**: Shuffling a corpus before computing lag-MI
