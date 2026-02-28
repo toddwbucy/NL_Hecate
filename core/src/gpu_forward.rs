@@ -460,6 +460,7 @@ fn gpu_memory_forward(
             (y, GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states, s_states })
         }
         (None, MemoryRuleKind::HebbianRule) => {
+            assert_eq!(bs, 1, "Hebbian GPU forward with batch_size > 1 is not supported");
             let mut m_states = GpuBuf::zeros(bs * (s + 1) * dd);
             let mut y = GpuBuf::zeros(bs * s * d);
             crate::dispatch::hebbian_forward_dd(

@@ -347,6 +347,10 @@ def run_build(bcfg: BuildConfig):
     for step in range(resume_step, end_step):
         if use_bpe:
             if bcfg.batch_size > 1:
+                if gpu_model is None or not use_adamw_gpu:
+                    raise RuntimeError(
+                        "batch_size > 1 currently requires GPU with optimizer=adamw_gpu"
+                    )
                 all_input: list[int] = []
                 all_target: list[int] = []
                 for _ in range(bcfg.batch_size):
@@ -461,7 +465,7 @@ def run_build(bcfg: BuildConfig):
             window_steps = (step + 1) - window_step_start  # steps [window_start, step] inclusive
             dt = t_now - t_window_start
             if window_steps > 0 and dt > 0:
-                tok_per_sec = window_steps * bcfg.seq_len * bcfg.batch_size / dt
+                tok_per_sec = window_steps * len(input_ids) / dt
             else:
                 tok_per_sec = 0.0
             t_window_start = t_now
@@ -728,7 +732,7 @@ def run_build(bcfg: BuildConfig):
 
     t_end = time.perf_counter()
     elapsed = t_end - t_start
-    total_tokens = len(losses) * bcfg.seq_len * bcfg.batch_size
+    total_tokens = len(losses) * bcfg.seq_len * (bcfg.batch_size if use_bpe else 1)
     tok_per_sec = total_tokens / elapsed if elapsed > 0 else 0
 
     if bcfg.k >= 4:

@@ -480,7 +480,8 @@ extern "C" void delta_backward_f32_cuda(
     float* d_M_work = nullptr;
     check_cuda_alloc("delta_backward: cudaMalloc d_M_work",
                      cudaMalloc(&d_M_work, (size_t)batch_size * dd * sizeof(float)));
-    cudaMemset(d_M_work, 0, (size_t)batch_size * dd * sizeof(float));
+    check_cuda_alloc("delta_backward: cudaMemset d_M_work",
+                     cudaMemset(d_M_work, 0, (size_t)batch_size * dd * sizeof(float)));
 
     delta_backward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_states, d_y,

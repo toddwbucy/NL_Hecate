@@ -529,8 +529,10 @@ extern "C" void titans_backward_f32_cuda(
                      cudaMalloc(&d_M_work, (size_t)batch_size * dd * sizeof(float)));
     check_cuda_alloc("titans_backward: cudaMalloc d_S_work",
                      cudaMalloc(&d_S_work, (size_t)batch_size * dd * sizeof(float)));
-    cudaMemset(d_M_work, 0, (size_t)batch_size * dd * sizeof(float));
-    cudaMemset(d_S_work, 0, (size_t)batch_size * dd * sizeof(float));
+    check_cuda_alloc("titans_backward: cudaMemset d_M_work",
+                     cudaMemset(d_M_work, 0, (size_t)batch_size * dd * sizeof(float)));
+    check_cuda_alloc("titans_backward: cudaMemset d_S_work",
+                     cudaMemset(d_S_work, 0, (size_t)batch_size * dd * sizeof(float)));
 
     titans_backward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, eta,

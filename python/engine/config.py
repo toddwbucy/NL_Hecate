@@ -214,6 +214,7 @@ class BuildConfig:
             "load": "load", "log_file": "log_file",
             "eval_every": "eval_every", "eval_max_chunks": "eval_max_chunks",
             "checkpoint_interval": "checkpoint_interval",
+            "batch_size": "batch_size",
             "projection_kind": "projection_kind",
             "self_ref_chunk_size": "self_ref_chunk_size",
             "momentum_kind": "momentum_kind",
