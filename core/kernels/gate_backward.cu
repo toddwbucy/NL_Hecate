@@ -24,6 +24,7 @@
 // Bias: all threads accumulate the per-token scalar redundantly; thread 0 writes.
 
 #include <cuda_runtime.h>
+#include <cassert>
 #include <math.h>
 
 __global__ void gate_backward_kernel(
@@ -105,10 +106,11 @@ extern "C" void gate_backward_cuda(
     float* d_w_eta,   float* d_b_eta,
     int T, int D, int has_theta, int has_eta)
 {
-    // Block = min(2*D, 1024). Requires D <= 512 for single-thread-per-weight design.
-    // For larger D, increase block size and add a stride loop over weight indices.
+    // Requires D <= 512: block = 2*D must fit in one CUDA block (max 1024 threads).
+    // When D > 512, indices [1024, 2*D) would be silently unwritten — fail loudly.
+    // To support larger D, replace with a stride loop over weight indices per thread.
+    assert(D <= 512 && "gate_backward_cuda requires D <= 512 (2*D <= 1024 threads)");
     int block = 2 * D;
-    if (block > 1024) block = 1024;
     if (block < 1) block = 1;
 
     gate_backward_kernel<<<1, block>>>(
