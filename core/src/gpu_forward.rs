@@ -192,6 +192,10 @@ pub fn gpu_cms_forward(
     assert_eq!(d, nh * hd);
 
     let bs = batch_size;  // shorthand
+    // Pre-checked i32 conversions for CUDA kernel parameters (used throughout)
+    let tokens_i32 = i32::try_from(bs * s).expect("bs*s exceeds i32::MAX");
+    let d_i32      = i32::try_from(d).expect("d_model exceeds i32::MAX");
+    let v_i32      = i32::try_from(v).expect("vocab_size exceeds i32::MAX");
 
     // Convert input_ids to i32 for CUDA kernels (flat: [batch_size * s])
     let input_ids_i32: Vec<i32> = input_ids.iter()
@@ -224,7 +228,7 @@ pub fn gpu_cms_forward(
             params.swa.w_embed.as_ptr(),
             d_input_ids.ptr() as *const i32,
             embedded.ptr(),
-            (bs * s) as i32, d as i32,
+            tokens_i32, d_i32,
         );
     }
 
@@ -240,6 +244,7 @@ pub fn gpu_cms_forward(
     // ── Stage 3a: SWA attention (bf16 on GPU) ─────────────────────────
     let total = bs * s * d;
     let aw_total = bs * nh * s * ws;
+    let total_i32 = i32::try_from(total).expect("bs*s*d exceeds i32::MAX");
     let mut q_bf16 = GpuBuf::<u16>::zeros(total);
     let mut k_bf16 = GpuBuf::<u16>::zeros(total);
     let mut v_bf16 = GpuBuf::<u16>::zeros(total);
@@ -248,9 +253,9 @@ pub fn gpu_cms_forward(
 
     // f32 → bf16 conversion on GPU
     unsafe {
-        crate::cuda_ffi::f32_to_bf16_cuda(q_f32.as_ptr(), q_bf16.ptr(), total as i32);
-        crate::cuda_ffi::f32_to_bf16_cuda(k_f32.as_ptr(), k_bf16.ptr(), total as i32);
-        crate::cuda_ffi::f32_to_bf16_cuda(v_f32.as_ptr(), v_bf16.ptr(), total as i32);
+        crate::cuda_ffi::f32_to_bf16_cuda(q_f32.as_ptr(), q_bf16.ptr(), total_i32);
+        crate::cuda_ffi::f32_to_bf16_cuda(k_f32.as_ptr(), k_bf16.ptr(), total_i32);
+        crate::cuda_ffi::f32_to_bf16_cuda(v_f32.as_ptr(), v_bf16.ptr(), total_i32);
     }
 
     // SWA forward kernel (bf16) — batch_size sequences in parallel
@@ -263,7 +268,7 @@ pub fn gpu_cms_forward(
     // bf16 → f32 for attn_out (needed for gating)
     let mut attn_out = GpuBuf::<f32>::zeros(total);
     unsafe {
-        crate::cuda_ffi::bf16_to_f32_cuda(attn_out_bf16.as_ptr(), attn_out.ptr(), total as i32);
+        crate::cuda_ffi::bf16_to_f32_cuda(attn_out_bf16.as_ptr(), attn_out.ptr(), total_i32);
     }
 
     // ── Stage 2b+3b: Memory branch per level ──────────────────────────
@@ -302,13 +307,13 @@ pub fn gpu_cms_forward(
     let mut y_combined = GpuBuf::<f32>::zeros(bs * s * d);
     for y_level in &y_per_level {
         unsafe {
-            crate::cuda_ffi::saxpy_cuda(1.0, y_level.as_ptr(), y_combined.ptr(), (bs * s * d) as i32);
+            crate::cuda_ffi::saxpy_cuda(1.0, y_level.as_ptr(), y_combined.ptr(), total_i32);
         }
     }
     if cfg.k > 2 {
         let scale = 1.0 / (cfg.k as f32).sqrt();
         unsafe {
-            crate::cuda_ffi::saxpy_cuda(scale - 1.0, y_combined.as_ptr(), y_combined.ptr(), (bs * s * d) as i32);
+            crate::cuda_ffi::saxpy_cuda(scale - 1.0, y_combined.as_ptr(), y_combined.ptr(), total_i32);
         }
     }
 
@@ -316,8 +321,8 @@ pub fn gpu_cms_forward(
     let mut gate = GpuBuf::<f32>::zeros(bs * s * d);
     let mut gated_out = GpuBuf::<f32>::zeros(bs * s * d);
     unsafe {
-        crate::cuda_ffi::sigmoid_cuda(y_combined.as_ptr(), gate.ptr(), (bs * s * d) as i32);
-        crate::cuda_ffi::elemwise_mul_cuda(attn_out.as_ptr(), gate.as_ptr(), gated_out.ptr(), (bs * s * d) as i32);
+        crate::cuda_ffi::sigmoid_cuda(y_combined.as_ptr(), gate.ptr(), total_i32);
+        crate::cuda_ffi::elemwise_mul_cuda(attn_out.as_ptr(), gate.as_ptr(), gated_out.ptr(), total_i32);
     }
 
     // ── Stage 5: Output projection (cuBLAS on GPU) ────────────────────
@@ -335,7 +340,7 @@ pub fn gpu_cms_forward(
             logits.as_ptr(),
             d_target_ids.ptr() as *const i32,
             loss_gpu.ptr(),
-            (bs * s) as i32, v as i32,
+            tokens_i32, v_i32,
         );
     }
     crate::dispatch::cuda_sync();
@@ -394,6 +399,8 @@ fn gpu_memory_forward(
 ) -> (GpuBuf<f32>, GpuMemoryCache) {
     let bs = batch_size;
     let dd = d * d;
+    let tokens_i32 = i32::try_from(bs * s).expect("bs*s exceeds i32::MAX");
+    let d_i32      = i32::try_from(d).expect("d_model exceeds i32::MAX");
 
     // Memory projections: k_mem, v_mem, q_mem = embedded @ W^T
     // embedded is [bs*s, d]; cuBLAS treats bs*s as M dimension
@@ -416,12 +423,12 @@ fn gpu_memory_forward(
         crate::cuda_ffi::gate_compute_cuda(
             k_mem.as_ptr(), v_mem.as_ptr(), level_params.w_alpha.as_ptr(),
             b_alpha_host[0], alpha.ptr(),
-            (bs * s) as i32, d as i32, 0, // 0=sigmoid
+            tokens_i32, d_i32, 0, // 0=sigmoid
         );
         crate::cuda_ffi::gate_compute_cuda(
             k_mem.as_ptr(), v_mem.as_ptr(), level_params.w_theta.as_ptr(),
             b_theta_host[0], theta.ptr(),
-            (bs * s) as i32, d as i32, 1, // 1=softplus
+            tokens_i32, d_i32, 1, // 1=softplus
         );
     }
 
@@ -442,7 +449,7 @@ fn gpu_memory_forward(
             crate::dispatch::cuda_sync();
             // Carry forward element-0's final M: at offset s*dd in the first batch element
             copy_final_m(&m_states, context_m, s * dd, dd);
-            unsafe { crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d as i32, m_norm_max); }
+            unsafe { crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d_i32, m_norm_max); }
             (y, GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states })
         }
         (None, MemoryRuleKind::TitansLMM) => {
@@ -461,7 +468,7 @@ fn gpu_memory_forward(
             );
             crate::dispatch::cuda_sync();
             copy_final_m(&m_states, context_m, s * dd, dd);
-            unsafe { crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d as i32, m_norm_max); }
+            unsafe { crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d_i32, m_norm_max); }
             (y, GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states, s_states })
         }
         (None, MemoryRuleKind::HebbianRule) => {
@@ -474,7 +481,7 @@ fn gpu_memory_forward(
             );
             crate::dispatch::cuda_sync();
             copy_final_m(&m_states, context_m, s * dd, dd);
-            unsafe { crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d as i32, m_norm_max); }
+            unsafe { crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d_i32, m_norm_max); }
             (y, GpuMemoryCache::Hebbian { k_mem, v_mem, q_mem, alpha, m_states })
         }
         // ── Checkpointed paths (checkpoint_interval=Some(c)) ──
@@ -492,7 +499,7 @@ fn gpu_memory_forward(
             );
             crate::dispatch::cuda_sync();
             copy_final_m(&m_checkpoints, context_m, (num_ckpt - 1) * dd, dd);
-            unsafe { crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d as i32, m_norm_max); }
+            unsafe { crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d_i32, m_norm_max); }
             (y, GpuMemoryCache::DeltaCkpt { k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, checkpoint_interval: c })
         }
         (Some(c), MemoryRuleKind::TitansLMM) => {
@@ -511,7 +518,7 @@ fn gpu_memory_forward(
             );
             crate::dispatch::cuda_sync();
             copy_final_m(&m_checkpoints, context_m, (num_ckpt - 1) * dd, dd);
-            unsafe { crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d as i32, m_norm_max); }
+            unsafe { crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d_i32, m_norm_max); }
             (y, GpuMemoryCache::TitansCkpt { k_mem, v_mem, q_mem, alpha, theta, eta, m_checkpoints, s_checkpoints, checkpoint_interval: c })
         }
         (Some(c), MemoryRuleKind::HebbianRule) => {
@@ -526,7 +533,7 @@ fn gpu_memory_forward(
             );
             crate::dispatch::cuda_sync();
             copy_final_m(&m_checkpoints, context_m, (num_ckpt - 1) * dd, dd);
-            unsafe { crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d as i32, m_norm_max); }
+            unsafe { crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d_i32, m_norm_max); }
             (y, GpuMemoryCache::HebbianCkpt { k_mem, v_mem, q_mem, alpha, m_checkpoints, checkpoint_interval: c })
         }
         // ── SwiGLU: stateless MLP, no M state, no m_norm_clamp ──────────
@@ -545,7 +552,8 @@ fn gpu_memory_forward(
                     level_params.down_proj.as_ptr(),
                     y.ptr(),
                     gate_buf.ptr(), up_buf.ptr(), fused_buf.ptr(), cache_buf.ptr(),
-                    (bs * s) as i32, d as i32, inter as i32,
+                    tokens_i32, d_i32,
+                    i32::try_from(inter).expect("inter_dim exceeds i32::MAX"),
                 );
             }
             // context_m is unused for SwiGLU (no M state) — not updated.
