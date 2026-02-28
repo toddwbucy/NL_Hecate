@@ -35,31 +35,31 @@ pub struct GpuCMSCache {
     pub target_ids_i32: Vec<i32>,
 
     // Shared: embedded input
-    pub embedded: GpuBuf<f32>,        // [s, d]
+    pub embedded: GpuBuf<f32>,        // [bs*s, d]
 
     // Attention branch (bf16 for SWA)
-    pub q_f32: GpuBuf<f32>,           // [s, d] — f32 version (needed for backward projections)
-    pub k_f32: GpuBuf<f32>,           // [s, d]
-    pub v_f32: GpuBuf<f32>,           // [s, d]
-    pub q_bf16: GpuBuf<u16>,          // [s, d] bf16
-    pub k_bf16: GpuBuf<u16>,          // [s, d] bf16
-    pub v_bf16: GpuBuf<u16>,          // [s, d] bf16
-    pub attn_out_bf16: GpuBuf<u16>,   // [s, d] bf16
-    pub attn_weights_bf16: GpuBuf<u16>, // [nh, s, ws] bf16
-    pub attn_out: GpuBuf<f32>,        // [s, d] f32 (converted back)
+    pub q_f32: GpuBuf<f32>,           // [bs*s, d] — f32 version (needed for backward projections)
+    pub k_f32: GpuBuf<f32>,           // [bs*s, d]
+    pub v_f32: GpuBuf<f32>,           // [bs*s, d]
+    pub q_bf16: GpuBuf<u16>,          // [bs*s, d] bf16
+    pub k_bf16: GpuBuf<u16>,          // [bs*s, d] bf16
+    pub v_bf16: GpuBuf<u16>,          // [bs*s, d] bf16
+    pub attn_out_bf16: GpuBuf<u16>,   // [bs*s, d] bf16
+    pub attn_weights_bf16: GpuBuf<u16>, // [bs*nh, s, ws] bf16
+    pub attn_out: GpuBuf<f32>,        // [bs*s, d] f32 (converted back)
 
     // Memory branch per level
     pub memory_caches: Vec<Option<GpuMemoryCache>>,
-    pub y_per_level: Vec<GpuBuf<f32>>, // [s, d] per level
+    pub y_per_level: Vec<GpuBuf<f32>>, // [bs*s, d] per level
 
     // Combined + gating
-    pub y_combined: GpuBuf<f32>,      // [s, d]
-    pub gate: GpuBuf<f32>,            // [s, d] sigmoid(y_combined)
-    pub gated_out: GpuBuf<f32>,       // [s, d] attn_out * gate
+    pub y_combined: GpuBuf<f32>,      // [bs*s, d]
+    pub gate: GpuBuf<f32>,            // [bs*s, d] sigmoid(y_combined)
+    pub gated_out: GpuBuf<f32>,       // [bs*s, d] attn_out * gate
 
     // Post-gating
-    pub projected: GpuBuf<f32>,       // [s, d]
-    pub logits: GpuBuf<f32>,          // [s, v]
+    pub projected: GpuBuf<f32>,       // [bs*s, d]
+    pub logits: GpuBuf<f32>,          // [bs*s, v]
 
     // Pulse snapshot (needed by backward for level dispatch)
     pub pulse: Pulse,
