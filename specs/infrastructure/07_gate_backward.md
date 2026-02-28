@@ -1,6 +1,6 @@
 # Gate Backward: CUDA Gradient Accumulation for Alpha/Theta/Eta Gates
 
-```
+```text
 CONTRACT
   Purpose: Implement GPU-resident backward pass for gate_compute_cuda —
            accumulate d_w_alpha, d_b_alpha, d_w_theta, d_b_theta, d_w_eta,
@@ -9,6 +9,9 @@ CONTRACT
            Per-token scalar upstream gradients (d_alpha, d_theta, d_eta) from
            CUDA memory-rule backward kernels.
            Per-token gate inputs k_mem [bs*s, d], v_mem [bs*s, d].
+           d <= 512 (enforced by assert in gate_backward_cuda): the single-block
+           design assigns one thread per weight index in [0, 2*d); 2*d must fit
+           within the 1024-thread CUDA block limit.
   Guarantees: d_w_alpha[i] = sum_t( d_alpha[t] * alpha'(t) * concat(k_t,v_t)[i] )
               d_b_alpha[0] = sum_t( d_alpha[t] * alpha'(t) )
               and analogously for theta and eta.
@@ -29,7 +32,7 @@ CONTRACT
 
 ## Gate Definitions (forward)
 
-```
+```text
 alpha_t = sigmoid(W_alpha @ concat(k_t, v_t) + b_alpha)
 theta_t = softplus(W_theta @ concat(k_t, v_t) + b_theta)
 eta_t   = sigmoid(W_eta   @ concat(k_t, v_t) + b_eta)   [Titans only]
