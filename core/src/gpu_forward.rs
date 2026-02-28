@@ -182,6 +182,7 @@ pub fn gpu_cms_forward(
     let hd = cfg.swa.head_dim;
     let ws = cfg.swa.window_size;
 
+    assert!(s > 0, "seq_len must be > 0");
     // Derive batch_size from input length; default to 1 for single-sequence calls
     assert!(input_ids.len() >= s, "input_ids too short");
     let batch_size = input_ids.len() / s;
