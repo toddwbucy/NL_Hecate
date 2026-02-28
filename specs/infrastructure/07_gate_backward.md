@@ -20,7 +20,11 @@ CONTRACT
              thread 0 writes the final bias value.
   Position: Called from accumulate_projection_grads in gpu_backward.rs after
             projection weight grads are computed.
-  Source: MIRAS §2.2 gate definitions; Titans §A.1 momentum gate.
+  Source: MIRAS §2.2 gate definitions (NL HADES: miras_equations/table1-titans-lmm-write
+          covers the Titans LMM write rule; no dedicated node for §2.2 alpha/theta
+          definitions — they appear inline in Table 1 entries).
+          Titans §A.1 momentum gate (NL HADES: titans_equations — no dedicated node;
+          eta gate defined inline in §A.1 alongside the momentum accumulator S).
 ```
 
 ## Gate Definitions (forward)
@@ -79,6 +83,12 @@ Thread i [0, 2*d):
 
 All threads also accumulate bias sums (uniform per-token scalar — no branch divergence
 from i; all threads reach same value; only thread 0 writes the result).
+
+Final write (weight grads): Each thread i writes its accumulated sum directly to
+d_w_alpha[i] (and d_w_theta[i], d_w_eta[i] when active). No cross-thread reduction
+is required — each weight index i in [0, 2*d) is owned exclusively by one thread,
+so there is no write conflict. This is NOT an atomic reduction; it is a partitioned
+parallel accumulation where each thread holds its own private running sum across t.
 
 Memory access pattern:
   - alpha[t], theta[t], eta[t]: T reads, broadcast across warp (L1 cache hit)
