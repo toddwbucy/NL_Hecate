@@ -194,8 +194,12 @@ pub fn gpu_cms_forward(
     let bs = batch_size;  // shorthand
 
     // Convert input_ids to i32 for CUDA kernels (flat: [batch_size * s])
-    let input_ids_i32: Vec<i32> = input_ids.iter().map(|&x| x as i32).collect();
-    let target_ids_i32: Vec<i32> = target_ids.iter().map(|&x| x as i32).collect();
+    let input_ids_i32: Vec<i32> = input_ids.iter()
+        .map(|&x| i32::try_from(x).expect("input token id overflows i32 — vocab_size exceeds i32::MAX"))
+        .collect();
+    let target_ids_i32: Vec<i32> = target_ids.iter()
+        .map(|&x| i32::try_from(x).expect("target token id overflows i32 — vocab_size exceeds i32::MAX"))
+        .collect();
     let d_input_ids = GpuBuf::<f32>::new(bs * s);
     let d_target_ids = GpuBuf::<f32>::new(bs * s);
     unsafe {
@@ -784,7 +788,9 @@ pub fn gpu_prefill_forward(
     assert!(input_ids.len() >= s);
 
     // Upload input_ids
-    let input_ids_i32: Vec<i32> = input_ids[..s].iter().map(|&x| x as i32).collect();
+    let input_ids_i32: Vec<i32> = input_ids[..s].iter()
+        .map(|&x| i32::try_from(x).expect("input token id overflows i32 — vocab_size exceeds i32::MAX"))
+        .collect();
     let d_input_ids = GpuBuf::<f32>::new(s);
     unsafe {
         let rc = gpu_buf_memcpy_h2d(
