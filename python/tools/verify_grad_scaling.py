@@ -31,8 +31,11 @@ FAIL = Real gradient normalization bug — must fix before relaunching B/C/D.
 
 import sys
 import random
+from pathlib import Path
 
-sys.path.insert(0, "/home/todd/olympus/NL_Hecate/python")
+# Locate the python/ package root relative to this script's location
+# (tools/ lives inside python/, so parent is python/)
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import nl_hecate
 
