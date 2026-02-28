@@ -6,10 +6,11 @@ Measures whether a corpus has genuine long-range token structure at the
 CMS frequency levels [1, 8, 64, 512] (period in tokens). A corpus passes
 the selection criterion iff:
 
-    NMI(lag=512) > 2.0 × NMI(lag=4096)
+    ESTR(lag=512) > 2.0 × ESTR(lag=4096)
 
-Where NMI is normalized mutual information estimated from empirical token
-co-occurrence at each lag. The 4096-lag reading is the background rate.
+Where ESTR (Excess Same-Token Rate) is the ratio of the observed same-token
+rate at a given lag to the expected collision rate under independent sampling,
+minus 1. The 4096-lag reading serves as the background / null reference.
 
 Spec: specs/infrastructure/02_corpus_selection.md
 CS-38: uses 'build'/'context' vocabulary, not 'training'
@@ -19,16 +20,17 @@ CS-47: --seed stored in output; same seed + corpus = identical result
 Usage:
     python tools/lag_mi.py \\
         --corpus allenai/c4 \\
+        --config en \\
         --split train \\
         --sample-tokens 100_000_000 \\
         --lags 1 8 64 512 4096 \\
-        --vocab-k 8192 \\
+        --exclude-top-n 200 \\
         --seed 42 \\
         --out results/lag_mi_c4.json
 
     # Quick smoke-test (1M tokens, fast)
-    python tools/lag_mi.py --corpus allenai/c4 --sample-tokens 1_000_000 \\
-        --out /tmp/c4_quick.json
+    python tools/lag_mi.py --corpus allenai/c4 --config en \\
+        --sample-tokens 1_000_000 --out /tmp/c4_quick.json
 
     # From a local tokenized .npy file (no HuggingFace needed)
     python tools/lag_mi.py --npy data/fineweb_edu/train_tokens.npy \\
@@ -55,7 +57,7 @@ DEFAULT_LAGS = [1, 8, 64, 512, 4096]
 TOKENIZER_ID = "hf-internal-testing/llama-tokenizer"  # 32K BPE, lightweight
 VOCAB_SIZE = 32000
 
-PASS_THRESHOLD = 2.0  # NMI(512) must exceed this × NMI(4096)
+PASS_THRESHOLD = 2.0  # ESTR(512) must exceed this × ESTR(4096)
 
 
 # ---------------------------------------------------------------------------
@@ -207,30 +209,30 @@ def _compute_estr(
     return same_rate / expected_collision - 1.0
 
 
-def compute_nmi_profile(
+def compute_estr_profile(
     tokens: np.ndarray,
     lags: list[int],
-    vocab_k: int,
+    exclude_top_n: int,
     n_samples: int,
     seed: int,
     verbose: bool,
 ) -> dict[int, float]:
-    """Compute NMI at each requested lag. Returns {lag: nmi_value}."""
+    """Compute ESTR at each requested lag. Returns {lag: estr_value}."""
     rng = np.random.default_rng(seed)  # CS-47: deterministic
     results: dict[int, float] = {}
 
     for lag in sorted(lags):
         t0 = time.time()
-        nmi = _compute_estr(tokens, lag, n_samples, rng, exclude_top_n=vocab_k)
+        estr = _compute_estr(tokens, lag, n_samples, rng, exclude_top_n=exclude_top_n)
         elapsed = time.time() - t0
-        results[lag] = nmi
+        results[lag] = estr
         if verbose:
             # Map lags to CMS level descriptions for clear output
             level_desc = {1: "L0 (every token)", 8: "L1 (period=8)",
                           64: "L2 (period=64)", 512: "L3 (period=512)",
                           4096: "background (period=4096)"}
             desc = level_desc.get(lag, f"lag={lag}")
-            print(f"  lag={lag:>5}  NMI={nmi:.6f}  [{desc}]  ({elapsed:.1f}s)")
+            print(f"  lag={lag:>5}  ESTR={estr:.6f}  [{desc}]  ({elapsed:.1f}s)")
 
     return results
 
@@ -239,34 +241,40 @@ def compute_nmi_profile(
 # Pass/fail evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate_criterion(nmi: dict[int, float], threshold: float = PASS_THRESHOLD) -> dict:
+def evaluate_criterion(estr: dict[int, float], threshold: float = PASS_THRESHOLD) -> dict:
     """Apply the corpus selection criterion.
 
-    A corpus passes iff NMI(lag=512) > threshold × NMI(lag=4096).
+    A corpus passes iff ESTR(lag=512) > threshold × ESTR(lag=4096),
+    AND ESTR(lag=512) > 0. A zero or negative background does NOT
+    auto-pass — it means the metric failed to compute a meaningful signal.
 
     Returns a dict with pass/fail, ratio, and per-level interpretation.
     """
-    nmi_512 = nmi.get(512, 0.0)
-    nmi_bg = nmi.get(4096, 0.0)
+    estr_512 = estr.get(512, 0.0)
+    estr_bg = estr.get(4096, 0.0)
 
-    ratio = nmi_512 / nmi_bg if nmi_bg > 0 else float("inf")
-    passed = ratio > threshold
+    # Guard: non-positive background forces FAIL (ambiguous signal).
+    # A corpus should have some background coherence; 0.0 means something
+    # went wrong with the metric computation, not that it's perfectly clean.
+    estr_bg_safe = max(estr_bg, 1e-12)
+    ratio = estr_512 / estr_bg_safe
+    passed = estr_512 > 0 and ratio > threshold
 
     # Per-CMS-level signal assessment
     level_signal = {}
     for level, period in enumerate(CMS_LEVEL_PERIODS):
-        if period in nmi:
-            bg = nmi_bg if nmi_bg > 0 else 1e-9
+        if period in estr:
+            bg = estr_bg_safe
             level_signal[f"L{level}_period{period}"] = {
-                "nmi": nmi[period],
-                "ratio_vs_background": nmi[period] / bg,
-                "has_signal": nmi[period] > threshold * bg,
+                "estr": estr[period],
+                "ratio_vs_background": estr[period] / bg,
+                "has_signal": estr[period] > threshold * bg,
             }
 
     return {
         "passed": passed,
-        "nmi_512": nmi_512,
-        "nmi_background_4096": nmi_bg,
+        "estr_512": estr_512,
+        "estr_background_4096": estr_bg,
         "ratio_512_4096": ratio,
         "threshold": threshold,
         "cms_level_signal": level_signal,
@@ -309,7 +317,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--sample-tokens", type=int, default=100_000_000,
-        help="Number of tokens to sample for NMI estimation (default: 100M)",
+        help="Number of tokens to sample for ESTR estimation (default: 100M)",
     )
     p.add_argument(
         "--n-samples", type=int, default=500_000,
@@ -320,16 +328,20 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Lags to evaluate (default: {DEFAULT_LAGS})",
     )
     p.add_argument(
-        "--vocab-k", type=int, default=8192,
-        help="Top-K vocabulary size for co-occurrence matrix (default: 8192)",
+        "--exclude-top-n", type=int, default=200,
+        help=(
+            "Exclude the N most frequent tokens (stop-words) before computing ESTR. "
+            "Stop-words appear at every lag at similar rates and mask content-word "
+            "long-range structure. (default: 200)"
+        ),
     )
     p.add_argument(
         "--threshold", type=float, default=PASS_THRESHOLD,
-        help=f"Pass threshold: NMI(512) > threshold × NMI(4096) (default: {PASS_THRESHOLD})",
+        help=f"Pass threshold: ESTR(512) > threshold × ESTR(4096) (default: {PASS_THRESHOLD})",
     )
     p.add_argument(
         "--seed", type=int, default=42,
-        help="RNG seed for sample selection. Store in output for CS-47 reproducibility.",
+        help="RNG seed for sample selection. Stored in output for CS-47 reproducibility.",
     )
     p.add_argument(
         "--out", required=True, metavar="PATH",
@@ -384,20 +396,20 @@ def main() -> None:
 
     if verbose:
         print(f"Tokens loaded: {len(tokens):,}  (dtype={tokens.dtype})")
-        print(f"Computing NMI at lags {args.lags} ...")
+        print(f"Computing ESTR at lags {args.lags} ...")
 
-    # --- Compute NMI profile ---
-    nmi = compute_nmi_profile(
+    # --- Compute ESTR profile ---
+    estr = compute_estr_profile(
         tokens=tokens,
         lags=args.lags,
-        vocab_k=args.vocab_k,
+        exclude_top_n=args.exclude_top_n,
         n_samples=args.n_samples,
         seed=args.seed,
         verbose=verbose,
     )
 
     # --- Evaluate criterion ---
-    criterion = evaluate_criterion(nmi, threshold=args.threshold)
+    criterion = evaluate_criterion(estr, threshold=args.threshold)
 
     elapsed = time.time() - t_start
 
@@ -408,10 +420,10 @@ def main() -> None:
         "tokenizer": tokenizer_id,
         "sample_tokens": len(tokens),
         "n_samples_per_lag": args.n_samples,
-        "vocab_k": args.vocab_k,
+        "exclude_top_n": args.exclude_top_n,
         "seed": args.seed,          # CS-47: stored for reproducibility
         "lags": args.lags,
-        "nmi": {str(k): v for k, v in nmi.items()},
+        "estr": {str(k): v for k, v in estr.items()},
         "criterion": criterion,
         "elapsed_seconds": round(elapsed, 1),
     }
@@ -426,9 +438,9 @@ def main() -> None:
     if verbose:
         status = "PASS ✓" if criterion["passed"] else "FAIL ✗"
         print(f"\n{status}  corpus={corpus_name}")
-        print(f"  NMI(lag=512)  = {criterion['nmi_512']:.6f}")
-        print(f"  NMI(bg=4096)  = {criterion['nmi_background_4096']:.6f}")
-        print(f"  ratio         = {criterion['ratio_512_4096']:.2f}×  "
+        print(f"  ESTR(lag=512)  = {criterion['estr_512']:.6f}")
+        print(f"  ESTR(bg=4096)  = {criterion['estr_background_4096']:.6f}")
+        print(f"  ratio          = {criterion['ratio_512_4096']:.2f}×  "
               f"(threshold: {args.threshold:.1f}×)")
         print(f"  Output: {out_path}")
         print(f"  Elapsed: {elapsed:.1f}s")

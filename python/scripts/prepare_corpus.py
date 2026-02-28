@@ -24,9 +24,9 @@ CS-37: CMS constructs called 'levels'
 CS-47: seed stored in meta.json for reproducibility
 
 Usage:
-    # C4 (Miras build corpus)
+    # C4 (Miras build corpus — requires --config en)
     python scripts/prepare_corpus.py \\
-        --corpus allenai/c4 --split train \\
+        --corpus allenai/c4 --config en --split train \\
         --target-tokens 1_000_000_000 \\
         --output data/c4
 
@@ -38,7 +38,7 @@ Usage:
 
     # Smoke test (10M tokens)
     python scripts/prepare_corpus.py \\
-        --corpus allenai/c4 --target-tokens 10_000_000 \\
+        --corpus allenai/c4 --config en --target-tokens 10_000_000 \\
         --output data/c4_smoke
 """
 
@@ -48,6 +48,7 @@ import argparse
 import json
 import sys
 import time
+from array import array as _array
 from pathlib import Path
 
 import numpy as np
@@ -74,6 +75,8 @@ def _prepare_targets(tokens: np.ndarray, vocab_size: int) -> np.ndarray:
     Since tokens are a flat stream (not chunked here), the only masked
     position is the very last token.
     """
+    if tokens.size == 0:
+        return np.empty(0, dtype=np.uint32)
     targets = np.empty_like(tokens)
     targets[:-1] = tokens[1:]
     targets[-1] = vocab_size  # sentinel: no target for final token
@@ -88,6 +91,7 @@ def stream_and_tokenize(
     tokenizer,
     seed: int,
     verbose: bool,
+    config: str | None = None,
 ) -> np.ndarray:
     """Stream corpus documents and return a flat uint32 token array.
 
@@ -104,11 +108,17 @@ def stream_and_tokenize(
         sys.exit("datasets not installed. Run: pip install datasets")
 
     eos_id = tokenizer.eos_token_id or 2
-    all_tokens: list[int] = []
+    # Use array.array instead of list to avoid OOM at 1B-token scale:
+    # list[int] holds Python int objects (~28 bytes each); array.array('I')
+    # stores raw 4-byte unsigned ints — ~7× lower peak memory.
+    all_tokens: _array = _array("I")
     t0 = time.time()
     doc_count = 0
 
-    ds = load_dataset(corpus, split=split, streaming=True, trust_remote_code=False)
+    load_kwargs: dict = {"split": split, "streaming": True, "trust_remote_code": False}
+    if config:
+        load_kwargs["name"] = config
+    ds = load_dataset(corpus, **load_kwargs)
 
     for doc in ds:
         text = doc.get(text_column, "")
@@ -161,6 +171,10 @@ def main() -> None:
         help="HuggingFace dataset ID (e.g. 'allenai/c4', 'pg19')",
     )
     parser.add_argument(
+        "--config", default=None, metavar="NAME",
+        help="Dataset config name if required (e.g. 'en' for allenai/c4)",
+    )
+    parser.add_argument(
         "--split", default="train",
         help="Dataset split (default: train)",
     )
@@ -202,7 +216,13 @@ def main() -> None:
         print(f"Loading tokenizer: {args.tokenizer}")
     tokenizer = _load_tokenizer(args.tokenizer)
 
-    vocab_size = min(tokenizer.vocab_size, VOCAB_SIZE)
+    if tokenizer.vocab_size != VOCAB_SIZE:
+        sys.exit(
+            f"Tokenizer vocab mismatch: expected {VOCAB_SIZE}, "
+            f"got {tokenizer.vocab_size}. Use the LLaMA tokenizer "
+            f"({TOKENIZER_ID}) or update VOCAB_SIZE in this script."
+        )
+    vocab_size = VOCAB_SIZE
 
     if verbose:
         print(f"Streaming {args.target_tokens:,} tokens from {args.corpus}/{args.split} ...")
@@ -216,6 +236,7 @@ def main() -> None:
         tokenizer=tokenizer,
         seed=args.seed,
         verbose=verbose,
+        config=args.config,
     )
 
     elapsed_stream = time.time() - t0
@@ -241,6 +262,7 @@ def main() -> None:
         "val_tokens": int(len(val_tokens)),
         "tokenizer": args.tokenizer,
         "corpus": args.corpus,
+        "config": args.config,
         "split": args.split,
         "seed": args.seed,   # CS-47: provenance for reproducibility
         "min_doc_len": MIN_DOC_LEN,

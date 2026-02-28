@@ -1,6 +1,6 @@
 # Corpus Selection for CMS Ablation Study
 
-```
+```text
 CONTRACT
   Purpose:    Select a build corpus that has genuine long-range token structure at
               CMS frequencies (lags 8, 64, 512 tokens) to distinguish the
@@ -48,6 +48,8 @@ CONTRACT
               Related: docs/research_notes/nlm_initialization_dynamics.md
 
   Source:     HOPE (2512.24695) §3 CMS frequency levels [1, 8, 64, 512]
+                HADES: hope_equations/eq-097-hope-cms-chain (CMS chained frequency rule)
+                       hope_equations/eq-093-freq-transfer (frequency transfer between levels)
               Internal: k=1 vs k=4 result (issue #135), committee_response_06.md
 ```
 
@@ -58,7 +60,7 @@ CONTRACT
 The k=1 vs k=4 comparison on FineWeb-Edu (72M tokens) showed dormant L2/L3 gates:
 L2 θ ≈ 0.0019, L3 θ ≈ 0.0005. There are two structurally different explanations:
 
-```
+```text
 Hypothesis A (data-limited):
   FineWeb-Edu articles average 300–600 tokens. Cross-article structure
   does not exist at lag=512 because each article is independent. L2/L3
@@ -108,37 +110,46 @@ carry useful signal.
 
 ## The Lag-MI Validation Protocol
 
-### Definition: Empirical PPMI at Lag L
+### Definition: Excess Same-Token Rate (ESTR) at Lag L
 
-For a tokenized corpus stream X = [x_0, x_1, ...], define the **empirical
-positive pointwise MI at lag L** as:
+For a tokenized corpus stream X = [x_0, x_1, ...], define the **Excess
+Same-Token Rate at lag L** as:
 
-```
-PPMI(L) = E_{t} [ max(0, log P̂(x_{t+L} | x_t) - log P̂(x_{t+L})) ]
+```text
+ESTR(L) = P(x_{t+L} == x_t) / expected_collision_rate  -  1
+
+Where:
+  expected_collision_rate = sum_v P(v)^2   (birthday-problem baseline)
 
 Estimated as:
-  1. Sample N=500K random indices t from the corpus
-  2. For each pair (x_t, x_{t+L}), look up:
-       p_joint(a, b)  = count(x_t=a, x_{t+L}=b) / N
-       p_marginal(b)  = count(x_{t+L}=b) / N
-  3. PPMI(L) = (1/N) * sum_t max(0, log p_joint(x_t, x_{t+L}) - log p_marginal(x_{t+L}))
+  1. Exclude the top-200 most frequent tokens (BPE stop-words)
+     They appear uniformly at every lag and mask content-word signal.
+  2. Sample N=500K random (t, t+lag) pairs from content-word positions
+  3. same_rate     = fraction of pairs where x_t == x_{t+lag}
+  4. expected_rate = sum_v (freq_v / total_content)^2   over content vocab
+  5. ESTR(L) = same_rate / expected_rate - 1
 ```
 
-PPMI(L) is zero when x_t and x_{t+L} are independent (uniform joint = product of
-marginals). It is positive when there is genuine statistical dependency at lag L.
+ESTR(L) ≈ 0 when tokens repeat at chance frequency (independent at lag L).
+ESTR(L) > 0 when the same content word recurs more than chance — the corpus
+has genuine predictive structure at that lag distance.
 
-### Practical computation (vocabulary-efficient)
+**Why ESTR instead of PPMI**: PPMI over the full 32K BPE vocabulary is
+dominated by high-frequency subwords ("the", "of", " a") which are flat at
+all lags. ESTR with stop-word exclusion isolates content-word repetition
+(proper nouns, technical terms) that reflects true long-range structure.
 
-Full vocabulary PPMI over 32K tokens requires O(V^2) storage. Instead:
+### Practical computation
 
-```
-APPROACH: Vocabulary-bucketed PPMI
-  1. Reduce to top-K tokens by frequency, bucket the rest as <UNK>
-     K = 8192 (covers ~95% of token mass in BPE corpora)
-  2. Build co-occurrence matrix C[K, K] from N=500K samples
-  3. PPMI(L) = sum_{a,b} C[a,b]/N * max(0, log(C[a,b]*N / row_sum[a]*col_sum[b]))
-  4. Normalize by vocabulary entropy H(X) to get a [0,1] bounded score:
-       NMI(L) = PPMI(L) / H(X)
+```text
+APPROACH: Stop-word-excluded same-token rate
+  1. Compute token frequency histogram over the sample
+  2. Build exclusion set: top-200 most frequent token IDs
+  3. Sample N=500K (t, t+lag) pairs; discard pairs where either token
+     is in the exclusion set
+  4. same_rate = mean(x_t == x_{t+lag}) over remaining pairs
+  5. expected_collision = sum_v (p_content_v)^2  over non-excluded vocab
+  6. ESTR(L) = same_rate / expected_collision - 1
 ```
 
 This is implemented in `python/tools/lag_mi.py` (deliverable).
@@ -157,14 +168,14 @@ These correspond to:
 
 ### Pass criterion
 
-```
-PASS: NMI(lag=512) > 2.0 × NMI(lag=4096)
+```text
+PASS: ESTR(lag=512) > 2.0 × ESTR(lag=4096)  AND  ESTR(lag=512) > 0
 
   Interpretation: lag-512 carries more than 2× the predictive signal of the
   background rate. This ensures L3 CMS has genuine information to memorize,
   not just topic-frequency artifacts.
 
-FAIL: NMI(lag=512) ≤ 2.0 × NMI(lag=4096)
+FAIL: ESTR(lag=512) ≤ 0  OR  ratio ≤ 2.0×
 
   Action: Corpus is excluded. Log the values in HADES and move to the next
   candidate. If all candidates fail, open a GitHub issue and halt ABLATION.
@@ -172,7 +183,7 @@ FAIL: NMI(lag=512) ≤ 2.0 × NMI(lag=4096)
 
 ### Selection criterion (if multiple candidates pass)
 
-Select the corpus with the highest `NMI(lag=512) / NMI(lag=4096)` ratio.
+Select the corpus with the highest `ESTR(lag=512) / ESTR(lag=4096)` ratio.
 Among ties (ratio within 10%): prefer the larger corpus.
 
 ---
@@ -187,10 +198,11 @@ A standalone script. No build-time dependencies. Interface:
 # Evaluate a corpus
 python tools/lag_mi.py \
     --corpus allenai/c4 \
+    --config en \
     --split train \
     --sample-tokens 100000000 \
     --lags 1 8 64 512 4096 \
-    --vocab-k 8192 \
+    --exclude-top-n 200 \
     --seed 42 \
     --out results/lag_mi_c4.json
 
@@ -198,11 +210,10 @@ python tools/lag_mi.py \
 # {
 #   "corpus": "allenai/c4",
 #   "sample_tokens": 100000000,
+#   "exclude_top_n": 200,
 #   "seed": 42,
-#   "nmi": {"1": 0.041, "8": 0.018, "64": 0.009, "512": 0.006, "4096": 0.002},
-#   "pass": true,
-#   "ratio_512_4096": 3.0,
-#   "threshold": 2.0
+#   "estr": {"1": 0.041, "8": 0.018, "64": 0.009, "512": 0.006, "4096": 0.002},
+#   "criterion": {"passed": true, "ratio_512_4096": 3.0, "threshold": 2.0}
 # }
 # CS-47: seed is stored in output; same seed + same corpus = same result
 ```
@@ -221,8 +232,8 @@ For each evaluated corpus, insert a node into `nl_experiments`:
   "type": "corpus_evaluation",
   "corpus": "<name>",
   "sample_tokens": 100000000,
-  "nmi_by_lag": {"1": N, "8": N, "64": N, "512": N, "4096": N},
-  "pass_criterion": "NMI(512) > 2x NMI(4096)",
+  "estr_by_lag": {"1": N, "8": N, "64": N, "512": N, "4096": N},
+  "pass_criterion": "ESTR(512) > 2x ESTR(4096)",
   "passed": true|false,
   "ratio_512_4096": N,
   "date": "2026-XX-XX",
@@ -234,7 +245,7 @@ For each evaluated corpus, insert a node into `nl_experiments`:
 
 Output matches the format consumed by `BpeDataLoader` in `engine/data.py`:
 
-```
+```text
 python/data/<selected_corpus_name>/
   train_tokens.npy    # uint32 numpy array of token IDs (input)
   train_targets.npy   # uint32 numpy array of next-token targets (-1 → vocab_size)
