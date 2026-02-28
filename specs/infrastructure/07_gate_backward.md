@@ -73,31 +73,84 @@ d_b_eta    = sum_t( d_eta[t] * eta_t * (1 - eta_t) )
 
 ## CUDA Kernel: gate_backward_kernel
 
-```text
-Grid:  (1)          — single block; weight grad is a global reduction
-Block: (min(2*d, 1024))  — one thread per weight index (d <= 512 in current ablations)
+Grid: `(1)` — single block. Block: `(2*d)` — one thread per weight index, d <= 512.
 
-Thread i [0, 2*d):
-  x_i  = k_mem[t*d + i]       for i < d
-          v_mem[t*d + (i-d)]   for i >= d
-  wa   += da_scalar * x_i     over t in [0, T)
-  wt   += dt_scalar * x_i     over t in [0, T)  (if has_theta)
-  we   += de_scalar * x_i     over t in [0, T)  (if has_eta)
+```rust
+// Pseudocode — mirrors gate_backward_kernel in gate_backward.cu exactly.
+// CUDA maps each thread to one i; the loop over t is serial within each thread.
+fn accumulate_weights(
+    d_alpha: &[f32],               // [T] upstream gate gradients
+    alpha:   &[f32],               // [T] cached sigmoid outputs
+    d_theta: Option<&[f32]>,       // [T] upstream; None for Hebbian
+    theta:   Option<&[f32]>,       // [T] cached softplus outputs; None for Hebbian
+    d_eta:   Option<&[f32]>,       // [T] upstream; None for Delta/DGD/Hebbian
+    eta:     Option<&[f32]>,       // [T] cached sigmoid outputs; None for Delta/DGD/Hebbian
+    k_mem:   &[f32],               // [T, d] gate input — first half of concat(k,v)
+    v_mem:   &[f32],               // [T, d] gate input — second half of concat(k,v)
+    d_w_alpha: &mut [f32],         // [2*d] weight grad output
+    d_b_alpha: &mut [f32],         // [1]   bias grad output
+    d_w_theta: Option<&mut [f32]>, // [2*d] weight grad; None if !has_theta
+    d_b_theta: Option<&mut [f32]>, // [1]   bias grad; None if !has_theta
+    d_w_eta:   Option<&mut [f32]>, // [2*d] weight grad; None if !has_eta
+    d_b_eta:   Option<&mut [f32]>, // [1]   bias grad; None if !has_eta
+    d: usize,                      // hidden dim; must satisfy d <= 512
+    T: usize,                      // total tokens = batch_size * seq_len
+    thread_idx: usize,             // CUDA threadIdx.x in [0, 2*d)
+) {
+    let i = thread_idx;
 
-All threads also accumulate bias sums (uniform per-token scalar — no branch divergence
-from i; all threads reach same value; only thread 0 writes the result).
+    // Private per-thread weight accumulators — no cross-thread reduction needed.
+    // Each i in [0, 2*d) is owned exclusively by one thread (no write conflict).
+    let (mut wa, mut wt, mut we) = (0.0_f32, 0.0_f32, 0.0_f32);
+    // Bias accumulators — per-token scalars are uniform across i, so every
+    // thread reaches the same value; only thread 0 writes the final result.
+    let (mut ba, mut bt, mut be) = (0.0_f32, 0.0_f32, 0.0_f32);
 
-Final write (weight grads): Each thread i writes its accumulated sum directly to
-d_w_alpha[i] (and d_w_theta[i], d_w_eta[i] when active). No cross-thread reduction
-is required — each weight index i in [0, 2*d) is owned exclusively by one thread,
-so there is no write conflict. This is NOT an atomic reduction; it is a partitioned
-parallel accumulation where each thread holds its own private running sum across t.
+    for t in 0..T {
+        // Load concat(k_t, v_t)[i]: first d dims from k_mem, next d from v_mem.
+        let x_i = if i < d { k_mem[t * d + i] } else { v_mem[t * d + (i - d)] };
+
+        // Alpha (sigmoid): da_scalar = d_alpha[t] * alpha[t] * (1 - alpha[t])
+        let a  = alpha[t];
+        let da_scalar = d_alpha[t] * a * (1.0 - a);
+        wa += da_scalar * x_i;
+        ba += da_scalar;
+
+        // Theta (softplus): dt_scalar = d_theta[t] * (1 - exp(-theta[t]))
+        // Identity: sigmoid(logit) = 1 - exp(-softplus(logit)) — no logit cache needed.
+        if let (Some(dt_up), Some(th)) = (d_theta, theta) {
+            let dt_scalar = dt_up[t] * (1.0 - (-th[t]).exp());
+            wt += dt_scalar * x_i;
+            bt += dt_scalar;
+        }
+
+        // Eta (sigmoid, Titans only): de_scalar = d_eta[t] * eta[t] * (1 - eta[t])
+        if let (Some(de_up), Some(et)) = (d_eta, eta) {
+            let e  = et[t];
+            let de_scalar = de_up[t] * e * (1.0 - e);
+            we += de_scalar * x_i;
+            be += de_scalar;
+        }
+    }
+
+    // Each thread writes its own index directly — no atomics, no shared memory reduction.
+    d_w_alpha[i] = wa;
+    if let Some(dw) = d_w_theta { dw[i] = wt; }
+    if let Some(dw) = d_w_eta   { dw[i] = we; }
+
+    // Bias: all threads computed the same scalar; thread 0 is the single writer.
+    if i == 0 {
+        d_b_alpha[0] = ba;
+        if let Some(db) = d_b_theta { db[0] = bt; }
+        if let Some(db) = d_b_eta   { db[0] = be; }
+    }
+}
+```
 
 Memory access pattern:
-  - alpha[t], theta[t], eta[t]: T reads, broadcast across warp (L1 cache hit)
-  - k_mem[t*d+0..d-1]: coalesced across threads 0..d-1 at each t
-  - v_mem[t*d+0..d-1]: coalesced across threads d..2d-1 at each t
-```
+- `alpha[t]`, `theta[t]`, `eta[t]`: T scalar reads per thread, broadcast across warp (L1 cache hit)
+- `k_mem[t*d + 0..d-1]`: coalesced across threads `0..d-1` at each `t`
+- `v_mem[t*d + 0..d-1]`: coalesced across threads `d..2*d-1` at each `t`
 
 ## Files Modified
 
