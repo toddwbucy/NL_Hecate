@@ -1661,9 +1661,10 @@ impl GpuModel {
                   eps: f32, weight_decay: f32, max_grad_norm: f32) -> PyResult<(f32, f32)> {
         let s = self.cfg.swa.seq_len;
         let v = self.cfg.swa.vocab_size;
-        if input_ids.len() != s || target_ids.len() != s {
+        // Accept batch_size * seq_len tokens (batch_size >= 1, derived from input length)
+        if input_ids.is_empty() || input_ids.len() % s != 0 || target_ids.len() != input_ids.len() {
             return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("input/target length must be seq_len {}", s)));
+                format!("input/target length must be batch_size * seq_len {} (got {})", s, input_ids.len())));
         }
         if let Some(&max_id) = input_ids.iter().max() {
             if max_id >= v {

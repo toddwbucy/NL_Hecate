@@ -140,7 +140,10 @@ pub fn gpu_cms_backward(
     let nh = cache.nh;
     let hd = cache.hd;
     let ws = cache.ws;
+    let bs = cache.batch_size;
     let sd = s * d;
+    let bsd = bs * sd;
+    let bsv = bs * s * v;
 
     // Initialize gradient buffers (all zeros on GPU)
     let mut grads = GpuMAGGrads {
@@ -157,7 +160,7 @@ pub fn gpu_cms_backward(
     };
 
     // ── Stage 7: Cross-entropy backward ──────────────────────────────
-    let mut d_logits = GpuBuf::zeros(s * v);
+    let mut d_logits = GpuBuf::zeros(bsv);
     // Count valid targets (masked targets with id < 0 or >= vocab are skipped
     // by the kernel — we must normalize by the same count as forward).
     let valid_count = cache.target_ids_i32.iter()
@@ -169,59 +172,53 @@ pub fn gpu_cms_backward(
             cache.logits.as_ptr(),
             cache.target_ids_gpu.ptr() as *const i32,
             d_logits.ptr(),
-            s as i32, v as i32,
+            (bs * s) as i32, v as i32,
             1.0 / count,
         );
     }
 
     // ── Stage 6: Unembed backward ────────────────────────────────────
-    // d_projected = d_logits @ W_unembed^T (transB: W_unembed is [d, v], so C = d_logits[s,v] @ W_unembed^T[v,d])
-    let mut d_projected = GpuBuf::zeros(sd);
+    // d_projected = d_logits @ W_unembed^T (transB: W_unembed is [d, v], so C = d_logits[bs*s,v] @ W_unembed^T[v,d])
+    let mut d_projected = GpuBuf::zeros(bsd);
     crate::dispatch::cublas_matmul_transb_dd(
-        &d_logits, &params.swa.w_unembed, &mut d_projected, s, v, d, 0.0,
+        &d_logits, &params.swa.w_unembed, &mut d_projected, bs * s, v, d, 0.0,
     );
 
-    // d_w_unembed = projected^T @ d_logits → [d, s] @ [s, v] = [d, v]
-    // We need projected^T. For GPU: C = A^T @ B is sgemm(N, T, v, d, s, ..., d_logits, v, projected, d, ..., C, v)
-    // Using row-major trick with transA: cublasSgemm(N, T, n=v, m=d, k=s, B_ptr=d_logits, n=v, A_ptr=projected, d, ...)
-    // Actually: d_w_unembed[d,v] = projected^T[d,s] @ d_logits[s,v]
-    // matmul_transb doesn't help. We need matmul with A transposed.
-    // Use: C = A^T @ B. In row-major → sgemm(N, T, n, m, k, alpha, B, n, A, k, beta, C, n)
-    // where m=d, k=s, n=v → sgemm(N, T, v, d, s, alpha, d_logits, v, projected, d, beta, C, v)
+    // d_w_unembed = projected^T @ d_logits → [d, bs*s] @ [bs*s, v] = [d, v]
     gpu_matmul_transa_dd(
         &cache.projected, &d_logits, &mut grads.d_w_unembed,
-        d, s, v,
+        d, bs * s, v,
     );
 
     // ── Stage 5: Output projection backward ──────────────────────────
     // projected = gated_out @ W_O^T  →  d_gated_out = d_projected @ W_O
-    let mut d_gated_out = GpuBuf::zeros(sd);
+    let mut d_gated_out = GpuBuf::zeros(bsd);
     crate::dispatch::cublas_matmul_dd(
-        &d_projected, &params.swa.w_o, &mut d_gated_out, s, d, d, 0.0,
+        &d_projected, &params.swa.w_o, &mut d_gated_out, bs * s, d, d, 0.0,
     );
 
-    // d_w_o = d_projected^T @ gated_out → [d, s] @ [s, d] = [d, d]
+    // d_w_o = d_projected^T @ gated_out → [d, bs*s] @ [bs*s, d] = [d, d]
     gpu_matmul_transa_dd(
         &d_projected, &cache.gated_out, &mut grads.d_w_o,
-        d, s, d,
+        d, bs * s, d,
     );
 
     // ── Stage 4: Gating backward ─────────────────────────────────────
     // gated_out = attn_out * gate
-    let mut d_attn_out = GpuBuf::zeros(sd);
-    let mut d_gate = GpuBuf::zeros(sd);
+    let mut d_attn_out = GpuBuf::zeros(bsd);
+    let mut d_gate = GpuBuf::zeros(bsd);
     unsafe {
         crate::cuda_ffi::gating_backward_cuda(
             d_gated_out.as_ptr(), cache.attn_out.as_ptr(), cache.gate.as_ptr(),
-            d_attn_out.ptr(), d_gate.ptr(), sd as i32,
+            d_attn_out.ptr(), d_gate.ptr(), bsd as i32,
         );
     }
 
     // d_y_combined = d_gate * gate * (1 - gate)  (sigmoid backward)
-    let mut d_y_combined = GpuBuf::zeros(sd);
+    let mut d_y_combined = GpuBuf::zeros(bsd);
     unsafe {
         crate::cuda_ffi::sigmoid_backward_cuda(
-            d_gate.as_ptr(), cache.gate.as_ptr(), d_y_combined.ptr(), sd as i32,
+            d_gate.as_ptr(), cache.gate.as_ptr(), d_y_combined.ptr(), bsd as i32,
         );
     }
 
@@ -230,13 +227,13 @@ pub fn gpu_cms_backward(
         let scale = 1.0 / (cfg.k as f32).sqrt();
         unsafe {
             crate::cuda_ffi::saxpy_cuda(
-                scale - 1.0, d_y_combined.as_ptr(), d_y_combined.ptr(), sd as i32,
+                scale - 1.0, d_y_combined.as_ptr(), d_y_combined.ptr(), bsd as i32,
             );
         }
     }
 
     // ── Stage 3b: Per-level memory backward ──────────────────────────
-    let mut d_embedded_mem = GpuBuf::zeros(sd);
+    let mut d_embedded_mem = GpuBuf::zeros(bsd);
 
     for level in 0..cfg.k {
         if cache.pulse.active_levels[level] {
@@ -245,11 +242,11 @@ pub fn gpu_cms_backward(
                     &params.levels[level], cfg, mem_cache,
                     &d_y_combined, &cache.embedded,
                     &mut grads.levels[level],
-                    s, d,
+                    s, d, bs,
                 );
                 // Accumulate d_embedded contribution
                 unsafe {
-                    crate::cuda_ffi::saxpy_cuda(1.0, d_emb_level.as_ptr(), d_embedded_mem.ptr(), sd as i32);
+                    crate::cuda_ffi::saxpy_cuda(1.0, d_emb_level.as_ptr(), d_embedded_mem.ptr(), bsd as i32);
                 }
             }
         } else {
@@ -260,41 +257,41 @@ pub fn gpu_cms_backward(
                 &mut grads.levels[level],
                 // For read-only, we need the context M — but we don't have it in cache.
                 // In the full version we'd pass GpuContextState. For now, skip frozen grads.
-                s, d,
+                s, d, bs,
             );
             unsafe {
-                crate::cuda_ffi::saxpy_cuda(1.0, d_emb_level.as_ptr(), d_embedded_mem.ptr(), sd as i32);
+                crate::cuda_ffi::saxpy_cuda(1.0, d_emb_level.as_ptr(), d_embedded_mem.ptr(), bsd as i32);
             }
         }
     }
 
     // ── Stage 3a: SWA backward ───────────────────────────────────────
-    let mut d_q = GpuBuf::zeros(sd);
-    let mut d_k = GpuBuf::zeros(sd);
-    let mut d_v = GpuBuf::zeros(sd);
+    let mut d_q = GpuBuf::zeros(bsd);
+    let mut d_k = GpuBuf::zeros(bsd);
+    let mut d_v = GpuBuf::zeros(bsd);
 
     crate::dispatch::swa_backward_dd(
         &cache.q_bf16, &cache.k_bf16, &cache.v_bf16,
         &cache.attn_weights_bf16, &d_attn_out,
         &mut d_q, &mut d_k, &mut d_v,
-        s, nh, hd, ws,
+        s, nh, hd, ws, bs,
     );
 
     // ── Stage 2a: QKV projection backward ────────────────────────────
     // d_embedded += d_q @ W_q + d_k @ W_k + d_v @ W_v
-    let mut d_embedded = GpuBuf::zeros(sd);
-    crate::dispatch::cublas_matmul_acc_dd(&d_q, &params.swa.w_q, &mut d_embedded, s, d, d);
-    crate::dispatch::cublas_matmul_acc_dd(&d_k, &params.swa.w_k, &mut d_embedded, s, d, d);
-    crate::dispatch::cublas_matmul_acc_dd(&d_v, &params.swa.w_v, &mut d_embedded, s, d, d);
+    let mut d_embedded = GpuBuf::zeros(bsd);
+    crate::dispatch::cublas_matmul_acc_dd(&d_q, &params.swa.w_q, &mut d_embedded, bs * s, d, d);
+    crate::dispatch::cublas_matmul_acc_dd(&d_k, &params.swa.w_k, &mut d_embedded, bs * s, d, d);
+    crate::dispatch::cublas_matmul_acc_dd(&d_v, &params.swa.w_v, &mut d_embedded, bs * s, d, d);
 
-    // d_w_q = d_q^T @ embedded → [d, s] @ [s, d] = [d, d]
-    gpu_matmul_transa_dd(&d_q, &cache.embedded, &mut grads.d_w_q, d, s, d);
-    gpu_matmul_transa_dd(&d_k, &cache.embedded, &mut grads.d_w_k, d, s, d);
-    gpu_matmul_transa_dd(&d_v, &cache.embedded, &mut grads.d_w_v, d, s, d);
+    // d_w_q = d_q^T @ embedded → [d, bs*s] @ [bs*s, d] = [d, d]
+    gpu_matmul_transa_dd(&d_q, &cache.embedded, &mut grads.d_w_q, d, bs * s, d);
+    gpu_matmul_transa_dd(&d_k, &cache.embedded, &mut grads.d_w_k, d, bs * s, d);
+    gpu_matmul_transa_dd(&d_v, &cache.embedded, &mut grads.d_w_v, d, bs * s, d);
 
     // Combine d_embedded from attention + memory branches
     unsafe {
-        crate::cuda_ffi::saxpy_cuda(1.0, d_embedded_mem.as_ptr(), d_embedded.ptr(), sd as i32);
+        crate::cuda_ffi::saxpy_cuda(1.0, d_embedded_mem.as_ptr(), d_embedded.ptr(), bsd as i32);
     }
 
     // ── Stage 1: Embedding scatter-add ───────────────────────────────
@@ -303,7 +300,7 @@ pub fn gpu_cms_backward(
             d_embedded.as_ptr(),
             cache.input_ids_gpu.ptr() as *const i32,
             grads.d_w_embed.ptr(),
-            s as i32, d as i32,
+            (bs * s) as i32, d as i32,
         );
     }
 
@@ -317,6 +314,7 @@ pub fn gpu_cms_backward(
 
 /// Active level backward: full gradient through memory rule inner loop.
 /// Returns d_embedded contribution from memory projections.
+/// `batch_size` is the number of sequences processed in parallel this step.
 #[cfg(feature = "cuda")]
 fn gpu_memory_backward(
     level_params: &GpuMemoryLevelParams,
@@ -327,17 +325,19 @@ fn gpu_memory_backward(
     level_grads: &mut GpuLevelGrads,
     s: usize,
     d: usize,
+    batch_size: usize,
 ) -> GpuBuf<f32> {
     let dd = d * d;
-    let sd = s * d;
+    let bsd = batch_size * s * d;
+    let bs_s = batch_size * s;
 
     match mem_cache {
         GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states } => {
-            let mut d_k_mem = GpuBuf::zeros(sd);
-            let mut d_v_mem = GpuBuf::zeros(sd);
-            let mut d_q_mem = GpuBuf::zeros(sd);
-            let mut d_alpha = GpuBuf::zeros(s);
-            let mut d_theta = GpuBuf::zeros(s);
+            let mut d_k_mem = GpuBuf::zeros(bsd);
+            let mut d_v_mem = GpuBuf::zeros(bsd);
+            let mut d_q_mem = GpuBuf::zeros(bsd);
+            let mut d_alpha = GpuBuf::zeros(bs_s);
+            let mut d_theta = GpuBuf::zeros(bs_s);
             let mut d_m_initial = GpuBuf::zeros(dd);
 
             crate::dispatch::delta_backward_dd(
@@ -345,23 +345,23 @@ fn gpu_memory_backward(
                 m_states, d_y,
                 &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
                 &mut d_alpha, &mut d_theta, &mut d_m_initial,
-                s, d,
+                s, d, batch_size,
             );
 
             accumulate_projection_grads(
                 level_params, embedded,
                 &d_k_mem, &d_v_mem, &d_q_mem,
                 &d_alpha, &d_theta, None,
-                level_grads, s, d,
+                level_grads, s, d, batch_size,
             )
         }
         GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states, s_states } => {
-            let mut d_k_mem = GpuBuf::zeros(sd);
-            let mut d_v_mem = GpuBuf::zeros(sd);
-            let mut d_q_mem = GpuBuf::zeros(sd);
-            let mut d_alpha = GpuBuf::zeros(s);
-            let mut d_theta = GpuBuf::zeros(s);
-            let mut d_eta = GpuBuf::zeros(s);
+            let mut d_k_mem = GpuBuf::zeros(bsd);
+            let mut d_v_mem = GpuBuf::zeros(bsd);
+            let mut d_q_mem = GpuBuf::zeros(bsd);
+            let mut d_alpha = GpuBuf::zeros(bs_s);
+            let mut d_theta = GpuBuf::zeros(bs_s);
+            let mut d_eta = GpuBuf::zeros(bs_s);
             let mut d_m_initial = GpuBuf::zeros(dd);
             let mut d_s_initial = GpuBuf::zeros(dd);
 
@@ -371,17 +371,20 @@ fn gpu_memory_backward(
                 &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
                 &mut d_alpha, &mut d_theta, &mut d_eta,
                 &mut d_m_initial, &mut d_s_initial,
-                s, d,
+                s, d, batch_size,
             );
 
             accumulate_projection_grads(
                 level_params, embedded,
                 &d_k_mem, &d_v_mem, &d_q_mem,
                 &d_alpha, &d_theta, Some(&d_eta),
-                level_grads, s, d,
+                level_grads, s, d, batch_size,
             )
         }
         GpuMemoryCache::Hebbian { k_mem, v_mem, q_mem, alpha, m_states } => {
+            // Hebbian kernels don't yet support batch_size > 1
+            assert_eq!(batch_size, 1, "Hebbian batch_size > 1 not yet supported");
+            let sd = s * d;
             let mut d_k_mem = GpuBuf::zeros(sd);
             let mut d_v_mem = GpuBuf::zeros(sd);
             let mut d_q_mem = GpuBuf::zeros(sd);
@@ -400,7 +403,7 @@ fn gpu_memory_backward(
                 level_params, embedded,
                 &d_k_mem, &d_v_mem, &d_q_mem,
                 &d_alpha, &GpuBuf::zeros(s), None,
-                level_grads, s, d,
+                level_grads, s, d, 1,
             )
         }
         // ── Checkpointed variants: segment-based backward ──────────
@@ -412,7 +415,7 @@ fn gpu_memory_backward(
                 level_params, embedded,
                 &d_k_mem, &d_v_mem, &d_q_mem,
                 &d_alpha, &d_theta, None,
-                level_grads, s, d,
+                level_grads, s, d, 1,
             )
         }
         GpuMemoryCache::TitansCkpt { k_mem, v_mem, q_mem, alpha, theta, eta, m_checkpoints, s_checkpoints, checkpoint_interval } => {
@@ -423,7 +426,7 @@ fn gpu_memory_backward(
                 level_params, embedded,
                 &d_k_mem, &d_v_mem, &d_q_mem,
                 &d_alpha, &d_theta, Some(&d_eta),
-                level_grads, s, d,
+                level_grads, s, d, 1,
             )
         }
         GpuMemoryCache::HebbianCkpt { k_mem, v_mem, q_mem, alpha, m_checkpoints, checkpoint_interval } => {
@@ -434,16 +437,16 @@ fn gpu_memory_backward(
                 level_params, embedded,
                 &d_k_mem, &d_v_mem, &d_q_mem,
                 &d_alpha, &GpuBuf::zeros(s), None,
-                level_grads, s, d,
+                level_grads, s, d, 1,
             )
         }
         // ── DGD: same structure as Delta (uses delta_backward kernels) ──
         GpuMemoryCache::DGD { k_mem, v_mem, q_mem, alpha, theta, m_states } => {
-            let mut d_k_mem = GpuBuf::zeros(sd);
-            let mut d_v_mem = GpuBuf::zeros(sd);
-            let mut d_q_mem = GpuBuf::zeros(sd);
-            let mut d_alpha = GpuBuf::zeros(s);
-            let mut d_theta = GpuBuf::zeros(s);
+            let mut d_k_mem = GpuBuf::zeros(bsd);
+            let mut d_v_mem = GpuBuf::zeros(bsd);
+            let mut d_q_mem = GpuBuf::zeros(bsd);
+            let mut d_alpha = GpuBuf::zeros(bs_s);
+            let mut d_theta = GpuBuf::zeros(bs_s);
             let mut d_m_initial = GpuBuf::zeros(dd);
 
             crate::dispatch::delta_backward_dd(
@@ -451,14 +454,14 @@ fn gpu_memory_backward(
                 m_states, d_y,
                 &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
                 &mut d_alpha, &mut d_theta, &mut d_m_initial,
-                s, d,
+                s, d, batch_size,
             );
 
             accumulate_projection_grads(
                 level_params, embedded,
                 &d_k_mem, &d_v_mem, &d_q_mem,
                 &d_alpha, &d_theta, None,
-                level_grads, s, d,
+                level_grads, s, d, batch_size,
             )
         }
         GpuMemoryCache::DGDCkpt { k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, checkpoint_interval } => {
@@ -469,13 +472,13 @@ fn gpu_memory_backward(
                 level_params, embedded,
                 &d_k_mem, &d_v_mem, &d_q_mem,
                 &d_alpha, &d_theta, None,
-                level_grads, s, d,
+                level_grads, s, d, 1,
             )
         }
         // ── SwiGLU: stateless MLP, direct weight grads ───────────────
         GpuMemoryCache::SwiGlu { gate_buf, up_buf, fused_buf, cache_buf } => {
             let inter = cfg.intermediate_size;
-            let mut d_x = GpuBuf::zeros(s * d);
+            let mut d_x = GpuBuf::zeros(batch_size * s * d);
             unsafe {
                 crate::cuda_ffi::swiglu_backward_f32_cuda_dd(
                     d_y.as_ptr(),
@@ -491,7 +494,7 @@ fn gpu_memory_backward(
                     level_grads.d_gate_proj.ptr(),
                     level_grads.d_up_proj.ptr(),
                     level_grads.d_down_proj.ptr(),
-                    s as i32, d as i32, inter as i32,
+                    (batch_size * s) as i32, d as i32, inter as i32,
                 );
             }
             d_x  // d_embedded contribution (accumulated into d_embedded_mem by caller)
@@ -571,7 +574,7 @@ fn delta_backward_checkpointed(
                 ckpt_m.as_ptr(),
                 local_m_states.ptr(),
                 local_y.ptr(),
-                seg_len as i32, d as i32,
+                seg_len as i32, d as i32, 1, // batch_size=1 (checkpointed paths are always bs=1)
             );
         }
         crate::dispatch::cuda_sync();
@@ -649,7 +652,7 @@ fn titans_backward_checkpointed(
                 local_m_states.ptr(),
                 local_s_states.ptr(),
                 local_y.ptr(),
-                seg_len as i32, d as i32,
+                seg_len as i32, d as i32, 1, // batch_size=1 (checkpointed paths are always bs=1)
             );
         }
         crate::dispatch::cuda_sync();
@@ -762,19 +765,21 @@ fn accumulate_projection_grads(
     level_grads: &mut GpuLevelGrads,
     s: usize,
     d: usize,
+    batch_size: usize,
 ) -> GpuBuf<f32> {
-    let sd = s * d;
+    let bs_s = batch_size * s;
+    let bsd = bs_s * d;
 
-    // Projection weight grads: d_W = d_proj^T @ embedded
-    gpu_matmul_transa_dd(d_k_mem, embedded, &mut level_grads.d_w_k_mem, d, s, d);
-    gpu_matmul_transa_dd(d_v_mem, embedded, &mut level_grads.d_w_v_mem, d, s, d);
-    gpu_matmul_transa_dd(d_q_mem, embedded, &mut level_grads.d_w_q_mem, d, s, d);
+    // Projection weight grads: d_W[d,d] = d_proj^T[d, bs*s] @ embedded[bs*s, d]
+    gpu_matmul_transa_dd(d_k_mem, embedded, &mut level_grads.d_w_k_mem, d, bs_s, d);
+    gpu_matmul_transa_dd(d_v_mem, embedded, &mut level_grads.d_w_v_mem, d, bs_s, d);
+    gpu_matmul_transa_dd(d_q_mem, embedded, &mut level_grads.d_w_q_mem, d, bs_s, d);
 
     // d_embedded from memory projections
-    let mut d_embedded = GpuBuf::zeros(sd);
-    crate::dispatch::cublas_matmul_acc_dd(d_k_mem, &level_params.w_k_mem, &mut d_embedded, s, d, d);
-    crate::dispatch::cublas_matmul_acc_dd(d_v_mem, &level_params.w_v_mem, &mut d_embedded, s, d, d);
-    crate::dispatch::cublas_matmul_acc_dd(d_q_mem, &level_params.w_q_mem, &mut d_embedded, s, d, d);
+    let mut d_embedded = GpuBuf::zeros(bsd);
+    crate::dispatch::cublas_matmul_acc_dd(d_k_mem, &level_params.w_k_mem, &mut d_embedded, bs_s, d, d);
+    crate::dispatch::cublas_matmul_acc_dd(d_v_mem, &level_params.w_v_mem, &mut d_embedded, bs_s, d, d);
+    crate::dispatch::cublas_matmul_acc_dd(d_q_mem, &level_params.w_q_mem, &mut d_embedded, bs_s, d, d);
 
     // Gate backward (alpha, theta, eta) is complex — involves per-token dot products
     // with concat(k_mem, v_mem). For now, gate weight grads are approximated by
@@ -798,6 +803,7 @@ fn gpu_memory_read_only_backward(
     _level_grads: &mut GpuLevelGrads,
     s: usize,
     d: usize,
+    batch_size: usize,
 ) -> GpuBuf<f32> {
     // Frozen level: y = q_mem @ M^T where M is frozen context.
     // d_q_mem = d_y @ M → needs M, which we don't store in cache.
@@ -807,7 +813,8 @@ fn gpu_memory_read_only_backward(
     // Frozen level gradients go to error buffers (not direct weight updates),
     // so this only affects d_embedded propagation from frozen levels.
     // The dominant gradient signal comes from active levels.
-    GpuBuf::zeros(s * d)
+    let _ = level_params;
+    GpuBuf::zeros(batch_size * s * d)
 }
 
 // ══════════════════════════════════════════════════════════════════════

@@ -71,6 +71,7 @@ pub struct GpuCMSCache {
     pub nh: usize,
     pub hd: usize,
     pub ws: usize,
+    pub batch_size: usize,
 }
 
 /// Per-level memory cache on GPU.
@@ -181,53 +182,59 @@ pub fn gpu_cms_forward(
     let hd = cfg.swa.head_dim;
     let ws = cfg.swa.window_size;
 
+    // Derive batch_size from input length; default to 1 for single-sequence calls
+    assert!(input_ids.len() >= s, "input_ids too short");
+    let batch_size = input_ids.len() / s;
+    assert!(batch_size >= 1);
+    assert_eq!(input_ids.len(), batch_size * s, "input_ids must be multiple of seq_len");
+    assert_eq!(target_ids.len(), batch_size * s, "target_ids must match input_ids length");
     assert_eq!(d, nh * hd);
-    assert!(input_ids.len() >= s);
-    assert!(target_ids.len() >= s);
 
-    // Convert input_ids to i32 for CUDA kernels
-    let input_ids_i32: Vec<i32> = input_ids[..s].iter().map(|&x| x as i32).collect();
-    let target_ids_i32: Vec<i32> = target_ids[..s].iter().map(|&x| x as i32).collect();
-    let d_input_ids = GpuBuf::<f32>::new(s);
-    let d_target_ids = GpuBuf::<f32>::new(s);
-    // Upload i32 data through the f32 buffer (same size)
+    let bs = batch_size;  // shorthand
+
+    // Convert input_ids to i32 for CUDA kernels (flat: [batch_size * s])
+    let input_ids_i32: Vec<i32> = input_ids.iter().map(|&x| x as i32).collect();
+    let target_ids_i32: Vec<i32> = target_ids.iter().map(|&x| x as i32).collect();
+    let d_input_ids = GpuBuf::<f32>::new(bs * s);
+    let d_target_ids = GpuBuf::<f32>::new(bs * s);
     unsafe {
         let rc = gpu_buf_memcpy_h2d(
             d_input_ids.ptr() as *mut std::ffi::c_void,
             input_ids_i32.as_ptr() as *const std::ffi::c_void,
-            s * 4,
+            bs * s * 4,
         );
         assert_eq!(rc, 0);
         let rc = gpu_buf_memcpy_h2d(
             d_target_ids.ptr() as *mut std::ffi::c_void,
             target_ids_i32.as_ptr() as *const std::ffi::c_void,
-            s * 4,
+            bs * s * 4,
         );
         assert_eq!(rc, 0);
     }
 
     // ── Stage 1: Embedding gather on GPU ──────────────────────────────
-    let mut embedded = GpuBuf::<f32>::zeros(s * d);
+    let mut embedded = GpuBuf::<f32>::zeros(bs * s * d);
     unsafe {
         crate::cuda_ffi::embedding_gather_cuda(
             params.swa.w_embed.as_ptr(),
             d_input_ids.ptr() as *const i32,
             embedded.ptr(),
-            s as i32, d as i32,
+            (bs * s) as i32, d as i32,
         );
     }
 
     // ── Stage 2a: QKV projections (cuBLAS on GPU) ─────────────────────
-    let mut q_f32 = GpuBuf::zeros(s * d);
-    let mut k_f32 = GpuBuf::zeros(s * d);
-    let mut v_f32 = GpuBuf::zeros(s * d);
-    crate::dispatch::cublas_matmul_transb_dd(&embedded, &params.swa.w_q, &mut q_f32, s, d, d, 0.0);
-    crate::dispatch::cublas_matmul_transb_dd(&embedded, &params.swa.w_k, &mut k_f32, s, d, d, 0.0);
-    crate::dispatch::cublas_matmul_transb_dd(&embedded, &params.swa.w_v, &mut v_f32, s, d, d, 0.0);
+    // cuBLAS matmul treats batch_size*s as the M dimension automatically
+    let mut q_f32 = GpuBuf::zeros(bs * s * d);
+    let mut k_f32 = GpuBuf::zeros(bs * s * d);
+    let mut v_f32 = GpuBuf::zeros(bs * s * d);
+    crate::dispatch::cublas_matmul_transb_dd(&embedded, &params.swa.w_q, &mut q_f32, bs * s, d, d, 0.0);
+    crate::dispatch::cublas_matmul_transb_dd(&embedded, &params.swa.w_k, &mut k_f32, bs * s, d, d, 0.0);
+    crate::dispatch::cublas_matmul_transb_dd(&embedded, &params.swa.w_v, &mut v_f32, bs * s, d, d, 0.0);
 
     // ── Stage 3a: SWA attention (bf16 on GPU) ─────────────────────────
-    let total = s * d;
-    let aw_total = nh * s * ws;
+    let total = bs * s * d;
+    let aw_total = bs * nh * s * ws;
     let mut q_bf16 = GpuBuf::<u16>::zeros(total);
     let mut k_bf16 = GpuBuf::<u16>::zeros(total);
     let mut v_bf16 = GpuBuf::<u16>::zeros(total);
@@ -241,11 +248,11 @@ pub fn gpu_cms_forward(
         crate::cuda_ffi::f32_to_bf16_cuda(v_f32.as_ptr(), v_bf16.ptr(), total as i32);
     }
 
-    // SWA forward kernel (bf16)
+    // SWA forward kernel (bf16) — batch_size sequences in parallel
     crate::dispatch::swa_forward_dd(
         &q_bf16, &k_bf16, &v_bf16,
         &mut attn_out_bf16, &mut attn_weights_bf16,
-        s, nh, hd, ws,
+        s, nh, hd, ws, bs,
     );
 
     // bf16 → f32 for attn_out (needed for gating)
@@ -268,16 +275,18 @@ pub fn gpu_cms_forward(
             let (y_level, mem_cache) = gpu_memory_forward(
                 &params.levels[level], cfg, &embedded,
                 &mut context.memory[level],
-                s, d, level,
+                s, d, level, bs,
             );
             y_per_level.push(y_level);
             memory_caches.push(Some(mem_cache));
         } else {
             // Frozen level: read-only M @ q_mem on GPU.
+            // Each batch element has distinct embeddings, so compute Y = Q @ M^T
+            // for all bs*s tokens simultaneously. Same frozen M for all batch elements.
             let y_level = gpu_memory_read_only(
                 &params.levels[level], &embedded,
                 &context.memory[level],
-                s, d,
+                bs * s, d,
             );
             y_per_level.push(y_level);
             memory_caches.push(None);
@@ -285,39 +294,34 @@ pub fn gpu_cms_forward(
     }
 
     // ── Combine levels: y_combined = sum with 1/sqrt(k) for k>2 ───────
-    let mut y_combined = GpuBuf::<f32>::zeros(s * d);
+    let mut y_combined = GpuBuf::<f32>::zeros(bs * s * d);
     for y_level in &y_per_level {
         unsafe {
-            crate::cuda_ffi::saxpy_cuda(1.0, y_level.as_ptr(), y_combined.ptr(), (s * d) as i32);
+            crate::cuda_ffi::saxpy_cuda(1.0, y_level.as_ptr(), y_combined.ptr(), (bs * s * d) as i32);
         }
     }
     if cfg.k > 2 {
         let scale = 1.0 / (cfg.k as f32).sqrt();
-        // Scale in place: y_combined *= scale. Use saxpy trick: y = scale*y + 0 is not right.
-        // Instead: zero a tmp, then saxpy(scale, y, tmp), copy back. Or just use elemwise.
-        // Simpler: allocate temp, saxpy, swap. Actually simplest: download, scale, upload.
-        // Best: use a scale kernel. We have saxpy: y += alpha*x. So: tmp=0, saxpy(scale, y, tmp), copy.
-        // Actually: y = (scale-1)*y + y = scale*y. So: saxpy(scale-1, y, y). y += (scale-1)*y = scale*y. Yes!
         unsafe {
-            crate::cuda_ffi::saxpy_cuda(scale - 1.0, y_combined.as_ptr(), y_combined.ptr(), (s * d) as i32);
+            crate::cuda_ffi::saxpy_cuda(scale - 1.0, y_combined.as_ptr(), y_combined.ptr(), (bs * s * d) as i32);
         }
     }
 
     // ── Stage 4: Gating on GPU ────────────────────────────────────────
-    let mut gate = GpuBuf::<f32>::zeros(s * d);
-    let mut gated_out = GpuBuf::<f32>::zeros(s * d);
+    let mut gate = GpuBuf::<f32>::zeros(bs * s * d);
+    let mut gated_out = GpuBuf::<f32>::zeros(bs * s * d);
     unsafe {
-        crate::cuda_ffi::sigmoid_cuda(y_combined.as_ptr(), gate.ptr(), (s * d) as i32);
-        crate::cuda_ffi::elemwise_mul_cuda(attn_out.as_ptr(), gate.as_ptr(), gated_out.ptr(), (s * d) as i32);
+        crate::cuda_ffi::sigmoid_cuda(y_combined.as_ptr(), gate.ptr(), (bs * s * d) as i32);
+        crate::cuda_ffi::elemwise_mul_cuda(attn_out.as_ptr(), gate.as_ptr(), gated_out.ptr(), (bs * s * d) as i32);
     }
 
     // ── Stage 5: Output projection (cuBLAS on GPU) ────────────────────
-    let mut projected = GpuBuf::<f32>::zeros(s * d);
-    crate::dispatch::cublas_matmul_transb_dd(&gated_out, &params.swa.w_o, &mut projected, s, d, d, 0.0);
+    let mut projected = GpuBuf::<f32>::zeros(bs * s * d);
+    crate::dispatch::cublas_matmul_transb_dd(&gated_out, &params.swa.w_o, &mut projected, bs * s, d, d, 0.0);
 
     // ── Stage 6: Unembed (cuBLAS on GPU) ──────────────────────────────
-    let mut logits = GpuBuf::<f32>::zeros(s * v);
-    crate::dispatch::cublas_matmul_dd(&projected, &params.swa.w_unembed, &mut logits, s, d, v, 0.0);
+    let mut logits = GpuBuf::<f32>::zeros(bs * s * v);
+    crate::dispatch::cublas_matmul_dd(&projected, &params.swa.w_unembed, &mut logits, bs * s, d, v, 0.0);
 
     // ── Stage 7: Cross-entropy loss (GPU → scalar D2H) ────────────────
     let mut loss_gpu = GpuBuf::<f32>::zeros(1);
@@ -326,7 +330,7 @@ pub fn gpu_cms_forward(
             logits.as_ptr(),
             d_target_ids.ptr() as *const i32,
             loss_gpu.ptr(),
-            s as i32, v as i32,
+            (bs * s) as i32, v as i32,
         );
     }
     crate::dispatch::cuda_sync();
@@ -334,8 +338,7 @@ pub fn gpu_cms_forward(
     // Download scalar loss (4 bytes D2H)
     let mut loss_host = [0.0f32; 1];
     loss_gpu.copy_to_host(&mut loss_host);
-    // Mean over VALID tokens only (masked targets with id < 0 or >= vocab are
-    // skipped by the cross-entropy kernel, so we must divide by the actual count).
+    // Mean over VALID tokens across all batch elements
     let valid_count = target_ids_i32.iter()
         .filter(|&&t| t >= 0 && (t as usize) < v)
         .count() as f32;
@@ -358,6 +361,7 @@ pub fn gpu_cms_forward(
         projected, logits,
         pulse: pulse.clone(),
         s, d, v, nh, hd, ws,
+        batch_size: bs,
     };
 
     (loss, cache)
@@ -368,76 +372,87 @@ pub fn gpu_cms_forward(
 // ══════════════════════════════════════════════════════════════════════
 
 /// Compute memory projections + gates + inner loop for an active level, all on GPU.
+///
+/// `embedded` has shape [batch_size * s, d] (flat batch).
+/// `context_m` is the carry-forward M state [d*d] — broadcast to all batch elements,
+/// then element-0's final M is written back after the forward pass.
 #[cfg(feature = "cuda")]
 fn gpu_memory_forward(
     level_params: &crate::gpu_params::GpuMemoryLevelParams,
     cfg: &MAGConfig,
     embedded: &GpuBuf<f32>,
-    context_m: &mut GpuBuf<f32>,   // [d*d] — updated with final M
+    context_m: &mut GpuBuf<f32>,   // [d*d] — carry-forward, updated with elem-0's final M
     s: usize,
     d: usize,
     level: usize,
+    batch_size: usize,
 ) -> (GpuBuf<f32>, GpuMemoryCache) {
+    let bs = batch_size;
     let dd = d * d;
 
     // Memory projections: k_mem, v_mem, q_mem = embedded @ W^T
-    let mut k_mem = GpuBuf::zeros(s * d);
-    let mut v_mem = GpuBuf::zeros(s * d);
-    let mut q_mem = GpuBuf::zeros(s * d);
-    crate::dispatch::cublas_matmul_transb_dd(embedded, &level_params.w_k_mem, &mut k_mem, s, d, d, 0.0);
-    crate::dispatch::cublas_matmul_transb_dd(embedded, &level_params.w_v_mem, &mut v_mem, s, d, d, 0.0);
-    crate::dispatch::cublas_matmul_transb_dd(embedded, &level_params.w_q_mem, &mut q_mem, s, d, d, 0.0);
+    // embedded is [bs*s, d]; cuBLAS treats bs*s as M dimension
+    let mut k_mem = GpuBuf::zeros(bs * s * d);
+    let mut v_mem = GpuBuf::zeros(bs * s * d);
+    let mut q_mem = GpuBuf::zeros(bs * s * d);
+    crate::dispatch::cublas_matmul_transb_dd(embedded, &level_params.w_k_mem, &mut k_mem, bs * s, d, d, 0.0);
+    crate::dispatch::cublas_matmul_transb_dd(embedded, &level_params.w_v_mem, &mut v_mem, bs * s, d, d, 0.0);
+    crate::dispatch::cublas_matmul_transb_dd(embedded, &level_params.w_q_mem, &mut q_mem, bs * s, d, d, 0.0);
 
-    // Compute per-token gates: alpha = sigmoid(dot(concat(k,v), w_alpha) + b_alpha)
-    let mut alpha = GpuBuf::zeros(s);
-    let mut theta = GpuBuf::zeros(s);
+    // Compute per-token gates: alpha[bs*s], theta[bs*s]
+    let mut alpha = GpuBuf::zeros(bs * s);
+    let mut theta = GpuBuf::zeros(bs * s);
     let mut b_alpha_host = [0.0f32];
     let mut b_theta_host = [0.0f32];
     level_params.b_alpha.copy_to_host(&mut b_alpha_host);
     level_params.b_theta.copy_to_host(&mut b_theta_host);
 
     unsafe {
-        // alpha = sigmoid(gate_compute(k_mem, v_mem, w_alpha, b_alpha))
         crate::cuda_ffi::gate_compute_cuda(
             k_mem.as_ptr(), v_mem.as_ptr(), level_params.w_alpha.as_ptr(),
             b_alpha_host[0], alpha.ptr(),
-            s as i32, d as i32, 0, // 0=sigmoid
+            (bs * s) as i32, d as i32, 0, // 0=sigmoid
         );
-        // theta = softplus(gate_compute(k_mem, v_mem, w_theta, b_theta))
         crate::cuda_ffi::gate_compute_cuda(
             k_mem.as_ptr(), v_mem.as_ptr(), level_params.w_theta.as_ptr(),
             b_theta_host[0], theta.ptr(),
-            s as i32, d as i32, 1, // 1=softplus
+            (bs * s) as i32, d as i32, 1, // 1=softplus
         );
     }
 
-    let m_initial = context_m.slice(0, dd);
+    // Broadcast context_m [dd] → batch_m_initial [bs * dd]
+    let batch_m_initial = broadcast_m_initial(context_m, bs, dd);
+    let m_initial_slice = batch_m_initial.slice(0, bs * dd);
     let m_norm_max = cfg.max_m_norm(level);
 
     match (cfg.checkpoint_interval, cfg.memory_rule) {
         // ── Full-trajectory paths (checkpoint_interval=None, current behavior) ──
         (None, MemoryRuleKind::DeltaRule) => {
-            let mut m_states = GpuBuf::zeros((s + 1) * dd);
-            let mut y = GpuBuf::zeros(s * d);
+            let mut m_states = GpuBuf::zeros(bs * (s + 1) * dd);
+            let mut y = GpuBuf::zeros(bs * s * d);
             crate::dispatch::delta_forward_dd(
                 &k_mem, &v_mem, &q_mem, &alpha, &theta,
-                &m_initial, &mut m_states, &mut y, s, d,
+                &m_initial_slice, &mut m_states, &mut y, s, d, bs,
             );
             crate::dispatch::cuda_sync();
+            // Carry forward element-0's final M: at offset s*dd in the first batch element
             copy_final_m(&m_states, context_m, s * dd, dd);
             unsafe { crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d as i32, m_norm_max); }
             (y, GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states })
         }
         (None, MemoryRuleKind::TitansLMM) => {
-            let eta = compute_eta(level_params, &k_mem, &v_mem, s, d);
-            let s_initial_buf = GpuBuf::zeros(dd);
-            let mut m_states = GpuBuf::zeros((s + 1) * dd);
-            let mut s_states = GpuBuf::zeros((s + 1) * dd);
-            let mut y = GpuBuf::zeros(s * d);
+            // Compute eta gate for all bs*s tokens (Titans uses 3 gates: alpha, theta, eta)
+            let eta = compute_eta(level_params, &k_mem, &v_mem, bs * s, d);
+            // s_initial is all-zeros per batch element; broadcast batch_m_initial already covers M
+            let batch_s_initial = GpuBuf::zeros(bs * dd);
+            let s_initial_slice = batch_s_initial.slice(0, bs * dd);
+            let mut m_states = GpuBuf::zeros(bs * (s + 1) * dd);
+            let mut s_states = GpuBuf::zeros(bs * (s + 1) * dd);
+            let mut y = GpuBuf::zeros(bs * s * d);
             crate::dispatch::titans_forward_dd(
                 &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
-                &m_initial, &s_initial_buf.slice(0, dd),
-                &mut m_states, &mut s_states, &mut y, s, d,
+                &m_initial_slice, &s_initial_slice,
+                &mut m_states, &mut s_states, &mut y, s, d, bs,
             );
             crate::dispatch::cuda_sync();
             copy_final_m(&m_states, context_m, s * dd, dd);
@@ -445,11 +460,11 @@ fn gpu_memory_forward(
             (y, GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states, s_states })
         }
         (None, MemoryRuleKind::HebbianRule) => {
-            let mut m_states = GpuBuf::zeros((s + 1) * dd);
-            let mut y = GpuBuf::zeros(s * d);
+            let mut m_states = GpuBuf::zeros(bs * (s + 1) * dd);
+            let mut y = GpuBuf::zeros(bs * s * d);
             crate::dispatch::hebbian_forward_dd(
                 &k_mem, &v_mem, &q_mem, &alpha,
-                &m_initial, &mut m_states, &mut y, s, d,
+                &m_initial_slice, &mut m_states, &mut y, s, d,
             );
             crate::dispatch::cuda_sync();
             copy_final_m(&m_states, context_m, s * dd, dd);
@@ -457,7 +472,11 @@ fn gpu_memory_forward(
             (y, GpuMemoryCache::Hebbian { k_mem, v_mem, q_mem, alpha, m_states })
         }
         // ── Checkpointed paths (checkpoint_interval=Some(c)) ──
+        // Gradient checkpointing with batch_size>1 is not supported — ablation configs
+        // do not use checkpoint_interval, so this combination never occurs in practice.
         (Some(c), MemoryRuleKind::DeltaRule) => {
+            assert_eq!(bs, 1, "checkpoint_interval with batch_size>1 not supported");
+            let m_initial = context_m.slice(0, dd);
             let num_ckpt = checkpoint_count(s, c);
             let mut m_checkpoints = GpuBuf::zeros(num_ckpt * dd);
             let mut y = GpuBuf::zeros(s * d);
@@ -471,6 +490,8 @@ fn gpu_memory_forward(
             (y, GpuMemoryCache::DeltaCkpt { k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, checkpoint_interval: c })
         }
         (Some(c), MemoryRuleKind::TitansLMM) => {
+            assert_eq!(bs, 1, "checkpoint_interval with batch_size>1 not supported");
+            let m_initial = context_m.slice(0, dd);
             let eta = compute_eta(level_params, &k_mem, &v_mem, s, d);
             let s_initial_buf = GpuBuf::zeros(dd);
             let num_ckpt = checkpoint_count(s, c);
@@ -488,6 +509,8 @@ fn gpu_memory_forward(
             (y, GpuMemoryCache::TitansCkpt { k_mem, v_mem, q_mem, alpha, theta, eta, m_checkpoints, s_checkpoints, checkpoint_interval: c })
         }
         (Some(c), MemoryRuleKind::HebbianRule) => {
+            assert_eq!(bs, 1, "checkpoint_interval with batch_size>1 not supported");
+            let m_initial = context_m.slice(0, dd);
             let num_ckpt = checkpoint_count(s, c);
             let mut m_checkpoints = GpuBuf::zeros(num_ckpt * dd);
             let mut y = GpuBuf::zeros(s * d);
@@ -503,11 +526,11 @@ fn gpu_memory_forward(
         // ── SwiGLU: stateless MLP, no M state, no m_norm_clamp ──────────
         (_, MemoryRuleKind::SwiGluMlp) => {
             let inter = cfg.intermediate_size;
-            let mut gate_buf  = GpuBuf::zeros(s * inter);
-            let mut up_buf    = GpuBuf::zeros(s * inter);
-            let mut fused_buf = GpuBuf::zeros(s * inter);
-            let mut cache_buf = GpuBuf::zeros(s * inter);
-            let mut y = GpuBuf::zeros(s * d);
+            let mut gate_buf  = GpuBuf::zeros(bs * s * inter);
+            let mut up_buf    = GpuBuf::zeros(bs * s * inter);
+            let mut fused_buf = GpuBuf::zeros(bs * s * inter);
+            let mut cache_buf = GpuBuf::zeros(bs * s * inter);
+            let mut y = GpuBuf::zeros(bs * s * d);
             unsafe {
                 crate::cuda_ffi::swiglu_forward_f32_cuda_dd(
                     embedded.as_ptr(),
@@ -516,7 +539,7 @@ fn gpu_memory_forward(
                     level_params.down_proj.as_ptr(),
                     y.ptr(),
                     gate_buf.ptr(), up_buf.ptr(), fused_buf.ptr(), cache_buf.ptr(),
-                    s as i32, d as i32, inter as i32,
+                    (bs * s) as i32, d as i32, inter as i32,
                 );
             }
             // context_m is unused for SwiGLU (no M state) — not updated.
@@ -524,6 +547,27 @@ fn gpu_memory_forward(
         }
         _ => panic!("GPU-resident forward only supports DeltaRule, TitansLMM, HebbianRule, DGD, SwiGluMlp. Got {:?}", cfg.memory_rule),
     }
+}
+
+/// Broadcast a single M matrix [dd] into a batch buffer [batch_size * dd] via D2D copies.
+///
+/// All B batch elements start with an identical copy of the context M. After the forward
+/// pass, element-0's final M is written back to context via copy_final_m.
+#[cfg(feature = "cuda")]
+fn broadcast_m_initial(context_m: &GpuBuf<f32>, batch_size: usize, dd: usize) -> GpuBuf<f32> {
+    let mut batch_m = GpuBuf::<f32>::zeros(batch_size * dd);
+    let bytes = dd * 4;
+    for b in 0..batch_size {
+        unsafe {
+            let rc = gpu_buf_memcpy_d2d(
+                (batch_m.ptr() as *mut u8).add(b * bytes) as *mut std::ffi::c_void,
+                context_m.as_ptr() as *const std::ffi::c_void,
+                bytes,
+            );
+            assert_eq!(rc, 0, "broadcast_m_initial D2D copy failed for batch element {b}");
+        }
+    }
+    batch_m
 }
 
 /// Copy final M state from states buffer to context (D2D).
@@ -788,10 +832,11 @@ pub fn gpu_prefill_forward(
         crate::cuda_ffi::f32_to_bf16_cuda(v_f32.as_ptr(), v_bf16.ptr(), total as i32);
     }
 
+    // prefill is always batch_size=1 (single prompt)
     crate::dispatch::swa_forward_dd(
         &q_bf16, &k_bf16, &v_bf16,
         &mut attn_out_bf16, &mut attn_weights_bf16,
-        s, nh, hd, ws,
+        s, nh, hd, ws, 1,
     );
 
     let mut attn_out = GpuBuf::<f32>::zeros(total);
@@ -806,7 +851,7 @@ pub fn gpu_prefill_forward(
             let (y_level, _mem_cache) = gpu_memory_forward(
                 &params.levels[level], cfg, &embedded,
                 &mut context.memory[level],
-                s, d, level,
+                s, d, level, 1,
             );
             y_per_level.push(y_level);
         } else {
@@ -994,7 +1039,7 @@ pub fn gpu_single_token_forward(
             let (y_level, _mem_cache) = gpu_memory_forward(
                 &params.levels[level], cfg, &ws.embedded,
                 &mut context.memory[level],
-                1, d, level,
+                1, d, level, 1,
             );
             y_per_level.push(y_level);
         } else {

@@ -38,21 +38,35 @@ static inline void check_cuda_alloc(const char* tag, cudaError_t err) {
 }
 
 __global__ void titans_forward_kernel(
-    const float* __restrict__ k_mem,      // [seq_len, d]
-    const float* __restrict__ v_mem,      // [seq_len, d]
-    const float* __restrict__ q_mem,      // [seq_len, d]
-    const float* __restrict__ alpha,      // [seq_len]
-    const float* __restrict__ theta,      // [seq_len]
-    const float* __restrict__ eta,        // [seq_len]
-    const float* __restrict__ m_initial,  // [d*d]
-    const float* __restrict__ s_initial,  // [d*d]
-    float* __restrict__ m_states,         // [(seq_len+1)*d*d]
-    float* __restrict__ s_states,         // [(seq_len+1)*d*d]
-    float* __restrict__ y,                // [seq_len, d]
+    const float* __restrict__ k_mem,      // [batch_size, seq_len, d]
+    const float* __restrict__ v_mem,      // [batch_size, seq_len, d]
+    const float* __restrict__ q_mem,      // [batch_size, seq_len, d]
+    const float* __restrict__ alpha,      // [batch_size, seq_len]
+    const float* __restrict__ theta,      // [batch_size, seq_len]
+    const float* __restrict__ eta,        // [batch_size, seq_len]
+    const float* __restrict__ m_initial,  // [batch_size, d*d]
+    const float* __restrict__ s_initial,  // [batch_size, d*d]
+    float* __restrict__ m_states,         // [batch_size, (seq_len+1)*d*d]
+    float* __restrict__ s_states,         // [batch_size, (seq_len+1)*d*d]
+    float* __restrict__ y,                // [batch_size, seq_len, d]
     int seq_len, int d)
 {
+    int b = blockIdx.x;   // batch index
     int tid = threadIdx.x;
     int dd = d * d;
+
+    // Offset all pointers to this batch element's slice
+    k_mem     += b * seq_len * d;
+    v_mem     += b * seq_len * d;
+    q_mem     += b * seq_len * d;
+    alpha     += b * seq_len;
+    theta     += b * seq_len;
+    eta       += b * seq_len;
+    m_initial += b * dd;
+    s_initial += b * dd;
+    m_states  += b * (seq_len + 1) * dd;
+    s_states  += b * (seq_len + 1) * dd;
+    y         += b * seq_len * d;
 
     // Shared memory: only small working buffers
     extern __shared__ float smem[];
@@ -258,13 +272,13 @@ extern "C" void titans_forward_f32_cuda(
     const float* alpha, const float* theta, const float* eta,
     const float* m_initial, const float* s_initial,
     float* m_states, float* s_states, float* y,
-    int seq_len, int d)
+    int seq_len, int d, int batch_size)
 {
     int dd = d * d;
     int block_size = (dd < 1024) ? dd : 1024;
     if (block_size < d) block_size = d;
 
-    dim3 grid(1);
+    dim3 grid(batch_size);
     dim3 block(block_size);
 
     // Shared: prediction[d] + error[d] only

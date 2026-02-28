@@ -22,22 +22,33 @@
 #include <math.h>
 
 __global__ void swa_backward_kernel(
-    const __nv_bfloat16* __restrict__ q,           // [seq_len, total_dim]
-    const __nv_bfloat16* __restrict__ k,           // [seq_len, total_dim]
-    const __nv_bfloat16* __restrict__ v,           // [seq_len, total_dim]
-    const __nv_bfloat16* __restrict__ attn_weights,// [num_heads, seq_len, window_size]
-    const float* __restrict__ d_attn_out,          // [seq_len, total_dim]
-    float* __restrict__ d_q,                       // [seq_len, total_dim]
-    float* __restrict__ d_k,                       // [seq_len, total_dim]
-    float* __restrict__ d_v,                       // [seq_len, total_dim]
+    const __nv_bfloat16* __restrict__ q,           // [batch_size, seq_len, total_dim]
+    const __nv_bfloat16* __restrict__ k,           // [batch_size, seq_len, total_dim]
+    const __nv_bfloat16* __restrict__ v,           // [batch_size, seq_len, total_dim]
+    const __nv_bfloat16* __restrict__ attn_weights,// [batch_size, num_heads, seq_len, window_size]
+    const float* __restrict__ d_attn_out,          // [batch_size, seq_len, total_dim]
+    float* __restrict__ d_q,                       // [batch_size, seq_len, total_dim]
+    float* __restrict__ d_k,                       // [batch_size, seq_len, total_dim]
+    float* __restrict__ d_v,                       // [batch_size, seq_len, total_dim]
     int seq_len, int num_heads, int head_dim, int window_size)
 {
-    int h = blockIdx.x;       // head index
-    int q_pos = blockIdx.y;   // query position
-    int d = threadIdx.x;      // dimension within head
+    int b = blockIdx.x / num_heads;  // batch index
+    int h = blockIdx.x % num_heads;  // head index
+    int q_pos = blockIdx.y;          // query position
+    int d = threadIdx.x;             // dimension within head
 
     int total_dim = num_heads * head_dim;
     int h_offset = h * head_dim;
+
+    // Offset all buffers to this batch element
+    q            += b * seq_len * total_dim;
+    k            += b * seq_len * total_dim;
+    v            += b * seq_len * total_dim;
+    attn_weights += b * num_heads * seq_len * window_size;
+    d_attn_out   += b * seq_len * total_dim;
+    d_q          += b * seq_len * total_dim;
+    d_k          += b * seq_len * total_dim;
+    d_v          += b * seq_len * total_dim;
 
     // Causal window: [win_start, q_pos] inclusive
     int win_start = (q_pos + 1 >= window_size) ? (q_pos + 1 - window_size) : 0;
@@ -138,9 +149,9 @@ extern "C" void swa_backward_f32_cuda(
     const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
     const __nv_bfloat16* attn_weights, const float* d_attn_out,
     float* d_q, float* d_k, float* d_v,
-    int seq_len, int num_heads, int head_dim, int window_size)
+    int seq_len, int num_heads, int head_dim, int window_size, int batch_size)
 {
-    dim3 grid(num_heads, seq_len);
+    dim3 grid(batch_size * num_heads, seq_len);
     dim3 block(head_dim);
 
     // Shared memory: d_attn_w[window_size] + d_scores[window_size] + reduce[head_dim]

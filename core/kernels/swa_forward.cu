@@ -20,19 +20,27 @@
 #define MAX_WINDOW 64
 
 __global__ void swa_forward_kernel(
-    const __nv_bfloat16* __restrict__ q,      // [seq_len, total_dim]
-    const __nv_bfloat16* __restrict__ k,      // [seq_len, total_dim]
-    const __nv_bfloat16* __restrict__ v,      // [seq_len, total_dim]
-    __nv_bfloat16* __restrict__ out,          // [seq_len, total_dim]
-    __nv_bfloat16* __restrict__ attn_weights, // [num_heads, seq_len, window_size]
+    const __nv_bfloat16* __restrict__ q,      // [batch_size, seq_len, total_dim]
+    const __nv_bfloat16* __restrict__ k,      // [batch_size, seq_len, total_dim]
+    const __nv_bfloat16* __restrict__ v,      // [batch_size, seq_len, total_dim]
+    __nv_bfloat16* __restrict__ out,          // [batch_size, seq_len, total_dim]
+    __nv_bfloat16* __restrict__ attn_weights, // [batch_size, num_heads, seq_len, window_size]
     int seq_len, int num_heads, int head_dim, int window_size)
 {
-    int h = blockIdx.x;       // head index
-    int q_pos = blockIdx.y;   // query position
-    int d = threadIdx.x;      // dimension within head
+    int b = blockIdx.x / num_heads;  // batch index
+    int h = blockIdx.x % num_heads;  // head index
+    int q_pos = blockIdx.y;          // query position
+    int d = threadIdx.x;             // dimension within head
 
     int total_dim = num_heads * head_dim;
     int h_offset = h * head_dim;
+
+    // Offset Q/K/V/out buffers to this batch element
+    q   += b * seq_len * total_dim;
+    k   += b * seq_len * total_dim;
+    v   += b * seq_len * total_dim;
+    out += b * seq_len * total_dim;
+    attn_weights += b * num_heads * seq_len * window_size;
 
     // Causal window: [win_start, q_pos] inclusive
     int win_start = (q_pos + 1 >= window_size) ? (q_pos + 1 - window_size) : 0;
@@ -131,9 +139,9 @@ __global__ void swa_forward_kernel(
 extern "C" void swa_forward_f32_cuda(
     const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
     __nv_bfloat16* out, __nv_bfloat16* attn_weights,
-    int seq_len, int num_heads, int head_dim, int window_size)
+    int seq_len, int num_heads, int head_dim, int window_size, int batch_size)
 {
-    dim3 grid(num_heads, seq_len);
+    dim3 grid(batch_size * num_heads, seq_len);
     dim3 block(head_dim);
 
     // Shared memory: q_row[head_dim] + scores[window_size] + weights[window_size] + reduce[head_dim]
