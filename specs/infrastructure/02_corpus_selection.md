@@ -121,19 +121,25 @@ carry useful signal.
 For a tokenized corpus stream X = [x_0, x_1, ...], define the **Excess
 Same-Token Rate at lag L** as:
 
-```text
-ESTR(L) = P(x_{t+L} == x_t) / expected_collision_rate  -  1
+```rust
+// ESTR(L): Excess Same-Token Rate at lag L
+// tokens: &[u32]  — flat uint32 token stream
+// lag: usize      — distance between compared positions
+// exclude_top_n: usize — number of high-frequency tokens to ignore
+fn estr(tokens: &[u32], lag: usize, exclude_top_n: usize, n_samples: usize) -> f64 {
+    let freq = frequency_histogram(tokens);           // freq[v] = count of token v
+    let stop_ids: HashSet<u32> = top_n_ids(&freq, exclude_top_n);
 
-Where:
-  expected_collision_rate = sum_v P(v)^2   (birthday-problem baseline)
+    // Sample (t, t+lag) pairs restricted to content-word positions
+    let (same, total) = sample_pairs(tokens, lag, n_samples, &stop_ids);
+    let same_rate: f64 = same as f64 / total as f64;
 
-Estimated as:
-  1. Exclude the top-200 most frequent tokens (BPE stop-words)
-     They appear uniformly at every lag and mask content-word signal.
-  2. Sample N=500K random (t, t+lag) pairs from content-word positions
-  3. same_rate     = fraction of pairs where x_t == x_{t+lag}
-  4. expected_rate = sum_v (freq_v / total_content)^2   over content vocab
-  5. ESTR(L) = same_rate / expected_rate - 1
+    // Birthday-problem baseline: expected collision rate under independence
+    let expected_collision: f64 = content_vocab_probs(&freq, &stop_ids)
+        .iter().map(|p| p * p).sum();
+
+    same_rate / expected_collision - 1.0  // ESTR > 0 ↔ structured; ≈ 0 ↔ flat
+}
 ```
 
 ESTR(L) ≈ 0 when tokens repeat at chance frequency (independent at lag L).
@@ -147,15 +153,31 @@ all lags. ESTR with stop-word exclusion isolates content-word repetition
 
 ### Practical computation
 
-```text
-APPROACH: Stop-word-excluded same-token rate
-  1. Compute token frequency histogram over the sample
-  2. Build exclusion set: top-200 most frequent token IDs
-  3. Sample N=500K (t, t+lag) pairs; discard pairs where either token
-     is in the exclusion set
-  4. same_rate = mean(x_t == x_{t+lag}) over remaining pairs
-  5. expected_collision = sum_v (p_content_v)^2  over non-excluded vocab
-  6. ESTR(L) = same_rate / expected_collision - 1
+```rust
+// Stop-word-excluded same-token rate (practical ESTR estimation)
+// Implemented in python/tools/lag_mi.py::_compute_estr
+fn compute_estr_practical(
+    tokens: &[u32],
+    lag: usize,
+    exclude_top_n: usize,  // default: 200
+    n_samples: usize,       // default: 500_000
+    rng: &mut Rng,
+) -> f64 {
+    let freq = np_bincount(tokens);
+    let stop_ids: HashSet<u32> = argsort_desc(&freq)[..exclude_top_n].collect();
+
+    let positions = rng.integers(0, tokens.len() - lag, n_samples);
+    let pairs: Vec<(u32, u32)> = positions
+        .filter(|&t| !stop_ids.contains(&tokens[t]) && !stop_ids.contains(&tokens[t + lag]))
+        .map(|t| (tokens[t], tokens[t + lag]))
+        .collect();
+
+    let same_rate = pairs.iter().filter(|(a, b)| a == b).count() as f64 / pairs.len() as f64;
+    let p_content = content_unigram_probs(&freq, &stop_ids);
+    let expected_collision: f64 = p_content.iter().map(|p| p * p).sum();
+
+    same_rate / expected_collision - 1.0
+}
 ```
 
 This is implemented in `python/tools/lag_mi.py` (deliverable).
@@ -174,17 +196,21 @@ These correspond to:
 
 ### Pass criterion
 
-```text
-PASS: ESTR(lag=512) > 2.0 × ESTR(lag=4096)  AND  ESTR(lag=512) > 0
+```rust
+// Corpus selection criterion (implemented in lag_mi.py::evaluate_criterion)
+fn passes_selection(estr: &HashMap<usize, f64>, threshold: f64) -> bool {
+    let estr_512 = estr[&512];           // L3 CMS period — the signal lag
+    let estr_bg  = estr[&4096];          // background / null reference
 
-  Interpretation: lag-512 carries more than 2× the predictive signal of the
-  background rate. This ensures L3 CMS has genuine information to memorize,
-  not just topic-frequency artifacts.
+    // Non-positive background forces FAIL: ambiguous / broken metric
+    let bg_safe = estr_bg.max(1e-12);
+    let ratio = estr_512 / bg_safe;
 
-FAIL: ESTR(lag=512) ≤ 0  OR  ratio ≤ 2.0×
-
-  Action: Corpus is excluded. Log the values in HADES and move to the next
-  candidate. If all candidates fail, open a GitHub issue and halt ABLATION.
+    // PASS: signal exists AND exceeds threshold × background
+    estr_512 > 0.0 && ratio > threshold  // threshold = 2.0 (PASS_THRESHOLD)
+    // FAIL: estr_512 ≤ 0 OR ratio ≤ threshold
+    //   → corpus excluded; log to HADES, try next candidate
+}
 ```
 
 ### Selection criterion (if multiple candidates pass)
@@ -323,7 +349,7 @@ experiment.
    order, then shuffle the *shards* for build.
 
 4. **Shard format**: The existing `python/engine/data.py` ContextStream reads raw
-   `int32` token arrays in contiguous files. Match this format exactly.
+   `uint32` token arrays in contiguous files. Match this format exactly.
 
 5. **The k=1/k=4 FineWeb-Edu runs already exist**: Resist the temptation to resume
    `fineweb_k1` at step 55K on a new corpus as a "quick check." That run is not
