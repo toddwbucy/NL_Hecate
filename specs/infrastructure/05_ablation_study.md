@@ -1,6 +1,6 @@
 # CMS Multi-Scale Ablation Study
 
-```
+```text
 CONTRACT
   Purpose:    Determine whether CMS multi-scale structure (k=4, levels L0–L3) provides
               a measurable perplexity advantage over single-level (k=1) and no-memory
@@ -11,7 +11,11 @@ CONTRACT
   Expects:    - Build corpus selected and validated by specs/infrastructure/02_corpus_selection.md
                 (lag-MI ESTR ratio ≥ 2.0× at lag=512 vs background). Selected: allenai/c4 (en).
               - Corpus prepared: python/data/c4/{train,val}_tokens.npy + meta.json
-              - All 4 run configs: python/configs/ablation_{A,B,C,D}.json present and validated
+              - All 4 run configs present and validated:
+                  python/configs/ablation_A_no_memory.json
+                  python/configs/ablation_B_k1_titans.json
+                  python/configs/ablation_C_k4_cms.json
+                  python/configs/ablation_D_k4_dgd.json
               - GPU available; A6000 (46 GiB) sufficient for d=512 k=4 at 100K steps
               - HADES nl_experiments: hecate-experimental-plan-2026-02 node exists
 
@@ -31,7 +35,17 @@ CONTRACT
               absolute magnitude matches.
 
   Position:   specs/infrastructure/05_ablation_study.md
-  Source:     HOPE (2512.24695) Table 6 ablation (§5.3); §4.5 DGD; §3 CMS levels
+  Source:     HOPE (2512.24695) Table 6 ablation (§5.3)
+                HADES: hope_equations/eq-088-practical-dgd-update (DGD update rule)
+                       hope_equations/eq-096-hope-dgd-update (DGD variant)
+                       hope_equations/eq-097-hope-cms-chain (CMS frequency chain)
+              HOPE (2512.24695) §4.5 DGD inner-loop optimizer
+              HOPE (2512.24695) §3 CMS frequency levels [1, 8, 64, 512]
+              Titans (2501.00663) §3.2 Delta Rule memory update
+                HADES: titans_equations/eq-034-deltanet-update (Delta Rule)
+              MIRAS (2504.13173) §3 Delta Rule / standard GD
+                HADES: miras_equations/eq-009-delta-rule (Delta Rule update)
+                       miras_equations/eq-005-basic-gd-update (standard GD)
   Related:    specs/infrastructure/02_corpus_selection.md (corpus prerequisite)
               docs/research_notes/nlm_initialization_dynamics.md
               docs/committee_response_06.md (k=1 vs k=4 FineWeb-Edu findings)
@@ -51,12 +65,12 @@ k=1 vs k=4 comparison on FineWeb-Edu was therefore inconclusive about the archit
 it reflected corpus choice, not model capacity.
 
 **Primary prediction**: After 100K build steps on C4,
-```
+```text
 ppl(Run D) < ppl(Run C) < ppl(Run B) < ppl(Run A)
 ```
 
 with ppl(B)/ppl(D) matching the direction of HOPE Table 6:
-```
+```text
 Table 6 (HOPE, 760M tokens, Wikitext-103):
   B (k=1 Titans):  14.68 ppl  (normalized to A=baseline)
   C (k=4 delta):   13.76 ppl  (−6.3% vs B)
@@ -144,24 +158,33 @@ benefit under identical optimizer). This is the cleanest test of the CMS claim.
 
 ### Memory rule semantics (CS-33/CS-34 compliant)
 
-```
+```text
 memory_rule = "delta"
   Algorithm: standard GD (state-independent)
   Update:    M_{t+1} = (1 - alpha_t) * M_t + theta_t * v_t ⊗ k_t
-  Source:    MIRAS §3, Delta Rule (Hebbian with retention)
+  Source:    MIRAS (2504.13173) §3, Delta Rule (Hebbian with retention)
+  HADES:     miras_equations/eq-009-delta-rule
+             miras_equations/eq-005-basic-gd-update
 
 memory_rule = "titans"
   Algorithm: DGD — L2 regression inner loop (state-dependent)
   Update:    error_t = M_t k_t - v_t
              M_{t+1} = (1 - alpha_t) * M_t - theta_t * biased(error_t) ⊗ k_t
   Source:    HOPE (2512.24695) §4.5, Eq 88; Titans (2501.00663) §3.2
+  HADES:     hope_equations/eq-088-practical-dgd-update
+             titans_equations/eq-034-deltanet-update
 ```
 
 ---
 
 ## Configuration Files
 
-Authoritative configs are at `python/configs/ablation_{A,B,C,D}.json`.
+Authoritative configs are at:
+- `python/configs/ablation_A_no_memory.json`
+- `python/configs/ablation_B_k1_titans.json`
+- `python/configs/ablation_C_k4_cms.json`
+- `python/configs/ablation_D_k4_dgd.json`
+
 They are the executable form of this spec — the spec and configs must stay in sync.
 
 ---
@@ -173,7 +196,7 @@ in parallel (independent). A+B must complete before drawing conclusions about
 C+D, but C+D may start immediately.
 
 Recommended execution with two GPUs:
-```
+```text
 GPU 0: Run A and Run C sequentially (no-mem baseline + k=4 delta)
 GPU 1: Run B and Run D sequentially (k=1 titans + k=4 titans/DGD)
 ```
