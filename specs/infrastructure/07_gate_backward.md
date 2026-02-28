@@ -35,7 +35,7 @@ eta_t   = sigmoid(W_eta   @ concat(k_t, v_t) + b_eta)   [Titans only]
 
 ### Alpha (sigmoid gate)
 
-```
+```text
 sigmoid'(logit) = sigmoid(logit) * (1 - sigmoid(logit)) = alpha * (1 - alpha)
 d_w_alpha[i] = sum_t( d_alpha[t] * alpha_t * (1 - alpha_t) * concat(k_t, v_t)[i] )
 d_b_alpha    = sum_t( d_alpha[t] * alpha_t * (1 - alpha_t) )
@@ -43,7 +43,7 @@ d_b_alpha    = sum_t( d_alpha[t] * alpha_t * (1 - alpha_t) )
 
 ### Theta (softplus gate)
 
-```
+```text
 softplus'(logit) = sigmoid(logit)
 
 Key insight: sigmoid(logit) = 1 - exp(-softplus(logit)) = 1 - exp(-theta)
@@ -58,7 +58,7 @@ d_b_theta    = sum_t( d_theta[t] * (1 - exp(-theta_t)) )
 
 ### Eta (sigmoid gate, Titans only)
 
-```
+```text
 Same as alpha — sigmoid derivative from the cached sigmoid output.
 d_w_eta[i] = sum_t( d_eta[t] * eta_t * (1 - eta_t) * concat(k_t, v_t)[i] )
 d_b_eta    = sum_t( d_eta[t] * eta_t * (1 - eta_t) )
@@ -66,7 +66,7 @@ d_b_eta    = sum_t( d_eta[t] * eta_t * (1 - eta_t) )
 
 ## CUDA Kernel: gate_backward_kernel
 
-```
+```text
 Grid:  (1)          — single block; weight grad is a global reduction
 Block: (min(2*d, 1024))  — one thread per weight index (d <= 512 in current ablations)
 
