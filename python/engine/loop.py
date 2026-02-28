@@ -299,9 +299,22 @@ def run_build(bcfg: BuildConfig):
     if bcfg.projection_kind == "adaptive" and not bcfg.load:
         context.seed_self_ref(params)
 
+    # Per-slot loaders for context continuity (spec 06_batch_context_continuity.md).
+    # Each slot b has its own sequential M stream through sub-corpus b.
+    # Slot b starts at position b * (total_tokens // batch_size) and strides by
+    # batch_size * seq_len per step, giving dense sequential coverage within 1/B
+    # of the corpus. batch_size=1 falls through to the scalar bpe_loader path.
+    bpe_loaders: list[BpeDataLoader] = []
+    if use_bpe and bcfg.batch_size > 1 and bpe_loader is not None:
+        slot_size = bpe_loader.total_tokens // bcfg.batch_size
+        for b in range(bcfg.batch_size):
+            loader_b = BpeDataLoader(bcfg.data_path, split="train")
+            loader_b.position = b * slot_size
+            bpe_loaders.append(loader_b)
+
     gpu_model = None
     if use_gpu:
-        gpu_model = nl_hecate.GpuModel.from_params(params, cfg)
+        gpu_model = nl_hecate.GpuModel.from_params(params, cfg, batch_size=bcfg.batch_size)
 
     error_buffers = nl_hecate.ErrorBufferList(bcfg.k, bcfg.d_model)
 
@@ -351,15 +364,16 @@ def run_build(bcfg: BuildConfig):
                     raise RuntimeError(
                         "batch_size > 1 currently requires GPU with optimizer=adamw_gpu"
                     )
+                # Per-slot chunk collection: each loader_b yields its own sequential
+                # chunk from sub-corpus b, giving each slot a dense M stream.
                 all_input: list[int] = []
                 all_target: list[int] = []
-                for _ in range(bcfg.batch_size):
-                    chunk = bpe_loader.next_chunk(bcfg.seq_len)
+                for loader_b in bpe_loaders:
+                    chunk = loader_b.next_chunk(bcfg.seq_len)
                     if chunk is None:
                         break
-                    inp, tgt = chunk
-                    all_input.extend(inp)
-                    all_target.extend(tgt)
+                    all_input.extend(chunk[0])
+                    all_target.extend(chunk[1])
                 if not all_input:
                     break
                 input_ids, target_ids = all_input, all_target
@@ -654,7 +668,7 @@ def run_build(bcfg: BuildConfig):
                         v_params, v_cfg = nl_hecate.load_checkpoint(ckpt_path)
                     else:
                         v_params, v_cfg, _ = nl_hecate.load_build_checkpoint(ckpt_path)
-                    v_model = nl_hecate.GpuModel.from_params(v_params, v_cfg)
+                    v_model = nl_hecate.GpuModel.from_params(v_params, v_cfg, batch_size=bcfg.batch_size)
                     # Save context before verification forward passes
                     rt_ctx = gpu_model.to_host_context()
                     try:
