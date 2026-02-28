@@ -228,7 +228,7 @@ A standalone script. No build-time dependencies. Interface:
 
 ```bash
 # Evaluate a corpus
-python tools/lag_mi.py \
+python python/tools/lag_mi.py \
     --corpus allenai/c4 \
     --config en \
     --split train \
