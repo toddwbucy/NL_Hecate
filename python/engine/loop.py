@@ -314,7 +314,9 @@ def run_build(bcfg: BuildConfig):
 
     gpu_model = None
     if use_gpu:
-        gpu_model = nl_hecate.GpuModel.from_params(params, cfg, batch_size=bcfg.batch_size)
+        periodic = (bcfg.memory_reset == "periodic")
+        gpu_model = nl_hecate.GpuModel.from_params(
+            params, cfg, batch_size=bcfg.batch_size, memory_reset=periodic)
 
     error_buffers = nl_hecate.ErrorBufferList(bcfg.k, bcfg.d_model)
 

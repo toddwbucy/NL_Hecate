@@ -1498,6 +1498,9 @@ struct GpuModel {
     adamw_state: Option<nl_hecate_core::gpu_optimizer::GpuAdamWState>,
     kv_cache: Option<nl_hecate_core::gpu_forward::GpuKVCache>,
     decode_workspace: Option<nl_hecate_core::gpu_forward::DecodeWorkspace>,
+    /// TNT periodic reset mode. When true, context.memory[k] is zeroed after
+    /// each step where pulse.active_levels[k] is true (eq-006, 2511.07343).
+    memory_reset: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -1507,8 +1510,8 @@ impl GpuModel {
     /// All parameters are uploaded to GPU once. batch_size determines how many
     /// independent M-state slots are allocated in GpuContextState.
     #[new]
-    #[pyo3(signature = (cfg, seed, batch_size=1))]
-    fn new(cfg: &MAGConfig, seed: u64, batch_size: usize) -> PyResult<Self> {
+    #[pyo3(signature = (cfg, seed, batch_size=1, memory_reset=false))]
+    fn new(cfg: &MAGConfig, seed: u64, batch_size: usize, memory_reset: bool) -> PyResult<Self> {
         let host_params = nl_hecate_core::model::MAGParams::init(&cfg.inner, seed);
         let gpu_params = nl_hecate_core::gpu_params::GpuMAGParams::from_host(&host_params);
         let gpu_context = nl_hecate_core::gpu_params::GpuContextState::new(
@@ -1521,14 +1524,15 @@ impl GpuModel {
             adamw_state: None,
             kv_cache: None,
             decode_workspace: None,
+            memory_reset,
         })
     }
 
     /// Create from existing host params (e.g., loaded from checkpoint).
     /// batch_size controls how many M-state slots are allocated for batched training.
     #[staticmethod]
-    #[pyo3(signature = (params, cfg, batch_size=1))]
-    fn from_params(params: &MAGParams, cfg: &MAGConfig, batch_size: usize) -> PyResult<Self> {
+    #[pyo3(signature = (params, cfg, batch_size=1, memory_reset=false))]
+    fn from_params(params: &MAGParams, cfg: &MAGConfig, batch_size: usize, memory_reset: bool) -> PyResult<Self> {
         let gpu_params = nl_hecate_core::gpu_params::GpuMAGParams::from_host(&params.inner);
         let gpu_context = nl_hecate_core::gpu_params::GpuContextState::new(
             cfg.inner.k, cfg.inner.swa.d_model, batch_size,
@@ -1540,6 +1544,7 @@ impl GpuModel {
             adamw_state: None,
             kv_cache: None,
             decode_workspace: None,
+            memory_reset,
         })
     }
 
@@ -1718,6 +1723,17 @@ impl GpuModel {
             self.cfg.swa.vocab_size,
         );
 
+        // TNT periodic reset (2511.07343 eq-006): after observing this step's final M,
+        // reset context.memory[k] to zeros for each level that fired this step.
+        // CS-32 compliant: reset happens after the step's advance, before the next step's observe.
+        if self.memory_reset {
+            for (k, &active) in pulse.inner.active_levels.iter().enumerate() {
+                if active {
+                    self.context.periodic_reset_level(k);
+                }
+            }
+        }
+
         Ok((loss, grad_norm))
     }
 
@@ -1781,6 +1797,15 @@ impl GpuModel {
             self.cfg.swa.d_model,
             self.cfg.swa.vocab_size,
         );
+
+        // TNT periodic reset — same policy as step_adamw (CS-32 compliant).
+        if self.memory_reset {
+            for (k, &active) in pulse.inner.active_levels.iter().enumerate() {
+                if active {
+                    self.context.periodic_reset_level(k);
+                }
+            }
+        }
 
         Ok((loss, grad_norm, last_logits))
     }
@@ -1874,11 +1899,13 @@ impl GpuModel {
     /// but norm is computed Rust-side so Python never sees raw memory.
     fn memory_norms(&self) -> Vec<f32> {
         let d = self.context.d;
+        let dd = d * d;
         let mut norms = Vec::with_capacity(self.context.memory.len());
-        let mut buf = vec![0.0f32; d * d];
         for gpu_mem in &self.context.memory {
+            // Buffer is batch_size * d * d; only element 0 is the carry-forward M.
+            let mut buf = vec![0.0f32; gpu_mem.len()];
             gpu_mem.copy_to_host(&mut buf);
-            let norm = buf.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let norm = buf[..dd].iter().map(|x| x * x).sum::<f32>().sqrt();
             norms.push(norm);
         }
         norms

@@ -277,6 +277,20 @@ impl GpuContextState {
         }
     }
 
+    /// TNT periodic reset: zero context.memory[level] (all batch slots).
+    /// Called after each step where pulse.active_levels[level] is true,
+    /// when memory_reset = "periodic". Resets M to zeros (the initial prior).
+    /// CS-32: called AFTER the step's forward/backward/update — the previous
+    /// shard's final M was already observed; the next shard starts from zero.
+    ///
+    /// Note: when M_init becomes a learnable outer_loop_param (follow-up task),
+    /// this method should D2D-copy m_init[level] instead of zeroing.
+    pub fn periodic_reset_level(&self, level: usize) {
+        if let Some(buf) = self.memory.get(level) {
+            buf.zero();
+        }
+    }
+
     /// Upload from host ContextState and broadcast to all batch_size slots.
     /// Used for checkpoint restore: host M is written to every slot so all
     /// batch elements start from the same saved context.
