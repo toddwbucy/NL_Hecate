@@ -148,6 +148,11 @@ def per_smell_breakdown(
     results: dict[str, dict[str, float]] = {}
     gen = torch.Generator().manual_seed(seed)
 
+    # Build exclusion set from all known positives to avoid label noise
+    all_pos_set: set[tuple[int, int]] = set(
+        zip(pos_ei[0].tolist(), pos_ei[1].tolist())
+    )
+
     # Group positive edges by destination smell index
     unique_dsts = pos_ei[1].unique().tolist()
     for dst_idx in unique_dsts:
@@ -155,8 +160,15 @@ def per_smell_breakdown(
         local_pos_ei = pos_ei[:, mask].to(device)
         n_pos = local_pos_ei.size(1)
 
-        neg_srcs = torch.randint(num_src, (n_pos * neg_ratio,), generator=gen)
-        neg_dsts = torch.full((n_pos * neg_ratio,), dst_idx, dtype=torch.long)
+        neg_srcs_list: list[int] = []
+        for _ in range(n_pos * neg_ratio):
+            for _ in range(100):  # max attempts per sample
+                src = int(torch.randint(num_src, (1,), generator=gen).item())
+                if (src, int(dst_idx)) not in all_pos_set:
+                    neg_srcs_list.append(src)
+                    break
+        neg_srcs = torch.tensor(neg_srcs_list, dtype=torch.long)
+        neg_dsts = torch.full((len(neg_srcs_list),), dst_idx, dtype=torch.long)
         local_neg_ei = torch.stack([neg_srcs, neg_dsts], dim=0).to(device)
 
         pos_logits = predictor.predict_edges(node_embs, local_pos_ei).detach().cpu().numpy()
