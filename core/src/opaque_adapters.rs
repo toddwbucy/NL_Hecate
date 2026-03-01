@@ -293,7 +293,9 @@ pub fn delta_rule_opaque_backward(
         k_conv_cache, q_conv_cache,
     };
 
-    let rule = DeltaRule { bias, sign_sharpness, theta_floor: 0.0, theta_ceil: f32::MAX };
+    let theta_floor = if saved[0].len() > 5 { saved[0][4] } else { 0.0 };
+    let theta_ceil = if saved[0].len() > 6 { saved[0][5] } else { f32::MAX };
+    let rule = DeltaRule { bias, sign_sharpness, theta_floor, theta_ceil };
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
     d_inputs[0] = d_embedded;
@@ -475,7 +477,9 @@ pub fn moneta_opaque_backward(
         q_conv_cache: q_conv_cache_restored,
     };
 
-    let rule = Moneta { d_hidden, lp_p, lambda_2, sign_sharpness, lq_q, theta_floor: 0.0, theta_ceil: f32::MAX };
+    let theta_floor = if saved[0].len() > 8 { saved[0][7] } else { 0.0 };
+    let theta_ceil = if saved[0].len() > 9 { saved[0][8] } else { f32::MAX };
+    let rule = Moneta { d_hidden, lp_p, lambda_2, sign_sharpness, lq_q, theta_floor, theta_ceil };
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
     d_inputs[0] = d_embedded;
@@ -681,7 +685,9 @@ pub fn trellis_opaque_backward(
         q_conv_cache: q_conv_cache_restored,
     };
 
-    let rule = Trellis { d_k, lambda_k, lambda_v, theta_floor: 0.0, theta_ceil: f32::MAX };
+    let theta_floor = if saved[0].len() > 6 { saved[0][5] } else { 0.0 };
+    let theta_ceil = if saved[0].len() > 7 { saved[0][6] } else { f32::MAX };
+    let rule = Trellis { d_k, lambda_k, lambda_v, theta_floor, theta_ceil };
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
     d_inputs[0] = d_embedded;

@@ -80,6 +80,7 @@ pub fn lattice_gla_forward(
     d: usize,
     chunk_size: usize,
     cfg: &MAGConfig,
+    level: usize,
     initial_m: Option<Vec<f32>>,
 ) -> (Vec<f32>, LatticeGLACache) {
     assert!(chunk_size >= 1, "chunk_size must be >= 1");
@@ -105,7 +106,7 @@ pub fn lattice_gla_forward(
         let chunk_embedded = &embedded[start * d..end * d];
 
         let (chunk_y, chunk_cache) = chunkwise_gd_forward(
-            level_params, chunk_embedded, clen, d, clen, cfg, boundary_state.clone(),
+            level_params, chunk_embedded, clen, d, clen, cfg, level, boundary_state.clone(),
         );
 
         y[start * d..end * d].copy_from_slice(&chunk_y);
@@ -162,8 +163,9 @@ pub fn lattice_gla_backward(
     d_y: &[f32],
     embedded: &[f32],
     cfg: &MAGConfig,
+    level: usize,
 ) -> (MemoryLevelParams, Vec<f32>) {
-    chunkwise_gd_backward(level_params, &cache.gd_cache, d_y, embedded, cfg)
+    chunkwise_gd_backward(level_params, &cache.gd_cache, d_y, embedded, cfg, level)
 }
 
 /// Trellis GLA forward — like Lattice but renormalizes S_K/S_V.
@@ -174,6 +176,7 @@ pub fn trellis_gla_forward(
     d: usize,
     chunk_size: usize,
     cfg: &MAGConfig,
+    level: usize,
     initial_m: Option<Vec<f32>>,
 ) -> (Vec<f32>, LatticeGLACache) {
     assert!(chunk_size >= 1, "chunk_size must be >= 1");
@@ -197,7 +200,7 @@ pub fn trellis_gla_forward(
         let chunk_embedded = &embedded[start * d..end * d];
 
         let (chunk_y, chunk_cache) = chunkwise_gd_forward(
-            level_params, chunk_embedded, clen, d, clen, cfg, boundary_state.clone(),
+            level_params, chunk_embedded, clen, d, clen, cfg, level, boundary_state.clone(),
         );
 
         y[start * d..end * d].copy_from_slice(&chunk_y);
@@ -240,8 +243,9 @@ pub fn trellis_gla_backward(
     d_y: &[f32],
     embedded: &[f32],
     cfg: &MAGConfig,
+    level: usize,
 ) -> (MemoryLevelParams, Vec<f32>) {
-    chunkwise_gd_backward(level_params, &cache.gd_cache, d_y, embedded, cfg)
+    chunkwise_gd_backward(level_params, &cache.gd_cache, d_y, embedded, cfg, level)
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -618,7 +622,7 @@ mod tests {
         let d = cfg.swa.d_model;
 
         let (y_gla, _) = lattice_gla_forward(
-            &params.levels[0], &embedded, s, d, s, &cfg, None,
+            &params.levels[0], &embedded, s, d, s, &cfg, 0, None,
         );
         let rule = LatticeOSR { m_slots: cfg.m_slots, variant: cfg.lattice_variant };
         let (y_seq, _) = rule.step(&params.levels[0], &embedded, s, d, None);
@@ -642,7 +646,7 @@ mod tests {
 
         let c = 4.min(s);
         let (y_gla, _) = lattice_gla_forward(
-            &params.levels[0], &embedded, s, d, c, &cfg, None,
+            &params.levels[0], &embedded, s, d, c, &cfg, 0, None,
         );
 
         let rel = relative_diff(&y_seq, &y_gla);
@@ -660,7 +664,7 @@ mod tests {
         let d = cfg.swa.d_model;
 
         let (y, _) = lattice_gla_forward(
-            &params.levels[0], &embedded, s, d, 2, &cfg, None,
+            &params.levels[0], &embedded, s, d, 2, &cfg, 0, None,
         );
         for &v in &y { assert!(v.is_finite()); }
     }
@@ -674,11 +678,11 @@ mod tests {
         let d = cfg.swa.d_model;
 
         let (_, cache) = lattice_gla_forward(
-            &params.levels[0], &embedded, s, d, 2, &cfg, None,
+            &params.levels[0], &embedded, s, d, 2, &cfg, 0, None,
         );
         let d_y = vec![1.0f32; s * d];
         let (grads, d_emb) = lattice_gla_backward(
-            &params.levels[0], &cache, &d_y, &embedded, &cfg,
+            &params.levels[0], &cache, &d_y, &embedded, &cfg, 0,
         );
 
         for &v in grads.w_k_mem.master().iter() { assert!(v.is_finite()); }
@@ -695,7 +699,7 @@ mod tests {
         let d = cfg.swa.d_model;
 
         let (_, cache) = lattice_gla_forward(
-            &params.levels[0], &embedded, s, d, 2, &cfg, None,
+            &params.levels[0], &embedded, s, d, 2, &cfg, 0, None,
         );
 
         for boundary in &cache.normalized_boundaries {
@@ -731,7 +735,7 @@ mod tests {
         let mut last_loss = 0.0f32;
 
         for outer_step in 0..100 {
-            let (y, cache) = lattice_gla_forward(&lp, &embedded, s, d, 2, &cfg, None);
+            let (y, cache) = lattice_gla_forward(&lp, &embedded, s, d, 2, &cfg, 0, None);
             let loss: f32 = y.iter().zip(target.iter())
                 .map(|(a, b)| (a - b).powi(2)).sum::<f32>() / (s * d) as f32;
             if outer_step == 0 { first_loss = loss; }
@@ -739,7 +743,7 @@ mod tests {
 
             let d_y: Vec<f32> = y.iter().zip(target.iter())
                 .map(|(a, b)| 2.0 * (a - b) / (s * d) as f32).collect();
-            let (grads, _) = lattice_gla_backward(&lp, &cache, &d_y, &embedded, &cfg);
+            let (grads, _) = lattice_gla_backward(&lp, &cache, &d_y, &embedded, &cfg, 0);
 
             // Outer-loop weight update (projection weights, not inner-loop memory)
             for (w, g) in lp.w_k_mem.master_mut().iter_mut().zip(grads.w_k_mem.master().iter()) { *w -= lr * g; }
@@ -766,7 +770,7 @@ mod tests {
         let d = cfg.swa.d_model;
 
         let (y_gla, _) = trellis_gla_forward(
-            &params.levels[0], &embedded, s, d, s, &cfg, None,
+            &params.levels[0], &embedded, s, d, s, &cfg, 0, None,
         );
         let rule = Trellis::from_cfg(&cfg);
         let (y_seq, _) = rule.step(&params.levels[0], &embedded, s, d, None);
@@ -790,7 +794,7 @@ mod tests {
 
         let c = 4.min(s);
         let (y_gla, _) = trellis_gla_forward(
-            &params.levels[0], &embedded, s, d, c, &cfg, None,
+            &params.levels[0], &embedded, s, d, c, &cfg, 0, None,
         );
 
         let rel = relative_diff(&y_seq, &y_gla);
@@ -807,7 +811,7 @@ mod tests {
         let d = cfg.swa.d_model;
 
         let (y, _) = trellis_gla_forward(
-            &params.levels[0], &embedded, s, d, 2, &cfg, None,
+            &params.levels[0], &embedded, s, d, 2, &cfg, 0, None,
         );
         for &v in &y { assert!(v.is_finite()); }
     }
@@ -821,11 +825,11 @@ mod tests {
         let d = cfg.swa.d_model;
 
         let (_, cache) = trellis_gla_forward(
-            &params.levels[0], &embedded, s, d, 2, &cfg, None,
+            &params.levels[0], &embedded, s, d, 2, &cfg, 0, None,
         );
         let d_y = vec![1.0f32; s * d];
         let (grads, d_emb) = trellis_gla_backward(
-            &params.levels[0], &cache, &d_y, &embedded, &cfg,
+            &params.levels[0], &cache, &d_y, &embedded, &cfg, 0,
         );
 
         for &v in grads.w_k_mem.master().iter() { assert!(v.is_finite()); }
@@ -852,7 +856,7 @@ mod tests {
         let mut last_loss = 0.0f32;
 
         for outer_step in 0..100 {
-            let (y, cache) = trellis_gla_forward(&lp, &embedded, s, d, 2, &cfg, None);
+            let (y, cache) = trellis_gla_forward(&lp, &embedded, s, d, 2, &cfg, 0, None);
             let loss: f32 = y.iter().zip(target.iter())
                 .map(|(a, b)| (a - b).powi(2)).sum::<f32>() / (s * d) as f32;
             if outer_step == 0 { first_loss = loss; }
@@ -860,7 +864,7 @@ mod tests {
 
             let d_y: Vec<f32> = y.iter().zip(target.iter())
                 .map(|(a, b)| 2.0 * (a - b) / (s * d) as f32).collect();
-            let (grads, _) = trellis_gla_backward(&lp, &cache, &d_y, &embedded, &cfg);
+            let (grads, _) = trellis_gla_backward(&lp, &cache, &d_y, &embedded, &cfg, 0);
 
             // Outer-loop weight update (projection weights, not inner-loop memory)
             for (w, g) in lp.w_k_mem.master_mut().iter_mut().zip(grads.w_k_mem.master().iter()) { *w -= lr * g; }
@@ -888,10 +892,10 @@ mod tests {
         let (y_seq, _) = rule.step(&params.levels[0], &embedded, s, d, None);
 
         let (y_gla, _) = lattice_gla_forward(
-            &params.levels[0], &embedded, s, d, 2, &cfg, None,
+            &params.levels[0], &embedded, s, d, 2, &cfg, 0, None,
         );
         let (y_cw, _) = chunkwise_gd_forward(
-            &params.levels[0], &embedded, s, d, 2, &cfg, None,
+            &params.levels[0], &embedded, s, d, 2, &cfg, 0, None,
         );
 
         let gla_diff = relative_diff(&y_seq, &y_gla);
@@ -1025,7 +1029,7 @@ mod tests {
         let d = cfg.swa.d_model;
 
         let (y_approx, _) = lattice_gla_forward(
-            &params.levels[0], &embedded, s, d, 1, &cfg, None,
+            &params.levels[0], &embedded, s, d, 1, &cfg, 0, None,
         );
         let (y_lin, _) = linearized_gla_forward(
             &params.levels[0], &embedded, s, d, 1, &cfg, None,

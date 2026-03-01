@@ -472,7 +472,7 @@ pub fn traced_cms_forward(
             let initial_m = Some(std::mem::take(&mut context.memory[level]));
 
             let (y_data, mem_cache, final_m, y_id) = traced_active_level(
-                tape, cfg, &params.levels[level], &embedded, s, d,
+                tape, cfg, level, &params.levels[level], &embedded, s, d,
                 initial_m, emb_id, lp_id,
             );
 
@@ -623,6 +623,7 @@ pub fn traced_cms_forward(
 fn traced_active_level(
     tape: &mut Tape,
     cfg: &MAGConfig,
+    level: usize,
     level_params: &MemoryLevelParams,
     embedded: &[f32],
     s: usize,
@@ -635,12 +636,14 @@ fn traced_active_level(
 
     match cfg.memory_rule {
         MemoryRuleKind::DeltaRule => {
-            let (y, cache) = DeltaRule::from_cfg(cfg).step(level_params, embedded, s, d, initial_m);
+            let rule = DeltaRule::from_cfg_level(cfg, level);
+            let (y, cache) = rule.step(level_params, embedded, s, d, initial_m);
             let m_final_start = s * d * d;
             let final_m = cache.m_states[m_final_start..m_final_start + d * d].to_vec();
 
+            let extra_meta = [crate::moneta::bias_to_f32(rule.bias), rule.sign_sharpness, rule.theta_floor, rule.theta_ceil];
             let (meta_id, lp_saved, emb_saved) =
-                alloc_common_saved(tape, level_params, embedded, s, d, &[]);
+                alloc_common_saved(tape, level_params, embedded, s, d, &extra_meta);
             let cache_ids = vec![
                 tape.alloc(cache.m_states.clone(), vec![]),
                 tape.alloc(cache.k_mem.clone(), vec![]),
@@ -748,7 +751,7 @@ fn traced_active_level(
             (y, MemoryCache::Hebbian(cache), final_m, y_id)
         }
         MemoryRuleKind::Moneta => {
-            let rule = Moneta::from_cfg(cfg);
+            let rule = Moneta::from_cfg_level(cfg, level);
             let (y, cache) = rule.step(level_params, embedded, s, d, initial_m);
             let dh = cfg.d_hidden;
             let w1_size = dh * d;
@@ -759,7 +762,7 @@ fn traced_active_level(
             final_m.extend_from_slice(w1_final);
             final_m.extend_from_slice(w2_final);
 
-            let extra_meta = [dh as f32, cfg.lp_p, cfg.lambda_2, cfg.sign_sharpness, cfg.lq_q];
+            let extra_meta = [dh as f32, cfg.lp_p, cfg.lambda_2, cfg.sign_sharpness, cfg.lq_q, rule.theta_floor, rule.theta_ceil];
             let (meta_id, lp_saved, emb_saved) =
                 alloc_common_saved(tape, level_params, embedded, s, d, &extra_meta);
             let mut cache_ids = vec![
@@ -944,7 +947,7 @@ fn traced_active_level(
             (y, MemoryCache::Lattice(cache), final_m, y_id)
         }
         MemoryRuleKind::Trellis => {
-            let rule = Trellis::from_cfg(cfg);
+            let rule = Trellis::from_cfg_level(cfg, level);
             let (y, cache) = rule.step(level_params, embedded, s, d, initial_m);
             let d_k = cfg.d_compress;
             let sk_size = d_k * d;
@@ -955,7 +958,7 @@ fn traced_active_level(
             final_m.extend_from_slice(sk_final);
             final_m.extend_from_slice(sv_final);
 
-            let extra_meta = [d_k as f32, cfg.lambda_k, cfg.lambda_v];
+            let extra_meta = [d_k as f32, cfg.lambda_k, cfg.lambda_v, rule.theta_floor, rule.theta_ceil];
             let (meta_id, lp_saved, emb_saved) =
                 alloc_common_saved(tape, level_params, embedded, s, d, &extra_meta);
             let cache_ids = vec![

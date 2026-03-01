@@ -962,7 +962,7 @@ mod tests {
     // ── CS-39 clamp_theta tests ───────────────────────────────────────
 
     #[test]
-    fn test_delta_clamp_theta_floor_applies() {
+    fn test_delta_clamp_theta_ceil_applies() {
         // With theta_ceil=0.01 (very tight), theta output must be ≤ 0.01
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
@@ -987,8 +987,11 @@ mod tests {
         let (_, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let d_y = vec![1.0f32; cfg.swa.seq_len * cfg.swa.d_model];
         let (grads, _) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
-        // All theta are clamped to ceil, so clamp_mask=0 for all t → b_theta gradient must be 0
+        // All theta are clamped to ceil, so clamp_mask=0 for all t → b_theta and w_theta gradients must be 0
         assert!(grads.b_theta[0].abs() < 1e-10, "b_theta grad should be 0 when all theta clamped: {}", grads.b_theta[0]);
+        for (i, &g) in grads.w_theta.iter().enumerate() {
+            assert!(g.abs() < 1e-10, "w_theta[{i}] grad should be 0 when all theta clamped: {g}");
+        }
     }
 
     #[test]

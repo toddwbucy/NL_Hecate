@@ -50,6 +50,7 @@ pub struct MALForwardCache {
 /// Dispatch memory step for MAL. Returns (y, MemoryCache).
 fn dispatch_memory_step(
     cfg: &MAGConfig,
+    level: usize,
     level_params: &crate::model::MemoryLevelParams,
     embedded: &[f32],
     s: usize,
@@ -58,11 +59,11 @@ fn dispatch_memory_step(
 ) -> (Vec<f32>, MemoryCache) {
     match cfg.memory_rule {
         MemoryRuleKind::DeltaRule => {
-            let (y, cache) = DeltaRule::from_cfg(cfg).step(level_params, embedded, s, d, initial_m);
+            let (y, cache) = DeltaRule::from_cfg_level(cfg, level).step(level_params, embedded, s, d, initial_m);
             (y, MemoryCache::Delta(cache))
         }
         MemoryRuleKind::TitansLMM => {
-            let (y, cache) = TitansLMM::from_cfg(cfg).step(level_params, embedded, s, d, initial_m);
+            let (y, cache) = TitansLMM::from_cfg_level(cfg, level).step(level_params, embedded, s, d, initial_m);
             (y, MemoryCache::Titans(cache))
         }
         MemoryRuleKind::HebbianRule => {
@@ -70,7 +71,7 @@ fn dispatch_memory_step(
             (y, MemoryCache::Hebbian(cache))
         }
         MemoryRuleKind::Moneta => {
-            let rule = Moneta::from_cfg(cfg);
+            let rule = Moneta::from_cfg_level(cfg, level);
             let (y, cache) = rule.step(level_params, embedded, s, d, initial_m);
             (y, MemoryCache::Moneta(cache))
         }
@@ -90,7 +91,7 @@ fn dispatch_memory_step(
             (y, MemoryCache::Lattice(cache))
         }
         MemoryRuleKind::Trellis => {
-            let rule = Trellis::from_cfg(cfg);
+            let rule = Trellis::from_cfg_level(cfg, level);
             let (y, cache) = rule.step(level_params, embedded, s, d, initial_m);
             (y, MemoryCache::Trellis(cache))
         }
@@ -108,17 +109,18 @@ fn dispatch_memory_step(
 /// Dispatch memory step_backward. Returns (level param grads, d_embedded).
 fn dispatch_memory_backward(
     cfg: &MAGConfig,
+    level: usize,
     level_params: &crate::model::MemoryLevelParams,
     cache: &MemoryCache,
     d_y: &[f32],
     embedded: &[f32],
 ) -> (crate::model::MemoryLevelParams, Vec<f32>) {
     match cache {
-        MemoryCache::Delta(c) => DeltaRule::from_cfg(cfg).step_backward(level_params, c, d_y, embedded),
-        MemoryCache::Titans(c) => TitansLMM::from_cfg(cfg).step_backward(level_params, c, d_y, embedded),
+        MemoryCache::Delta(c) => DeltaRule::from_cfg_level(cfg, level).step_backward(level_params, c, d_y, embedded),
+        MemoryCache::Titans(c) => TitansLMM::from_cfg_level(cfg, level).step_backward(level_params, c, d_y, embedded),
         MemoryCache::Hebbian(c) => HebbianRule.step_backward(level_params, c, d_y, embedded),
         MemoryCache::Moneta(c) => {
-            let rule = Moneta::from_cfg(cfg);
+            let rule = Moneta::from_cfg_level(cfg, level);
             rule.step_backward(level_params, c, d_y, embedded)
         }
         MemoryCache::YAAD(c) => {
@@ -134,7 +136,7 @@ fn dispatch_memory_backward(
             rule.step_backward(level_params, c, d_y, embedded)
         }
         MemoryCache::Trellis(c) => {
-            let rule = Trellis::from_cfg(cfg);
+            let rule = Trellis::from_cfg_level(cfg, level);
             rule.step_backward(level_params, c, d_y, embedded)
         }
         MemoryCache::Atlas(c) => {
@@ -176,7 +178,7 @@ pub fn mal_forward(
     }
 
     // Stage 2: Memory step on embedded → m_t
-    let (m_t, memory_cache) = dispatch_memory_step(cfg, &params.levels[0], &embedded, s, d, None);
+    let (m_t, memory_cache) = dispatch_memory_step(cfg, 0, &params.levels[0], &embedded, s, d, None);
 
     // Stage 2.5: Residual — attn_input = m_t + embedded
     // This breaks the bootstrapping deadlock: at init m_t ≈ 0, so attention sees embedded.
@@ -373,7 +375,7 @@ pub fn mal_backward(
 
     // ── Stage 2: Memory backward ────────────────────────────────────
     let (mem_grads, d_embedded_mem) = dispatch_memory_backward(
-        cfg, &params.levels[0], &cache.memory_cache, &d_m_t, &cache.embedded,
+        cfg, 0, &params.levels[0], &cache.memory_cache, &d_m_t, &cache.embedded,
     );
     grads.levels[0].accumulate(&mem_grads);
 
@@ -585,7 +587,7 @@ pub fn cms_mal_forward(
         if effective_active {
             let initial_m = Some(std::mem::take(&mut context.memory[level]));
             let (y_level, mem_cache) = dispatch_memory_step(
-                cfg, &params.levels[level], &embedded, s, d, initial_m,
+                cfg, level, &params.levels[level], &embedded, s, d, initial_m,
             );
             persist_memory_state(cfg, &mem_cache, s, d, &mut context.memory[level]);
             y_per_level.push(y_level);
@@ -829,7 +831,7 @@ pub fn cms_mal_backward(
         if cache.memory_caches[level].is_some() {
             let mem_cache = cache.memory_caches[level].as_ref().unwrap();
             let (mem_grads, d_embedded_mem) = dispatch_memory_backward(
-                cfg, &params.levels[level], mem_cache, &d_m_t, &cache.embedded,
+                cfg, level, &params.levels[level], mem_cache, &d_m_t, &cache.embedded,
             );
             grads.levels[level].accumulate(&mem_grads);
             for i in 0..(s * d) {

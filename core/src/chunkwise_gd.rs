@@ -129,15 +129,16 @@ fn run_chunk(
     chunk_len: usize,
     d: usize,
     cfg: &MAGConfig,
+    level: usize,
     initial_m: Option<Vec<f32>>,
 ) -> (Vec<f32>, MemoryCache) {
     match cfg.memory_rule {
         MemoryRuleKind::DeltaRule => {
-            let (y, cache) = DeltaRule::from_cfg(cfg).step(level_params, embedded_chunk, chunk_len, d, initial_m);
+            let (y, cache) = DeltaRule::from_cfg_level(cfg, level).step(level_params, embedded_chunk, chunk_len, d, initial_m);
             (y, MemoryCache::Delta(cache))
         }
         MemoryRuleKind::TitansLMM => {
-            let (y, cache) = TitansLMM::from_cfg(cfg).step(level_params, embedded_chunk, chunk_len, d, initial_m);
+            let (y, cache) = TitansLMM::from_cfg_level(cfg, level).step(level_params, embedded_chunk, chunk_len, d, initial_m);
             (y, MemoryCache::Titans(cache))
         }
         MemoryRuleKind::HebbianRule => {
@@ -145,7 +146,7 @@ fn run_chunk(
             (y, MemoryCache::Hebbian(cache))
         }
         MemoryRuleKind::Moneta => {
-            let rule = Moneta::from_cfg(cfg);
+            let rule = Moneta::from_cfg_level(cfg, level);
             let (y, cache) = rule.step(level_params, embedded_chunk, chunk_len, d, initial_m);
             (y, MemoryCache::Moneta(cache))
         }
@@ -165,7 +166,7 @@ fn run_chunk(
             (y, MemoryCache::Lattice(cache))
         }
         MemoryRuleKind::Trellis => {
-            let rule = Trellis::from_cfg(cfg);
+            let rule = Trellis::from_cfg_level(cfg, level);
             let (y, cache) = rule.step(level_params, embedded_chunk, chunk_len, d, initial_m);
             (y, MemoryCache::Trellis(cache))
         }
@@ -189,13 +190,14 @@ fn run_chunk_backward(
     d_y_chunk: &[f32],
     embedded_chunk: &[f32],
     cfg: &MAGConfig,
+    level: usize,
 ) -> (MemoryLevelParams, Vec<f32>) {
     match cache {
-        MemoryCache::Delta(c) => DeltaRule::from_cfg(cfg).step_backward(level_params, c, d_y_chunk, embedded_chunk),
-        MemoryCache::Titans(c) => TitansLMM::from_cfg(cfg).step_backward(level_params, c, d_y_chunk, embedded_chunk),
+        MemoryCache::Delta(c) => DeltaRule::from_cfg_level(cfg, level).step_backward(level_params, c, d_y_chunk, embedded_chunk),
+        MemoryCache::Titans(c) => TitansLMM::from_cfg_level(cfg, level).step_backward(level_params, c, d_y_chunk, embedded_chunk),
         MemoryCache::Hebbian(c) => HebbianRule.step_backward(level_params, c, d_y_chunk, embedded_chunk),
         MemoryCache::Moneta(c) => {
-            let rule = Moneta::from_cfg(cfg);
+            let rule = Moneta::from_cfg_level(cfg, level);
             rule.step_backward(level_params, c, d_y_chunk, embedded_chunk)
         }
         MemoryCache::YAAD(c) => {
@@ -211,7 +213,7 @@ fn run_chunk_backward(
             rule.step_backward(level_params, c, d_y_chunk, embedded_chunk)
         }
         MemoryCache::Trellis(c) => {
-            let rule = Trellis::from_cfg(cfg);
+            let rule = Trellis::from_cfg_level(cfg, level);
             rule.step_backward(level_params, c, d_y_chunk, embedded_chunk)
         }
         MemoryCache::Atlas(c) => {
@@ -238,6 +240,7 @@ pub fn chunkwise_gd_forward(
     d: usize,
     chunk_size: usize,
     cfg: &MAGConfig,
+    level: usize,
     initial_m: Option<Vec<f32>>,
 ) -> (Vec<f32>, ChunkwiseGDCache) {
     debug_assert_eq!(embedded.len(), seq_len * d);
@@ -261,7 +264,7 @@ pub fn chunkwise_gd_forward(
 
         let embedded_chunk = &embedded[start * d..end * d];
         let (y_chunk, cache) = run_chunk(
-            level_params, embedded_chunk, clen, d, cfg, boundary_state,
+            level_params, embedded_chunk, clen, d, cfg, level, boundary_state,
         );
 
         // Copy output into full y
@@ -301,6 +304,7 @@ pub fn chunkwise_gd_backward(
     d_y: &[f32],
     embedded: &[f32],
     cfg: &MAGConfig,
+    level: usize,
 ) -> (MemoryLevelParams, Vec<f32>) {
     let s = gd_cache.seq_len;
     let d = gd_cache.d;
@@ -322,7 +326,7 @@ pub fn chunkwise_gd_backward(
         let embedded_chunk = &embedded[start * d..end * d];
 
         let (chunk_grads, d_emb_chunk) = run_chunk_backward(
-            level_params, &chunk_result.cache, d_y_chunk, embedded_chunk, cfg,
+            level_params, &chunk_result.cache, d_y_chunk, embedded_chunk, cfg, level,
         );
 
         total_grads.accumulate(&chunk_grads);
@@ -374,10 +378,10 @@ mod tests {
         let d = cfg.swa.d_model;
 
         // Sequential: C=1
-        let (y_seq, _) = chunkwise_gd_forward(level_params, embedded, s, d, 1, cfg, None);
+        let (y_seq, _) = chunkwise_gd_forward(level_params, embedded, s, d, 1, cfg, 0, None);
 
         // Chunkwise: C=chunk_size
-        let (y_chunk, _) = chunkwise_gd_forward(level_params, embedded, s, d, chunk_size, cfg, None);
+        let (y_chunk, _) = chunkwise_gd_forward(level_params, embedded, s, d, chunk_size, cfg, 0, None);
 
         (y_seq, y_chunk)
     }
@@ -418,12 +422,12 @@ mod tests {
 
                     // C=1 chunkwise should exactly match direct rule.step()
                     let (y_c1, _) = chunkwise_gd_forward(
-                        &params.levels[0], &embedded, s, d, 1, &cfg, None,
+                        &params.levels[0], &embedded, s, d, 1, &cfg, 0, None,
                     );
 
                     // Direct sequential via rule.step()
                     let (y_seq, _) = run_chunk(
-                        &params.levels[0], &embedded, s, d, &cfg, None,
+                        &params.levels[0], &embedded, s, d, &cfg, 0, None,
                     );
 
                     let max_diff: f32 = y_c1.iter().zip(y_seq.iter())
@@ -443,7 +447,7 @@ mod tests {
                     let d = cfg.swa.d_model;
 
                     let (y, _) = chunkwise_gd_forward(
-                        &params.levels[0], &embedded, s, d, 2, &cfg, None,
+                        &params.levels[0], &embedded, s, d, 2, &cfg, 0, None,
                     );
                     for (i, &v) in y.iter().enumerate() {
                         assert!(v.is_finite(),
@@ -460,12 +464,12 @@ mod tests {
                     let d = cfg.swa.d_model;
 
                     let (_, cache) = chunkwise_gd_forward(
-                        &params.levels[0], &embedded, s, d, 2, &cfg, None,
+                        &params.levels[0], &embedded, s, d, 2, &cfg, 0, None,
                     );
 
                     let d_y = vec![1.0f32; s * d];
                     let (grads, d_emb) = chunkwise_gd_backward(
-                        &params.levels[0], &cache, &d_y, &embedded, &cfg,
+                        &params.levels[0], &cache, &d_y, &embedded, &cfg, 0,
                     );
 
                     assert_eq!(grads.w_k_mem.len(), d * d);
@@ -483,7 +487,7 @@ mod tests {
                     let d = cfg.swa.d_model;
 
                     let (_, cache) = chunkwise_gd_forward(
-                        &params.levels[0], &embedded, s, d, 2, &cfg, None,
+                        &params.levels[0], &embedded, s, d, 2, &cfg, 0, None,
                     );
 
                     // At least 2 chunks should exist
@@ -539,12 +543,12 @@ mod tests {
                     let d = cfg.swa.d_model;
 
                     let (_, cache) = chunkwise_gd_forward(
-                        &params.levels[0], &embedded, s, d, 2, &cfg, None,
+                        &params.levels[0], &embedded, s, d, 2, &cfg, 0, None,
                     );
 
                     let d_y = vec![1.0f32; s * d];
                     let (grads, d_emb) = chunkwise_gd_backward(
-                        &params.levels[0], &cache, &d_y, &embedded, &cfg,
+                        &params.levels[0], &cache, &d_y, &embedded, &cfg, 0,
                     );
 
                     for &v in grads.w_k_mem.master().iter()
@@ -571,12 +575,12 @@ mod tests {
                     let d = cfg.swa.d_model;
 
                     let (_, cache) = chunkwise_gd_forward(
-                        &params.levels[0], &embedded, s, d, 2, &cfg, None,
+                        &params.levels[0], &embedded, s, d, 2, &cfg, 0, None,
                     );
 
                     let d_y = vec![1.0f32; s * d];
                     let (grads, d_emb) = chunkwise_gd_backward(
-                        &params.levels[0], &cache, &d_y, &embedded, &cfg,
+                        &params.levels[0], &cache, &d_y, &embedded, &cfg, 0,
                     );
 
                     let norm: f32 = grads.w_k_mem.master().iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -600,11 +604,11 @@ mod tests {
 
                     // Analytical gradient
                     let (y, cache) = chunkwise_gd_forward(
-                        &params.levels[0], &embedded, s, d, 2, &cfg, None,
+                        &params.levels[0], &embedded, s, d, 2, &cfg, 0, None,
                     );
                     let d_y = vec![1.0f32; s * d]; // d(sum)/dy = 1
                     let (grads, _) = chunkwise_gd_backward(
-                        &params.levels[0], &cache, &d_y, &embedded, &cfg,
+                        &params.levels[0], &cache, &d_y, &embedded, &cfg, 0,
                     );
 
                     // Check a few indices of w_k_mem via FD
@@ -622,14 +626,14 @@ mod tests {
                         let mut lp_plus = params.levels[0].clone();
                         lp_plus.w_k_mem.master_mut()[idx] += eps;
                         let (y_plus, _) = chunkwise_gd_forward(
-                            &lp_plus, &embedded, s, d, 2, &cfg, None,
+                            &lp_plus, &embedded, s, d, 2, &cfg, 0, None,
                         );
                         let loss_plus: f32 = y_plus.iter().sum();
 
                         let mut lp_minus = params.levels[0].clone();
                         lp_minus.w_k_mem.master_mut()[idx] -= eps;
                         let (y_minus, _) = chunkwise_gd_forward(
-                            &lp_minus, &embedded, s, d, 2, &cfg, None,
+                            &lp_minus, &embedded, s, d, 2, &cfg, 0, None,
                         );
                         let loss_minus: f32 = y_minus.iter().sum();
 
@@ -688,7 +692,7 @@ mod tests {
 
                     for outer_step in 0..100 {
                         let (y, cache) = chunkwise_gd_forward(
-                            &level_params, &embedded, s, d, chunk_size, &cfg, None,
+                            &level_params, &embedded, s, d, chunk_size, &cfg, 0, None,
                         );
 
                         let loss: f32 = y.iter().zip(target.iter())
@@ -703,7 +707,7 @@ mod tests {
                             .collect();
 
                         let (grads, _) = chunkwise_gd_backward(
-                            &level_params, &cache, &d_y, &embedded, &cfg,
+                            &level_params, &cache, &d_y, &embedded, &cfg, 0,
                         );
 
                         // Outer-loop weight update (projection weights, not inner-loop memory)
@@ -772,7 +776,7 @@ mod tests {
         rng.fill_uniform(&mut embedded, 0.1);
 
         let (y, cache) = chunkwise_gd_forward(
-            &params.levels[0], &embedded, seq_len, d, 4, &cfg, None,
+            &params.levels[0], &embedded, seq_len, d, 4, &cfg, 0, None,
         );
 
         assert_eq!(cache.chunks.len(), 2);
@@ -794,7 +798,7 @@ mod tests {
         let d = cfg.swa.d_model;
 
         let (_, cache) = chunkwise_gd_forward(
-            &params.levels[0], &embedded, s, d, 2, &cfg, None,
+            &params.levels[0], &embedded, s, d, 2, &cfg, 0, None,
         );
 
         // Check that momentum is present in boundaries
@@ -816,7 +820,7 @@ mod tests {
         let d = cfg.swa.d_model;
 
         let (y_delta, cache_delta) = chunkwise_gd_forward(
-            &params.levels[0], &embedded, s, d, 2, &cfg, None,
+            &params.levels[0], &embedded, s, d, 2, &cfg, 0, None,
         );
 
         // Check momentum present in boundaries (Delta still uses S accumulator)
@@ -829,7 +833,7 @@ mod tests {
         let mut ema_cfg = MAGConfig::titans_test_config();
         ema_cfg.momentum_kind = crate::model::MomentumKind::EMA;
         let (y_ema, _) = chunkwise_gd_forward(
-            &params.levels[0], &embedded, s, d, 2, &ema_cfg, None,
+            &params.levels[0], &embedded, s, d, 2, &ema_cfg, 0, None,
         );
         let diff: f32 = y_ema.iter().zip(y_delta.iter()).map(|(a, b)| (a - b).abs()).sum();
         // With tiny test dims (d=8, seq_len=4), ||g||^2 is small so decay ≈ eta,
@@ -852,11 +856,11 @@ mod tests {
         let d = cfg.swa.d_model;
 
         let (y_full, _) = chunkwise_gd_forward(
-            &params.levels[0], &embedded, s, d, s, &cfg, None,
+            &params.levels[0], &embedded, s, d, s, &cfg, 0, None,
         );
 
         let (y_direct, _) = run_chunk(
-            &params.levels[0], &embedded, s, d, &cfg, None,
+            &params.levels[0], &embedded, s, d, &cfg, 0, None,
         );
 
         let max_diff: f32 = y_full.iter().zip(y_direct.iter())
@@ -878,13 +882,13 @@ mod tests {
 
         // Sequential baseline
         let (y_seq, _) = chunkwise_gd_forward(
-            &params.levels[0], &embedded, s, d, 1, &cfg, None,
+            &params.levels[0], &embedded, s, d, 1, &cfg, 0, None,
         );
 
         let mut prev_diff = 0.0f32;
         for c in [2, 4] {
             let (y_chunk, _) = chunkwise_gd_forward(
-                &params.levels[0], &embedded, s, d, c, &cfg, None,
+                &params.levels[0], &embedded, s, d, c, &cfg, 0, None,
             );
             let diff = relative_diff(&y_seq, &y_chunk);
             assert!(diff >= prev_diff - 0.01, // small tolerance for floating point
@@ -908,11 +912,11 @@ mod tests {
         rng.fill_uniform(&mut initial_m, 0.01);
 
         let (y_with_init, _) = chunkwise_gd_forward(
-            &params.levels[0], &embedded, s, d, 2, &cfg, Some(initial_m.clone()),
+            &params.levels[0], &embedded, s, d, 2, &cfg, 0, Some(initial_m.clone()),
         );
 
         let (y_no_init, _) = chunkwise_gd_forward(
-            &params.levels[0], &embedded, s, d, 2, &cfg, None,
+            &params.levels[0], &embedded, s, d, 2, &cfg, 0, None,
         );
 
         // Results should differ when initial_m is non-zero
@@ -934,14 +938,14 @@ mod tests {
 
         // Forward with C=2
         let (_, cache) = chunkwise_gd_forward(
-            &params.levels[0], &embedded, s, d, 2, &cfg, None,
+            &params.levels[0], &embedded, s, d, 2, &cfg, 0, None,
         );
 
         let d_y = vec![1.0f32; s * d];
 
         // Full backward
         let (grads_full, _) = chunkwise_gd_backward(
-            &params.levels[0], &cache, &d_y, &embedded, &cfg,
+            &params.levels[0], &cache, &d_y, &embedded, &cfg, 0,
         );
 
         // Verify multi-chunk gradients are larger than single-chunk
@@ -973,10 +977,10 @@ mod tests {
             let d = cfg.swa.d_model;
 
             let (y_c1, _) = chunkwise_gd_forward(
-                &params.levels[0], &embedded, s, d, 1, cfg, None,
+                &params.levels[0], &embedded, s, d, 1, cfg, 0, None,
             );
             let (y_full, _) = chunkwise_gd_forward(
-                &params.levels[0], &embedded, s, d, s, cfg, None,
+                &params.levels[0], &embedded, s, d, s, cfg, 0, None,
             );
 
             let max_diff: f32 = y_c1.iter().zip(y_full.iter())

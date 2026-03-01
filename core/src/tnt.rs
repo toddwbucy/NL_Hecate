@@ -369,6 +369,7 @@ pub fn tnt_forward(
     d: usize,
     tnt_cfg: &TNTConfig,
     cfg: &MAGConfig,
+    level: usize,
     initial_m: Option<Vec<f32>>,
     tnt_params: Option<&TNTParams>,
 ) -> (Vec<f32>, TNTForwardCache) {
@@ -423,7 +424,7 @@ pub fn tnt_forward(
             let (local_y, local_cache) = chunkwise_gd_forward(
                 level_params, local_embedded, local_len, d,
                 local_len, // C=local_len (process as single chunk within local)
-                cfg, Some(global_m.clone()),
+                cfg, level, Some(global_m.clone()),
             );
 
             shard_y[local_start * d..local_end * d].copy_from_slice(&local_y);
@@ -649,6 +650,7 @@ pub fn tnt_backward(
     embedded: &[f32],
     tnt_cfg: &TNTConfig,
     cfg: &MAGConfig,
+    level: usize,
     tnt_params: Option<&TNTParams>,
 ) -> (MemoryLevelParams, Vec<f32>, Option<TNTParams>) {
     let s = cache.seq_len;
@@ -727,7 +729,7 @@ pub fn tnt_backward(
                 let local_embedded = &shard_embedded[local_start * d..local_end * d];
 
                 let (local_grads, local_d_emb) = chunkwise_gd_backward(
-                    level_params, local_cache, d_y_local, local_embedded, cfg,
+                    level_params, local_cache, d_y_local, local_embedded, cfg, level,
                 );
 
                 total_grads.accumulate(&local_grads);
@@ -747,7 +749,7 @@ pub fn tnt_backward(
                 let local_embedded = &shard_embedded[local_start * d..local_end * d];
 
                 let (local_grads, local_d_emb) = chunkwise_gd_backward(
-                    level_params, local_cache, d_y_local, local_embedded, cfg,
+                    level_params, local_cache, d_y_local, local_embedded, cfg, level,
                 );
 
                 total_grads.accumulate(&local_grads);
@@ -806,7 +808,7 @@ mod tests {
                     let tnt = tnt_cfg_small();
 
                     let (y, cache) = tnt_forward(
-                        &params.levels[0], &embedded, s, d, &tnt, &cfg, None, None,
+                        &params.levels[0], &embedded, s, d, &tnt, &cfg, 0, None, None,
                     );
                     assert_eq!(y.len(), s * d);
                     for &v in &y {
@@ -828,7 +830,7 @@ mod tests {
                     };
 
                     let (y, _) = tnt_forward(
-                        &params.levels[0], &embedded, s, d, &tnt, &cfg, None, None,
+                        &params.levels[0], &embedded, s, d, &tnt, &cfg, 0, None, None,
                     );
                     for &v in &y {
                         assert!(v.is_finite());
@@ -845,11 +847,11 @@ mod tests {
                     let tnt = tnt_cfg_small();
 
                     let (_, cache) = tnt_forward(
-                        &params.levels[0], &embedded, s, d, &tnt, &cfg, None, None,
+                        &params.levels[0], &embedded, s, d, &tnt, &cfg, 0, None, None,
                     );
                     let d_y = vec![1.0f32; s * d];
                     let (grads, d_emb, _) = tnt_backward(
-                        &params.levels[0], &cache, &d_y, &embedded, &tnt, &cfg, None,
+                        &params.levels[0], &cache, &d_y, &embedded, &tnt, &cfg, 0, None,
                     );
                     assert_eq!(grads.w_k_mem.len(), d * d);
                     assert_eq!(d_emb.len(), s * d);
@@ -866,23 +868,23 @@ mod tests {
                     let eps = 1e-2f32;
 
                     let (_, cache) = tnt_forward(
-                        &params.levels[0], &embedded, s, d, &tnt, &cfg, None, None,
+                        &params.levels[0], &embedded, s, d, &tnt, &cfg, 0, None, None,
                     );
                     let d_y = vec![1.0f32; s * d];
                     let (grads, _, _) = tnt_backward(
-                        &params.levels[0], &cache, &d_y, &embedded, &tnt, &cfg, None,
+                        &params.levels[0], &cache, &d_y, &embedded, &tnt, &cfg, 0, None,
                     );
 
                     let mut lp_p = params.levels[0].clone();
                     lp_p.w_k_mem.master_mut()[0] += eps;
                     lp_p.w_k_mem.sync_from_master();
-                    let (y_p, _) = tnt_forward(&lp_p, &embedded, s, d, &tnt, &cfg, None, None);
+                    let (y_p, _) = tnt_forward(&lp_p, &embedded, s, d, &tnt, &cfg, 0, None, None);
                     let loss_p: f32 = y_p.iter().sum();
 
                     let mut lp_m = params.levels[0].clone();
                     lp_m.w_k_mem.master_mut()[0] -= eps;
                     lp_m.w_k_mem.sync_from_master();
-                    let (y_m, _) = tnt_forward(&lp_m, &embedded, s, d, &tnt, &cfg, None, None);
+                    let (y_m, _) = tnt_forward(&lp_m, &embedded, s, d, &tnt, &cfg, 0, None, None);
                     let loss_m: f32 = y_m.iter().sum();
 
                     let fd = (loss_p - loss_m) / (2.0 * eps);
@@ -922,7 +924,7 @@ mod tests {
         };
 
         let (_, cache) = tnt_forward(
-            &params.levels[0], &embedded, s, d, &tnt, &cfg, None, None,
+            &params.levels[0], &embedded, s, d, &tnt, &cfg, 0, None, None,
         );
 
         if cache.shards[0].local_caches.len() >= 2 {
@@ -942,7 +944,7 @@ mod tests {
         let tnt = tnt_cfg_small();
 
         let (_, cache) = tnt_forward(
-            &params.levels[0], &embedded, s, d, &tnt, &cfg, None, None,
+            &params.levels[0], &embedded, s, d, &tnt, &cfg, 0, None, None,
         );
 
         if cache.global_states.len() >= 3 {
@@ -973,7 +975,7 @@ mod tests {
 
         for outer_step in 0..100 {
             let (y, cache) = tnt_forward(
-                &level_params, &embedded, s, d, &tnt, &cfg, None, None,
+                &level_params, &embedded, s, d, &tnt, &cfg, 0, None, None,
             );
             let loss: f32 = y.iter().zip(target.iter())
                 .map(|(a, b)| (a - b).powi(2)).sum::<f32>() / (s * d) as f32;
@@ -983,7 +985,7 @@ mod tests {
             let d_y: Vec<f32> = y.iter().zip(target.iter())
                 .map(|(a, b)| 2.0 * (a - b) / (s * d) as f32).collect();
             let (grads, _, _) = tnt_backward(
-                &level_params, &cache, &d_y, &embedded, &tnt, &cfg, None,
+                &level_params, &cache, &d_y, &embedded, &tnt, &cfg, 0, None,
             );
 
             for (w, g) in level_params.w_k_mem.master_mut().iter_mut().zip(grads.w_k_mem.master().iter()) { *w -= lr * g; }
@@ -1011,11 +1013,11 @@ mod tests {
             use_qk_projection: false, use_attention_summary: false,
         };
         let (y_tnt, _) = tnt_forward(
-            &params.levels[0], &embedded, s, d, &tnt, &cfg, None, None,
+            &params.levels[0], &embedded, s, d, &tnt, &cfg, 0, None, None,
         );
 
         let (y_cw, _) = cw_forward(
-            &params.levels[0], &embedded, s, d, s, &cfg, None,
+            &params.levels[0], &embedded, s, d, s, &cfg, 0, None,
         );
 
         let max_diff: f32 = y_tnt.iter().zip(y_cw.iter())
@@ -1034,11 +1036,11 @@ mod tests {
         let tnt = tnt_cfg_small();
 
         let (_, cache) = tnt_forward(
-            &params.levels[0], &embedded, s, d, &tnt, &cfg, None, None,
+            &params.levels[0], &embedded, s, d, &tnt, &cfg, 0, None, None,
         );
         let d_y = vec![1.0f32; s * d];
         let (grads, d_emb, _) = tnt_backward(
-            &params.levels[0], &cache, &d_y, &embedded, &tnt, &cfg, None,
+            &params.levels[0], &cache, &d_y, &embedded, &tnt, &cfg, 0, None,
         );
 
         let grad_norm: f32 = grads.w_k_mem.master().iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -1101,7 +1103,7 @@ mod tests {
         };
 
         let (y, cache) = tnt_forward(
-            &params.levels[0], &embedded, s, d, &tnt, &cfg, None, Some(&tnt_p),
+            &params.levels[0], &embedded, s, d, &tnt, &cfg, 0, None, Some(&tnt_p),
         );
         for (i, &v) in y.iter().enumerate() {
             assert!(v.is_finite(), "attention summary: y[{i}] not finite");
@@ -1157,11 +1159,11 @@ mod tests {
 
         // Analytical gradient
         let (y, cache) = tnt_forward(
-            &params.levels[0], &embedded, s, d, &tnt, &cfg, None, Some(&tnt_p),
+            &params.levels[0], &embedded, s, d, &tnt, &cfg, 0, None, Some(&tnt_p),
         );
         let d_y = vec![1.0f32; s * d]; // d(sum(y))/dy = 1
         let (_grads, _d_emb, tnt_grads) = tnt_backward(
-            &params.levels[0], &cache, &d_y, &embedded, &tnt, &cfg, Some(&tnt_p),
+            &params.levels[0], &cache, &d_y, &embedded, &tnt, &cfg, 0, Some(&tnt_p),
         );
         let analytical = tnt_grads.as_ref().unwrap().w_summary_q[0];
 
@@ -1170,14 +1172,14 @@ mod tests {
         let mut tp_p = tnt_p.clone();
         tp_p.w_summary_q[0] += eps;
         let (y_p, _) = tnt_forward(
-            &params.levels[0], &embedded, s, d, &tnt, &cfg, None, Some(&tp_p),
+            &params.levels[0], &embedded, s, d, &tnt, &cfg, 0, None, Some(&tp_p),
         );
         let loss_p: f32 = y_p.iter().sum();
 
         let mut tp_m = tnt_p.clone();
         tp_m.w_summary_q[0] -= eps;
         let (y_m, _) = tnt_forward(
-            &params.levels[0], &embedded, s, d, &tnt, &cfg, None, Some(&tp_m),
+            &params.levels[0], &embedded, s, d, &tnt, &cfg, 0, None, Some(&tp_m),
         );
         let loss_m: f32 = y_m.iter().sum();
         let fd = (loss_p - loss_m) / (2.0 * eps);
