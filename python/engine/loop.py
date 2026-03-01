@@ -665,6 +665,7 @@ def run_build(bcfg: BuildConfig):
 
             # S4-M7: Checkpoint roundtrip verification
             if use_gpu:
+                v_model = None
                 try:
                     if use_bpe:
                         v_params, v_cfg = nl_hecate.load_checkpoint(ckpt_path)
@@ -672,11 +673,15 @@ def run_build(bcfg: BuildConfig):
                         v_params, v_cfg, _ = nl_hecate.load_build_checkpoint(ckpt_path)
                     v_model = nl_hecate.GpuModel.from_params(v_params, v_cfg, batch_size=bcfg.batch_size)
                     # Save context before verification forward passes
+                    # Slice to single seq_len chunk — forward() expects exactly
+                    # seq_len tokens regardless of batch_size used in step_adamw
+                    rt_input = list(input_ids[:bcfg.seq_len])
+                    rt_target = list(target_ids[:bcfg.seq_len])
                     rt_ctx = gpu_model.to_host_context()
                     try:
                         v_model.upload_context(rt_ctx)
-                        train_fwd, _ = gpu_model.forward(input_ids, target_ids, pulse)
-                        verify_fwd, _ = v_model.forward(input_ids, target_ids, pulse)
+                        train_fwd, _ = gpu_model.forward(rt_input, rt_target, pulse)
+                        verify_fwd, _ = v_model.forward(rt_input, rt_target, pulse)
                     finally:
                         # Restore context after verification (forward modifies M)
                         gpu_model.upload_context(rt_ctx)
@@ -691,9 +696,10 @@ def run_build(bcfg: BuildConfig):
                     else:
                         print(f"  [checkpoint roundtrip OK, "
                               f"delta={delta:.2e}]")
-                    del v_model
                 except (OSError, RuntimeError, ValueError) as e:
                     print(f"  [checkpoint roundtrip failed: {e}]")
+                finally:
+                    del v_model
 
             # ── Checkpoint learning samples + Probe 3 ─────────────────
             if tokenizer is not None and gpu_model is not None:
