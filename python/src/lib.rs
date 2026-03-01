@@ -1798,6 +1798,15 @@ impl GpuModel {
             self.cfg.swa.vocab_size,
         );
 
+        // TNT periodic reset — same policy as step_adamw (CS-32 compliant).
+        if self.memory_reset {
+            for (k, &active) in pulse.inner.active_levels.iter().enumerate() {
+                if active {
+                    self.context.periodic_reset_level(k);
+                }
+            }
+        }
+
         Ok((loss, grad_norm, last_logits))
     }
 
