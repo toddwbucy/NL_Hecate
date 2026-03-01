@@ -370,12 +370,14 @@ pub fn titans_lmm_opaque_backward(
         q_conv_cache: q_conv_cache_restored,
     };
 
+    let theta_floor = if saved[0].len() > 6 { saved[0][5] } else { 0.0 };
+    let theta_ceil = if saved[0].len() > 7 { saved[0][6] } else { f32::MAX };
     let rule = TitansLMM {
         bias, sign_sharpness,
         momentum_kind,
         momentum_d_hidden: 0,
-        theta_floor: 0.0,
-        theta_ceil: f32::MAX,
+        theta_floor,
+        theta_ceil,
         m_norm_max: f32::MAX,
     };
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
@@ -896,7 +898,7 @@ impl OpaqueVjp for DeltaRule {
         &self, tape: &mut Tape, level_params: &MemoryLevelParams,
         embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
     ) -> (Vec<f32>, BufId, BufId, BufId) {
-        let extra_meta = [crate::moneta::bias_to_f32(self.bias), self.sign_sharpness];
+        let extra_meta = [crate::moneta::bias_to_f32(self.bias), self.sign_sharpness, self.theta_floor, self.theta_ceil];
         let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
             record_common_inputs(tape, level_params, embedded, seq_len, d, &extra_meta);
 
@@ -944,7 +946,7 @@ impl OpaqueVjp for TitansLMM {
             crate::model::MomentumKind::DeltaMomentum => 2.0,
             crate::model::MomentumKind::DeepMomentum => 3.0,
         };
-        let extra_meta = [crate::moneta::bias_to_f32(self.bias), self.sign_sharpness, mk_f32];
+        let extra_meta = [crate::moneta::bias_to_f32(self.bias), self.sign_sharpness, mk_f32, self.theta_floor, self.theta_ceil];
         let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
             record_common_inputs(tape, level_params, embedded, seq_len, d, &extra_meta);
 
@@ -1032,7 +1034,7 @@ impl OpaqueVjp for Moneta {
         &self, tape: &mut Tape, level_params: &MemoryLevelParams,
         embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
     ) -> (Vec<f32>, BufId, BufId, BufId) {
-        let extra_meta = [self.d_hidden as f32, self.lp_p, self.lambda_2, self.sign_sharpness, self.lq_q];
+        let extra_meta = [self.d_hidden as f32, self.lp_p, self.lambda_2, self.sign_sharpness, self.lq_q, self.theta_floor, self.theta_ceil];
         let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
             record_common_inputs(tape, level_params, embedded, seq_len, d, &extra_meta);
 

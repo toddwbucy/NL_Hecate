@@ -676,12 +676,20 @@ fn traced_active_level(
             (y, MemoryCache::Delta(cache), final_m, y_id)
         }
         MemoryRuleKind::TitansLMM => {
-            let (y, cache) = TitansLMM::from_cfg(cfg).step(level_params, embedded, s, d, initial_m);
+            let rule = TitansLMM::from_cfg_level(cfg, level);
+            let (y, cache) = rule.step(level_params, embedded, s, d, initial_m);
             let m_final_start = s * d * d;
             let final_m = cache.m_states[m_final_start..m_final_start + d * d].to_vec();
 
+            let mk_f32 = match rule.momentum_kind {
+                crate::model::MomentumKind::None => 0.0f32,
+                crate::model::MomentumKind::EMA => 1.0,
+                crate::model::MomentumKind::DeltaMomentum => 2.0,
+                crate::model::MomentumKind::DeepMomentum => 3.0,
+            };
+            let extra_meta = [crate::moneta::bias_to_f32(rule.bias), rule.sign_sharpness, mk_f32, rule.theta_floor, rule.theta_ceil];
             let (meta_id, lp_saved, emb_saved) =
-                alloc_common_saved(tape, level_params, embedded, s, d, &[]);
+                alloc_common_saved(tape, level_params, embedded, s, d, &extra_meta);
             let cache_ids = vec![
                 tape.alloc(cache.m_states.clone(), vec![]),
                 tape.alloc(cache.s_states.clone(), vec![]),
