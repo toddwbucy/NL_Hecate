@@ -31,7 +31,12 @@ class CompliancePredictor(nn.Module):
     Takes per-node embeddings from HeteroRGCN and predicts compliance edge existence.
     """
 
-    def __init__(self, hidden_dim: int = 256, dropout: float = 0.1):
+    def __init__(
+        self,
+        hidden_dim: int = 256,
+        dropout: float = 0.1,
+        pos_weight: float = 5.0,
+    ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.decoder = nn.Sequential(
@@ -40,8 +45,8 @@ class CompliancePredictor(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
         )
-        # pos_weight compensates for 1:5 positive:negative ratio
-        self.register_buffer("pos_weight", torch.tensor(5.0))
+        # pos_weight compensates for class imbalance; should match neg_ratio in training
+        self.register_buffer("pos_weight", torch.tensor(pos_weight))
 
     def forward(
         self,
@@ -113,12 +118,16 @@ def sample_negatives(
     num_src: int,                  # total arxiv_metadata nodes
     neg_ratio: int = 5,
     seed: int | None = None,
+    all_pos_edge_index: torch.Tensor | None = None,  # [2, E_all] -- full positive set
 ) -> torch.Tensor:
     """
     Generate negative edges by corrupting the source (code file) endpoint.
 
     For each positive edge (src, dst), sample neg_ratio source nodes that are
-    NOT connected to dst in the positive set. Returns edge_index [2, P*neg_ratio].
+    NOT connected to dst in ANY known positive edge. Returns edge_index [2, P*neg_ratio].
+
+    Pass all_pos_edge_index to exclude cross-split positives (e.g., train positives
+    when sampling negatives for the val/test split).
     """
     if seed is not None:
         gen = torch.Generator().manual_seed(seed)
@@ -128,10 +137,13 @@ def sample_negatives(
     pos_src = pos_edge_index[0]  # [P]
     pos_dst = pos_edge_index[1]  # [P]
 
-    # Build a set of (src, dst) pairs to exclude from negatives
-    pos_set: set[tuple[int, int]] = set(
-        zip(pos_src.tolist(), pos_dst.tolist())
-    )
+    # Build exclusion set from ALL known positives (not just current split)
+    if all_pos_edge_index is not None:
+        all_src = all_pos_edge_index[0].tolist()
+        all_dst = all_pos_edge_index[1].tolist()
+        pos_set: set[tuple[int, int]] = set(zip(all_src, all_dst))
+    else:
+        pos_set = set(zip(pos_src.tolist(), pos_dst.tolist()))
 
     neg_srcs: list[int] = []
     neg_dsts: list[int] = []

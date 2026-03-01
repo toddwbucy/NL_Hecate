@@ -54,6 +54,7 @@ COMPLIANCE_TRIPLET = (
 def cosine_baseline(
     data,
     test_pos_ei: torch.Tensor,
+    all_pos_ei: torch.Tensor | None = None,
     num_neg_per_pos: int = 20,
     seed: int = 42,
     device: torch.device = torch.device("cpu"),
@@ -61,9 +62,8 @@ def cosine_baseline(
     """
     Score each (code_file, smell) pair by cosine similarity of raw Jina embeddings.
 
-    Generates num_neg_per_pos negatives per positive (uniform random over code files)
-    and computes AUC + AP on the resulting binary classification task.
-    Uses L2-normalized inner product for efficiency.
+    Generates num_neg_per_pos negatives per positive (random source, same destination),
+    filtering out all known positive edges to avoid label noise.
     """
     src_feat = data["arxiv_metadata"].x.to(device)   # [N_src, 2048]
     dst_feat = data["nl_code_smells"].x.to(device)    # [N_dst, 2048]
@@ -72,15 +72,33 @@ def cosine_baseline(
     dst_norm = F.normalize(dst_feat, dim=-1)  # [N_dst, 2048]
     num_src = src_norm.size(0)
 
+    # Build exclusion set from all known positives
+    ref_ei = all_pos_ei if all_pos_ei is not None else test_pos_ei
+    all_pos_set: set[tuple[int, int]] = set(
+        zip(ref_ei[0].tolist(), ref_ei[1].tolist())
+    )
+
     # Positive scores
     pos_src_emb = src_norm[test_pos_ei[0]]   # [P, 2048]
     pos_dst_emb = dst_norm[test_pos_ei[1]]   # [P, 2048]
     pos_scores = (pos_src_emb * pos_dst_emb).sum(dim=-1).cpu()  # [P]
 
-    # Negative scores (random source, same destination as positive)
+    # Negative scores: random source, same destination, filtered against all_pos_set
     gen = torch.Generator().manual_seed(seed)
-    neg_srcs = torch.randint(num_src, (test_pos_ei.size(1) * num_neg_per_pos,), generator=gen)
-    neg_dsts = test_pos_ei[1].repeat(num_neg_per_pos)
+    neg_src_list: list[int] = []
+    neg_dst_list: list[int] = []
+    for dst in test_pos_ei[1].tolist():
+        count = 0
+        attempts = 0
+        while count < num_neg_per_pos and attempts < num_neg_per_pos * 20:
+            src = int(torch.randint(num_src, (1,), generator=gen).item())
+            if (src, dst) not in all_pos_set:
+                neg_src_list.append(src)
+                neg_dst_list.append(dst)
+                count += 1
+            attempts += 1
+    neg_srcs = torch.tensor(neg_src_list, dtype=torch.long)
+    neg_dsts = torch.tensor(neg_dst_list, dtype=torch.long)
     neg_src_emb = src_norm[neg_srcs]
     neg_dst_emb = dst_norm[neg_dsts]
     neg_scores = (neg_src_emb * neg_dst_emb).sum(dim=-1).cpu()
@@ -171,10 +189,11 @@ def evaluate(
     model: HeteroRGCN,
     predictor: CompliancePredictor,
     data,
-    pos_ei: torch.Tensor,   # [2, P] -- positive edges for this split
+    pos_ei: torch.Tensor,             # [2, P] -- positive edges for this split
     device: torch.device,
     neg_ratio: int = 5,
     seed: int = 0,
+    all_pos_ei: torch.Tensor | None = None,  # [2, E_all] -- full pos set for exclusion
 ) -> dict[str, float]:
     """Run full-graph forward pass and return AUC + AP for a split."""
     model.train(False)
@@ -184,7 +203,9 @@ def evaluate(
         node_embs = model(data)
 
     num_src = node_embs["arxiv_metadata"].size(0)
-    neg_ei = sample_negatives(pos_ei, num_src, neg_ratio=neg_ratio, seed=seed)
+    neg_ei = sample_negatives(
+        pos_ei, num_src, neg_ratio=neg_ratio, seed=seed, all_pos_edge_index=all_pos_ei
+    )
     neg_ei = neg_ei.to(device)
 
     pos_logits = predictor.predict_edges(node_embs, pos_ei).detach().cpu().numpy()
@@ -240,7 +261,9 @@ def train(args: argparse.Namespace) -> None:
 
     # -------------------------------------------- Cosine similarity baseline
     print("\n=== Cosine similarity baseline ===")
-    baseline = cosine_baseline(data, test_ei.cpu(), device=torch.device("cpu"))
+    baseline = cosine_baseline(
+        data, test_ei.cpu(), all_pos_ei=compliance_ei.cpu(), device=torch.device("cpu")
+    )
     print(f"  Test AUC: {baseline['cosine_auc']:.4f}  AP: {baseline['cosine_ap']:.4f}")
 
     # ------------------------------------------------------------ Build model
@@ -307,7 +330,8 @@ def train(args: argparse.Namespace) -> None:
 
         # Evaluate val set (cheap — full-graph, <1000 nodes)
         val_m = evaluate(model, predictor, data, val_ei, device,
-                         neg_ratio=args.neg_ratio, seed=epoch + 10000)
+                         neg_ratio=args.neg_ratio, seed=epoch + 10000,
+                         all_pos_ei=compliance_ei)
         val_auc = val_m["auc"]
         val_ap  = val_m["ap"]
 
@@ -361,7 +385,8 @@ def train(args: argparse.Namespace) -> None:
     model.load_state_dict(ckpt["model_state"])
     predictor.load_state_dict(ckpt["predictor_state"])
 
-    test_m = evaluate(model, predictor, data, test_ei, device, neg_ratio=20, seed=99)
+    test_m = evaluate(model, predictor, data, test_ei, device, neg_ratio=20, seed=99,
+                      all_pos_ei=compliance_ei)
     print(f"  RGCN   — Test AUC: {test_m['auc']:.4f}  AP: {test_m['ap']:.4f}")
     print(f"  Cosine — Test AUC: {baseline['cosine_auc']:.4f}  AP: {baseline['cosine_ap']:.4f}")
 

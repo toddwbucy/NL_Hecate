@@ -91,7 +91,10 @@ def aql(database: str, query: str, bind_vars: dict | None = None) -> list:
         cursor_id = result["id"]
         status, result = arango_request(database, "PUT", f"/_api/cursor/{cursor_id}")
         if status not in (200, 201):
-            break
+            raise RuntimeError(
+                f"AQL cursor pagination failed ({status}) for query: {query[:120]!r}: "
+                f"{result.get('errorMessage', '')}"
+            )
         docs.extend(result.get("result", []))
     return docs
 
@@ -471,6 +474,12 @@ def export(database: str, output: Path, seed: int = 42, verbose: bool = True) ->
                 compliance_triplets.append(triplet)
 
     # Phase 3: Add train/val/test masks to compliance edges
+    if not compliance_triplets:
+        raise RuntimeError(
+            f"No '{TARGET_EDGE_COLLECTION}' edges exported. "
+            "Check that both endpoints have embeddings and appear in node_maps."
+        )
+
     for triplet in compliance_triplets:
         src_type, edge_col, dst_type = triplet
         ei = data[triplet].edge_index
@@ -513,7 +522,8 @@ def verify(output: Path, verbose: bool = True) -> bool:
         node_maps = json.load(f)
 
     ok = True
-    print("\n=== Verification ===")
+    if verbose:
+        print("\n=== Verification ===")
 
     # 1. Node types match node_maps
     for nt in data.node_types:
@@ -522,15 +532,18 @@ def verify(output: Path, verbose: bool = True) -> bool:
         n = data[nt].x.size(0)
         mapped_n = len(node_maps.get(nt, {}))
         if n != mapped_n:
-            print(f"  [FAIL] {nt}: HeteroData has {n} nodes but node_map has {mapped_n}")
+            if verbose:
+                print(f"  [FAIL] {nt}: HeteroData has {n} nodes but node_map has {mapped_n}")
             ok = False
         # Check shape
         if data[nt].x.shape[1] != EMBED_DIM:
-            print(f"  [FAIL] {nt}: expected dim {EMBED_DIM}, got {data[nt].x.shape[1]}")
+            if verbose:
+                print(f"  [FAIL] {nt}: expected dim {EMBED_DIM}, got {data[nt].x.shape[1]}")
             ok = False
         # Check NaN/Inf
         if torch.isnan(data[nt].x).any() or torch.isinf(data[nt].x).any():
-            print(f"  [FAIL] {nt}: NaN or Inf in features")
+            if verbose:
+                print(f"  [FAIL] {nt}: NaN or Inf in features")
             ok = False
 
     # 2. Compliance masks
@@ -544,11 +557,13 @@ def verify(output: Path, verbose: bool = True) -> bool:
             tsm = ei.test_mask.sum().item()
             total_masked = tm + vm + tsm
             if total_masked != n:
-                print(f"  [FAIL] compliance masks sum {total_masked} != {n} edges")
+                if verbose:
+                    print(f"  [FAIL] compliance masks sum {total_masked} != {n} edges")
                 ok = False
-            print(f"  Compliance edges: {n} total, {tm}/{vm}/{tsm} (train/val/test)")
+            if verbose:
+                print(f"  Compliance edges: {n} total, {tm}/{vm}/{tsm} (train/val/test)")
 
-    if ok:
+    if ok and verbose:
         print("  All checks passed.")
     return ok
 

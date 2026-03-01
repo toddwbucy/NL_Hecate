@@ -46,6 +46,7 @@ def run_forward(
     device: torch.device,
     neg_ratio: int = 20,
     seed: int = 99,
+    all_pos_ei: torch.Tensor | None = None,
 ) -> dict[str, float]:
     """Return AUC and AP for a set of positive edges."""
     model.train(False)
@@ -55,7 +56,9 @@ def run_forward(
         node_embs = model(data)
 
     num_src = node_embs["arxiv_metadata"].size(0)
-    neg_ei = sample_negatives(pos_ei, num_src, neg_ratio=neg_ratio, seed=seed).to(device)
+    neg_ei = sample_negatives(
+        pos_ei, num_src, neg_ratio=neg_ratio, seed=seed, all_pos_edge_index=all_pos_ei
+    ).to(device)
 
     pos_logits = predictor.predict_edges(node_embs, pos_ei).detach().cpu().numpy()
     neg_logits = predictor.predict_edges(node_embs, neg_ei).detach().cpu().numpy()
@@ -74,6 +77,7 @@ def cosine_auc(
     test_ei: torch.Tensor,
     num_neg_per_pos: int = 20,
     seed: int = 42,
+    all_pos_ei: torch.Tensor | None = None,
 ) -> dict[str, float]:
     """Cosine similarity baseline (raw 2048d Jina embeddings)."""
     src_norm = F.normalize(data["arxiv_metadata"].x.cpu(), dim=-1)
@@ -82,9 +86,27 @@ def cosine_auc(
 
     pos_scores = (src_norm[test_ei[0].cpu()] * dst_norm[test_ei[1].cpu()]).sum(-1)
 
+    # Build exclusion set from all known positives
+    ref_ei = all_pos_ei if all_pos_ei is not None else test_ei
+    all_pos_set: set[tuple[int, int]] = set(
+        zip(ref_ei[0].cpu().tolist(), ref_ei[1].cpu().tolist())
+    )
+
     gen = torch.Generator().manual_seed(seed)
-    neg_srcs = torch.randint(num_src, (test_ei.size(1) * num_neg_per_pos,), generator=gen)
-    neg_dsts = test_ei[1].cpu().repeat(num_neg_per_pos)
+    neg_src_list: list[int] = []
+    neg_dst_list: list[int] = []
+    for dst in test_ei[1].cpu().tolist():
+        count = 0
+        attempts = 0
+        while count < num_neg_per_pos and attempts < num_neg_per_pos * 20:
+            src = int(torch.randint(num_src, (1,), generator=gen).item())
+            if (src, dst) not in all_pos_set:
+                neg_src_list.append(src)
+                neg_dst_list.append(dst)
+                count += 1
+            attempts += 1
+    neg_srcs = torch.tensor(neg_src_list, dtype=torch.long)
+    neg_dsts = torch.tensor(neg_dst_list, dtype=torch.long)
     neg_scores = (src_norm[neg_srcs] * dst_norm[neg_dsts]).sum(-1)
 
     scores = torch.cat([pos_scores, neg_scores]).numpy()
@@ -204,13 +226,18 @@ def main() -> None:
     pos_ei = compliance_ei[:, mask]
     print(f"\nEvaluating {args.split} split: {pos_ei.size(1)} positive edges")
 
-    # Cosine baseline
-    baseline = cosine_auc(data, pos_ei, num_neg_per_pos=args.neg_ratio)
+    if pos_ei.size(1) == 0:
+        print(f"No positive edges in '{args.split}' split; skipping metric computation.")
+        return
+
+    # Cosine baseline (filter all known positives)
+    baseline = cosine_auc(data, pos_ei, num_neg_per_pos=args.neg_ratio,
+                          all_pos_ei=compliance_ei)
     print(f"\nCosine baseline:  AUC={baseline['cosine_auc']:.4f}  AP={baseline['cosine_ap']:.4f}")
 
-    # RGCN evaluation
+    # RGCN evaluation (filter all known positives)
     rgcn_m = run_forward(model, predictor, data, pos_ei, device,
-                         neg_ratio=args.neg_ratio)
+                         neg_ratio=args.neg_ratio, all_pos_ei=compliance_ei)
     print(f"RGCN:             AUC={rgcn_m['auc']:.4f}  AP={rgcn_m['ap']:.4f}")
 
     delta_auc = rgcn_m["auc"] - baseline["cosine_auc"]

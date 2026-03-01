@@ -221,7 +221,10 @@ def fetch_unembedded(collection: str) -> list[dict]:
         cursor_id = result["id"]
         status, result = arango_request("PUT", f"/_api/cursor/{cursor_id}")
         if status not in (200, 201):
-            break
+            raise RuntimeError(
+                f"Cursor pagination failed for {collection!r} (status={status}): "
+                f"{result.get('errorMessage', '')}"
+            )
         docs.extend(result.get("result", []))
     return docs
 
@@ -278,6 +281,12 @@ def embed_collection(collection: str, config: dict, dry_run: bool) -> tuple[int,
             vectors = embedder_request(valid_texts, batch_size=BATCH_SIZE)
         except RuntimeError as e:
             print(f"\n  [ERROR] embedding batch {i//BATCH_SIZE}: {e}")
+            errors += len(valid_indices)
+            continue
+
+        if len(vectors) != len(valid_indices):
+            print(f"\n  [ERROR] embedder returned {len(vectors)} vectors for "
+                  f"{len(valid_indices)} texts in batch {i//BATCH_SIZE}")
             errors += len(valid_indices)
             continue
 
