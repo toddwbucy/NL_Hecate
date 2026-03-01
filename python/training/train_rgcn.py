@@ -175,7 +175,7 @@ def per_smell_breakdown(
         neg_logits = predictor.predict_edges(node_embs, local_neg_ei).detach().cpu().numpy()
 
         scores = list(pos_logits) + list(neg_logits)
-        labels = [1] * n_pos + [0] * (n_pos * neg_ratio)
+        labels = [1] * n_pos + [0] * len(neg_srcs_list)
 
         if len(set(labels)) < 2:
             continue  # can't compute AUC with only one class
@@ -309,7 +309,7 @@ def train(args: argparse.Namespace) -> None:
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    best_val_auc     = 0.0
+    best_val_auc     = float("-inf")
     patience_counter = 0
     history: list[dict] = []
 

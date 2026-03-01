@@ -170,7 +170,7 @@ def per_smell_breakdown(
         nl = predictor.predict_edges(node_embs, local_neg).detach().cpu().numpy()
 
         scores = list(pl) + list(nl)
-        labels = [1] * n_pos + [0] * (n_pos * neg_ratio)
+        labels = [1] * n_pos + [0] * len(neg_srcs_list)
 
         if len(set(labels)) < 2:
             continue
