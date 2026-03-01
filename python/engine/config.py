@@ -80,6 +80,11 @@ class BuildConfig:
     # Batching
     batch_size: int = 1  # number of sequences per step (GPU batching)
 
+    # TNT periodic reset (2511.07343 §3.2)
+    # "carry_forward": M carries across all steps (default, current behavior)
+    # "periodic": M resets to zeros at each CMS level fire boundary (TNT mode)
+    memory_reset: str = "carry_forward"
+
     # Runtime
     gpu: bool = True  # GPU by default; --cpu to override
     load: str | None = None
@@ -153,6 +158,9 @@ class BuildConfig:
                 f"checkpoint_interval must be >= 1 or None, got {self.checkpoint_interval}")
         if self.batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {self.batch_size}")
+        if self.memory_reset not in ("carry_forward", "periodic"):
+            raise ValueError(
+                f"memory_reset must be 'carry_forward' or 'periodic', got '{self.memory_reset}'")
 
     @property
     def head_dim(self) -> int:

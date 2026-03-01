@@ -1,0 +1,49 @@
+{
+  "description": "ABLATION-C-TNT: k=4 CMS (multi-scale memory) + TNT periodic reset",
+  "notes": "TNT counterpart to ABLATION-C. Identical except memory_reset=periodic. L0 resets every step, L1 every 8 steps, L2 every 64 steps, L3 every 512 steps. Core test: does periodic reset help L2/L3 escape the initialization trap? See specs/infrastructure/08_tnt_periodic_reset.md.",
+
+  "model": {
+    "d_model": 512,
+    "num_heads": 8,
+    "seq_len": 512,
+    "window_size": 512,
+    "vocab_size": 32000,
+    "memory_enabled": true,
+    "k": 4,
+    "chunk_sizes": [1, 8, 64, 512],
+    "memory_rule": "titans",
+    "composition": "mag",
+    "projection_kind": "adaptive",
+    "self_generated_values": false,
+    "self_ref_chunk_size": 1,
+    "momentum_kind": "none",
+    "momentum_d_hidden": 0,
+    "memory_reset": "periodic"
+  },
+
+  "build": {
+    "lr": 0.0004,
+    "batch_size": 8,
+    "steps": 25000,
+    "optimizer": "adamw_gpu",
+    "warmup_steps": 200,
+    "weight_decay": 0.1,
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "max_grad_norm": 1.0,
+    "seed": 42,
+    "save_path": "checkpoints/ablation_C_tnt.safetensors",
+    "save_every": 2500,
+    "log_every": 10,
+    "eval_every": 1000,
+    "eval_max_chunks": 100,
+    "log_file": "runs/ablation_C_tnt.jsonl"
+  },
+
+  "data": {
+    "path": "data/c4",
+    "format": "sharegpt"
+  },
+
+  "m_norm_max": [100.0, 100.0, 100.0, 100.0]
+}
