@@ -748,7 +748,7 @@ fn traced_active_level(
             (y, MemoryCache::Hebbian(cache), final_m, y_id)
         }
         MemoryRuleKind::Moneta => {
-            let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2, sign_sharpness: cfg.sign_sharpness, lq_q: cfg.lq_q };
+            let rule = Moneta::from_cfg(cfg);
             let (y, cache) = rule.step(level_params, embedded, s, d, initial_m);
             let dh = cfg.d_hidden;
             let w1_size = dh * d;
@@ -944,7 +944,7 @@ fn traced_active_level(
             (y, MemoryCache::Lattice(cache), final_m, y_id)
         }
         MemoryRuleKind::Trellis => {
-            let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
+            let rule = Trellis::from_cfg(cfg);
             let (y, cache) = rule.step(level_params, embedded, s, d, initial_m);
             let d_k = cfg.d_compress;
             let sk_size = d_k * d;

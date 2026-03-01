@@ -57,6 +57,26 @@ pub struct Trellis {
     pub d_k: usize,       // key compression dimension
     pub lambda_k: f32,    // key state L2 decay
     pub lambda_v: f32,    // value state L2 decay
+    /// Per-level theta floor/ceil (CS-39 training wheels). 0.0/MAX = no clamp.
+    pub theta_floor: f32,
+    pub theta_ceil: f32,
+}
+
+impl Trellis {
+    /// Construct from MAGConfig fields for a specific CMS level (CS-39 clamp per level).
+    pub fn from_cfg_level(cfg: &crate::model::MAGConfig, level: usize) -> Self {
+        Trellis {
+            d_k: cfg.d_compress,
+            lambda_k: cfg.lambda_k,
+            lambda_v: cfg.lambda_v,
+            theta_floor: cfg.theta_floor.get(level).copied().unwrap_or(0.0),
+            theta_ceil: cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX),
+        }
+    }
+    /// Construct from MAGConfig fields (level 0 — backward compatible).
+    pub fn from_cfg(cfg: &crate::model::MAGConfig) -> Self {
+        Self::from_cfg_level(cfg, 0)
+    }
 }
 
 /// All intermediate values from a Trellis forward pass, needed for backward.
@@ -236,7 +256,7 @@ impl MemoryRule for Trellis {
             alpha_pre[t] = alpha_pre_t;
             alpha[t] = sigmoid_f32(alpha_pre_t);
             theta_pre[t] = theta_pre_t;
-            theta[t] = softplus_f32(theta_pre_t);
+            theta[t] = softplus_f32(theta_pre_t).clamp(self.theta_floor, self.theta_ceil);
 
             let sk_t_off = t * sk_size;
             let sv_t_off = t * sv_size;
@@ -659,9 +679,11 @@ impl MemoryRule for Trellis {
             let sig_deriv = alpha_t * (1.0 - alpha_t);
             let d_alpha_pre = d_alpha_total * sig_deriv;
 
-            // softplus derivative: sigmoid(x)
+            // softplus derivative: sigmoid(x), with straight-through clamp mask (CS-39)
+            let theta_raw = cache.theta[t];
+            let clamp_mask = if theta_raw <= self.theta_floor || theta_raw >= self.theta_ceil { 0.0 } else { 1.0 };
             let sp_deriv = sigmoid_f32(cache.theta_pre[t]);
-            let d_theta_pre = d_theta_total * sp_deriv;
+            let d_theta_pre = d_theta_total * sp_deriv * clamp_mask;
 
             // w_alpha, b_alpha, w_theta, b_theta gradients
             for i in 0..(2 * d) {
@@ -911,7 +933,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
+        let rule = Trellis::from_cfg(&cfg);
         let (y, _cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for (i, &v) in y.iter().enumerate() {
             assert!(v.is_finite(), "y[{i}] is not finite: {v}");
@@ -923,7 +945,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
+        let rule = Trellis::from_cfg(&cfg);
         let (y1, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let (y2, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         assert_eq!(y1, y2, "Trellis forward should be deterministic");
@@ -934,7 +956,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
+        let rule = Trellis::from_cfg(&cfg);
         let (y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
@@ -952,7 +974,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
+        let rule = Trellis::from_cfg(&cfg);
         let (_y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let d = cfg.swa.d_model;
         let d_k = cfg.d_compress;
@@ -976,7 +998,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
+        let rule = Trellis::from_cfg(&cfg);
         let (_y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for t in 0..cfg.swa.seq_len {
             let a = cache.alpha[t];
@@ -991,7 +1013,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
+        let rule = Trellis::from_cfg(&cfg);
         let (_y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let d_k = cfg.d_compress;
         let target_norm = (d_k as f32).sqrt();
@@ -1014,7 +1036,7 @@ mod tests {
         let embedded = make_embedded(&cfg, 99);
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
-        let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
+        let rule = Trellis::from_cfg(&cfg);
         let (_y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
 
         let d_y = vec![1.0f32; s * d];
@@ -1042,7 +1064,7 @@ mod tests {
         let embedded = make_embedded(&cfg, 99);
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
-        let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
+        let rule = Trellis::from_cfg(&cfg);
         let (_y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
 
         let d_y = vec![1.0f32; s * d];
@@ -1066,7 +1088,7 @@ mod tests {
         let embedded = make_embedded(&cfg, 99);
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
-        let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
+        let rule = Trellis::from_cfg(&cfg);
         let (_y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
 
         let d_y = vec![1.0f32; s * d];
@@ -1086,7 +1108,7 @@ mod tests {
 
     #[test]
     fn test_trellis_init() {
-        let rule = Trellis { d_k: 4, lambda_k: 0.01, lambda_v: 0.01 };
+        let rule = Trellis { d_k: 4, lambda_k: 0.01, lambda_v: 0.01, theta_floor: 0.0, theta_ceil: f32::MAX };
         let state = rule.init(8);
         assert_eq!(state.s_k.len(), 4 * 8); // [d_k, d]
         assert_eq!(state.s_v.len(), 8 * 4); // [d, d_k]
@@ -1096,7 +1118,7 @@ mod tests {
 
     #[test]
     fn test_trellis_write_read_unsupported() {
-        let rule = Trellis { d_k: 4, lambda_k: 0.01, lambda_v: 0.01 };
+        let rule = Trellis { d_k: 4, lambda_k: 0.01, lambda_v: 0.01, theta_floor: 0.0, theta_ceil: f32::MAX };
         let mut state = rule.init(8);
         let k = [0.0f32; 8];
         let v = [0.0f32; 8];
@@ -1108,7 +1130,7 @@ mod tests {
 
     #[test]
     fn test_trellis_level_and_parallelization() {
-        let rule = Trellis { d_k: 8, lambda_k: 0.01, lambda_v: 0.01 };
+        let rule = Trellis { d_k: 8, lambda_k: 0.01, lambda_v: 0.01, theta_floor: 0.0, theta_ceil: f32::MAX };
         assert_eq!(rule.level(), 0);
         let strategies = rule.supported_parallelization();
         assert!(strategies.contains(&"sequential"));
@@ -1129,7 +1151,7 @@ mod tests {
         let d_k = cfg.d_compress;
 
         // Create a non-zero frozen state via running a forward pass
-        let rule = Trellis { d_k, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
+        let rule = Trellis { d_k, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v, theta_floor: 0.0, theta_ceil: f32::MAX };
         let (_, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
         let sk_final = &cache.sk_states[s * d_k * d..(s + 1) * d_k * d];
         let sv_final = &cache.sv_states[s * d * d_k..(s + 1) * d * d_k];
@@ -1153,7 +1175,7 @@ mod tests {
         let s = cfg.swa.seq_len;
         let d_k = cfg.d_compress;
 
-        let rule = Trellis { d_k, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
+        let rule = Trellis { d_k, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v, theta_floor: 0.0, theta_ceil: f32::MAX };
         let (_, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
         let sk_final = &cache.sk_states[s * d_k * d..(s + 1) * d_k * d];
         let sv_final = &cache.sv_states[s * d * d_k..(s + 1) * d * d_k];
@@ -1182,7 +1204,7 @@ mod tests {
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
         let d_k = cfg.d_compress;
-        let rule = Trellis { d_k, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
+        let rule = Trellis { d_k, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v, theta_floor: 0.0, theta_ceil: f32::MAX };
 
         // Custom initial state
         let mut custom_m0 = vec![0.1f32; d_k * d + d * d_k];
@@ -1200,7 +1222,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
+        let rule = Trellis::from_cfg(&cfg);
         let (_y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
 
         // Verify both S_K and S_V are non-trivial after forward

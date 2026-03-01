@@ -293,7 +293,7 @@ pub fn delta_rule_opaque_backward(
         k_conv_cache, q_conv_cache,
     };
 
-    let rule = DeltaRule { bias, sign_sharpness };
+    let rule = DeltaRule { bias, sign_sharpness, theta_floor: 0.0, theta_ceil: f32::MAX };
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
     d_inputs[0] = d_embedded;
@@ -475,7 +475,7 @@ pub fn moneta_opaque_backward(
         q_conv_cache: q_conv_cache_restored,
     };
 
-    let rule = Moneta { d_hidden, lp_p, lambda_2, sign_sharpness, lq_q };
+    let rule = Moneta { d_hidden, lp_p, lambda_2, sign_sharpness, lq_q, theta_floor: 0.0, theta_ceil: f32::MAX };
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
     d_inputs[0] = d_embedded;
@@ -681,7 +681,7 @@ pub fn trellis_opaque_backward(
         q_conv_cache: q_conv_cache_restored,
     };
 
-    let rule = Trellis { d_k, lambda_k, lambda_v };
+    let rule = Trellis { d_k, lambda_k, lambda_v, theta_floor: 0.0, theta_ceil: f32::MAX };
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
     d_inputs[0] = d_embedded;
@@ -1600,7 +1600,7 @@ mod tests {
 
     #[test]
     fn test_opaque_vjp_moneta() {
-        assert_opaque_roundtrip(&Moneta { d_hidden: 8, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0, lq_q: 2.0 }, 4, 3);
+        assert_opaque_roundtrip(&Moneta { d_hidden: 8, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0, lq_q: 2.0, theta_floor: 0.0, theta_ceil: f32::MAX }, 4, 3);
     }
 
     #[test]
@@ -1620,7 +1620,7 @@ mod tests {
 
     #[test]
     fn test_opaque_vjp_trellis() {
-        assert_opaque_roundtrip(&Trellis { d_k: 3, lambda_k: 0.01, lambda_v: 0.01 }, 4, 3);
+        assert_opaque_roundtrip(&Trellis { d_k: 3, lambda_k: 0.01, lambda_v: 0.01, theta_floor: 0.0, theta_ceil: f32::MAX }, 4, 3);
     }
 
     #[test]
@@ -1633,11 +1633,11 @@ mod tests {
         assert_eq!(DeltaRule::l2().opaque_key(), OpaqueKey::DeltaRule);
         assert_eq!(TitansLMM::l2().opaque_key(), OpaqueKey::TitansLMM);
         assert_eq!(HebbianRule.opaque_key(), OpaqueKey::HebbianRule);
-        assert_eq!((Moneta { d_hidden: 8, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0, lq_q: 2.0 }).opaque_key(), OpaqueKey::Moneta);
+        assert_eq!((Moneta { d_hidden: 8, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0, lq_q: 2.0, theta_floor: 0.0, theta_ceil: f32::MAX }).opaque_key(), OpaqueKey::Moneta);
         assert_eq!((YAAD { d_hidden: 8, delta: 0.9, lambda_local: 0.1, lambda_2: 0.01 }).opaque_key(), OpaqueKey::YAAD);
         assert_eq!((MEMORA { d_hidden: 8 }).opaque_key(), OpaqueKey::MEMORA);
         assert_eq!((LatticeOSR { m_slots: 3, variant: crate::model::LatticeVariant::Decode }).opaque_key(), OpaqueKey::LatticeOSR);
-        assert_eq!((Trellis { d_k: 3, lambda_k: 0.01, lambda_v: 0.01 }).opaque_key(), OpaqueKey::Trellis);
+        assert_eq!((Trellis { d_k: 3, lambda_k: 0.01, lambda_v: 0.01, theta_floor: 0.0, theta_ceil: f32::MAX }).opaque_key(), OpaqueKey::Trellis);
         assert_eq!(AtlasOmega.opaque_key(), OpaqueKey::AtlasOmega);
     }
 
@@ -1729,7 +1729,7 @@ mod tests {
     #[test]
     fn test_class1_hebbian() { assert_class1_isolation(&HebbianRule, 4, 3); }
     #[test]
-    fn test_class1_moneta() { assert_class1_isolation(&Moneta { d_hidden: 8, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0, lq_q: 2.0 }, 4, 3); }
+    fn test_class1_moneta() { assert_class1_isolation(&Moneta { d_hidden: 8, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0, lq_q: 2.0, theta_floor: 0.0, theta_ceil: f32::MAX }, 4, 3); }
     #[test]
     fn test_class1_yaad() { assert_class1_isolation(&YAAD { d_hidden: 8, delta: 0.9, lambda_local: 0.1, lambda_2: 0.01 }, 4, 3); }
     #[test]
@@ -1737,7 +1737,7 @@ mod tests {
     #[test]
     fn test_class1_lattice_osr() { assert_class1_isolation(&LatticeOSR { m_slots: 3, variant: crate::model::LatticeVariant::Decode }, 4, 3); }
     #[test]
-    fn test_class1_trellis() { assert_class1_isolation(&Trellis { d_k: 3, lambda_k: 0.01, lambda_v: 0.01 }, 4, 3); }
+    fn test_class1_trellis() { assert_class1_isolation(&Trellis { d_k: 3, lambda_k: 0.01, lambda_v: 0.01, theta_floor: 0.0, theta_ceil: f32::MAX }, 4, 3); }
     #[test]
     fn test_class1_atlas_omega() { assert_class1_isolation(&AtlasOmega, 4, 3); }
 

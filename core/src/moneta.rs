@@ -64,6 +64,28 @@ pub struct Moneta {
     /// At q=4 (MONETA design target): W = A / ||A||_4^2, bounding peak magnitudes.
     /// Source: MIRAS §5.3 Eqs 24-25, specs/algorithms/retention_mechanisms/07_lq_norm.md.
     pub lq_q: f32,
+    /// Per-level theta floor/ceil (CS-39 training wheels). 0.0/MAX = no clamp.
+    pub theta_floor: f32,
+    pub theta_ceil: f32,
+}
+
+impl Moneta {
+    /// Construct from MAGConfig fields for a specific CMS level (CS-39 clamp per level).
+    pub fn from_cfg_level(cfg: &crate::model::MAGConfig, level: usize) -> Self {
+        Moneta {
+            d_hidden: cfg.d_hidden,
+            lp_p: cfg.lp_p,
+            lambda_2: cfg.lambda_2,
+            sign_sharpness: cfg.sign_sharpness,
+            lq_q: cfg.lq_q,
+            theta_floor: cfg.theta_floor.get(level).copied().unwrap_or(0.0),
+            theta_ceil: cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX),
+        }
+    }
+    /// Construct from MAGConfig fields (level 0 — backward compatible).
+    pub fn from_cfg(cfg: &crate::model::MAGConfig) -> Self {
+        Self::from_cfg_level(cfg, 0)
+    }
 }
 
 /// All intermediate values from a MONETA forward pass, needed for backward.
@@ -292,7 +314,7 @@ impl MemoryRule for Moneta {
                 theta_pre_t += concat_t[i] * level_params.w_theta[i];
             }
             theta_pre[t] = theta_pre_t;
-            theta[t] = softplus_f32(theta_pre_t);
+            theta[t] = softplus_f32(theta_pre_t).clamp(self.theta_floor, self.theta_ceil);
 
             // MLP forward: pre_act = W1 @ k_t, h = silu(pre_act)
             // Use split_at_mut to get non-overlapping borrows for current (immutable)
@@ -737,8 +759,11 @@ impl MemoryRule for Moneta {
                 // Gate backward
                 let sig_deriv = alpha_t * (1.0 - alpha_t);
                 let d_alpha_pre = d_alpha_scalar * sig_deriv;
+                // straight-through clamp mask (CS-39)
+                let theta_raw = cache.theta[t];
+                let clamp_mask = if theta_raw <= self.theta_floor || theta_raw >= self.theta_ceil { 0.0 } else { 1.0 };
                 let softplus_deriv = sigmoid_f32(theta_pre_t);
-                let d_theta_pre = d_theta_scalar * softplus_deriv;
+                let d_theta_pre = d_theta_scalar * softplus_deriv * clamp_mask;
 
                 for i in 0..(2 * d) {
                     grads.w_alpha[i] += d_alpha_pre * concat_t[i];
@@ -973,9 +998,11 @@ impl MemoryRule for Moneta {
             let sig_deriv = alpha_t * (1.0 - alpha_t);
             let d_alpha_pre = d_alpha_scalar * sig_deriv;
 
-            // ── Gate backward: theta_t = softplus(theta_pre_t) ──
+            // ── Gate backward: theta_t = softplus(theta_pre_t), straight-through clamp (CS-39) ──
+            let theta_raw = cache.theta[t];
+            let clamp_mask = if theta_raw <= self.theta_floor || theta_raw >= self.theta_ceil { 0.0 } else { 1.0 };
             let softplus_deriv = sigmoid_f32(theta_pre_t);
-            let d_theta_pre = d_theta_scalar * softplus_deriv;
+            let d_theta_pre = d_theta_scalar * softplus_deriv * clamp_mask;
 
             // ── w_alpha, b_alpha gradient ──
             for i in 0..(2 * d) {
@@ -1359,7 +1386,7 @@ mod tests {
     }
 
     fn make_moneta(cfg: &MAGConfig) -> Moneta {
-        Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2, sign_sharpness: cfg.sign_sharpness, lq_q: cfg.lq_q }
+        Moneta::from_cfg(cfg)
     }
 
     #[test]
@@ -1517,7 +1544,7 @@ mod tests {
 
     #[test]
     fn test_moneta_init() {
-        let rule = Moneta { d_hidden: 4, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0, lq_q: 2.0 };
+        let rule = Moneta { d_hidden: 4, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0, lq_q: 2.0, theta_floor: 0.0, theta_ceil: f32::MAX };
         let state = rule.init(8);
         assert_eq!(state.w1.len(), 4 * 8); // [d_hidden, d]
         assert_eq!(state.w2.len(), 8 * 4); // [d, d_hidden]
@@ -1529,7 +1556,7 @@ mod tests {
 
     #[test]
     fn test_moneta_level_and_parallelization() {
-        let rule = Moneta { d_hidden: 4, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0, lq_q: 2.0 };
+        let rule = Moneta { d_hidden: 4, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0, lq_q: 2.0, theta_floor: 0.0, theta_ceil: f32::MAX };
         assert_eq!(rule.level(), 0);
         let strategies = rule.supported_parallelization();
         assert!(strategies.contains(&"sequential"));

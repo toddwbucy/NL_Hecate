@@ -162,7 +162,7 @@ fn step_dispatch(
             (y, MemoryCache::Hebbian(c))
         }
         MemoryRuleKind::Moneta => {
-            let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2, sign_sharpness: cfg.sign_sharpness, lq_q: cfg.lq_q };
+            let rule = Moneta::from_cfg(cfg);
             let (y, c) = rule.step(level_params, input, s, d, initial_m);
             (y, MemoryCache::Moneta(c))
         }
@@ -182,7 +182,7 @@ fn step_dispatch(
             (y, MemoryCache::Lattice(c))
         }
         MemoryRuleKind::Trellis => {
-            let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
+            let rule = Trellis::from_cfg(cfg);
             let (y, c) = rule.step(level_params, input, s, d, initial_m);
             (y, MemoryCache::Trellis(c))
         }
@@ -210,7 +210,7 @@ fn step_backward_dispatch(
         MemoryCache::Titans(c) => TitansLMM::from_cfg(cfg).step_backward(level_params, c, d_y, input),
         MemoryCache::Hebbian(c) => HebbianRule.step_backward(level_params, c, d_y, input),
         MemoryCache::Moneta(c) => {
-            let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2, sign_sharpness: cfg.sign_sharpness, lq_q: cfg.lq_q };
+            let rule = Moneta::from_cfg(cfg);
             rule.step_backward(level_params, c, d_y, input)
         }
         MemoryCache::YAAD(c) => {
@@ -226,7 +226,7 @@ fn step_backward_dispatch(
             rule.step_backward(level_params, c, d_y, input)
         }
         MemoryCache::Trellis(c) => {
-            let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
+            let rule = Trellis::from_cfg(cfg);
             rule.step_backward(level_params, c, d_y, input)
         }
         MemoryCache::Atlas(c) => AtlasOmega.step_backward(level_params, c, d_y, input),

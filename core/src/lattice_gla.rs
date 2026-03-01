@@ -768,7 +768,7 @@ mod tests {
         let (y_gla, _) = trellis_gla_forward(
             &params.levels[0], &embedded, s, d, s, &cfg, None,
         );
-        let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
+        let rule = Trellis::from_cfg(&cfg);
         let (y_seq, _) = rule.step(&params.levels[0], &embedded, s, d, None);
 
         let max_diff: f32 = y_gla.iter().zip(y_seq.iter())
@@ -785,7 +785,7 @@ mod tests {
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
 
-        let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
+        let rule = Trellis::from_cfg(&cfg);
         let (y_seq, _) = rule.step(&params.levels[0], &embedded, s, d, None);
 
         let c = 4.min(s);
