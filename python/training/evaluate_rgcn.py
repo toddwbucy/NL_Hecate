@@ -228,8 +228,10 @@ def main() -> None:
     model.load_state_dict(ckpt["model_state"])
     predictor.load_state_dict(ckpt["predictor_state"])
 
+    val_auc = ckpt.get("val_auc")
+    val_auc_str = f"{val_auc:.4f}" if isinstance(val_auc, (int, float)) else "?"
     print(f"  Checkpoint from epoch {ckpt.get('epoch', '?')}  "
-          f"(val_auc={ckpt.get('val_auc', '?'):.4f})")
+          f"(val_auc={val_auc_str})")
 
     # Select split
     compliance_ei = data[COMPLIANCE_TRIPLET].edge_index
