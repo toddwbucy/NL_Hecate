@@ -148,9 +148,21 @@ def sample_negatives(
             attempts += 1
 
     if not neg_srcs:
-        # Fallback: just use random pairs (rare edge case when graph is fully dense)
-        neg_srcs = torch.randint(num_src, (len(pos_dst) * neg_ratio,), generator=gen).tolist()
-        neg_dsts = pos_dst.repeat(neg_ratio).tolist()
+        # Fallback: sample random pairs, filtering out known positives
+        candidates = torch.randint(
+            num_src, (len(pos_dst) * neg_ratio * 2,), generator=gen
+        ).tolist()
+        fallback_dsts = pos_dst.repeat(neg_ratio * 2).tolist()
+        for src, dst in zip(candidates, fallback_dsts):
+            if (src, dst) not in pos_set:
+                neg_srcs.append(src)
+                neg_dsts.append(dst)
+                if len(neg_srcs) >= len(pos_dst) * neg_ratio:
+                    break
+        # If still empty (truly dense graph), accept any pairs as last resort
+        if not neg_srcs:
+            neg_srcs = candidates[:len(pos_dst) * neg_ratio]
+            neg_dsts = fallback_dsts[:len(pos_dst) * neg_ratio]
 
     device = pos_edge_index.device
     return torch.tensor([neg_srcs, neg_dsts], dtype=torch.long, device=device)

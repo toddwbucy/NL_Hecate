@@ -98,6 +98,8 @@ COLLECTION_CONFIG: dict[str, dict[str, Any]] = {
     "hope_algorithms":      {"fields": ["name", "description", "pseudocode"],              "strategy": "join"},
     "hope_assumptions":     {"fields": ["name", "assumption", "description"],              "strategy": "join"},
     "nl_probe_patterns":    {"fields": ["name", "description"],                            "strategy": "join"},
+    # NL core axioms (IS / IS NOT containers)
+    "nl_axioms":            {"fields": ["name", "description"],                            "strategy": "join"},
 }
 
 
@@ -204,6 +206,9 @@ def build_embed_text(doc: dict, fields: list[str], strategy: str) -> str:
 
 def fetch_unembedded(collection: str) -> list[dict]:
     """Return all docs in collection that have no 'embedding' field."""
+    # Collection name must be alphanumeric + underscore (all entries are from COLLECTION_CONFIG)
+    if not collection.replace("_", "").isalnum():
+        raise ValueError(f"Invalid collection name: {collection!r}")
     aql = f"FOR d IN {collection} FILTER !HAS(d, 'embedding') RETURN d"
     status, result = arango_request("POST", "/_api/cursor",
                                     body={"query": aql, "batchSize": 500, "count": True})
@@ -354,16 +359,16 @@ def main() -> None:
         verify_coverage()
         return
 
+    if args.collection and args.collection not in COLLECTION_CONFIG:
+        print(f"ERROR: unknown collection '{args.collection}'. "
+              f"Known: {', '.join(COLLECTION_CONFIG)}")
+        sys.exit(1)
+
     collections = (
         {args.collection: COLLECTION_CONFIG[args.collection]}
         if args.collection
         else COLLECTION_CONFIG
     )
-
-    if args.collection and args.collection not in COLLECTION_CONFIG:
-        print(f"ERROR: unknown collection '{args.collection}'. "
-              f"Known: {', '.join(COLLECTION_CONFIG)}")
-        sys.exit(1)
 
     print(f"\nEmbedding {len(collections)} collection(s) "
           f"{'[DRY RUN] ' if args.dry_run else ''}"
