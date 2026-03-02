@@ -14,7 +14,8 @@
 ///
 /// RandomFourier stability:
 ///   ||phi(k)|| <= sqrt(2) for ALL k (bounded by cos^2 <= 1).
-///   GD stability condition: theta < 1/||phi(k)||^2 >= 1/2 — a global bound.
+///   Since ||phi(k)||^2 <= 2, we have 1/||phi(k)||^2 >= 1/2.
+///   A conservative global bound is therefore: theta < 1/2.
 ///   This makes carry-forward safe for slow CMS levels (L2/L3).
 
 use serde::{Serialize, Deserialize};
