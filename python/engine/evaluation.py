@@ -421,8 +421,8 @@ def probe_memory_vocab(host_params, host_context, cfg, tokenizer, step: int,
     levels_data: list = []
 
     memory = host_context.memory  # list[k] of flat Vec<f32> length d*d each
-    for l in range(k):
-        M_l = np.array(memory[l], dtype=np.float32).reshape(d, d)
+    for level_idx in range(k):
+        M_l = np.array(memory[level_idx], dtype=np.float32).reshape(d, d)
         m_norm = float(np.linalg.norm(M_l, "fro"))
 
         # Project: [d, d] @ [d, v] → [d, v]; mean over rows → [v]
@@ -433,7 +433,7 @@ def probe_memory_vocab(host_params, host_context, cfg, tokenizer, step: int,
         level_probs.append(probs_l)
 
         entry: dict = {
-            "level": l,
+            "level": level_idx,
             "m_norm": round(m_norm, 6),
             "top20": _top20(probs_l) if m_norm > 1e-6 else [],
         }
