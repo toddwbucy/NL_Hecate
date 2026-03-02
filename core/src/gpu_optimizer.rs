@@ -346,6 +346,59 @@ fn gpu_grad_norm(grads: &GpuMAGGrads, state: &mut GpuAdamWState) -> f32 {
     (total_sq).sqrt() as f32
 }
 
+/// Compute per-level L2 gradient norms. Returns Vec<f32> of length k.
+/// Called before global clipping so the values reflect the true per-level
+/// learning signal (post-clip all levels are scaled by the same factor,
+/// losing relative dead-level information).
+#[cfg(feature = "cuda")]
+pub fn gpu_per_level_grad_norms(grads: &GpuMAGGrads, state: &mut GpuAdamWState) -> Vec<f32> {
+    let mut level_norms = Vec::with_capacity(grads.levels.len());
+
+    for lg in &grads.levels {
+        let mut level_sq = 0.0f64;
+
+        macro_rules! accum_level {
+            ($g:expr) => {{
+                let n = $g.len() as i32;
+                if n > 0 {
+                    let mut num_blocks: i32 = 0;
+                    let err = unsafe {
+                        crate::cuda_ffi::grad_norm_sq_cuda(
+                            $g.as_ptr(), state.norm_scratch.ptr(), n, &mut num_blocks,
+                        )
+                    };
+                    assert_eq!(err, 0, "grad_norm_sq_cuda failed with cudaError_t={}", err);
+                    crate::dispatch::cuda_sync();
+                    let nb = num_blocks as usize;
+                    state.norm_scratch.slice(0, nb).copy_to_host(&mut state.norm_host[..nb]);
+                    for i in 0..nb {
+                        level_sq += state.norm_host[i] as f64;
+                    }
+                }
+            }};
+        }
+
+        accum_level!(lg.d_w_k_mem);
+        accum_level!(lg.d_w_v_mem);
+        accum_level!(lg.d_w_q_mem);
+        accum_level!(lg.d_w_alpha);
+        accum_level!(lg.d_b_alpha);
+        accum_level!(lg.d_w_theta);
+        accum_level!(lg.d_b_theta);
+        accum_level!(lg.d_w_eta);
+        accum_level!(lg.d_b_eta);
+        if lg.has_mlp {
+            accum_level!(lg.d_gate_proj);
+            accum_level!(lg.d_up_proj);
+            accum_level!(lg.d_down_proj);
+        }
+
+        level_norms.push(level_sq.sqrt() as f32);
+    }
+
+    level_norms
+}
+
 /// Scale all gradient buffers by a constant factor (for clipping).
 #[cfg(feature = "cuda")]
 fn gpu_scale_grads(grads: &mut GpuMAGGrads, scale: f32) {
