@@ -1,5 +1,2 @@
-# Compiled binary artifacts — gitignored, reproducible from source
-*.so
-*.whl
-*.fatbin
+# .build-meta.json is machine-local (written by promote_artifacts.py)
 .build-meta.json

@@ -46,8 +46,5 @@ python/*.log
 # Hermes workspace config
 .hermes/
 
-# Compiled artifact binaries (layout tracked in artifacts/, binaries are not)
-artifacts/*.so
-artifacts/*.whl
-artifacts/*.fatbin
+# artifacts/.build-meta.json is machine-local (see artifacts/.gitignore)
 artifacts/.build-meta.json

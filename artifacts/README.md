@@ -1,18 +1,20 @@
 # NL-Hecate Compiled Artifacts
 
-Compiled binary outputs live here. **Binaries are gitignored** — this directory
-tracks the layout, not the content.
+Compiled binary outputs live here. **Binaries are committed to git** — at 4.1MB
+the release `.so` is small enough to distribute directly through the repository.
 
 See `specs/infrastructure/02_artifact_layout.md` for the full spec.
 
 ## Layout
 
-```
+```text
 artifacts/
-├── .build-meta.json      ← written by promote_artifacts.py; records git SHA + sizes
+├── .build-meta.json      ← gitignored; written by promote_artifacts.py; local staleness pointer
 ├── cuda/                 ← reserved for standalone CUDA fat binaries (future)
-├── so/                   ← SHA-tagged PyO3 .so files
-└── wheels/               ← version-tagged maturin .whl files
+├── so/                   ← SHA-tagged PyO3 .so files (committed)
+│   └── nl_hecate.cpython-312-x86_64-linux-gnu.<sha>.so
+└── wheels/               ← version-tagged maturin .whl files (committed)
+    └── nl_hecate-<version>-cp312-linux_x86_64.whl
 ```
 
 ## Rebuild + Promote
@@ -22,11 +24,14 @@ artifacts/
 cd python && maturin develop --release && cd ..
 
 # Promote: copies .so to artifacts/so/, writes .build-meta.json, prints HADES JSON:
-python scripts/promote_artifacts.py
+python scripts/promote_artifacts.py [--task-key task_87a521]
 
 # Optional: promote a wheel instead of a dev install
 cd python && maturin build --release && cd ..
-python scripts/promote_artifacts.py --wheel
+python scripts/promote_artifacts.py --wheel [--task-key task_87a521]
+
+# Commit the promoted binary:
+git add artifacts/so/ && git commit -m "chore: promote nl_hecate .so <sha>"
 ```
 
 ## Staleness Check
@@ -48,17 +53,19 @@ else:
 
 ## Artifact Provenance (HADES)
 
-Every promoted artifact registers a document in the `hecate_artifacts` collection
-of the NL HADES database. Query:
+Every promoted artifact has a metadata node in the `hecate_artifacts` collection
+of the NL HADES database, connected to the source code nodes it was compiled from
+via `hecate_artifact_edges` (`rel: compiled_from`). Query:
 
 ```bash
 hades --database NL db aql "FOR a IN hecate_artifacts SORT a.build_date_epoch DESC LIMIT 5 RETURN a"
 ```
 
-## Distribution
-
-Versioned builds are published as GitHub Release assets:
+Traverse source provenance:
 
 ```bash
-gh release create v0.4.0 artifacts/so/nl_hecate.*.so --title "v0.4.0" --notes "..."
+hades --database NL db aql "
+  FOR v, e IN 1..1 OUTBOUND 'hecate_artifacts/nl-hecate-so-e0010028'
+    hecate_artifact_edges RETURN v._key
+"
 ```

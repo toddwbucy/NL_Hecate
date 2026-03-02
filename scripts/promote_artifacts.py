@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 promote_artifacts.py — copy the built PyO3 .so into artifacts/so/ and write
-artifacts/.build-meta.json. Prints the hecate_artifacts HADES JSON for manual
-insertion.
+artifacts/.build-meta.json. Prints hecate_artifacts and hecate_artifact_edges
+JSON for manual HADES insertion.
 
 Usage:
-    python scripts/promote_artifacts.py [--venv VENV_DIR]
+    python scripts/promote_artifacts.py [--venv VENV_DIR] [--task-key TASK_KEY]
+    python scripts/promote_artifacts.py --wheel [--task-key TASK_KEY]
 
 Default venv: python/.venv
 """
@@ -23,6 +24,19 @@ ARTIFACTS_DIR = REPO_ROOT / "artifacts"
 SO_DIR = ARTIFACTS_DIR / "so"
 WHEEL_DIR = ARTIFACTS_DIR / "wheels"
 META_FILE = ARTIFACTS_DIR / ".build-meta.json"
+
+# Source code nodes compiled into the release .so (Rust + CUDA only).
+# Python engine files and test files are not compiled into the binary.
+COMPILED_FROM_SOURCES = [
+    "gpu-forward-rs",
+    "cuda-graph-rs",
+    "cuda-ffi-rs",
+    "gpu-params-rs",
+    "gpu-buf-rs",
+    "core-lib-rs",
+    "elementwise-cu",
+    "python-lib-rs",
+]
 
 
 def git_sha() -> str:
@@ -49,10 +63,9 @@ def find_wheel() -> Path:
     return max(Path(m) for m in matches)  # newest by name
 
 
-def promote_so(venv: Path, sha: str) -> dict:
+def promote_so(venv: Path, sha: str, produced_by_task: str | None) -> dict:
     src = find_so(venv)
     short = sha[:8]
-    # e.g. nl_hecate.cpython-312-x86_64-linux-gnu.e001002.so
     stem = src.stem  # nl_hecate.cpython-312-x86_64-linux-gnu
     dest_name = f"{stem}.{short}.so"
     dest = SO_DIR / dest_name
@@ -67,13 +80,13 @@ def promote_so(venv: Path, sha: str) -> dict:
         "git_sha": sha,
         "size_bytes": size,
         "cuda_archs": ["sm_86", "sm_89", "sm_90", "compute_86"],
-        "produced_by_task": None,
+        "produced_by_task": produced_by_task,
         "build_date_epoch": int(time.time()),
         "notes": "Release build via maturin develop --release; all CUDA kernels embedded",
     }
 
 
-def promote_wheel(sha: str) -> dict:
+def promote_wheel(sha: str, produced_by_task: str | None) -> dict:
     src = find_wheel()
     WHEEL_DIR.mkdir(parents=True, exist_ok=True)
     dest = WHEEL_DIR / src.name
@@ -88,7 +101,7 @@ def promote_wheel(sha: str) -> dict:
         "git_sha": sha,
         "size_bytes": size,
         "cuda_archs": ["sm_86", "sm_89", "sm_90", "compute_86"],
-        "produced_by_task": None,
+        "produced_by_task": produced_by_task,
         "build_date_epoch": int(time.time()),
         "notes": "Release wheel via maturin build --release",
     }
@@ -107,34 +120,61 @@ def write_meta(sha: str, artifact: dict) -> None:
     print(f"  wrote {META_FILE.relative_to(REPO_ROOT)}")
 
 
+def build_edges(artifact: dict) -> list[dict]:
+    """Return compiled_from edge dicts for all source nodes."""
+    artifact_id = f"hecate_artifacts/{artifact['_key']}"
+    return [
+        {
+            "_from": artifact_id,
+            "_to": f"arxiv_metadata/{src}",
+            "rel": "compiled_from",
+        }
+        for src in COMPILED_FROM_SOURCES
+    ]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--venv", default=str(REPO_ROOT / "python" / ".venv"),
                         help="Path to the active venv (default: python/.venv)")
     parser.add_argument("--wheel", action="store_true",
                         help="Promote a .whl from python/target/wheels/ instead of venv .so")
+    parser.add_argument("--task-key", default=None,
+                        help="Persephone task key, e.g. task_87a521 (optional)")
     args = parser.parse_args()
+
+    produced_by_task = f"persephone_tasks/{args.task_key}" if args.task_key else None
 
     sha = git_sha()
     print(f"git SHA: {sha[:8]}")
 
     if args.wheel:
-        artifact = promote_wheel(sha)
+        artifact = promote_wheel(sha, produced_by_task)
     else:
-        artifact = promote_so(Path(args.venv), sha)
+        artifact = promote_so(Path(args.venv), sha, produced_by_task)
 
     write_meta(sha, artifact)
+    edges = build_edges(artifact)
 
     print()
-    print("── HADES hecate_artifacts entry ────────────────────────────────")
-    print("Insert this into the NL database to register artifact provenance:")
+    print("── HADES hecate_artifacts node ─────────────────────────────────")
+    print("Insert into NL database:")
     print()
-    print(f"  hades --database NL db insert --collection hecate_artifacts \\")
-    print(f"    '{json.dumps(artifact)}'")
+    print("  hades --database NL db aql \"INSERT")
+    print(f"    {json.dumps(artifact)}")
+    print("    INTO hecate_artifacts\"")
     print()
-    print("Or via MCP:")
-    print(f"  hades_db_insert(collection='hecate_artifacts', database='NL',")
-    print(f"    data='{json.dumps(artifact)}')")
+    print("── HADES hecate_artifact_edges (compiled_from) ─────────────────")
+    print("Insert each edge:")
+    print()
+    for edge in edges:
+        print(f"  hades --database NL db aql \"INSERT {json.dumps(edge)} INTO hecate_artifact_edges\"")
+    print()
+    print("── Next step ───────────────────────────────────────────────────")
+    print("Commit the promoted binary:")
+    dest_path = artifact["path"]
+    print(f"  git add {dest_path}")
+    print("  git commit -m \"chore: promote nl_hecate .so " + sha[:8] + "\"")
 
 
 if __name__ == "__main__":
