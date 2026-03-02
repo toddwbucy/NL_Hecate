@@ -18,6 +18,7 @@ from engine.evaluation import (
     eval_coherence_samples, generate_samples,
     full_snapshot, full_restore,
     probe_within_generation, probe_cross_exposure, probe_context_value,
+    probe_memory_vocab,
     EVAL_PROMPTS, SAMPLE_PROMPTS,
 )
 from engine.logging_utils import JSONLLogger, rss_mb
@@ -669,6 +670,23 @@ def run_build(bcfg: BuildConfig):
                 finally:
                     full_restore(gpu_model, snapshot)
                     gpu_model.reset_optimizer()  # probes corrupt AdamW moments
+            # ── Memory vocab probe (logit lens for CMS levels) ────────
+            if gpu_model is not None and tokenizer is not None:
+                try:
+                    # Reuse params/context already downloaded by full_snapshot.
+                    # snapshot is defined in the learning-probe block above;
+                    # guard both blocks under the same condition.
+                    vprobe = probe_memory_vocab(
+                        snapshot["params"], snapshot["context"],
+                        cfg, tokenizer, step)
+                    for lv in vprobe["levels"]:
+                        top3 = " ".join(t["tok"] for t in lv["top20"][:3])
+                        print(f"    [vocab-probe] L{lv['level']}  "
+                              f"‖M‖={lv['m_norm']:.4f}  top3={top3}")
+                    if jsonl:
+                        jsonl.log(event="memory_vocab_probe", **vprobe)
+                except Exception as e:
+                    print(f"    [vocab probe failed: {e}]")
             if jsonl:
                 jsonl.log(event="eval", step=step, eval_loss=eval_loss,
                           eval_ppl=eval_ppl, eval_chunks=bcfg.eval_max_chunks)

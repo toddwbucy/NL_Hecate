@@ -356,6 +356,115 @@ def eval_coherence_samples(gpu_model, cfg, max_tokens: int = 30,
     return results
 
 
+def probe_memory_vocab(host_params, host_context, cfg, tokenizer, step: int,
+                       donor_params=None) -> dict:
+    """Logit lens for CMS memory states: project M_l through W_unembed.
+
+    For each CMS level l, computes mean(M_l @ W_unembed, axis=0) to get a
+    single vocabulary distribution — asking 'what does this memory level know?'
+
+    Args:
+        host_params:   MAGParams downloaded from GPU (snapshot["params"]).
+        host_context:  ContextState downloaded from GPU (snapshot["context"]).
+        cfg:           MAGConfig (provides d_model, vocab_size, k).
+        tokenizer:     BpeTokenizer (for token-id → string decoding).
+        step:          Current training step (for logging).
+        donor_params:  Optional donor MAGParams; if given, computes KL from
+                       donor W_unembed projection for each level.
+
+    Returns dict with keys:
+        step, levels (per-level top-20 + M-norm + optional kl_from_donor),
+        js_divergence (JS div between every level pair).
+    """
+    import math
+    import numpy as np
+
+    d = cfg.d_model
+    v = cfg.vocab_size
+    k = cfg.k
+
+    # w_unembed layout: [d_model, vocab_size] row-major
+    # (index: w_unembed[i * vocab + j], reshaped to [d, v])
+    weights = host_params.get_weights()
+    w_u = np.array(weights["w_unembed"], dtype=np.float32).reshape(d, v)
+
+    donor_w_u = None
+    if donor_params is not None:
+        dw = donor_params.get_weights()
+        donor_w_u = np.array(dw["w_unembed"], dtype=np.float32).reshape(d, v)
+
+    def _softmax(x: "np.ndarray") -> "np.ndarray":
+        x = x - x.max()
+        e = np.exp(x)
+        return e / (e.sum() + 1e-30)
+
+    def _top20(probs: "np.ndarray") -> list:
+        top_ids = np.argsort(probs)[-20:][::-1]
+        out = []
+        for tid in top_ids:
+            tok_str = ""
+            try:
+                tok_str = tokenizer.decode([int(tid)])
+            except Exception:
+                tok_str = f"<{int(tid)}>"
+            out.append({"id": int(tid), "prob": round(float(probs[tid]), 6),
+                        "tok": repr(tok_str)})
+        return out
+
+    def _kl(p: "np.ndarray", q: "np.ndarray") -> float:
+        eps = 1e-10
+        p = p + eps
+        q = q + eps
+        return float(np.sum(p * np.log(p / q)))
+
+    level_probs: list = []
+    levels_data: list = []
+
+    memory = host_context.memory  # list[k] of flat Vec<f32> length d*d each
+    for l in range(k):
+        M_l = np.array(memory[l], dtype=np.float32).reshape(d, d)
+        m_norm = float(np.linalg.norm(M_l, "fro"))
+
+        # Project: [d, d] @ [d, v] → [d, v]; mean over rows → [v]
+        logits_l = M_l @ w_u           # [d, v]
+        mean_logits = logits_l.mean(axis=0)  # [v]
+        probs_l = _softmax(mean_logits)
+
+        level_probs.append(probs_l)
+
+        entry: dict = {
+            "level": l,
+            "m_norm": round(m_norm, 6),
+            "top20": _top20(probs_l) if m_norm > 1e-6 else [],
+        }
+
+        if donor_w_u is not None:
+            donor_logits = M_l @ donor_w_u
+            donor_mean = donor_logits.mean(axis=0)
+            donor_probs = _softmax(donor_mean)
+            entry["kl_from_donor"] = round(_kl(probs_l, donor_probs), 6)
+
+        levels_data.append(entry)
+
+    # Jensen–Shannon divergence between every level pair
+    js_pairs: list = []
+    for i in range(k):
+        for j in range(i + 1, k):
+            eps = 1e-10
+            p = level_probs[i] + eps
+            q = level_probs[j] + eps
+            m = 0.5 * (p + q)
+            js = float(0.5 * np.sum(p * np.log(p / m))
+                       + 0.5 * np.sum(q * np.log(q / m)))
+            js_pairs.append({"levels": f"{i}-{j}", "js_div": round(js, 6)})
+
+    return {
+        "step": step,
+        "levels": levels_data,
+        "js_divergence": js_pairs,
+    }
+
+
 def generate_samples(gpu_model, cfg, tokenizer, step: int,
                      temperature: float = 0.7,
                      max_tokens: int = 128) -> list[dict]:
