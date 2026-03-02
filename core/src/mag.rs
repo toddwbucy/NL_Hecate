@@ -763,7 +763,7 @@ fn run_level_memory(
                 &params.levels[level], input, frozen_ref, s, d, cfg.d_compress,
             ),
             _ => delta_rule_read_only(
-                &params.levels[level], input, frozen_ref, s, d,
+                &params.levels[level], input, frozen_ref, s, d, &cfg.feature_map,
             ),
         };
         (y_level, None, Some(q_mem), Some(frozen_ref.clone()))
@@ -1062,7 +1062,7 @@ pub fn cms_backward(
                         &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.d_compress,
                     ),
                     _ => delta_rule_read_only_backward(
-                        &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d,
+                        &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, &cfg.feature_map,
                     ),
                 };
                 error_buffers[level].accumulate(&mem_grads);
@@ -1171,6 +1171,7 @@ pub fn cms_backward(
                         &cache.embedded,
                         s,
                         d,
+                        &cfg.feature_map,
                     ),
                 }
             };

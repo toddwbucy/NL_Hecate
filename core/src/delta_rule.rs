@@ -621,6 +621,7 @@ pub fn delta_rule_read_only(
     frozen_m: &[f32],
     seq_len: usize,
     d: usize,
+    feature_map: &FeatureMapKind,
 ) -> (Vec<f32>, Vec<f32>) {
     debug_assert_eq!(embedded.len(), seq_len * d);
     debug_assert_eq!(frozen_m.len(), d * d);
@@ -630,19 +631,14 @@ pub fn delta_rule_read_only(
     let w_q_f32 = level_params.w_q_mem.as_f32();
     crate::dispatch::matmul_transb_dispatch(embedded, &w_q_f32, &mut q_mem, seq_len, d, d);
 
-    // y_t = M @ phi(q_t) for each token
+    // y_t = M @ phi(q_t) for each token. Use apply_into to avoid per-token allocation.
     let mut y = vec![0.0f32; seq_len * d];
-    let fm_kind = if level_params.w_rand.is_empty() {
-        FeatureMapKind::Identity
-    } else {
-        // If w_rand is present, default to RFF with sigma=1 for read-only path.
-        // The exact sigma doesn't matter here: phi(q) uses the frozen w_rand/b_rand directly.
-        FeatureMapKind::RandomFourier { sigma: 1.0 }
-    };
+    let mut phi_q_buf = vec![0.0f32; d];
+    let mut z_q_buf = vec![0.0f32; d];
     for t in 0..seq_len {
         let q_t = &q_mem[t * d..(t + 1) * d];
-        let (phi_q_t, _) = feature_map::apply(q_t, &fm_kind, &level_params.w_rand, &level_params.b_rand, d);
-        matmul_f32(frozen_m, &phi_q_t, &mut y[t * d..(t + 1) * d], d, d, 1);
+        feature_map::apply_into(q_t, feature_map, &level_params.w_rand, &level_params.b_rand, &mut phi_q_buf, &mut z_q_buf, d);
+        matmul_f32(frozen_m, &phi_q_buf, &mut y[t * d..(t + 1) * d], d, d, 1);
     }
 
     (y, q_mem)
@@ -663,19 +659,13 @@ pub fn delta_rule_read_only_backward(
     embedded: &[f32],
     seq_len: usize,
     d: usize,
+    feature_map: &FeatureMapKind,
 ) -> (MemoryLevelParams, Vec<f32>) {
     debug_assert_eq!(d_y.len(), seq_len * d);
 
     let mut grads = MemoryLevelParams::zeros_like(d);
 
-    // Determine feature map kind from level_params (same heuristic as forward).
-    let fm_kind = if level_params.w_rand.is_empty() {
-        FeatureMapKind::Identity
-    } else {
-        // sigma doesn't affect the VJP computation (only w_rand matters).
-        FeatureMapKind::RandomFourier { sigma: 1.0 }
-    };
-    let has_fm = !matches!(fm_kind, FeatureMapKind::Identity);
+    let has_fm = !matches!(feature_map, FeatureMapKind::Identity);
 
     // y_t = M @ phi(q_t)
     // Backward: d_phi_q_t = M^T @ d_y_t, then d_q_t = vjp(d_phi_q_t, z_q_t).
@@ -695,8 +685,8 @@ pub fn delta_rule_read_only_backward(
         // Re-run apply on q_t to recover the cached z (recompute is cheap for read-only path).
         let d_q_t = if has_fm {
             let q_t = &q_mem[t * d..(t + 1) * d];
-            let (_, z_q_t) = feature_map::apply(q_t, &fm_kind, &level_params.w_rand, &level_params.b_rand, d);
-            feature_map::vjp(&d_phi_q_t, &z_q_t, &fm_kind, &level_params.w_rand, d)
+            let (_, z_q_t) = feature_map::apply(q_t, feature_map, &level_params.w_rand, &level_params.b_rand, d);
+            feature_map::vjp(&d_phi_q_t, &z_q_t, feature_map, &level_params.w_rand, d)
         } else {
             d_phi_q_t
         };
@@ -934,7 +924,7 @@ mod tests {
         let d = cfg.swa.d_model;
         let s = cfg.swa.seq_len;
         let frozen_m = vec![0.0f32; d * d];
-        let (y, _q_mem) = delta_rule_read_only(&params.levels[0], &embedded, &frozen_m, s, d);
+        let (y, _q_mem) = delta_rule_read_only(&params.levels[0], &embedded, &frozen_m, s, d, &crate::feature_map::FeatureMapKind::Identity);
         // Zero memory → zero output
         assert!(y.iter().all(|&x| x.abs() < 1e-12));
     }
@@ -949,7 +939,7 @@ mod tests {
         // Identity memory → y_t = q_t
         let mut frozen_m = vec![0.0f32; d * d];
         for i in 0..d { frozen_m[i * d + i] = 1.0; }
-        let (y, q_mem) = delta_rule_read_only(&params.levels[0], &embedded, &frozen_m, s, d);
+        let (y, q_mem) = delta_rule_read_only(&params.levels[0], &embedded, &frozen_m, s, d, &crate::feature_map::FeatureMapKind::Identity);
         // y should equal q_mem when M = I
         for i in 0..(s * d) {
             assert!((y[i] - q_mem[i]).abs() < 1e-6, "y[{i}]={} != q_mem[{i}]={}", y[i], q_mem[i]);

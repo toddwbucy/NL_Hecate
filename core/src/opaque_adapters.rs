@@ -1035,8 +1035,9 @@ impl OpaqueVjp for DeltaRule {
         ];
 
         // Save feature map z caches and frozen FM weights before conv caches (if non-Identity).
+        // Gated on fm_kind (not cache emptiness) so ELU — which has empty w_rand — is included.
         // Backward reads: fm_z_k at saved[15], fm_z_q at [16], w_rand at [17], b_rand at [18].
-        if !cache.fm_z_k_mem.is_empty() {
+        if !matches!(self.feature_map, crate::feature_map::FeatureMapKind::Identity) {
             cache_ids.push(tape.alloc(cache.fm_z_k_mem, vec![]));
             cache_ids.push(tape.alloc(cache.fm_z_q_mem, vec![]));
             cache_ids.push(tape.alloc(level_params.w_rand.clone(), vec![]));
@@ -1111,8 +1112,9 @@ impl OpaqueVjp for TitansLMM {
         }
 
         // Save feature map z caches and frozen FM weights before conv caches (if non-Identity).
+        // Gated on fm_kind (not cache emptiness) so ELU — which has empty w_rand — is included.
         // fm_base = 18 (EMA/None) or 19 (DeltaMomentum); layout matches backward adapter.
-        if !cache.fm_z_k_mem.is_empty() {
+        if !matches!(self.feature_map, crate::feature_map::FeatureMapKind::Identity) {
             cache_ids.push(tape.alloc(cache.fm_z_k_mem, vec![]));
             cache_ids.push(tape.alloc(cache.fm_z_q_mem, vec![]));
             cache_ids.push(tape.alloc(level_params.w_rand.clone(), vec![]));
@@ -1746,6 +1748,8 @@ mod tests {
                     "d_embedded[{}]: tape={tv} direct={dv}", i);
             }
             let lp_flat = level_params_grads_to_flat(&param_grads_direct);
+            assert_eq!(d_lp_tape.len(), lp_flat.len(),
+                "d_level_params length mismatch: tape={} direct={}", d_lp_tape.len(), lp_flat.len());
             for (i, (&tv, &dv)) in d_lp_tape.iter().zip(lp_flat.iter()).enumerate() {
                 assert!((tv - dv).abs() < 1e-5,
                     "d_level_params[{}]: tape={tv} direct={dv}", i);

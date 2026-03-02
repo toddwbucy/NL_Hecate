@@ -575,11 +575,11 @@ impl MAGConfig {
     #[getter]
     fn m_norm_max(&self) -> Vec<f32> { self.inner.m_norm_max.clone() }
     #[getter]
-    fn feature_map(&self) -> &str {
+    fn feature_map(&self) -> (String, Option<f64>) {
         match self.inner.feature_map {
-            RustFeatureMapKind::Identity => "identity",
-            RustFeatureMapKind::RandomFourier { .. } => "random_fourier",
-            RustFeatureMapKind::ELU => "elu",
+            RustFeatureMapKind::Identity => ("identity".to_string(), None),
+            RustFeatureMapKind::RandomFourier { sigma } => ("random_fourier".to_string(), Some(sigma as f64)),
+            RustFeatureMapKind::ELU => ("elu".to_string(), None),
         }
     }
 }

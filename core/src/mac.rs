@@ -110,7 +110,7 @@ fn read_only_dispatch(
             "MAC read_only_dispatch reached SwiGluMlp — SwiGluMlp has no M state and must \
              always run the active path. Check that MAC caller forces active=true for SwiGluMlp."
         ),
-        _ => delta_rule_read_only(level_params, embedded, m_state, s, d),
+        _ => delta_rule_read_only(level_params, embedded, m_state, s, d, &cfg.feature_map),
     }
 }
 
@@ -135,7 +135,7 @@ fn read_only_backward_dispatch(
             "MAC read_only_backward_dispatch reached SwiGluMlp — SwiGluMlp has no M state and \
              must always run the active path. Check that MAC caller forces active=true for SwiGluMlp."
         ),
-        _ => delta_rule_read_only_backward(level_params, frozen_m, q_mem, d_y, embedded, s, d),
+        _ => delta_rule_read_only_backward(level_params, frozen_m, q_mem, d_y, embedded, s, d, &cfg.feature_map),
     }
 }
 

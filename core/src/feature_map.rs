@@ -14,7 +14,7 @@
 ///
 /// RandomFourier stability:
 ///   ||phi(k)|| <= sqrt(2) for ALL k (bounded by cos^2 <= 1).
-///   GD stability condition: theta < 1/||phi(k)||^2 <= 1/2 — a global bound.
+///   GD stability condition: theta < 1/||phi(k)||^2 >= 1/2 — a global bound.
 ///   This makes carry-forward safe for slow CMS levels (L2/L3).
 
 use serde::{Serialize, Deserialize};
@@ -122,7 +122,7 @@ pub fn apply(x: &[f32], kind: &FeatureMapKind, w_rand: &[f32], b_rand: &[f32], d
             (phi_x, z)
         }
         FeatureMapKind::ELU => {
-            // phi(k) = elu(k) + 1 = k if k>0, else exp(k)
+            // phi(k) = elu(k) + 1 = k+1 if k>0, else exp(k)
             let phi_x: Vec<f32> = x.iter().map(|&xi| {
                 if xi > 0.0 { xi + 1.0 } else { xi.exp() }
             }).collect();
@@ -195,18 +195,15 @@ pub fn apply_batch(
         }
         _ => {
             let mut phi_mem = vec![0.0f32; seq_len * d];
-            let mut z_mem = if matches!(kind, FeatureMapKind::Identity) {
-                vec![]
-            } else {
-                vec![0.0f32; seq_len * d]
-            };
+            let mut z_mem = vec![0.0f32; seq_len * d];
+            // Preallocate per-token scratch to avoid per-iteration allocation.
+            let mut phi_buf = vec![0.0f32; d];
+            let mut z_buf = vec![0.0f32; d];
             for t in 0..seq_len {
                 let x_t = &x_mem[t * d..(t + 1) * d];
-                let (phi_t, z_t) = apply(x_t, kind, w_rand, b_rand, d);
-                phi_mem[t * d..(t + 1) * d].copy_from_slice(&phi_t);
-                if !z_t.is_empty() {
-                    z_mem[t * d..(t + 1) * d].copy_from_slice(&z_t);
-                }
+                apply_into(x_t, kind, w_rand, b_rand, &mut phi_buf, &mut z_buf, d);
+                phi_mem[t * d..(t + 1) * d].copy_from_slice(&phi_buf);
+                z_mem[t * d..(t + 1) * d].copy_from_slice(&z_buf);
             }
             (phi_mem, z_mem)
         }

@@ -517,7 +517,7 @@ pub fn traced_cms_forward(
                 ),
                 // Delta, Titans, Hebbian, Atlas — all use matrix M: y = M @ q
                 _ => delta_rule_read_only(
-                    &params.levels[level], &embedded, frozen_ref, s, d,
+                    &params.levels[level], &embedded, frozen_ref, s, d, &cfg.feature_map,
                 ),
             };
 

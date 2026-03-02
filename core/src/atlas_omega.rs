@@ -716,7 +716,7 @@ mod tests {
         let d = cfg.swa.d_model;
         let s = cfg.swa.seq_len;
         let frozen_m = vec![0.0f32; d * d];
-        let (y, _q_mem) = delta_rule_read_only(&params.levels[0], &embedded, &frozen_m, s, d);
+        let (y, _q_mem) = delta_rule_read_only(&params.levels[0], &embedded, &frozen_m, s, d, &crate::feature_map::FeatureMapKind::Identity);
         assert!(y.iter().all(|&x| x.abs() < 1e-12));
     }
 
