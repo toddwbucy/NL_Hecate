@@ -31,7 +31,7 @@ cd python && maturin build --release && cd ..
 python scripts/promote_artifacts.py --wheel [--task-key task_87a521]
 
 # Commit the promoted binary:
-git add artifacts/so/ && git commit -m "chore: promote nl_hecate .so <sha>"
+git add artifacts/so/ artifacts/wheels/ && git commit -m "chore: promote nl_hecate .so|.whl <sha>"
 ```
 
 ## Staleness Check

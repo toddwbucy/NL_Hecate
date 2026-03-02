@@ -40,8 +40,11 @@ COMPILED_FROM_SOURCES = [
 
 
 def git_sha() -> str:
+    git = shutil.which("git")
+    if git is None:
+        sys.exit("ERROR: git executable not found on PATH")
     return subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT
+        [git, "rev-parse", "HEAD"], cwd=REPO_ROOT
     ).decode().strip()
 
 
@@ -51,7 +54,7 @@ def find_so(venv: Path) -> Path:
     if not matches:
         sys.exit(f"ERROR: no nl_hecate*.so found under {venv}\n"
                  "       Run `maturin develop --release` first.")
-    return Path(matches[0])
+    return max((Path(m) for m in matches), key=lambda p: p.stat().st_mtime)
 
 
 def find_wheel() -> Path:
@@ -60,7 +63,7 @@ def find_wheel() -> Path:
     if not matches:
         sys.exit("ERROR: no .whl found under python/target/wheels/\n"
                  "       Run `maturin build --release` first.")
-    return max(Path(m) for m in matches)  # newest by name
+    return max((Path(m) for m in matches), key=lambda p: p.stat().st_mtime)
 
 
 def promote_so(venv: Path, sha: str, produced_by_task: str | None) -> dict:
@@ -77,11 +80,11 @@ def promote_so(venv: Path, sha: str, produced_by_task: str | None) -> dict:
         "_key": f"nl-hecate-so-{short}",
         "artifact_type": "pyo3_so",
         "path": str(dest.relative_to(REPO_ROOT)),
-        "git_sha": sha,
+        "build_hash": sha,
         "size_bytes": size,
         "cuda_archs": ["sm_86", "sm_89", "sm_90", "compute_86"],
         "produced_by_task": produced_by_task,
-        "build_date_epoch": int(time.time()),
+        "created_at": f"epoch:{int(time.time())}",
         "notes": "Release build via maturin develop --release; all CUDA kernels embedded",
     }
 
@@ -98,19 +101,21 @@ def promote_wheel(sha: str, produced_by_task: str | None) -> dict:
         "_key": f"nl-hecate-whl-{short}",
         "artifact_type": "wheel",
         "path": str(dest.relative_to(REPO_ROOT)),
-        "git_sha": sha,
+        "build_hash": sha,
         "size_bytes": size,
         "cuda_archs": ["sm_86", "sm_89", "sm_90", "compute_86"],
         "produced_by_task": produced_by_task,
-        "build_date_epoch": int(time.time()),
+        "created_at": f"epoch:{int(time.time())}",
         "notes": "Release wheel via maturin build --release",
     }
 
 
 def write_meta(sha: str, artifact: dict) -> None:
+    # Uses git_sha (not build_hash) — the staleness check in hecate.py reads
+    # meta['git_sha'] to compare against `git rev-parse HEAD`.
     meta = {
         "git_sha": sha,
-        "promoted_at_epoch": artifact["build_date_epoch"],
+        "promoted_at_epoch": int(artifact["created_at"].split(":")[1]),
         "artifact_type": artifact["artifact_type"],
         "path": artifact["path"],
         "size_bytes": artifact["size_bytes"],
@@ -156,6 +161,9 @@ def main() -> None:
     write_meta(sha, artifact)
     edges = build_edges(artifact)
 
+    # Derive extension for commit hint from the promoted artifact path.
+    ext = Path(artifact["path"]).suffix  # .so or .whl
+
     print()
     print("── HADES hecate_artifacts node ─────────────────────────────────")
     print("Insert into NL database:")
@@ -172,9 +180,8 @@ def main() -> None:
     print()
     print("── Next step ───────────────────────────────────────────────────")
     print("Commit the promoted binary:")
-    dest_path = artifact["path"]
-    print(f"  git add {dest_path}")
-    print("  git commit -m \"chore: promote nl_hecate .so " + sha[:8] + "\"")
+    print(f"  git add artifacts/so/ artifacts/wheels/")
+    print(f"  git commit -m \"chore: promote nl_hecate {ext} {sha[:8]}\"")
 
 
 if __name__ == "__main__":

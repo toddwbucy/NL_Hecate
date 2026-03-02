@@ -138,14 +138,19 @@ Every promoted artifact writes one document to `hecate_artifacts`:
   "_key": "nl-hecate-so-<short-sha>",
   "artifact_type": "pyo3_so",
   "path": "artifacts/so/nl_hecate.cpython-312-x86_64-linux-gnu.<sha>.so",
-  "git_sha": "<full 40-char sha>",
+  "build_hash": "<full 40-char git sha>",
   "size_bytes": 4300000,
   "cuda_archs": ["sm_86", "sm_89", "sm_90", "compute_86"],
   "produced_by_task": "persephone_tasks/<task_key>",
-  "build_date_epoch": 1740000000,
+  "created_at": "epoch:1740000000",
   "notes": "Release build, all CUDA kernels embedded"
 }
 ```
+
+Field names `build_hash` and `created_at` match the canonical `hecate_artifacts`
+schema defined in `CLAUDE.md`. `created_at` uses the `"epoch:NNN"` string format.
+The local `.build-meta.json` file uses `git_sha` (not `build_hash`) since that
+is what the staleness check reads.
 
 `artifact_type` values: `pyo3_so`, `wheel`, `cuda_fatbin`.
 
@@ -185,3 +190,31 @@ The script:
 4. Writes `artifacts/.build-meta.json` (gitignored)
 5. Prints the `hecate_artifacts` document JSON and all `hecate_artifact_edges`
    edge JSON for manual HADES insertion
+
+---
+
+## 8. HADES Spec Registration
+
+This spec is registered in the HADES `hecate_specs` collection as a graph node
+and linked to the `hecate_artifacts` collection via `nl_hecate_trace_edges`.
+The registration was inserted once at spec creation time; it does not repeat on
+each promote invocation.
+
+```json
+{
+  "_key": "artifact-layout",
+  "title": "Canonical Artifact Directory Layout",
+  "category": "infrastructure",
+  "version": "0.4.0",
+  "path": "specs/infrastructure/02_artifact_layout.md",
+  "purpose": "Filesystem layout, staleness detection, and HADES provenance schema for compiled artifacts",
+  "paper_source": [],
+  "traced_to_equations": [],
+  "traced_to_axioms": [],
+  "status": "v0.4.0"
+}
+```
+
+No paper equation edges exist for this spec (it is infrastructure, not algorithm).
+The spec node is self-contained; artifact nodes link to source code nodes via
+`hecate_artifact_edges` as described in §6.
