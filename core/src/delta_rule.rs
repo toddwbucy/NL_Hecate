@@ -144,16 +144,28 @@ pub trait MemoryRule: OpaqueVjp {
 pub struct DeltaRule {
     pub bias: crate::model::AttentionalBias,
     pub sign_sharpness: f32,
+    /// Per-level theta floor/ceil (CS-39 training wheels). 0.0/MAX = no clamp.
+    pub theta_floor: f32,
+    pub theta_ceil: f32,
 }
 
 impl DeltaRule {
     /// L2 bias (backward compatible default).
     pub fn l2() -> Self {
-        DeltaRule { bias: crate::model::AttentionalBias::L2, sign_sharpness: 10.0 }
+        DeltaRule { bias: crate::model::AttentionalBias::L2, sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: f32::MAX }
     }
-    /// Construct from MAGConfig fields.
+    /// Construct from MAGConfig fields for a specific CMS level (CS-39 clamp per level).
+    pub fn from_cfg_level(cfg: &crate::model::MAGConfig, level: usize) -> Self {
+        DeltaRule {
+            bias: cfg.attentional_bias,
+            sign_sharpness: cfg.sign_sharpness,
+            theta_floor: cfg.theta_floor.get(level).copied().unwrap_or(0.0),
+            theta_ceil: cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX),
+        }
+    }
+    /// Construct from MAGConfig fields (level 0 — backward compatible).
     pub fn from_cfg(cfg: &crate::model::MAGConfig) -> Self {
-        DeltaRule { bias: cfg.attentional_bias, sign_sharpness: cfg.sign_sharpness }
+        Self::from_cfg_level(cfg, 0)
     }
 }
 
@@ -312,7 +324,7 @@ impl MemoryRule for DeltaRule {
                 theta_pre_t += concat_t[i] * level_params.w_theta[i];
             }
             theta_pre[t] = theta_pre_t;
-            theta[t] = softplus_f32(theta_pre_t);
+            theta[t] = softplus_f32(theta_pre_t).clamp(self.theta_floor, self.theta_ceil);
 
             // prediction error via DGD primitive: e = M_t @ k_t - v_t
             let m_t = &m_states[t * d * d..(t + 1) * d * d];
@@ -474,9 +486,12 @@ impl MemoryRule for DeltaRule {
             let sig_deriv = alpha_t * (1.0 - alpha_t);
             let d_alpha_pre = d_alpha_scalar * sig_deriv;
 
-            // ── Gate backward: theta_t = softplus(theta_pre_t) ──
+            // ── Gate backward: theta_t = softplus(theta_pre_t).clamp(floor, ceil) (CS-39) ──
+            // Straight-through: zero gradient when clamp is active (theta at boundary).
+            let theta_raw = cache.theta[t];
+            let clamp_mask = if theta_raw <= self.theta_floor || theta_raw >= self.theta_ceil { 0.0 } else { 1.0 };
             let softplus_deriv = sigmoid_f32(theta_pre_t);
-            let d_theta_pre = d_theta_scalar * softplus_deriv;
+            let d_theta_pre = d_theta_scalar * softplus_deriv * clamp_mask;
 
             // ── w_alpha, b_alpha gradient ──
             for i in 0..(2 * d) {
@@ -858,7 +873,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = DeltaRule { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0 };
+        let rule = DeltaRule { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: f32::MAX };
         let (y, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for (i, &v) in y.iter().enumerate() {
             assert!(v.is_finite(), "L1 y[{i}] not finite: {v}");
@@ -870,7 +885,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = DeltaRule { bias: crate::model::AttentionalBias::Lp(3.0), sign_sharpness: 10.0 };
+        let rule = DeltaRule { bias: crate::model::AttentionalBias::Lp(3.0), sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: f32::MAX };
         let (y, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for (i, &v) in y.iter().enumerate() {
             assert!(v.is_finite(), "Lp(3) y[{i}] not finite: {v}");
@@ -882,7 +897,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = DeltaRule { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0 };
+        let rule = DeltaRule { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: f32::MAX };
         let (y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let d_y = vec![1.0f32; y.len()];
         let (grads, d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
@@ -902,7 +917,7 @@ mod tests {
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
         let (y_l2, _) = DeltaRule::l2().step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
-        let rule_lp2 = DeltaRule { bias: crate::model::AttentionalBias::Lp(2.0), sign_sharpness: 10.0 };
+        let rule_lp2 = DeltaRule { bias: crate::model::AttentionalBias::Lp(2.0), sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: f32::MAX };
         let (y_lp2, _) = rule_lp2.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         // Forward outputs should differ (biased grad → different M updates)
         let max_diff: f32 = y_l2.iter().zip(y_lp2.iter())
@@ -922,7 +937,7 @@ mod tests {
         let mut embedded = vec![0.0f32; seq_len * d];
         SimpleRng::new(99).fill_uniform(&mut embedded, 0.5);
 
-        let rule = DeltaRule { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0 };
+        let rule = DeltaRule { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: f32::MAX };
         let (_, cache) = rule.step(&params, &embedded, seq_len, d, None);
         let d_y = vec![1.0f32; seq_len * d];
         let (pg_direct, de_direct) = rule.step_backward(&params, &cache, &d_y, &embedded);
@@ -942,5 +957,55 @@ mod tests {
                 assert!((t - d).abs() < 1e-5, "L1 tape d_lp[{i}]: tape={t} direct={d}");
             }
         });
+    }
+
+    // ── CS-39 clamp_theta tests ───────────────────────────────────────
+
+    #[test]
+    fn test_delta_clamp_theta_ceil_applies() {
+        // With theta_ceil=0.01 (very tight), theta output must be ≤ 0.01
+        let cfg = test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let rule = DeltaRule { bias: crate::model::AttentionalBias::L2, sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: 0.01 };
+        let (_, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
+        for (t, &th) in cache.theta.iter().enumerate() {
+            assert!(th <= 0.01 + 1e-6, "theta[{t}]={th} exceeds ceil=0.01");
+        }
+    }
+
+    #[test]
+    fn test_delta_clamp_theta_backward_zeromask_at_ceil() {
+        // When theta is clamped to ceil, the backward gradient for theta_pre should be zero.
+        let cfg = test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        // Ceiling of 0.0 forces all theta to 0.0, ensuring clamping for any positive softplus output.
+        // Use floor=MAX to force clamping at floor (theta = 0.0 floor, which is at boundary):
+        // Instead, set ceil extremely small so every token hits the ceil.
+        let rule = DeltaRule { bias: crate::model::AttentionalBias::L2, sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: 1e-10 };
+        let (_, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
+        let d_y = vec![1.0f32; cfg.swa.seq_len * cfg.swa.d_model];
+        let (grads, _) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
+        // All theta are clamped to ceil, so clamp_mask=0 for all t → b_theta and w_theta gradients must be 0
+        assert!(grads.b_theta[0].abs() < 1e-10, "b_theta grad should be 0 when all theta clamped: {}", grads.b_theta[0]);
+        for (i, &g) in grads.w_theta.iter().enumerate() {
+            assert!(g.abs() < 1e-10, "w_theta[{i}] grad should be 0 when all theta clamped: {g}");
+        }
+    }
+
+    #[test]
+    fn test_delta_clamp_theta_noop_when_unclamped() {
+        // With floor=0/ceil=MAX (no clamp), results should match an unclamp-aware rule.
+        let cfg = test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let rule_no_clamp = DeltaRule::l2();
+        let rule_with_noop = DeltaRule { bias: crate::model::AttentionalBias::L2, sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: f32::MAX };
+        let (y1, _) = rule_no_clamp.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
+        let (y2, _) = rule_with_noop.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
+        for (i, (&a, &b)) in y1.iter().zip(y2.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-7, "no-clamp outputs differ at [{i}]: {a} vs {b}");
+        }
     }
 }

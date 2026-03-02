@@ -142,6 +142,7 @@ fn read_only_backward_dispatch(
 /// Memory step dispatch. Returns (y, MemoryCache).
 fn step_dispatch(
     cfg: &MAGConfig,
+    level: usize,
     level_params: &MemoryLevelParams,
     input: &[f32],
     s: usize,
@@ -150,11 +151,11 @@ fn step_dispatch(
 ) -> (Vec<f32>, MemoryCache) {
     match cfg.memory_rule {
         MemoryRuleKind::DeltaRule => {
-            let (y, c) = DeltaRule::from_cfg(cfg).step(level_params, input, s, d, initial_m);
+            let (y, c) = DeltaRule::from_cfg_level(cfg, level).step(level_params, input, s, d, initial_m);
             (y, MemoryCache::Delta(c))
         }
         MemoryRuleKind::TitansLMM => {
-            let (y, c) = TitansLMM::from_cfg(cfg).step(level_params, input, s, d, initial_m);
+            let (y, c) = TitansLMM::from_cfg_level(cfg, level).step(level_params, input, s, d, initial_m);
             (y, MemoryCache::Titans(c))
         }
         MemoryRuleKind::HebbianRule => {
@@ -162,7 +163,7 @@ fn step_dispatch(
             (y, MemoryCache::Hebbian(c))
         }
         MemoryRuleKind::Moneta => {
-            let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2, sign_sharpness: cfg.sign_sharpness, lq_q: cfg.lq_q };
+            let rule = Moneta::from_cfg_level(cfg, level);
             let (y, c) = rule.step(level_params, input, s, d, initial_m);
             (y, MemoryCache::Moneta(c))
         }
@@ -182,7 +183,7 @@ fn step_dispatch(
             (y, MemoryCache::Lattice(c))
         }
         MemoryRuleKind::Trellis => {
-            let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
+            let rule = Trellis::from_cfg_level(cfg, level);
             let (y, c) = rule.step(level_params, input, s, d, initial_m);
             (y, MemoryCache::Trellis(c))
         }
@@ -200,17 +201,18 @@ fn step_dispatch(
 /// Memory step_backward dispatch. Returns (level grads, d_input).
 fn step_backward_dispatch(
     cfg: &MAGConfig,
+    level: usize,
     level_params: &MemoryLevelParams,
     cache: &MemoryCache,
     d_y: &[f32],
     input: &[f32],
 ) -> (MemoryLevelParams, Vec<f32>) {
     match cache {
-        MemoryCache::Delta(c) => DeltaRule::from_cfg(cfg).step_backward(level_params, c, d_y, input),
-        MemoryCache::Titans(c) => TitansLMM::from_cfg(cfg).step_backward(level_params, c, d_y, input),
+        MemoryCache::Delta(c) => DeltaRule::from_cfg_level(cfg, level).step_backward(level_params, c, d_y, input),
+        MemoryCache::Titans(c) => TitansLMM::from_cfg_level(cfg, level).step_backward(level_params, c, d_y, input),
         MemoryCache::Hebbian(c) => HebbianRule.step_backward(level_params, c, d_y, input),
         MemoryCache::Moneta(c) => {
-            let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2, sign_sharpness: cfg.sign_sharpness, lq_q: cfg.lq_q };
+            let rule = Moneta::from_cfg_level(cfg, level);
             rule.step_backward(level_params, c, d_y, input)
         }
         MemoryCache::YAAD(c) => {
@@ -226,7 +228,7 @@ fn step_backward_dispatch(
             rule.step_backward(level_params, c, d_y, input)
         }
         MemoryCache::Trellis(c) => {
-            let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
+            let rule = Trellis::from_cfg_level(cfg, level);
             rule.step_backward(level_params, c, d_y, input)
         }
         MemoryCache::Atlas(c) => AtlasOmega.step_backward(level_params, c, d_y, input),
@@ -322,7 +324,7 @@ pub fn mac_forward(
 
     // Stage 7: Memory step on y_t → reflective_y (updates M)
     let (reflective_y, memory_cache) = step_dispatch(
-        cfg, &params.levels[0], &y_t, s, d, None,
+        cfg, 0, &params.levels[0], &y_t, s, d, None,
     );
 
     // Stage 8: Reflective gate — output = y_t * sigmoid(reflective_y)
@@ -445,7 +447,7 @@ pub fn mac_backward(
 
     // ── Stage 7: Memory step backward (on y_t) ──────────────────────
     let (mem_grads_step, d_y_t_mem) = step_backward_dispatch(
-        cfg, &params.levels[0], &cache.memory_cache, &d_reflective_y, &cache.y_t,
+        cfg, 0, &params.levels[0], &cache.memory_cache, &d_reflective_y, &cache.y_t,
     );
 
     // Combine d_y_t from gate and memory
@@ -671,7 +673,7 @@ pub fn cms_mac_forward(
         if pulse.active_levels[level] {
             let initial_m = Some(std::mem::take(&mut context.memory[level]));
             let (refl_y, mem_cache) = step_dispatch(
-                cfg, &params.levels[level], &y_t, s, d, initial_m,
+                cfg, level, &params.levels[level], &y_t, s, d, initial_m,
             );
             persist_mac_memory(cfg, &mem_cache, s, d, &mut context.memory[level]);
             reflective_per_level.push(Some(refl_y));
@@ -824,7 +826,7 @@ pub fn cms_mac_backward(
             let d_refl_level: Vec<f32> = d_reflective_y_combined.iter()
                 .map(|&dy| dy * w_refl[level]).collect();
             let (mem_grads, d_y_t_mem) = step_backward_dispatch(
-                cfg, &params.levels[level], step_cache, &d_refl_level, &cache.y_t,
+                cfg, level, &params.levels[level], step_cache, &d_refl_level, &cache.y_t,
             );
             grads.levels[level].accumulate(&mem_grads);
             for i in 0..(s * d) {

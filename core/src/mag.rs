@@ -129,7 +129,7 @@ pub fn mag_forward(
             (y, MemoryCache::Hebbian(cache))
         }
         MemoryRuleKind::Moneta => {
-            let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2, sign_sharpness: cfg.sign_sharpness, lq_q: cfg.lq_q };
+            let rule = Moneta::from_cfg(cfg);
             let (y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
             (y, MemoryCache::Moneta(cache))
         }
@@ -149,7 +149,7 @@ pub fn mag_forward(
             (y, MemoryCache::Lattice(cache))
         }
         MemoryRuleKind::Trellis => {
-            let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
+            let rule = Trellis::from_cfg(cfg);
             let (y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
             (y, MemoryCache::Trellis(cache))
         }
@@ -280,7 +280,7 @@ pub fn mag_backward(
             HebbianRule.step_backward(&params.levels[0], hebbian_cache, &d_y, &cache.embedded)
         }
         MemoryCache::Moneta(moneta_cache) => {
-            let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2, sign_sharpness: cfg.sign_sharpness, lq_q: cfg.lq_q };
+            let rule = Moneta::from_cfg(cfg);
             rule.step_backward(&params.levels[0], moneta_cache, &d_y, &cache.embedded)
         }
         MemoryCache::YAAD(yaad_cache) => {
@@ -296,7 +296,7 @@ pub fn mag_backward(
             rule.step_backward(&params.levels[0], lattice_cache, &d_y, &cache.embedded)
         }
         MemoryCache::Trellis(trellis_cache) => {
-            let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
+            let rule = Trellis::from_cfg(cfg);
             rule.step_backward(&params.levels[0], trellis_cache, &d_y, &cache.embedded)
         }
         MemoryCache::Atlas(atlas_cache) => {
@@ -637,7 +637,7 @@ fn run_level_memory(
         let initial_m = Some(std::mem::take(&mut context.memory[level]));
         let (y_level, mem_cache) = match cfg.memory_rule {
             MemoryRuleKind::DeltaRule => {
-                let (y, cache) = DeltaRule::from_cfg(cfg).step(&params.levels[level], input, s, d, initial_m);
+                let (y, cache) = DeltaRule::from_cfg_level(cfg, level).step(&params.levels[level], input, s, d, initial_m);
                 let m_final_start = s * d * d;
                 context.memory[level] = cache.m_states[m_final_start..m_final_start + d * d].to_vec();
                 (y, MemoryCache::Delta(cache))
@@ -655,7 +655,7 @@ fn run_level_memory(
                 (y, MemoryCache::Hebbian(cache))
             }
             MemoryRuleKind::Moneta => {
-                let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2, sign_sharpness: cfg.sign_sharpness, lq_q: cfg.lq_q };
+                let rule = Moneta::from_cfg_level(cfg, level);
                 let (y, cache) = rule.step(&params.levels[level], input, s, d, initial_m);
                 let dh = cfg.d_hidden;
                 let w1_size = dh * d;
@@ -705,7 +705,7 @@ fn run_level_memory(
                 (y, MemoryCache::Lattice(cache))
             }
             MemoryRuleKind::Trellis => {
-                let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
+                let rule = Trellis::from_cfg_level(cfg, level);
                 let (y, cache) = rule.step(&params.levels[level], input, s, d, initial_m);
                 let d_k = cfg.d_compress;
                 let sk_size = d_k * d;
@@ -1074,7 +1074,7 @@ pub fn cms_backward(
             let mem_cache = cache.memory_caches[level].as_ref().unwrap();
             let (mem_grads, d_embedded_mem) = match mem_cache {
                 MemoryCache::Delta(delta_cache) => {
-                    DeltaRule::from_cfg(cfg).step_backward(&params.levels[level], delta_cache, &d_y_combined, &cache.embedded)
+                    DeltaRule::from_cfg_level(cfg, level).step_backward(&params.levels[level], delta_cache, &d_y_combined, &cache.embedded)
                 }
                 MemoryCache::Titans(titans_cache) => {
                     TitansLMM::from_cfg_level(cfg, level).step_backward(&params.levels[level], titans_cache, &d_y_combined, &cache.embedded)
@@ -1083,8 +1083,7 @@ pub fn cms_backward(
                     HebbianRule.step_backward(&params.levels[level], hebbian_cache, &d_y_combined, &cache.embedded)
                 }
                 MemoryCache::Moneta(moneta_cache) => {
-                    let rule = Moneta { d_hidden: cfg.d_hidden, lp_p: cfg.lp_p, lambda_2: cfg.lambda_2, sign_sharpness: cfg.sign_sharpness, lq_q: cfg.lq_q };
-                    rule.step_backward(&params.levels[level], moneta_cache, &d_y_combined, &cache.embedded)
+                    Moneta::from_cfg_level(cfg, level).step_backward(&params.levels[level], moneta_cache, &d_y_combined, &cache.embedded)
                 }
                 MemoryCache::YAAD(yaad_cache) => {
                     let rule = YAAD { d_hidden: cfg.d_hidden, delta: cfg.delta, lambda_local: cfg.lambda_local, lambda_2: cfg.lambda_2 };
@@ -1099,8 +1098,7 @@ pub fn cms_backward(
                     rule.step_backward(&params.levels[level], lattice_cache, &d_y_combined, &cache.embedded)
                 }
                 MemoryCache::Trellis(trellis_cache) => {
-                    let rule = Trellis { d_k: cfg.d_compress, lambda_k: cfg.lambda_k, lambda_v: cfg.lambda_v };
-                    rule.step_backward(&params.levels[level], trellis_cache, &d_y_combined, &cache.embedded)
+                    Trellis::from_cfg_level(cfg, level).step_backward(&params.levels[level], trellis_cache, &d_y_combined, &cache.embedded)
                 }
                 MemoryCache::Atlas(atlas_cache) => {
                     AtlasOmega.step_backward(&params.levels[level], atlas_cache, &d_y_combined, &cache.embedded)

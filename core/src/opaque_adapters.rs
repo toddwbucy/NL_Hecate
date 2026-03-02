@@ -293,7 +293,9 @@ pub fn delta_rule_opaque_backward(
         k_conv_cache, q_conv_cache,
     };
 
-    let rule = DeltaRule { bias, sign_sharpness };
+    let theta_floor = if saved[0].len() > 5 { saved[0][4] } else { 0.0 };
+    let theta_ceil = if saved[0].len() > 6 { saved[0][5] } else { f32::MAX };
+    let rule = DeltaRule { bias, sign_sharpness, theta_floor, theta_ceil };
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
     d_inputs[0] = d_embedded;
@@ -368,12 +370,14 @@ pub fn titans_lmm_opaque_backward(
         q_conv_cache: q_conv_cache_restored,
     };
 
+    let theta_floor = if saved[0].len() > 6 { saved[0][5] } else { 0.0 };
+    let theta_ceil = if saved[0].len() > 7 { saved[0][6] } else { f32::MAX };
     let rule = TitansLMM {
         bias, sign_sharpness,
         momentum_kind,
         momentum_d_hidden: 0,
-        theta_floor: 0.0,
-        theta_ceil: f32::MAX,
+        theta_floor,
+        theta_ceil,
         m_norm_max: f32::MAX,
     };
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
@@ -475,7 +479,9 @@ pub fn moneta_opaque_backward(
         q_conv_cache: q_conv_cache_restored,
     };
 
-    let rule = Moneta { d_hidden, lp_p, lambda_2, sign_sharpness, lq_q };
+    let theta_floor = if saved[0].len() > 8 { saved[0][7] } else { 0.0 };
+    let theta_ceil = if saved[0].len() > 9 { saved[0][8] } else { f32::MAX };
+    let rule = Moneta { d_hidden, lp_p, lambda_2, sign_sharpness, lq_q, theta_floor, theta_ceil };
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
     d_inputs[0] = d_embedded;
@@ -681,7 +687,9 @@ pub fn trellis_opaque_backward(
         q_conv_cache: q_conv_cache_restored,
     };
 
-    let rule = Trellis { d_k, lambda_k, lambda_v };
+    let theta_floor = if saved[0].len() > 6 { saved[0][5] } else { 0.0 };
+    let theta_ceil = if saved[0].len() > 7 { saved[0][6] } else { f32::MAX };
+    let rule = Trellis { d_k, lambda_k, lambda_v, theta_floor, theta_ceil };
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
     d_inputs[0] = d_embedded;
@@ -890,7 +898,7 @@ impl OpaqueVjp for DeltaRule {
         &self, tape: &mut Tape, level_params: &MemoryLevelParams,
         embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
     ) -> (Vec<f32>, BufId, BufId, BufId) {
-        let extra_meta = [crate::moneta::bias_to_f32(self.bias), self.sign_sharpness];
+        let extra_meta = [crate::moneta::bias_to_f32(self.bias), self.sign_sharpness, self.theta_floor, self.theta_ceil];
         let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
             record_common_inputs(tape, level_params, embedded, seq_len, d, &extra_meta);
 
@@ -938,7 +946,7 @@ impl OpaqueVjp for TitansLMM {
             crate::model::MomentumKind::DeltaMomentum => 2.0,
             crate::model::MomentumKind::DeepMomentum => 3.0,
         };
-        let extra_meta = [crate::moneta::bias_to_f32(self.bias), self.sign_sharpness, mk_f32];
+        let extra_meta = [crate::moneta::bias_to_f32(self.bias), self.sign_sharpness, mk_f32, self.theta_floor, self.theta_ceil];
         let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
             record_common_inputs(tape, level_params, embedded, seq_len, d, &extra_meta);
 
@@ -1026,7 +1034,7 @@ impl OpaqueVjp for Moneta {
         &self, tape: &mut Tape, level_params: &MemoryLevelParams,
         embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
     ) -> (Vec<f32>, BufId, BufId, BufId) {
-        let extra_meta = [self.d_hidden as f32, self.lp_p, self.lambda_2, self.sign_sharpness, self.lq_q];
+        let extra_meta = [self.d_hidden as f32, self.lp_p, self.lambda_2, self.sign_sharpness, self.lq_q, self.theta_floor, self.theta_ceil];
         let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
             record_common_inputs(tape, level_params, embedded, seq_len, d, &extra_meta);
 
@@ -1212,7 +1220,7 @@ impl OpaqueVjp for Trellis {
         &self, tape: &mut Tape, level_params: &MemoryLevelParams,
         embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
     ) -> (Vec<f32>, BufId, BufId, BufId) {
-        let extra_meta = [self.d_k as f32, self.lambda_k, self.lambda_v];
+        let extra_meta = [self.d_k as f32, self.lambda_k, self.lambda_v, self.theta_floor, self.theta_ceil];
         let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
             record_common_inputs(tape, level_params, embedded, seq_len, d, &extra_meta);
 
@@ -1600,7 +1608,7 @@ mod tests {
 
     #[test]
     fn test_opaque_vjp_moneta() {
-        assert_opaque_roundtrip(&Moneta { d_hidden: 8, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0, lq_q: 2.0 }, 4, 3);
+        assert_opaque_roundtrip(&Moneta { d_hidden: 8, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0, lq_q: 2.0, theta_floor: 0.0, theta_ceil: f32::MAX }, 4, 3);
     }
 
     #[test]
@@ -1620,7 +1628,7 @@ mod tests {
 
     #[test]
     fn test_opaque_vjp_trellis() {
-        assert_opaque_roundtrip(&Trellis { d_k: 3, lambda_k: 0.01, lambda_v: 0.01 }, 4, 3);
+        assert_opaque_roundtrip(&Trellis { d_k: 3, lambda_k: 0.01, lambda_v: 0.01, theta_floor: 0.0, theta_ceil: f32::MAX }, 4, 3);
     }
 
     #[test]
@@ -1633,11 +1641,11 @@ mod tests {
         assert_eq!(DeltaRule::l2().opaque_key(), OpaqueKey::DeltaRule);
         assert_eq!(TitansLMM::l2().opaque_key(), OpaqueKey::TitansLMM);
         assert_eq!(HebbianRule.opaque_key(), OpaqueKey::HebbianRule);
-        assert_eq!((Moneta { d_hidden: 8, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0, lq_q: 2.0 }).opaque_key(), OpaqueKey::Moneta);
+        assert_eq!((Moneta { d_hidden: 8, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0, lq_q: 2.0, theta_floor: 0.0, theta_ceil: f32::MAX }).opaque_key(), OpaqueKey::Moneta);
         assert_eq!((YAAD { d_hidden: 8, delta: 0.9, lambda_local: 0.1, lambda_2: 0.01 }).opaque_key(), OpaqueKey::YAAD);
         assert_eq!((MEMORA { d_hidden: 8 }).opaque_key(), OpaqueKey::MEMORA);
         assert_eq!((LatticeOSR { m_slots: 3, variant: crate::model::LatticeVariant::Decode }).opaque_key(), OpaqueKey::LatticeOSR);
-        assert_eq!((Trellis { d_k: 3, lambda_k: 0.01, lambda_v: 0.01 }).opaque_key(), OpaqueKey::Trellis);
+        assert_eq!((Trellis { d_k: 3, lambda_k: 0.01, lambda_v: 0.01, theta_floor: 0.0, theta_ceil: f32::MAX }).opaque_key(), OpaqueKey::Trellis);
         assert_eq!(AtlasOmega.opaque_key(), OpaqueKey::AtlasOmega);
     }
 
@@ -1729,7 +1737,7 @@ mod tests {
     #[test]
     fn test_class1_hebbian() { assert_class1_isolation(&HebbianRule, 4, 3); }
     #[test]
-    fn test_class1_moneta() { assert_class1_isolation(&Moneta { d_hidden: 8, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0, lq_q: 2.0 }, 4, 3); }
+    fn test_class1_moneta() { assert_class1_isolation(&Moneta { d_hidden: 8, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0, lq_q: 2.0, theta_floor: 0.0, theta_ceil: f32::MAX }, 4, 3); }
     #[test]
     fn test_class1_yaad() { assert_class1_isolation(&YAAD { d_hidden: 8, delta: 0.9, lambda_local: 0.1, lambda_2: 0.01 }, 4, 3); }
     #[test]
@@ -1737,7 +1745,7 @@ mod tests {
     #[test]
     fn test_class1_lattice_osr() { assert_class1_isolation(&LatticeOSR { m_slots: 3, variant: crate::model::LatticeVariant::Decode }, 4, 3); }
     #[test]
-    fn test_class1_trellis() { assert_class1_isolation(&Trellis { d_k: 3, lambda_k: 0.01, lambda_v: 0.01 }, 4, 3); }
+    fn test_class1_trellis() { assert_class1_isolation(&Trellis { d_k: 3, lambda_k: 0.01, lambda_v: 0.01, theta_floor: 0.0, theta_ceil: f32::MAX }, 4, 3); }
     #[test]
     fn test_class1_atlas_omega() { assert_class1_isolation(&AtlasOmega, 4, 3); }
 
