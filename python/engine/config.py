@@ -92,7 +92,7 @@ class BuildConfig:
     # gate_warmup_l2_threshold / l3_threshold: falsification pass thresholds
     gate_warmup_theta_floor_init: list[float] | None = None
     gate_warmup_decay_steps: int = 0
-    gate_warmup_falsification_step: int = 0
+    gate_warmup_falsification_step: int = 20000
     gate_warmup_l2_threshold: float = 0.005
     gate_warmup_l3_threshold: float = 0.001
 

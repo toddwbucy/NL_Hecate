@@ -642,6 +642,12 @@ def run_build(bcfg: BuildConfig):
                 jsonl.log(event="gate_warmup_falsification", step=step,
                           l2_theta=round(l2_theta, 6), l3_theta=round(l3_theta, 6),
                           l2_pass=l2_pass, l3_pass=l3_pass, verdict=verdict)
+            if verdict != "GO":
+                raise RuntimeError(
+                    f"Gate warmup falsification FAILED at step {step}: "
+                    f"L2 θ={l2_theta:.5f} ({'PASS' if l2_pass else 'FAIL'}), "
+                    f"L3 θ={l3_theta:.5f} ({'PASS' if l3_pass else 'FAIL'}). "
+                    f"Pod run blocked. See specs/infrastructure/09_gate_warmup.md §5.")
 
         if (jsonl and bcfg.k >= 4 and step > 0 and step % 1000 == 0):
             l3_fires_delta = level3_total_fires - level3_prev_fires
