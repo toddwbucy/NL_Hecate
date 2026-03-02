@@ -79,7 +79,7 @@ fn test_forward_parity(rule: MemoryRuleKind) {
 
     // GPU-resident
     let gpu_params = GpuMAGParams::from_host(&params);
-    let mut ctx_gpu = GpuContextState::new(cfg.k, cfg.swa.d_model, 1);
+    let mut ctx_gpu = GpuContextState::new(cfg.k, cfg.swa.d_model, 1, None, 0);
     let (loss_gpu, _) = gpu_cms_forward(&gpu_params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx_gpu);
 
     let diff = (loss_cpu - loss_gpu).abs();
@@ -117,7 +117,7 @@ fn test_gpu_multistep_loss_decrease() {
     let pulse = single_level_pulse();
 
     let mut gpu_params = GpuMAGParams::from_host(&params);
-    let mut ctx = GpuContextState::new(cfg.k, cfg.swa.d_model, 1);
+    let mut ctx = GpuContextState::new(cfg.k, cfg.swa.d_model, 1, None, 0);
 
     let mut losses = Vec::new();
     for _step in 0..5 {
@@ -149,7 +149,7 @@ fn test_gpu_k2_forward() {
     let pulse = Pulse { global_step: 0, active_levels: vec![true, true] };
 
     let gpu_params = GpuMAGParams::from_host(&params);
-    let mut ctx = GpuContextState::new(cfg.k, cfg.swa.d_model, 1);
+    let mut ctx = GpuContextState::new(cfg.k, cfg.swa.d_model, 1, None, 0);
     let (loss, _) = gpu_cms_forward(&gpu_params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx);
 
     assert!(loss.is_finite(), "k=2 GPU forward loss is not finite: {loss}");
@@ -166,13 +166,13 @@ fn test_gpu_checkpoint_roundtrip() {
     let pulse = single_level_pulse();
 
     let gpu_params = GpuMAGParams::from_host(&params);
-    let mut ctx = GpuContextState::new(cfg.k, cfg.swa.d_model, 1);
+    let mut ctx = GpuContextState::new(cfg.k, cfg.swa.d_model, 1, None, 0);
     let (loss1, _) = gpu_cms_forward(&gpu_params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx);
 
     // Roundtrip: GPU → host → GPU
     let host_params = gpu_params.to_host(&cfg);
     let gpu_params2 = GpuMAGParams::from_host(&host_params);
-    let mut ctx2 = GpuContextState::new(cfg.k, cfg.swa.d_model, 1);
+    let mut ctx2 = GpuContextState::new(cfg.k, cfg.swa.d_model, 1, None, 0);
     let (loss2, _) = gpu_cms_forward(&gpu_params2, &cfg, &input_ids, &target_ids, &pulse, &mut ctx2);
 
     let diff = (loss1 - loss2).abs();

@@ -1546,12 +1546,16 @@ impl GpuModel {
     /// All parameters are uploaded to GPU once. batch_size determines how many
     /// independent M-state slots are allocated in GpuContextState.
     #[new]
-    #[pyo3(signature = (cfg, seed, batch_size=1, memory_reset=false))]
-    fn new(cfg: &MAGConfig, seed: u64, batch_size: usize, memory_reset: bool) -> PyResult<Self> {
+    #[pyo3(signature = (cfg, seed, batch_size=1, memory_reset=false, cuda_graph_warmup=0))]
+    fn new(
+        cfg: &MAGConfig, seed: u64, batch_size: usize,
+        memory_reset: bool, cuda_graph_warmup: usize,
+    ) -> PyResult<Self> {
         let host_params = nl_hecate_core::model::MAGParams::init(&cfg.inner, seed);
         let gpu_params = nl_hecate_core::gpu_params::GpuMAGParams::from_host(&host_params);
         let gpu_context = nl_hecate_core::gpu_params::GpuContextState::new(
             cfg.inner.k, cfg.inner.swa.d_model, batch_size,
+            Some(&cfg.inner), cuda_graph_warmup,
         );
         Ok(GpuModel {
             params: gpu_params,
@@ -1567,12 +1571,17 @@ impl GpuModel {
 
     /// Create from existing host params (e.g., loaded from checkpoint).
     /// batch_size controls how many M-state slots are allocated for batched training.
+    /// cuda_graph_warmup: steps before graph capture (0 = disabled, 100 = recommended for training).
     #[staticmethod]
-    #[pyo3(signature = (params, cfg, batch_size=1, memory_reset=false))]
-    fn from_params(params: &MAGParams, cfg: &MAGConfig, batch_size: usize, memory_reset: bool) -> PyResult<Self> {
+    #[pyo3(signature = (params, cfg, batch_size=1, memory_reset=false, cuda_graph_warmup=0))]
+    fn from_params(
+        params: &MAGParams, cfg: &MAGConfig,
+        batch_size: usize, memory_reset: bool, cuda_graph_warmup: usize,
+    ) -> PyResult<Self> {
         let gpu_params = nl_hecate_core::gpu_params::GpuMAGParams::from_host(&params.inner);
         let gpu_context = nl_hecate_core::gpu_params::GpuContextState::new(
             cfg.inner.k, cfg.inner.swa.d_model, batch_size,
+            Some(&cfg.inner), cuda_graph_warmup,
         );
         Ok(GpuModel {
             params: gpu_params,

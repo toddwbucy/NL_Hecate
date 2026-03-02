@@ -60,10 +60,15 @@ impl GpuElement for u16 {
 ///
 /// Allocated via cudaMalloc, freed via cudaFree on drop.
 /// NOT Send/Sync — GPU pointers are bound to the CUDA context of the allocating thread.
+///
+/// When `owned = false` (constructed via `from_raw_non_owning`), Drop is a no-op —
+/// the memory is owned by the caller (e.g., a `GpuLevelScratch` in GpuContextState).
+/// This enables zero-copy non-owning cache entries for CUDA graph replay paths.
 #[cfg(feature = "cuda")]
 pub struct GpuBuf<T: GpuElement> {
     ptr: *mut T,
     len: usize,
+    owned: bool,
     _not_send_sync: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
@@ -76,7 +81,25 @@ impl<T: GpuElement> GpuBuf<T> {
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         let rc = unsafe { cudaMalloc(&mut ptr, bytes) };
         assert_eq!(rc, 0, "cudaMalloc failed: error code {rc} (requested {bytes} bytes)");
-        GpuBuf { ptr: ptr as *mut T, len, _not_send_sync: std::marker::PhantomData }
+        GpuBuf { ptr: ptr as *mut T, len, owned: true, _not_send_sync: std::marker::PhantomData }
+    }
+
+    /// Create a non-owning view into device memory owned by another buffer.
+    ///
+    /// Drop is a no-op — the caller is responsible for ensuring the pointed-to memory
+    /// outlives this `GpuBuf`. Intended for CUDA graph replay paths where scratch
+    /// buffers (owned by `GpuLevelScratch` in `GpuContextState`) are exposed as cache
+    /// entries without additional allocations. The scratch outlives the forward cache
+    /// because backward is called before the next forward (which would overwrite scratch).
+    ///
+    /// # Safety
+    /// `ptr` must be a valid CUDA device pointer of `len` elements of type `T`.
+    /// The pointed-to allocation must remain valid for the lifetime of this `GpuBuf`.
+    #[cfg(feature = "cuda")]
+    pub unsafe fn from_raw_non_owning(ptr: *mut T, len: usize) -> Self {
+        assert!(!ptr.is_null(), "from_raw_non_owning: null pointer");
+        assert!(len > 0, "from_raw_non_owning: len must be > 0");
+        GpuBuf { ptr, len, owned: false, _not_send_sync: std::marker::PhantomData }
     }
 
     /// Allocate and zero-initialize `len` elements.
@@ -181,8 +204,11 @@ impl<T: GpuElement> GpuBuf<T> {
 #[cfg(feature = "cuda")]
 impl<T: GpuElement> Drop for GpuBuf<T> {
     fn drop(&mut self) {
-        let rc = unsafe { cudaFree(self.ptr as *mut std::ffi::c_void) };
-        debug_assert_eq!(rc, 0, "cudaFree failed: error code {rc}");
+        if self.owned {
+            let rc = unsafe { cudaFree(self.ptr as *mut std::ffi::c_void) };
+            debug_assert_eq!(rc, 0, "cudaFree failed: error code {rc}");
+        }
+        // owned=false: memory is managed by the originating GpuLevelScratch — no-op here.
     }
 }
 
