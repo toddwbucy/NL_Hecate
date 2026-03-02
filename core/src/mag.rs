@@ -762,8 +762,13 @@ fn run_level_memory(
             MemoryRuleKind::Trellis => trellis_read_only(
                 &params.levels[level], input, frozen_ref, s, d, cfg.d_compress,
             ),
+            // HebbianRule and AtlasOmega do not yet support feature maps in their active
+            // step() (deferred to follow-on PR) — use Identity to stay consistent.
+            MemoryRuleKind::HebbianRule | MemoryRuleKind::AtlasOmega => delta_rule_read_only(
+                &params.levels[level], input, frozen_ref, s, d, &crate::feature_map::FeatureMapKind::Identity,
+            ),
             _ => delta_rule_read_only(
-                &params.levels[level], input, frozen_ref, s, d,
+                &params.levels[level], input, frozen_ref, s, d, &cfg.feature_map,
             ),
         };
         (y_level, None, Some(q_mem), Some(frozen_ref.clone()))
@@ -1061,8 +1066,11 @@ pub fn cms_backward(
                     MemoryRuleKind::Trellis => trellis_read_only_backward(
                         &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.d_compress,
                     ),
+                    MemoryRuleKind::HebbianRule | MemoryRuleKind::AtlasOmega => delta_rule_read_only_backward(
+                        &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, &crate::feature_map::FeatureMapKind::Identity,
+                    ),
                     _ => delta_rule_read_only_backward(
-                        &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d,
+                        &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, &cfg.feature_map,
                     ),
                 };
                 error_buffers[level].accumulate(&mem_grads);
@@ -1163,6 +1171,9 @@ pub fn cms_backward(
                     MemoryRuleKind::Trellis => trellis_read_only_backward(
                         &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.d_compress,
                     ),
+                    MemoryRuleKind::HebbianRule | MemoryRuleKind::AtlasOmega => delta_rule_read_only_backward(
+                        &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, &crate::feature_map::FeatureMapKind::Identity,
+                    ),
                     _ => delta_rule_read_only_backward(
                         &params.levels[level],
                         frozen_m,
@@ -1171,6 +1182,7 @@ pub fn cms_backward(
                         &cache.embedded,
                         s,
                         d,
+                        &cfg.feature_map,
                     ),
                 }
             };

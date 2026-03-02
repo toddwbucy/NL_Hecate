@@ -28,6 +28,7 @@ use crate::model::MemoryLevelParams;
 use crate::moneta::{apply_attentional_bias, apply_attentional_bias_backward};
 use crate::delta_rule::{MemoryRule, MemoryState, Gates, MemoryError};
 use crate::bf16::Bf16Storage;
+use crate::feature_map::{self, FeatureMapKind};
 
 // ── Titans LMM implementation ───────────────────────────────────────
 
@@ -45,6 +46,8 @@ pub struct TitansLMM {
     pub theta_ceil: f32,
     /// M Frobenius norm ceiling (straight-through). f32::MAX = disabled.
     pub m_norm_max: f32,
+    /// Feature map applied to k_t and q_t before memory operations (φ).
+    pub feature_map: FeatureMapKind,
 }
 
 impl TitansLMM {
@@ -58,6 +61,7 @@ impl TitansLMM {
             theta_floor: 0.0,
             theta_ceil: f32::MAX,
             m_norm_max: f32::MAX,
+            feature_map: FeatureMapKind::Identity,
         }
     }
     /// Construct from MAGConfig fields for a specific CMS level.
@@ -71,6 +75,7 @@ impl TitansLMM {
             theta_floor: cfg.theta_floor.get(level).copied().unwrap_or(0.0),
             theta_ceil: cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX),
             m_norm_max: cfg.max_m_norm(level),
+            feature_map: cfg.feature_map.clone(),
         }
     }
     /// Construct from MAGConfig fields (backward compat — no level clamp).
@@ -129,6 +134,10 @@ pub struct TitansLMMCache {
     pub k_conv_cache: Option<crate::conv1d::Conv1DCache>,
     /// Conv1D cache for query preprocessing (None when kernel_size=0)
     pub q_conv_cache: Option<crate::conv1d::Conv1DCache>,
+    /// Pre-activation z for feature map on keys: [seq_len * d]. Empty for Identity.
+    pub fm_z_k_mem: Vec<f32>,
+    /// Pre-activation z for feature map on queries: [seq_len * d]. Empty for Identity.
+    pub fm_z_q_mem: Vec<f32>,
 }
 
 impl MemoryRule for TitansLMM {
@@ -241,13 +250,36 @@ impl MemoryRule for TitansLMM {
             Some(crate::momentum::DeepMomentumCache::new(seq_len, dd, deep_dh))
         } else { None };
 
+        let has_fm = !matches!(self.feature_map, FeatureMapKind::Identity);
+        let mut fm_z_k_mem = if has_fm { vec![0.0f32; seq_len * d] } else { vec![] };
+        let mut fm_z_q_mem = if has_fm { vec![0.0f32; seq_len * d] } else { vec![] };
+
+        // Pre-allocated phi/z buffers — reused each token to avoid per-iter Vec alloc.
+        let mut phi_k_buf = vec![0.0f32; d];
+        let mut phi_q_buf = vec![0.0f32; d];
+        let mut z_k_buf = if has_fm { vec![0.0f32; d] } else { vec![] };
+        let mut z_q_buf = if has_fm { vec![0.0f32; d] } else { vec![] };
+
         // Sequential token loop
         for t in 0..seq_len {
             let k_t = &k_mem[t * d..(t + 1) * d];
             let v_t = &v_mem[t * d..(t + 1) * d];
             let q_t = &q_mem[t * d..(t + 1) * d];
 
-            // Concatenate (k_t, v_t)
+            // Feature map: phi_k_t = φ(k_t), phi_q_t = φ(q_t). Gates use raw k_t.
+            // For Identity: phi slices alias k_t/q_t (zero allocation).
+            // For non-Identity: phi_k_buf/phi_q_buf are pre-allocated and reused.
+            let (phi_k_t, phi_q_t): (&[f32], &[f32]) = if has_fm {
+                feature_map::apply_into(k_t, &self.feature_map, &level_params.w_rand, &level_params.b_rand, &mut phi_k_buf, &mut z_k_buf, d);
+                feature_map::apply_into(q_t, &self.feature_map, &level_params.w_rand, &level_params.b_rand, &mut phi_q_buf, &mut z_q_buf, d);
+                fm_z_k_mem[t * d..(t + 1) * d].copy_from_slice(&z_k_buf);
+                fm_z_q_mem[t * d..(t + 1) * d].copy_from_slice(&z_q_buf);
+                (&phi_k_buf, &phi_q_buf)
+            } else {
+                (k_t, q_t)
+            };
+
+            // Concatenate (k_t, v_t) — raw k_t for gate computation
             let c_base = t * 2 * d;
             concat_kv[c_base..c_base + d].copy_from_slice(k_t);
             concat_kv[c_base + d..c_base + 2 * d].copy_from_slice(v_t);
@@ -277,10 +309,10 @@ impl MemoryRule for TitansLMM {
             eta_pre[t] = eta_pre_t;
             eta[t] = sigmoid_f32(eta_pre_t);
 
-            // prediction = M_t @ k_t
+            // prediction = M_t @ φ(k_t)
             let m_t = &m_states[t * d * d..(t + 1) * d * d];
             let mut prediction = vec![0.0f32; d];
-            matmul_f32(m_t, k_t, &mut prediction, d, d, 1);
+            matmul_f32(m_t, &phi_k_t, &mut prediction, d, d, 1);
 
             // error = prediction - v_t (raw error, stored for backward VJP)
             let e_base = t * d;
@@ -291,9 +323,9 @@ impl MemoryRule for TitansLMM {
             // Apply attentional bias: L2 → identity, L1 → tanh(a*e), Lp → general
             let biased = apply_attentional_bias(&error[e_base..e_base + d], self.bias, self.sign_sharpness);
 
-            // grad = outer(biased_error, k_t)
+            // grad = outer(biased_error, φ(k_t))
             let g_base = t * d * d;
-            outer_product_f32(&biased, k_t, &mut grad_outer[g_base..g_base + d * d]);
+            outer_product_f32(&biased, &phi_k_t, &mut grad_outer[g_base..g_base + d * d]);
 
             // Momentum update — dispatched to momentum.rs
             let eta_t = eta[t];
@@ -338,15 +370,15 @@ impl MemoryRule for TitansLMM {
                 }
             }
 
-            // y_t = M_{t+1} @ q_t
+            // y_t = M_{t+1} @ φ(q_t)
             let m_next = &m_states[m_next_off..m_next_off + d * d];
-            matmul_f32(m_next, q_t, &mut y[t * d..(t + 1) * d], d, d, 1);
+            matmul_f32(m_next, &phi_q_t, &mut y[t * d..(t + 1) * d], d, d, 1);
         }
 
         let cache = TitansLMMCache {
             seq_len, d, m_states, s_states, k_mem, v_mem, q_mem, concat_kv,
             alpha_pre, alpha, theta_pre, theta, eta_pre, eta,
-            error, grad_outer, y: y.clone(),
+            error, grad_outer, y: y.clone(), fm_z_k_mem, fm_z_q_mem,
             momentum_kind: mk,
             decay: decay_buf,
             deep_cache,
@@ -382,6 +414,8 @@ impl MemoryRule for TitansLMM {
         let mut d_m = vec![0.0f32; d * d];
         let mut d_s = vec![0.0f32; d * d];
 
+        let has_fm = !cache.fm_z_k_mem.is_empty();
+
         // Reverse token loop
         for t in (0..s).rev() {
             let k_t = &cache.k_mem[t * d..(t + 1) * d];
@@ -398,24 +432,41 @@ impl MemoryRule for TitansLMM {
             let theta_pre_t = cache.theta_pre[t];
             let eta_t = cache.eta[t];
 
-            // ── y_t = M_{t+1} @ q_t backward ──
+            // Reconstruct phi_k_t and phi_q_t (for backward through memory ops)
+            let z_k_t = if has_fm { &cache.fm_z_k_mem[t * d..(t + 1) * d] } else { &[] as &[f32] };
+            let z_q_t = if has_fm { &cache.fm_z_q_mem[t * d..(t + 1) * d] } else { &[] as &[f32] };
+            let phi_k_t = if has_fm {
+                feature_map::apply(k_t, &self.feature_map, &level_params.w_rand, &level_params.b_rand, d).0
+            } else {
+                k_t.to_vec()
+            };
+            let phi_q_t = if has_fm {
+                feature_map::apply(q_t, &self.feature_map, &level_params.w_rand, &level_params.b_rand, d).0
+            } else {
+                q_t.to_vec()
+            };
+
+            // ── y_t = M_{t+1} @ φ(q_t) backward ──
             let d_y_t = &d_y[t * d..(t + 1) * d];
 
-            // d_M += outer(d_y_t, q_t)
+            // d_M += outer(d_y_t, φ(q_t))
             for i in 0..d {
                 for j in 0..d {
-                    d_m[i * d + j] += d_y_t[i] * q_t[j];
+                    d_m[i * d + j] += d_y_t[i] * phi_q_t[j];
                 }
             }
 
-            // d_q_t = M_{t+1}^T @ d_y_t
+            // d_phi_q_t = M_{t+1}^T @ d_y_t, then VJP → d_q_mem
+            let mut d_phi_q_t = vec![0.0f32; d];
             for i in 0..d {
                 let mut sum = 0.0f32;
                 for j in 0..d {
                     sum += m_next[j * d + i] * d_y_t[j];
                 }
-                d_q_mem[t * d + i] = sum;
+                d_phi_q_t[i] = sum;
             }
+            let d_q_t = feature_map::vjp(&d_phi_q_t, z_q_t, &self.feature_map, &level_params.w_rand, d);
+            d_q_mem[t * d..(t + 1) * d].copy_from_slice(&d_q_t);
 
             // ── M_{t+1} = (1-alpha) * M_t + S_{t+1} backward ──
             // d_S_{t+1} = d_M  (S contributes additively to M)
@@ -457,26 +508,27 @@ impl MemoryRule for TitansLMM {
             // Clone for the d_m/d_s swap at end of loop iteration.
             let d_s_prev = d_s.clone();
 
-            // ── grad = outer(biased_error, k) backward ──
-            // Recompute biased error for d_k (not stored in cache)
+            // ── grad = outer(biased_error, φ(k)) backward ──
+            // Recompute biased error for d_phi_k (not stored in cache)
             let biased = apply_attentional_bias(err_t, self.bias, self.sign_sharpness);
 
-            // d_biased[i] = sum_j d_grad[i,j] * k[j]
+            // d_biased[i] = sum_j d_grad[i,j] * φ(k)[j]
             let mut d_biased = vec![0.0f32; d];
             for i in 0..d {
                 let mut sum = 0.0f32;
                 for j in 0..d {
-                    sum += d_grad[i * d + j] * k_t[j];
+                    sum += d_grad[i * d + j] * phi_k_t[j];
                 }
                 d_biased[i] = sum;
             }
-            // d_k[j] += sum_i d_grad[i,j] * biased[i]
+            // d_phi_k[j] += sum_i d_grad[i,j] * biased[i]  (accumulate, add prediction contrib below)
+            let mut d_phi_k_t = vec![0.0f32; d];
             for j in 0..d {
                 let mut sum = 0.0f32;
                 for i in 0..d {
                     sum += d_grad[i * d + j] * biased[i];
                 }
-                d_k_mem[t * d + j] += sum;
+                d_phi_k_t[j] = sum;
             }
 
             // ── VJP through attentional bias: biased = f(error) ──
@@ -487,18 +539,24 @@ impl MemoryRule for TitansLMM {
                 d_v_mem[t * d + i] -= d_err[i];
             }
 
-            // ── prediction = M_t @ k_t backward ──
+            // ── prediction = M_t @ φ(k_t) backward ──
             for i in 0..d {
                 for j in 0..d {
-                    d_m_prev[i * d + j] += d_err[i] * k_t[j];
+                    d_m_prev[i * d + j] += d_err[i] * phi_k_t[j];
                 }
             }
+            // d_phi_k[j] += sum_i M_t[i,j] * d_err[i]
             for j in 0..d {
                 let mut sum = 0.0f32;
                 for i in 0..d {
                     sum += m_t[i * d + j] * d_err[i];
                 }
-                d_k_mem[t * d + j] += sum;
+                d_phi_k_t[j] += sum;
+            }
+            // VJP through feature map: d_phi_k_t → d_k_mem
+            let d_k_t = feature_map::vjp(&d_phi_k_t, z_k_t, &self.feature_map, &level_params.w_rand, d);
+            for j in 0..d {
+                d_k_mem[t * d + j] += d_k_t[j];
             }
 
             // ── Gate backward: alpha_t = sigmoid(alpha_pre_t) ──
@@ -793,7 +851,7 @@ mod tests {
         let d = cfg.swa.d_model;
         let s = cfg.swa.seq_len;
         let frozen_m = vec![0.0f32; d * d];
-        let (y, _q_mem) = delta_rule_read_only(&params.levels[0], &embedded, &frozen_m, s, d);
+        let (y, _q_mem) = delta_rule_read_only(&params.levels[0], &embedded, &frozen_m, s, d, &crate::feature_map::FeatureMapKind::Identity);
         assert!(y.iter().all(|&x| x.abs() < 1e-12));
     }
 
@@ -807,7 +865,7 @@ mod tests {
         let s = cfg.swa.seq_len;
         let mut frozen_m = vec![0.0f32; d * d];
         for i in 0..d { frozen_m[i * d + i] = 1.0; }
-        let (y, q_mem) = delta_rule_read_only(&params.levels[0], &embedded, &frozen_m, s, d);
+        let (y, q_mem) = delta_rule_read_only(&params.levels[0], &embedded, &frozen_m, s, d, &crate::feature_map::FeatureMapKind::Identity);
         for i in 0..(s * d) {
             assert!((y[i] - q_mem[i]).abs() < 1e-6, "y[{i}]={} != q_mem[{i}]={}", y[i], q_mem[i]);
         }
@@ -831,7 +889,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = TitansLMM { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0, theta_floor: 0.0, theta_ceil: f32::MAX, m_norm_max: f32::MAX };
+        let rule = TitansLMM { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0, theta_floor: 0.0, theta_ceil: f32::MAX, m_norm_max: f32::MAX, feature_map: FeatureMapKind::Identity };
         let (y, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for (i, &v) in y.iter().enumerate() {
             assert!(v.is_finite(), "L1 y[{i}] not finite: {v}");
@@ -843,7 +901,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = TitansLMM { bias: crate::model::AttentionalBias::Lp(3.0), sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0, theta_floor: 0.0, theta_ceil: f32::MAX, m_norm_max: f32::MAX };
+        let rule = TitansLMM { bias: crate::model::AttentionalBias::Lp(3.0), sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0, theta_floor: 0.0, theta_ceil: f32::MAX, m_norm_max: f32::MAX, feature_map: FeatureMapKind::Identity };
         let (y, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for (i, &v) in y.iter().enumerate() {
             assert!(v.is_finite(), "Lp(3) y[{i}] not finite: {v}");
@@ -855,7 +913,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = TitansLMM { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0, theta_floor: 0.0, theta_ceil: f32::MAX, m_norm_max: f32::MAX };
+        let rule = TitansLMM { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0, theta_floor: 0.0, theta_ceil: f32::MAX, m_norm_max: f32::MAX, feature_map: FeatureMapKind::Identity };
         let (y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let d_y = vec![1.0f32; y.len()];
         let (grads, d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
@@ -910,6 +968,7 @@ mod tests {
             theta_floor: 0.0,
             theta_ceil: f32::MAX,
             m_norm_max: f32::MAX,
+            feature_map: FeatureMapKind::Identity,
         };
         let (y_delta, cache_delta) = delta_rule.step(&params.levels[0], &embedded, s, d, None);
 
@@ -945,6 +1004,7 @@ mod tests {
             theta_floor: 0.0,
             theta_ceil: f32::MAX,
             m_norm_max: f32::MAX,
+            feature_map: FeatureMapKind::Identity,
         };
         let (y_deep, cache_deep) = deep_rule.step(&params.levels[0], &embedded, s, d, None);
 

@@ -90,6 +90,11 @@ pub struct GpuMemoryLevelParams {
     pub up_proj:   GpuBuf<f32>,   // [inter × d]
     pub down_proj: GpuBuf<f32>,   // [d × inter]
     pub has_mlp: bool,
+    // RandomFourier feature map weights (CPU-side; phi computed before CUDA kernel launch).
+    // Empty Vec when feature_map == Identity.
+    pub w_rand_cpu: Vec<f32>,     // [d * d]
+    pub b_rand_cpu: Vec<f32>,     // [d]
+    pub has_fm: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -119,6 +124,16 @@ impl GpuMemoryLevelParams {
         let up_proj   = if has_mlp { GpuBuf::from_host(&host.up_proj)   } else { GpuBuf::zeros(1) };
         let down_proj = if has_mlp { GpuBuf::from_host(&host.down_proj) } else { GpuBuf::zeros(1) };
 
+        let has_w_rand = !host.w_rand.is_empty();
+        let has_b_rand = !host.b_rand.is_empty();
+        assert_eq!(
+            has_w_rand, has_b_rand,
+            "GpuMemoryLevelParams::from_host: w_rand (len={}) and b_rand (len={}) must both be \
+             non-empty or both be empty — mismatched FM pair indicates a corrupted host params",
+            host.w_rand.len(), host.b_rand.len()
+        );
+        let has_fm = has_w_rand && has_b_rand;
+
         GpuMemoryLevelParams {
             w_k_mem: GpuBuf::from_host(host.w_k_mem.master()),
             w_v_mem: GpuBuf::from_host(host.w_v_mem.master()),
@@ -137,6 +152,9 @@ impl GpuMemoryLevelParams {
             has_conv,
             gate_proj, up_proj, down_proj,
             has_mlp,
+            w_rand_cpu: host.w_rand.clone(),
+            b_rand_cpu: host.b_rand.clone(),
+            has_fm,
         }
     }
 
@@ -175,6 +193,10 @@ impl GpuMemoryLevelParams {
             self.gate_proj.copy_to_host(&mut p.gate_proj);
             self.up_proj.copy_to_host(&mut p.up_proj);
             self.down_proj.copy_to_host(&mut p.down_proj);
+        }
+        if self.has_fm {
+            p.w_rand = self.w_rand_cpu.clone();
+            p.b_rand = self.b_rand_cpu.clone();
         }
         p
     }

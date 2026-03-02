@@ -28,6 +28,7 @@ use crate::model::MemoryLevelParams;
 use crate::moneta::{apply_attentional_bias, apply_attentional_bias_backward};
 use crate::tape::OpaqueVjp;
 use crate::bf16::Bf16Storage;
+use crate::feature_map::{self, FeatureMapKind};
 
 // ── Memory rule trait ────────────────────────────────────────────────
 
@@ -147,12 +148,14 @@ pub struct DeltaRule {
     /// Per-level theta floor/ceil (CS-39 training wheels). 0.0/MAX = no clamp.
     pub theta_floor: f32,
     pub theta_ceil: f32,
+    /// Feature map phi(k) to apply before memory operations. Default: Identity.
+    pub feature_map: FeatureMapKind,
 }
 
 impl DeltaRule {
     /// L2 bias (backward compatible default).
     pub fn l2() -> Self {
-        DeltaRule { bias: crate::model::AttentionalBias::L2, sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: f32::MAX }
+        DeltaRule { bias: crate::model::AttentionalBias::L2, sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: f32::MAX, feature_map: FeatureMapKind::Identity }
     }
     /// Construct from MAGConfig fields for a specific CMS level (CS-39 clamp per level).
     pub fn from_cfg_level(cfg: &crate::model::MAGConfig, level: usize) -> Self {
@@ -161,6 +164,7 @@ impl DeltaRule {
             sign_sharpness: cfg.sign_sharpness,
             theta_floor: cfg.theta_floor.get(level).copied().unwrap_or(0.0),
             theta_ceil: cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX),
+            feature_map: cfg.feature_map.clone(),
         }
     }
     /// Construct from MAGConfig fields (level 0 — backward compatible).
@@ -206,6 +210,11 @@ pub struct DeltaRuleCache {
     pub k_conv_cache: Option<crate::conv1d::Conv1DCache>,
     /// Conv1D cache for query preprocessing (None when kernel_size=0)
     pub q_conv_cache: Option<crate::conv1d::Conv1DCache>,
+    /// Feature map pre-activations for keys: [seq_len * d]. Empty for Identity.
+    /// z_k[t] = W_rand @ k_t + b_rand. Needed for VJP through phi.
+    pub fm_z_k_mem: Vec<f32>,
+    /// Feature map pre-activations for queries: [seq_len * d]. Empty for Identity.
+    pub fm_z_q_mem: Vec<f32>,
 }
 
 impl MemoryRule for DeltaRule {
@@ -298,13 +307,37 @@ impl MemoryRule for DeltaRule {
         let mut grad_outer = vec![0.0f32; seq_len * d * d];
         let mut y = vec![0.0f32; seq_len * d];
 
+        // Feature map pre-activation cache (empty for Identity)
+        let has_fm = !matches!(self.feature_map, FeatureMapKind::Identity);
+        let mut fm_z_k_mem = if has_fm { vec![0.0f32; seq_len * d] } else { vec![] };
+        let mut fm_z_q_mem = if has_fm { vec![0.0f32; seq_len * d] } else { vec![] };
+
+        // Pre-allocated phi/z buffers — reused each token to avoid per-iter Vec alloc.
+        let mut phi_k_buf = vec![0.0f32; d];
+        let mut phi_q_buf = vec![0.0f32; d];
+        let mut z_k_buf = if has_fm { vec![0.0f32; d] } else { vec![] };
+        let mut z_q_buf = if has_fm { vec![0.0f32; d] } else { vec![] };
+
         // Sequential token loop
         for t in 0..seq_len {
             let k_t = &k_mem[t * d..(t + 1) * d];
             let v_t = &v_mem[t * d..(t + 1) * d];
             let q_t = &q_mem[t * d..(t + 1) * d];
 
-            // Concatenate (k_t, v_t)
+            // Apply feature map phi(k_t), phi(q_t). Gates use raw k_t (unchanged).
+            // For Identity: phi slice aliases k_t/q_t directly (zero allocation).
+            // For non-Identity: phi_k_buf/phi_q_buf are pre-allocated and reused.
+            let (phi_k_t, phi_q_t): (&[f32], &[f32]) = if has_fm {
+                feature_map::apply_into(k_t, &self.feature_map, &level_params.w_rand, &level_params.b_rand, &mut phi_k_buf, &mut z_k_buf, d);
+                feature_map::apply_into(q_t, &self.feature_map, &level_params.w_rand, &level_params.b_rand, &mut phi_q_buf, &mut z_q_buf, d);
+                fm_z_k_mem[t * d..(t + 1) * d].copy_from_slice(&z_k_buf);
+                fm_z_q_mem[t * d..(t + 1) * d].copy_from_slice(&z_q_buf);
+                (&phi_k_buf, &phi_q_buf)
+            } else {
+                (k_t, q_t)
+            };
+
+            // Concatenate (k_t, v_t) — gates use raw k_t
             let c_base = t * 2 * d;
             concat_kv[c_base..c_base + d].copy_from_slice(k_t);
             concat_kv[c_base + d..c_base + 2 * d].copy_from_slice(v_t);
@@ -326,17 +359,17 @@ impl MemoryRule for DeltaRule {
             theta_pre[t] = theta_pre_t;
             theta[t] = softplus_f32(theta_pre_t).clamp(self.theta_floor, self.theta_ceil);
 
-            // prediction error via DGD primitive: e = M_t @ k_t - v_t
+            // prediction error via DGD primitive: e = M_t @ phi_k_t - v_t
             let m_t = &m_states[t * d * d..(t + 1) * d * d];
             let e_base = t * d;
-            dgd_error_into(m_t, k_t, v_t, d, &mut error[e_base..e_base + d]);
+            dgd_error_into(m_t, &phi_k_t, v_t, d, &mut error[e_base..e_base + d]);
 
             // Apply attentional bias: L2 → identity, L1 → tanh(a*e), Lp → general
             let biased = apply_attentional_bias(&error[e_base..e_base + d], self.bias, self.sign_sharpness);
 
-            // grad = outer(biased_error, k_t)
+            // grad = outer(biased_error, phi_k_t)
             let g_base = t * d * d;
-            outer_product_f32(&biased, k_t, &mut grad_outer[g_base..g_base + d * d]);
+            outer_product_f32(&biased, &phi_k_t, &mut grad_outer[g_base..g_base + d * d]);
 
             // M_{t+1} = (1-alpha_t) * M_t - theta_t * grad
             let lr = theta[t];
@@ -348,15 +381,16 @@ impl MemoryRule for DeltaRule {
                 m_states[m_next_off + i] -= lr * grad_outer[g_base + i];
             }
 
-            // y_t = M_{t+1} @ q_t
+            // y_t = M_{t+1} @ phi_q_t
             let m_next = &m_states[(t + 1) * d * d..(t + 2) * d * d];
-            matmul_f32(m_next, q_t, &mut y[t * d..(t + 1) * d], d, d, 1);
+            matmul_f32(m_next, &phi_q_t, &mut y[t * d..(t + 1) * d], d, d, 1);
         }
 
         let cache = DeltaRuleCache {
             seq_len, d, m_states, k_mem, v_mem, q_mem, concat_kv,
             alpha_pre, alpha, theta_pre, theta, error, grad_outer, y: y.clone(),
             k_conv_cache, q_conv_cache,
+            fm_z_k_mem, fm_z_q_mem,
         };
 
         (y, cache)
@@ -405,24 +439,43 @@ impl MemoryRule for DeltaRule {
             let theta_t = cache.theta[t];
             let theta_pre_t = cache.theta_pre[t];
 
-            // ── y_t = M_{t+1} @ q_t backward ──
-            // d_M_{t+1} += outer(d_y_t, q_t)
-            // d_q_t = M_{t+1}^T @ d_y_t
+            // Reconstruct phi(k_t) and phi(q_t) from cached z for backward.
+            // For Identity: phi = k/q, z = [] (empty, no allocation).
+            let has_fm = !cache.fm_z_k_mem.is_empty();
+            let z_k_t: &[f32] = if has_fm { &cache.fm_z_k_mem[t * d..(t + 1) * d] } else { &[] };
+            let z_q_t: &[f32] = if has_fm { &cache.fm_z_q_mem[t * d..(t + 1) * d] } else { &[] };
+            // Recompute phi(k_t)/phi(q_t) from z (cheaper than caching all seq_len * d values again).
+            let phi_k_t: Vec<f32> = if has_fm {
+                let (phi, _) = feature_map::apply(k_t, &self.feature_map, &level_params.w_rand, &level_params.b_rand, d);
+                phi
+            } else { k_t.to_vec() };
+            let phi_q_t: Vec<f32> = if has_fm {
+                let (phi, _) = feature_map::apply(q_t, &self.feature_map, &level_params.w_rand, &level_params.b_rand, d);
+                phi
+            } else { q_t.to_vec() };
+
+            // ── y_t = M_{t+1} @ phi_q_t backward ──
+            // d_M_{t+1} += outer(d_y_t, phi_q_t)
+            // d_phi_q_t = M_{t+1}^T @ d_y_t → then VJP through phi for d_q_mem
             let d_y_t = &d_y[t * d..(t + 1) * d];
 
             for i in 0..d {
                 for j in 0..d {
-                    d_m[i * d + j] += d_y_t[i] * q_t[j];
+                    d_m[i * d + j] += d_y_t[i] * phi_q_t[j];
                 }
             }
 
+            let mut d_phi_q_t = vec![0.0f32; d];
             for i in 0..d {
                 let mut sum = 0.0f32;
                 for j in 0..d {
                     sum += m_next[j * d + i] * d_y_t[j];
                 }
-                d_q_mem[t * d + i] = sum;
+                d_phi_q_t[i] = sum;
             }
+            // VJP through phi for q
+            let d_q_t = feature_map::vjp(&d_phi_q_t, z_q_t, &self.feature_map, &level_params.w_rand, d);
+            d_q_mem[t * d..(t + 1) * d].copy_from_slice(&d_q_t);
 
             // ── M_{t+1} = (1-alpha) * M_t - theta * grad backward ──
             let d_alpha_scalar = -frobenius_dot_f32(&d_m, m_t);
@@ -438,26 +491,27 @@ impl MemoryRule for DeltaRule {
             let mut d_m_prev = d_m.clone();
             l2_apply_retention(&mut d_m_prev, 1.0 - alpha_t);
 
-            // ── grad = outer(biased_error, k) backward ──
-            // Recompute biased error for d_k (not stored in cache)
+            // ── grad = outer(biased_error, phi_k_t) backward ──
+            // Recompute biased error for d_phi_k (not stored in cache)
             let biased = apply_attentional_bias(err_t, self.bias, self.sign_sharpness);
 
-            // d_biased[i] = sum_j d_grad[i,j] * k[j]
+            // d_biased[i] = sum_j d_grad[i,j] * phi_k_t[j]
             let mut d_biased = vec![0.0f32; d];
             for i in 0..d {
                 let mut sum = 0.0f32;
                 for j in 0..d {
-                    sum += d_grad[i * d + j] * k_t[j];
+                    sum += d_grad[i * d + j] * phi_k_t[j];
                 }
                 d_biased[i] = sum;
             }
-            // d_k[j] += sum_i d_grad[i,j] * biased[i]
+            // d_phi_k[j] += sum_i d_grad[i,j] * biased[i]  (from outer product)
+            let mut d_phi_k_t = vec![0.0f32; d];
             for j in 0..d {
                 let mut sum = 0.0f32;
                 for i in 0..d {
                     sum += d_grad[i * d + j] * biased[i];
                 }
-                d_k_mem[t * d + j] += sum;
+                d_phi_k_t[j] += sum;
             }
 
             // ── VJP through attentional bias: biased = f(error) ──
@@ -468,18 +522,24 @@ impl MemoryRule for DeltaRule {
                 d_v_mem[t * d + i] -= d_err[i];
             }
 
-            // ── prediction = M_t @ k_t backward ──
+            // ── prediction = M_t @ phi_k_t backward ──
             for i in 0..d {
                 for j in 0..d {
-                    d_m_prev[i * d + j] += d_err[i] * k_t[j];
+                    d_m_prev[i * d + j] += d_err[i] * phi_k_t[j];
                 }
             }
+            // d_phi_k[j] += M_t^T @ d_err  (from prediction)
             for j in 0..d {
                 let mut sum = 0.0f32;
                 for i in 0..d {
                     sum += m_t[i * d + j] * d_err[i];
                 }
-                d_k_mem[t * d + j] += sum;
+                d_phi_k_t[j] += sum;
+            }
+            // VJP through phi for k: d_k = phi.vjp(d_phi_k, z_k)
+            let d_k_t = feature_map::vjp(&d_phi_k_t, z_k_t, &self.feature_map, &level_params.w_rand, d);
+            for j in 0..d {
+                d_k_mem[t * d + j] += d_k_t[j];
             }
 
             // ── Gate backward: alpha_t = sigmoid(alpha_pre_t) ──
@@ -553,7 +613,7 @@ impl MemoryRule for DeltaRule {
 
 /// Forward pass for a frozen (read-only) level: uses persisted M without writing.
 ///
-/// For each token: y_t = M @ q_t, where M is the frozen memory matrix.
+/// For each token: y_t = M @ phi(q_t), where M is the frozen memory matrix.
 /// Returns (y [seq_len, d], projected q_mem [seq_len, d]).
 pub fn delta_rule_read_only(
     level_params: &MemoryLevelParams,
@@ -561,6 +621,7 @@ pub fn delta_rule_read_only(
     frozen_m: &[f32],
     seq_len: usize,
     d: usize,
+    feature_map: &FeatureMapKind,
 ) -> (Vec<f32>, Vec<f32>) {
     debug_assert_eq!(embedded.len(), seq_len * d);
     debug_assert_eq!(frozen_m.len(), d * d);
@@ -570,11 +631,14 @@ pub fn delta_rule_read_only(
     let w_q_f32 = level_params.w_q_mem.as_f32();
     crate::dispatch::matmul_transb_dispatch(embedded, &w_q_f32, &mut q_mem, seq_len, d, d);
 
-    // y_t = M @ q_t for each token
+    // y_t = M @ phi(q_t) for each token. Use apply_into to avoid per-token allocation.
     let mut y = vec![0.0f32; seq_len * d];
+    let mut phi_q_buf = vec![0.0f32; d];
+    let mut z_q_buf = vec![0.0f32; d];
     for t in 0..seq_len {
         let q_t = &q_mem[t * d..(t + 1) * d];
-        matmul_f32(frozen_m, q_t, &mut y[t * d..(t + 1) * d], d, d, 1);
+        feature_map::apply_into(q_t, feature_map, &level_params.w_rand, &level_params.b_rand, &mut phi_q_buf, &mut z_q_buf, d);
+        matmul_f32(frozen_m, &phi_q_buf, &mut y[t * d..(t + 1) * d], d, d, 1);
     }
 
     (y, q_mem)
@@ -590,27 +654,43 @@ pub fn delta_rule_read_only(
 pub fn delta_rule_read_only_backward(
     level_params: &MemoryLevelParams,
     frozen_m: &[f32],
-    _q_mem: &[f32],
+    q_mem: &[f32],
     d_y: &[f32],
     embedded: &[f32],
     seq_len: usize,
     d: usize,
+    feature_map: &FeatureMapKind,
 ) -> (MemoryLevelParams, Vec<f32>) {
     debug_assert_eq!(d_y.len(), seq_len * d);
 
     let mut grads = MemoryLevelParams::zeros_like(d);
 
-    // y_t = M @ q_t → d_q_t = M^T @ d_y_t
+    let has_fm = !matches!(feature_map, FeatureMapKind::Identity);
+
+    // y_t = M @ phi(q_t)
+    // Backward: d_phi_q_t = M^T @ d_y_t, then d_q_t = vjp(d_phi_q_t, z_q_t).
     let mut d_q_mem = vec![0.0f32; seq_len * d];
     for t in 0..seq_len {
         let d_y_t = &d_y[t * d..(t + 1) * d];
+        // d_phi_q_t = M^T @ d_y_t
+        let mut d_phi_q_t = vec![0.0f32; d];
         for i in 0..d {
             let mut sum = 0.0f32;
             for j in 0..d {
                 sum += frozen_m[j * d + i] * d_y_t[j];
             }
-            d_q_mem[t * d + i] = sum;
+            d_phi_q_t[i] = sum;
         }
+        // Apply phi VJP through the feature map: d_q_t = φ'(q_t)^T d_phi_q_t.
+        // Re-run apply on q_t to recover the cached z (recompute is cheap for read-only path).
+        let d_q_t = if has_fm {
+            let q_t = &q_mem[t * d..(t + 1) * d];
+            let (_, z_q_t) = feature_map::apply(q_t, feature_map, &level_params.w_rand, &level_params.b_rand, d);
+            feature_map::vjp(&d_phi_q_t, &z_q_t, feature_map, &level_params.w_rand, d)
+        } else {
+            d_phi_q_t
+        };
+        d_q_mem[t * d..(t + 1) * d].copy_from_slice(&d_q_t);
     }
 
     // q_mem = embedded @ W_Q_mem^T → d_W_Q_mem, d_embedded
@@ -844,7 +924,7 @@ mod tests {
         let d = cfg.swa.d_model;
         let s = cfg.swa.seq_len;
         let frozen_m = vec![0.0f32; d * d];
-        let (y, _q_mem) = delta_rule_read_only(&params.levels[0], &embedded, &frozen_m, s, d);
+        let (y, _q_mem) = delta_rule_read_only(&params.levels[0], &embedded, &frozen_m, s, d, &crate::feature_map::FeatureMapKind::Identity);
         // Zero memory → zero output
         assert!(y.iter().all(|&x| x.abs() < 1e-12));
     }
@@ -859,7 +939,7 @@ mod tests {
         // Identity memory → y_t = q_t
         let mut frozen_m = vec![0.0f32; d * d];
         for i in 0..d { frozen_m[i * d + i] = 1.0; }
-        let (y, q_mem) = delta_rule_read_only(&params.levels[0], &embedded, &frozen_m, s, d);
+        let (y, q_mem) = delta_rule_read_only(&params.levels[0], &embedded, &frozen_m, s, d, &crate::feature_map::FeatureMapKind::Identity);
         // y should equal q_mem when M = I
         for i in 0..(s * d) {
             assert!((y[i] - q_mem[i]).abs() < 1e-6, "y[{i}]={} != q_mem[{i}]={}", y[i], q_mem[i]);
@@ -873,7 +953,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = DeltaRule { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: f32::MAX };
+        let rule = DeltaRule { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: f32::MAX , feature_map: FeatureMapKind::Identity};
         let (y, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for (i, &v) in y.iter().enumerate() {
             assert!(v.is_finite(), "L1 y[{i}] not finite: {v}");
@@ -885,7 +965,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = DeltaRule { bias: crate::model::AttentionalBias::Lp(3.0), sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: f32::MAX };
+        let rule = DeltaRule { bias: crate::model::AttentionalBias::Lp(3.0), sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: f32::MAX , feature_map: FeatureMapKind::Identity};
         let (y, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for (i, &v) in y.iter().enumerate() {
             assert!(v.is_finite(), "Lp(3) y[{i}] not finite: {v}");
@@ -897,7 +977,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = DeltaRule { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: f32::MAX };
+        let rule = DeltaRule { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: f32::MAX , feature_map: FeatureMapKind::Identity};
         let (y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let d_y = vec![1.0f32; y.len()];
         let (grads, d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
@@ -917,7 +997,7 @@ mod tests {
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
         let (y_l2, _) = DeltaRule::l2().step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
-        let rule_lp2 = DeltaRule { bias: crate::model::AttentionalBias::Lp(2.0), sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: f32::MAX };
+        let rule_lp2 = DeltaRule { bias: crate::model::AttentionalBias::Lp(2.0), sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: f32::MAX , feature_map: FeatureMapKind::Identity};
         let (y_lp2, _) = rule_lp2.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         // Forward outputs should differ (biased grad → different M updates)
         let max_diff: f32 = y_l2.iter().zip(y_lp2.iter())
@@ -937,7 +1017,7 @@ mod tests {
         let mut embedded = vec![0.0f32; seq_len * d];
         SimpleRng::new(99).fill_uniform(&mut embedded, 0.5);
 
-        let rule = DeltaRule { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: f32::MAX };
+        let rule = DeltaRule { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: f32::MAX , feature_map: FeatureMapKind::Identity};
         let (_, cache) = rule.step(&params, &embedded, seq_len, d, None);
         let d_y = vec![1.0f32; seq_len * d];
         let (pg_direct, de_direct) = rule.step_backward(&params, &cache, &d_y, &embedded);
@@ -967,7 +1047,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = DeltaRule { bias: crate::model::AttentionalBias::L2, sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: 0.01 };
+        let rule = DeltaRule { bias: crate::model::AttentionalBias::L2, sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: 0.01 , feature_map: FeatureMapKind::Identity};
         let (_, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for (t, &th) in cache.theta.iter().enumerate() {
             assert!(th <= 0.01 + 1e-6, "theta[{t}]={th} exceeds ceil=0.01");
@@ -983,7 +1063,7 @@ mod tests {
         // Ceiling of 0.0 forces all theta to 0.0, ensuring clamping for any positive softplus output.
         // Use floor=MAX to force clamping at floor (theta = 0.0 floor, which is at boundary):
         // Instead, set ceil extremely small so every token hits the ceil.
-        let rule = DeltaRule { bias: crate::model::AttentionalBias::L2, sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: 1e-10 };
+        let rule = DeltaRule { bias: crate::model::AttentionalBias::L2, sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: 1e-10 , feature_map: FeatureMapKind::Identity};
         let (_, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let d_y = vec![1.0f32; cfg.swa.seq_len * cfg.swa.d_model];
         let (grads, _) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
@@ -1001,7 +1081,7 @@ mod tests {
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
         let rule_no_clamp = DeltaRule::l2();
-        let rule_with_noop = DeltaRule { bias: crate::model::AttentionalBias::L2, sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: f32::MAX };
+        let rule_with_noop = DeltaRule { bias: crate::model::AttentionalBias::L2, sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: f32::MAX , feature_map: FeatureMapKind::Identity};
         let (y1, _) = rule_no_clamp.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let (y2, _) = rule_with_noop.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for (i, (&a, &b)) in y1.iter().zip(y2.iter()).enumerate() {

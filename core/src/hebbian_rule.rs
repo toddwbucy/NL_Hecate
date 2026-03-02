@@ -528,7 +528,7 @@ mod tests {
         let d = cfg.swa.d_model;
         let s = cfg.swa.seq_len;
         let frozen_m = vec![0.0f32; d * d];
-        let (y, _q_mem) = delta_rule_read_only(&params.levels[0], &embedded, &frozen_m, s, d);
+        let (y, _q_mem) = delta_rule_read_only(&params.levels[0], &embedded, &frozen_m, s, d, &crate::feature_map::FeatureMapKind::Identity);
         assert!(y.iter().all(|&x| x.abs() < 1e-12));
     }
 
@@ -542,7 +542,7 @@ mod tests {
         let s = cfg.swa.seq_len;
         let mut frozen_m = vec![0.0f32; d * d];
         for i in 0..d { frozen_m[i * d + i] = 1.0; }
-        let (y, q_mem) = delta_rule_read_only(&params.levels[0], &embedded, &frozen_m, s, d);
+        let (y, q_mem) = delta_rule_read_only(&params.levels[0], &embedded, &frozen_m, s, d, &crate::feature_map::FeatureMapKind::Identity);
         for i in 0..(s * d) {
             assert!((y[i] - q_mem[i]).abs() < 1e-6, "y[{i}]={} != q_mem[{i}]={}", y[i], q_mem[i]);
         }

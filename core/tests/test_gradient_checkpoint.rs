@@ -7,7 +7,7 @@
 // Requires: --features cuda
 #![cfg(feature = "cuda")]
 
-use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind, CompositionKind, HopeVariant, LatticeVariant, MomentumKind, ProjectionKind};
+use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind, CompositionKind, HopeVariant, LatticeVariant, MomentumKind, ProjectionKind, FeatureMapKind};
 use nl_hecate_core::conductor::Pulse;
 use nl_hecate_core::gpu_forward::{gpu_cms_forward, checkpoint_count};
 use nl_hecate_core::gpu_backward::gpu_cms_backward;
@@ -50,6 +50,7 @@ fn make_config(rule: MemoryRuleKind, checkpoint_interval: Option<usize>) -> MAGC
             theta_ceil: vec![],
         intermediate_size: 0,
         m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
     }
 }
 

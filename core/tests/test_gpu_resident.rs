@@ -6,7 +6,7 @@
 ///
 /// Requires: --features cuda
 
-use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind, CompositionKind, HopeVariant, LatticeVariant, MomentumKind, ProjectionKind};
+use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind, CompositionKind, HopeVariant, LatticeVariant, MomentumKind, ProjectionKind, FeatureMapKind};
 use nl_hecate_core::conductor::{Pulse, ContextState};
 use nl_hecate_core::dispatch;
 use nl_hecate_core::mag::cms_forward;
@@ -50,6 +50,7 @@ fn make_test_config(rule: MemoryRuleKind) -> MAGConfig {
             theta_ceil: vec![],
         intermediate_size: 0,
         m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
     }
 }
 

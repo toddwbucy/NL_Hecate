@@ -515,6 +515,10 @@ pub fn unflatten_to_mag_grads(flat: &[f32], template: &MAGParams) -> MAGParams {
             gate_proj: take(flat, &mut offset, tl.gate_proj.len()),
             up_proj: take(flat, &mut offset, tl.up_proj.len()),
             down_proj: take(flat, &mut offset, tl.down_proj.len()),
+            // w_rand/b_rand are frozen — not included in M3 flat optimizer state.
+            // Propagate from template so the rule can read them.
+            w_rand: tl.w_rand.clone(),
+            b_rand: tl.b_rand.clone(),
         });
     }
 

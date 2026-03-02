@@ -515,9 +515,13 @@ pub fn traced_cms_forward(
                     "SwiGluMlp has no frozen read-only path; \
                      inactive levels must run via the active path (effective_active=true)"
                 ),
-                // Delta, Titans, Hebbian, Atlas — all use matrix M: y = M @ q
+                // HebbianRule and AtlasOmega: no FM in active step() yet (deferred PR).
+                MemoryRuleKind::HebbianRule | MemoryRuleKind::AtlasOmega => delta_rule_read_only(
+                    &params.levels[level], &embedded, frozen_ref, s, d, &crate::feature_map::FeatureMapKind::Identity,
+                ),
+                // Delta, Titans — support configured feature map.
                 _ => delta_rule_read_only(
-                    &params.levels[level], &embedded, frozen_ref, s, d,
+                    &params.levels[level], &embedded, frozen_ref, s, d, &cfg.feature_map,
                 ),
             };
 
@@ -530,13 +534,45 @@ pub fn traced_cms_forward(
                 cfg.memory_rule,
             );
 
-            // Record frozen opaque block: input = q_mem_id, saved = [meta, m_frozen]
+            // Determine which feature map was applied in this frozen level.
+            // Only DeltaRule/TitansLMM support cfg.feature_map; all others use Identity.
+            let effective_fm = match cfg.memory_rule {
+                MemoryRuleKind::DeltaRule | MemoryRuleKind::TitansLMM => &cfg.feature_map,
+                _ => &crate::feature_map::FeatureMapKind::Identity,
+            };
+            let has_fm = !matches!(effective_fm, crate::feature_map::FeatureMapKind::Identity);
+
+            // Compute z_q_mem (phi pre-activations) so backward can apply the phi VJP.
+            // Re-running apply_batch on q_mem is cheap: w_rand is frozen, same inputs.
+            let fm_z_q_save = if has_fm {
+                let (_, z) = crate::feature_map::apply_batch(
+                    &q_mem_data, effective_fm,
+                    &params.levels[level].w_rand, &params.levels[level].b_rand, s, d,
+                );
+                z
+            } else {
+                vec![]
+            };
+            let (fm_kind_f32, fm_sigma) = match effective_fm {
+                crate::feature_map::FeatureMapKind::Identity => (0.0f32, 1.0f32),
+                crate::feature_map::FeatureMapKind::RandomFourier { sigma } => (1.0f32, *sigma),
+                crate::feature_map::FeatureMapKind::ELU => (2.0f32, 1.0f32),
+            };
+
+            // Record frozen opaque block.
+            // Meta: [s, d, fm_kind_f32, fm_sigma] (Identity: fm_kind=0, old tapes had len=2).
+            // Extra saves (if non-Identity): fm_z_q_mem, w_rand.
             let fk = frozen_opaque_key(cfg.memory_rule);
-            let meta = vec![s as f32, d as f32];
+            let meta = vec![s as f32, d as f32, fm_kind_f32, fm_sigma];
             let meta_id = tape.alloc(meta, vec![]);
             let m_saved = tape.alloc(frozen_ref.to_vec(), vec![]);
             let y_id = tape.alloc(y_data.clone(), vec![s, d]);
-            tape.record_opaque(fk, vec![q_mem_id], vec![y_id], vec![meta_id, m_saved]);
+            let mut tape_saved = vec![meta_id, m_saved];
+            if has_fm {
+                tape_saved.push(tape.alloc(fm_z_q_save, vec![]));
+                tape_saved.push(tape.alloc(params.levels[level].w_rand.clone(), vec![]));
+            }
+            tape.record_opaque(fk, vec![q_mem_id], vec![y_id], tape_saved);
 
             y_ids.push(y_id);
             y_per_level_data.push(y_data);
@@ -641,7 +677,16 @@ fn traced_active_level(
             let m_final_start = s * d * d;
             let final_m = cache.m_states[m_final_start..m_final_start + d * d].to_vec();
 
-            let extra_meta = [crate::moneta::bias_to_f32(rule.bias), rule.sign_sharpness, rule.theta_floor, rule.theta_ceil];
+            let fm_kind_f32 = match rule.feature_map {
+                crate::feature_map::FeatureMapKind::Identity => 0.0f32,
+                crate::feature_map::FeatureMapKind::RandomFourier { .. } => 1.0,
+                crate::feature_map::FeatureMapKind::ELU => 2.0,
+            };
+            let fm_sigma = match rule.feature_map {
+                crate::feature_map::FeatureMapKind::RandomFourier { sigma } => sigma,
+                _ => 1.0,
+            };
+            let extra_meta = [crate::moneta::bias_to_f32(rule.bias), rule.sign_sharpness, rule.theta_floor, rule.theta_ceil, fm_kind_f32, fm_sigma];
             let (meta_id, lp_saved, emb_saved) =
                 alloc_common_saved(tape, level_params, embedded, s, d, &extra_meta);
             let cache_ids = vec![
@@ -661,6 +706,15 @@ fn traced_active_level(
             let y_id = tape.alloc(y.clone(), vec![s, d]);
             let mut saved = vec![meta_id, lp_saved, emb_saved];
             saved.extend(cache_ids);
+            // Save feature map z caches and frozen FM weights before conv caches (if non-Identity).
+            // Backward adapter reads fm_z_k at saved[15], fm_z_q at saved[16],
+            // w_rand at saved[17], b_rand at saved[18].
+            if !cache.fm_z_k_mem.is_empty() {
+                saved.push(tape.alloc(cache.fm_z_k_mem.clone(), vec![]));
+                saved.push(tape.alloc(cache.fm_z_q_mem.clone(), vec![]));
+                saved.push(tape.alloc(level_params.w_rand.clone(), vec![]));
+                saved.push(tape.alloc(level_params.b_rand.clone(), vec![]));
+            }
             // Save conv1d cache if active
             assert!(cache.k_conv_cache.is_some() == cache.q_conv_cache.is_some(),
                 "traced_forward: partial Conv1D cache — k={}, q={}",
@@ -687,7 +741,16 @@ fn traced_active_level(
                 crate::model::MomentumKind::DeltaMomentum => 2.0,
                 crate::model::MomentumKind::DeepMomentum => 3.0,
             };
-            let extra_meta = [crate::moneta::bias_to_f32(rule.bias), rule.sign_sharpness, mk_f32, rule.theta_floor, rule.theta_ceil];
+            let fm_kind_f32 = match rule.feature_map {
+                crate::feature_map::FeatureMapKind::Identity => 0.0f32,
+                crate::feature_map::FeatureMapKind::RandomFourier { .. } => 1.0,
+                crate::feature_map::FeatureMapKind::ELU => 2.0,
+            };
+            let fm_sigma = match rule.feature_map {
+                crate::feature_map::FeatureMapKind::RandomFourier { sigma } => sigma,
+                _ => 1.0,
+            };
+            let extra_meta = [crate::moneta::bias_to_f32(rule.bias), rule.sign_sharpness, mk_f32, rule.theta_floor, rule.theta_ceil, fm_kind_f32, fm_sigma];
             let (meta_id, lp_saved, emb_saved) =
                 alloc_common_saved(tape, level_params, embedded, s, d, &extra_meta);
             let mut cache_ids = vec![
@@ -712,6 +775,15 @@ fn traced_active_level(
                 assert!(!cache.decay.is_empty(),
                     "traced_forward TitansLMM: DeltaMomentum produced empty decay buffer");
                 cache_ids.push(tape.alloc(cache.decay.clone(), vec![]));
+            }
+            // Save feature map z caches and frozen FM weights before conv caches (if non-Identity).
+            // Backward adapter: fm_base = 18 (EMA/None) or 19 (DeltaMomentum).
+            // fm_z_k at fm_base, fm_z_q at fm_base+1, w_rand at fm_base+2, b_rand at fm_base+3.
+            if !cache.fm_z_k_mem.is_empty() {
+                cache_ids.push(tape.alloc(cache.fm_z_k_mem.clone(), vec![]));
+                cache_ids.push(tape.alloc(cache.fm_z_q_mem.clone(), vec![]));
+                cache_ids.push(tape.alloc(level_params.w_rand.clone(), vec![]));
+                cache_ids.push(tape.alloc(level_params.b_rand.clone(), vec![]));
             }
             let y_id = tape.alloc(y.clone(), vec![s, d]);
             let mut saved = vec![meta_id, lp_saved, emb_saved];
