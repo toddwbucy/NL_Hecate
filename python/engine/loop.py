@@ -241,6 +241,10 @@ def run_build(bcfg: BuildConfig):
         print(f"  Donor:    {bcfg.donor_weights}")
     if bcfg.theta_floor is not None or bcfg.theta_ceil is not None:
         print(f"  θ clamps: floor={bcfg.theta_floor}, ceil={bcfg.theta_ceil}")
+    if bcfg.gate_warmup_theta_floor_init is not None:
+        print(f"  GateWarmup: theta_floor_init={bcfg.gate_warmup_theta_floor_init}, "
+              f"decay_steps={bcfg.gate_warmup_decay_steps}, "
+              f"falsification_step={bcfg.gate_warmup_falsification_step}")
     if len(cfg.m_norm_max) > 0:
         print(f"  M-norm:   max={list(cfg.m_norm_max)}")
     print(f"  Params:   {params.num_params():,}")
@@ -433,6 +437,41 @@ def run_build(bcfg: BuildConfig):
                     if theta_val > 0.001:
                         level3_active_fires += 1
 
+        # ── Gate warmup schedule (09_gate_warmup.md) ─────────────────────
+        # Phase 2: linearly decay theta_floor_init → 0 over gate_warmup_decay_steps.
+        # Applied before the forward pass so the clamp is live for this step.
+        if (bcfg.gate_warmup_theta_floor_init is not None
+                and step < resume_step + bcfg.gate_warmup_decay_steps):
+            alpha = 1.0 - (step - resume_step) / bcfg.gate_warmup_decay_steps
+            warmup_floor = [f * alpha for f in bcfg.gate_warmup_theta_floor_init]
+            if gpu_model is not None:
+                gpu_model.update_theta_floor(warmup_floor)
+            else:
+                cfg = nl_hecate.MAGConfig(
+                    d_model=cfg.d_model, num_heads=cfg.num_heads,
+                    head_dim=cfg.head_dim, seq_len=cfg.seq_len,
+                    window_size=cfg.window_size, vocab_size=cfg.vocab_size,
+                    memory_enabled=cfg.memory_enabled, k=cfg.k,
+                    chunk_sizes=list(cfg.chunk_sizes),
+                    memory_rule=cfg.memory_rule, composition=cfg.composition,
+                    checkpoint_interval=bcfg.checkpoint_interval,
+                    projection_kind=cfg.projection_kind,
+                    self_generated_values=cfg.self_generated_values,
+                    self_ref_chunk_size=cfg.self_ref_chunk_size,
+                    momentum_kind=cfg.momentum_kind,
+                    momentum_d_hidden=cfg.momentum_d_hidden,
+                    intermediate_size=bcfg.intermediate_size,
+                    theta_floor=warmup_floor,
+                    theta_ceil=list(cfg.theta_ceil) if list(cfg.theta_ceil) else None,
+                    m_norm_max=list(cfg.m_norm_max) if list(cfg.m_norm_max) else None,
+                )
+        elif (bcfg.gate_warmup_theta_floor_init is not None
+              and step == resume_step + bcfg.gate_warmup_decay_steps
+              and gpu_model is not None):
+            # Phase 3 start: floor is fully decayed — restore permanent floor
+            final_floor = bcfg.theta_floor if bcfg.theta_floor is not None else [0.0] * bcfg.k
+            gpu_model.update_theta_floor(final_floor)
+
         use_cosine = (adamw_opt is not None or use_adamw_gpu)
         current_lr = cosine_lr(step, bcfg.warmup_steps, end_step, bcfg.lr) if use_cosine else bcfg.lr
 
@@ -563,6 +602,27 @@ def run_build(bcfg: BuildConfig):
                 log_fields["memory_norms"] = [
                     round(n, 6) for n in gpu_model.memory_norms()]
             jsonl.log(**log_fields)
+
+        # Gate warmup falsification checkpoint (09_gate_warmup.md §5)
+        if (bcfg.gate_warmup_theta_floor_init is not None
+                and bcfg.gate_warmup_falsification_step > 0
+                and step == bcfg.gate_warmup_falsification_step
+                and gpu_model is not None
+                and hasattr(gpu_model, "gate_biases")):
+            biases = gpu_model.gate_biases()
+            l2_theta = math.log1p(math.exp(biases[2][1])) if len(biases) > 2 else 0.0
+            l3_theta = math.log1p(math.exp(biases[3][1])) if len(biases) > 3 else 0.0
+            l2_pass = l2_theta > bcfg.gate_warmup_l2_threshold
+            l3_pass = l3_theta > bcfg.gate_warmup_l3_threshold
+            verdict = "GO" if (l2_pass and l3_pass) else "NO-GO"
+            print(f"\n  ── Gate warmup falsification @ step {step} ──")
+            print(f"     L2 θ={l2_theta:.5f}  threshold={bcfg.gate_warmup_l2_threshold}  {'PASS' if l2_pass else 'FAIL'}")
+            print(f"     L3 θ={l3_theta:.5f}  threshold={bcfg.gate_warmup_l3_threshold}  {'PASS' if l3_pass else 'FAIL'}")
+            print(f"     Verdict: {verdict}\n")
+            if jsonl:
+                jsonl.log(event="gate_warmup_falsification", step=step,
+                          l2_theta=round(l2_theta, 6), l3_theta=round(l3_theta, 6),
+                          l2_pass=l2_pass, l3_pass=l3_pass, verdict=verdict)
 
         if (jsonl and bcfg.k >= 4 and step > 0 and step % 1000 == 0):
             l3_fires_delta = level3_total_fires - level3_prev_fires

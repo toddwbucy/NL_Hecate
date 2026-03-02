@@ -1939,6 +1939,20 @@ impl GpuModel {
         self.context.reset();
     }
 
+    /// Update per-level theta_floor values on the live model config.
+    /// The new floor is applied starting from the next forward pass.
+    /// Length must equal k. Used by the gate warmup schedule in loop.py.
+    fn update_theta_floor(&mut self, floor: Vec<f32>) -> PyResult<()> {
+        if floor.len() != self.cfg.k {
+            return Err(PyValueError::new_err(format!(
+                "update_theta_floor: floor length {} != k {}",
+                floor.len(), self.cfg.k
+            )));
+        }
+        self.cfg.theta_floor = floor;
+        Ok(())
+    }
+
     /// Upload context state from host (e.g., to restore after a read-only run).
     fn upload_context(&mut self, ctx: &ContextState) -> PyResult<()> {
         if ctx.inner.d != self.cfg.swa.d_model || ctx.inner.memory.len() != self.cfg.k {
