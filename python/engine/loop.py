@@ -355,14 +355,20 @@ def run_build(bcfg: BuildConfig):
     min_stories_loss: float | None = None
 
     # ── task_cc7eda: CMS health monitoring ───────────────────────────
-    # Rolling 100-step gnorm window per level for dead level detection.
+    # Rolling gnorm window per level (active-step only — ignores inactive-step zeros
+    # that would false-trigger dead-level detection for low-frequency CMS levels).
     _DEAD_LEVEL_WINDOW = 100
     _DEAD_LEVEL_THRESHOLD = 1e-4
+    _DEAD_LEVEL_MIN_SAMPLES = 4  # require ≥4 active samples before declaring dead
     level_gnorm_history: list[deque] = [deque(maxlen=_DEAD_LEVEL_WINDOW) for _ in range(bcfg.k)]
     # Per-level gnorms for current step (empty until first step_adamw call).
     level_gnorms: list[float] = []
-    # Initial per-level param norms captured at step 0 for drift tracking.
+    # Initial per-level M norms captured before training for drift tracking.
+    # Captured here (pre-loop) so it reflects the true restored/initialized state,
+    # not state after the first optimizer step.
     level_param_norms_init: list[float] = []
+    if gpu_model is not None and hasattr(gpu_model, "memory_norms"):
+        level_param_norms_init = list(gpu_model.memory_norms())
 
     losses = []
     t_start = time.perf_counter()
@@ -430,6 +436,10 @@ def run_build(bcfg: BuildConfig):
         current_lr = cosine_lr(step, bcfg.warmup_steps, end_step, bcfg.lr) if use_cosine else bcfg.lr
 
         g_norm = 0.0
+        # Compute log_this before step_adamw so we can pass collect_level_gnorms
+        # only when we'll actually use the per-level norms this step.
+        log_this = (step % bcfg.log_every == 0 or step == end_step - 1
+                    or (step < 100 and step % 10 == 0))
 
         if gpu_model is not None and use_adamw_gpu:
             loss, g_norm = gpu_model.step_adamw(
@@ -437,12 +447,15 @@ def run_build(bcfg: BuildConfig):
                 beta1=bcfg.beta1, beta2=bcfg.beta2, eps=1e-8,
                 weight_decay=bcfg.weight_decay,
                 max_grad_norm=bcfg.max_grad_norm,
+                collect_level_gnorms=log_this,
             )
-            # Component 1+2: collect per-level gnorms for monitoring
-            if hasattr(gpu_model, "level_grad_norms"):
+            # Component 1+2: collect per-level gnorms for monitoring (active steps only)
+            if log_this and hasattr(gpu_model, "level_grad_norms"):
                 level_gnorms = gpu_model.level_grad_norms()
                 for i, n in enumerate(level_gnorms):
-                    if i < len(level_gnorm_history):
+                    if (i < len(level_gnorm_history)
+                            and i < len(pulse.active_levels)
+                            and pulse.active_levels[i]):
                         level_gnorm_history[i].append(n)
         elif gpu_model is not None and adamw_opt is None:
             loss = gpu_model.step(input_ids, target_ids, pulse, current_lr)
@@ -463,11 +476,6 @@ def run_build(bcfg: BuildConfig):
             else:
                 nl_hecate.mag_apply_weight_gradients(params, grads, current_lr)
                 error_buffers.apply_for_active(params, pulse, current_lr)
-
-        # Component 3: capture baseline param norms at step 0 for drift tracking
-        if step == resume_step and gpu_model is not None and not level_param_norms_init:
-            if hasattr(gpu_model, "memory_norms"):
-                level_param_norms_init = list(gpu_model.memory_norms())
 
         if math.isnan(loss) or math.isinf(loss):
             print(f"  step {step:5d}  loss={loss} — ABORTING (NaN/Inf detected)")
@@ -496,8 +504,6 @@ def run_build(bcfg: BuildConfig):
 
         ppl = math.exp(min(loss, 20.0))
 
-        log_this = (step % bcfg.log_every == 0 or step == end_step - 1
-                    or (step < 100 and step % 10 == 0))
         if log_this:
             t_now = time.perf_counter()
             window_steps = (step + 1) - window_step_start  # steps [window_start, step] inclusive
@@ -522,13 +528,16 @@ def run_build(bcfg: BuildConfig):
             msg += f"  rss={rss_mb():.0f}MB"
             print(msg)
 
-            # Component 2: dead level detection — rolling window STOP THE LINE warning
+            # Component 2: dead level detection (active-step samples only).
+            # level_gnorm_history only contains entries for steps where the level
+            # fired, so no inactive-step zeros can false-trigger the warning.
             for i, hist in enumerate(level_gnorm_history):
-                if (len(hist) >= _DEAD_LEVEL_WINDOW
-                        and sum(hist) / len(hist) < _DEAD_LEVEL_THRESHOLD):
-                    win_avg = sum(hist) / len(hist)
+                if len(hist) < _DEAD_LEVEL_MIN_SAMPLES:
+                    continue  # too few active samples — defer judgment
+                win_avg = sum(hist) / len(hist)
+                if win_avg < _DEAD_LEVEL_THRESHOLD:
                     print(f"  WARNING: Level {i} dead — "
-                          f"{_DEAD_LEVEL_WINDOW}-step gnorm avg {win_avg:.2e} "
+                          f"{len(hist)}-sample active gnorm avg {win_avg:.2e} "
                           f"< {_DEAD_LEVEL_THRESHOLD:.0e} — STOP THE LINE")
 
         if jsonl and (step % bcfg.log_every == 0 or step == end_step - 1):
@@ -563,20 +572,23 @@ def run_build(bcfg: BuildConfig):
             level3_prev_fires = level3_total_fires
             level3_prev_active = level3_active_fires
 
-        # Component 4: level activity heatmap at eval intervals
+        # Component 4: level activity heatmap at eval intervals.
+        # Stats computed over active-step samples only (same as dead level check).
         if (jsonl and bcfg.eval_every > 0 and step > 0
                 and step % bcfg.eval_every == 0):
             heatmap_levels = []
             for i in range(bcfg.k):
                 hist = level_gnorm_history[i]
-                win_avg = sum(hist) / len(hist) if hist else 0.0
-                win_min = min(hist) if hist else 0.0
-                win_max = max(hist) if hist else 0.0
-                is_dead = (len(hist) >= _DEAD_LEVEL_WINDOW
+                n_samples = len(hist)
+                win_avg = sum(hist) / n_samples if n_samples else 0.0
+                win_min = min(hist) if n_samples else 0.0
+                win_max = max(hist) if n_samples else 0.0
+                is_dead = (n_samples >= _DEAD_LEVEL_MIN_SAMPLES
                            and win_avg < _DEAD_LEVEL_THRESHOLD)
                 heatmap_levels.append({
                     "level": i,
                     "fires": level_fire_counts[i],
+                    "active_samples": n_samples,
                     "gnorm_avg": round(win_avg, 6),
                     "gnorm_min": round(win_min, 6),
                     "gnorm_max": round(win_max, 6),

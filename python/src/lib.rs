@@ -1706,10 +1706,11 @@ impl GpuModel {
     /// Full GPU build step with AdamW optimizer. Returns (loss, grad_norm).
     /// Zero PCIe traffic for weights — only input_ids, target_ids, and loss cross the bus.
     /// AdamW state is lazily created on first call.
-    #[pyo3(signature = (input_ids, target_ids, pulse, lr, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.1, max_grad_norm=1.0))]
+    #[pyo3(signature = (input_ids, target_ids, pulse, lr, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.1, max_grad_norm=1.0, collect_level_gnorms=false))]
     fn step_adamw(&mut self, input_ids: Vec<usize>, target_ids: Vec<usize>,
                   pulse: &Pulse, lr: f32, beta1: f32, beta2: f32,
-                  eps: f32, weight_decay: f32, max_grad_norm: f32) -> PyResult<(f32, f32)> {
+                  eps: f32, weight_decay: f32, max_grad_norm: f32,
+                  collect_level_gnorms: bool) -> PyResult<(f32, f32)> {
         let s = self.cfg.swa.seq_len;
         let v = self.cfg.swa.vocab_size;
         if s == 0 {
@@ -1747,10 +1748,14 @@ impl GpuModel {
         }
         let state = self.adamw_state.as_mut().unwrap();
 
-        // Per-level gradient norms before clipping (pre-clip = true learning signal).
-        // Stored for level_grad_norms() — dead level detection reads this each step.
-        self.last_level_gnorms =
-            nl_hecate_core::gpu_optimizer::gpu_per_level_grad_norms(&grads, state);
+        // Per-level gradient norms before clipping — opt-in to avoid overhead on
+        // steps where the caller won't read them (e.g., non-logging steps).
+        if collect_level_gnorms {
+            self.last_level_gnorms =
+                nl_hecate_core::gpu_optimizer::gpu_per_level_grad_norms(&grads, state);
+        } else {
+            self.last_level_gnorms.clear();
+        }
 
         // AdamW update (Pulse-gated, with grad clipping)
         let grad_norm = nl_hecate_core::gpu_optimizer::gpu_adamw_update(
