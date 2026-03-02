@@ -1534,6 +1534,9 @@ struct GpuModel {
     /// TNT periodic reset mode. When true, context.memory[k] is zeroed after
     /// each step where pulse.active_levels[k] is true (eq-006, 2511.07343).
     memory_reset: bool,
+    /// Per-level gradient norms from the most recent step_adamw call, computed
+    /// before global gradient clipping. Empty until the first step_adamw call.
+    last_level_gnorms: Vec<f32>,
 }
 
 #[cfg(feature = "cuda")]
@@ -1558,6 +1561,7 @@ impl GpuModel {
             kv_cache: None,
             decode_workspace: None,
             memory_reset,
+            last_level_gnorms: Vec::new(),
         })
     }
 
@@ -1578,6 +1582,7 @@ impl GpuModel {
             kv_cache: None,
             decode_workspace: None,
             memory_reset,
+            last_level_gnorms: Vec::new(),
         })
     }
 
@@ -1741,6 +1746,11 @@ impl GpuModel {
             );
         }
         let state = self.adamw_state.as_mut().unwrap();
+
+        // Per-level gradient norms before clipping (pre-clip = true learning signal).
+        // Stored for level_grad_norms() — dead level detection reads this each step.
+        self.last_level_gnorms =
+            nl_hecate_core::gpu_optimizer::gpu_per_level_grad_norms(&grads, state);
 
         // AdamW update (Pulse-gated, with grad clipping)
         let grad_norm = nl_hecate_core::gpu_optimizer::gpu_adamw_update(
@@ -1956,6 +1966,14 @@ impl GpuModel {
             level.b_eta.copy_to_host(&mut be);
             (ba[0], bt[0], be[0])
         }).collect()
+    }
+
+    /// Per-level gradient norms from the most recent step_adamw call.
+    /// Computed before global gradient clipping, so values reflect the true
+    /// learning signal per level (not scaled by the global clipping factor).
+    /// Returns empty Vec if step_adamw has not been called yet.
+    fn level_grad_norms(&self) -> Vec<f32> {
+        self.last_level_gnorms.clone()
     }
 }
 

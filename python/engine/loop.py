@@ -5,6 +5,7 @@ import json
 import math
 import os
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Optional
 
@@ -353,6 +354,16 @@ def run_build(bcfg: BuildConfig):
     phase_val_data: dict[str, tuple] = {}
     min_stories_loss: float | None = None
 
+    # ── task_cc7eda: CMS health monitoring ───────────────────────────
+    # Rolling 100-step gnorm window per level for dead level detection.
+    _DEAD_LEVEL_WINDOW = 100
+    _DEAD_LEVEL_THRESHOLD = 1e-4
+    level_gnorm_history: list[deque] = [deque(maxlen=_DEAD_LEVEL_WINDOW) for _ in range(bcfg.k)]
+    # Per-level gnorms for current step (empty until first step_adamw call).
+    level_gnorms: list[float] = []
+    # Initial per-level param norms captured at step 0 for drift tracking.
+    level_param_norms_init: list[float] = []
+
     losses = []
     t_start = time.perf_counter()
     t_window_start = t_start
@@ -427,6 +438,12 @@ def run_build(bcfg: BuildConfig):
                 weight_decay=bcfg.weight_decay,
                 max_grad_norm=bcfg.max_grad_norm,
             )
+            # Component 1+2: collect per-level gnorms for monitoring
+            if hasattr(gpu_model, "level_grad_norms"):
+                level_gnorms = gpu_model.level_grad_norms()
+                for i, n in enumerate(level_gnorms):
+                    if i < len(level_gnorm_history):
+                        level_gnorm_history[i].append(n)
         elif gpu_model is not None and adamw_opt is None:
             loss = gpu_model.step(input_ids, target_ids, pulse, current_lr)
         elif gpu_model is not None and adamw_opt is not None:
@@ -446,6 +463,11 @@ def run_build(bcfg: BuildConfig):
             else:
                 nl_hecate.mag_apply_weight_gradients(params, grads, current_lr)
                 error_buffers.apply_for_active(params, pulse, current_lr)
+
+        # Component 3: capture baseline param norms at step 0 for drift tracking
+        if step == resume_step and gpu_model is not None and not level_param_norms_init:
+            if hasattr(gpu_model, "memory_norms"):
+                level_param_norms_init = list(gpu_model.memory_norms())
 
         if math.isnan(loss) or math.isinf(loss):
             print(f"  step {step:5d}  loss={loss} — ABORTING (NaN/Inf detected)")
@@ -491,10 +513,23 @@ def run_build(bcfg: BuildConfig):
                 msg += f"  tok/s={tok_per_sec:.0f}"
             if g_norm > 0:
                 msg += f"  gnorm={g_norm:.4f}"
+            # Component 1: per-level gnorm breakdown (e.g. gnorm_l=[2.1,0.8,0.3,0.02])
+            if level_gnorms:
+                lgnorm_str = ",".join(f"{n:.3f}" for n in level_gnorms)
+                msg += f"  gnorm_l=[{lgnorm_str}]"
             if adamw_opt or use_adamw_gpu:
                 msg += f"  lr={current_lr:.6f}"
             msg += f"  rss={rss_mb():.0f}MB"
             print(msg)
+
+            # Component 2: dead level detection — rolling window STOP THE LINE warning
+            for i, hist in enumerate(level_gnorm_history):
+                if (len(hist) >= _DEAD_LEVEL_WINDOW
+                        and sum(hist) / len(hist) < _DEAD_LEVEL_THRESHOLD):
+                    win_avg = sum(hist) / len(hist)
+                    print(f"  WARNING: Level {i} dead — "
+                          f"{_DEAD_LEVEL_WINDOW}-step gnorm avg {win_avg:.2e} "
+                          f"< {_DEAD_LEVEL_THRESHOLD:.0e} — STOP THE LINE")
 
         if jsonl and (step % bcfg.log_every == 0 or step == end_step - 1):
             log_fields: dict[str, Any] = dict(
@@ -509,6 +544,9 @@ def run_build(bcfg: BuildConfig):
             if gpu_model is not None and hasattr(gpu_model, "gate_biases"):
                 log_fields["gate_biases"] = gpu_model.gate_biases()
             log_fields["level_fires"] = list(level_fire_counts)
+            # Component 1: per-level gnorms in JSONL
+            if level_gnorms:
+                log_fields["level_grad_norms"] = [round(n, 6) for n in level_gnorms]
             if (bcfg.eval_every > 0 and step % bcfg.eval_every == 0
                     and gpu_model is not None
                     and hasattr(gpu_model, "memory_norms")):
@@ -524,6 +562,27 @@ def run_build(bcfg: BuildConfig):
                       active=l3_active_delta)
             level3_prev_fires = level3_total_fires
             level3_prev_active = level3_active_fires
+
+        # Component 4: level activity heatmap at eval intervals
+        if (jsonl and bcfg.eval_every > 0 and step > 0
+                and step % bcfg.eval_every == 0):
+            heatmap_levels = []
+            for i in range(bcfg.k):
+                hist = level_gnorm_history[i]
+                win_avg = sum(hist) / len(hist) if hist else 0.0
+                win_min = min(hist) if hist else 0.0
+                win_max = max(hist) if hist else 0.0
+                is_dead = (len(hist) >= _DEAD_LEVEL_WINDOW
+                           and win_avg < _DEAD_LEVEL_THRESHOLD)
+                heatmap_levels.append({
+                    "level": i,
+                    "fires": level_fire_counts[i],
+                    "gnorm_avg": round(win_avg, 6),
+                    "gnorm_min": round(win_min, 6),
+                    "gnorm_max": round(win_max, 6),
+                    "dead": is_dead,
+                })
+            jsonl.log(event="level_heatmap", step=step, levels=heatmap_levels)
 
         if (bcfg.eval_every > 0 and val_loader is not None
                 and step > 0 and step % bcfg.eval_every == 0):
@@ -662,6 +721,23 @@ def run_build(bcfg: BuildConfig):
                 sidecar = Path(str(ckpt_path) + ".cursor.json")
                 sidecar.write_text(json.dumps(bpe_loader.cursor(), indent=2))
             print(f"  [checkpoint saved: {ckpt_path}]")
+
+            # Component 3: per-level parameter drift (||M_t||_F vs ||M_0||_F)
+            # Uses memory_norms as proxy for parameter magnitude per level.
+            # ||M_t - M_0|| is approximated by tracking norm evolution over time
+            # since storing full initial M tensors would require d*d*k floats.
+            if jsonl and gpu_model is not None and hasattr(gpu_model, "memory_norms"):
+                cur_norms = list(gpu_model.memory_norms())
+                drift_info = []
+                for i, cur_n in enumerate(cur_norms):
+                    init_n = level_param_norms_init[i] if i < len(level_param_norms_init) else 0.0
+                    drift_info.append({
+                        "level": i,
+                        "norm_init": round(init_n, 6),
+                        "norm_now": round(cur_n, 6),
+                        "norm_ratio": round(cur_n / init_n, 4) if init_n > 1e-8 else None,
+                    })
+                jsonl.log(event="level_param_drift", step=step, levels=drift_info)
 
             # S4-M7: Checkpoint roundtrip verification
             if use_gpu:
