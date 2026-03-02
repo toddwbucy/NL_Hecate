@@ -632,6 +632,9 @@ fn gpu_memory_forward(
 ///
 /// Supported rules: DeltaRule, TitansLMM. Other rules fall back to standard dispatch.
 #[cfg(feature = "cuda")]
+/// Returns `false` for unsupported rule/checkpoint combos — caller must abort capture and
+/// fall back to standard dispatch. Never panics so a misconfigured rule does not
+/// hard-abort during a GPU capture window.
 fn gpu_memory_forward_into_scratch(
     level_params: &crate::gpu_params::GpuMemoryLevelParams,
     cfg: &MAGConfig,
@@ -642,7 +645,7 @@ fn gpu_memory_forward_into_scratch(
     d: usize,
     level: usize,
     batch_size: usize,
-) {
+) -> bool {
     let bs = batch_size;
     let dd = d * d;
     let tokens_i32 = i32::try_from(bs * s).expect("bs*s exceeds i32::MAX");
@@ -684,6 +687,7 @@ fn gpu_memory_forward_into_scratch(
                 &m_initial_slice, &mut scratch.m_states, &mut scratch.y, s, d, bs,
             );
             // NOTE: copy_final_m_batch is NOT called here — caller does it outside the graph.
+            true
         }
         (None, MemoryRuleKind::TitansLMM) => {
             // Eta gate for Titans
@@ -709,10 +713,12 @@ fn gpu_memory_forward_into_scratch(
                 );
                 // NOTE: copy_final_m_batch NOT called here — caller does it outside the graph.
             }
+            true
         }
         _ => {
-            // Unsupported rule for scratch path — caller should fall back to standard dispatch.
-            panic!("gpu_memory_forward_into_scratch: unsupported rule {:?} (use standard dispatch)", cfg.memory_rule);
+            // Unsupported rule/checkpoint combo for scratch path — signal caller to fall back.
+            eprintln!("[cuda_graph] gpu_memory_forward_into_scratch: unsupported rule {:?} — disabling graph capture", cfg.memory_rule);
+            false
         }
     }
 }
@@ -729,18 +735,18 @@ unsafe fn memory_cache_from_scratch(
     bs: usize,
     s: usize,
     d: usize,
-) -> GpuMemoryCache {
+) -> Option<GpuMemoryCache> {
     let dd = d * d;
     match (cfg.checkpoint_interval, cfg.memory_rule) {
-        (None, MemoryRuleKind::DeltaRule) => GpuMemoryCache::Delta {
+        (None, MemoryRuleKind::DeltaRule) => Some(GpuMemoryCache::Delta {
             k_mem:    GpuBuf::from_raw_non_owning(scratch.k_mem.ptr(), bs * s * d),
             v_mem:    GpuBuf::from_raw_non_owning(scratch.v_mem.ptr(), bs * s * d),
             q_mem:    GpuBuf::from_raw_non_owning(scratch.q_mem.ptr(), bs * s * d),
             alpha:    GpuBuf::from_raw_non_owning(scratch.alpha.ptr(), bs * s),
             theta:    GpuBuf::from_raw_non_owning(scratch.theta.ptr(), bs * s),
             m_states: GpuBuf::from_raw_non_owning(scratch.m_states.ptr(), bs * (s + 1) * dd),
-        },
-        (None, MemoryRuleKind::TitansLMM) => GpuMemoryCache::Titans {
+        }),
+        (None, MemoryRuleKind::TitansLMM) => Some(GpuMemoryCache::Titans {
             k_mem:    GpuBuf::from_raw_non_owning(scratch.k_mem.ptr(), bs * s * d),
             v_mem:    GpuBuf::from_raw_non_owning(scratch.v_mem.ptr(), bs * s * d),
             q_mem:    GpuBuf::from_raw_non_owning(scratch.q_mem.ptr(), bs * s * d),
@@ -749,8 +755,8 @@ unsafe fn memory_cache_from_scratch(
             eta:      GpuBuf::from_raw_non_owning(scratch.eta.ptr(), bs * s),
             m_states: GpuBuf::from_raw_non_owning(scratch.m_states.ptr(), bs * (s + 1) * dd),
             s_states: GpuBuf::from_raw_non_owning(scratch.s_states.ptr(), bs * (s + 1) * dd),
-        },
-        _ => panic!("memory_cache_from_scratch: unsupported rule {:?}", cfg.memory_rule),
+        }),
+        _ => None,  // Unsupported rule — caller (gpu_cms_replay) returns None → standard dispatch
     }
 }
 
@@ -902,10 +908,16 @@ fn gpu_cms_capture_all_patterns(
                 let lvl_scratch = unsafe { &mut *lvl_ptr.add(level) };
                 let context_m_ptr = &context.memory[level] as *const GpuBuf<f32>;
                 let context_m = unsafe { &*context_m_ptr };
-                gpu_memory_forward_into_scratch(
+                if !gpu_memory_forward_into_scratch(
                     &params.levels[level], cfg, &fwd.embedded,
                     context_m, lvl_scratch, s, d, level, bs,
-                );
+                ) {
+                    // Unsupported rule: end the capture cleanly to release the stream,
+                    // then disable graph capture entirely and fall back to standard dispatch.
+                    let _ = context.cuda_graph.end_capture(bitmask);
+                    context.cuda_graph.disable();
+                    return;
+                }
                 // y_per_level[level] ← scratch.y (copy into forward_scratch.y_per_level)
                 unsafe {
                     let rc = gpu_buf_memcpy_d2d(
@@ -975,7 +987,7 @@ fn gpu_cms_capture_all_patterns(
     }
 
     eprintln!("[cuda_graph] Captured {} patterns at step {}.",
-              REACHABLE_BITMASKS_K4.len(), context.cuda_graph.steps_seen);
+              reachable.len(), context.cuda_graph.steps_seen);
     let _ = (nh, hd, ws, total_i32, v_i32, d_i32, tokens_i32); // suppress unused warnings
 }
 
@@ -1073,7 +1085,7 @@ fn gpu_cms_replay(
             || matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp);
         if is_active {
             let lvl = &context.level_scratch[level];
-            let cache = unsafe { memory_cache_from_scratch(lvl, cfg, bs, s, d) };
+            let cache = unsafe { memory_cache_from_scratch(lvl, cfg, bs, s, d)? };
             memory_caches.push(Some(cache));
             let y = unsafe { GpuBuf::from_raw_non_owning(lvl.y.ptr(), bs * s * d) };
             y_per_level.push(y);

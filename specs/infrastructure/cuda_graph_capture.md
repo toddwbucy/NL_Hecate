@@ -8,8 +8,8 @@ CONTRACT
               kernels individually from the CPU host thread — eliminating per-step
               CPU→GPU kernel dispatch overhead entirely for steady-state training.
   Expects:    Primary model (TitansLMM or DeltaRule + MAG + k=4) training-stable
-              with a validated loss curve. CUDA Toolkit 12.8+, driver ≥ 13.0,
-              target sm_86 (A6000 Ampere). GpuBuf<f32> arena sizes fixed at capture
+              with a validated loss curve. CUDA Toolkit 12.8+, driver ≥ 570.26
+              (Linux x86_64) / ≥ 570.65 (Windows x86_64), target sm_86 (A6000 Ampere). GpuBuf<f32> arena sizes fixed at capture
               time (they are: seq_len, d, batch_size are config-determined).
   Guarantees: Numerically identical output to non-captured dispatch on every step
               (CUDA graphs replay the same kernel code with the same pointer args).
@@ -79,33 +79,71 @@ L0 always fires (chunk_sizes[0]=1 → fires every step). Only 8 of the 16 possib
 
 ## 3. Capture Lifecycle
 
-```text
-warmup phase  (steps 0..WARMUP_STEPS-1):
-  - Standard dispatch (current behavior)
-  - GPU buffer layout stabilizes (alloc from fixed config, no realloc after step 0)
-  - No graph capture
+```rust
+fn gpu_cms_forward(context: &mut GpuContextState, pulse: &Pulse, /* ... */) {
+    context.cuda_graph.step();
 
-capture phase (step == WARMUP_STEPS):
-  - For each of the 8 reachable pulse patterns:
-    1. Reset GpuContextState to known-good state
-    2. cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal)
-    3. Run full gpu_memory_forward() for this pulse pattern
-    4. cudaStreamEndCapture(stream, &graph_raw)
-    5. cudaGraphInstantiate(&exec, graph_raw, ...)
-    6. Store exec in CudaGraphStore[bitmask]
-    7. cudaGraphDestroy(graph_raw)
-  - Fallback: if any capture fails, set store to Disabled; log warning
+    // ── Warmup phase (steps 0..warmup_steps-1) ──────────────────────────
+    // Standard dispatch; GPU buffer layout stabilises from fixed config.
+    // CudaGraphStore::should_capture() and should_replay() both return false.
 
-replay phase  (steps > WARMUP_STEPS):
-  - Compute bitmask from pulse.active_levels
-  - If store.has(bitmask): cudaGraphLaunch(store[bitmask], stream)
-  - Else: standard dispatch (pattern not captured, shouldn't happen for k=4)
-  - Tape metadata recording proceeds on CPU as usual (unchanged)
+    // ── Capture phase (step == warmup_steps) ────────────────────────────
+    if context.cuda_graph.should_capture() {
+        for bitmask in REACHABLE_BITMASKS_K4 {
+            // Restore context_m to known-good state before each capture.
+            context.restore_saved_m();
 
-invalidation:
-  - On checkpoint resume: if buffer layout changes (d or seq_len differ),
-    call CudaGraphStore::invalidate() → drops all cudaGraphExec_t handles
-    and re-enters warmup phase
+            // Begin capturing all work submitted to the default stream.
+            if !context.cuda_graph.begin_capture() {
+                // cudaStreamBeginCapture failed — disable permanently.
+                context.cuda_graph.disable();
+                return;
+            }
+
+            // Record kernel launches into the graph (scratch buffers have
+            // stable device pointers valid for the lifetime of `context`).
+            let ok = gpu_memory_forward_into_scratch(&params, cfg, pulse, context);
+            if !ok {
+                // Unsupported rule: end capture cleanly, then disable.
+                let _ = context.cuda_graph.end_capture(bitmask);
+                context.cuda_graph.disable();
+                return;
+            }
+
+            // Finalise: cudaStreamEndCapture → cudaGraphInstantiate →
+            // store exec; cudaGraphDestroy(raw_graph).
+            if !context.cuda_graph.end_capture(bitmask) {
+                context.cuda_graph.disable();
+                return;
+            }
+        }
+        // Restore context_m; the actual step will run via standard dispatch.
+        context.restore_saved_m();
+    }
+
+    // ── Replay phase (steps > warmup_steps) ─────────────────────────────
+    let bitmask = pulse_to_bitmask(pulse);
+    if context.cuda_graph.should_replay(bitmask) {
+        // cudaGraphLaunch(store[bitmask], stream=null)
+        if context.cuda_graph.replay(bitmask) {
+            return;  // GPU work submitted; tape recording continues on CPU.
+        }
+        // replay() returned false (CUDA error) — fall through to standard dispatch.
+    }
+
+    // Standard dispatch (warmup phase, replay miss, or capture disabled).
+    gpu_cms_forward_standard(context, pulse, /* ... */);
+}
+
+// ── Invalidation ────────────────────────────────────────────────────────
+// Called on checkpoint restore when d or seq_len change.
+impl CudaGraphStore {
+    pub fn invalidate(&mut self) {
+        self.graphs = std::array::from_fn(|_| None);  // drops all cudaGraphExec_t
+        self.steps_seen = 0;
+        self.enabled = self.warmup_steps > 0;          // re-enters warmup phase
+    }
+}
 ```
 
 ---
