@@ -1,0 +1,2 @@
+# .build-meta.json is machine-local (written by promote_artifacts.py)
+.build-meta.json

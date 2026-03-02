@@ -45,3 +45,6 @@ python/*.log
 
 # Hermes workspace config
 .hermes/
+
+# artifacts/.build-meta.json is machine-local (see artifacts/.gitignore)
+artifacts/.build-meta.json
