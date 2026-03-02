@@ -514,6 +514,9 @@ fn dispatch_read_only(
             "MAL dispatch_read_only reached SwiGluMlp — SwiGluMlp has no M state and must \
              always run the active path. Check that MAL caller uses effective_active for SwiGluMlp."
         ),
+        // HebbianRule and AtlasOmega do not yet support feature maps in their active
+        // step() (deferred to follow-on PR) — use Identity to stay consistent.
+        MemoryRuleKind::HebbianRule | MemoryRuleKind::AtlasOmega => delta_rule_read_only(level_params, embedded, frozen_ref, s, d, &crate::feature_map::FeatureMapKind::Identity),
         _ => delta_rule_read_only(level_params, embedded, frozen_ref, s, d, &cfg.feature_map),
     }
 }
@@ -539,6 +542,7 @@ fn dispatch_read_only_backward(
             "MAL dispatch_read_only_backward reached SwiGluMlp — SwiGluMlp has no M state and \
              must always run the active path. Check that MAL caller uses effective_active for SwiGluMlp."
         ),
+        MemoryRuleKind::HebbianRule | MemoryRuleKind::AtlasOmega => delta_rule_read_only_backward(level_params, frozen_m, q_mem, d_y, embedded, s, d, &crate::feature_map::FeatureMapKind::Identity),
         _ => delta_rule_read_only_backward(level_params, frozen_m, q_mem, d_y, embedded, s, d, &cfg.feature_map),
     }
 }

@@ -126,7 +126,7 @@ impl GpuMemoryLevelParams {
 
         let has_w_rand = !host.w_rand.is_empty();
         let has_b_rand = !host.b_rand.is_empty();
-        debug_assert_eq!(
+        assert_eq!(
             has_w_rand, has_b_rand,
             "GpuMemoryLevelParams::from_host: w_rand (len={}) and b_rand (len={}) must both be \
              non-empty or both be empty — mismatched FM pair indicates a corrupted host params",

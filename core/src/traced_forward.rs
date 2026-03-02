@@ -515,7 +515,11 @@ pub fn traced_cms_forward(
                     "SwiGluMlp has no frozen read-only path; \
                      inactive levels must run via the active path (effective_active=true)"
                 ),
-                // Delta, Titans, Hebbian, Atlas — all use matrix M: y = M @ q
+                // HebbianRule and AtlasOmega: no FM in active step() yet (deferred PR).
+                MemoryRuleKind::HebbianRule | MemoryRuleKind::AtlasOmega => delta_rule_read_only(
+                    &params.levels[level], &embedded, frozen_ref, s, d, &crate::feature_map::FeatureMapKind::Identity,
+                ),
+                // Delta, Titans — support configured feature map.
                 _ => delta_rule_read_only(
                     &params.levels[level], &embedded, frozen_ref, s, d, &cfg.feature_map,
                 ),
