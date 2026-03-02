@@ -629,8 +629,11 @@ def run_build(bcfg: BuildConfig):
                 and gpu_model is not None
                 and hasattr(gpu_model, "gate_biases")):
             biases = gpu_model.gate_biases()
-            l2_theta = math.log1p(math.exp(biases[2][1])) if len(biases) > 2 else 0.0
-            l3_theta = math.log1p(math.exp(biases[3][1])) if len(biases) > 3 else 0.0
+            def _softplus(x: float) -> float:
+                # Numerically stable: avoids exp() overflow for large positive x
+                return x + math.log1p(math.exp(-x)) if x > 0 else math.log1p(math.exp(x))
+            l2_theta = _softplus(biases[2][1]) if len(biases) > 2 else 0.0
+            l3_theta = _softplus(biases[3][1]) if len(biases) > 3 else 0.0
             l2_pass = l2_theta > bcfg.gate_warmup_l2_threshold
             l3_pass = l3_theta > bcfg.gate_warmup_l3_threshold
             verdict = "GO" if (l2_pass and l3_pass) else "NO-GO"

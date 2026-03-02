@@ -173,6 +173,9 @@ class BuildConfig:
             raise ValueError(
                 f"memory_reset must be 'carry_forward' or 'periodic', got '{self.memory_reset}'")
         if self.gate_warmup_theta_floor_init is not None:
+            if self.k < 4:
+                raise ValueError(
+                    f"gate_warmup requires k >= 4 (CMS L2/L3 levels), got k={self.k}")
             if len(self.gate_warmup_theta_floor_init) != self.k:
                 raise ValueError(
                     f"gate_warmup_theta_floor_init length "
@@ -180,6 +183,10 @@ class BuildConfig:
             if self.gate_warmup_decay_steps <= 0:
                 raise ValueError(
                     "gate_warmup_decay_steps must be > 0 when gate_warmup_theta_floor_init is set")
+            if self.gate_warmup_falsification_step < 0:
+                raise ValueError(
+                    f"gate_warmup_falsification_step must be >= 0, "
+                    f"got {self.gate_warmup_falsification_step}")
             if (self.gate_warmup_falsification_step > 0
                     and self.gate_warmup_falsification_step <= self.gate_warmup_decay_steps):
                 raise ValueError(
