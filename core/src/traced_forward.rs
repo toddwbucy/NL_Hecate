@@ -690,7 +690,7 @@ fn traced_active_level(
             let extra_meta = [crate::moneta::bias_to_f32(rule.bias), rule.sign_sharpness, mk_f32, rule.theta_floor, rule.theta_ceil];
             let (meta_id, lp_saved, emb_saved) =
                 alloc_common_saved(tape, level_params, embedded, s, d, &extra_meta);
-            let cache_ids = vec![
+            let mut cache_ids = vec![
                 tape.alloc(cache.m_states.clone(), vec![]),
                 tape.alloc(cache.s_states.clone(), vec![]),
                 tape.alloc(cache.k_mem.clone(), vec![]),
@@ -707,6 +707,12 @@ fn traced_active_level(
                 tape.alloc(cache.grad_outer.clone(), vec![]),
                 tape.alloc(cache.y.clone(), vec![]),
             ];
+            // Save DeltaMomentum decay buffer at saved[18] — backward adapter reads it there.
+            if rule.momentum_kind == crate::model::MomentumKind::DeltaMomentum {
+                assert!(!cache.decay.is_empty(),
+                    "traced_forward TitansLMM: DeltaMomentum produced empty decay buffer");
+                cache_ids.push(tape.alloc(cache.decay.clone(), vec![]));
+            }
             let y_id = tape.alloc(y.clone(), vec![s, d]);
             let mut saved = vec![meta_id, lp_saved, emb_saved];
             saved.extend(cache_ids);

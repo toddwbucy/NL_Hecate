@@ -1220,7 +1220,7 @@ impl OpaqueVjp for Trellis {
         &self, tape: &mut Tape, level_params: &MemoryLevelParams,
         embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
     ) -> (Vec<f32>, BufId, BufId, BufId) {
-        let extra_meta = [self.d_k as f32, self.lambda_k, self.lambda_v];
+        let extra_meta = [self.d_k as f32, self.lambda_k, self.lambda_v, self.theta_floor, self.theta_ceil];
         let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
             record_common_inputs(tape, level_params, embedded, seq_len, d, &extra_meta);
 
