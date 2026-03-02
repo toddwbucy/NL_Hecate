@@ -157,8 +157,8 @@ impl CudaGraphStore {
   buffers, same addresses
 
 ### `core/src/model.rs` / `python/src/lib.rs`
-- `GpuModel::new()` accepts `warmup_steps: usize` (default 100, 0 = disabled)
-- Python: `GpuModel.from_params(..., cuda_graph_warmup=100)`
+- `GpuModel::new()` accepts `warmup_steps: usize` (default 0 = disabled; set > 0 to enable capture)
+- Python: `GpuModel.from_params(..., cuda_graph_warmup=0)`  ← 0 disables; pass e.g. 100 to enable
 
 ### `core/src/gpu_backward.rs`
 - Backward graphs are captured identically if `backward_capture=True` (deferred:
