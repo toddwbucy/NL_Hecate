@@ -835,11 +835,11 @@ fn gpu_cms_capture_all_patterns(
         }
     }
 
-    let tokens_i32 = bs as i32 * s as i32;
-    let d_i32      = d as i32;
-    let v_i32      = v as i32;
+    let tokens_i32 = i32::try_from(bs * s).expect("bs*s exceeds i32::MAX");
+    let d_i32      = i32::try_from(d).expect("d_model exceeds i32::MAX");
+    let v_i32      = i32::try_from(v).expect("vocab_size exceeds i32::MAX");
     let total      = bs * s * d;
-    let total_i32  = total as i32;
+    let total_i32  = i32::try_from(total).expect("bs*s*d exceeds i32::MAX");
 
     for bitmask in reachable {
         // Restore context_m state before each capture
@@ -1007,9 +1007,9 @@ fn gpu_cms_replay(
     let dd = d * d;
 
     let fwd = context.forward_scratch.as_ref()?;
-    let d_i32     = d as i32;
-    let tokens_i32 = bs as i32 * s as i32;
-    let v_i32     = v as i32;
+    let d_i32      = i32::try_from(d).expect("d_model exceeds i32::MAX");
+    let tokens_i32 = i32::try_from(bs * s).expect("bs*s exceeds i32::MAX");
+    let v_i32      = i32::try_from(v).expect("vocab_size exceeds i32::MAX");
 
     // H2D upload BEFORE graph launch (outside captured region, on default stream)
     unsafe {

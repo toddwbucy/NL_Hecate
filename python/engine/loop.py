@@ -620,8 +620,8 @@ def run_build(bcfg: BuildConfig):
             # ── Learning probes (CS-10: model learns during eval) ─────
             snapshot = None
             if gpu_model is not None and tokenizer is not None:
-                snapshot = full_snapshot(gpu_model)
                 try:
+                    snapshot = full_snapshot(gpu_model)
                     # Probe 1: within-generation learning curve
                     # Restore between probes: step_generate modifies params
                     for prompt_text in EVAL_PROMPTS:
@@ -669,8 +669,9 @@ def run_build(bcfg: BuildConfig):
                 except Exception as e:
                     print(f"    [learning probe failed: {e}]")
                 finally:
-                    full_restore(gpu_model, snapshot)
-                    gpu_model.reset_optimizer()  # probes corrupt AdamW moments
+                    if snapshot is not None:
+                        full_restore(gpu_model, snapshot)
+                        gpu_model.reset_optimizer()  # probes corrupt AdamW moments
             # ── Memory vocab probe (logit lens for CMS levels) ────────
             if gpu_model is not None and tokenizer is not None:
                 try:
