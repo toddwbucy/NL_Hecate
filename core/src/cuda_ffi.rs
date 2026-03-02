@@ -384,6 +384,16 @@ extern "C" {
         seq_len: i32, d: i32, activation: i32,
     );
 
+    /// CS-39 theta clamp (forward): clamp each element in-place to [lo, hi].
+    /// No-op when lo == 0 and hi >= f32::MAX.
+    pub(crate) fn clamp_f32_cuda(inout: *mut f32, n: i32, lo: f32, hi: f32);
+
+    /// CS-39 theta clamp (backward): straight-through mask.
+    /// Zeroes d_theta[i] when theta[i] <= lo or theta[i] >= hi.
+    pub(crate) fn theta_clamp_mask_cuda(
+        theta: *const f32, d_theta: *mut f32, n: i32, lo: f32, hi: f32,
+    );
+
     /// Gate backward: accumulate d_w_alpha/theta/eta and d_b_alpha/theta/eta.
     /// has_theta=1 enables theta computation; has_eta=1 enables eta (Titans).
     /// When has_theta=0 or has_eta=0, corresponding pointer args are ignored.

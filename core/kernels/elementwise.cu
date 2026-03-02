@@ -235,3 +235,46 @@ extern "C" void saxpy_cuda(float alpha, const float* x, float* y, int n) {
     int grid = (n + block - 1) / block;
     saxpy_kernel<<<grid, block>>>(alpha, x, y, n);
 }
+
+// ── CS-39 theta clamp (forward): clamp each element in-place to [lo, hi] ─
+// Applied after gate_compute_cuda softplus output for theta.
+
+__global__ void clamp_f32_kernel(float* __restrict__ inout, int n, float lo, float hi) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = inout[i];
+        inout[i] = fmaxf(lo, fminf(hi, v));
+    }
+}
+
+extern "C" void clamp_f32_cuda(float* inout, int n, float lo, float hi) {
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    clamp_f32_kernel<<<grid, block>>>(inout, n, lo, hi);
+}
+
+// ── CS-39 theta clamp (backward): straight-through mask ──────────────────
+// Zeros d_theta[t] when theta[t] is at the clamp boundary (lo or hi),
+// preserving gradient only when the clamp is inactive (lo < theta < hi).
+// Mirrors CPU: clamp_mask = 0 if theta <= floor || theta >= ceil, else 1.
+
+__global__ void theta_clamp_mask_kernel(
+    const float* __restrict__ theta, float* __restrict__ d_theta,
+    int n, float lo, float hi)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float t = theta[i];
+        if (t <= lo || t >= hi) {
+            d_theta[i] = 0.0f;
+        }
+    }
+}
+
+extern "C" void theta_clamp_mask_cuda(
+    const float* theta, float* d_theta, int n, float lo, float hi)
+{
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    theta_clamp_mask_kernel<<<grid, block>>>(theta, d_theta, n, lo, hi);
+}
