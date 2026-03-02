@@ -534,13 +534,45 @@ pub fn traced_cms_forward(
                 cfg.memory_rule,
             );
 
-            // Record frozen opaque block: input = q_mem_id, saved = [meta, m_frozen]
+            // Determine which feature map was applied in this frozen level.
+            // Only DeltaRule/TitansLMM support cfg.feature_map; all others use Identity.
+            let effective_fm = match cfg.memory_rule {
+                MemoryRuleKind::DeltaRule | MemoryRuleKind::TitansLMM => &cfg.feature_map,
+                _ => &crate::feature_map::FeatureMapKind::Identity,
+            };
+            let has_fm = !matches!(effective_fm, crate::feature_map::FeatureMapKind::Identity);
+
+            // Compute z_q_mem (phi pre-activations) so backward can apply the phi VJP.
+            // Re-running apply_batch on q_mem is cheap: w_rand is frozen, same inputs.
+            let fm_z_q_save = if has_fm {
+                let (_, z) = crate::feature_map::apply_batch(
+                    &q_mem_data, effective_fm,
+                    &params.levels[level].w_rand, &params.levels[level].b_rand, s, d,
+                );
+                z
+            } else {
+                vec![]
+            };
+            let (fm_kind_f32, fm_sigma) = match effective_fm {
+                crate::feature_map::FeatureMapKind::Identity => (0.0f32, 1.0f32),
+                crate::feature_map::FeatureMapKind::RandomFourier { sigma } => (1.0f32, *sigma),
+                crate::feature_map::FeatureMapKind::ELU => (2.0f32, 1.0f32),
+            };
+
+            // Record frozen opaque block.
+            // Meta: [s, d, fm_kind_f32, fm_sigma] (Identity: fm_kind=0, old tapes had len=2).
+            // Extra saves (if non-Identity): fm_z_q_mem, w_rand.
             let fk = frozen_opaque_key(cfg.memory_rule);
-            let meta = vec![s as f32, d as f32];
+            let meta = vec![s as f32, d as f32, fm_kind_f32, fm_sigma];
             let meta_id = tape.alloc(meta, vec![]);
             let m_saved = tape.alloc(frozen_ref.to_vec(), vec![]);
             let y_id = tape.alloc(y_data.clone(), vec![s, d]);
-            tape.record_opaque(fk, vec![q_mem_id], vec![y_id], vec![meta_id, m_saved]);
+            let mut tape_saved = vec![meta_id, m_saved];
+            if has_fm {
+                tape_saved.push(tape.alloc(fm_z_q_save, vec![]));
+                tape_saved.push(tape.alloc(params.levels[level].w_rand.clone(), vec![]));
+            }
+            tape.record_opaque(fk, vec![q_mem_id], vec![y_id], tape_saved);
 
             y_ids.push(y_id);
             y_per_level_data.push(y_data);

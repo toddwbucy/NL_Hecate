@@ -911,26 +911,57 @@ fn frozen_read_backward(
     saved: &[&[f32]],
     d_inputs: &mut [Vec<f32>],
 ) {
-    let (seq_len, d) = read_meta_2(saved[0]);
+    // meta layout:
+    //   [s, d]                       (old / Identity, len=2)
+    //   [s, d, fm_kind_f32, fm_sigma] (new / non-Identity, len=4)
+    let seq_len = saved[0][0] as usize;
+    let d      = saved[0][1] as usize;
     let m_frozen = saved[1]; // d × d
     let d_y = d_outputs[0]; // seq_len × d
 
-    // d_q[t] = M^T @ d_y[t] for each token
-    let mut d_q = vec![0.0f32; seq_len * d];
+    // Decode feature map kind if present (backward-compat: old tapes have meta.len()==2).
+    let fm_kind = if saved[0].len() > 2 {
+        decode_feature_map_kind(saved[0][2], saved[0][3])
+    } else {
+        crate::feature_map::FeatureMapKind::Identity
+    };
+    let has_fm = !matches!(fm_kind, crate::feature_map::FeatureMapKind::Identity);
+
+    // Step 1: d_phi_q[t] = M^T @ d_y[t] — gradient w.r.t. phi(q_t)
+    let mut d_phi_q = vec![0.0f32; seq_len * d];
     let mut m_t = vec![0.0f32; d * d];
     tensor::transpose_f32(m_frozen, &mut m_t, d, d);
     for t in 0..seq_len {
         let dy_t = &d_y[t * d..(t + 1) * d];
-        let dq_t = &mut d_q[t * d..(t + 1) * d];
-        // dq_t = M^T @ dy_t
+        let dphi_t = &mut d_phi_q[t * d..(t + 1) * d];
         for i in 0..d {
             let mut sum = 0.0f32;
             for j in 0..d {
                 sum += m_t[i * d + j] * dy_t[j];
             }
-            dq_t[i] = sum;
+            dphi_t[i] = sum;
         }
     }
+
+    // Step 2: apply phi VJP — d_q[t] = vjp(d_phi_q[t], z_q[t], fm_kind, w_rand, d)
+    // For Identity: d_q = d_phi_q (no-op). For RFF/ELU: chain rule through phi.
+    let d_q = if has_fm {
+        assert!(saved.len() > 3,
+            "frozen_read_backward: has_fm=true but saved.len()={} < 4 — \
+             tape from incompatible version", saved.len());
+        let fm_z_q_mem = saved[2]; // [seq_len * d]
+        let w_rand     = saved[3]; // [d * d] (empty for ELU)
+        let mut d_q_out = vec![0.0f32; seq_len * d];
+        for t in 0..seq_len {
+            let d_phi_t = &d_phi_q[t * d..(t + 1) * d];
+            let z_t = &fm_z_q_mem[t * d..(t + 1) * d];
+            let d_q_t = crate::feature_map::vjp(d_phi_t, z_t, &fm_kind, w_rand, d);
+            d_q_out[t * d..(t + 1) * d].copy_from_slice(&d_q_t);
+        }
+        d_q_out
+    } else {
+        d_phi_q
+    };
 
     d_inputs[0] = d_q;
 }
@@ -1642,6 +1673,40 @@ mod tests {
         assert!((d_inputs[0][1] - 0.0).abs() < 1e-6); // d_q[0][1]
         assert!((d_inputs[0][2] - 0.0).abs() < 1e-6); // d_q[1][0]
         assert!((d_inputs[0][3] - 2.0).abs() < 1e-6); // d_q[1][1]
+    }
+
+    /// Like test_frozen_read_backward but with ELU phi (non-Identity path).
+    /// Verifies that the chain rule d_q = vjp(M^T @ d_y) is applied correctly.
+    #[test]
+    fn test_frozen_read_backward_elu() {
+        // d=2, seq_len=1, M=[[2,0],[0,3]], q=[2.0,-1.0]
+        // z_q = q (ELU: z = x), d_y = [1.0, 1.0]
+        //
+        // Step 1: d_phi_q = M^T @ d_y = [2·1+0·1, 0·1+3·1] = [2.0, 3.0]
+        // Step 2 (ELU vjp):
+        //   d_q[0] = d_phi_q[0] · 1         = 2.0         (z[0]=2.0 > 0)
+        //   d_q[1] = d_phi_q[1] · exp(z[1]) = 3·exp(-1.0) ≈ 1.1036
+        let meta = vec![
+            1.0f32, 2.0, // seq_len=1, d=2
+            2.0, 1.0,    // ELU kind=2, sigma unused=1
+        ];
+        let m_frozen  = vec![2.0f32, 0.0, 0.0, 3.0]; // [[2,0],[0,3]]
+        let fm_z_q    = vec![2.0f32, -1.0];            // z = q for ELU
+        let w_rand_empty: Vec<f32> = vec![];            // ELU needs no w_rand
+        let d_y = vec![1.0f32, 1.0];
+
+        let saved: Vec<&[f32]> = vec![&meta, &m_frozen, &fm_z_q, &w_rand_empty];
+        let d_outputs: Vec<&[f32]> = vec![&d_y];
+        let mut d_inputs = vec![vec![0.0f32; 2]];
+
+        frozen_read_backward(&d_outputs, &saved, &mut d_inputs);
+
+        let expected_0 = 2.0f32;
+        let expected_1 = 3.0f32 * (-1.0f32).exp(); // ≈ 1.10364
+        assert!((d_inputs[0][0] - expected_0).abs() < 1e-5,
+            "d_q[0]: expected {expected_0}, got {}", d_inputs[0][0]);
+        assert!((d_inputs[0][1] - expected_1).abs() < 1e-5,
+            "d_q[1]: expected {expected_1}, got {}", d_inputs[0][1]);
     }
 
     // ── OpaqueVjp round-trip tests ──────────────────────────────────
