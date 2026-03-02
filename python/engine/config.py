@@ -192,6 +192,12 @@ class BuildConfig:
                 raise ValueError(
                     f"gate_warmup_falsification_step ({self.gate_warmup_falsification_step}) "
                     f"must be > gate_warmup_decay_steps ({self.gate_warmup_decay_steps})")
+            if self.gate_warmup_l2_threshold <= 0:
+                raise ValueError(
+                    f"gate_warmup_l2_threshold must be > 0, got {self.gate_warmup_l2_threshold}")
+            if self.gate_warmup_l3_threshold <= 0:
+                raise ValueError(
+                    f"gate_warmup_l3_threshold must be > 0, got {self.gate_warmup_l3_threshold}")
 
     @property
     def head_dim(self) -> int:
