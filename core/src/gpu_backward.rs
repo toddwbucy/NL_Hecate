@@ -242,7 +242,7 @@ pub fn gpu_cms_backward(
                     &params.levels[level], cfg, mem_cache,
                     &d_y_combined, &cache.embedded,
                     &mut grads.levels[level],
-                    s, d, bs,
+                    s, d, level, bs,
                 );
                 // Accumulate d_embedded contribution
                 unsafe {
@@ -325,6 +325,7 @@ fn gpu_memory_backward(
     level_grads: &mut GpuLevelGrads,
     s: usize,
     d: usize,
+    level: usize,
     batch_size: usize,
 ) -> GpuBuf<f32> {
     let dd = d * d;
@@ -347,6 +348,17 @@ fn gpu_memory_backward(
                 &mut d_alpha, &mut d_theta, &mut d_m_initial,
                 s, d, batch_size,
             );
+
+            // CS-39 straight-through: zero d_theta where theta was clamped.
+            let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
+            let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
+            if theta_floor > 0.0 || theta_ceil < f32::MAX {
+                unsafe {
+                    crate::cuda_ffi::theta_clamp_mask_cuda(
+                        theta.as_ptr(), d_theta.ptr(), bs_s as i32, theta_floor, theta_ceil,
+                    );
+                }
+            }
 
             accumulate_projection_grads(
                 level_params, embedded,
@@ -374,6 +386,17 @@ fn gpu_memory_backward(
                 &mut d_m_initial, &mut d_s_initial,
                 s, d, batch_size,
             );
+
+            // CS-39 straight-through: zero d_theta where theta was clamped.
+            let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
+            let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
+            if theta_floor > 0.0 || theta_ceil < f32::MAX {
+                unsafe {
+                    crate::cuda_ffi::theta_clamp_mask_cuda(
+                        theta.as_ptr(), d_theta.ptr(), bs_s as i32, theta_floor, theta_ceil,
+                    );
+                }
+            }
 
             accumulate_projection_grads(
                 level_params, embedded,
@@ -412,8 +435,18 @@ fn gpu_memory_backward(
         // ── Checkpointed variants: segment-based backward ──────────
         GpuMemoryCache::DeltaCkpt { k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, checkpoint_interval } => {
             let c = *checkpoint_interval;
-            let (d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta) =
+            let (d_k_mem, d_v_mem, d_q_mem, d_alpha, mut d_theta) =
                 delta_backward_checkpointed(k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, d_y, s, d, c);
+            // CS-39 straight-through: zero d_theta where theta was clamped.
+            let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
+            let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
+            if theta_floor > 0.0 || theta_ceil < f32::MAX {
+                unsafe {
+                    crate::cuda_ffi::theta_clamp_mask_cuda(
+                        theta.as_ptr(), d_theta.ptr(), s as i32, theta_floor, theta_ceil,
+                    );
+                }
+            }
             accumulate_projection_grads(
                 level_params, embedded,
                 k_mem, v_mem, alpha, Some(theta), None,
@@ -424,8 +457,18 @@ fn gpu_memory_backward(
         }
         GpuMemoryCache::TitansCkpt { k_mem, v_mem, q_mem, alpha, theta, eta, m_checkpoints, s_checkpoints, checkpoint_interval } => {
             let c = *checkpoint_interval;
-            let (d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta, d_eta) =
+            let (d_k_mem, d_v_mem, d_q_mem, d_alpha, mut d_theta, d_eta) =
                 titans_backward_checkpointed(k_mem, v_mem, q_mem, alpha, theta, eta, m_checkpoints, s_checkpoints, d_y, s, d, c);
+            // CS-39 straight-through: zero d_theta where theta was clamped.
+            let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
+            let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
+            if theta_floor > 0.0 || theta_ceil < f32::MAX {
+                unsafe {
+                    crate::cuda_ffi::theta_clamp_mask_cuda(
+                        theta.as_ptr(), d_theta.ptr(), s as i32, theta_floor, theta_ceil,
+                    );
+                }
+            }
             accumulate_projection_grads(
                 level_params, embedded,
                 k_mem, v_mem, alpha, Some(theta), Some(eta),
@@ -463,6 +506,17 @@ fn gpu_memory_backward(
                 s, d, batch_size,
             );
 
+            // CS-39 straight-through: zero d_theta where theta was clamped.
+            let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
+            let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
+            if theta_floor > 0.0 || theta_ceil < f32::MAX {
+                unsafe {
+                    crate::cuda_ffi::theta_clamp_mask_cuda(
+                        theta.as_ptr(), d_theta.ptr(), bs_s as i32, theta_floor, theta_ceil,
+                    );
+                }
+            }
+
             accumulate_projection_grads(
                 level_params, embedded,
                 k_mem, v_mem, alpha, Some(theta), None,
@@ -473,8 +527,18 @@ fn gpu_memory_backward(
         }
         GpuMemoryCache::DGDCkpt { k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, checkpoint_interval } => {
             let c = *checkpoint_interval;
-            let (d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta) =
+            let (d_k_mem, d_v_mem, d_q_mem, d_alpha, mut d_theta) =
                 delta_backward_checkpointed(k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, d_y, s, d, c);
+            // CS-39 straight-through: zero d_theta where theta was clamped.
+            let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
+            let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
+            if theta_floor > 0.0 || theta_ceil < f32::MAX {
+                unsafe {
+                    crate::cuda_ffi::theta_clamp_mask_cuda(
+                        theta.as_ptr(), d_theta.ptr(), s as i32, theta_floor, theta_ceil,
+                    );
+                }
+            }
             accumulate_projection_grads(
                 level_params, embedded,
                 k_mem, v_mem, alpha, Some(theta), None,

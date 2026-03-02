@@ -38,7 +38,7 @@ fn test_chunkwise_smoke() {
 
     // Forward with C=2
     let (y, cache) = chunkwise_gd_forward(
-        &params.levels[0], &embedded, s, d, 2, &cfg, None,
+        &params.levels[0], &embedded, s, d, 2, &cfg, 0, None,
     );
     assert_eq!(y.len(), s * d);
     for &v in &y {
@@ -48,7 +48,7 @@ fn test_chunkwise_smoke() {
     // Backward
     let d_y = vec![1.0f32; s * d];
     let (grads, d_emb) = chunkwise_gd_backward(
-        &params.levels[0], &cache, &d_y, &embedded, &cfg,
+        &params.levels[0], &cache, &d_y, &embedded, &cfg, 0,
     );
     assert_eq!(d_emb.len(), s * d);
     let grad_norm: f32 = grads.w_k_mem.master().iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -65,10 +65,10 @@ fn test_chunkwise_c1_equivalence() {
     let d = cfg.swa.d_model;
 
     let (y_c1, _) = chunkwise_gd_forward(
-        &params.levels[0], &embedded, s, d, 1, &cfg, None,
+        &params.levels[0], &embedded, s, d, 1, &cfg, 0, None,
     );
     let (y_full, _) = chunkwise_gd_forward(
-        &params.levels[0], &embedded, s, d, s, &cfg, None,
+        &params.levels[0], &embedded, s, d, s, &cfg, 0, None,
     );
 
     let max_diff: f32 = y_c1.iter().zip(y_full.iter())
@@ -88,13 +88,13 @@ fn test_chunkwise_quality_degradation_curve() {
 
     // Baseline
     let (y_seq, _) = chunkwise_gd_forward(
-        &params.levels[0], &embedded, s, d, 1, &cfg, None,
+        &params.levels[0], &embedded, s, d, 1, &cfg, 0, None,
     );
 
     let mut prev_diff = 0.0f32;
     for c in [2, 4, s] {
         let (y_chunk, _) = chunkwise_gd_forward(
-            &params.levels[0], &embedded, s, d, c, &cfg, None,
+            &params.levels[0], &embedded, s, d, c, &cfg, 0, None,
         );
         let diff = relative_diff(&y_seq, &y_chunk);
 
@@ -128,7 +128,7 @@ fn test_chunkwise_convergence_comparison() {
 
     for step in 0..100 {
         let (y, cache) = chunkwise_gd_forward(
-            &params_c1.levels[0], &embedded, s, d, 1, &cfg, None,
+            &params_c1.levels[0], &embedded, s, d, 1, &cfg, 0, None,
         );
         let loss: f32 = y.iter().zip(target.iter())
             .map(|(a, b)| (a - b).powi(2)).sum::<f32>() / (s * d) as f32;
@@ -138,7 +138,7 @@ fn test_chunkwise_convergence_comparison() {
         let d_y: Vec<f32> = y.iter().zip(target.iter())
             .map(|(a, b)| 2.0 * (a - b) / (s * d) as f32).collect();
         let (grads, _) = chunkwise_gd_backward(
-            &params_c1.levels[0], &cache, &d_y, &embedded, &cfg,
+            &params_c1.levels[0], &cache, &d_y, &embedded, &cfg, 0,
         );
         for (w, g) in params_c1.levels[0].w_k_mem.master_mut().iter_mut().zip(grads.w_k_mem.master().iter()) { *w -= lr * g; }
         for (w, g) in params_c1.levels[0].w_v_mem.master_mut().iter_mut().zip(grads.w_v_mem.master().iter()) { *w -= lr * g; }
@@ -154,7 +154,7 @@ fn test_chunkwise_convergence_comparison() {
 
     for step in 0..100 {
         let (y, cache) = chunkwise_gd_forward(
-            &params_c2.levels[0], &embedded, s, d, 2, &cfg, None,
+            &params_c2.levels[0], &embedded, s, d, 2, &cfg, 0, None,
         );
         let loss: f32 = y.iter().zip(target.iter())
             .map(|(a, b)| (a - b).powi(2)).sum::<f32>() / (s * d) as f32;
@@ -163,7 +163,7 @@ fn test_chunkwise_convergence_comparison() {
         let d_y: Vec<f32> = y.iter().zip(target.iter())
             .map(|(a, b)| 2.0 * (a - b) / (s * d) as f32).collect();
         let (grads, _) = chunkwise_gd_backward(
-            &params_c2.levels[0], &cache, &d_y, &embedded, &cfg,
+            &params_c2.levels[0], &cache, &d_y, &embedded, &cfg, 0,
         );
         for (w, g) in params_c2.levels[0].w_k_mem.master_mut().iter_mut().zip(grads.w_k_mem.master().iter()) { *w -= lr * g; }
         for (w, g) in params_c2.levels[0].w_v_mem.master_mut().iter_mut().zip(grads.w_v_mem.master().iter()) { *w -= lr * g; }
@@ -197,7 +197,7 @@ fn test_chunkwise_cms_k2_compatibility() {
 
     for level in 0..cfg.k {
         let (y, cache) = chunkwise_gd_forward(
-            &params.levels[level], &embedded, s, d, 2, &cfg, None,
+            &params.levels[level], &embedded, s, d, 2, &cfg, level, None,
         );
         assert_eq!(y.len(), s * d, "level {level} output size mismatch");
 
@@ -208,7 +208,7 @@ fn test_chunkwise_cms_k2_compatibility() {
         // Backward should work
         let d_y = vec![1.0f32; s * d];
         let (grads, d_emb) = chunkwise_gd_backward(
-            &params.levels[level], &cache, &d_y, &embedded, &cfg,
+            &params.levels[level], &cache, &d_y, &embedded, &cfg, level,
         );
         assert_eq!(d_emb.len(), s * d);
 

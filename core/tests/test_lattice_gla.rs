@@ -29,14 +29,14 @@ fn test_lattice_gla_smoke() {
     let d = cfg.swa.d_model;
 
     let (y, cache) = lattice_gla_forward(
-        &params.levels[0], &embedded, s, d, 2, &cfg, None,
+        &params.levels[0], &embedded, s, d, 2, &cfg, 0, None,
     );
     assert_eq!(y.len(), s * d);
     for &v in &y { assert!(v.is_finite()); }
 
     let d_y = vec![1.0f32; s * d];
     let (grads, d_emb) = lattice_gla_backward(
-        &params.levels[0], &cache, &d_y, &embedded, &cfg,
+        &params.levels[0], &cache, &d_y, &embedded, &cfg, 0,
     );
     assert_eq!(d_emb.len(), s * d);
     let norm: f32 = grads.w_k_mem.master().iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -54,7 +54,7 @@ fn test_lattice_gla_cms_k2() {
 
     for level in 0..cfg.k {
         let (y, _) = lattice_gla_forward(
-            &params.levels[level], &embedded, s, d, 2, &cfg, None,
+            &params.levels[level], &embedded, s, d, 2, &cfg, level, None,
         );
         for &v in &y {
             assert!(v.is_finite(), "level {level} output not finite");
@@ -77,7 +77,7 @@ fn test_lattice_gla_quality_sweep() {
 
     // GLA with full sequence (no renormalization) should match
     let (y_full, _) = lattice_gla_forward(
-        &params.levels[0], &embedded, s, d, s, &cfg, None,
+        &params.levels[0], &embedded, s, d, s, &cfg, 0, None,
     );
     let diff_full: f32 = y_seq.iter().zip(y_full.iter())
         .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
@@ -85,7 +85,7 @@ fn test_lattice_gla_quality_sweep() {
 
     // GLA with chunk_size=2 may differ slightly
     let (y_c2, _) = lattice_gla_forward(
-        &params.levels[0], &embedded, s, d, 2, &cfg, None,
+        &params.levels[0], &embedded, s, d, 2, &cfg, 0, None,
     );
     let diff_c2: f32 = y_seq.iter().zip(y_c2.iter())
         .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
@@ -102,7 +102,7 @@ fn test_trellis_gla_smoke() {
     let d = cfg.swa.d_model;
 
     let (y, _) = trellis_gla_forward(
-        &params.levels[0], &embedded, s, d, 2, &cfg, None,
+        &params.levels[0], &embedded, s, d, 2, &cfg, 0, None,
     );
     assert_eq!(y.len(), s * d);
     for &v in &y { assert!(v.is_finite()); }

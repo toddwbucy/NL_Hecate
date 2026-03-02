@@ -430,6 +430,12 @@ fn gpu_memory_forward(
             b_theta_host[0], theta.ptr(),
             tokens_i32, d_i32, 1, // 1=softplus
         );
+        // CS-39: clamp post-softplus theta to [floor, ceil] per level.
+        let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
+        let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
+        if theta_floor > 0.0 || theta_ceil < f32::MAX {
+            crate::cuda_ffi::clamp_f32_cuda(theta.ptr(), tokens_i32, theta_floor, theta_ceil);
+        }
     }
 
     // context_m is [bs * dd] — slot b's initial M occupies offset b*dd.

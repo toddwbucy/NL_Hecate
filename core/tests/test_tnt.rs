@@ -33,11 +33,11 @@ fn test_tnt_smoke() {
     let d = cfg.swa.d_model;
     let tnt = tnt_cfg(2, 1);
 
-    let (y, cache) = tnt_forward(&params.levels[0], &embedded, s, d, &tnt, &cfg, None, None);
+    let (y, cache) = tnt_forward(&params.levels[0], &embedded, s, d, &tnt, &cfg, 0, None, None);
     assert_eq!(y.len(), s * d);
 
     let d_y = vec![1.0f32; s * d];
-    let (grads, d_emb, _) = tnt_backward(&params.levels[0], &cache, &d_y, &embedded, &tnt, &cfg, None);
+    let (grads, d_emb, _) = tnt_backward(&params.levels[0], &cache, &d_y, &embedded, &tnt, &cfg, 0, None);
     assert_eq!(d_emb.len(), s * d);
     let norm: f32 = grads.w_k_mem.master().iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(norm > 1e-10);
@@ -53,11 +53,11 @@ fn test_tnt_quality_comparison() {
     let d = cfg.swa.d_model;
 
     // Sequential baseline
-    let (y_seq, _) = chunkwise_gd_forward(&params.levels[0], &embedded, s, d, 1, &cfg, None);
+    let (y_seq, _) = chunkwise_gd_forward(&params.levels[0], &embedded, s, d, 1, &cfg, 0, None);
 
     // TNT with small shards
     let tnt = tnt_cfg(2, 1);
-    let (y_tnt, _) = tnt_forward(&params.levels[0], &embedded, s, d, &tnt, &cfg, None, None);
+    let (y_tnt, _) = tnt_forward(&params.levels[0], &embedded, s, d, &tnt, &cfg, 0, None, None);
 
     let max_diff: f32 = y_seq.iter().zip(y_tnt.iter())
         .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
@@ -84,7 +84,7 @@ fn test_tnt_convergence() {
     let mut last_loss = 0.0f32;
 
     for step in 0..50 {
-        let (y, cache) = tnt_forward(&level_params, &embedded, s, d, &tnt, &cfg, None, None);
+        let (y, cache) = tnt_forward(&level_params, &embedded, s, d, &tnt, &cfg, 0, None, None);
         let loss: f32 = y.iter().zip(target.iter())
             .map(|(a, b)| (a - b).powi(2)).sum::<f32>() / (s * d) as f32;
         if step == 0 { first_loss = loss; }
@@ -92,7 +92,7 @@ fn test_tnt_convergence() {
 
         let d_y: Vec<f32> = y.iter().zip(target.iter())
             .map(|(a, b)| 2.0 * (a - b) / (s * d) as f32).collect();
-        let (grads, _, _) = tnt_backward(&level_params, &cache, &d_y, &embedded, &tnt, &cfg, None);
+        let (grads, _, _) = tnt_backward(&level_params, &cache, &d_y, &embedded, &tnt, &cfg, 0, None);
 
         for (w, g) in level_params.w_k_mem.master_mut().iter_mut().zip(grads.w_k_mem.master().iter()) { *w -= lr * g; }
         for (w, g) in level_params.w_v_mem.master_mut().iter_mut().zip(grads.w_v_mem.master().iter()) { *w -= lr * g; }
@@ -121,7 +121,7 @@ fn test_tnt_cms_k2() {
     rng.fill_uniform(&mut embedded, 0.1);
 
     for level in 0..cfg.k {
-        let (y, _) = tnt_forward(&params.levels[level], &embedded, s, d, &tnt, &cfg, None, None);
+        let (y, _) = tnt_forward(&params.levels[level], &embedded, s, d, &tnt, &cfg, level, None, None);
         for &v in &y {
             assert!(v.is_finite(), "level {level} TNT output not finite");
         }
