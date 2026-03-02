@@ -1947,7 +1947,18 @@ impl GpuModel {
                 ctx.inner.memory.len(), ctx.inner.d, self.cfg.k, self.cfg.swa.d_model
             )));
         }
-        self.context = nl_hecate_core::gpu_params::GpuContextState::from_host_context(&ctx.inner, self.context.batch_size);
+        let mut new_ctx = nl_hecate_core::gpu_params::GpuContextState::from_host_context(&ctx.inner, self.context.batch_size);
+        // Preserve CUDA graph capture state across host-context restore.
+        // from_host_context creates CudaGraphStore::new(0) (disabled), so move the live
+        // store + scratch from the old context and call invalidate() to re-enter warmup.
+        new_ctx.forward_scratch = self.context.forward_scratch.take();
+        new_ctx.level_scratch = std::mem::take(&mut self.context.level_scratch);
+        new_ctx.cuda_graph = std::mem::replace(
+            &mut self.context.cuda_graph,
+            nl_hecate_core::cuda_graph::CudaGraphStore::new(0),
+        );
+        new_ctx.cuda_graph.invalidate();
+        self.context = new_ctx;
         Ok(())
     }
 

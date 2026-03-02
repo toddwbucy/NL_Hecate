@@ -113,9 +113,13 @@ impl CudaGraphStore {
 
     /// True for steps > warmup_steps when a graph has been captured for this bitmask.
     pub fn should_replay(&self, bitmask: u8) -> bool {
+        let idx = bitmask as usize;
+        if idx >= self.graphs.len() {
+            return false;
+        }
         self.enabled
             && self.steps_seen > self.warmup_steps
-            && self.graphs[bitmask as usize].is_some()
+            && self.graphs[idx].is_some()
     }
 
     /// Capture the default stream into a new graph exec for `bitmask`.
@@ -152,14 +156,23 @@ impl CudaGraphStore {
             return false;
         }
 
-        self.graphs[bitmask as usize] = Some(CudaGraphExec { handle: exec });
+        let idx = bitmask as usize;
+        if idx >= self.graphs.len() {
+            unsafe { cudaGraphExecDestroy(exec) };
+            return false;
+        }
+        self.graphs[idx] = Some(CudaGraphExec { handle: exec });
         true
     }
 
     /// Replay the captured graph for `bitmask` on the default stream.
     /// Returns `false` if no graph is stored for this bitmask.
     pub fn replay(&self, bitmask: u8) -> bool {
-        if let Some(exec) = &self.graphs[bitmask as usize] {
+        let idx = bitmask as usize;
+        if idx >= self.graphs.len() {
+            return false;
+        }
+        if let Some(exec) = &self.graphs[idx] {
             let rc = unsafe { cudaGraphLaunch(exec.handle, std::ptr::null_mut()) };
             rc == 0
         } else {
@@ -220,6 +233,9 @@ pub struct GpuLevelScratch {
     pub y: GpuBuf<f32>,
     /// Whether s_states is a real allocation (TitansLMM) or a dummy zeros(1).
     pub has_s_states: bool,
+    /// Initial momentum state for Titans — [bs * d*d]; zeros(1) for non-Titans.
+    /// Persistent (not transient) so captured graph nodes reference a stable device pointer.
+    pub s_initial: GpuBuf<f32>,
 }
 
 #[cfg(feature = "cuda")]
@@ -245,6 +261,11 @@ impl GpuLevelScratch {
             },
             y:        GpuBuf::zeros(bs * s * d),
             has_s_states,
+            s_initial: if has_s_states {
+                GpuBuf::zeros(bs * dd)  // Titans: persistent zero buffer, zeroed each step
+            } else {
+                GpuBuf::zeros(1)  // dummy — never used
+            },
         }
     }
 
@@ -287,6 +308,9 @@ pub struct ForwardScratch {
     pub loss_gpu:     GpuBuf<f32>,    // [1]
     /// Per-level output buffers (one GpuBuf<f32> per CMS level, [bs*s*d] each).
     pub y_per_level:  Vec<GpuBuf<f32>>,
+    /// Per-level q_mem temporaries for the frozen-level path — [bs*s*d] each.
+    /// Persistent so frozen-path kernel nodes captured in the graph reference stable pointers.
+    pub q_tmp_per_level: Vec<GpuBuf<f32>>,
 }
 
 #[cfg(feature = "cuda")]
@@ -319,6 +343,7 @@ impl ForwardScratch {
             logits:            GpuBuf::zeros(bs * s * v),
             loss_gpu:          GpuBuf::zeros(1),
             y_per_level:       (0..k).map(|_| GpuBuf::zeros(bs * s * d)).collect(),
+            q_tmp_per_level:   (0..k).map(|_| GpuBuf::zeros(bs * s * d)).collect(),
         }
     }
 }

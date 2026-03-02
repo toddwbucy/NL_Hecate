@@ -694,8 +694,10 @@ fn gpu_memory_forward_into_scratch(
                     tokens_i32, d_i32, 0,
                 );
             }
-            let s_initial = GpuBuf::<f32>::zeros(bs * dd); // Titans: s_initial always zero per chunk
-            let s_initial_slice = s_initial.slice(0, bs * dd);
+            // Use the persistent scratch.s_initial buffer (stable device pointer, safe for CUDA graph capture).
+            // Titans: s_initial is always zero per chunk; re-zero on each step.
+            scratch.s_initial.zero();
+            let s_initial_slice = scratch.s_initial.slice(0, bs * dd);
             if scratch.has_s_states {
                 scratch.m_states.zero();
                 scratch.s_states.zero();
@@ -914,11 +916,11 @@ fn gpu_cms_capture_all_patterns(
                     assert_eq!(rc, 0);
                 }
             } else {
-                // Frozen: q_mem @ M^T
-                let mut q_tmp = GpuBuf::zeros(bs * s * d);
+                // Frozen: q_mem @ M^T — use persistent scratch to keep device pointers
+                // stable across CUDA graph capture/replay (transient GpuBuf would dangle).
                 crate::dispatch::cublas_matmul_transb_dd(&fwd.embedded, &params.levels[level].w_q_mem,
-                                                          &mut q_tmp, bs * s, d, d, 0.0);
-                crate::dispatch::cublas_matmul_transb_dd(&q_tmp, &context.memory[level],
+                                                          &mut fwd.q_tmp_per_level[level], bs * s, d, d, 0.0);
+                crate::dispatch::cublas_matmul_transb_dd(&fwd.q_tmp_per_level[level], &context.memory[level],
                                                           &mut fwd.y_per_level[level], bs * s, d, d, 0.0);
             }
         }
