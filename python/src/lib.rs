@@ -8,7 +8,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::types::PyDict;
 
 use nl_hecate_core::model::{SWAConfig as RustConfig, SWAParams as RustParams};
-use nl_hecate_core::model::{MAGConfig as RustMAGConfig, MAGParams as RustMAGParams, MemoryRuleKind, CompositionKind, AttentionalBias as RustAttentionalBias};
+use nl_hecate_core::model::{MAGConfig as RustMAGConfig, MAGParams as RustMAGParams, MemoryRuleKind, CompositionKind, AttentionalBias as RustAttentionalBias, FeatureMapKind as RustFeatureMapKind};
 use nl_hecate_core::retention::{RetentionKind, default_retention};
 use nl_hecate_core::m3::M3Config as RustM3Config;
 use nl_hecate_core::dynamic_freq::{FrequencySchedule, LearnedFreqConfig};
@@ -278,6 +278,8 @@ impl MAGConfig {
         theta_floor=None, theta_ceil=None,
         intermediate_size=0,
         m_norm_max=None,
+        feature_map="identity",
+        feature_map_sigma=1.0,
     ))]
     fn new(
         d_model: usize,
@@ -317,6 +319,8 @@ impl MAGConfig {
         theta_ceil: Option<Vec<f32>>,
         intermediate_size: usize,
         m_norm_max: Option<Vec<f32>>,
+        feature_map: &str,
+        feature_map_sigma: f32,
     ) -> PyResult<Self> {
         if d_model != num_heads * head_dim {
             return Err(PyValueError::new_err(format!(
@@ -420,6 +424,14 @@ impl MAGConfig {
                 "Unknown attentional_bias '{s}'. Expected: 'L2', 'L1', or 'Lp(p)'"
             ))),
         };
+        let fm_kind = match feature_map.to_lowercase().as_str() {
+            "identity" => RustFeatureMapKind::Identity,
+            "random_fourier" | "rff" => RustFeatureMapKind::RandomFourier { sigma: feature_map_sigma },
+            "elu" => RustFeatureMapKind::ELU,
+            _ => return Err(PyValueError::new_err(format!(
+                "Unknown feature_map '{feature_map}'. Expected: identity, random_fourier, elu"
+            ))),
+        };
         Ok(MAGConfig {
             inner: RustMAGConfig {
                 swa: RustConfig {
@@ -479,6 +491,7 @@ impl MAGConfig {
                 theta_ceil: theta_ceil.unwrap_or_default(),
                 intermediate_size,
                 m_norm_max: m_norm_max.unwrap_or_default(),
+                feature_map: fm_kind,
             },
         })
     }
@@ -554,6 +567,14 @@ impl MAGConfig {
     fn theta_ceil(&self) -> Vec<f32> { self.inner.theta_ceil.clone() }
     #[getter]
     fn m_norm_max(&self) -> Vec<f32> { self.inner.m_norm_max.clone() }
+    #[getter]
+    fn feature_map(&self) -> &str {
+        match self.inner.feature_map {
+            RustFeatureMapKind::Identity => "identity",
+            RustFeatureMapKind::RandomFourier { .. } => "random_fourier",
+            RustFeatureMapKind::ELU => "elu",
+        }
+    }
 }
 
 // ── MAGParams ──────────────────────────────────────────────────────
@@ -776,6 +797,8 @@ impl MAGForwardCache {
     theta_floor=None, theta_ceil=None,
     intermediate_size=0,
     m_norm_max=None,
+    feature_map="identity",
+    feature_map_sigma=1.0,
 ))]
 fn mag_create_config(
     d_model: usize,
@@ -815,6 +838,8 @@ fn mag_create_config(
     theta_ceil: Option<Vec<f32>>,
     intermediate_size: usize,
     m_norm_max: Option<Vec<f32>>,
+    feature_map: &str,
+    feature_map_sigma: f32,
 ) -> PyResult<MAGConfig> {
     MAGConfig::new(
         d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled,
@@ -823,6 +848,7 @@ fn mag_create_config(
         retention, m3, frequency_schedule, checkpoint_interval, attentional_bias, kernel_size, self_ref_chunk_size,
         projection_kind, self_generated_values, momentum_kind, momentum_d_hidden,
         theta_floor, theta_ceil, intermediate_size, m_norm_max,
+        feature_map, feature_map_sigma,
     )
 }
 

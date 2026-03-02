@@ -120,6 +120,12 @@ pub fn save_safetensors(
             tensors.push((format!("{p}.mlp.up_proj"),   enc(&lp.up_proj)));
             tensors.push((format!("{p}.mlp.down_proj"), enc(&lp.down_proj)));
         }
+
+        // Feature map frozen weights (empty for Identity)
+        if !lp.w_rand.is_empty() {
+            tensors.push((format!("{p}.fm.w_rand"), enc(&lp.w_rand)));
+            tensors.push((format!("{p}.fm.b_rand"), enc(&lp.b_rand)));
+        }
     }
 
     // 2. Serialize config + build_state into __metadata__
@@ -296,6 +302,8 @@ pub fn load_safetensors(
             gate_proj:    get(&format!("{p}.mlp.gate_proj")),
             up_proj:      get(&format!("{p}.mlp.up_proj")),
             down_proj:    get(&format!("{p}.mlp.down_proj")),
+            w_rand:       get(&format!("{p}.fm.w_rand")),
+            b_rand:       get(&format!("{p}.fm.b_rand")),
         });
     }
 

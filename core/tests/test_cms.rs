@@ -1,6 +1,6 @@
 //! CMS integration tests: multi-step training, error buffer health, falsification.
 
-use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind, CompositionKind, HopeVariant, LatticeVariant, MomentumKind, ProjectionKind};
+use nl_hecate_core::model::{MAGConfig, MAGParams, FeatureMapKind, MemoryRuleKind, CompositionKind, HopeVariant, LatticeVariant, MomentumKind, ProjectionKind};
 use nl_hecate_core::dynamic_freq::FrequencySchedule;
 use nl_hecate_core::retention::RetentionKind;
 use nl_hecate_core::mag::{cms_forward, cms_backward};
@@ -225,6 +225,7 @@ fn test_k2_beats_k1() {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
 
         };
     // k=2 config
@@ -254,6 +255,7 @@ fn test_k2_beats_k1() {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
 
         };
 
@@ -447,6 +449,7 @@ fn test_k4_vs_k2_multiscale() {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
 
         };
     let cfg_k4 = MAGConfig {
@@ -475,6 +478,7 @@ fn test_k4_vs_k2_multiscale() {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
 
         };
 
@@ -580,6 +584,7 @@ fn test_k4_diagnostics() {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
 
         };
 
@@ -863,6 +868,7 @@ fn test_cms_stability_boundary() {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
 
         };
     let cfg_k2 = MAGConfig {
@@ -891,6 +897,7 @@ fn test_cms_stability_boundary() {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
 
         };
 
@@ -1093,6 +1100,7 @@ fn test_k4_normalization_magnitude() {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
 
         };
     let params_k4 = MAGParams::init(&cfg_k4, 42);
@@ -1174,6 +1182,7 @@ fn test_k4_uniform_init_stable() {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
 
         };
 
@@ -1241,6 +1250,7 @@ fn test_k4_normalized_stable() {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
 
         };
 

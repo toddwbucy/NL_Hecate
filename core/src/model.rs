@@ -11,6 +11,7 @@ use crate::retention::{RetentionKind, default_retention};
 use crate::m3::{M3Config, M3State, m3_step, flatten_mag_params, unflatten_to_mag_grads};
 use crate::dynamic_freq::{FrequencySchedule, default_b_freq};
 pub use crate::self_ref::ProjectionKind;
+pub use crate::feature_map::FeatureMapKind;
 
 /// Which composition pattern to use (Titans Section 4).
 ///
@@ -348,6 +349,14 @@ pub struct MemoryLevelParams {
     /// SwiGluMlp down projection: [d_model x intermediate]. Empty for all other rules.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub down_proj: Vec<f32>,
+    /// Feature map frozen projection: [d * d]. Empty when feature_map == Identity.
+    /// w_rand ~ N(0, sigma^2). Frozen after init — not updated by outer-loop optimizer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub w_rand: Vec<f32>,
+    /// Feature map frozen bias: [d]. Empty when feature_map == Identity.
+    /// b_rand ~ U[0, 2*pi]. Frozen after init.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub b_rand: Vec<f32>,
 }
 
 impl MemoryLevelParams {
@@ -394,7 +403,7 @@ impl MemoryLevelParams {
         let w_freq = vec![];
         let b_freq = vec![];
 
-        MemoryLevelParams { w_k_mem, w_v_mem, w_q_mem, w_alpha, b_alpha, w_theta, b_theta, w_eta, b_eta, w_omega, w_freq, b_freq, w_k_conv: vec![], b_k_conv: vec![], w_q_conv: vec![], b_q_conv: vec![], m_k_init: vec![], m_v_init: vec![], m_q_init: vec![], m_eta_init: vec![], m_alpha_init: vec![], m_mem_init: vec![], gate_proj: vec![], up_proj: vec![], down_proj: vec![] }
+        MemoryLevelParams { w_k_mem, w_v_mem, w_q_mem, w_alpha, b_alpha, w_theta, b_theta, w_eta, b_eta, w_omega, w_freq, b_freq, w_k_conv: vec![], b_k_conv: vec![], w_q_conv: vec![], b_q_conv: vec![], m_k_init: vec![], m_v_init: vec![], m_q_init: vec![], m_eta_init: vec![], m_alpha_init: vec![], m_mem_init: vec![], gate_proj: vec![], up_proj: vec![], down_proj: vec![], w_rand: vec![], b_rand: vec![] }
     }
 
     /// Initialize with Xavier-initialized w_omega for Atlas Omega rule.
@@ -456,6 +465,9 @@ impl MemoryLevelParams {
             gate_proj: vec![],
             up_proj: vec![],
             down_proj: vec![],
+            // w_rand/b_rand are frozen — zero gradient, no allocation needed in shadow.
+            w_rand: vec![],
+            b_rand: vec![],
         }
     }
 
@@ -481,6 +493,10 @@ impl MemoryLevelParams {
         if !template.gate_proj.is_empty() { z.gate_proj = vec![0.0f32; template.gate_proj.len()]; }
         if !template.up_proj.is_empty() { z.up_proj = vec![0.0f32; template.up_proj.len()]; }
         if !template.down_proj.is_empty() { z.down_proj = vec![0.0f32; template.down_proj.len()]; }
+        // w_rand/b_rand are frozen — propagate the frozen values into the shadow
+        // so rules can read them from grad accumulators (reads only, no gradient update).
+        if !template.w_rand.is_empty() { z.w_rand = template.w_rand.clone(); }
+        if !template.b_rand.is_empty() { z.b_rand = template.b_rand.clone(); }
         z
     }
 
@@ -740,6 +756,13 @@ pub struct MAGConfig {
     /// Typically 4*d_model (e.g., 8192 for d=2048 — Llama-3.2-1B MLP size).
     #[serde(default)]
     pub intermediate_size: usize,
+    /// Feature map phi(k) applied to keys and queries before memory operations.
+    /// Identity: no-op, bitwise-identical to pre-feature-map behavior (serde default).
+    /// RandomFourier: bounded-norm Gaussian kernel approximation — recommended for
+    ///   new HOPE configs (see specs/algorithms/self_referential/02_feature_maps.md).
+    /// ELU: element-wise elu(k)+1, non-negative outputs (linear attention style).
+    #[serde(default)]
+    pub feature_map: FeatureMapKind,
 }
 
 fn default_one() -> usize { 1 }
@@ -846,6 +869,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
         }
     }
 
@@ -885,6 +909,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
         }
     }
 
@@ -924,6 +949,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
         }
     }
 
@@ -964,6 +990,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
         }
     }
 
@@ -1004,6 +1031,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
         }
     }
 
@@ -1044,6 +1072,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
         }
     }
 
@@ -1083,6 +1112,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
         }
     }
 
@@ -1122,6 +1152,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
         }
     }
 
@@ -1161,6 +1192,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
         }
     }
 
@@ -1200,6 +1232,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
         }
     }
 
@@ -1249,6 +1282,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
         }
     }
 
@@ -1298,6 +1332,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
         }
     }
 
@@ -1347,6 +1382,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
         }
     }
 
@@ -1396,6 +1432,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
         }
     }
 
@@ -1445,6 +1482,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
         }
     }
 
@@ -1494,6 +1532,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
         }
     }
 
@@ -1534,6 +1573,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
         }
     }
 
@@ -1574,6 +1614,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
         }
     }
 
@@ -1617,6 +1658,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
         }
     }
 
@@ -1660,6 +1702,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
         }
     }
 
@@ -1699,6 +1742,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
         }
     }
 
@@ -1738,6 +1782,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
         }
     }
 
@@ -1777,6 +1822,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
         }
     }
 
@@ -1816,6 +1862,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
         }
     }
 
@@ -1856,6 +1903,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
         }
     }
 
@@ -1895,6 +1943,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
         }
     }
 
@@ -1935,6 +1984,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
         }
     }
 
@@ -1975,6 +2025,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
         }
     }
 }
@@ -2062,6 +2113,13 @@ impl MAGParams {
                 let mut dp = vec![0.0f32; d * inter];
                 mlp_rng.fill_uniform(&mut dp, down_scale);
                 level_params.down_proj = dp;
+            }
+            // Initialize frozen RandomFourier weights if feature_map is set
+            if let crate::feature_map::FeatureMapKind::RandomFourier { sigma } = cfg.feature_map {
+                let mut fm_rng = SimpleRng::new(seed.wrapping_add(13000 + level as u64 * 200));
+                let (w_rand, b_rand) = crate::feature_map::init_random_fourier(d, sigma, &mut fm_rng);
+                level_params.w_rand = w_rand;
+                level_params.b_rand = b_rand;
             }
             levels.push(level_params);
         }

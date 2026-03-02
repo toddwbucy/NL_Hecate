@@ -1,5 +1,6 @@
 
 pub mod tensor;
+pub mod feature_map;
 pub mod tape;
 pub mod opaque_adapters;
 pub mod swa;

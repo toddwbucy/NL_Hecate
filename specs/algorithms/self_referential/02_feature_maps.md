@@ -102,6 +102,48 @@ m_{i+1} = alpha_{i+1} * m_i - eta_t * P_i @ phi(grad_L(W_i; x_i))
 -- its internal objective.")
 ```
 
+## Stability Argument for RandomFourier Default
+
+RandomFourier features provide a structural M stability guarantee that makes
+carry-forward viable for slow CMS levels (L2/L3, which fire every 64/512 steps):
+
+<!-- HADES: Derived from hope_equations/eq-005-fwp-update (§2 Eq 5); TNT (2511.07343) stability analysis -->
+```text
+-- RandomFourier bounded-norm property:
+--   phi(k) = sqrt(2/d) * cos(W_rand @ k + b_rand)
+--   ||phi(k)||_2^2 = (2/d) * sum_i cos^2(z_i) <= (2/d) * d = 2
+--   Therefore: ||phi(k)|| <= sqrt(2)  for ALL k, regardless of ||k||.
+
+-- Bounded per-step M perturbation (Delta Rule, L2 bias):
+--   delta_M = -theta * outer(biased_error, phi_k)
+--   ||delta_M||_F = theta * ||biased_error|| * ||phi_k||
+--               <= theta * ||M @ phi_k - v|| * sqrt(2)
+--   With phi: per-step perturbation is BOUNDED by sqrt(2) * max(||error||)
+--   Without phi (Identity): perturbation proportional to ||k||, which AdamW
+--                           can grow without bound on outer-loop weights.
+
+-- GD stability condition becomes globally finite:
+--   GD converges when theta < 1 / ||phi(k)||^2 <= 1/2
+--   With Identity: convergence requires theta < 1/||k||^2 — no global bound.
+--   With RandomFourier: theta < 0.5 is a sufficient condition for ALL inputs.
+--   This is why theta_ceil (CS-39) is less urgent with RandomFourier:
+--   the structural bound replaces the runtime safety rail.
+
+-- Why this makes carry-forward viable for L2/L3:
+--   Level 2 fires every 64 steps; Level 3 fires every 512 steps.
+--   Between activations, M carries forward unchanged. Each activation
+--   perturbs M by at most theta * ||error|| * sqrt(2) — a known finite amount.
+--   With Identity, large ||k|| from outer-loop weight growth can cause
+--   silent M drift that compound over 512 silent steps.
+--   With RandomFourier, the bounded perturbation property guarantees
+--   M stays within a neighborhood of its previous value.
+
+-- Recommendation:
+--   RandomFourier is the default feature map for new HOPE configs.
+--   Identity is preserved as the serde/backward-compat default to avoid
+--   breaking existing checkpoints and configs.
+```
+
 ## Feature Map Types
 
 Different choices of phi provide different capacity-cost tradeoffs:
@@ -112,7 +154,9 @@ Different choices of phi provide different capacity-cost tradeoffs:
 phi(k) = k                              -- d_phi = d
 -- Cost: O(0) (no-op)
 -- Capacity: O(d) associations per memory matrix
--- This is the current NL_Hecate default for all variants.
+-- NL_Hecate serde/backward-compat default. Preserves all existing checkpoints.
+-- RandomFourier is the recommended default for new HOPE configs (see Stability
+-- Argument above).
 
 -- Type 2: Linear projection
 phi(k) = W_phi @ k                      -- d_phi arbitrary

@@ -661,6 +661,11 @@ fn traced_active_level(
             let y_id = tape.alloc(y.clone(), vec![s, d]);
             let mut saved = vec![meta_id, lp_saved, emb_saved];
             saved.extend(cache_ids);
+            // Save feature map z caches before conv caches (if non-Identity)
+            if !cache.fm_z_k_mem.is_empty() {
+                saved.push(tape.alloc(cache.fm_z_k_mem.clone(), vec![]));
+                saved.push(tape.alloc(cache.fm_z_q_mem.clone(), vec![]));
+            }
             // Save conv1d cache if active
             assert!(cache.k_conv_cache.is_some() == cache.q_conv_cache.is_some(),
                 "traced_forward: partial Conv1D cache — k={}, q={}",
@@ -712,6 +717,11 @@ fn traced_active_level(
                 assert!(!cache.decay.is_empty(),
                     "traced_forward TitansLMM: DeltaMomentum produced empty decay buffer");
                 cache_ids.push(tape.alloc(cache.decay.clone(), vec![]));
+            }
+            // Save feature map z caches before conv caches (if non-Identity)
+            if !cache.fm_z_k_mem.is_empty() {
+                cache_ids.push(tape.alloc(cache.fm_z_k_mem.clone(), vec![]));
+                cache_ids.push(tape.alloc(cache.fm_z_q_mem.clone(), vec![]));
             }
             let y_id = tape.alloc(y.clone(), vec![s, d]);
             let mut saved = vec![meta_id, lp_saved, emb_saved];

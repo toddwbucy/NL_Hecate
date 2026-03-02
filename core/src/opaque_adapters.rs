@@ -193,6 +193,10 @@ pub fn level_params_from_flat(flat: &[f32], d: usize, kernel_size: usize) -> Mem
         m_k_init: vec![], m_v_init: vec![], m_q_init: vec![],
         m_eta_init: vec![], m_alpha_init: vec![], m_mem_init: vec![],
         gate_proj: vec![], up_proj: vec![], down_proj: vec![],
+        // w_rand/b_rand: not serialized via the flat opaque adapter path.
+        // The feature map kind and frozen weights are embedded in the rule struct
+        // via the metadata save, not in the flat level_params buffer.
+        w_rand: vec![], b_rand: vec![],
     }
 }
 
@@ -276,6 +280,17 @@ pub fn delta_rule_opaque_backward(
         restore_conv_cache(&saved[n-4..])
     } else { (None, None) };
 
+    // Feature map z caches: saved[15] = fm_z_k_mem, saved[16] = fm_z_q_mem (if non-Identity).
+    // Layout: conv caches always at tail. fm caches come before conv in the non-conv path.
+    // has_fm is detected from saved.len() > 15 AND the fm buffer is non-empty.
+    let base_after_conv = if !level_params.w_k_conv.is_empty() { 4 } else { 0 };
+    let n = saved.len();
+    let (fm_z_k_mem, fm_z_q_mem) = if n > 15 + base_after_conv && !saved[15].is_empty() {
+        (saved[15].to_vec(), saved[16].to_vec())
+    } else {
+        (vec![], vec![])
+    };
+
     let cache = DeltaRuleCache {
         seq_len, d,
         m_states: saved[3].to_vec(),
@@ -291,11 +306,12 @@ pub fn delta_rule_opaque_backward(
         grad_outer: saved[13].to_vec(),
         y: saved[14].to_vec(),
         k_conv_cache, q_conv_cache,
+        fm_z_k_mem, fm_z_q_mem,
     };
 
     let theta_floor = if saved[0].len() > 5 { saved[0][4] } else { 0.0 };
     let theta_ceil = if saved[0].len() > 6 { saved[0][5] } else { f32::MAX };
-    let rule = DeltaRule { bias, sign_sharpness, theta_floor, theta_ceil };
+    let rule = DeltaRule { bias, sign_sharpness, theta_floor, theta_ceil, feature_map: crate::feature_map::FeatureMapKind::Identity };
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
     d_inputs[0] = d_embedded;
@@ -368,6 +384,8 @@ pub fn titans_lmm_opaque_backward(
         deep_d_hidden: 0,
         k_conv_cache: k_conv_cache_restored,
         q_conv_cache: q_conv_cache_restored,
+        fm_z_k_mem: vec![],
+        fm_z_q_mem: vec![],
     };
 
     let theta_floor = if saved[0].len() > 6 { saved[0][5] } else { 0.0 };
@@ -379,6 +397,7 @@ pub fn titans_lmm_opaque_backward(
         theta_floor,
         theta_ceil,
         m_norm_max: f32::MAX,
+        feature_map: crate::feature_map::FeatureMapKind::Identity,
     };
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
@@ -905,7 +924,7 @@ impl OpaqueVjp for DeltaRule {
         let (y, cache) = self.step(level_params, embedded, seq_len, d, initial_m);
 
         // Saved cache fields: same order as delta_rule_opaque_backward reads them
-        let cache_ids: Vec<BufId> = vec![
+        let mut cache_ids: Vec<BufId> = vec![
             tape.alloc(cache.m_states, vec![]),
             tape.alloc(cache.k_mem, vec![]),
             tape.alloc(cache.v_mem, vec![]),
@@ -919,6 +938,12 @@ impl OpaqueVjp for DeltaRule {
             tape.alloc(cache.grad_outer, vec![]),
             tape.alloc(cache.y, vec![]),
         ];
+
+        // Save feature map z caches before conv caches (if non-Identity)
+        if !cache.fm_z_k_mem.is_empty() {
+            cache_ids.push(tape.alloc(cache.fm_z_k_mem, vec![]));
+            cache_ids.push(tape.alloc(cache.fm_z_q_mem, vec![]));
+        }
 
         // Save conv1d cache if active
         let conv_ids = save_conv_cache(tape, &cache.k_conv_cache, &cache.q_conv_cache);
@@ -976,6 +1001,12 @@ impl OpaqueVjp for TitansLMM {
             assert!(!cache.decay.is_empty(),
                 "DeltaMomentum forward produced empty decay buffer — step() bug");
             cache_ids.push(tape.alloc(cache.decay, vec![]));
+        }
+
+        // Save feature map z caches before conv caches (if non-Identity)
+        if !cache.fm_z_k_mem.is_empty() {
+            cache_ids.push(tape.alloc(cache.fm_z_k_mem, vec![]));
+            cache_ids.push(tape.alloc(cache.fm_z_q_mem, vec![]));
         }
 
         // Save conv1d cache if active
@@ -1597,6 +1628,7 @@ mod tests {
             theta_floor: 0.0,
             theta_ceil: f32::MAX,
             m_norm_max: f32::MAX,
+            feature_map: crate::feature_map::FeatureMapKind::Identity,
         };
         assert_opaque_roundtrip(&rule, 4, 3);
     }

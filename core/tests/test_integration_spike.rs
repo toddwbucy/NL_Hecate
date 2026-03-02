@@ -8,7 +8,7 @@
 //! A model that learned should achieve significantly lower loss AND correct predictions.
 
 use nl_hecate_core::model::{
-    MAGConfig, MAGParams, SWAConfig, CompositionKind, MemoryRuleKind, HopeVariant, LatticeVariant, MomentumKind, ProjectionKind,
+    MAGConfig, MAGParams, SWAConfig, CompositionKind, MemoryRuleKind, HopeVariant, LatticeVariant, MomentumKind, ProjectionKind, FeatureMapKind,
 };
 use nl_hecate_core::dynamic_freq::FrequencySchedule;
 use nl_hecate_core::conductor::{Conductor, ContextState, ErrorBuffer, Pulse};
@@ -77,6 +77,7 @@ fn spike_config_a() -> MAGConfig {
             theta_ceil: vec![],
         intermediate_size: 0,
         m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
     }
 }
 
@@ -118,6 +119,7 @@ fn spike_config_b() -> MAGConfig {
             theta_ceil: vec![],
         intermediate_size: 0,
         m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
     }
 }
 
@@ -159,6 +161,7 @@ fn spike_config_c() -> MAGConfig {
             theta_ceil: vec![],
         intermediate_size: 0,
         m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
     }
 }
 
@@ -770,6 +773,7 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
         // SwiGluMlp requires intermediate_size > 0; other rules don't use it.
         intermediate_size: if rule == MemoryRuleKind::SwiGluMlp { 4 * d_model } else { 0 },
         m_norm_max: vec![],
+            feature_map: FeatureMapKind::Identity,
     }
 }
 
