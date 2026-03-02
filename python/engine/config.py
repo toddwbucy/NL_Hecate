@@ -85,6 +85,17 @@ class BuildConfig:
     # "periodic": M resets to zeros at each CMS level fire boundary (TNT mode)
     memory_reset: str = "carry_forward"
 
+    # Gate warmup protocol (specs/infrastructure/09_gate_warmup.md)
+    # theta_floor_init: per-level scaffold floor at step 0; decays linearly to 0
+    # gate_warmup_decay_steps: step at which theta_floor_init reaches 0 (Phase 2 end)
+    # gate_warmup_falsification_step: step at which go/no-go thresholds are checked
+    # gate_warmup_l2_threshold / l3_threshold: falsification pass thresholds
+    gate_warmup_theta_floor_init: list[float] | None = None
+    gate_warmup_decay_steps: int = 0
+    gate_warmup_falsification_step: int = 20000
+    gate_warmup_l2_threshold: float = 0.005
+    gate_warmup_l3_threshold: float = 0.001
+
     # Runtime
     gpu: bool = True  # GPU by default; --cpu to override
     load: str | None = None
@@ -161,6 +172,32 @@ class BuildConfig:
         if self.memory_reset not in ("carry_forward", "periodic"):
             raise ValueError(
                 f"memory_reset must be 'carry_forward' or 'periodic', got '{self.memory_reset}'")
+        if self.gate_warmup_theta_floor_init is not None:
+            if self.k < 4:
+                raise ValueError(
+                    f"gate_warmup requires k >= 4 (CMS L2/L3 levels), got k={self.k}")
+            if len(self.gate_warmup_theta_floor_init) != self.k:
+                raise ValueError(
+                    f"gate_warmup_theta_floor_init length "
+                    f"{len(self.gate_warmup_theta_floor_init)} must match k={self.k}")
+            if self.gate_warmup_decay_steps <= 0:
+                raise ValueError(
+                    "gate_warmup_decay_steps must be > 0 when gate_warmup_theta_floor_init is set")
+            if self.gate_warmup_falsification_step < 0:
+                raise ValueError(
+                    f"gate_warmup_falsification_step must be >= 0, "
+                    f"got {self.gate_warmup_falsification_step}")
+            if (self.gate_warmup_falsification_step > 0
+                    and self.gate_warmup_falsification_step <= self.gate_warmup_decay_steps):
+                raise ValueError(
+                    f"gate_warmup_falsification_step ({self.gate_warmup_falsification_step}) "
+                    f"must be > gate_warmup_decay_steps ({self.gate_warmup_decay_steps})")
+            if self.gate_warmup_l2_threshold <= 0:
+                raise ValueError(
+                    f"gate_warmup_l2_threshold must be > 0, got {self.gate_warmup_l2_threshold}")
+            if self.gate_warmup_l3_threshold <= 0:
+                raise ValueError(
+                    f"gate_warmup_l3_threshold must be > 0, got {self.gate_warmup_l3_threshold}")
 
     @property
     def head_dim(self) -> int:
@@ -188,9 +225,22 @@ class BuildConfig:
                         flat["val_doc_starts_path"] = sub["val_doc_starts"]
                 else:
                     flat.update(sub)
+        # gate_warmup section (09_gate_warmup.md)
+        if "gate_warmup" in raw:
+            gw = raw["gate_warmup"]
+            if "theta_floor_init" in gw:
+                flat["gate_warmup_theta_floor_init"] = gw["theta_floor_init"]
+            if "gate_warmup_decay_steps" in gw:
+                flat["gate_warmup_decay_steps"] = gw["gate_warmup_decay_steps"]
+            if "falsification_step" in gw:
+                flat["gate_warmup_falsification_step"] = gw["falsification_step"]
+            if "l2_theta_threshold" in gw:
+                flat["gate_warmup_l2_threshold"] = gw["l2_theta_threshold"]
+            if "l3_theta_threshold" in gw:
+                flat["gate_warmup_l3_threshold"] = gw["l3_theta_threshold"]
         # Top-level overrides (for flat configs)
         for key in list(raw.keys()):
-            if key not in ("model", "build", "data", "notes", "description"):
+            if key not in ("model", "build", "data", "gate_warmup", "notes", "description"):
                 flat[key] = raw[key]
         # Rename head_dim if present (derived, not stored)
         flat.pop("head_dim", None)

@@ -847,7 +847,7 @@ fn gpu_cms_capture_all_patterns(
     let total      = bs * s * d;
     let total_i32  = i32::try_from(total).expect("bs*s*d exceeds i32::MAX");
 
-    for bitmask in reachable {
+    for &bitmask in &reachable {
         // Restore context_m state before each capture
         for (level, buf) in context.memory.iter().enumerate() {
             buf.copy_from_host(&saved_m[level]);
