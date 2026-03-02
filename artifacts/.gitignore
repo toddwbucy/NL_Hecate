@@ -1,0 +1,5 @@
+# Compiled binary artifacts — gitignored, reproducible from source
+*.so
+*.whl
+*.fatbin
+.build-meta.json
