@@ -405,7 +405,7 @@ def probe_memory_vocab(host_params, host_context, cfg, tokenizer, step: int,
             tok_str = ""
             try:
                 tok_str = tokenizer.decode([int(tid)])
-            except Exception:
+            except (ValueError, TypeError):
                 tok_str = f"<{int(tid)}>"
             out.append({"id": int(tid), "prob": round(float(probs[tid]), 6),
                         "tok": repr(tok_str)})
@@ -446,7 +446,7 @@ def probe_memory_vocab(host_params, host_context, cfg, tokenizer, step: int,
 
         levels_data.append(entry)
 
-    # Jensen–Shannon divergence between every level pair
+    # Jensen-Shannon divergence between every level pair
     js_pairs: list = []
     for i in range(k):
         for j in range(i + 1, k):
