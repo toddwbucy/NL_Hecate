@@ -180,7 +180,7 @@ def main() -> None:
     print()
     print("── Next step ───────────────────────────────────────────────────")
     print("Commit the promoted binary:")
-    print(f"  git add artifacts/so/ artifacts/wheels/")
+    print("  git add artifacts/so/ artifacts/wheels/")
     print(f"  git commit -m \"chore: promote nl_hecate {ext} {sha[:8]}\"")
 
 
