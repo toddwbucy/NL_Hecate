@@ -236,6 +236,22 @@ fn read_kernel_size(saved: &[f32]) -> usize {
     *saved.last().expect("metadata must not be empty") as usize
 }
 
+/// Decode a FeatureMapKind from its f32 representation stored in meta.
+/// 0.0 → Identity, 1.0 → RandomFourier { sigma }, 2.0 → ELU.
+/// Unknown values default to Identity with a warning.
+fn decode_feature_map_kind(kind_f32: f32, sigma: f32) -> crate::feature_map::FeatureMapKind {
+    match kind_f32 as u8 {
+        0 => crate::feature_map::FeatureMapKind::Identity,
+        1 => crate::feature_map::FeatureMapKind::RandomFourier { sigma },
+        2 => crate::feature_map::FeatureMapKind::ELU,
+        v => {
+            eprintln!("opaque_adapters: unknown FeatureMapKind f32={v} in backward meta; \
+                       defaulting to Identity");
+            crate::feature_map::FeatureMapKind::Identity
+        }
+    }
+}
+
 /// Read metadata with attentional bias encoding: [seq_len, d, bias_f32, sign_sharpness, kernel_size].
 /// Used by DeltaRule and TitansLMM opaque backward adapters.
 fn read_meta_with_bias(saved: &[f32]) -> (usize, usize, crate::model::AttentionalBias, f32) {
@@ -262,34 +278,60 @@ fn read_meta_with_bias(saved: &[f32]) -> (usize, usize, crate::model::Attentiona
 //   d_inputs[1] = d_level_params: flattened MemoryLevelParams gradients
 
 /// Delta Rule opaque backward adapter.
+///
+/// Saved buffer layout (DeltaRule):
+///   saved[0]  = meta: [seq_len, d, bias, sign_sharpness, theta_floor, theta_ceil, fm_kind, sigma, kernel_size]
+///   saved[1]  = level_params_flat
+///   saved[2]  = embedded
+///   saved[3..14] = cache fields (m_states, k_mem, v_mem, q_mem, concat_kv, alpha_pre, alpha,
+///                                theta_pre, theta, error, grad_outer, y)
+///   saved[15] = fm_z_k_mem (only if non-Identity; detected from fm_kind in meta)
+///   saved[16] = fm_z_q_mem (only if non-Identity)
+///   saved[17] = w_rand     (only if non-Identity)
+///   saved[18] = b_rand     (only if non-Identity)
+///   saved[N-4..N] = conv cache buffers (if conv weights present; always at tail)
+///
+/// Backward-compat: old recordings have meta len=7 (no fm_kind/sigma fields).
+///   len guard `saved[0].len() > 7` safely detects old vs new format.
 pub fn delta_rule_opaque_backward(
     d_outputs: &[&[f32]],
     saved: &[&[f32]],
     d_inputs: &mut [Vec<f32>],
 ) {
     let (seq_len, d, bias, sign_sharpness) = read_meta_with_bias(saved[0]);
-    let level_params = level_params_from_flat(saved[1], d, read_kernel_size(saved[0]));
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
-    // Conv1D cache at tail of saved buffers
+    // Decode feature map kind from meta (new format: meta[6]=fm_kind, meta[7]=sigma).
+    // Old recordings have meta.len()=7, so guard with len > 7 for backward-compat.
+    let fm_kind_f32 = if saved[0].len() > 7 { saved[0][6] } else { 0.0 };
+    let fm_sigma    = if saved[0].len() > 8 { saved[0][7] } else { 1.0 };
+    let fm_kind = decode_feature_map_kind(fm_kind_f32, fm_sigma);
+    let has_fm = !matches!(fm_kind, crate::feature_map::FeatureMapKind::Identity);
+
+    // Read frozen FM weights from tape buffers if non-Identity.
+    // Layout: saved[15]=fm_z_k, saved[16]=fm_z_q, saved[17]=w_rand, saved[18]=b_rand.
+    let (fm_z_k_mem, fm_z_q_mem, w_rand, b_rand) = if has_fm {
+        assert!(saved.len() > 18,
+            "delta_rule_opaque_backward: has_fm=true but saved.len()={} < 19 — \
+             tape may be from an incompatible version", saved.len());
+        (saved[15].to_vec(), saved[16].to_vec(), saved[17].to_vec(), saved[18].to_vec())
+    } else {
+        (vec![], vec![], vec![], vec![])
+    };
+
+    // Reconstruct level_params (w_rand/b_rand not in flat buffer; inject from tape).
+    let mut level_params = level_params_from_flat(saved[1], d, read_kernel_size(saved[0]));
+    level_params.w_rand = w_rand;
+    level_params.b_rand = b_rand;
+
+    // Conv1D cache at tail of saved buffers (always last 4, tail-indexed).
     let (k_conv_cache, q_conv_cache) = if !level_params.w_k_conv.is_empty() {
         let n = saved.len();
         assert!(n > 15, "delta_rule_opaque_backward: conv weights present but conv caches missing \
             (saved.len()={}, expected > 15)", n);
         restore_conv_cache(&saved[n-4..])
     } else { (None, None) };
-
-    // Feature map z caches: saved[15] = fm_z_k_mem, saved[16] = fm_z_q_mem (if non-Identity).
-    // Layout: conv caches always at tail. fm caches come before conv in the non-conv path.
-    // has_fm is detected from saved.len() > 15 AND the fm buffer is non-empty.
-    let base_after_conv = if !level_params.w_k_conv.is_empty() { 4 } else { 0 };
-    let n = saved.len();
-    let (fm_z_k_mem, fm_z_q_mem) = if n > 15 + base_after_conv && !saved[15].is_empty() {
-        (saved[15].to_vec(), saved[16].to_vec())
-    } else {
-        (vec![], vec![])
-    };
 
     let cache = DeltaRuleCache {
         seq_len, d,
@@ -310,8 +352,8 @@ pub fn delta_rule_opaque_backward(
     };
 
     let theta_floor = if saved[0].len() > 5 { saved[0][4] } else { 0.0 };
-    let theta_ceil = if saved[0].len() > 6 { saved[0][5] } else { f32::MAX };
-    let rule = DeltaRule { bias, sign_sharpness, theta_floor, theta_ceil, feature_map: crate::feature_map::FeatureMapKind::Identity };
+    let theta_ceil  = if saved[0].len() > 6 { saved[0][5] } else { f32::MAX };
+    let rule = DeltaRule { bias, sign_sharpness, theta_floor, theta_ceil, feature_map: fm_kind };
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
     d_inputs[0] = d_embedded;
@@ -319,17 +361,35 @@ pub fn delta_rule_opaque_backward(
 }
 
 /// Titans LMM opaque backward adapter.
+///
+/// Saved buffer layout (TitansLMM, no DeltaMomentum):
+///   saved[0]     = meta: [seq_len, d, bias, sign_sharpness, mk_f32, theta_floor, theta_ceil,
+///                         fm_kind, sigma, kernel_size]
+///   saved[1]     = level_params_flat
+///   saved[2]     = embedded
+///   saved[3..17] = cache fields (m_states, s_states, k_mem, v_mem, q_mem, concat_kv,
+///                                alpha_pre, alpha, theta_pre, theta, eta_pre, eta,
+///                                error, grad_outer, y)
+///   saved[18]    = fm_z_k_mem  (if non-Identity, fm_base=18)
+///   saved[19]    = fm_z_q_mem
+///   saved[20]    = w_rand
+///   saved[21]    = b_rand
+///   saved[N-4..] = conv cache (always at tail)
+///
+/// With DeltaMomentum: decay shifts all fm indices by 1 (fm_base=19).
+///
+/// Backward-compat: old recordings have meta len=8 (no fm_kind/sigma).
+///   len guard `saved[0].len() > 8` safely detects new format.
 pub fn titans_lmm_opaque_backward(
     d_outputs: &[&[f32]],
     saved: &[&[f32]],
     d_inputs: &mut [Vec<f32>],
 ) {
     let (seq_len, d, bias, sign_sharpness) = read_meta_with_bias(saved[0]);
-    let level_params = level_params_from_flat(saved[1], d, read_kernel_size(saved[0]));
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
-    // Read momentum_kind from extra_meta if present (new format: meta[4] = momentum_kind as f32).
+    // Read momentum_kind from extra_meta if present (meta[4] = momentum_kind as f32).
     let momentum_kind = if saved[0].len() > 4 {
         match saved[0][4] as u8 {
             0 => crate::model::MomentumKind::None,
@@ -349,7 +409,33 @@ pub fn titans_lmm_opaque_backward(
         crate::model::MomentumKind::EMA // backward compat: old recordings used EMA
     };
 
-    // Conv1D cache at tail of saved buffers
+    // Decode feature map kind from meta (new format: meta[7]=fm_kind, meta[8]=sigma).
+    // Old recordings have meta.len()=8, so guard with len > 8 for backward-compat.
+    let fm_kind_f32 = if saved[0].len() > 8 { saved[0][7] } else { 0.0 };
+    let fm_sigma    = if saved[0].len() > 9 { saved[0][8] } else { 1.0 };
+    let fm_kind = decode_feature_map_kind(fm_kind_f32, fm_sigma);
+    let has_fm = !matches!(fm_kind, crate::feature_map::FeatureMapKind::Identity);
+
+    // Base index for fm buffers: 18 (EMA/None) or 19 (DeltaMomentum).
+    let fm_base = if momentum_kind == crate::model::MomentumKind::DeltaMomentum { 19 } else { 18 };
+
+    // Read frozen FM weights and z caches from tape if non-Identity.
+    let (fm_z_k_mem, fm_z_q_mem, w_rand, b_rand) = if has_fm {
+        assert!(saved.len() > fm_base + 3,
+            "titans_lmm_opaque_backward: has_fm=true but saved.len()={} < {} — \
+             tape may be from an incompatible version", saved.len(), fm_base + 4);
+        (saved[fm_base].to_vec(), saved[fm_base + 1].to_vec(),
+         saved[fm_base + 2].to_vec(), saved[fm_base + 3].to_vec())
+    } else {
+        (vec![], vec![], vec![], vec![])
+    };
+
+    // Reconstruct level_params (w_rand/b_rand not in flat buffer; inject from tape).
+    let mut level_params = level_params_from_flat(saved[1], d, read_kernel_size(saved[0]));
+    level_params.w_rand = w_rand;
+    level_params.b_rand = b_rand;
+
+    // Conv1D cache at tail of saved buffers (always last 4, tail-indexed).
     let (k_conv_cache_restored, q_conv_cache_restored) = if !level_params.w_k_conv.is_empty() {
         let n = saved.len();
         restore_conv_cache(&saved[n-4..])
@@ -384,12 +470,12 @@ pub fn titans_lmm_opaque_backward(
         deep_d_hidden: 0,
         k_conv_cache: k_conv_cache_restored,
         q_conv_cache: q_conv_cache_restored,
-        fm_z_k_mem: vec![],
-        fm_z_q_mem: vec![],
+        fm_z_k_mem,
+        fm_z_q_mem,
     };
 
     let theta_floor = if saved[0].len() > 6 { saved[0][5] } else { 0.0 };
-    let theta_ceil = if saved[0].len() > 7 { saved[0][6] } else { f32::MAX };
+    let theta_ceil  = if saved[0].len() > 7 { saved[0][6] } else { f32::MAX };
     let rule = TitansLMM {
         bias, sign_sharpness,
         momentum_kind,
@@ -397,7 +483,7 @@ pub fn titans_lmm_opaque_backward(
         theta_floor,
         theta_ceil,
         m_norm_max: f32::MAX,
-        feature_map: crate::feature_map::FeatureMapKind::Identity,
+        feature_map: fm_kind,
     };
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
@@ -917,7 +1003,16 @@ impl OpaqueVjp for DeltaRule {
         &self, tape: &mut Tape, level_params: &MemoryLevelParams,
         embedded: &[f32], seq_len: usize, d: usize, initial_m: Option<Vec<f32>>,
     ) -> (Vec<f32>, BufId, BufId, BufId) {
-        let extra_meta = [crate::moneta::bias_to_f32(self.bias), self.sign_sharpness, self.theta_floor, self.theta_ceil];
+        let fm_kind_f32 = match self.feature_map {
+            crate::feature_map::FeatureMapKind::Identity => 0.0f32,
+            crate::feature_map::FeatureMapKind::RandomFourier { .. } => 1.0,
+            crate::feature_map::FeatureMapKind::ELU => 2.0,
+        };
+        let fm_sigma = match self.feature_map {
+            crate::feature_map::FeatureMapKind::RandomFourier { sigma } => sigma,
+            _ => 1.0,
+        };
+        let extra_meta = [crate::moneta::bias_to_f32(self.bias), self.sign_sharpness, self.theta_floor, self.theta_ceil, fm_kind_f32, fm_sigma];
         let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
             record_common_inputs(tape, level_params, embedded, seq_len, d, &extra_meta);
 
@@ -939,10 +1034,13 @@ impl OpaqueVjp for DeltaRule {
             tape.alloc(cache.y, vec![]),
         ];
 
-        // Save feature map z caches before conv caches (if non-Identity)
+        // Save feature map z caches and frozen FM weights before conv caches (if non-Identity).
+        // Backward reads: fm_z_k at saved[15], fm_z_q at [16], w_rand at [17], b_rand at [18].
         if !cache.fm_z_k_mem.is_empty() {
             cache_ids.push(tape.alloc(cache.fm_z_k_mem, vec![]));
             cache_ids.push(tape.alloc(cache.fm_z_q_mem, vec![]));
+            cache_ids.push(tape.alloc(level_params.w_rand.clone(), vec![]));
+            cache_ids.push(tape.alloc(level_params.b_rand.clone(), vec![]));
         }
 
         // Save conv1d cache if active
@@ -971,7 +1069,16 @@ impl OpaqueVjp for TitansLMM {
             crate::model::MomentumKind::DeltaMomentum => 2.0,
             crate::model::MomentumKind::DeepMomentum => 3.0,
         };
-        let extra_meta = [crate::moneta::bias_to_f32(self.bias), self.sign_sharpness, mk_f32, self.theta_floor, self.theta_ceil];
+        let fm_kind_f32 = match self.feature_map {
+            crate::feature_map::FeatureMapKind::Identity => 0.0f32,
+            crate::feature_map::FeatureMapKind::RandomFourier { .. } => 1.0,
+            crate::feature_map::FeatureMapKind::ELU => 2.0,
+        };
+        let fm_sigma = match self.feature_map {
+            crate::feature_map::FeatureMapKind::RandomFourier { sigma } => sigma,
+            _ => 1.0,
+        };
+        let extra_meta = [crate::moneta::bias_to_f32(self.bias), self.sign_sharpness, mk_f32, self.theta_floor, self.theta_ceil, fm_kind_f32, fm_sigma];
         let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
             record_common_inputs(tape, level_params, embedded, seq_len, d, &extra_meta);
 
@@ -1003,10 +1110,13 @@ impl OpaqueVjp for TitansLMM {
             cache_ids.push(tape.alloc(cache.decay, vec![]));
         }
 
-        // Save feature map z caches before conv caches (if non-Identity)
+        // Save feature map z caches and frozen FM weights before conv caches (if non-Identity).
+        // fm_base = 18 (EMA/None) or 19 (DeltaMomentum); layout matches backward adapter.
         if !cache.fm_z_k_mem.is_empty() {
             cache_ids.push(tape.alloc(cache.fm_z_k_mem, vec![]));
             cache_ids.push(tape.alloc(cache.fm_z_q_mem, vec![]));
+            cache_ids.push(tape.alloc(level_params.w_rand.clone(), vec![]));
+            cache_ids.push(tape.alloc(level_params.b_rand.clone(), vec![]));
         }
 
         // Save conv1d cache if active
@@ -1608,14 +1718,129 @@ mod tests {
         }
     }
 
+    /// Like assert_opaque_roundtrip but accepts pre-constructed params (for RFF tests
+    /// that need w_rand/b_rand populated in level_params).
+    fn assert_opaque_roundtrip_with_params<R: MemoryRule>(
+        rule: &R, params: &MemoryLevelParams, d: usize, seq_len: usize,
+    ) {
+        let embedded = make_test_embedded(seq_len, d);
+
+        let (y_direct, cache) = rule.step(params, &embedded, seq_len, d, None);
+        let d_y = vec![1.0f32; seq_len * d];
+        let (param_grads_direct, d_embedded_direct) =
+            rule.step_backward(params, &cache, &d_y, &embedded);
+
+        let registry = register_opaque_vjps();
+        crate::tape::with_tape(registry, |tape| {
+            let (y_tape, y_id, emb_in, lp_in) =
+                rule.record_on_tape(tape, params, &embedded, seq_len, d, None);
+
+            tape.seed_grad(y_id, d_y.clone());
+            tape.backward(y_id);
+
+            let d_emb_tape = tape.get_grad(emb_in).expect("embedded grad missing");
+            let d_lp_tape  = tape.get_grad(lp_in).expect("lp grad missing");
+
+            for (i, (&tv, &dv)) in d_emb_tape.iter().zip(d_embedded_direct.iter()).enumerate() {
+                assert!((tv - dv).abs() < 1e-5,
+                    "d_embedded[{}]: tape={tv} direct={dv}", i);
+            }
+            let lp_flat = level_params_grads_to_flat(&param_grads_direct);
+            for (i, (&tv, &dv)) in d_lp_tape.iter().zip(lp_flat.iter()).enumerate() {
+                assert!((tv - dv).abs() < 1e-5,
+                    "d_level_params[{}]: tape={tv} direct={dv}", i);
+            }
+            for (i, (&a, &b)) in y_tape.iter().zip(y_direct.iter()).enumerate() {
+                assert!((a - b).abs() < 1e-7, "y[{}]: tape={a} direct={b}", i);
+            }
+        });
+    }
+
     #[test]
     fn test_opaque_vjp_delta_rule() {
         assert_opaque_roundtrip(&DeltaRule::l2(), 4, 3);
     }
 
     #[test]
+    fn test_opaque_vjp_delta_rule_rff() {
+        use crate::tensor::SimpleRng;
+        use crate::feature_map::{init_random_fourier, FeatureMapKind as FMKind};
+        let d = 4;
+        let mut rng = SimpleRng::new(42);
+        let mut params = make_test_params(d);
+        let (w_rand, b_rand) = init_random_fourier(d, 1.0, &mut rng);
+        params.w_rand = w_rand;
+        params.b_rand = b_rand;
+        let rule = DeltaRule {
+            bias: crate::model::AttentionalBias::L2,
+            sign_sharpness: 10.0,
+            theta_floor: 0.0,
+            theta_ceil: f32::MAX,
+            feature_map: FMKind::RandomFourier { sigma: 1.0 },
+        };
+        assert_opaque_roundtrip_with_params(&rule, &params, d, 3);
+    }
+
+    #[test]
+    fn test_opaque_vjp_delta_rule_elu() {
+        use crate::feature_map::FeatureMapKind as FMKind;
+        let d = 4;
+        let params = make_test_params(d);
+        let rule = DeltaRule {
+            bias: crate::model::AttentionalBias::L2,
+            sign_sharpness: 10.0,
+            theta_floor: 0.0,
+            theta_ceil: f32::MAX,
+            feature_map: FMKind::ELU,
+        };
+        // ELU needs no w_rand/b_rand — level_params.w_rand stays empty.
+        assert_opaque_roundtrip_with_params(&rule, &params, d, 3);
+    }
+
+    #[test]
     fn test_opaque_vjp_titans_lmm() {
         assert_opaque_roundtrip(&TitansLMM::l2(), 4, 3);
+    }
+
+    #[test]
+    fn test_opaque_vjp_titans_lmm_rff() {
+        use crate::tensor::SimpleRng;
+        use crate::feature_map::{init_random_fourier, FeatureMapKind as FMKind};
+        let d = 4;
+        let mut rng = SimpleRng::new(77);
+        let mut params = make_test_params(d);
+        let (w_rand, b_rand) = init_random_fourier(d, 1.0, &mut rng);
+        params.w_rand = w_rand;
+        params.b_rand = b_rand;
+        let rule = TitansLMM {
+            bias: crate::model::AttentionalBias::L2,
+            sign_sharpness: 10.0,
+            momentum_kind: crate::model::MomentumKind::EMA,
+            momentum_d_hidden: 0,
+            theta_floor: 0.0,
+            theta_ceil: f32::MAX,
+            m_norm_max: f32::MAX,
+            feature_map: FMKind::RandomFourier { sigma: 1.0 },
+        };
+        assert_opaque_roundtrip_with_params(&rule, &params, d, 3);
+    }
+
+    #[test]
+    fn test_opaque_vjp_titans_lmm_elu() {
+        use crate::feature_map::FeatureMapKind as FMKind;
+        let d = 4;
+        let params = make_test_params(d);
+        let rule = TitansLMM {
+            bias: crate::model::AttentionalBias::L2,
+            sign_sharpness: 10.0,
+            momentum_kind: crate::model::MomentumKind::EMA,
+            momentum_d_hidden: 0,
+            theta_floor: 0.0,
+            theta_ceil: f32::MAX,
+            m_norm_max: f32::MAX,
+            feature_map: FMKind::ELU,
+        };
+        assert_opaque_roundtrip_with_params(&rule, &params, d, 3);
     }
 
     #[test]

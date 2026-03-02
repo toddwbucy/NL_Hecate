@@ -121,8 +121,19 @@ pub fn save_safetensors(
             tensors.push((format!("{p}.mlp.down_proj"), enc(&lp.down_proj)));
         }
 
-        // Feature map frozen weights (empty for Identity)
-        if !lp.w_rand.is_empty() {
+        // Feature map frozen weights (empty for Identity).
+        // Enforce pair integrity: both must be present or both absent.
+        let has_w = !lp.w_rand.is_empty();
+        let has_b = !lp.b_rand.is_empty();
+        if has_w != has_b {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{p}.fm.w_rand and {p}.fm.b_rand must both be non-empty or both be empty \
+                         (got w_rand.len()={}, b_rand.len()={})",
+                        lp.w_rand.len(), lp.b_rand.len()),
+            ));
+        }
+        if has_w {
             tensors.push((format!("{p}.fm.w_rand"), enc(&lp.w_rand)));
             tensors.push((format!("{p}.fm.b_rand"), enc(&lp.b_rand)));
         }
@@ -305,6 +316,19 @@ pub fn load_safetensors(
             w_rand:       get(&format!("{p}.fm.w_rand")),
             b_rand:       get(&format!("{p}.fm.b_rand")),
         });
+        // Pair integrity: both fm weights must be present or both absent.
+        let lp = levels.last().unwrap();
+        let has_w = !lp.w_rand.is_empty();
+        let has_b = !lp.b_rand.is_empty();
+        if has_w != has_b {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{p}.fm.w_rand and {p}.fm.b_rand must both be present or both absent \
+                         (got w_rand.len()={}, b_rand.len()={}). \
+                         Checkpoint may be corrupt.",
+                        lp.w_rand.len(), lp.b_rand.len()),
+            ));
+        }
     }
 
     let params = MAGParams {

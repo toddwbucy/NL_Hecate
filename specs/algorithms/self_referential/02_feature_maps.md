@@ -35,8 +35,9 @@ CONTRACT
               Parent: 00_interface.md (self-referential framework)
               Sibling of: 01_self_generated_values.md (Phase 3 targets)
   Source:     HOPE (2512.24695) §2 Eq 5 (FWP with phi), §4.4 Eq 51 (higher-order
-              momentum); extends to MIRAS attentional bias framework via key
-              preprocessing
+              momentum); TNT (2511.07343) stability analysis for bounded-norm
+              feature maps and carry-forward viability; extends to MIRAS
+              attentional bias framework via key preprocessing
 ```
 
 ## Feature Maps in Fast Weight Programmers (Eq 5)
@@ -123,7 +124,9 @@ carry-forward viable for slow CMS levels (L2/L3, which fire every 64/512 steps):
 --                           can grow without bound on outer-loop weights.
 
 -- GD stability condition becomes globally finite:
---   GD converges when theta < 1 / ||phi(k)||^2 <= 1/2
+--   GD converges when theta < 1 / ||phi(k)||^2.
+--   Since ||phi(k)||^2 <= 2, we have 1/||phi(k)||^2 >= 1/2,
+--   so theta < 0.5 is a sufficient conservative bound for ALL inputs.
 --   With Identity: convergence requires theta < 1/||k||^2 — no global bound.
 --   With RandomFourier: theta < 0.5 is a sufficient condition for ALL inputs.
 --   This is why theta_ceil (CS-39) is less urgent with RandomFourier:

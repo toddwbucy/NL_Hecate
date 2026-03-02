@@ -641,7 +641,16 @@ fn traced_active_level(
             let m_final_start = s * d * d;
             let final_m = cache.m_states[m_final_start..m_final_start + d * d].to_vec();
 
-            let extra_meta = [crate::moneta::bias_to_f32(rule.bias), rule.sign_sharpness, rule.theta_floor, rule.theta_ceil];
+            let fm_kind_f32 = match rule.feature_map {
+                crate::feature_map::FeatureMapKind::Identity => 0.0f32,
+                crate::feature_map::FeatureMapKind::RandomFourier { .. } => 1.0,
+                crate::feature_map::FeatureMapKind::ELU => 2.0,
+            };
+            let fm_sigma = match rule.feature_map {
+                crate::feature_map::FeatureMapKind::RandomFourier { sigma } => sigma,
+                _ => 1.0,
+            };
+            let extra_meta = [crate::moneta::bias_to_f32(rule.bias), rule.sign_sharpness, rule.theta_floor, rule.theta_ceil, fm_kind_f32, fm_sigma];
             let (meta_id, lp_saved, emb_saved) =
                 alloc_common_saved(tape, level_params, embedded, s, d, &extra_meta);
             let cache_ids = vec![
@@ -661,10 +670,14 @@ fn traced_active_level(
             let y_id = tape.alloc(y.clone(), vec![s, d]);
             let mut saved = vec![meta_id, lp_saved, emb_saved];
             saved.extend(cache_ids);
-            // Save feature map z caches before conv caches (if non-Identity)
+            // Save feature map z caches and frozen FM weights before conv caches (if non-Identity).
+            // Backward adapter reads fm_z_k at saved[15], fm_z_q at saved[16],
+            // w_rand at saved[17], b_rand at saved[18].
             if !cache.fm_z_k_mem.is_empty() {
                 saved.push(tape.alloc(cache.fm_z_k_mem.clone(), vec![]));
                 saved.push(tape.alloc(cache.fm_z_q_mem.clone(), vec![]));
+                saved.push(tape.alloc(level_params.w_rand.clone(), vec![]));
+                saved.push(tape.alloc(level_params.b_rand.clone(), vec![]));
             }
             // Save conv1d cache if active
             assert!(cache.k_conv_cache.is_some() == cache.q_conv_cache.is_some(),
@@ -692,7 +705,16 @@ fn traced_active_level(
                 crate::model::MomentumKind::DeltaMomentum => 2.0,
                 crate::model::MomentumKind::DeepMomentum => 3.0,
             };
-            let extra_meta = [crate::moneta::bias_to_f32(rule.bias), rule.sign_sharpness, mk_f32, rule.theta_floor, rule.theta_ceil];
+            let fm_kind_f32 = match rule.feature_map {
+                crate::feature_map::FeatureMapKind::Identity => 0.0f32,
+                crate::feature_map::FeatureMapKind::RandomFourier { .. } => 1.0,
+                crate::feature_map::FeatureMapKind::ELU => 2.0,
+            };
+            let fm_sigma = match rule.feature_map {
+                crate::feature_map::FeatureMapKind::RandomFourier { sigma } => sigma,
+                _ => 1.0,
+            };
+            let extra_meta = [crate::moneta::bias_to_f32(rule.bias), rule.sign_sharpness, mk_f32, rule.theta_floor, rule.theta_ceil, fm_kind_f32, fm_sigma];
             let (meta_id, lp_saved, emb_saved) =
                 alloc_common_saved(tape, level_params, embedded, s, d, &extra_meta);
             let mut cache_ids = vec![
@@ -718,10 +740,14 @@ fn traced_active_level(
                     "traced_forward TitansLMM: DeltaMomentum produced empty decay buffer");
                 cache_ids.push(tape.alloc(cache.decay.clone(), vec![]));
             }
-            // Save feature map z caches before conv caches (if non-Identity)
+            // Save feature map z caches and frozen FM weights before conv caches (if non-Identity).
+            // Backward adapter: fm_base = 18 (EMA/None) or 19 (DeltaMomentum).
+            // fm_z_k at fm_base, fm_z_q at fm_base+1, w_rand at fm_base+2, b_rand at fm_base+3.
             if !cache.fm_z_k_mem.is_empty() {
                 cache_ids.push(tape.alloc(cache.fm_z_k_mem.clone(), vec![]));
                 cache_ids.push(tape.alloc(cache.fm_z_q_mem.clone(), vec![]));
+                cache_ids.push(tape.alloc(level_params.w_rand.clone(), vec![]));
+                cache_ids.push(tape.alloc(level_params.b_rand.clone(), vec![]));
             }
             let y_id = tape.alloc(y.clone(), vec![s, d]);
             let mut saved = vec![meta_id, lp_saved, emb_saved];

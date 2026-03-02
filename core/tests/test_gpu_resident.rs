@@ -6,7 +6,7 @@
 ///
 /// Requires: --features cuda
 
-use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind, CompositionKind, HopeVariant, LatticeVariant, MomentumKind, ProjectionKind};
+use nl_hecate_core::model::{MAGConfig, MAGParams, MemoryRuleKind, CompositionKind, HopeVariant, LatticeVariant, MomentumKind, ProjectionKind, FeatureMapKind};
 use nl_hecate_core::conductor::{Pulse, ContextState};
 use nl_hecate_core::dispatch;
 use nl_hecate_core::mag::cms_forward;

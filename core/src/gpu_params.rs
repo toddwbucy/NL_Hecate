@@ -124,7 +124,15 @@ impl GpuMemoryLevelParams {
         let up_proj   = if has_mlp { GpuBuf::from_host(&host.up_proj)   } else { GpuBuf::zeros(1) };
         let down_proj = if has_mlp { GpuBuf::from_host(&host.down_proj) } else { GpuBuf::zeros(1) };
 
-        let has_fm = !host.w_rand.is_empty();
+        let has_w_rand = !host.w_rand.is_empty();
+        let has_b_rand = !host.b_rand.is_empty();
+        debug_assert_eq!(
+            has_w_rand, has_b_rand,
+            "GpuMemoryLevelParams::from_host: w_rand (len={}) and b_rand (len={}) must both be \
+             non-empty or both be empty — mismatched FM pair indicates a corrupted host params",
+            host.w_rand.len(), host.b_rand.len()
+        );
+        let has_fm = has_w_rand && has_b_rand;
 
         GpuMemoryLevelParams {
             w_k_mem: GpuBuf::from_host(host.w_k_mem.master()),

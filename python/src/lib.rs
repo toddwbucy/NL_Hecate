@@ -426,7 +426,14 @@ impl MAGConfig {
         };
         let fm_kind = match feature_map.to_lowercase().as_str() {
             "identity" => RustFeatureMapKind::Identity,
-            "random_fourier" | "rff" => RustFeatureMapKind::RandomFourier { sigma: feature_map_sigma },
+            "random_fourier" | "rff" => {
+                if !feature_map_sigma.is_finite() || feature_map_sigma <= 0.0 {
+                    return Err(PyValueError::new_err(format!(
+                        "feature_map_sigma must be a positive finite number, got {feature_map_sigma}"
+                    )));
+                }
+                RustFeatureMapKind::RandomFourier { sigma: feature_map_sigma }
+            }
             "elu" => RustFeatureMapKind::ELU,
             _ => return Err(PyValueError::new_err(format!(
                 "Unknown feature_map '{feature_map}'. Expected: identity, random_fourier, elu"

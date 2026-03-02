@@ -95,11 +95,12 @@ pub fn init_random_fourier(d: usize, sigma: f32, rng: &mut SimpleRng) -> (Vec<f3
 ///
 /// Returns (phi_x, z) where:
 /// - phi_x: [d] the mapped vector (same dim; d_phi = d for all current maps)
-/// - z: [d] the pre-activation (needed for backward). Empty Vec for Identity/ELU.
+/// - z: [d] the pre-activation (needed for backward). Empty Vec for Identity only.
 ///
 /// For Identity: returns (x.to_vec(), vec![]) — zero allocation hot path.
 /// For RandomFourier: z = W_rand @ x + b_rand, phi_x = sqrt(2/d) * cos(z).
-/// For ELU: phi_x = elu(x) + 1 = max(x, 0) + exp(min(x, 0)), z = x (as phi).
+/// For ELU: phi_x = elu(x) + 1 = max(x, 0) + exp(min(x, 0)), z = x (the input,
+///          cached as the pre-activation for VJP: d(phi)/dx = 1 if x>0 else exp(x)).
 pub fn apply(x: &[f32], kind: &FeatureMapKind, w_rand: &[f32], b_rand: &[f32], d: usize) -> (Vec<f32>, Vec<f32>) {
     match kind {
         FeatureMapKind::Identity => {
@@ -127,6 +128,51 @@ pub fn apply(x: &[f32], kind: &FeatureMapKind, w_rand: &[f32], b_rand: &[f32], d
             }).collect();
             // z = x (needed for backward: d(phi)/dx = 1 if x>0, else exp(x))
             (phi_x, x.to_vec())
+        }
+    }
+}
+
+/// Apply feature map in-place into pre-allocated output buffers.
+///
+/// Eliminates per-token Vec allocations in hot loops. Callers preallocate
+/// `phi_out: [d]` and `z_out: [d]` once before the token loop and reuse them.
+///
+/// - Identity: copies x into phi_out; z_out is left unchanged (unused).
+/// - RandomFourier: computes z = W_rand @ x + b_rand into z_out, phi = sqrt(2/d)*cos(z) into phi_out.
+/// - ELU: computes phi = elu(x)+1 into phi_out, z = x into z_out.
+pub fn apply_into(
+    x: &[f32],
+    kind: &FeatureMapKind,
+    w_rand: &[f32],
+    b_rand: &[f32],
+    phi_out: &mut [f32],
+    z_out: &mut [f32],
+    d: usize,
+) {
+    match kind {
+        FeatureMapKind::Identity => {
+            phi_out.copy_from_slice(x);
+        }
+        FeatureMapKind::RandomFourier { .. } => {
+            debug_assert_eq!(w_rand.len(), d * d, "w_rand shape mismatch");
+            debug_assert_eq!(b_rand.len(), d, "b_rand shape mismatch");
+            z_out.copy_from_slice(b_rand);
+            for i in 0..d {
+                for j in 0..d {
+                    z_out[i] += w_rand[i * d + j] * x[j];
+                }
+            }
+            let scale = (2.0 / d as f32).sqrt();
+            for i in 0..d {
+                phi_out[i] = scale * z_out[i].cos();
+            }
+        }
+        FeatureMapKind::ELU => {
+            for i in 0..d {
+                let xi = x[i];
+                phi_out[i] = if xi > 0.0 { xi + 1.0 } else { xi.exp() };
+                z_out[i] = xi;
+            }
         }
     }
 }

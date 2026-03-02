@@ -254,6 +254,12 @@ impl MemoryRule for TitansLMM {
         let mut fm_z_k_mem = if has_fm { vec![0.0f32; seq_len * d] } else { vec![] };
         let mut fm_z_q_mem = if has_fm { vec![0.0f32; seq_len * d] } else { vec![] };
 
+        // Pre-allocated phi/z buffers — reused each token to avoid per-iter Vec alloc.
+        let mut phi_k_buf = vec![0.0f32; d];
+        let mut phi_q_buf = vec![0.0f32; d];
+        let mut z_k_buf = if has_fm { vec![0.0f32; d] } else { vec![] };
+        let mut z_q_buf = if has_fm { vec![0.0f32; d] } else { vec![] };
+
         // Sequential token loop
         for t in 0..seq_len {
             let k_t = &k_mem[t * d..(t + 1) * d];
@@ -261,12 +267,17 @@ impl MemoryRule for TitansLMM {
             let q_t = &q_mem[t * d..(t + 1) * d];
 
             // Feature map: phi_k_t = φ(k_t), phi_q_t = φ(q_t). Gates use raw k_t.
-            let (phi_k_t, z_k_t) = feature_map::apply(k_t, &self.feature_map, &level_params.w_rand, &level_params.b_rand, d);
-            let (phi_q_t, z_q_t) = feature_map::apply(q_t, &self.feature_map, &level_params.w_rand, &level_params.b_rand, d);
-            if has_fm {
-                fm_z_k_mem[t * d..(t + 1) * d].copy_from_slice(&z_k_t);
-                fm_z_q_mem[t * d..(t + 1) * d].copy_from_slice(&z_q_t);
-            }
+            // For Identity: phi slices alias k_t/q_t (zero allocation).
+            // For non-Identity: phi_k_buf/phi_q_buf are pre-allocated and reused.
+            let (phi_k_t, phi_q_t): (&[f32], &[f32]) = if has_fm {
+                feature_map::apply_into(k_t, &self.feature_map, &level_params.w_rand, &level_params.b_rand, &mut phi_k_buf, &mut z_k_buf, d);
+                feature_map::apply_into(q_t, &self.feature_map, &level_params.w_rand, &level_params.b_rand, &mut phi_q_buf, &mut z_q_buf, d);
+                fm_z_k_mem[t * d..(t + 1) * d].copy_from_slice(&z_k_buf);
+                fm_z_q_mem[t * d..(t + 1) * d].copy_from_slice(&z_q_buf);
+                (&phi_k_buf, &phi_q_buf)
+            } else {
+                (k_t, q_t)
+            };
 
             // Concatenate (k_t, v_t) — raw k_t for gate computation
             let c_base = t * 2 * d;

@@ -312,6 +312,12 @@ impl MemoryRule for DeltaRule {
         let mut fm_z_k_mem = if has_fm { vec![0.0f32; seq_len * d] } else { vec![] };
         let mut fm_z_q_mem = if has_fm { vec![0.0f32; seq_len * d] } else { vec![] };
 
+        // Pre-allocated phi/z buffers — reused each token to avoid per-iter Vec alloc.
+        let mut phi_k_buf = vec![0.0f32; d];
+        let mut phi_q_buf = vec![0.0f32; d];
+        let mut z_k_buf = if has_fm { vec![0.0f32; d] } else { vec![] };
+        let mut z_q_buf = if has_fm { vec![0.0f32; d] } else { vec![] };
+
         // Sequential token loop
         for t in 0..seq_len {
             let k_t = &k_mem[t * d..(t + 1) * d];
@@ -319,13 +325,17 @@ impl MemoryRule for DeltaRule {
             let q_t = &q_mem[t * d..(t + 1) * d];
 
             // Apply feature map phi(k_t), phi(q_t). Gates use raw k_t (unchanged).
-            let (phi_k_t, z_k_t) = feature_map::apply(k_t, &self.feature_map, &level_params.w_rand, &level_params.b_rand, d);
-            let (phi_q_t, z_q_t) = feature_map::apply(q_t, &self.feature_map, &level_params.w_rand, &level_params.b_rand, d);
-            // Store pre-activations for backward
-            if has_fm {
-                fm_z_k_mem[t * d..(t + 1) * d].copy_from_slice(&z_k_t);
-                fm_z_q_mem[t * d..(t + 1) * d].copy_from_slice(&z_q_t);
-            }
+            // For Identity: phi slice aliases k_t/q_t directly (zero allocation).
+            // For non-Identity: phi_k_buf/phi_q_buf are pre-allocated and reused.
+            let (phi_k_t, phi_q_t): (&[f32], &[f32]) = if has_fm {
+                feature_map::apply_into(k_t, &self.feature_map, &level_params.w_rand, &level_params.b_rand, &mut phi_k_buf, &mut z_k_buf, d);
+                feature_map::apply_into(q_t, &self.feature_map, &level_params.w_rand, &level_params.b_rand, &mut phi_q_buf, &mut z_q_buf, d);
+                fm_z_k_mem[t * d..(t + 1) * d].copy_from_slice(&z_k_buf);
+                fm_z_q_mem[t * d..(t + 1) * d].copy_from_slice(&z_q_buf);
+                (&phi_k_buf, &phi_q_buf)
+            } else {
+                (k_t, q_t)
+            };
 
             // Concatenate (k_t, v_t) — gates use raw k_t
             let c_base = t * 2 * d;
@@ -648,7 +658,7 @@ pub fn delta_rule_read_only(
 pub fn delta_rule_read_only_backward(
     level_params: &MemoryLevelParams,
     frozen_m: &[f32],
-    _q_mem: &[f32],
+    q_mem: &[f32],
     d_y: &[f32],
     embedded: &[f32],
     seq_len: usize,
@@ -658,17 +668,39 @@ pub fn delta_rule_read_only_backward(
 
     let mut grads = MemoryLevelParams::zeros_like(d);
 
-    // y_t = M @ q_t → d_q_t = M^T @ d_y_t
+    // Determine feature map kind from level_params (same heuristic as forward).
+    let fm_kind = if level_params.w_rand.is_empty() {
+        FeatureMapKind::Identity
+    } else {
+        // sigma doesn't affect the VJP computation (only w_rand matters).
+        FeatureMapKind::RandomFourier { sigma: 1.0 }
+    };
+    let has_fm = !matches!(fm_kind, FeatureMapKind::Identity);
+
+    // y_t = M @ phi(q_t)
+    // Backward: d_phi_q_t = M^T @ d_y_t, then d_q_t = vjp(d_phi_q_t, z_q_t).
     let mut d_q_mem = vec![0.0f32; seq_len * d];
     for t in 0..seq_len {
         let d_y_t = &d_y[t * d..(t + 1) * d];
+        // d_phi_q_t = M^T @ d_y_t
+        let mut d_phi_q_t = vec![0.0f32; d];
         for i in 0..d {
             let mut sum = 0.0f32;
             for j in 0..d {
                 sum += frozen_m[j * d + i] * d_y_t[j];
             }
-            d_q_mem[t * d + i] = sum;
+            d_phi_q_t[i] = sum;
         }
+        // Apply phi VJP through the feature map: d_q_t = φ'(q_t)^T d_phi_q_t.
+        // Re-run apply on q_t to recover the cached z (recompute is cheap for read-only path).
+        let d_q_t = if has_fm {
+            let q_t = &q_mem[t * d..(t + 1) * d];
+            let (_, z_q_t) = feature_map::apply(q_t, &fm_kind, &level_params.w_rand, &level_params.b_rand, d);
+            feature_map::vjp(&d_phi_q_t, &z_q_t, &fm_kind, &level_params.w_rand, d)
+        } else {
+            d_phi_q_t
+        };
+        d_q_mem[t * d..(t + 1) * d].copy_from_slice(&d_q_t);
     }
 
     // q_mem = embedded @ W_Q_mem^T → d_W_Q_mem, d_embedded
