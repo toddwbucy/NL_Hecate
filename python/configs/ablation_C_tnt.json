@@ -11,7 +11,7 @@
     "memory_enabled": true,
     "k": 4,
     "chunk_sizes": [1, 8, 64, 512],
-    "memory_rule": "titans",
+    "memory_rule": "delta",
     "composition": "mag",
     "projection_kind": "adaptive",
     "self_generated_values": false,

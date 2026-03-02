@@ -48,6 +48,9 @@ static inline void check_cuda_alloc(const char* tag, cudaError_t err) {
     }
 }
 
+// __launch_bounds__(512): nvcc caps register allocation to 65536/512 = 128 regs/thread,
+// enabling launch at block_size=512 on sm_89 where register file = 65536.
+__launch_bounds__(512)
 __global__ void delta_backward_kernel(
     const float* __restrict__ k_mem,      // [batch_size, seq_len, d]
     const float* __restrict__ v_mem,      // [batch_size, seq_len, d]
@@ -247,6 +250,7 @@ __global__ void delta_backward_kernel(
 // k_mem/v_mem/q_mem/d_y pointers are full-sequence; t_start/t_end select range.
 // ══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(512)
 __global__ void delta_backward_segment_kernel(
     const float* __restrict__ k_mem,
     const float* __restrict__ v_mem,
