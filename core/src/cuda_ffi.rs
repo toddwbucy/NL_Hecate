@@ -378,9 +378,12 @@ extern "C" {
 
     /// Per-token gate computation: dot(concat(k,v), w) + bias → activation.
     /// activation: 0=sigmoid, 1=softplus.
+    /// bias_ptr: device pointer to a [1]-element f32 buffer — read by kernel at launch.
+    /// Using a device pointer instead of a scalar makes this kernel CUDA-graph-capture-safe:
+    /// the graph captures the stable pointer; optimizer updates the value in-place.
     pub(crate) fn gate_compute_cuda(
         k_mem: *const f32, v_mem: *const f32, w_gate: *const f32,
-        bias: f32, gate_out: *mut f32,
+        bias_ptr: *const f32, gate_out: *mut f32,
         seq_len: i32, d: i32, activation: i32,
     );
 

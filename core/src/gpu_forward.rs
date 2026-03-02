@@ -204,6 +204,39 @@ pub fn gpu_cms_forward(
     let target_ids_i32: Vec<i32> = target_ids.iter()
         .map(|&x| i32::try_from(x).expect("target token id overflows i32 — vocab_size exceeds i32::MAX"))
         .collect();
+
+    // ── CUDA Graph step accounting ─────────────────────────────────────
+    // Advance the step counter and check for capture/replay opportunities.
+    // Capture and replay only trigger when scratch buffers are allocated
+    // (forward_scratch.is_some() requires cuda_graph_warmup > 0).
+    context.cuda_graph.step();
+    let bitmask = pulse_to_bitmask(pulse, cfg.k);
+
+    // ── CUDA Graph capture phase (one-time at warmup_steps) ────────────
+    if context.cuda_graph.should_capture() && context.forward_scratch.is_some() {
+        // Check that the memory rule is supported for graph capture.
+        let can_capture = matches!(cfg.memory_rule, MemoryRuleKind::DeltaRule | MemoryRuleKind::TitansLMM)
+            && cfg.checkpoint_interval.is_none();
+
+        if can_capture {
+            gpu_cms_capture_all_patterns(params, cfg, &input_ids_i32, &target_ids_i32, pulse, context, bs);
+        } else {
+            // Rule not supported for graph capture — disable permanently.
+            eprintln!("[cuda_graph] Capture skipped: rule {:?} not supported. Falling through to standard dispatch.", cfg.memory_rule);
+            context.cuda_graph.disable();
+        }
+    }
+
+    // ── CUDA Graph replay path ─────────────────────────────────────────
+    if context.cuda_graph.should_replay(bitmask) {
+        if let Some(loss) = gpu_cms_replay(params, cfg, &input_ids_i32, &target_ids_i32,
+                                            pulse, context, bitmask, bs) {
+            return loss;
+        }
+        // If replay returns None, fall through to standard dispatch.
+    }
+
+    // ── Standard dispatch path (warmup or graph disabled) ─────────────
     let d_input_ids = GpuBuf::<f32>::new(bs * s);
     let d_target_ids = GpuBuf::<f32>::new(bs * s);
     unsafe {
@@ -412,22 +445,20 @@ fn gpu_memory_forward(
     crate::dispatch::cublas_matmul_transb_dd(embedded, &level_params.w_q_mem, &mut q_mem, bs * s, d, d, 0.0);
 
     // Compute per-token gates: alpha[bs*s], theta[bs*s]
+    // b_alpha and b_theta are passed as device pointers (CUDA-graph-capture-safe):
+    // the graph captures the stable pointer; optimizer updates the value in-place.
     let mut alpha = GpuBuf::zeros(bs * s);
     let mut theta = GpuBuf::zeros(bs * s);
-    let mut b_alpha_host = [0.0f32];
-    let mut b_theta_host = [0.0f32];
-    level_params.b_alpha.copy_to_host(&mut b_alpha_host);
-    level_params.b_theta.copy_to_host(&mut b_theta_host);
 
     unsafe {
         crate::cuda_ffi::gate_compute_cuda(
             k_mem.as_ptr(), v_mem.as_ptr(), level_params.w_alpha.as_ptr(),
-            b_alpha_host[0], alpha.ptr(),
+            level_params.b_alpha.as_ptr(), alpha.ptr(),
             tokens_i32, d_i32, 0, // 0=sigmoid
         );
         crate::cuda_ffi::gate_compute_cuda(
             k_mem.as_ptr(), v_mem.as_ptr(), level_params.w_theta.as_ptr(),
-            b_theta_host[0], theta.ptr(),
+            level_params.b_theta.as_ptr(), theta.ptr(),
             tokens_i32, d_i32, 1, // 1=softplus
         );
         // CS-39: clamp post-softplus theta to [floor, ceil] per level.
@@ -584,6 +615,517 @@ fn gpu_memory_forward(
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════
+// Scratch-based forward helpers (CUDA graph capture/replay)
+// ══════════════════════════════════════════════════════════════════════
+
+/// Run memory kernel dispatch for one active level, writing into pre-allocated scratch.
+///
+/// Unlike `gpu_memory_forward`, this function:
+///   - Uses pre-allocated `GpuLevelScratch` buffers with FIXED device addresses
+///   - Does NOT call `copy_final_m_batch` (caller does that outside the captured graph)
+///   - Returns nothing; all outputs are in scratch fields
+///
+/// The caller wraps this in `begin_capture` / `end_capture` to build a CUDA graph.
+/// During CUDA graph replay, all kernel launches recorded here are re-executed
+/// using the same (stable) scratch buffer pointers.
+///
+/// Supported rules: DeltaRule, TitansLMM. Other rules fall back to standard dispatch.
+#[cfg(feature = "cuda")]
+/// Returns `false` for unsupported rule/checkpoint combos — caller must abort capture and
+/// fall back to standard dispatch. Never panics so a misconfigured rule does not
+/// hard-abort during a GPU capture window.
+fn gpu_memory_forward_into_scratch(
+    level_params: &crate::gpu_params::GpuMemoryLevelParams,
+    cfg: &MAGConfig,
+    embedded: &GpuBuf<f32>,
+    context_m: &GpuBuf<f32>,   // [bs*d*d] — carry-forward (read-only here; written by caller)
+    scratch: &mut crate::cuda_graph::GpuLevelScratch,
+    s: usize,
+    d: usize,
+    level: usize,
+    batch_size: usize,
+) -> bool {
+    let bs = batch_size;
+    let dd = d * d;
+    let tokens_i32 = i32::try_from(bs * s).expect("bs*s exceeds i32::MAX");
+    let d_i32      = i32::try_from(d).expect("d_model exceeds i32::MAX");
+
+    // Memory projections into pre-allocated scratch.k_mem, v_mem, q_mem
+    crate::dispatch::cublas_matmul_transb_dd(embedded, &level_params.w_k_mem, &mut scratch.k_mem, bs * s, d, d, 0.0);
+    crate::dispatch::cublas_matmul_transb_dd(embedded, &level_params.w_v_mem, &mut scratch.v_mem, bs * s, d, d, 0.0);
+    crate::dispatch::cublas_matmul_transb_dd(embedded, &level_params.w_q_mem, &mut scratch.q_mem, bs * s, d, d, 0.0);
+
+    // Gates into pre-allocated scratch.alpha, theta (device pointers — graph-capture-safe)
+    unsafe {
+        crate::cuda_ffi::gate_compute_cuda(
+            scratch.k_mem.as_ptr(), scratch.v_mem.as_ptr(), level_params.w_alpha.as_ptr(),
+            level_params.b_alpha.as_ptr(), scratch.alpha.ptr(),
+            tokens_i32, d_i32, 0, // 0=sigmoid
+        );
+        crate::cuda_ffi::gate_compute_cuda(
+            scratch.k_mem.as_ptr(), scratch.v_mem.as_ptr(), level_params.w_theta.as_ptr(),
+            level_params.b_theta.as_ptr(), scratch.theta.ptr(),
+            tokens_i32, d_i32, 1, // 1=softplus
+        );
+        let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
+        let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
+        if theta_floor > 0.0 || theta_ceil < f32::MAX {
+            crate::cuda_ffi::clamp_f32_cuda(scratch.theta.ptr(), tokens_i32, theta_floor, theta_ceil);
+        }
+    }
+
+    let m_initial_slice = context_m.slice(0, bs * dd);
+
+    match (cfg.checkpoint_interval, cfg.memory_rule) {
+        (None, MemoryRuleKind::DeltaRule) => {
+            // Zero scratch.m_states at start of each step (initial M from context_m is copied in)
+            scratch.m_states.zero();
+            crate::dispatch::delta_forward_dd(
+                &scratch.k_mem, &scratch.v_mem, &scratch.q_mem,
+                &scratch.alpha, &scratch.theta,
+                &m_initial_slice, &mut scratch.m_states, &mut scratch.y, s, d, bs,
+            );
+            // NOTE: copy_final_m_batch is NOT called here — caller does it outside the graph.
+            true
+        }
+        (None, MemoryRuleKind::TitansLMM) => {
+            // Eta gate for Titans
+            unsafe {
+                crate::cuda_ffi::gate_compute_cuda(
+                    scratch.k_mem.as_ptr(), scratch.v_mem.as_ptr(), level_params.w_eta.as_ptr(),
+                    level_params.b_eta.as_ptr(), scratch.eta.ptr(),
+                    tokens_i32, d_i32, 0,
+                );
+            }
+            // Use the persistent scratch.s_initial buffer (stable device pointer, safe for CUDA graph capture).
+            // Titans: s_initial is always zero per chunk; re-zero on each step.
+            scratch.s_initial.zero();
+            let s_initial_slice = scratch.s_initial.slice(0, bs * dd);
+            if scratch.has_s_states {
+                scratch.m_states.zero();
+                scratch.s_states.zero();
+                crate::dispatch::titans_forward_dd(
+                    &scratch.k_mem, &scratch.v_mem, &scratch.q_mem,
+                    &scratch.alpha, &scratch.theta, &scratch.eta,
+                    &m_initial_slice, &s_initial_slice,
+                    &mut scratch.m_states, &mut scratch.s_states, &mut scratch.y, s, d, bs,
+                );
+                // NOTE: copy_final_m_batch NOT called here — caller does it outside the graph.
+            }
+            true
+        }
+        _ => {
+            // Unsupported rule/checkpoint combo for scratch path — signal caller to fall back.
+            eprintln!("[cuda_graph] gpu_memory_forward_into_scratch: unsupported rule {:?} — disabling graph capture", cfg.memory_rule);
+            false
+        }
+    }
+}
+
+/// Build a non-owning `GpuMemoryCache` from scratch buffer pointers.
+///
+/// The returned cache holds `from_raw_non_owning` GpuBuf views into the scratch.
+/// These are valid until the next call to gpu_cms_forward (which overwrites scratch).
+/// Safety invariant: backward is called before the next forward — no aliasing hazard.
+#[cfg(feature = "cuda")]
+unsafe fn memory_cache_from_scratch(
+    scratch: &crate::cuda_graph::GpuLevelScratch,
+    cfg: &MAGConfig,
+    bs: usize,
+    s: usize,
+    d: usize,
+) -> Option<GpuMemoryCache> {
+    let dd = d * d;
+    match (cfg.checkpoint_interval, cfg.memory_rule) {
+        (None, MemoryRuleKind::DeltaRule) => Some(GpuMemoryCache::Delta {
+            k_mem:    GpuBuf::from_raw_non_owning(scratch.k_mem.ptr(), bs * s * d),
+            v_mem:    GpuBuf::from_raw_non_owning(scratch.v_mem.ptr(), bs * s * d),
+            q_mem:    GpuBuf::from_raw_non_owning(scratch.q_mem.ptr(), bs * s * d),
+            alpha:    GpuBuf::from_raw_non_owning(scratch.alpha.ptr(), bs * s),
+            theta:    GpuBuf::from_raw_non_owning(scratch.theta.ptr(), bs * s),
+            m_states: GpuBuf::from_raw_non_owning(scratch.m_states.ptr(), bs * (s + 1) * dd),
+        }),
+        (None, MemoryRuleKind::TitansLMM) => Some(GpuMemoryCache::Titans {
+            k_mem:    GpuBuf::from_raw_non_owning(scratch.k_mem.ptr(), bs * s * d),
+            v_mem:    GpuBuf::from_raw_non_owning(scratch.v_mem.ptr(), bs * s * d),
+            q_mem:    GpuBuf::from_raw_non_owning(scratch.q_mem.ptr(), bs * s * d),
+            alpha:    GpuBuf::from_raw_non_owning(scratch.alpha.ptr(), bs * s),
+            theta:    GpuBuf::from_raw_non_owning(scratch.theta.ptr(), bs * s),
+            eta:      GpuBuf::from_raw_non_owning(scratch.eta.ptr(), bs * s),
+            m_states: GpuBuf::from_raw_non_owning(scratch.m_states.ptr(), bs * (s + 1) * dd),
+            s_states: GpuBuf::from_raw_non_owning(scratch.s_states.ptr(), bs * (s + 1) * dd),
+        }),
+        _ => None,  // Unsupported rule — caller (gpu_cms_replay) returns None → standard dispatch
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// CUDA Graph capture/replay helpers
+// ══════════════════════════════════════════════════════════════════════
+
+/// Compute the CMS pulse bitmask (bit i = level i is active). L0 always fires.
+#[cfg(feature = "cuda")]
+pub fn pulse_to_bitmask(pulse: &Pulse, k: usize) -> u8 {
+    let mut mask: u8 = 0;
+    for i in 0..k.min(8) {
+        if pulse.active_levels[i] {
+            mask |= 1u8 << i;
+        }
+    }
+    mask
+}
+
+/// All 8 reachable CMS bitmasks for k=4 (L0 always fires → only odd bitmasks 1..15).
+#[cfg(feature = "cuda")]
+const REACHABLE_BITMASKS_K4: [u8; 8] = [
+    0b0001, 0b0011, 0b0101, 0b0111,
+    0b1001, 0b1011, 0b1101, 0b1111,
+];
+
+/// Capture all reachable pulse patterns into the CudaGraphStore.
+///
+/// For each bitmask: save context_m → begin_capture → run kernel-only forward into scratch
+/// → end_capture → restore context_m. Does NOT update context_m (caller does actual step).
+/// Called once at step == warmup_steps.
+#[cfg(feature = "cuda")]
+fn gpu_cms_capture_all_patterns(
+    params: &GpuMAGParams,
+    cfg: &MAGConfig,
+    input_ids_i32: &[i32],
+    target_ids_i32: &[i32],
+    _pulse: &Pulse,
+    context: &mut GpuContextState,
+    bs: usize,
+) {
+    let s  = cfg.swa.seq_len;
+    let d  = cfg.swa.d_model;
+    let v  = cfg.swa.vocab_size;
+    let nh = cfg.swa.num_heads;
+    let hd = cfg.swa.head_dim;
+    let ws = cfg.swa.window_size;
+    let k  = cfg.k;
+
+    // Build reachable bitmask list for this k value
+    let reachable: Vec<u8> = REACHABLE_BITMASKS_K4.iter()
+        .copied()
+        .filter(|&b| (b as usize) < (1 << k))  // drop bitmasks that exceed k levels
+        .collect();
+
+    // Save context_m state for each level (D2D into host-side Vec<Vec<f32>>)
+    let dd = d * d;
+    let mut saved_m: Vec<Vec<f32>> = context.memory.iter()
+        .map(|buf| {
+            let mut v = vec![0.0f32; bs * dd];
+            buf.copy_to_host(&mut v);
+            v
+        })
+        .collect();
+
+    // Upload input_ids into forward_scratch.d_input_ids (captured as device pointer)
+    {
+        let fwd = context.forward_scratch.as_ref().expect("forward_scratch must be Some");
+        unsafe {
+            let rc = gpu_buf_memcpy_h2d(
+                fwd.d_input_ids.ptr() as *mut std::ffi::c_void,
+                input_ids_i32.as_ptr() as *const std::ffi::c_void,
+                bs * s * 4,
+            );
+            assert_eq!(rc, 0, "capture: H2D input_ids failed");
+            let rc = gpu_buf_memcpy_h2d(
+                fwd.d_target_ids.ptr() as *mut std::ffi::c_void,
+                target_ids_i32.as_ptr() as *const std::ffi::c_void,
+                bs * s * 4,
+            );
+            assert_eq!(rc, 0, "capture: H2D target_ids failed");
+        }
+    }
+
+    let tokens_i32 = i32::try_from(bs * s).expect("bs*s exceeds i32::MAX");
+    let d_i32      = i32::try_from(d).expect("d_model exceeds i32::MAX");
+    let v_i32      = i32::try_from(v).expect("vocab_size exceeds i32::MAX");
+    let total      = bs * s * d;
+    let total_i32  = i32::try_from(total).expect("bs*s*d exceeds i32::MAX");
+
+    for bitmask in reachable {
+        // Restore context_m state before each capture
+        for (level, buf) in context.memory.iter().enumerate() {
+            buf.copy_from_host(&saved_m[level]);
+        }
+
+        // Build a synthetic pulse from this bitmask
+        let mut active_levels = vec![false; k];
+        for i in 0..k {
+            active_levels[i] = (bitmask >> i) & 1 != 0;
+        }
+
+        // Begin CUDA graph capture (captures all work on default stream)
+        if !context.cuda_graph.begin_capture() {
+            eprintln!("[cuda_graph] begin_capture failed for bitmask {bitmask:#04b}. Disabling.");
+            context.cuda_graph.disable();
+            return;
+        }
+
+        // Run the full forward pass into scratch buffers (no copy_final_m, no sync, no D2H)
+        // All kernel launches go into the capture stream.
+        // SAFETY: forward_scratch and level_scratch have fixed addresses valid for the lifetime of context.
+        let fwd_ptr = context.forward_scratch.as_mut().expect("forward_scratch must be Some") as *mut crate::cuda_graph::ForwardScratch;
+        let lvl_ptr = context.level_scratch.as_mut_ptr();
+        let fwd = unsafe { &mut *fwd_ptr };
+
+        // Stage 1: Embedding
+        unsafe {
+            crate::cuda_ffi::embedding_gather_cuda(
+                params.swa.w_embed.as_ptr(),
+                fwd.d_input_ids.ptr() as *const i32,
+                fwd.embedded.ptr(),
+                tokens_i32, d_i32,
+            );
+        }
+
+        // Stage 2a: QKV projections
+        crate::dispatch::cublas_matmul_transb_dd(&fwd.embedded, &params.swa.w_q, &mut fwd.q_f32, bs * s, d, d, 0.0);
+        crate::dispatch::cublas_matmul_transb_dd(&fwd.embedded, &params.swa.w_k, &mut fwd.k_f32, bs * s, d, d, 0.0);
+        crate::dispatch::cublas_matmul_transb_dd(&fwd.embedded, &params.swa.w_v, &mut fwd.v_f32, bs * s, d, d, 0.0);
+
+        // Stage 3a: f32→bf16, SWA, bf16→f32
+        unsafe {
+            crate::cuda_ffi::f32_to_bf16_cuda(fwd.q_f32.as_ptr(), fwd.q_bf16.ptr(), total_i32);
+            crate::cuda_ffi::f32_to_bf16_cuda(fwd.k_f32.as_ptr(), fwd.k_bf16.ptr(), total_i32);
+            crate::cuda_ffi::f32_to_bf16_cuda(fwd.v_f32.as_ptr(), fwd.v_bf16.ptr(), total_i32);
+        }
+        crate::dispatch::swa_forward_dd(&fwd.q_bf16, &fwd.k_bf16, &fwd.v_bf16,
+                                         &mut fwd.attn_out_bf16, &mut fwd.attn_weights_bf16,
+                                         s, nh, hd, ws, bs);
+        unsafe { crate::cuda_ffi::bf16_to_f32_cuda(fwd.attn_out_bf16.as_ptr(), fwd.attn_out.ptr(), total_i32); }
+
+        // Stage 2b+3b: Memory per level
+        for level in 0..k {
+            let is_active = active_levels[level]
+                || matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp);
+
+            if is_active {
+                let lvl_scratch = unsafe { &mut *lvl_ptr.add(level) };
+                let context_m_ptr = &context.memory[level] as *const GpuBuf<f32>;
+                let context_m = unsafe { &*context_m_ptr };
+                if !gpu_memory_forward_into_scratch(
+                    &params.levels[level], cfg, &fwd.embedded,
+                    context_m, lvl_scratch, s, d, level, bs,
+                ) {
+                    // Unsupported rule: end the capture cleanly to release the stream,
+                    // then disable graph capture entirely and fall back to standard dispatch.
+                    let _ = context.cuda_graph.end_capture(bitmask);
+                    context.cuda_graph.disable();
+                    return;
+                }
+                // y_per_level[level] ← scratch.y (copy into forward_scratch.y_per_level)
+                unsafe {
+                    let rc = gpu_buf_memcpy_d2d(
+                        fwd.y_per_level[level].ptr() as *mut std::ffi::c_void,
+                        lvl_scratch.y.as_ptr() as *const std::ffi::c_void,
+                        bs * s * d * 4,
+                    );
+                    assert_eq!(rc, 0);
+                }
+            } else {
+                // Frozen: q_mem @ M^T — use persistent scratch to keep device pointers
+                // stable across CUDA graph capture/replay (transient GpuBuf would dangle).
+                crate::dispatch::cublas_matmul_transb_dd(&fwd.embedded, &params.levels[level].w_q_mem,
+                                                          &mut fwd.q_tmp_per_level[level], bs * s, d, d, 0.0);
+                crate::dispatch::cublas_matmul_transb_dd(&fwd.q_tmp_per_level[level], &context.memory[level],
+                                                          &mut fwd.y_per_level[level], bs * s, d, d, 0.0);
+            }
+        }
+
+        // Stage: Combine
+        fwd.y_combined.zero();
+        for level in 0..k {
+            unsafe {
+                crate::cuda_ffi::saxpy_cuda(1.0, fwd.y_per_level[level].as_ptr(), fwd.y_combined.ptr(), total_i32);
+            }
+        }
+        if k > 2 {
+            let scale = 1.0 / (k as f32).sqrt();
+            unsafe { crate::cuda_ffi::saxpy_cuda(scale - 1.0, fwd.y_combined.as_ptr(), fwd.y_combined.ptr(), total_i32); }
+        }
+
+        // Stage: Gate
+        unsafe {
+            crate::cuda_ffi::sigmoid_cuda(fwd.y_combined.as_ptr(), fwd.gate.ptr(), total_i32);
+            crate::cuda_ffi::elemwise_mul_cuda(fwd.attn_out.as_ptr(), fwd.gate.as_ptr(), fwd.gated_out.ptr(), total_i32);
+        }
+
+        // Stage: Output projection + unembed
+        crate::dispatch::cublas_matmul_transb_dd(&fwd.gated_out, &params.swa.w_o, &mut fwd.projected, bs * s, d, d, 0.0);
+        crate::dispatch::cublas_matmul_dd(&fwd.projected, &params.swa.w_unembed, &mut fwd.logits, bs * s, d, v, 0.0);
+
+        // Stage: Cross-entropy (result in fwd.loss_gpu)
+        unsafe {
+            crate::cuda_ffi::cross_entropy_forward_cuda(
+                fwd.logits.as_ptr(),
+                fwd.d_target_ids.ptr() as *const i32,
+                fwd.loss_gpu.ptr(),
+                tokens_i32, v_i32,
+            );
+        }
+
+        // End capture → instantiate graph
+        if !context.cuda_graph.end_capture(bitmask) {
+            eprintln!("[cuda_graph] end_capture failed for bitmask {bitmask:#04b}. Disabling.");
+            context.cuda_graph.disable();
+            // Restore context_m
+            for (level, buf) in context.memory.iter().enumerate() {
+                buf.copy_from_host(&saved_m[level]);
+            }
+            return;
+        }
+    }
+
+    // Restore context_m to pre-capture state (caller will run the actual step via standard dispatch)
+    for (level, buf) in context.memory.iter().enumerate() {
+        buf.copy_from_host(&saved_m[level]);
+    }
+
+    eprintln!("[cuda_graph] Captured {} patterns at step {}.",
+              reachable.len(), context.cuda_graph.steps_seen);
+    let _ = (nh, hd, ws, total_i32, v_i32, d_i32, tokens_i32); // suppress unused warnings
+}
+
+/// Run one GPU forward pass via CUDA graph replay.
+///
+/// Uploads current input/target token ids into pre-allocated scratch (outside graph),
+/// then launches the captured graph, runs manual copy_final_m + m_norm_clamp (outside graph),
+/// syncs, downloads loss, and returns `(f32, GpuCMSCache)` with non-owning cache.
+///
+/// Returns `None` if replay fails (caller falls through to standard dispatch).
+#[cfg(feature = "cuda")]
+fn gpu_cms_replay(
+    params: &GpuMAGParams,
+    cfg: &MAGConfig,
+    input_ids_i32: &[i32],
+    target_ids_i32: &[i32],
+    pulse: &Pulse,
+    context: &mut GpuContextState,
+    bitmask: u8,
+    bs: usize,
+) -> Option<(f32, GpuCMSCache)> {
+    let s  = cfg.swa.seq_len;
+    let d  = cfg.swa.d_model;
+    let v  = cfg.swa.vocab_size;
+    let nh = cfg.swa.num_heads;
+    let hd = cfg.swa.head_dim;
+    let ws = cfg.swa.window_size;
+    let k  = cfg.k;
+    let dd = d * d;
+
+    let fwd = context.forward_scratch.as_ref()?;
+    let d_i32      = i32::try_from(d).expect("d_model exceeds i32::MAX");
+    let tokens_i32 = i32::try_from(bs * s).expect("bs*s exceeds i32::MAX");
+    let v_i32      = i32::try_from(v).expect("vocab_size exceeds i32::MAX");
+
+    // H2D upload BEFORE graph launch (outside captured region, on default stream)
+    unsafe {
+        let rc = gpu_buf_memcpy_h2d(
+            fwd.d_input_ids.ptr() as *mut std::ffi::c_void,
+            input_ids_i32.as_ptr() as *const std::ffi::c_void,
+            bs * s * 4,
+        );
+        if rc != 0 { return None; }
+        let rc = gpu_buf_memcpy_h2d(
+            fwd.d_target_ids.ptr() as *mut std::ffi::c_void,
+            target_ids_i32.as_ptr() as *const std::ffi::c_void,
+            bs * s * 4,
+        );
+        if rc != 0 { return None; }
+    }
+
+    // Launch the captured graph (replays all kernel launches with fixed scratch pointers)
+    if !context.cuda_graph.replay(bitmask) {
+        return None;
+    }
+
+    // Manual copy_final_m + m_norm_clamp OUTSIDE graph, for each active level
+    for level in 0..k {
+        let is_active = pulse.active_levels[level]
+            || matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp);
+        if is_active {
+            let m_states = &context.level_scratch[level].m_states;
+            copy_final_m_batch(m_states, &mut context.memory[level], s, dd, bs);
+            let m_norm_max = cfg.max_m_norm(level);
+            for b in 0..bs {
+                unsafe {
+                    crate::cuda_ffi::m_norm_clamp_f32_cuda(
+                        (context.memory[level].ptr() as *mut u8).add(b * dd * 4) as *mut f32,
+                        d_i32, m_norm_max,
+                    );
+                }
+            }
+        }
+    }
+
+    // Sync + D2H loss
+    crate::dispatch::cuda_sync();
+    let fwd = context.forward_scratch.as_ref().unwrap();
+    let mut loss_host = [0.0f32; 1];
+    fwd.loss_gpu.copy_to_host(&mut loss_host);
+    let valid_count = target_ids_i32.iter()
+        .filter(|&&t| t >= 0 && (t as usize) < v)
+        .count() as f32;
+    let loss = if valid_count > 0.0 { loss_host[0] / valid_count } else { 0.0 };
+
+    // Build GpuCMSCache with non-owning views into scratch
+    // SAFETY: scratch lives in GpuContextState which outlives this cache.
+    // Backward is called before the next forward, so non-owning views are valid.
+    let fwd = context.forward_scratch.as_ref().unwrap();
+    let mut memory_caches = Vec::with_capacity(k);
+    let mut y_per_level: Vec<GpuBuf<f32>> = Vec::with_capacity(k);
+
+    for level in 0..k {
+        let is_active = pulse.active_levels[level]
+            || matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp);
+        if is_active {
+            let lvl = &context.level_scratch[level];
+            let cache = unsafe { memory_cache_from_scratch(lvl, cfg, bs, s, d)? };
+            memory_caches.push(Some(cache));
+            let y = unsafe { GpuBuf::from_raw_non_owning(lvl.y.ptr(), bs * s * d) };
+            y_per_level.push(y);
+        } else {
+            memory_caches.push(None);
+            let y = unsafe { GpuBuf::from_raw_non_owning(fwd.y_per_level[level].ptr(), bs * s * d) };
+            y_per_level.push(y);
+        }
+    }
+
+    let cache = GpuCMSCache {
+        input_ids_gpu:       unsafe { GpuBuf::from_raw_non_owning(fwd.d_input_ids.ptr(), bs * s) },
+        target_ids_gpu:      unsafe { GpuBuf::from_raw_non_owning(fwd.d_target_ids.ptr(), bs * s) },
+        input_ids_i32:       input_ids_i32.to_vec(),
+        target_ids_i32:      target_ids_i32.to_vec(),
+        embedded:            unsafe { GpuBuf::from_raw_non_owning(fwd.embedded.ptr(), bs * s * d) },
+        q_f32:               unsafe { GpuBuf::from_raw_non_owning(fwd.q_f32.ptr(), bs * s * d) },
+        k_f32:               unsafe { GpuBuf::from_raw_non_owning(fwd.k_f32.ptr(), bs * s * d) },
+        v_f32:               unsafe { GpuBuf::from_raw_non_owning(fwd.v_f32.ptr(), bs * s * d) },
+        q_bf16:              unsafe { GpuBuf::from_raw_non_owning(fwd.q_bf16.ptr(), bs * s * d) },
+        k_bf16:              unsafe { GpuBuf::from_raw_non_owning(fwd.k_bf16.ptr(), bs * s * d) },
+        v_bf16:              unsafe { GpuBuf::from_raw_non_owning(fwd.v_bf16.ptr(), bs * s * d) },
+        attn_out_bf16:       unsafe { GpuBuf::from_raw_non_owning(fwd.attn_out_bf16.ptr(), bs * s * d) },
+        attn_weights_bf16:   unsafe { GpuBuf::from_raw_non_owning(fwd.attn_weights_bf16.ptr(), bs * nh * s * ws) },
+        attn_out:            unsafe { GpuBuf::from_raw_non_owning(fwd.attn_out.ptr(), bs * s * d) },
+        memory_caches,
+        y_per_level,
+        y_combined:          unsafe { GpuBuf::from_raw_non_owning(fwd.y_combined.ptr(), bs * s * d) },
+        gate:                unsafe { GpuBuf::from_raw_non_owning(fwd.gate.ptr(), bs * s * d) },
+        gated_out:           unsafe { GpuBuf::from_raw_non_owning(fwd.gated_out.ptr(), bs * s * d) },
+        projected:           unsafe { GpuBuf::from_raw_non_owning(fwd.projected.ptr(), bs * s * d) },
+        logits:              unsafe { GpuBuf::from_raw_non_owning(fwd.logits.ptr(), bs * s * v) },
+        pulse: pulse.clone(),
+        s, d, v, nh, hd, ws,
+        batch_size: bs,
+    };
+
+    Some((loss, cache))
+}
+
 /// Copy all batch elements' final M back to their respective context slots.
 ///
 /// Element b's final M is at m_states offset: `b * (seq_len+1) * dd + seq_len * dd`
@@ -639,12 +1181,11 @@ fn compute_eta(
     s: usize, d: usize,
 ) -> GpuBuf<f32> {
     let mut eta = GpuBuf::zeros(s);
-    let mut b_eta_host = [0.0f32];
-    level_params.b_eta.copy_to_host(&mut b_eta_host);
+    // Pass b_eta as device pointer (CUDA-graph-capture-safe: stable pointer, value updated in-place).
     unsafe {
         crate::cuda_ffi::gate_compute_cuda(
             k_mem.as_ptr(), v_mem.as_ptr(), level_params.w_eta.as_ptr(),
-            b_eta_host[0], eta.ptr(),
+            level_params.b_eta.as_ptr(), eta.ptr(),
             s as i32, d as i32, 0,
         );
     }

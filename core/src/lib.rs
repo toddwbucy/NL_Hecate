@@ -49,6 +49,8 @@ pub mod gpu_buf;
 #[cfg(feature = "cuda")]
 pub mod gpu_params;
 #[cfg(feature = "cuda")]
+pub mod cuda_graph;
+#[cfg(feature = "cuda")]
 pub mod gpu_forward;
 #[cfg(feature = "cuda")]
 pub mod gpu_backward;

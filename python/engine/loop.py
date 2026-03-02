@@ -618,9 +618,10 @@ def run_build(bcfg: BuildConfig):
                 print(f"    [fires] {fires_str}")
                 level_fire_counts = [0] * bcfg.k
             # ── Learning probes (CS-10: model learns during eval) ─────
+            snapshot = None
             if gpu_model is not None and tokenizer is not None:
-                snapshot = full_snapshot(gpu_model)
                 try:
+                    snapshot = full_snapshot(gpu_model)
                     # Probe 1: within-generation learning curve
                     # Restore between probes: step_generate modifies params
                     for prompt_text in EVAL_PROMPTS:
@@ -668,14 +669,16 @@ def run_build(bcfg: BuildConfig):
                 except Exception as e:
                     print(f"    [learning probe failed: {e}]")
                 finally:
-                    full_restore(gpu_model, snapshot)
-                    gpu_model.reset_optimizer()  # probes corrupt AdamW moments
+                    if snapshot is not None:
+                        full_restore(gpu_model, snapshot)
+                        gpu_model.reset_optimizer()  # probes corrupt AdamW moments
             # ── Memory vocab probe (logit lens for CMS levels) ────────
             if gpu_model is not None and tokenizer is not None:
                 try:
                     # Reuse params/context already downloaded by full_snapshot.
-                    # snapshot is defined in the learning-probe block above;
-                    # guard both blocks under the same condition.
+                    # Guard: full_snapshot may have failed or been skipped; re-acquire if needed.
+                    if snapshot is None:
+                        snapshot = full_snapshot(gpu_model)
                     vprobe = probe_memory_vocab(
                         snapshot["params"], snapshot["context"],
                         cfg, tokenizer, step)

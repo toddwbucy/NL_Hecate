@@ -262,20 +262,57 @@ impl GpuMAGParams {
 /// Slot 0 is the "primary" context used for checkpointing and inference.
 ///
 /// For matrix rules (Delta/Titans/Hebbian): each level has batch_size * d*d floats.
+///
+/// When `cuda_graph_warmup > 0`: also holds pre-allocated `ForwardScratch` and per-level
+/// `GpuLevelScratch` with fixed GPU addresses for CUDA graph capture/replay.
 #[cfg(feature = "cuda")]
 pub struct GpuContextState {
     /// Per-level M matrices on GPU. Each is [batch_size * d*d].
     pub memory: Vec<GpuBuf<f32>>,
     pub d: usize,
     pub batch_size: usize,
+    /// Pre-allocated forward buffers for CUDA graph capture (None when warmup_steps=0).
+    pub forward_scratch: Option<crate::cuda_graph::ForwardScratch>,
+    /// Pre-allocated per-level activation buffers for CUDA graph capture (empty when warmup_steps=0).
+    pub level_scratch: Vec<crate::cuda_graph::GpuLevelScratch>,
+    /// CUDA graph store — captures/replays kernel dispatch per pulse bitmask.
+    pub cuda_graph: crate::cuda_graph::CudaGraphStore,
 }
 
 #[cfg(feature = "cuda")]
 impl GpuContextState {
     /// Initialize zero M matrices for k levels, each [batch_size * d*d].
-    pub fn new(k: usize, d: usize, batch_size: usize) -> Self {
+    ///
+    /// When `cuda_graph_warmup > 0`, also pre-allocates scratch buffers for all k levels
+    /// and the forward pass. This adds persistent VRAM equal to ~one forward pass's
+    /// intermediates — the same memory that would be dynamically allocated per step.
+    pub fn new(
+        k: usize, d: usize, batch_size: usize,
+        cfg: Option<&crate::model::MAGConfig>,
+        cuda_graph_warmup: usize,
+    ) -> Self {
         let memory = (0..k).map(|_| GpuBuf::zeros(batch_size * d * d)).collect();
-        GpuContextState { memory, d, batch_size }
+        let (forward_scratch, level_scratch) = if cuda_graph_warmup > 0 {
+            if let Some(cfg) = cfg {
+                let fwd = crate::cuda_graph::ForwardScratch::from_cfg(cfg, batch_size);
+                let lvl: Vec<_> = (0..k)
+                    .map(|_| crate::cuda_graph::GpuLevelScratch::from_cfg(cfg, batch_size))
+                    .collect();
+                (Some(fwd), lvl)
+            } else {
+                (None, Vec::new())
+            }
+        } else {
+            (None, Vec::new())
+        };
+        GpuContextState {
+            memory,
+            d,
+            batch_size,
+            forward_scratch,
+            level_scratch,
+            cuda_graph: crate::cuda_graph::CudaGraphStore::new(cuda_graph_warmup),
+        }
     }
 
     /// Download slot-0 M to host ContextState (for checkpoint / inference).
@@ -336,6 +373,13 @@ impl GpuContextState {
             }
             buf
         }).collect();
-        GpuContextState { memory, d, batch_size }
+        GpuContextState {
+            memory,
+            d,
+            batch_size,
+            forward_scratch: None,
+            level_scratch: Vec::new(),
+            cuda_graph: crate::cuda_graph::CudaGraphStore::new(0),
+        }
     }
 }

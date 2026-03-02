@@ -155,7 +155,9 @@ extern "C" void bf16_to_f32_cuda(const unsigned short* src, float* dst, int n) {
 
 // ── Per-token gate computation ────────────────────────────────────────
 // For each token t: gate_out[t] = activation(dot(concat(k_mem_t, v_mem_t), w_gate) + bias)
-// k_mem_t and v_mem_t are each [d], w_gate is [2*d], bias is scalar.
+// k_mem_t and v_mem_t are each [d], w_gate is [2*d], bias_ptr points to a scalar on device.
+// Using a device pointer for bias makes this kernel CUDA-graph-capture-safe: the graph
+// captures the pointer (which is stable across optimizer updates), not the value.
 // activation: 0=sigmoid, 1=softplus
 // Grid=(seq_len), Block=(min(d, 512)) with warp reduction.
 
@@ -163,7 +165,7 @@ __global__ void gate_compute_kernel(
     const float* __restrict__ k_mem,     // [seq_len, d]
     const float* __restrict__ v_mem,     // [seq_len, d]
     const float* __restrict__ w_gate,    // [2*d]
-    float bias,
+    const float* __restrict__ bias_ptr,  // [1] — device pointer, read once per block
     float* __restrict__ gate_out,        // [seq_len]
     int seq_len, int d, int activation)
 {
@@ -196,7 +198,7 @@ __global__ void gate_compute_kernel(
         for (int w = 0; w < num_warps; w++) {
             total += warp_sums[w];
         }
-        total += bias;
+        total += bias_ptr[0];  // read bias from device memory (stable pointer)
 
         if (activation == 0) {
             // sigmoid
@@ -210,13 +212,13 @@ __global__ void gate_compute_kernel(
 
 extern "C" void gate_compute_cuda(
     const float* k_mem, const float* v_mem, const float* w_gate,
-    float bias, float* gate_out,
+    const float* bias_ptr, float* gate_out,
     int seq_len, int d, int activation)
 {
     int block = (d < 512) ? d : 512;
     if (block < 32) block = 32;  // minimum warp
     gate_compute_kernel<<<seq_len, block>>>(
-        k_mem, v_mem, w_gate, bias, gate_out, seq_len, d, activation);
+        k_mem, v_mem, w_gate, bias_ptr, gate_out, seq_len, d, activation);
 }
 
 // ── SAXPY: y[i] += alpha * x[i] ──────────────────────────────────────

@@ -1546,12 +1546,16 @@ impl GpuModel {
     /// All parameters are uploaded to GPU once. batch_size determines how many
     /// independent M-state slots are allocated in GpuContextState.
     #[new]
-    #[pyo3(signature = (cfg, seed, batch_size=1, memory_reset=false))]
-    fn new(cfg: &MAGConfig, seed: u64, batch_size: usize, memory_reset: bool) -> PyResult<Self> {
+    #[pyo3(signature = (cfg, seed, batch_size=1, memory_reset=false, cuda_graph_warmup=0))]
+    fn new(
+        cfg: &MAGConfig, seed: u64, batch_size: usize,
+        memory_reset: bool, cuda_graph_warmup: usize,
+    ) -> PyResult<Self> {
         let host_params = nl_hecate_core::model::MAGParams::init(&cfg.inner, seed);
         let gpu_params = nl_hecate_core::gpu_params::GpuMAGParams::from_host(&host_params);
         let gpu_context = nl_hecate_core::gpu_params::GpuContextState::new(
             cfg.inner.k, cfg.inner.swa.d_model, batch_size,
+            Some(&cfg.inner), cuda_graph_warmup,
         );
         Ok(GpuModel {
             params: gpu_params,
@@ -1567,12 +1571,17 @@ impl GpuModel {
 
     /// Create from existing host params (e.g., loaded from checkpoint).
     /// batch_size controls how many M-state slots are allocated for batched training.
+    /// cuda_graph_warmup: steps before graph capture (0 = disabled, 100 = recommended for training).
     #[staticmethod]
-    #[pyo3(signature = (params, cfg, batch_size=1, memory_reset=false))]
-    fn from_params(params: &MAGParams, cfg: &MAGConfig, batch_size: usize, memory_reset: bool) -> PyResult<Self> {
+    #[pyo3(signature = (params, cfg, batch_size=1, memory_reset=false, cuda_graph_warmup=0))]
+    fn from_params(
+        params: &MAGParams, cfg: &MAGConfig,
+        batch_size: usize, memory_reset: bool, cuda_graph_warmup: usize,
+    ) -> PyResult<Self> {
         let gpu_params = nl_hecate_core::gpu_params::GpuMAGParams::from_host(&params.inner);
         let gpu_context = nl_hecate_core::gpu_params::GpuContextState::new(
             cfg.inner.k, cfg.inner.swa.d_model, batch_size,
+            Some(&cfg.inner), cuda_graph_warmup,
         );
         Ok(GpuModel {
             params: gpu_params,
@@ -1938,7 +1947,18 @@ impl GpuModel {
                 ctx.inner.memory.len(), ctx.inner.d, self.cfg.k, self.cfg.swa.d_model
             )));
         }
-        self.context = nl_hecate_core::gpu_params::GpuContextState::from_host_context(&ctx.inner, self.context.batch_size);
+        let mut new_ctx = nl_hecate_core::gpu_params::GpuContextState::from_host_context(&ctx.inner, self.context.batch_size);
+        // Preserve CUDA graph capture state across host-context restore.
+        // from_host_context creates CudaGraphStore::new(0) (disabled), so move the live
+        // store + scratch from the old context and call invalidate() to re-enter warmup.
+        new_ctx.forward_scratch = self.context.forward_scratch.take();
+        new_ctx.level_scratch = std::mem::take(&mut self.context.level_scratch);
+        new_ctx.cuda_graph = std::mem::replace(
+            &mut self.context.cuda_graph,
+            nl_hecate_core::cuda_graph::CudaGraphStore::new(0),
+        );
+        new_ctx.cuda_graph.invalidate();
+        self.context = new_ctx;
         Ok(())
     }
 
