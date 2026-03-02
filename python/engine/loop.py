@@ -441,8 +441,8 @@ def run_build(bcfg: BuildConfig):
         # Phase 2: linearly decay theta_floor_init → 0 over gate_warmup_decay_steps.
         # Applied before the forward pass so the clamp is live for this step.
         if (bcfg.gate_warmup_theta_floor_init is not None
-                and step < resume_step + bcfg.gate_warmup_decay_steps):
-            alpha = 1.0 - (step - resume_step) / bcfg.gate_warmup_decay_steps
+                and step < bcfg.gate_warmup_decay_steps):
+            alpha = 1.0 - step / bcfg.gate_warmup_decay_steps
             warmup_floor = [f * alpha for f in bcfg.gate_warmup_theta_floor_init]
             if gpu_model is not None:
                 gpu_model.update_theta_floor(warmup_floor)
@@ -466,11 +466,30 @@ def run_build(bcfg: BuildConfig):
                     m_norm_max=list(cfg.m_norm_max) if list(cfg.m_norm_max) else None,
                 )
         elif (bcfg.gate_warmup_theta_floor_init is not None
-              and step == resume_step + bcfg.gate_warmup_decay_steps
-              and gpu_model is not None):
+              and step == bcfg.gate_warmup_decay_steps):
             # Phase 3 start: floor is fully decayed — restore permanent floor
             final_floor = bcfg.theta_floor if bcfg.theta_floor is not None else [0.0] * bcfg.k
-            gpu_model.update_theta_floor(final_floor)
+            if gpu_model is not None:
+                gpu_model.update_theta_floor(final_floor)
+            else:
+                cfg = nl_hecate.MAGConfig(
+                    d_model=cfg.d_model, num_heads=cfg.num_heads,
+                    head_dim=cfg.head_dim, seq_len=cfg.seq_len,
+                    window_size=cfg.window_size, vocab_size=cfg.vocab_size,
+                    memory_enabled=cfg.memory_enabled, k=cfg.k,
+                    chunk_sizes=list(cfg.chunk_sizes),
+                    memory_rule=cfg.memory_rule, composition=cfg.composition,
+                    checkpoint_interval=bcfg.checkpoint_interval,
+                    projection_kind=cfg.projection_kind,
+                    self_generated_values=cfg.self_generated_values,
+                    self_ref_chunk_size=cfg.self_ref_chunk_size,
+                    momentum_kind=cfg.momentum_kind,
+                    momentum_d_hidden=cfg.momentum_d_hidden,
+                    intermediate_size=bcfg.intermediate_size,
+                    theta_floor=final_floor,
+                    theta_ceil=list(cfg.theta_ceil) if list(cfg.theta_ceil) else None,
+                    m_norm_max=list(cfg.m_norm_max) if list(cfg.m_norm_max) else None,
+                )
 
         use_cosine = (adamw_opt is not None or use_adamw_gpu)
         current_lr = cosine_lr(step, bcfg.warmup_steps, end_step, bcfg.lr) if use_cosine else bcfg.lr

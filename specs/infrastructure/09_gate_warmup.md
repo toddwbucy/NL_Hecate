@@ -56,8 +56,13 @@ CONTRACT
   Position:   specs/infrastructure/09_gate_warmup.md
   Source:     HOPE (2512.24695) — CMS frequency structure, DGD update, per-level
                 inner LR (η_t^(ℓ)).
+                HADES: hope_equations/eq-102-gated-memory (write gate θ_t),
+                       hope_equations/eq-100-freq-equilibrium (CMS frequency structure),
+                       hope_equations/eq-106-freq-weights (per-level η_t^(ℓ)).
               TNT (2511.07343) §3.2 — shard boundaries and initialization trap
                 analysis (motivates the frequency-dependent LR mismatch).
+                HADES: tnt_equations/eq-006-local-memory-update,
+                       tnt_equations/eq-014-n-local-memories-update.
               specs/infrastructure/08_tnt_periodic_reset.md — gate dormancy
                 context, L3 fires 48× in 25K steps.
               specs/infrastructure/07_gate_backward.md — theta gate gradient
@@ -71,14 +76,14 @@ CONTRACT
 
 The CMS k=4 write gate for level ℓ is:
 
-```
+```text
 θ_t^(ℓ) = softplus(b_theta^(ℓ))    [outer_loop_param, learned by AdamW]
 ```
 
 The default initialization is `b_theta = [-4.6, -5.6, -6.6, -7.6]` for
 levels 0–3, giving:
 
-```
+```text
 θ^(L0) = softplus(-4.6) ≈ 0.010    fires every step      → ~20K updates
 θ^(L1) = softplus(-5.6) ≈ 0.004    fires every 8 steps   → ~2500 updates
 θ^(L2) = softplus(-6.6) ≈ 0.001    fires every 64 steps  → ~312 updates
@@ -96,14 +101,14 @@ Observed outcome in all ablation runs (A/B/C/D and B-TNT/C-TNT/D-TNT):
 
 AdamW with β₁=0.9 accumulates first-moment momentum:
 
-```
+```text
 m_t = β₁ · m_{t-1} + (1 - β₁) · g_t
 ```
 
 When L3 fires at step t and then does not fire for another 512 steps, the
 first moment decays:
 
-```
+```text
 m_{t+512} ≈ β₁^512 · m_t = 0.9^512 ≈ 3.7 × 10^{-24} · m_t
 ```
 
@@ -116,7 +121,7 @@ and with near-zero v_hat the update is noisy but not directional.
 
 The gradient of the loss through the gate:
 
-```
+```text
 ∂L/∂b_theta = (∂L/∂θ) · softplus'(b_theta)
 ```
 
@@ -163,7 +168,7 @@ applying the same principle per-level.
 
 **Action**: Apply a linearly-decaying theta_floor schedule. At step t:
 
-```
+```text
 theta_floor_t^(ℓ) = theta_floor_init^(ℓ) · max(0, 1 - t / gate_warmup_decay_steps)
 ```
 
@@ -267,7 +272,7 @@ cause of L2/L3 dormancy, and a targeted warmup is sufficient to escape it.**
 
 ### Go Gate (pod run authorized)
 
-```
+```text
 L2 θ_mean > 0.005  AND  L3 θ_mean > 0.001  at step 20K
 ```
 
@@ -275,7 +280,7 @@ where θ_mean is the mean gate activation across all tokens at step 20K (or
 the running mean over the final 100 eval steps).
 
 Equivalently in b_theta space:
-```
+```text
 b_theta^(L2) > softplus_inv(0.005) ≈ -5.3
 b_theta^(L3) > softplus_inv(0.001) ≈ -6.9
 ```
@@ -314,13 +319,13 @@ diagnostic run.
 Run ESTR (Excess Spectral Transfer Ratio) at lags [1, 8, 64, 512, 4096] on
 a 10M-token sample:
 
-```
+```text
 ESTR(lag) = MI(x_t, x_{t-lag}) / MI(x_t, x_{t-1})
 ```
 
 **Pass conditions** (corpus is acceptable):
 
-```
+```text
 ESTR(64)  / ESTR(4096) > 2.0×    (period-64 signal is genuine)
 ESTR(512) / ESTR(4096) > 2.0×    (period-512 signal is genuine)
 ```

@@ -180,6 +180,11 @@ class BuildConfig:
             if self.gate_warmup_decay_steps <= 0:
                 raise ValueError(
                     "gate_warmup_decay_steps must be > 0 when gate_warmup_theta_floor_init is set")
+            if (self.gate_warmup_falsification_step > 0
+                    and self.gate_warmup_falsification_step <= self.gate_warmup_decay_steps):
+                raise ValueError(
+                    f"gate_warmup_falsification_step ({self.gate_warmup_falsification_step}) "
+                    f"must be > gate_warmup_decay_steps ({self.gate_warmup_decay_steps})")
 
     @property
     def head_dim(self) -> int:
