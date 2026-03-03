@@ -2,7 +2,7 @@
 
 **Ab initio Rust implementation of the Nested Learning research program**
 
-Stages 0–3 complete, Stage 4 active | 1,406 tests | Phase 0 build running | Apache 2.0
+Stages 0–3 complete, Stage 4 active | 1,410 tests | Phase 0 build running | Apache 2.0
 
 ---
 
@@ -86,7 +86,7 @@ The [HOPE](https://arxiv.org/abs/2512.24695) architecture adds self-modification
 
 **Current**: Phase 0 TinyStories 100K build running on GPU (d=512, k=4 CMS, Titans LMM + MAG, adaptive projections, DGD, adamw_gpu). Loss: 10.37 to 3.78 at step 5K. CMS gate biases differentiating across all 4 levels.
 
-See [ROADMAP.md](ROADMAP.md) for per-milestone detail and [PROGRESS_REPORT.md](PROGRESS_REPORT.md) for the executive summary.
+See [ROADMAP.md](ROADMAP.md) for per-milestone detail.
 
 ## Quick Start
 
@@ -160,7 +160,7 @@ NL_Hecate/
   core/                     Rust core crate (nl-hecate-core)
     src/                      50,725 lines: rules, compositions, retention, CMS, dispatch
     kernels/                  8 CUDA kernels (4 forward + 4 backward)
-    tests/                    1,379 tests
+    tests/                    1,383 tests
     benches/                  Criterion benchmarks (edge throughput)
   python/                   PyO3 bindings + orchestration
     src/lib.rs                PyO3 module: all 9 rules + 3 compositions
@@ -170,7 +170,6 @@ NL_Hecate/
     tests/                    27 Python tests
   docs/                     Build matrix, architecture dispatch, committee responses
   ROADMAP.md                Milestone-level progress tracking
-  PROGRESS_REPORT.md        Executive summary with current build status
   LICENSE                   Apache 2.0
 ```
 
