@@ -48,6 +48,9 @@ static inline void check_cuda_alloc(const char* tag, cudaError_t err) {
     }
 }
 
+// __launch_bounds__(512): nvcc caps register allocation to 65536/512 = 128 regs/thread,
+// enabling launch at block_size=512 on sm_89 where register file = 65536.
+__launch_bounds__(512)
 __global__ void delta_backward_kernel(
     const float* __restrict__ k_mem,      // [batch_size, seq_len, d]
     const float* __restrict__ v_mem,      // [batch_size, seq_len, d]
@@ -247,6 +250,7 @@ __global__ void delta_backward_kernel(
 // k_mem/v_mem/q_mem/d_y pointers are full-sequence; t_start/t_end select range.
 // ══════════════════════════════════════════════════════════════════════
 
+__launch_bounds__(512)
 __global__ void delta_backward_segment_kernel(
     const float* __restrict__ k_mem,
     const float* __restrict__ v_mem,
@@ -415,15 +419,14 @@ extern "C" void delta_backward_segment_f32_cuda(
     int t_start, int t_end, int d)
 {
     int dd = d * d;
-    // Cap at d (not dd): backward kernels require ~2× more registers than
-    // forward due to prediction/error reconstruction. At d=512, block_size=1024
-    // leaves only 64 regs/thread — too few. Using d=512 gives 128 regs/thread.
-    int block_size = (d < 1024) ? d : 1024;
-    // Ceil to smallest power-of-2 >= block_size, then cap at 1024.
-    // Must round UP: see titans_backward_segment comment for rationale.
+    // Cap at min(d, 512): __launch_bounds__(512) constrains nvcc to 128 regs/thread.
+    // Launching with >512 threads would need >65536 registers/block — exceeds sm_89
+    // register file. For d > 512 the strided loop handles the extra elements.
+    int block_size = (d < 512) ? d : 512;
+    // Ceil to smallest power-of-2 >= block_size (required for tree reduction).
     int rounded = 1;
     while (rounded < block_size) rounded <<= 1;
-    if (rounded > 1024) rounded >>= 1;
+    if (rounded > 512) rounded >>= 1;
     block_size = rounded;
 
     dim3 grid(1);
@@ -458,14 +461,14 @@ extern "C" void delta_backward_f32_cuda(
     int seq_len, int d, int batch_size)
 {
     int dd = d * d;
-    // Cap at d (not dd): backward kernels require ~2× more registers than
-    // forward due to prediction/error reconstruction. At d=512, block_size=1024
-    // leaves only 64 regs/thread — too few. Using d=512 gives 128 regs/thread.
-    int block_size = (d < 1024) ? d : 1024;
-    // Round up to next power of 2 for tree reduction correctness
+    // Cap at min(d, 512): __launch_bounds__(512) constrains nvcc to 128 regs/thread.
+    // Launching with >512 threads would need >65536 registers/block — exceeds sm_89
+    // register file. For d > 512 the strided loop handles the extra elements.
+    int block_size = (d < 512) ? d : 512;
+    // Round up to next power of 2 for tree reduction correctness.
     int rounded = 1;
     while (rounded < block_size) rounded <<= 1;
-    if (rounded > 1024) rounded = 1024;
+    if (rounded > 512) rounded = 512;
     block_size = rounded;
 
     dim3 grid(batch_size);
