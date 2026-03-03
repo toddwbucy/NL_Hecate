@@ -37,10 +37,10 @@
     "eval_max_chunks": 50,
     "save_every": 5000,
     "save_path": "checkpoints/gate_warmup_diagnostic.safetensors",
-    "log_file": "python/runs/gate_warmup_diagnostic.jsonl"
+    "log_file": "runs/gate_warmup_diagnostic.jsonl"
   },
   "data": {
-    "path": "python/data/c4",
+    "path": "data/c4",
     "format": "sharegpt"
   }
 }
