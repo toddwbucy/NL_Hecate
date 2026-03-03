@@ -307,7 +307,7 @@ def test_slot_count_mismatch_resets(tmp_path):
 
     # Mismatch: slot_cursors has 3 entries, bpe_loaders has 2 → do NOT restore
     if slot_cursors and len(slot_cursors) == len(bpe_loaders):
-        for loader_b, cur in zip(bpe_loaders, slot_cursors):
+        for loader_b, cur in zip(bpe_loaders, slot_cursors, strict=True):
             loader_b.restore(cur)
     # else: fall through — loaders stay at partition-start positions
 
