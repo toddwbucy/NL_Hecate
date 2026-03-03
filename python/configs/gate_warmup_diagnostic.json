@@ -37,6 +37,7 @@
     "log_every": 250,
     "eval_every": 250,
     "eval_max_chunks": 50,
+    "tape_every": 1000,
     "save_every": 5000,
     "save_path": "checkpoints/gate_warmup_diagnostic.safetensors",
     "log_file": "runs/gate_warmup_diagnostic.jsonl"

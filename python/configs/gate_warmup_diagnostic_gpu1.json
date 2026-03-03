@@ -1,0 +1,74 @@
+{
+  "description": "Gate activation warmup diagnostic \u2014 GPU1 companion run. Same config as gate_warmup_diagnostic.json (GPU0/task_fd444d) but launched from post-PR#163+PR#164 main branch. Checkpoints include M_l matrices via save_checkpoint_with_context (PR #164), enabling Module 4 Grassmann distance analysis via memory_manifold_analysis.py (PR #163). Task: task_fd444d.",
+  "notes": "GPU1 run. GPU0 run (same config, no context persistence): checkpoints/gate_warmup_diagnostic.safetensors / runs/gate_warmup_diagnostic.jsonl. Compare the two runs post-hoc with --module align --checkpoint ckpt_gpu1_5k.safetensors --compare-steps 5000.",
+  "model": {
+    "d_model": 256,
+    "num_heads": 4,
+    "seq_len": 512,
+    "window_size": 256,
+    "vocab_size": 32000,
+    "k": 4,
+    "memory_rule": "delta",
+    "composition": "mag",
+    "memory_reset": "carry_forward",
+    "chunk_sizes": [
+      1,
+      8,
+      64,
+      512
+    ],
+    "theta_floor": [
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "theta_ceil": [
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ],
+    "m_norm_max": [
+      100.0,
+      100.0,
+      100.0,
+      100.0
+    ]
+  },
+  "gate_warmup": {
+    "theta_floor_init": [
+      0.0,
+      0.0,
+      0.005,
+      0.001
+    ],
+    "gate_warmup_decay_steps": 10000,
+    "falsification_step": 20000,
+    "l2_theta_threshold": 0.005,
+    "l3_theta_threshold": 0.001
+  },
+  "build": {
+    "lr": 0.0003,
+    "batch_size": 8,
+    "steps": 25000,
+    "seed": 42,
+    "optimizer": "adamw_gpu",
+    "weight_decay": 0.1,
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "warmup_steps": 500,
+    "max_grad_norm": 1.0,
+    "log_every": 250,
+    "eval_every": 250,
+    "eval_max_chunks": 50,
+    "tape_every": 1000,
+    "save_every": 5000,
+    "save_path": "checkpoints/gate_warmup_diagnostic_gpu1.safetensors",
+    "log_file": "runs/gate_warmup_diagnostic_gpu1.jsonl"
+  },
+  "data": {
+    "path": "data/c4",
+    "format": "sharegpt"
+  }
+}
