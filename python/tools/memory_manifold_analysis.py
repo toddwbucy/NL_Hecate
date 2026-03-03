@@ -83,14 +83,17 @@ def _load_checkpoint(ckpt_path: str) -> tuple:
             context.set_memory(build_state["context_memory"])
             return params, cfg, context
         return params, cfg, None
-    except Exception:
-        pass
+    except Exception as e:
+        build_load_err = e
 
     try:
         params, cfg = nl_hecate.load_checkpoint(ckpt_path)
         return params, cfg, None
     except Exception as e:
-        raise RuntimeError(f"Cannot load checkpoint {ckpt_path}: {e}") from e
+        raise RuntimeError(
+            f"Cannot load checkpoint {ckpt_path}. "
+            f"build loader failed: {build_load_err}; fallback loader failed: {e}"
+        ) from e
 
 
 def _get_weights(params) -> dict:
@@ -166,7 +169,8 @@ def module_js(jsonl_path: str, out_dir: str, falsification_step: int = 20000) ->
         js_val = js_at_step[closest_step].get(l0_l_last)
         js_at_f = {"step": closest_step, "pair": l0_l_last, "js": js_val}
         if js_val is not None:
-            if closest_step < falsification_step * 0.9:
+            max_delta = max(1, int(0.1 * falsification_step))
+            if abs(closest_step - falsification_step) > max_delta:
                 verdict = f"PENDING — run at step {closest_step}, falsification at {falsification_step}"
             elif js_val >= JS_FALSIFICATION_THRESHOLD:
                 verdict = f"PASS — JS(L0,L{k-1})={js_val:.4f} >= {JS_FALSIFICATION_THRESHOLD} at step {closest_step}"
@@ -388,11 +392,12 @@ def module_cluster(
             latest_by_level[r["level"]] = r
 
     # Check tertiary prediction: coherence_ratio(L_{k-1}) > coherence_ratio(L0)
-    if len(latest_by_level) >= 2 and 0 in latest_by_level and (k - 1) in latest_by_level:
+    if nn_indices is None:
+        coherence_pred = "PENDING"
+    elif len(latest_by_level) >= 2 and 0 in latest_by_level and (k - 1) in latest_by_level:
         r_l0 = latest_by_level[0]["coherence_ratio"]
         r_lk = latest_by_level[k - 1]["coherence_ratio"]
-        coherence_pred = "PASS" if (math.isnan(r_l0) or math.isnan(r_lk) or r_lk >= r_l0) \
-                         else "FAIL"
+        coherence_pred = "PASS" if r_lk >= r_l0 else "FAIL"
     else:
         coherence_pred = "PENDING"
 
@@ -429,13 +434,15 @@ def module_align(jsonl_path: str, out_dir: str) -> dict:
     n_steps = len(steps)
 
     # Determine vocab size from events
-    v = max(
+    token_ids = [
         e2["id"]
         for evt in events
         for lv in evt["levels"]
-        if lv.get("top20")
-        for e2 in lv["top20"]
-    ) + 1
+        for e2 in lv.get("top20", [])
+    ]
+    if not token_ids:
+        return {"error": "No top20 token data found; cannot compute alignment PCA"}
+    v = max(token_ids) + 1
 
     # Build sparse probability matrix per level [n_steps × v] (dense for small v)
     # For large vocab (32K), use sparse representation: store only top-20 entries
@@ -499,7 +506,7 @@ def module_align(jsonl_path: str, out_dir: str) -> dict:
             cos_angles = np.clip(cos_angles, -1, 1)
             principal_angles = np.arccos(cos_angles)
             subspace_dist = float(principal_angles.sum())
-            max_angle = float(principal_angles[0])
+            max_angle = float(np.max(principal_angles))
 
             cross_rows.append({
                 "level_pair": f"{i}-{j}",
