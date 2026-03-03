@@ -22,6 +22,7 @@ Usage:
 import argparse
 import io
 import json
+import filecmp
 import shutil
 import sys
 import time
@@ -326,9 +327,11 @@ def main() -> None:
     np.save(out_dir / "val_tokens.npy", np.array(val_input, dtype=np.uint32))
     np.save(out_dir / "val_targets.npy", np.array(val_targets, dtype=np.int32))
 
-    # Tokenizer copy (not symlink — portable across mounts)
+    # Tokenizer copy (not symlink — portable across mounts).
+    # If destination exists but differs from the requested tokenizer, overwrite it so
+    # the output directory is always consistent with the --tokenizer argument.
     dest_tok = out_dir / "tokenizer.json"
-    if not dest_tok.exists():
+    if not dest_tok.exists() or not filecmp.cmp(tokenizer_path, dest_tok, shallow=False):
         shutil.copy2(tokenizer_path, dest_tok)
 
     source_label = (

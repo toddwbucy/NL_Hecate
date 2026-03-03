@@ -89,7 +89,7 @@ next layer to build.
 
 The Wengert tape core is operational. Per `specs/infrastructure/differentiation/`:
 
-```
+```text
 ✓ TapeBuf with arena storage (BufId-indexed)
 ✓ 17 VJP operations registered via OpaqueKey enum
 ✓ Full saved[] arrays per opaque block
@@ -101,7 +101,7 @@ The Wengert tape core is operational. Per `specs/infrastructure/differentiation/
 
 Per `specs/infrastructure/differentiation/02_tape_observation.md`:
 
-```
+```text
 ◐ DeltaRuleLevel0..DeltaRuleLevel3 — per-level key registration
 ◐ SavedBufferMetadata (role + level fields on TapeBuf)
 ◐ DGD delta as named intermediate (alloc_named with obs::DGD_DELTA)
@@ -118,7 +118,7 @@ tests pass (see §8 of `02_tape_observation.md`).
 
 All four MC variants are designed but not implemented:
 
-```
+```text
 ✗ MemoryCachingRule trait (segment_forward + aggregate signatures)
 ✗ OpaqueKey variants for MC operations
 ✗ SegmentCache data structure (segment_idx → BufId mapping)
@@ -178,7 +178,7 @@ break the VJP computation graph.
 
 The GRM gate computes:
 
-```
+```text
 gate_i = similarity(u_t, MeanPooling(K_i))
 ```
 
@@ -191,7 +191,7 @@ degradation, but complete model collapse.
 
 Enforcement:
 
-```
+```text
 CS-SHARED-U-Q: GRM aggregate() connector argument must resolve to a BufId
 distinct from the query argument. If they are the same buffer, the backward
 adapter panics with: "GRM u_t and q_t aliased — model collapse guaranteed".
@@ -206,7 +206,7 @@ the `02_gated_residual_memory.md` component spec is finalized.
 
 Every call to `segment_forward()` must record a `TapeOp::Opaque` block:
 
-```
+```text
 CS-NO-SEGMENT-SNAPSHOT: Any MC variant that skips tape recording at a segment
 boundary makes that segment's checkpoint invisible to backward — gradient cannot
 flow through cache access that wasn't recorded. This applies even for frozen
@@ -218,7 +218,7 @@ not silence. Silence is a correctness bug.
 
 GRM and SSC both involve selection. The distinction matters for correctness:
 
-```
+```text
 GRM: content-based gate — gate_i = f(u_t, K_i)
      Gate output varies with query. Same cache, different u_t → different weights.
      This is learned content sensitivity.
