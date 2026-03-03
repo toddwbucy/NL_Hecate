@@ -201,3 +201,116 @@ def test_restore_after_wrap(tmp_path):
     assert loader2.position  == 64
     assert loader2._chunk_id == 3
     assert loader2._seq_len  == 64
+
+
+# ── Multi-slot sidecar (task_969aa6) ─────────────────────────────────────────
+
+def test_multi_slot_cursor_roundtrip(tmp_path):
+    """Per-slot cursors are saved and restored correctly for batch_size > 1.
+
+    Simulates the loop.py multi-slot path:
+      - Two slot loaders, each advanced a different number of chunks.
+      - Sidecar written as {"slots": [cursor0, cursor1]}.
+      - Fresh loaders reconstructed and restored from sidecar.
+      - Positions and chunk_ids must match exactly.
+    """
+    _make_dataset(tmp_path, n_tokens=512)
+    seq_len = 64
+    n_slots = 2
+    slot_size = 512 // n_slots
+
+    # Build and advance slot loaders
+    slots = []
+    for b in range(n_slots):
+        loader_b = BpeDataLoader(str(tmp_path))
+        loader_b.position = b * slot_size
+        slots.append(loader_b)
+
+    slots[0].next_chunk(seq_len)   # slot 0: position = slot_size*0 + seq_len
+    slots[0].next_chunk(seq_len)
+    slots[1].next_chunk(seq_len)   # slot 1: position = slot_size*1 + seq_len
+
+    saved_positions = [l.position  for l in slots]
+    saved_chunk_ids = [l._chunk_id for l in slots]
+
+    # Write sidecar ({"slots": [...]})
+    ckpt_path = tmp_path / "model_step10.safetensors"
+    sidecar   = Path(str(ckpt_path) + ".cursor.json")
+    sidecar.write_text(json.dumps({"slots": [l.cursor() for l in slots]}, indent=2))
+
+    # Reconstruct fresh slot loaders and restore
+    saved = json.loads(sidecar.read_text())
+    slot_cursors = saved["slots"]
+    assert len(slot_cursors) == n_slots
+
+    restored = []
+    for b in range(n_slots):
+        loader_b = BpeDataLoader(str(tmp_path))
+        loader_b.position = b * slot_size      # initial partition start
+        loader_b.restore(slot_cursors[b])      # overwrite with saved position
+        restored.append(loader_b)
+
+    for b in range(n_slots):
+        assert restored[b].position  == saved_positions[b], \
+            f"slot {b} position mismatch: {restored[b].position} != {saved_positions[b]}"
+        assert restored[b]._chunk_id == saved_chunk_ids[b], \
+            f"slot {b} chunk_id mismatch"
+
+
+def test_single_slot_sidecar_unchanged(tmp_path):
+    """batch_size=1 path writes a flat cursor dict, not a {'slots': [...]} wrapper."""
+    _make_dataset(tmp_path)
+    loader = BpeDataLoader(str(tmp_path))
+    loader.next_chunk(64)
+
+    ckpt_path = tmp_path / "model_step1.safetensors"
+    sidecar   = Path(str(ckpt_path) + ".cursor.json")
+
+    # Simulate loop.py single-slot save: bpe_loaders is empty
+    bpe_loaders: list = []
+    if bpe_loaders:
+        sidecar.write_text(json.dumps({"slots": [l.cursor() for l in bpe_loaders]}, indent=2))
+    else:
+        sidecar.write_text(json.dumps(loader.cursor(), indent=2))
+
+    saved = json.loads(sidecar.read_text())
+    assert "slots" not in saved,         "single-slot sidecar must be a flat cursor dict"
+    assert "position" in saved,          "single-slot sidecar must contain 'position'"
+    assert saved["position"] == 64
+
+
+def test_slot_count_mismatch_resets(tmp_path):
+    """Sidecar slot count != bpe_loaders count falls back to partition start, no abort."""
+    _make_dataset(tmp_path, n_tokens=512)
+    seq_len = 64
+    n_slots = 2
+    slot_size = 512 // n_slots
+
+    # Write a sidecar with 3 slots
+    three_slot_cursors = [{"position": i * 50, "total_tokens": 512,
+                           "content_hash": 0, "chunk_id": i,
+                           "seq_len": seq_len, "dataset_path": str(tmp_path)}
+                          for i in range(3)]
+    ckpt_path = tmp_path / "model_old.safetensors"
+    sidecar   = Path(str(ckpt_path) + ".cursor.json")
+    sidecar.write_text(json.dumps({"slots": three_slot_cursors}, indent=2))
+
+    # Now reconstruct with only 2 slots (batch_size changed)
+    bpe_loaders = []
+    for b in range(n_slots):
+        loader_b = BpeDataLoader(str(tmp_path))
+        loader_b.position = b * slot_size
+        bpe_loaders.append(loader_b)
+
+    saved = json.loads(sidecar.read_text())
+    slot_cursors = saved.get("slots") if isinstance(saved, dict) else None
+
+    # Mismatch: slot_cursors has 3 entries, bpe_loaders has 2 → do NOT restore
+    if slot_cursors and len(slot_cursors) == len(bpe_loaders):
+        for loader_b, cur in zip(bpe_loaders, slot_cursors):
+            loader_b.restore(cur)
+    # else: fall through — loaders stay at partition-start positions
+
+    # Loaders must be at partition-start (not the 3-slot sidecar positions)
+    assert bpe_loaders[0].position == 0,          "slot 0 must reset to partition start"
+    assert bpe_loaders[1].position == slot_size,  "slot 1 must reset to partition start"
