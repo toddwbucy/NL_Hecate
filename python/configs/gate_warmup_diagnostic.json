@@ -1,6 +1,6 @@
 {
   "description": "Gate activation warmup diagnostic — k=4 Delta Rule + 3-phase gate warmup on C4 (995M tokens, Llama tokenizer). Task: task_fd444d.",
-  "notes": "See specs/infrastructure/09_gate_warmup.md. Phase 2: linearly decaying theta_floor scaffold [0,0,0.005,0.001]→0 over 10K steps. Falsification at step 20K: L2 θ>0.005 AND L3 θ>0.001.",
+  "notes": "See specs/infrastructure/09_gate_warmup.md. Phase 2 decays gate_warmup.theta_floor_init → 0 over gate_warmup.gate_warmup_decay_steps. Falsification checks L2/L3 θ against gate_warmup.l2_theta_threshold / l3_theta_threshold.",
   "model": {
     "d_model": 256,
     "num_heads": 4,
