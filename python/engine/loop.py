@@ -14,7 +14,7 @@ import nl_hecate
 from engine.config import BuildConfig, cosine_lr
 from engine.data import BpeDataLoader, CursorMismatchError, CursorOutOfBounds, DEMO_TEXT, MmapTokenStream
 from engine.evaluation import (
-    evaluate, evaluate_numpy, print_level_metrics,
+    evaluate, evaluate_numpy, print_level_metrics, print_tape_summary,
     eval_coherence_samples, generate_samples,
     full_snapshot, full_restore,
     probe_within_generation, probe_cross_exposure, probe_context_value,
@@ -717,6 +717,23 @@ def run_build(bcfg: BuildConfig):
             print(f"  [eval] step {step:5d}  loss={eval_loss:.4f}  ppl={eval_ppl:.1f}")
             if gpu_model is not None and hasattr(gpu_model, "gate_biases"):
                 print_level_metrics(gpu_model, bcfg.k)
+            if (gpu_model is not None
+                    and hasattr(gpu_model, "tape_forward_summary")
+                    and input_ids is not None and target_ids is not None
+                    and max(target_ids) < gpu_model.vocab_size()):
+                # Skip silently when batch contains masked targets (vocab_size sentinel).
+                # The Rust binding rejects target_ids >= vocab_size; masked batches are
+                # normal (all-user-turn chunks) and should not generate warning noise.
+                try:
+                    tape_sum = gpu_model.tape_forward_summary(
+                        input_ids, target_ids, pulse
+                    )
+                except (ValueError, KeyError, TypeError, OSError) as exc:
+                    print(f"  [tape] WARNING: tape_forward_summary failed at step {step}: {exc}")
+                else:
+                    print_tape_summary(tape_sum, step)
+                    if jsonl:
+                        jsonl.log(event="tape_summary", step=step, **tape_sum)
             if bcfg.k > 1:
                 fires_str = "  ".join(f"L{i}:{level_fire_counts[i]}" for i in range(bcfg.k))
                 print(f"    [fires] {fires_str}")
