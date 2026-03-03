@@ -90,6 +90,12 @@ class BuildConfig:
     eval_every: int = 0  # 0 = disabled; evaluate on val set every N steps
     eval_max_chunks: int = 100  # max chunks per eval pass
 
+    # Probe tuning (learning probes fire at every eval; these control their cost)
+    probe_max_tokens: int = 20   # tokens generated per learning probe (was hardcoded 60)
+    probe_prompts: int = 1       # how many EVAL_PROMPTS to run for probe1 (1–4)
+    tape_every: int = 0          # 0 = same as eval_every; set to a multiple (e.g. 4×) to run
+    #                            # tape_forward_summary less often (it runs a CPU forward pass)
+
     # Gradient checkpointing (VRAM optimization for memory rules)
     checkpoint_interval: int | None = None  # None = full trajectory; C = store M every C steps
 
