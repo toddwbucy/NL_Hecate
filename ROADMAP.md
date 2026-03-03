@@ -773,6 +773,24 @@ Replace the hand-written `cms_backward()` gradient path with the Wengert tape-ba
 
 **Dependencies**: S0-M1 (tape core), S3-M5 (dynamic frequency for P3.3)
 
+#### S4-M8 Extension: Wengert Tape Observation Infrastructure ✅
+
+**HADES task**: `task_4acd05`
+
+Native interpretability layer added to the tape — per-level metadata on every arena buffer, per-level tagging of opaque VJP blocks, and DGD delta exposed as a named intermediate. Zero compute overhead when not queried; post-backward query API for probing gradient flow and self-modification signals.
+
+**What was delivered** (PR #157, 2026-03-03):
+- `TapeBuf.role` / `TapeBuf.level` — `Option<&'static str>` + `Option<usize>` on every arena buffer; zero overhead
+- `tape::obs` module — canonical role constants: `DGD_DELTA`, `M_STATES`, `K_MEM`, `V_MEM`, `ALPHA`, `THETA`, `EMBEDDED`, `LEVEL_PARAMS`, `ERROR`
+- `alloc_named()` — allocate a buffer with semantic role + level metadata
+- `TapeOp::Opaque { level }` — all active CMS levels tagged `Some(level)`, SWA/non-level ops tagged `None`
+- `OpaqueVjp::record_on_tape(..., level: Option<usize>)` — trait + all 11 impls updated
+- DGD delta (`cache.error` = `M@k − v`, HOPE Eq. 88) allocated via `alloc_named(..., obs::DGD_DELTA, level)` in `DeltaRule::record_on_tape`
+- Post-backward query API (never on hot path): `find_opaque_ops`, `find_opaque_at_level`, `get_saved_by_role`, `enumerate_opaque_blocks`, `opaque_output_grad_norm`
+- Test Class 4: 4 new tests (metadata, per-level distinctness, role retrieval, grad norm)
+
+**PR**: #157
+
 ---
 
 ## Behavioral Validation
@@ -867,7 +885,7 @@ Stage 1: Algorithm Core ──────────────────�
 
 ---
 
-## HADES Task Cross-Reference (updated 2026-02-24)
+## HADES Task Cross-Reference (updated 2026-03-03)
 
 Complete mapping between ROADMAP milestones and HADES Persephone tasks. Use this to avoid rebuilding context across sessions.
 
@@ -890,6 +908,7 @@ Complete mapping between ROADMAP milestones and HADES Persephone tasks. Use this
 | 5c | **S4-M12**: AdamW Outer-Loop | `task_a27d3a` | IMPL: AdamW frequency-aware outer-loop optimizer | **closed** (PR #118) |
 | 6 | **S4-M13**: HOPE Model Config | `task_30e20a` + `task_4a10eb` | IMPL + SPEC: build.py HOPE model configuration | **closed** (PR #120) |
 | 7 | **S4-M14**: HOPE End-to-End Validation | `task_08ca2e` | HOPE NLM Phase 0+1 Training | **in progress** (Phase 0 build running) |
+| — | **S4-M8 Ext**: Tape Observation Infrastructure | `task_4acd05` | Wengert Tape Observation Infrastructure — Native Interpretability Layer | **closed** (PR #157) |
 
 ### S3b-Deferred (Stage 5) — Task Status
 
@@ -933,10 +952,10 @@ Complete mapping between ROADMAP milestones and HADES Persephone tasks. Use this
 | Stage 3: Extensions | 5 | 22 retention + 35 M3/variants + 26 Atlas + 22 dynamic freq = 105 | COMPLETE |
 | Stage 3b-Critical: HOPE Path | 4 impl milestones (DGD, self-ref, outer-loop+HOPE, DGD CUDA) | DGD: 16, DGD CUDA: ~10, self-ref: 41, AdamW: ~20, Conv1D: ~15, HOPE comp: ~12 | COMPLETE (except GAP-E feature maps) |
 | Stage 3b-Deferred: MIRAS Completeness | 3 impl milestones (algo knobs, retention/bias, AdaMuon) | — | DEFERRED (Stage 5) |
-| Stage 4 Phase 1: Pipeline Scaffolding | 8 | 27 Python + 120 tape/traced/class3 Rust + 1 forget gate probe | COMPLETE |
+| Stage 4 Phase 1: Pipeline Scaffolding | 8 (+M8 ext) | 27 Python + 124 tape/traced/class3 Rust + 1 forget gate probe | COMPLETE |
 | Stage 4 Phase 2: HOPE Build & Serve | 6 milestones (M9–M14) | — | M10-M13 COMPLETE, M14 IN PROGRESS, M9 deferred |
 
-**Current position** (updated 2026-02-24): S0–S3 complete. S3b-Critical complete (all HOPE-path primitives delivered, GAP-E feature maps remaining). S4 Phase 1 complete (M1–M8). **S4 Phase 2 active**: M10 (DGD build path, PR #120), M11 (self-referential build, PRs #115-121), M12 (AdamW outer-loop, PR #118), M13 (HOPE model config, PR #120) all COMPLETE. **M14 (end-to-end validation) IN PROGRESS**: Phase 0 build running on GPU0 (TinyStories 100K steps, d=512, k=4, loss 10.37→3.78 at step 5000). Unified `hecate.py` entry point with GPU-default paradigm (PR #122, merged).
+**Current position** (updated 2026-03-03): S0–S3 complete. S3b-Critical complete (all HOPE-path primitives delivered, GAP-E feature maps remaining). S4 Phase 1 complete (M1–M8), including the Wengert Tape Observation Infrastructure extension (PR #157). **S4 Phase 2 active**: M10 (DGD build path, PR #120), M11 (self-referential build, PRs #115-121), M12 (AdamW outer-loop, PR #118), M13 (HOPE model config, PR #120) all COMPLETE. **M14 (end-to-end validation) IN PROGRESS**: Phase 0 build running on GPU0 (TinyStories 100K steps, d=512, k=4, loss 10.37→3.78 at step 5000). Unified `hecate.py` entry point with GPU-default paradigm (PR #122, merged).
 
 **HADES graph state**: 7 probes registered in `hope_probes` (forget gate, loss monotonicity, slow-gradient-zero, fast-gradient-nonzero, self-modification-matches-eq88, frozen-state-structural, transplant-integrity). 3 axioms in `hope_axioms` (CMS frequency separation, container-is, container-is-not). 50 tasks closed, 16 open. `hope_blockers`: 2 resolved (k and f_i).
 
@@ -947,4 +966,4 @@ Complete mapping between ROADMAP milestones and HADES Persephone tasks. Use this
 4. **GAP-E** (open): Feature maps — `phi(k)` hook and `FeatureMapKind` enum. Last S3b-M3 sub-task.
 5. **S3b-Deferred / Stage 5** (post-HOPE): MIRAS design-space completeness. Retention variants, bias variants, DMGD, FTRL, Implicit GD, NS inner, AdaMuon.
 
-Total test count: 1379 Rust + 27 Python = **1,406 tests** (122 PRs merged; full `cargo test`).
+Total test count: 1383 Rust + 27 Python = **1,410 tests** (157 PRs merged; full `cargo test`).
