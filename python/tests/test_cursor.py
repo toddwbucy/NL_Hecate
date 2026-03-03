@@ -269,7 +269,7 @@ def test_single_slot_sidecar_unchanged(tmp_path):
     # Simulate loop.py single-slot save: bpe_loaders is empty
     bpe_loaders: list = []
     if bpe_loaders:
-        sidecar.write_text(json.dumps({"slots": [l.cursor() for l in bpe_loaders]}, indent=2))
+        sidecar.write_text(json.dumps({"slots": [loader.cursor() for loader in bpe_loaders]}, indent=2))
     else:
         sidecar.write_text(json.dumps(loader.cursor(), indent=2))
 
