@@ -51,7 +51,7 @@ import numpy as np
 JS_FALSIFICATION_THRESHOLD = 0.1   # nats: JS(L0,L3) must exceed this at step 20K
 CLUSTER_TOP_K = 20                  # tokens per vocab probe event (matches eval)
 SEMANTIC_KNN = 20                   # neighbours per token in semantic graph
-RANK_TOP_N_PCS = 32                 # PCs to keep for subspace comparisons
+RANK_TOP_N_PCS = 8                  # principal components for subspace comparisons (Module 4)
 
 
 # ── JSONL parsing ──────────────────────────────────────────────────────────
@@ -59,7 +59,7 @@ RANK_TOP_N_PCS = 32                 # PCs to keep for subspace comparisons
 def _load_jsonl_events(path: str, event_type: str) -> list[dict]:
     """Read all events of a given type from a training JSONL log."""
     events = []
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -120,7 +120,7 @@ def _load_tokenizer(tok_path: Optional[str]):
         from engine.tokenizer import BpeTokenizer
         return BpeTokenizer(tok_path)
     except Exception as e:
-        warnings.warn(f"Tokenizer load failed ({e}); token strings will be IDs only.")
+        warnings.warn(f"Tokenizer load failed ({e}); token strings will be IDs only.", stacklevel=2)
         return None
 
 
@@ -455,7 +455,10 @@ def module_cluster(
     elif len(latest_by_level) >= 2 and 0 in latest_by_level and (k - 1) in latest_by_level:
         r_l0 = latest_by_level[0]["coherence_ratio"]
         r_lk = latest_by_level[k - 1]["coherence_ratio"]
-        coherence_pred = "PASS" if r_lk >= r_l0 else "FAIL"
+        if math.isnan(r_l0) or math.isnan(r_lk):
+            coherence_pred = "PENDING"
+        else:
+            coherence_pred = "PASS" if r_lk >= r_l0 else "FAIL"
     else:
         coherence_pred = "PENDING"
 
@@ -536,7 +539,7 @@ def module_align(
 
     d = loaded[0][1]
     k = loaded[0][2]
-    r = 8  # top-8 principal components per spec
+    r = RANK_TOP_N_PCS  # principal components per spec
 
     rows = []
     for idx in range(len(loaded) - 1):
@@ -753,7 +756,7 @@ def main() -> int:
 
     # ── Run analysis for each log (multi-run mode iterates; single-run is one pass) ──
     multi_run = len(log_pairs) > 1
-    all_results: list[dict] = []
+    all_results: list[tuple[str, dict, str]] = []
     for run_name, jsonl_path in log_pairs:
         # Each run writes to its own subdirectory in multi-run mode
         run_out = os.path.join(args.out, run_name) if multi_run else args.out
