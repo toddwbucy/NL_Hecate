@@ -346,7 +346,7 @@ if let Some(op_idx) = ops.first() {
 
 ### 5.4 Per-level error buffer (frozen levels)
 
-Frozen level ops use `OpaqueKey::FrozenDeltaRule` (or equivalent frozen variant).
+Frozen-level ops use `OpaqueKey::FrozenDeltaRule` (or equivalent frozen variant).
 Their `saved` array records `M_FROZEN` and `Q_T`, which flow into ErrorBuffer
 accumulation. Per-level keys make it possible to distinguish Level 1 frozen
 accumulation from Level 3.

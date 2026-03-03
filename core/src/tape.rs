@@ -846,7 +846,7 @@ impl Tape {
     /// Returns `None` if `op_idx` does not point to an `Opaque` op,
     /// or if no saved buffer carries the given `role`.
     pub fn get_saved_by_role(&self, op_idx: usize, role: &str) -> Option<&[f32]> {
-        match &self.ops[op_idx] {
+        match self.ops.get(op_idx)? {
             TapeOp::Opaque { saved, .. } => {
                 saved.iter().find_map(|&id| {
                     if self.bufs[id].role.map_or(false, |r| r == role) {
@@ -875,7 +875,7 @@ impl Tape {
     /// Returns `None` if the op is not `Opaque`, has no outputs, or the output
     /// has no accumulated gradient (no gradient flowed through it).
     pub fn opaque_output_grad_norm(&self, op_idx: usize) -> Option<f32> {
-        match &self.ops[op_idx] {
+        match self.ops.get(op_idx)? {
             TapeOp::Opaque { outputs, .. } => {
                 let out_id = *outputs.first()?;
                 let grad = self.grad_accum[out_id].as_deref()?;
