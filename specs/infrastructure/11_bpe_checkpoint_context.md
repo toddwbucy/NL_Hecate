@@ -88,7 +88,13 @@ fn save_checkpoint_with_context(
     conductor: &Conductor,
     context: &ContextState,
 ) -> PyResult<()> {
-    // No has_stream() check — BPE conductors are always streamless here
+    // Guard: reject stream-backed conductors — this API is BPE/streamless only.
+    if conductor.inner.has_stream() {
+        return Err(PyValueError::new_err(
+            "save_checkpoint_with_context is for streamless BPE conductors; \
+             use save_build_checkpoint for stream-backed conductors"
+        ));
+    }
     let build_state = RustBuildResumeState {
         conductor: conductor.inner.state(),        // step, k, chunk_sizes
         stream_cursor: StreamCursor::zeroed(),      // BPE: position in sidecar
@@ -105,14 +111,14 @@ fn save_checkpoint_with_context(
 
 Replace the BPE checkpoint branch:
 
-```rust
-// Before
+```python
+# Before
 if use_bpe:
     nl_hecate.save_checkpoint(ckpt_path, params, cfg)
 else:
     nl_hecate.save_build_checkpoint(ckpt_path, params, cfg, conductor, context)
 
-// After
+# After
 if use_bpe:
     nl_hecate.save_checkpoint_with_context(ckpt_path, params, cfg, conductor, context)
 else:
@@ -126,8 +132,8 @@ of training.
 
 The BPE load path currently always creates a fresh `ContextState`:
 
-```rust
-// Before (line ~307)
+```python
+# Before (line ~307)
 if use_bpe:
     conductor = nl_hecate.Conductor(bcfg.k, bcfg.chunk_sizes)
     context = nl_hecate.ContextState(bcfg.k, bcfg.d_model)
@@ -135,13 +141,16 @@ if use_bpe:
 
 After this fix, when resuming from a new-format BPE checkpoint, restore M_l:
 
-```rust
-// After
+```python
+# After
 if use_bpe:
     conductor = nl_hecate.Conductor(bcfg.k, bcfg.chunk_sizes)
     if bcfg.load and build_state is not None and "context_memory" in build_state:
         context = nl_hecate.ContextState(bcfg.k, bcfg.d_model)
         context.set_memory(build_state["context_memory"])
+        target_step = int(build_state.get("conductor_step", 0))
+        while conductor.step < target_step:
+            conductor.advance()
     else:
         context = nl_hecate.ContextState(bcfg.k, bcfg.d_model)
 ```
