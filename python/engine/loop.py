@@ -719,7 +719,11 @@ def run_build(bcfg: BuildConfig):
                 print_level_metrics(gpu_model, bcfg.k)
             if (gpu_model is not None
                     and hasattr(gpu_model, "tape_forward_summary")
-                    and input_ids is not None and target_ids is not None):
+                    and input_ids is not None and target_ids is not None
+                    and max(target_ids) < gpu_model.vocab_size()):
+                # Skip silently when batch contains masked targets (vocab_size sentinel).
+                # The Rust binding rejects target_ids >= vocab_size; masked batches are
+                # normal (all-user-turn chunks) and should not generate warning noise.
                 try:
                     tape_sum = gpu_model.tape_forward_summary(
                         input_ids, target_ids, pulse
