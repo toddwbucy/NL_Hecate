@@ -299,6 +299,21 @@ def main() -> None:
     actual_vocab = tokenizer.get_vocab_size()
     print(f"  Vocab size: {actual_vocab:,}")
 
+    # Validate special token IDs match the hardcoded meta.json mapping and EOT_ID.
+    # If --tokenizer points to a non-NL-Hecate vocabulary these IDs will differ,
+    # which would silently corrupt the token stream and meta.json special_tokens block.
+    _expected = {"<|im_start|>": 0, "<|im_end|>": 1, "<|pad|>": 2, "<|endoftext|>": EOT_ID}
+    for token, expected_id in _expected.items():
+        actual_id = tokenizer.token_to_id(token)
+        if actual_id != expected_id:
+            print(
+                f"ERROR: Special token '{token}' has id={actual_id}, expected {expected_id}.\n"
+                "       --tokenizer must use the standard NL-Hecate 32K BPE vocabulary\n"
+                "       (data/fineweb_edu/tokenizer.json).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
     # ── Step 5: Tokenize ──────────────────────────────────────────────
     print(f"\nStep 5: Tokenizing (target={args.target_tokens:,} total tokens)...")
     t0 = time.time()
