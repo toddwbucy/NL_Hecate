@@ -146,7 +146,10 @@ def module_js(jsonl_path: str, out_dir: str, falsification_step: int = 20000) ->
     if not events:
         return {"error": "No memory_vocab_probe events found in JSONL"}
 
-    k = max(e["levels"][-1]["level"] for e in events) + 1
+    level_ids = [lv["level"] for e in events for lv in e.get("levels", []) if "level" in lv]
+    if not level_ids:
+        return {"error": "No level metadata found in memory_vocab_probe events"}
+    k = max(level_ids) + 1
     pairs = [(i, j) for i in range(k) for j in range(i + 1, k)]
 
     rows = []
@@ -243,6 +246,7 @@ def module_rank(ckpt_path: str, out_dir: str) -> dict:
     d = cfg.d_model
     k = cfg.k
     rows = []
+    stable_ranks_raw: list = []
 
     for level_idx in range(k):
         M_l = np.array(context.memory[level_idx], dtype=np.float32).reshape(d, d)
@@ -253,6 +257,7 @@ def module_rank(ckpt_path: str, out_dir: str) -> dict:
 
         # Stable rank: ‖M‖_F² / ‖M‖_2² — invariant to scaling
         stable_rank = float((m_fro ** 2) / (m_spec ** 2 + 1e-30))
+        stable_ranks_raw.append(stable_rank)
 
         # Spectral entropy rank: exp(H(p)) where p = S / S.sum()
         s_sum = S.sum() + 1e-30
@@ -275,17 +280,18 @@ def module_rank(ckpt_path: str, out_dir: str) -> dict:
         w.writeheader()
         w.writerows(rows)
 
-    # Check rank gradient prediction: rank(L0) > rank(L1) > ... > rank(L_{k-1})
-    stable_ranks = [r["stable_rank"] for r in rows]
+    # Check rank gradient prediction using raw (unrounded) values to avoid
+    # masking small inversions at rounding boundaries.
     rank_gradient_ok = all(
-        stable_ranks[i] >= stable_ranks[i + 1] for i in range(len(stable_ranks) - 1)
+        stable_ranks_raw[i] >= stable_ranks_raw[i + 1]
+        for i in range(len(stable_ranks_raw) - 1)
     )
 
     return {
         "csv_path": csv_path,
         "ranks": rows,
         "rank_gradient_prediction": "PASS" if rank_gradient_ok else "FAIL",
-        "rank_gradient_values": stable_ranks,
+        "rank_gradient_values": [round(x, 3) for x in stable_ranks_raw],
     }
 
 
@@ -310,8 +316,16 @@ def _build_semantic_graph_fallback(w_embed: np.ndarray, k_nn: int) -> "np.ndarra
 
 def _build_semantic_graph(w_embed: np.ndarray, cache_path: str, k_nn: int) -> np.ndarray:
     """Build or load k-NN semantic graph. Returns [v, k_nn] neighbour index array."""
+    v_expected = w_embed.shape[0]
     if os.path.exists(cache_path):
-        return np.load(cache_path)["nn_indices"]
+        cached = np.load(cache_path)["nn_indices"]
+        if cached.shape == (v_expected, k_nn):
+            return cached
+        print(
+            f"  WARNING: cached semantic graph shape {cached.shape} does not match "
+            f"expected ({v_expected}, {k_nn}); rebuilding.",
+            flush=True,
+        )
 
     v, d = w_embed.shape
     print(f"  Building semantic graph: {v} tokens, {d} dims, k={k_nn}...", flush=True)
@@ -406,7 +420,7 @@ def module_cluster(
 
             rows.append({
                 "step": step, "level": level, "m_norm": round(m_norm, 6),
-                "coherence_ratio": round(coherence_ratio, 3),
+                "coherence_ratio": coherence_ratio,  # raw; rounded at CSV write time
                 "uniform_probs": False,
                 "top5_tokens": top5_str,
             })
@@ -417,13 +431,23 @@ def module_cluster(
                                            "coherence_ratio", "uniform_probs",
                                            "top5_tokens"])
         w.writeheader()
-        w.writerows(rows)
+        csv_rows = [
+            {**r, "coherence_ratio": (
+                round(r["coherence_ratio"], 6)
+                if not r["uniform_probs"] and not (isinstance(r["coherence_ratio"], float)
+                                                   and r["coherence_ratio"] != r["coherence_ratio"])
+                else r["coherence_ratio"]
+            )}
+            for r in rows
+        ]
+        w.writerows(csv_rows)
 
-    # Summarise latest step per level
+    # Summarise latest step per level (max-step wins to avoid ordering dependency)
     latest_by_level: dict[int, dict] = {}
     for r in rows:
         if not r["uniform_probs"]:
-            latest_by_level[r["level"]] = r
+            if r["level"] not in latest_by_level or r["step"] > latest_by_level[r["level"]]["step"]:
+                latest_by_level[r["level"]] = r
 
     # Check tertiary prediction: coherence_ratio(L_{k-1}) > coherence_ratio(L0)
     if nn_indices is None:
@@ -468,6 +492,15 @@ def module_align(
     if not ckpt_paths:
         return {"error": "No checkpoint paths provided; --checkpoint required for Module 4"}
 
+    # Validate --compare-steps cardinality if provided
+    if compare_steps is not None and len(compare_steps) != len(ckpt_paths):
+        return {
+            "error": (
+                f"--compare-steps has {len(compare_steps)} entries but "
+                f"--checkpoint has {len(ckpt_paths)} paths; they must match."
+            )
+        }
+
     # Load (step_label, d, k, context) for each checkpoint
     loaded = []
     for i, path in enumerate(ckpt_paths):
@@ -481,7 +514,18 @@ def module_align(
                     "save_build_checkpoint (stream path)."
                 )
             }
-        step_label = compare_steps[i] if compare_steps and i < len(compare_steps) else i
+        # Validate d/k consistency across checkpoints
+        if loaded:
+            ref_d, ref_k = loaded[0][1], loaded[0][2]
+            if cfg.d_model != ref_d or cfg.k != ref_k:
+                return {
+                    "error": (
+                        f"Checkpoint {path} has d_model={cfg.d_model}, k={cfg.k} "
+                        f"but first checkpoint has d_model={ref_d}, k={ref_k}; "
+                        "all checkpoints must share the same configuration."
+                    )
+                }
+        step_label = compare_steps[i] if compare_steps else i
         loaded.append((step_label, cfg.d_model, cfg.k, context))
 
     # If only one checkpoint, prepend a zero-init baseline at step 0
@@ -708,13 +752,18 @@ def main() -> int:
         modules = [m for m in modules if m != "align"]
 
     # ── Run analysis for each log (multi-run mode iterates; single-run is one pass) ──
+    multi_run = len(log_pairs) > 1
     all_results: list[dict] = []
     for run_name, jsonl_path in log_pairs:
+        # Each run writes to its own subdirectory in multi-run mode
+        run_out = os.path.join(args.out, run_name) if multi_run else args.out
+        os.makedirs(run_out, exist_ok=True)
+
         print(f"Memory Manifold Analysis: {run_name}", flush=True)
         print(f"  log:        {jsonl_path}", flush=True)
         print(f"  checkpoint: {primary_ckpt or '(none)'}", flush=True)
         print(f"  modules:    {' '.join(modules)}", flush=True)
-        print(f"  out:        {args.out}", flush=True)
+        print(f"  out:        {run_out}", flush=True)
         print(flush=True)
 
         tokenizer = _load_tokenizer(args.tokenizer) if args.tokenizer else None
@@ -723,13 +772,13 @@ def main() -> int:
         # Module 1: JS trajectory
         if "js" in modules:
             print("[js] JS divergence trajectory...", flush=True)
-            results["js"] = module_js(jsonl_path, args.out, args.step)
+            results["js"] = module_js(jsonl_path, run_out, args.step)
             print(f"  verdict: {results['js'].get('verdict', '')}", flush=True)
 
         # Module 2: Effective rank
         if "rank" in modules:
             print("[rank] Memory effective rank...", flush=True)
-            results["rank"] = module_rank(primary_ckpt, args.out)
+            results["rank"] = module_rank(primary_ckpt, run_out)
             if "error" in results["rank"]:
                 print(f"  SKIPPED: {results['rank']['error'][:80]}", flush=True)
             else:
@@ -740,7 +789,7 @@ def main() -> int:
         if "cluster" in modules:
             print("[cluster] Vocabulary semantic clustering...", flush=True)
             results["cluster"] = module_cluster(
-                jsonl_path, primary_ckpt, args.out, tokenizer,
+                jsonl_path, primary_ckpt, run_out, tokenizer,
                 no_semantic_graph=args.no_semantic_graph,
             )
             if "error" in results["cluster"]:
@@ -752,21 +801,21 @@ def main() -> int:
         # Module 4: Level subspace alignment (Grassmann distance between checkpoint pairs)
         if "align" in modules:
             print("[align] Level subspace alignment (Grassmann distance)...", flush=True)
-            results["align"] = module_align(ckpt_paths, args.out, args.compare_steps)
+            results["align"] = module_align(ckpt_paths, run_out, args.compare_steps)
             if "error" in results["align"]:
                 print(f"  SKIPPED: {results['align']['error']}", flush=True)
             else:
                 print(f"  pairs={results['align']['n_pairs']}  "
                       f"levels={results['align']['n_levels']}", flush=True)
 
-        all_results.append((run_name, results))
+        all_results.append((run_name, results, run_out))
 
     # Render report for the primary (or only) run
-    primary_run_name, primary_results = all_results[0]
-    report = _render_report(primary_run_name, modules, primary_results, args.out, args.step)
+    primary_run_name, primary_results, primary_out = all_results[0]
+    report = _render_report(primary_run_name, modules, primary_results, primary_out, args.step)
     print(flush=True)
     print(report, flush=True)
-    print(f"Report written to: {args.out}/report.txt", flush=True)
+    print(f"Report written to: {primary_out}/report.txt", flush=True)
 
     return 0
 
