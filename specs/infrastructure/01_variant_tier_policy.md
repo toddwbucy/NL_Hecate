@@ -177,6 +177,7 @@ defaults that resolve to the Tier 1 canonical config when combined.
   `attentional_bias`, `retention`, and `momentum`. Overrides are permitted within the
   constraints documented in `specs/algorithms/memory_update_rules/`.
 - Canonical variant defaults:
+
   | Variant | bias | retention | momentum |
   |---|---|---|---|
   | `titans_lmm` | `l2` | `l2_weight_decay` | `ema` |
@@ -252,14 +253,15 @@ Error template:
 ConfigError: k={k} but len(chunk_sizes)={n}. chunk_sizes must have exactly k entries.
 ```
 
-### Rule V-05: GPU tier check (when device=cuda requested)
-When `device: "cuda"` (explicit or inferred from CUDA_VISIBLE_DEVICES), the combination
+### Rule V-05: GPU tier check (when gpu=true)
+When `gpu: true` (the default, or explicit in the build section), the combination
 must be Tier 1 or Tier 2a (has GPU kernels). Tier 2b and Tier 3 combinations trigger:
 ```text
 ConfigError: '{memory_rule}' is Tier {tier} — no GPU kernels available.
   This combination runs on CPU only. Either:
-    (a) set device: "cpu" to run intentionally on CPU, or
-    (b) use a Tier 1 or Tier 2a memory_rule (titans_lmm, delta_rule, hebbian)
+    (a) add "gpu": false to your config build section, or
+    (b) pass --cpu at the command line, or
+    (c) use a Tier 1 or Tier 2a memory_rule (titans_lmm, delta_rule, hebbian)
        to run on GPU.
   See specs/infrastructure/01_variant_tier_policy.md for the full tier matrix.
 ```
@@ -274,7 +276,7 @@ ConfigWarning: '{field}' is Tier 3 (research stub). Not production-ready.
 
 ---
 
-## The `validate-config` Subcommand
+## The `--validate-config` Option Flag
 
 `hecate.py --validate-config <path>` performs a dry-run config check without launching training.
 It runs all V-01 through V-06 rules and reports:

@@ -212,7 +212,7 @@ def _validate_config_cmd(path: str) -> int:
     if bcfg is not None:
         rule = bcfg.memory_rule
         if rule in _GPU_CAPABLE:
-            tier_label = "Tier 1" if rule == "titans" else "Tier 2a — GPU-capable"
+            tier_label = "Tier 1" if rule in _TIER_1 else "Tier 2a — GPU-capable"
         elif rule in _TIER_2B:
             tier_label = "Tier 2b — CPU only"
         elif rule in _TIER_3_RULES:
