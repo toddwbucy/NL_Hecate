@@ -57,10 +57,11 @@ def run_build(bcfg: BuildConfig):
 
     if use_bpe:
         active_loader = BpeDataLoader(bcfg.data_path, split="train")
-        print(f"Loaded ShareGPT BPE data: {len(active_loader):,} tokens, "
+        print(f"Loaded {bcfg.data_format} BPE data: {len(active_loader):,} tokens, "
               f"vocab={active_loader.vocab_size}")
         if len(active_loader) < bcfg.seq_len:
-            print(f"Error: data too short ({len(active_loader)} tokens < seq_len={bcfg.seq_len})")
+            print(f"Error: data too short ({len(active_loader)} tokens < seq_len={bcfg.seq_len}, "
+                  f"format={bcfg.data_format})")
             return
         if bcfg.eval_every > 0:
             val_path = Path(bcfg.data_path) / "val_tokens.npy"
@@ -268,7 +269,7 @@ def run_build(bcfg: BuildConfig):
     print(f"  Params:   {params.num_params():,}")
     data_len = len(active_loader) if use_bpe else len(token_ids)
     print(f"  Data:     {data_len:,} tokens" +
-          (f" (ShareGPT BPE, {bcfg.data_format})" if use_bpe else ""))
+          (f" ({bcfg.data_format} BPE)" if use_bpe else ""))
     use_gpu = bcfg.gpu and hasattr(nl_hecate, "GpuModel")
     # Auto-promote adamw → adamw_gpu when on GPU (no reason to round-trip to CPU)
     if use_gpu and bcfg.optimizer == "adamw":
