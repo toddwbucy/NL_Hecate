@@ -11,6 +11,7 @@
     "memory_rule": "delta",
     "composition": "mag",
     "memory_reset": "carry_forward",
+    "chunk_sizes": [1, 8, 64, 512],
     "theta_floor": [0.0, 0.0, 0.0, 0.0],
     "theta_ceil": [1.0, 1.0, 1.0, 1.0],
     "m_norm_max": [100.0, 100.0, 100.0, 100.0]
@@ -24,6 +25,7 @@
   },
   "build": {
     "lr": 3e-4,
+    "batch_size": 8,
     "steps": 25000,
     "seed": 42,
     "optimizer": "adamw_gpu",
