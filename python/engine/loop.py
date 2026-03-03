@@ -298,7 +298,10 @@ def run_build(bcfg: BuildConfig):
         print(f"  Grad clip: max_norm={bcfg.max_grad_norm}")
     print(f"  Device:   {'GPU' if use_gpu else 'CPU'}")
     if bcfg.eval_every > 0:
+        tape_eff_disp = bcfg.tape_every if bcfg.tape_every > 0 else bcfg.eval_every
         print(f"  Eval:     every {bcfg.eval_every} steps, {bcfg.eval_max_chunks} max chunks")
+        print(f"  Probes:   {bcfg.probe_prompts} prompt(s), {bcfg.probe_max_tokens} tokens each  "
+              f"| tape every {tape_eff_disp} steps")
     if bcfg.log_file:
         print(f"  Log:      {bcfg.log_file}")
     print(f"{'=' * 60}\n")
@@ -763,7 +766,9 @@ def run_build(bcfg: BuildConfig):
             print(f"  [eval] step {step:5d}  loss={eval_loss:.4f}  ppl={eval_ppl:.1f}")
             if gpu_model is not None and hasattr(gpu_model, "gate_biases"):
                 print_level_metrics(gpu_model, bcfg.k)
-            if (gpu_model is not None
+            tape_eff = bcfg.tape_every if bcfg.tape_every > 0 else bcfg.eval_every
+            if (tape_eff > 0 and step % tape_eff == 0
+                    and gpu_model is not None
                     and hasattr(gpu_model, "tape_forward_summary")
                     and input_ids is not None and target_ids is not None
                     and max(target_ids) < bcfg.vocab_size):
@@ -791,13 +796,14 @@ def run_build(bcfg: BuildConfig):
                     snapshot = full_snapshot(gpu_model)
                     # Probe 1: within-generation learning curve
                     # Restore between probes: step_generate modifies params
-                    for prompt_text in EVAL_PROMPTS:
+                    n_prompts = max(1, min(bcfg.probe_prompts, len(EVAL_PROMPTS)))
+                    for prompt_text in EVAL_PROMPTS[:n_prompts]:
                         full_restore(gpu_model, snapshot)
                         gpu_model.reset_optimizer()
                         prompt_ids = tokenizer.encode(prompt_text)
                         result = probe_within_generation(
                             gpu_model, cfg, prompt_ids, tokenizer,
-                            max_tokens=60, temperature=0.7, lr=bcfg.lr)
+                            max_tokens=bcfg.probe_max_tokens, temperature=0.7, lr=bcfg.lr)
                         preview = result["generated_text"][:60].replace("\n", "\\n")
                         print(f"    [probe1] \"{prompt_text}\" → \"{preview}\"")
                         print(f"      loss: {result['loss_first10_avg']:.4f} → "
@@ -819,7 +825,8 @@ def run_build(bcfg: BuildConfig):
                     prompt_ids = tokenizer.encode(prompt_text)
                     xresult = probe_cross_exposure(
                         gpu_model, cfg, prompt_ids, tokenizer,
-                        max_tokens=30, temperature=0.7, lr=bcfg.lr)
+                        max_tokens=max(10, bcfg.probe_max_tokens // 2),
+                        temperature=0.7, lr=bcfg.lr)
                     print(f"    [probe2] \"{prompt_text}\" "
                           f"run1={xresult['run1_avg_loss']:.4f} → "
                           f"run2={xresult['run2_avg_loss']:.4f}  "
