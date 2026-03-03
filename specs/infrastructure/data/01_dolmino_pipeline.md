@@ -63,7 +63,7 @@ traces, and instruction data in two ingredient variants (ingredient1, ingredient
 
 Each ingredient occupies a separate subdirectory tree under `data/`:
 
-```
+```text
 /bulk-store/training-datasets/dolmino_mix_100B/
 ├── data/                    ← 323 subdirectories
 │   ├── ingredient1-common_crawl-high-quality_19_*/
@@ -81,7 +81,7 @@ JSONL record schema (minimum required field):
 
 ## Output Format
 
-```
+```text
 data/dolmino_100b/
 ├── train_tokens.npy       ← uint32 flat token array
 ├── train_targets.npy      ← int32 flat target array (tokens[1:])
@@ -128,54 +128,90 @@ data/dolmino_100b/
 
 ## Algorithm
 
-```
-fn prepare_dolmino(source_dir, output_dir, ingredient, target_tokens, val_ratio, seed):
-    # 1. Discover shards (sorted for reproducibility)
-    dirs = sorted(glob(source_dir / "data" / f"{ingredient}-*"))
-    if len(dirs) == 0:
-        error("No source directories found for ingredient={ingredient}")
+```rust
+fn prepare_dolmino<P>(
+    source_dir:   P,
+    output_dir:   P,
+    ingredient:   &str,
+    target_tokens: usize,
+    val_ratio:    f32,
+    min_text_len: usize,
+    seed:         u64,
+) -> Result<(), PipelineError>
+where
+    P: AsRef<std::path::Path>,
+{
+    // 1. Discover shards (sorted for reproducibility)
+    let dirs: Vec<PathBuf> = glob(source_dir / "data" / format!("{ingredient}-*"))
+        .sorted()
+        .collect();
+    if dirs.is_empty() {
+        return Err(PipelineError::NoSourceDirs { ingredient });
+    }
+    let shards: Vec<PathBuf> = dirs.iter()
+        .flat_map(|d| glob(d / "*.jsonl.zst").sorted())
+        .collect();
 
-    shards = sorted(path for d in dirs for path in glob(d / "*.jsonl.zst"))
+    // 2. Stream documents; discard those shorter than min_text_len chars
+    let mut all_docs: Vec<String> = Vec::new();
+    let mut total_chars: usize = 0;
+    let target_chars: usize = target_tokens * 5; // headroom for tokenization ratio
+    'outer: for shard in &shards {
+        for record in stream_jsonl_zst(shard)? {
+            let text: String = record.get("text").unwrap_or_default();
+            if text.len() >= min_text_len {
+                total_chars += text.len();
+                all_docs.push(text);
+            }
+        }
+        if total_chars >= target_chars { break 'outer; }
+    }
 
-    # 2. Stream documents without accumulating corpus in RAM
-    all_docs: list[str] = []
-    for shard in shards:
-        for record in stream_jsonl_zst(shard):
-            text = record.get("text", "")
-            if len(text) >= MIN_TEXT_LEN:
-                all_docs.append(text)
+    // 3. Shuffle and split (seeded, reproducible)
+    let mut rng = Rng::seed(seed);
+    let indices = rng.permutation(all_docs.len());
+    let n_val   = 1.max((all_docs.len() as f32 * val_ratio) as usize);
+    let val_set: HashSet<usize> = indices[..n_val].iter().copied().collect();
+    let train_docs: Vec<&str> = all_docs.iter().enumerate()
+        .filter(|(i, _)| !val_set.contains(i)).map(|(_, s)| s.as_str()).collect();
+    let val_docs: Vec<&str> = val_set.iter()
+        .map(|&i| all_docs[i].as_str()).collect();
+    let n_train_docs = train_docs.len();
+    let n_val_docs   = val_docs.len();
 
-    # 3. Shuffle and split (seeded, reproducible)
-    rng = np.random.RandomState(seed)
-    indices = rng.permutation(len(all_docs))
-    n_val = max(1, int(len(all_docs) * val_ratio))
-    val_set  = {indices[i] for i in range(n_val)}
-    train_docs = [all_docs[i] for i in range(len(all_docs)) if i not in val_set]
-    val_docs   = [all_docs[i] for i in val_set]
+    // 4. Load tokenizer (no training — reuse existing 32K BPE)
+    let tokenizer = Tokenizer::from_file(tokenizer_path)?;
 
-    # 4. Load tokenizer (no training)
-    tokenizer = Tokenizer.from_file(tokenizer_path)
+    // 5. Tokenize into flat arrays with EOT separators
+    let train_tokens = tokenize_stream(&train_docs, &tokenizer,
+                                       (target_tokens as f32 * (1.0 - val_ratio)) as usize)?;
+    let val_tokens   = tokenize_stream(&val_docs,   &tokenizer,
+                                       (target_tokens as f32 * val_ratio) as usize)?;
 
-    # 5. Tokenize into flat arrays with EOT separators
-    train_tokens = tokenize_stream(train_docs, tokenizer, target_tokens * (1 - val_ratio))
-    val_tokens   = tokenize_stream(val_docs, tokenizer, target_tokens * val_ratio)
-
-    # 6. Write output
-    save_npy(output_dir / "train_tokens.npy", train_tokens, dtype=uint32)
-    save_npy(output_dir / "train_targets.npy", train_tokens[1:] concat [EOT], dtype=int32)
-    # (targets array is tokens shifted by 1 — standard next-token prediction)
-    save_meta(output_dir / "meta.json", ...)
-    copy_tokenizer(output_dir / "tokenizer.json")
+    // 6. Write output
+    // Standard next-token prediction: input[i] predicts tokens[i+1]
+    save_npy(output_dir / "train_tokens.npy",  &train_tokens[..train_tokens.len()-1], Dtype::U32)?;
+    save_npy(output_dir / "train_targets.npy", &train_tokens[1..],                    Dtype::I32)?;
+    save_npy(output_dir / "val_tokens.npy",    &val_tokens[..val_tokens.len()-1],     Dtype::U32)?;
+    save_npy(output_dir / "val_targets.npy",   &val_tokens[1..],                      Dtype::I32)?;
+    save_meta(output_dir / "meta.json",
+              n_train_docs, n_val_docs, &tokenizer, ingredient, min_text_len, seed)?;
+    copy_tokenizer(output_dir / "tokenizer.json")?;
+    Ok(())
+}
 ```
 
 ### Streaming helper
 
-```
-fn stream_jsonl_zst(path):
-    with open(path, "rb") as f:
-        reader = ZstdDecompressor().stream_reader(f)
-        for line in TextIOWrapper(reader):
-            yield json.loads(line)
+```rust
+fn stream_jsonl_zst(path: &Path) -> impl Iterator<Item = Result<JsonValue, ParseError>> {
+    let file   = File::open(path)?;
+    let reader = ZstdDecompressor::new().stream_reader(file)?;
+    BufReader::new(reader)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| serde_json::from_str(&line).map_err(ParseError::Json))
+}
 ```
 
 ## Constraint Compliance
@@ -187,7 +223,7 @@ fn stream_jsonl_zst(path):
 
 ## CLI Interface
 
-```
+```bash
 python scripts/prepare_dolmino.py [OPTIONS]
 
 Options:

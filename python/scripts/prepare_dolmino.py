@@ -16,7 +16,7 @@ Usage:
     python scripts/prepare_dolmino.py
     python scripts/prepare_dolmino.py --target_tokens 1_000_000_000
     python scripts/prepare_dolmino.py --ingredient ingredient2 --output data/dolmino_i2
-    python scripts/prepare_dolmino.py --min_text_len 4096   # stricter: force 2× L3
+    python scripts/prepare_dolmino.py --min_text_len 4096   # stricter: force 2x L3
 """
 
 import argparse
@@ -53,7 +53,11 @@ def stream_jsonl_zst(path: Path):
                     continue
                 try:
                     yield json.loads(line)
-                except json.JSONDecodeError:
+                except json.JSONDecodeError as exc:
+                    print(
+                        f"  warning: JSON decode error in {path.name}: {exc!r}",
+                        file=sys.stderr,
+                    )
                     continue
 
 
@@ -224,6 +228,13 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if not (0.0 < args.val_ratio < 1.0):
+        parser.error(f"--val_ratio must be in (0, 1), got {args.val_ratio}")
+    if args.target_tokens <= 0:
+        parser.error(f"--target_tokens must be > 0, got {args.target_tokens}")
+    if args.min_text_len <= 0:
+        parser.error(f"--min_text_len must be > 0, got {args.min_text_len}")
+
     source_dir = Path(args.source)
     out_dir = Path(args.output)
     tokenizer_path = Path(args.tokenizer)
@@ -294,6 +305,9 @@ def main() -> None:
     train_target = int(args.target_tokens * (1 - args.val_ratio))
     val_target = args.target_tokens - train_target
 
+    n_train_docs = len(train_docs)
+    n_val_docs = len(val_docs)
+
     print("  Train split:")
     train_input, train_targets = tokenize_documents(train_docs, tokenizer, train_target)
     train_docs = []  # free memory
@@ -332,7 +346,7 @@ def main() -> None:
         },
         "train": {
             "split": "train",
-            "documents": len(train_input) // 512 or 0,  # rough; exact below
+            "documents": n_train_docs,
             "total_tokens": len(train_input),
             "valid_targets": len(train_targets),
             "masked_targets": 0,
@@ -340,7 +354,7 @@ def main() -> None:
         },
         "val": {
             "split": "val",
-            "documents": len(val_input) // 512 or 0,
+            "documents": n_val_docs,
             "total_tokens": len(val_input),
             "valid_targets": len(val_targets),
             "masked_targets": 0,
