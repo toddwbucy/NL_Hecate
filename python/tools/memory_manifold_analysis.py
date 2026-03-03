@@ -151,6 +151,7 @@ def module_js(jsonl_path: str, out_dir: str, falsification_step: int = 20000) ->
         return {"error": "No level metadata found in memory_vocab_probe events"}
     k = max(level_ids) + 1
     pairs = [(i, j) for i in range(k) for j in range(i + 1, k)]
+    valid_pair_keys = {f"{a}-{b}" for a, b in pairs}
 
     rows = []
     js_at_step: dict[int, dict] = {}
@@ -159,7 +160,9 @@ def module_js(jsonl_path: str, out_dir: str, falsification_step: int = 20000) ->
         step = evt["step"]
         js_data = {f"{a}-{b}": None for a, b in pairs}
         for entry in evt.get("js_divergence", []):
-            js_data[entry["levels"]] = entry["js_div"]
+            key = entry.get("levels", "")
+            if key in valid_pair_keys:  # skip malformed / unexpected keys
+                js_data[key] = entry["js_div"]
         rows.append({"step": step, **js_data})
         js_at_step[step] = js_data
 
@@ -314,21 +317,26 @@ def _build_semantic_graph_fallback(w_embed: np.ndarray, k_nn: int) -> "np.ndarra
     return nn_indices
 
 
-def _build_semantic_graph(w_embed: np.ndarray, cache_path: str, k_nn: int) -> np.ndarray:
-    """Build or load k-NN semantic graph. Returns [v, k_nn] neighbour index array."""
-    v_expected = w_embed.shape[0]
+def _build_semantic_graph(w_embed: np.ndarray, cache_path: str, k_nn: int) -> tuple:
+    """Build or load k-NN semantic graph.
+
+    Returns (nn_indices [v, k_eff], k_eff) where k_eff = min(k_nn, v-1).
+    k_eff may be smaller than k_nn for small vocabularies.
+    """
+    v, d = w_embed.shape
+    k_eff = min(k_nn, v - 1)  # cap to avoid OOB on small vocab
+
     if os.path.exists(cache_path):
         cached = np.load(cache_path)["nn_indices"]
-        if cached.shape == (v_expected, k_nn):
-            return cached
+        if cached.shape == (v, k_eff):
+            return cached, k_eff
         print(
             f"  WARNING: cached semantic graph shape {cached.shape} does not match "
-            f"expected ({v_expected}, {k_nn}); rebuilding.",
+            f"expected ({v}, {k_eff}); rebuilding.",
             flush=True,
         )
 
-    v, d = w_embed.shape
-    print(f"  Building semantic graph: {v} tokens, {d} dims, k={k_nn}...", flush=True)
+    print(f"  Building semantic graph: {v} tokens, {d} dims, k={k_eff}...", flush=True)
 
     try:
         import faiss
@@ -336,17 +344,17 @@ def _build_semantic_graph(w_embed: np.ndarray, cache_path: str, k_nn: int) -> np
         W = (w_embed / norm).astype(np.float32)
         index = faiss.IndexFlatIP(d)
         index.add(W)
-        _, nn_indices = index.search(W, k_nn + 1)   # +1 because self is included
+        _, nn_indices = index.search(W, k_eff + 1)  # +1 because self is included
         nn_indices = nn_indices[:, 1:].astype(np.int32)  # drop self-match
         print("    (used FAISS)", flush=True)
     except ImportError:
         print("    (FAISS not available, using numpy batched cosine — slow for large vocab)",
               flush=True)
-        nn_indices = _build_semantic_graph_fallback(w_embed, k_nn)
+        nn_indices = _build_semantic_graph_fallback(w_embed, k_eff)
 
     np.savez_compressed(cache_path, nn_indices=nn_indices)
     print(f"  Cached to {cache_path}", flush=True)
-    return nn_indices
+    return nn_indices, k_eff
 
 
 def module_cluster(
@@ -375,9 +383,10 @@ def module_cluster(
     w_embed = w_embed_flat.reshape(v, d)
 
     nn_indices = None
+    k_eff_nn = SEMANTIC_KNN
     if not no_semantic_graph:
         cache_path = os.path.join(out_dir, "semantic_graph.npz")
-        nn_indices = _build_semantic_graph(w_embed, cache_path, SEMANTIC_KNN)
+        nn_indices, k_eff_nn = _build_semantic_graph(w_embed, cache_path, SEMANTIC_KNN)
 
     k = cfg.k
     rows = []
@@ -408,7 +417,7 @@ def module_cluster(
                     for tid in top_ids
                 )
                 n = len(top_ids)
-                max_possible = n * SEMANTIC_KNN
+                max_possible = n * k_eff_nn  # use actual neighbour count (may be < SEMANTIC_KNN)
                 density = edges_in / (max_possible + 1e-10)
 
                 # Baseline: expected density for random n tokens
@@ -813,12 +822,12 @@ def main() -> int:
 
         all_results.append((run_name, results, run_out))
 
-    # Render report for the primary (or only) run
-    primary_run_name, primary_results, primary_out = all_results[0]
-    report = _render_report(primary_run_name, modules, primary_results, primary_out, args.step)
-    print(flush=True)
-    print(report, flush=True)
-    print(f"Report written to: {primary_out}/report.txt", flush=True)
+    # Render per-run reports (single-run is one iteration; multi-run produces one per subdir)
+    for run_name, run_results, run_out in all_results:
+        report = _render_report(run_name, modules, run_results, run_out, args.step)
+        print(flush=True)
+        print(report, flush=True)
+        print(f"Report written to: {run_out}/report.txt", flush=True)
 
     return 0
 
