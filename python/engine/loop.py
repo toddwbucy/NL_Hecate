@@ -37,24 +37,30 @@ def _safetensors_path(path_str: str) -> str:
     return path_str
 
 
+# Data formats that use the numpy/BPE loader path (BpeDataLoader + sidecar cursor).
+# The byte-level path (VecStream / MmapTokenStream) uses a separate resume mechanism
+# and is unaffected by this constant.
+_NUMPY_LOADER_FORMATS = frozenset({"sharegpt", "dolmino"})
+
+
 def run_build(bcfg: BuildConfig):
     """Execute the full build loop. All state managed internally."""
 
     import numpy as np
 
     # ── Load data ─────────────────────────────────────────────────────
-    use_bpe = (bcfg.data_format == "sharegpt")
-    bpe_loader: BpeDataLoader | None = None
+    use_bpe = bcfg.data_format in _NUMPY_LOADER_FORMATS
+    active_loader: BpeDataLoader | None = None
     token_ids: list[int] | MmapTokenStream | None = None
 
     val_loader: BpeDataLoader | None = None
 
     if use_bpe:
-        bpe_loader = BpeDataLoader(bcfg.data_path, split="train")
-        print(f"Loaded ShareGPT BPE data: {len(bpe_loader):,} tokens, "
-              f"vocab={bpe_loader.vocab_size}")
-        if len(bpe_loader) < bcfg.seq_len:
-            print(f"Error: data too short ({len(bpe_loader)} tokens < seq_len={bcfg.seq_len})")
+        active_loader = BpeDataLoader(bcfg.data_path, split="train")
+        print(f"Loaded ShareGPT BPE data: {len(active_loader):,} tokens, "
+              f"vocab={active_loader.vocab_size}")
+        if len(active_loader) < bcfg.seq_len:
+            print(f"Error: data too short ({len(active_loader)} tokens < seq_len={bcfg.seq_len})")
             return
         if bcfg.eval_every > 0:
             val_path = Path(bcfg.data_path) / "val_tokens.npy"
@@ -133,10 +139,10 @@ def run_build(bcfg: BuildConfig):
                 params, cfg = nl_hecate.load_checkpoint(bcfg.load)
                 resume_step = 0
             sidecar = Path(str(bcfg.load) + ".cursor.json")
-            if sidecar.exists() and bpe_loader is not None:
+            if sidecar.exists() and active_loader is not None:
                 cursor = json.loads(sidecar.read_text())
                 try:
-                    bpe_loader.restore(cursor)
+                    active_loader.restore(cursor)
                     print(f"  Resuming from step {resume_step}")
                     print(f"  Stream position: {cursor['position']:,} / {cursor['total_tokens']:,} tokens")
                 except (CursorMismatchError, CursorOutOfBounds) as e:
@@ -260,7 +266,7 @@ def run_build(bcfg: BuildConfig):
     if len(cfg.m_norm_max) > 0:
         print(f"  M-norm:   max={list(cfg.m_norm_max)}")
     print(f"  Params:   {params.num_params():,}")
-    data_len = len(bpe_loader) if use_bpe else len(token_ids)
+    data_len = len(active_loader) if use_bpe else len(token_ids)
     print(f"  Data:     {data_len:,} tokens" +
           (f" (ShareGPT BPE, {bcfg.data_format})" if use_bpe else ""))
     use_gpu = bcfg.gpu and hasattr(nl_hecate, "GpuModel")
@@ -321,10 +327,10 @@ def run_build(bcfg: BuildConfig):
     # Each slot b has its own sequential M stream through sub-corpus b.
     # Slot b starts at position b * (total_tokens // batch_size) and strides by
     # batch_size * seq_len per step, giving dense sequential coverage within 1/B
-    # of the corpus. batch_size=1 falls through to the scalar bpe_loader path.
+    # of the corpus. batch_size=1 falls through to the scalar active_loader path.
     bpe_loaders: list[BpeDataLoader] = []
-    if use_bpe and bcfg.batch_size > 1 and bpe_loader is not None:
-        slot_size = bpe_loader.total_tokens // bcfg.batch_size
+    if use_bpe and bcfg.batch_size > 1 and active_loader is not None:
+        slot_size = active_loader.total_tokens // bcfg.batch_size
         for b in range(bcfg.batch_size):
             loader_b = BpeDataLoader(bcfg.data_path, split="train")
             loader_b.position = b * slot_size
@@ -414,7 +420,7 @@ def run_build(bcfg: BuildConfig):
                     break
                 input_ids, target_ids = all_input, all_target
             else:
-                chunk = bpe_loader.next_chunk(bcfg.seq_len)
+                chunk = active_loader.next_chunk(bcfg.seq_len)
                 if chunk is None:
                     break
                 input_ids, target_ids = chunk
@@ -871,9 +877,9 @@ def run_build(bcfg: BuildConfig):
                 nl_hecate.save_checkpoint(ckpt_path, params, cfg)
             else:
                 nl_hecate.save_build_checkpoint(ckpt_path, params, cfg, conductor, context)
-            if bpe_loader is not None:
+            if active_loader is not None:
                 sidecar = Path(str(ckpt_path) + ".cursor.json")
-                sidecar.write_text(json.dumps(bpe_loader.cursor(), indent=2))
+                sidecar.write_text(json.dumps(active_loader.cursor(), indent=2))
             print(f"  [checkpoint saved: {ckpt_path}]")
 
             # Component 3: per-level parameter drift (||M_t||_F vs ||M_0||_F)
@@ -1010,9 +1016,9 @@ def run_build(bcfg: BuildConfig):
         nl_hecate.save_checkpoint(final_path, params, cfg)
     else:
         nl_hecate.save_build_checkpoint(final_path, params, cfg, conductor, context)
-    if bpe_loader is not None:
+    if active_loader is not None:
         sidecar = Path(str(final_path) + ".cursor.json")
-        sidecar.write_text(json.dumps(bpe_loader.cursor(), indent=2))
+        sidecar.write_text(json.dumps(active_loader.cursor(), indent=2))
 
     # ── Summary ───────────────────────────────────────────────────────
     print(f"\n{'=' * 60}")
