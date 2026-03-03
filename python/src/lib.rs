@@ -1489,6 +1489,15 @@ fn save_checkpoint_with_context(
     path: &str, params: &MAGParams, cfg: &MAGConfig,
     conductor: &Conductor, context: &ContextState,
 ) -> PyResult<()> {
+    // Guard: stream-backed conductors must use save_build_checkpoint, which
+    // captures the real StreamCursor. Using this function with an attached
+    // stream would silently drop the data-loader position on resume.
+    if conductor.inner.has_stream() {
+        return Err(PyValueError::new_err(
+            "save_checkpoint_with_context is for streamless BPE conductors; \
+             use save_build_checkpoint for stream-backed conductors"
+        ));
+    }
     // For BPE-path runs: conductor has no attached stream (position lives in
     // the sidecar .cursor.json). Serialise M_l matrices with a zeroed
     // StreamCursor — callers must not use it for position resume.

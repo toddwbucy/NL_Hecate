@@ -1,6 +1,6 @@
 # BPE Checkpoint Context Persistence
 
-```
+```text
 CONTRACT
   Purpose:    Persist M_l memory matrices (ContextState) in BPE-path training
               checkpoints so that post-hoc diagnostic tools (spec 10: memory
@@ -146,11 +146,11 @@ if use_bpe:
         context = nl_hecate.ContextState(bcfg.k, bcfg.d_model)
 ```
 
-`build_state` is already parsed from the checkpoint by `_load_build_state_if_present`
-(called earlier in `run_build`). The BPE path must also call
-`load_build_checkpoint` instead of `load_checkpoint` when a new-format checkpoint
-is present — or simply always attempt `load_build_checkpoint` first (which is the
-pattern already used in `_load_checkpoint` in the manifold analysis tool).
+`build_state` is populated in the BPE resume block by attempting
+`nl_hecate.load_build_checkpoint(path)` first and falling back to
+`nl_hecate.load_checkpoint(path)` on exception — the same try/except pattern
+used in loop.py lines 136-141. The fallback produces `build_state = None`,
+which the context restore block handles via the backward-compatible fresh-init path.
 
 ---
 
@@ -204,7 +204,6 @@ This spec is falsified (implementation incorrect) if any of:
 
 4. The sidecar `.cursor.json` is modified or invalidated by using
    `save_checkpoint_with_context`.
-```
 
 ---
 

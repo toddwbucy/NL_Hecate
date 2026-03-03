@@ -309,6 +309,10 @@ def run_build(bcfg: BuildConfig):
         if build_state is not None and "context_memory" in build_state:
             context = nl_hecate.ContextState(bcfg.k, bcfg.d_model)
             context.set_memory(build_state["context_memory"])
+            # Sync conductor step so pulse scheduling matches resumed position.
+            target_step = int(build_state.get("conductor_step", 0))
+            while conductor.step < target_step:
+                conductor.advance()
         else:
             context = nl_hecate.ContextState(bcfg.k, bcfg.d_model)
     else:
