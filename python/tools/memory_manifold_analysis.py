@@ -11,9 +11,9 @@ trace semantically distinct, level-specific regions in the token embedding space
 
 Modules:
   js      JS divergence trajectory from JSONL (no checkpoint needed)
-  rank    Effective rank of M_l via PCA on row vectors (build checkpoint only)
+  rank    Effective rank of M_l SVD spectrum (checkpoint with context required)
   cluster Vocabulary semantic clustering via embedding k-NN (W_embed + JSONL)
-  align   Vocabulary distribution PCA across steps (JSONL only)
+  align   M_l SVD subspace alignment between checkpoints (Grassmann distance)
 
 Usage:
     cd python/
@@ -22,7 +22,15 @@ Usage:
         --checkpoint checkpoints/gate_warmup_diagnostic.safetensors \\
         --tokenizer data/c4/tokenizer.json \\
         --module js rank cluster align \\
-        --out results/gate_warmup_manifold/
+        --out results/gate_warmup_manifold/ \\
+        [--step 20000] \\
+        [--compare-steps 5000 10000 20000]
+
+Multi-run cross-run comparison:
+    python tools/memory_manifold_analysis.py \\
+        --logs runs/ablation_A.jsonl runs/ablation_C.jsonl runs/ablation_D.jsonl \\
+        --module js rank \\
+        --out results/ablation_manifold/
 """
 from __future__ import annotations
 
@@ -177,8 +185,34 @@ def module_js(jsonl_path: str, out_dir: str, falsification_step: int = 20000) ->
             else:
                 verdict = f"FAIL — JS(L0,L{k-1})={js_val:.4f} < {JS_FALSIFICATION_THRESHOLD} at step {closest_step}"
 
+    # Plot JS trajectory
+    png_path = os.path.join(out_dir, "js_trajectory.png")
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(10, 5))
+        steps_sorted = sorted(js_at_step.keys())
+        for a, b in pairs:
+            pair_key = f"{a}-{b}"
+            xs = [s for s in steps_sorted if js_at_step[s].get(pair_key) is not None]
+            ys = [js_at_step[s][pair_key] for s in xs]
+            if xs:
+                ax.plot(xs, ys, label=f"L{a}-L{b}")
+        ax.axhline(JS_FALSIFICATION_THRESHOLD, color="red", linestyle="--",
+                   label=f"threshold={JS_FALSIFICATION_THRESHOLD}")
+        ax.set_xlabel("Training step")
+        ax.set_ylabel("JS divergence (nats)")
+        ax.set_title("JS Divergence Trajectory")
+        ax.legend()
+        fig.savefig(png_path, dpi=100, bbox_inches="tight")
+        plt.close(fig)
+    except ImportError:
+        png_path = None
+
     return {
         "csv_path": csv_path,
+        "png_path": png_path,
         "k": k,
         "steps": len(events),
         "verdict": verdict,
@@ -200,9 +234,9 @@ def module_rank(ckpt_path: str, out_dir: str) -> dict:
         return {
             "error": (
                 "context_memory not available in this checkpoint. "
-                "BPE checkpoints (save_checkpoint path) do not persist M_l. "
-                "Module rank requires a build checkpoint saved with "
-                "save_build_checkpoint (non-BPE / stream runs)."
+                "Module rank requires a checkpoint saved with "
+                "save_checkpoint_with_context (BPE path) or "
+                "save_build_checkpoint (stream path)."
             )
         }
 
@@ -410,144 +444,97 @@ def module_cluster(
     }
 
 
-# ── Module 4: Vocabulary Distribution PCA (level subspace alignment) ──────
+# ── Module 4: Level Subspace Alignment (Grassmann distance) ───────────────
 
-def module_align(jsonl_path: str, out_dir: str) -> dict:
-    """Measure how vocabulary probe distributions evolve and differ across levels.
+def module_align(
+    ckpt_paths: list,
+    out_dir: str,
+    compare_steps: Optional[list] = None,
+) -> dict:
+    """Compute per-level Grassmann distance between M_l principal subspaces.
 
-    For each level, stacks the top-k sparse probability vectors across all logged
-    steps into a matrix [steps × vocab] (sparse) and computes PCA to find the
-    low-dimensional manifold each level traces through vocabulary space.
+    For each consecutive checkpoint pair (T1, T2), SVD-decomposes M_l at both
+    steps, takes the top-r=8 left singular vectors, and computes the Grassmann
+    distance (sum of principal angles between the two r-dimensional subspaces).
 
-    Cross-level: computes cosine similarity between level PC matrices to test
-    whether levels occupy distinct vocabulary subspaces.
+    If only one checkpoint is provided, compares against the zero-init baseline
+    (zeroed M_l), giving the total rotation from initialisation.
+
+    Spec: Module 4, specs/infrastructure/10_memory_manifold_analysis.md
     """
-    events = _load_jsonl_events(jsonl_path, "memory_vocab_probe")
-    if not events:
-        return {"error": "No memory_vocab_probe events found in JSONL"}
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    import nl_hecate
 
-    if len(events) < 3:
-        return {"error": f"Need ≥3 probe events for PCA; only {len(events)} found"}
+    if not ckpt_paths:
+        return {"error": "No checkpoint paths provided; --checkpoint required for Module 4"}
 
-    k = max(e["levels"][-1]["level"] for e in events) + 1
-    steps = [e["step"] for e in events]
-    n_steps = len(steps)
+    # Load (step_label, d, k, context) for each checkpoint
+    loaded = []
+    for i, path in enumerate(ckpt_paths):
+        _, cfg, context = _load_checkpoint(path)
+        if context is None:
+            return {
+                "error": (
+                    f"context_memory not available in checkpoint {path}. "
+                    "Module align requires a checkpoint saved with "
+                    "save_checkpoint_with_context (BPE path) or "
+                    "save_build_checkpoint (stream path)."
+                )
+            }
+        step_label = compare_steps[i] if compare_steps and i < len(compare_steps) else i
+        loaded.append((step_label, cfg.d_model, cfg.k, context))
 
-    # Determine vocab size from events
-    token_ids = [
-        e2["id"]
-        for evt in events
-        for lv in evt["levels"]
-        for e2 in lv.get("top20", [])
-    ]
-    if not token_ids:
-        return {"error": "No top20 token data found; cannot compute alignment PCA"}
-    v = max(token_ids) + 1
+    # If only one checkpoint, prepend a zero-init baseline at step 0
+    if len(loaded) == 1:
+        _, d, k, _ = loaded[0]
+        zero_ctx = nl_hecate.ContextState(k, d)
+        loaded = [(0, d, k, zero_ctx)] + loaded
 
-    # Build sparse probability matrix per level [n_steps × v] (dense for small v)
-    # For large vocab (32K), use sparse representation: store only top-20 entries
-    level_matrices: dict[int, np.ndarray] = {}
+    d = loaded[0][1]
+    k = loaded[0][2]
+    r = 8  # top-8 principal components per spec
 
-    for lv_idx in range(k):
-        mat = np.zeros((n_steps, v), dtype=np.float32)
-        for si, evt in enumerate(events):
-            lv_data = next((lv for lv in evt["levels"] if lv["level"] == lv_idx), None)
-            if lv_data and lv_data.get("top20"):
-                for entry in lv_data["top20"]:
-                    mat[si, entry["id"]] = entry["prob"]
-        level_matrices[lv_idx] = mat
-
-    # PCA on each level matrix — find top-r principal components
-    r = min(RANK_TOP_N_PCS, n_steps, 64)  # can't exceed n_steps
-    level_pcs: dict[int, np.ndarray] = {}
-    level_explained: dict[int, list] = {}
     rows = []
+    for idx in range(len(loaded) - 1):
+        step1, _, _, ctx1 = loaded[idx]
+        step2, _, _, ctx2 = loaded[idx + 1]
+        step_pair = f"{step1}-{step2}"
 
-    for lv_idx in range(k):
-        mat = level_matrices[lv_idx]
-        # Center
-        mean = mat.mean(axis=0)
-        centered = mat - mean
-        # SVD (n_steps × v, n_steps typically << v so use economy SVD)
-        U, S, Vt = np.linalg.svd(centered, full_matrices=False)
-        # U: [n_steps, n_steps], S: [n_steps], Vt: [n_steps, v]
-        # Principal directions in vocabulary space: rows of Vt
-        top_r = min(r, len(S))
-        level_pcs[lv_idx] = Vt[:top_r]  # [r, v]
+        for level_idx in range(k):
+            M1 = np.array(ctx1.memory[level_idx], dtype=np.float32).reshape(d, d)
+            M2 = np.array(ctx2.memory[level_idx], dtype=np.float32).reshape(d, d)
 
-        total_var = float((S ** 2).sum()) + 1e-30
-        explained = [(float(s ** 2) / total_var) for s in S[:top_r]]
-        level_explained[lv_idx] = explained
+            U1, _, _ = np.linalg.svd(M1, full_matrices=False)  # [d, d]
+            U2, _, _ = np.linalg.svd(M2, full_matrices=False)
 
-        cumulative_80 = next(
-            (i + 1 for i, _ in enumerate(np.cumsum(explained)) if _ >= 0.80),
-            len(explained)
-        )
-        rows.append({
-            "level": lv_idx,
-            "n_steps": n_steps,
-            "top1_explained_var": round(explained[0], 4) if explained else 0.0,
-            "top3_explained_var": round(sum(explained[:3]), 4) if len(explained) >= 3 else 0.0,
-            "dims_for_80pct_var": cumulative_80,
-        })
-
-    # Cross-level subspace alignment: cosine similarity between PC matrices
-    cross_rows = []
-    for i in range(k):
-        for j in range(i + 1, k):
-            pci = level_pcs[i]       # [r, v]
-            pcj = level_pcs[j]       # [r, v]
-            # Grassmann-like: nuclear norm of PCs' gram matrix
-            # Normalise each PC vector
-            pi_norm = pci / (np.linalg.norm(pci, axis=1, keepdims=True) + 1e-10)
-            pj_norm = pcj / (np.linalg.norm(pcj, axis=1, keepdims=True) + 1e-10)
-            gram = pi_norm @ pj_norm.T   # [r, r]
-            cos_angles = np.linalg.svd(gram, compute_uv=False)
-            cos_angles = np.clip(cos_angles, -1, 1)
+            top_r = min(r, d)
+            cos_angles = np.linalg.svd(
+                U1[:, :top_r].T @ U2[:, :top_r], compute_uv=False
+            )
+            cos_angles = np.clip(cos_angles, -1.0, 1.0)
             principal_angles = np.arccos(cos_angles)
-            subspace_dist = float(principal_angles.sum())
-            max_angle = float(np.max(principal_angles))
+            grassmann_dist = float(principal_angles.sum())
 
-            cross_rows.append({
-                "level_pair": f"{i}-{j}",
+            rows.append({
+                "step_pair": step_pair,
+                "level": level_idx,
+                "grassmann_distance": round(grassmann_dist, 4),
+                "max_principal_angle_rad": round(float(np.max(principal_angles)), 4),
                 "mean_principal_angle_rad": round(float(principal_angles.mean()), 4),
-                "max_principal_angle_rad": round(max_angle, 4),
-                "subspace_distance": round(subspace_dist, 4),
             })
 
     csv_path = os.path.join(out_dir, "subspace_alignment.csv")
     with open(csv_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["level", "n_steps", "top1_explained_var",
-                                           "top3_explained_var", "dims_for_80pct_var"])
+        w = csv.DictWriter(f, fieldnames=["step_pair", "level", "grassmann_distance",
+                                           "max_principal_angle_rad", "mean_principal_angle_rad"])
         w.writeheader()
         w.writerows(rows)
 
-    cross_csv = os.path.join(out_dir, "cross_level_alignment.csv")
-    with open(cross_csv, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["level_pair", "mean_principal_angle_rad",
-                                           "max_principal_angle_rad", "subspace_distance"])
-        w.writeheader()
-        w.writerows(cross_rows)
-
-    # Prediction: L0-L_{k-1} subspace distance > L0-L1 distance
-    if cross_rows and k >= 2:
-        dist_01 = next((r["subspace_distance"] for r in cross_rows if r["level_pair"] == "0-1"), None)
-        dist_0k = next((r["subspace_distance"] for r in cross_rows
-                        if r["level_pair"] == f"0-{k-1}"), None)
-        if dist_01 is not None and dist_0k is not None and dist_01 > 0:
-            align_pred = ("PASS" if dist_0k >= dist_01
-                          else f"FAIL — L0-L{k-1} dist={dist_0k:.3f} < L0-L1 dist={dist_01:.3f}")
-        else:
-            align_pred = "PENDING"
-    else:
-        align_pred = "PENDING"
-
     return {
-        "pca_csv": csv_path,
-        "cross_csv": cross_csv,
-        "level_dims": rows,
-        "cross_level": cross_rows,
-        "distant_levels_prediction": align_pred,
+        "csv_path": csv_path,
+        "rows": rows,
+        "n_pairs": len(loaded) - 1,
+        "n_levels": k,
     }
 
 
@@ -555,10 +542,10 @@ def module_align(jsonl_path: str, out_dir: str) -> dict:
 
 def _render_report(
     run_name: str,
-    modules: list[str],
+    modules: list,
     results: dict,
     out_dir: str,
-    falsification_step: int,
+    step: int,
 ) -> str:
     lines = [
         f"{'=' * 60}",
@@ -575,12 +562,12 @@ def _render_report(
         else:
             lines.append(f"  Steps logged: {r['steps']}  |  Levels: {r['k']}")
             if r["latest_js"]:
-                step = r["latest_js"]["step"]
+                latest_step = r["latest_js"]["step"]
                 js_vals = {k: v for k, v in r["latest_js"].items() if k != "step" and v is not None}
-                lines.append(f"  Latest step {step}:")
+                lines.append(f"  Latest step {latest_step}:")
                 for pair, val in sorted(js_vals.items()):
                     lines.append(f"    L{pair}: {val:.4f}")
-            lines.append(f"  Falsification (step {falsification_step}): {r['verdict']}")
+            lines.append(f"  Falsification (step {step}): {r['verdict']}")
         lines.append("")
 
     if "rank" in modules and "rank" in results:
@@ -618,20 +605,15 @@ def _render_report(
 
     if "align" in modules and "align" in results:
         r = results["align"]
-        lines += ["[Module 4: Vocabulary Subspace Alignment]"]
+        lines += ["[Module 4: Level Subspace Alignment]"]
         if "error" in r:
-            lines.append(f"  {'SKIPPED' if 'Need' in r['error'] else 'ERROR'}: {r['error']}")
+            lines.append(f"  SKIPPED: {r['error']}")
         else:
-            for row in r["level_dims"]:
+            for row in r["rows"]:
                 lines.append(
-                    f"  L{row['level']}: dims_for_80pct={row['dims_for_80pct_var']}"
-                    f"  top3_var={row['top3_explained_var']:.3f}"
+                    f"  {row['step_pair']} L{row['level']}: "
+                    f"grassmann={row['grassmann_distance']:.3f} rad"
                 )
-            if r["cross_level"]:
-                lines.append("  Cross-level subspace distances:")
-                for row in r["cross_level"]:
-                    lines.append(f"    L{row['level_pair']}: {row['subspace_distance']:.3f} rad")
-            lines.append(f"  Distant-levels prediction (L0-Lk > L0-L1): {r['distant_levels_prediction']}")
         lines.append("")
 
     # Overall verdict
@@ -643,8 +625,9 @@ def _render_report(
         verdicts.append(("Rank gradient", results["rank"]["rank_gradient_prediction"]))
     if "cluster" in results and "coherence_gradient_prediction" in results["cluster"]:
         verdicts.append(("Coherence gradient", results["cluster"]["coherence_gradient_prediction"]))
-    if "align" in results and "distant_levels_prediction" in results["align"]:
-        verdicts.append(("Subspace distance", results["align"]["distant_levels_prediction"]))
+    if "align" in results and "rows" in results["align"]:
+        n = len(results["align"]["rows"])
+        verdicts.append(("Subspace alignment", f"{n} level×pair rows written to subspace_alignment.csv"))
 
     for name, v in verdicts:
         lines.append(f"  {name}: {v}")
@@ -664,10 +647,17 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    p.add_argument("--log", required=True,
-                   help="Path to training JSONL log (runs/*.jsonl)")
-    p.add_argument("--checkpoint", default=None,
-                   help="Checkpoint safetensors path (required for rank, cluster modules)")
+    # Log inputs — mutually exclusive: single log or multi-run
+    log_grp = p.add_mutually_exclusive_group(required=True)
+    log_grp.add_argument("--log",
+                         help="Path to training JSONL log (runs/*.jsonl)")
+    log_grp.add_argument("--logs", nargs="+",
+                         help="Multiple JSONL paths for cross-run comparison "
+                              "(adds run_name column; --module js rank only)")
+    p.add_argument("--checkpoint", nargs="*", default=None,
+                   help="Checkpoint safetensors path(s). Single path: rank/cluster + "
+                        "Module 4 vs zero-init baseline. Multiple paths: Module 4 "
+                        "compares consecutive pairs.")
     p.add_argument("--tokenizer", default=None,
                    help="Path to BPE tokenizer JSON (optional; enables token decoding)")
     p.add_argument("--module", nargs="+", default=["js", "cluster", "align"],
@@ -677,8 +667,14 @@ def parse_args() -> argparse.Namespace:
                    help="Output directory for CSVs and report")
     p.add_argument("--no-semantic-graph", action="store_true",
                    help="Skip k-NN semantic graph in cluster module (faster)")
-    p.add_argument("--falsification-step", type=int, default=20000,
-                   help="Step at which to evaluate the JS falsification criterion (default: 20000)")
+    p.add_argument("--step", type=int, default=20000, dest="step",
+                   help="Step at which to evaluate the JS falsification criterion "
+                        "(default: 20000)")
+    p.add_argument("--falsification-step", type=int, dest="step",
+                   help=argparse.SUPPRESS)  # backward-compat alias for --step
+    p.add_argument("--compare-steps", nargs="+", type=int, default=None,
+                   help="Step labels for --checkpoint files (Module 4 temporal "
+                        "comparison; must match number of --checkpoint paths)")
     p.add_argument("--run-name", default=None,
                    help="Name for the run in the report (default: log filename stem)")
     return p.parse_args()
@@ -688,67 +684,86 @@ def main() -> int:
     args = parse_args()
 
     os.makedirs(args.out, exist_ok=True)
-    run_name = args.run_name or Path(args.log).stem
-    modules = args.module
 
-    print(f"Memory Manifold Analysis: {run_name}", flush=True)
-    print(f"  log:        {args.log}", flush=True)
-    print(f"  checkpoint: {args.checkpoint or '(none)'}", flush=True)
-    print(f"  modules:    {' '.join(modules)}", flush=True)
-    print(f"  out:        {args.out}", flush=True)
-    print(flush=True)
+    # Normalise log inputs: --log or --logs → list of (run_name, path) pairs
+    if args.logs:
+        log_pairs = [(Path(p).stem, p) for p in args.logs]
+    else:
+        log_pairs = [(args.run_name or Path(args.log).stem, args.log)]
 
-    tokenizer = _load_tokenizer(args.tokenizer) if args.tokenizer else None
+    # Normalise checkpoint list
+    ckpt_paths: list = args.checkpoint or []
+    primary_ckpt: Optional[str] = ckpt_paths[0] if ckpt_paths else None
 
-    results: dict = {}
+    modules = list(args.module)
+
+    # Warn if checkpoint-requiring modules lack a checkpoint
     needs_ckpt = {"rank", "cluster"}
-
-    if needs_ckpt & set(modules) and args.checkpoint is None:
+    if needs_ckpt & set(modules) and primary_ckpt is None:
         print("WARNING: modules [rank, cluster] require --checkpoint. Skipping.", flush=True)
         modules = [m for m in modules if m not in needs_ckpt]
 
-    # Module 1: JS trajectory
-    if "js" in modules:
-        print("[js] JS divergence trajectory...", flush=True)
-        results["js"] = module_js(args.log, args.out, args.falsification_step)
-        v = results["js"].get("verdict", "")
-        print(f"  verdict: {v}", flush=True)
+    if "align" in modules and not ckpt_paths:
+        print("WARNING: module [align] requires --checkpoint. Skipping.", flush=True)
+        modules = [m for m in modules if m != "align"]
 
-    # Module 2: Effective rank
-    if "rank" in modules:
-        print("[rank] Memory effective rank...", flush=True)
-        results["rank"] = module_rank(args.checkpoint, args.out)
-        if "error" in results["rank"]:
-            print(f"  SKIPPED: {results['rank']['error'][:80]}", flush=True)
-        else:
-            print(f"  rank gradient: {results['rank']['rank_gradient_prediction']}", flush=True)
+    # ── Run analysis for each log (multi-run mode iterates; single-run is one pass) ──
+    all_results: list[dict] = []
+    for run_name, jsonl_path in log_pairs:
+        print(f"Memory Manifold Analysis: {run_name}", flush=True)
+        print(f"  log:        {jsonl_path}", flush=True)
+        print(f"  checkpoint: {primary_ckpt or '(none)'}", flush=True)
+        print(f"  modules:    {' '.join(modules)}", flush=True)
+        print(f"  out:        {args.out}", flush=True)
+        print(flush=True)
 
-    # Module 3: Vocabulary clustering
-    if "cluster" in modules:
-        print("[cluster] Vocabulary semantic clustering...", flush=True)
-        results["cluster"] = module_cluster(
-            args.log, args.checkpoint, args.out, tokenizer,
-            no_semantic_graph=args.no_semantic_graph,
-        )
-        if "error" in results["cluster"]:
-            print(f"  ERROR: {results['cluster']['error']}", flush=True)
-        else:
-            print(f"  coherence gradient: {results['cluster']['coherence_gradient_prediction']}",
-                  flush=True)
+        tokenizer = _load_tokenizer(args.tokenizer) if args.tokenizer else None
+        results: dict = {}
 
-    # Module 4: Subspace alignment via vocabulary PCA
-    if "align" in modules:
-        print("[align] Vocabulary distribution PCA...", flush=True)
-        results["align"] = module_align(args.log, args.out)
-        if "error" in results["align"]:
-            print(f"  {'SKIPPED' if 'Need' in results['align']['error'] else 'ERROR'}: "
-                  f"{results['align']['error']}", flush=True)
-        else:
-            print(f"  distant-levels prediction: {results['align']['distant_levels_prediction']}",
-                  flush=True)
+        # Module 1: JS trajectory
+        if "js" in modules:
+            print("[js] JS divergence trajectory...", flush=True)
+            results["js"] = module_js(jsonl_path, args.out, args.step)
+            print(f"  verdict: {results['js'].get('verdict', '')}", flush=True)
 
-    # Render report
-    report = _render_report(run_name, modules, results, args.out, args.falsification_step)
+        # Module 2: Effective rank
+        if "rank" in modules:
+            print("[rank] Memory effective rank...", flush=True)
+            results["rank"] = module_rank(primary_ckpt, args.out)
+            if "error" in results["rank"]:
+                print(f"  SKIPPED: {results['rank']['error'][:80]}", flush=True)
+            else:
+                print(f"  rank gradient: {results['rank']['rank_gradient_prediction']}",
+                      flush=True)
+
+        # Module 3: Vocabulary clustering
+        if "cluster" in modules:
+            print("[cluster] Vocabulary semantic clustering...", flush=True)
+            results["cluster"] = module_cluster(
+                jsonl_path, primary_ckpt, args.out, tokenizer,
+                no_semantic_graph=args.no_semantic_graph,
+            )
+            if "error" in results["cluster"]:
+                print(f"  ERROR: {results['cluster']['error']}", flush=True)
+            else:
+                print(f"  coherence gradient: "
+                      f"{results['cluster']['coherence_gradient_prediction']}", flush=True)
+
+        # Module 4: Level subspace alignment (Grassmann distance between checkpoint pairs)
+        if "align" in modules:
+            print("[align] Level subspace alignment (Grassmann distance)...", flush=True)
+            results["align"] = module_align(ckpt_paths, args.out, args.compare_steps)
+            if "error" in results["align"]:
+                print(f"  SKIPPED: {results['align']['error']}", flush=True)
+            else:
+                print(f"  pairs={results['align']['n_pairs']}  "
+                      f"levels={results['align']['n_levels']}", flush=True)
+
+        all_results.append((run_name, results))
+
+    # Render report for the primary (or only) run
+    primary_run_name, primary_results = all_results[0]
+    report = _render_report(primary_run_name, modules, primary_results, args.out, args.step)
     print(flush=True)
     print(report, flush=True)
     print(f"Report written to: {args.out}/report.txt", flush=True)
