@@ -329,6 +329,29 @@ def print_level_metrics(gpu_model, k):
         print(f"    L{lev}: \u03b1={alpha:.4f} \u03b8={theta:.6f} \u03b7={eta:.4f} \u2016M\u2016={mnorm:.4f}")
 
 
+def print_tape_summary(tape_summary: dict, step: int) -> None:
+    """Log per-level tape diagnostics from gpu_model.tape_forward_summary().
+
+    Called at eval_every intervals alongside standard level metrics.
+    Each level line shows block count, output grad norm, and DGD delta norm.
+
+    Interpretation:
+      block_count == 0               Level did not fire this step (CMS frequency gate)
+      output_grad_norm == 0, blocks > 0  Gradient not flowing — initialization trap
+      output_grad_norm > 0, blocks > 0   Level active and receiving gradient (healthy)
+      dgd_delta_norm == 0, blocks > 0    Active but DGD delta collapsed (inner loop issue)
+    """
+    print(f"  [tape] step={step}  loss={tape_summary['loss']:.4f}"
+          f"  total_blocks={tape_summary['total_blocks']}")
+    for lvl in tape_summary["levels"]:
+        print(
+            f"    L{lvl['level']} [{lvl['opaque_key']}]"
+            f"  blocks={lvl['block_count']}"
+            f"  out_gnorm={lvl['output_grad_norm']:.4e}"
+            f"  dgd_delta={lvl['dgd_delta_norm']:.4e}"
+        )
+
+
 def eval_coherence_samples(gpu_model, cfg, max_tokens: int = 30,
                            tokenizer=None):
     """Generate short completions from fixed prompts to eyeball coherence.

@@ -2014,6 +2014,71 @@ impl GpuModel {
     fn level_grad_norms(&self) -> Vec<f32> {
         self.last_level_gnorms.clone()
     }
+
+    /// Run one traced forward+backward and return per-level tape diagnostics.
+    ///
+    /// Does NOT update weights or optimizer state — pure diagnostic read.
+    /// Returns a Python dict with schema:
+    ///   {"loss": float, "total_blocks": int, "levels": [
+    ///     {"level": int, "opaque_key": str, "block_count": int,
+    ///      "output_grad_norm": float, "dgd_delta_norm": float}, ...]}
+    ///
+    /// Call at eval_every intervals only. Cost is ~1 training step
+    /// (traced forward + backward, no AdamW update).
+    ///
+    /// CS-40: tape is activated only for the duration of this call.
+    /// CS-42: tape arena is dropped when this call returns.
+    /// CS-32: summary is read after backward, before any weight advance.
+    fn tape_forward_summary(
+        &mut self,
+        input_ids: Vec<usize>,
+        target_ids: Vec<usize>,
+        pulse: &Pulse,
+        py: Python<'_>,
+    ) -> PyResult<PyObject> {
+        let s = self.cfg.swa.seq_len;
+        if input_ids.is_empty() || input_ids.len() % s != 0
+            || target_ids.len() != input_ids.len()
+        {
+            return Err(PyValueError::new_err(format!(
+                "input/target length must be batch_size * seq_len {} (got {})",
+                s, input_ids.len()
+            )));
+        }
+
+        // The traced forward runs on CPU — pull host copies of params and context.
+        // Context state is read-only here: the tape diagnostic does not update
+        // M states, so we discard the modified host context after the call.
+        let host_params = self.params.to_host(&self.cfg);
+        let mut host_ctx = self.context.to_host(self.cfg.k);
+
+        let summary = nl_hecate_core::tape_summary::extract_tape_summary(
+            &host_params,
+            &self.cfg,
+            &input_ids,
+            &target_ids,
+            &pulse.inner,
+            &mut host_ctx,
+        );
+
+        let dict = PyDict::new(py);
+        dict.set_item("loss", summary.loss)?;
+        dict.set_item("total_blocks", summary.total_blocks)?;
+
+        let levels_list = pyo3::types::PyList::empty(py);
+        for lvl in &summary.levels {
+            let ldict = PyDict::new(py);
+            ldict.set_item("level", lvl.level)?;
+            ldict.set_item("opaque_key", &lvl.opaque_key)?;
+            ldict.set_item("block_count", lvl.block_count)?;
+            ldict.set_item("output_grad_norm", lvl.output_grad_norm)?;
+            ldict.set_item("dgd_delta_norm", lvl.dgd_delta_norm)?;
+            levels_list.append(ldict)?;
+        }
+        dict.set_item("levels", levels_list)?;
+
+        Ok(dict.into())
+    }
 }
 
 // ── FrequencyAwareAdamW (CPU) ─────────────────────────────────────────
