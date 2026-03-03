@@ -185,6 +185,16 @@ def run_build(bcfg: BuildConfig):
                 self_ref_chunk_size=cfg.self_ref_chunk_size,
                 momentum_kind=cfg.momentum_kind,
                 momentum_d_hidden=cfg.momentum_d_hidden,
+                attentional_bias=(
+                    bcfg.attentional_bias
+                    if bcfg.attentional_bias is not None
+                    else getattr(cfg, "attentional_bias", None)
+                ),
+                retention=(
+                    bcfg.retention
+                    if bcfg.retention is not None
+                    else getattr(cfg, "retention", None)
+                ),
                 intermediate_size=bcfg.intermediate_size,
                 theta_floor=theta_floor,
                 theta_ceil=theta_ceil,
@@ -209,6 +219,8 @@ def run_build(bcfg: BuildConfig):
             self_ref_chunk_size=bcfg.self_ref_chunk_size,
             momentum_kind=bcfg.momentum_kind,
             momentum_d_hidden=bcfg.momentum_d_hidden,
+            attentional_bias=bcfg.attentional_bias,
+            retention=bcfg.retention,
             theta_floor=bcfg.theta_floor,
             theta_ceil=bcfg.theta_ceil,
             intermediate_size=bcfg.intermediate_size,
@@ -460,6 +472,8 @@ def run_build(bcfg: BuildConfig):
                     self_ref_chunk_size=cfg.self_ref_chunk_size,
                     momentum_kind=cfg.momentum_kind,
                     momentum_d_hidden=cfg.momentum_d_hidden,
+                    attentional_bias=getattr(cfg, "attentional_bias", None),
+                    retention=getattr(cfg, "retention", None),
                     intermediate_size=bcfg.intermediate_size,
                     theta_floor=warmup_floor,
                     theta_ceil=list(cfg.theta_ceil) if list(cfg.theta_ceil) else None,
@@ -485,6 +499,8 @@ def run_build(bcfg: BuildConfig):
                     self_ref_chunk_size=cfg.self_ref_chunk_size,
                     momentum_kind=cfg.momentum_kind,
                     momentum_d_hidden=cfg.momentum_d_hidden,
+                    attentional_bias=getattr(cfg, "attentional_bias", None),
+                    retention=getattr(cfg, "retention", None),
                     intermediate_size=bcfg.intermediate_size,
                     theta_floor=final_floor,
                     theta_ceil=list(cfg.theta_ceil) if list(cfg.theta_ceil) else None,
