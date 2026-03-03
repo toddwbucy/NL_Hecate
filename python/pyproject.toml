@@ -14,3 +14,4 @@ dependencies = [
 
 [tool.maturin]
 features = []
+auditwheel = "skip"   # CUDA libs are system-provided; bundling inflates wheel 4MB → 572MB
