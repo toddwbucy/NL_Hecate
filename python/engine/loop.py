@@ -306,7 +306,15 @@ def run_build(bcfg: BuildConfig):
     # ── Stateful CMS build loop ───────────────────────────────────────
     if use_bpe:
         conductor = nl_hecate.Conductor(bcfg.k, bcfg.chunk_sizes)
-        context = nl_hecate.ContextState(bcfg.k, bcfg.d_model)
+        if build_state is not None and "context_memory" in build_state:
+            context = nl_hecate.ContextState(bcfg.k, bcfg.d_model)
+            context.set_memory(build_state["context_memory"])
+            # Sync conductor step so pulse scheduling matches resumed position.
+            target_step = int(build_state.get("conductor_step", 0))
+            while conductor.step < target_step:
+                conductor.advance()
+        else:
+            context = nl_hecate.ContextState(bcfg.k, bcfg.d_model)
     else:
         if isinstance(token_ids, MmapTokenStream):
             token_ids.close()
@@ -906,7 +914,7 @@ def run_build(bcfg: BuildConfig):
             ckpt_path = str(p.with_stem(f"{p.stem}_step{step}"))
             os.makedirs(os.path.dirname(ckpt_path) or ".", exist_ok=True)
             if use_bpe:
-                nl_hecate.save_checkpoint(ckpt_path, params, cfg)
+                nl_hecate.save_checkpoint_with_context(ckpt_path, params, cfg, conductor, context)
             else:
                 nl_hecate.save_build_checkpoint(ckpt_path, params, cfg, conductor, context)
             sidecar = Path(str(ckpt_path) + ".cursor.json")
@@ -1043,12 +1051,11 @@ def run_build(bcfg: BuildConfig):
     # ── Final checkpoint ──────────────────────────────────────────────
     if gpu_model is not None:
         params = gpu_model.to_host_params()
-        if not use_bpe:
-            context = gpu_model.to_host_context()
+        context = gpu_model.to_host_context()
     final_path = _safetensors_path(bcfg.save_path)
     os.makedirs(os.path.dirname(final_path) or ".", exist_ok=True)
     if use_bpe:
-        nl_hecate.save_checkpoint(final_path, params, cfg)
+        nl_hecate.save_checkpoint_with_context(final_path, params, cfg, conductor, context)
     else:
         nl_hecate.save_build_checkpoint(final_path, params, cfg, conductor, context)
     sidecar = Path(str(final_path) + ".cursor.json")
