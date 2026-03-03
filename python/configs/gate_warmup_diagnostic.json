@@ -1,5 +1,6 @@
 {
-  "_comment": "Gate activation warmup diagnostic. See specs/infrastructure/09_gate_warmup.md. k=4 Delta Rule + 3-phase gate warmup on C4 (995M tokens, Llama tokenizer). Task: task_fd444d.",
+  "description": "Gate activation warmup diagnostic — k=4 Delta Rule + 3-phase gate warmup on C4 (995M tokens, Llama tokenizer). Task: task_fd444d.",
+  "notes": "See specs/infrastructure/09_gate_warmup.md. Phase 2: linearly decaying theta_floor scaffold [0,0,0.005,0.001]→0 over 10K steps. Falsification at step 20K: L2 θ>0.005 AND L3 θ>0.001.",
   "model": {
     "d_model": 256,
     "num_heads": 4,
@@ -10,8 +11,6 @@
     "memory_rule": "delta",
     "composition": "mag",
     "memory_reset": "carry_forward",
-    "b_theta": [-4.6, -5.6, -4.6, -4.6],
-    "b_alpha": [3.0, 4.0, 4.5, 5.0],
     "theta_floor": [0.0, 0.0, 0.0, 0.0],
     "theta_ceil": [1.0, 1.0, 1.0, 1.0],
     "m_norm_max": [100.0, 100.0, 100.0, 100.0]
