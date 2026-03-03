@@ -217,6 +217,7 @@ pub fn traced_swa_forward(
         vec![q, k, v],
         vec![out_id],
         vec![meta_id, q_saved, k_saved, v_saved, aw_saved],
+        None,
     );
 
     (out_id, attn_weights)
@@ -572,7 +573,7 @@ pub fn traced_cms_forward(
                 tape_saved.push(tape.alloc(fm_z_q_save, vec![]));
                 tape_saved.push(tape.alloc(params.levels[level].w_rand.clone(), vec![]));
             }
-            tape.record_opaque(fk, vec![q_mem_id], vec![y_id], tape_saved);
+            tape.record_opaque(fk, vec![q_mem_id], vec![y_id], tape_saved, Some(level));
 
             y_ids.push(y_id);
             y_per_level_data.push(y_data);
@@ -725,7 +726,7 @@ fn traced_active_level(
                 saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
                 saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
             }
-            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved);
+            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level));
 
             (y, MemoryCache::Delta(cache), final_m, y_id)
         }
@@ -798,7 +799,7 @@ fn traced_active_level(
                 saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
                 saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
             }
-            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved);
+            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level));
 
             (y, MemoryCache::Titans(cache), final_m, y_id)
         }
@@ -832,7 +833,7 @@ fn traced_active_level(
                 saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
                 saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
             }
-            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved);
+            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level));
 
             (y, MemoryCache::Hebbian(cache), final_m, y_id)
         }
@@ -886,7 +887,7 @@ fn traced_active_level(
                 saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
                 saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
             }
-            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved);
+            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level));
 
             (y, MemoryCache::Moneta(cache), final_m, y_id)
         }
@@ -937,7 +938,7 @@ fn traced_active_level(
                 saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
                 saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
             }
-            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved);
+            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level));
 
             (y, MemoryCache::YAAD(cache), final_m, y_id)
         }
@@ -988,7 +989,7 @@ fn traced_active_level(
                 saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
                 saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
             }
-            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved);
+            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level));
 
             (y, MemoryCache::MEMORA(cache), final_m, y_id)
         }
@@ -1028,7 +1029,7 @@ fn traced_active_level(
                 saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
                 saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
             }
-            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved);
+            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level));
 
             (y, MemoryCache::Lattice(cache), final_m, y_id)
         }
@@ -1084,7 +1085,7 @@ fn traced_active_level(
                 saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
                 saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
             }
-            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved);
+            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level));
 
             (y, MemoryCache::Trellis(cache), final_m, y_id)
         }
@@ -1126,7 +1127,7 @@ fn traced_active_level(
                 saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
                 saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
             }
-            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved);
+            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level));
 
             (y, MemoryCache::Atlas(cache), final_m, y_id)
         }
@@ -1157,7 +1158,7 @@ fn traced_active_level(
 
             let y_id = tape.alloc(y.clone(), vec![s, d]);
             let saved = vec![meta_id, lp_id, emb_saved, x_id, gate_out_id, up_out_id, fused_id, gc_id];
-            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved);
+            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level));
 
             // No M state — return empty vec
             (y, MemoryCache::SwiGlu(cache), vec![], y_id)

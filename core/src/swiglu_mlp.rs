@@ -391,6 +391,7 @@ impl OpaqueVjp for SwiGluMlp {
         seq_len: usize,
         d: usize,
         _initial_m: Option<Vec<f32>>,
+        level: Option<usize>,
     ) -> (Vec<f32>, BufId, BufId, BufId) {
         let inter = self.intermediate_size;
 
@@ -420,7 +421,7 @@ impl OpaqueVjp for SwiGluMlp {
 
         let y_id = tape.alloc(y.clone(), vec![seq_len, d]);
         let saved = vec![meta_id, lp_in, emb_in, x_id, gate_out_id, up_out_id, fused_id, gc_id];
-        tape.record_opaque(OpaqueKey::SwiGluMlp, vec![emb_in, lp_in], vec![y_id], saved);
+        tape.record_opaque(OpaqueKey::SwiGluMlp, vec![emb_in, lp_in], vec![y_id], saved, level);
         (y, y_id, emb_in, lp_in)
     }
 }

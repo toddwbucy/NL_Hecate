@@ -27,20 +27,53 @@ pub struct TapeBuf {
     pub shape: Vec<usize>,
     /// True for outer-loop parameters (W_K, W_V, etc.) — these get gradient output.
     pub is_param: bool,
+    /// Semantic role of this buffer within its opaque block (observation metadata).
+    /// Examples: "m_states", "error", "dgd_delta". None for unnamed intermediates.
+    pub role: Option<&'static str>,
+    /// CMS level index (0..k-1) this buffer belongs to.
+    /// None for buffers that are not level-specific.
+    pub level: Option<usize>,
 }
 
 impl TapeBuf {
     pub fn new(data: Vec<f32>, shape: Vec<usize>) -> Self {
-        TapeBuf { data, shape, is_param: false }
+        TapeBuf { data, shape, is_param: false, role: None, level: None }
     }
 
     pub fn param(data: Vec<f32>, shape: Vec<usize>) -> Self {
-        TapeBuf { data, shape, is_param: true }
+        TapeBuf { data, shape, is_param: true, role: None, level: None }
     }
 
     pub fn numel(&self) -> usize {
         self.data.len()
     }
+}
+
+// ── Observation metadata ──────────────────────────────────────────────
+
+/// Canonical role string constants for named saved buffers.
+///
+/// Used with `Tape::alloc_named()` to give semantic identity to saved tensors.
+/// These names are stable across versions — do not rename without updating adapters.
+pub mod obs {
+    /// Memory matrix M states (all timesteps, flat [s+1, d, d]).
+    pub const M_STATES:     &str = "m_states";
+    /// L2 loss error signal used in most memory update rules.
+    pub const ERROR:        &str = "error";
+    /// DGD self-modification delta: M@k - v  (HOPE Eq. 88).
+    pub const DGD_DELTA:    &str = "dgd_delta";
+    /// Key memory projection.
+    pub const K_MEM:        &str = "k_mem";
+    /// Value memory projection.
+    pub const V_MEM:        &str = "v_mem";
+    /// Learned decay gate output (sigmoid of b_alpha).
+    pub const ALPHA:        &str = "alpha";
+    /// Softplus-gated learning rate (theta).
+    pub const THETA:        &str = "theta";
+    /// Input token embedding.
+    pub const EMBEDDED:     &str = "embedded";
+    /// Flattened MemoryLevelParams for this opaque block.
+    pub const LEVEL_PARAMS: &str = "level_params";
 }
 
 // ── Opaque VJP system ────────────────────────────────────────────────
@@ -114,10 +147,11 @@ pub trait OpaqueVjp {
     /// - Calls `step()` to execute the forward pass
     /// - Flattens the rule-specific cache into saved buffers matching the
     ///   adapter's expected layout in `opaque_adapters.rs`
-    /// - Pushes `TapeOp::Opaque` with the correct key, inputs, outputs, saved
+    /// - Pushes `TapeOp::Opaque` with the correct key, inputs, outputs, saved, level
     /// - Returns (output data, output BufId, embedded input BufId, level_params input BufId)
     ///
     /// `initial_m`: Optional initial memory state (from CMS context_memory).
+    /// `level`: CMS level index for this call site; `None` if level is not known at call time.
     fn record_on_tape(
         &self,
         tape: &mut Tape,
@@ -126,6 +160,7 @@ pub trait OpaqueVjp {
         seq_len: usize,
         d: usize,
         initial_m: Option<Vec<f32>>,
+        level: Option<usize>,
     ) -> (Vec<f32>, BufId, BufId, BufId);
 }
 
@@ -207,6 +242,8 @@ pub enum TapeOp {
         inputs: Vec<BufId>,
         outputs: Vec<BufId>,
         saved: Vec<BufId>,
+        /// CMS level index for this block (0..k-1), or None for non-CMS blocks (SWA, DGD).
+        level: Option<usize>,
     },
 }
 
@@ -252,6 +289,23 @@ impl Tape {
     pub fn alloc(&mut self, data: Vec<f32>, shape: Vec<usize>) -> BufId {
         let id = self.bufs.len();
         self.bufs.push(TapeBuf::new(data, shape));
+        self.grad_accum.push(None);
+        id
+    }
+
+    /// Allocate a named buffer with observation metadata.
+    ///
+    /// `role` and `level` are metadata only — they do not affect backward correctness.
+    /// Use `obs::*` constants for role names. Call post-backward to read via `get_saved_by_role`.
+    pub fn alloc_named(
+        &mut self,
+        data: Vec<f32>,
+        shape: Vec<usize>,
+        role: &'static str,
+        level: Option<usize>,
+    ) -> BufId {
+        let id = self.bufs.len();
+        self.bufs.push(TapeBuf { data, shape, is_param: false, role: Some(role), level });
         self.grad_accum.push(None);
         id
     }
@@ -326,11 +380,14 @@ impl Tape {
 
     /// Record an opaque block. Inputs and saved must already be allocated.
     /// Outputs are allocated by the caller before this call.
+    ///
+    /// `level`: CMS level index (0..k-1) for memory rule blocks; `None` for SWA, DGD, etc.
     pub fn record_opaque(&mut self, key: OpaqueKey, inputs: Vec<BufId>,
-                          outputs: Vec<BufId>, saved: Vec<BufId>) {
+                          outputs: Vec<BufId>, saved: Vec<BufId>,
+                          level: Option<usize>) {
         assert!(self.opaque_registry.contains_key(&key),
                 "No opaque backward registered for {:?}", key);
-        self.record(TapeOp::Opaque { key, inputs, outputs, saved });
+        self.record(TapeOp::Opaque { key, inputs, outputs, saved, level });
     }
 
     // ── Gradient seeding and access ──────────────────────────────
@@ -725,7 +782,7 @@ impl Tape {
             }
 
             // ── Opaque: registered VJP block ─────────────────────
-            TapeOp::Opaque { key, inputs, outputs, saved } => {
+            TapeOp::Opaque { key, inputs, outputs, saved, level: _ } => {
                 // Collect upstream gradients for all outputs.
                 let d_outputs: Vec<Vec<f32>> = outputs.iter().map(|&oid| {
                     self.grad_accum[oid].clone().unwrap_or_else(|| vec![0.0; self.bufs[oid].numel()])
@@ -752,6 +809,80 @@ impl Tape {
                     self.accumulate_grad(*iid, d_inp);
                 }
             }
+        }
+    }
+}
+
+// ── Observation query API ─────────────────────────────────────────────
+
+impl Tape {
+    /// All opaque ops matching `key` (any level). Returns op indices in forward order.
+    ///
+    /// Call post-backward only — no hot-path impact (O(ops) linear scan).
+    pub fn find_opaque_ops(&self, key: OpaqueKey) -> Vec<usize> {
+        self.ops.iter().enumerate()
+            .filter_map(|(i, op)| match op {
+                TapeOp::Opaque { key: k, .. } if *k == key => Some(i),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// All opaque ops matching `key` at a specific CMS `level`. Returns op indices.
+    ///
+    /// Call post-backward only. Returns empty vec if no ops match.
+    pub fn find_opaque_at_level(&self, key: OpaqueKey, level: usize) -> Vec<usize> {
+        self.ops.iter().enumerate()
+            .filter_map(|(i, op)| match op {
+                TapeOp::Opaque { key: k, level: Some(l), .. }
+                    if *k == key && *l == level => Some(i),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Get the saved buffer with the given role from an opaque op.
+    ///
+    /// Returns `None` if `op_idx` does not point to an `Opaque` op,
+    /// or if no saved buffer carries the given `role`.
+    pub fn get_saved_by_role(&self, op_idx: usize, role: &str) -> Option<&[f32]> {
+        match self.ops.get(op_idx)? {
+            TapeOp::Opaque { saved, .. } => {
+                saved.iter().find_map(|&id| {
+                    if self.bufs[id].role.map_or(false, |r| r == role) {
+                        Some(self.bufs[id].data.as_slice())
+                    } else {
+                        None
+                    }
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Enumerate all opaque blocks in forward order: `(op_idx, key, level)`.
+    pub fn enumerate_opaque_blocks(&self) -> Vec<(usize, OpaqueKey, Option<usize>)> {
+        self.ops.iter().enumerate()
+            .filter_map(|(i, op)| match op {
+                TapeOp::Opaque { key, level, .. } => Some((i, *key, *level)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Get the gradient norm of the first output of an opaque block (post-backward).
+    ///
+    /// Returns `None` if the op is not `Opaque`, has no outputs, or the output
+    /// has no accumulated gradient (no gradient flowed through it).
+    pub fn opaque_output_grad_norm(&self, op_idx: usize) -> Option<f32> {
+        match self.ops.get(op_idx)? {
+            TapeOp::Opaque { outputs, .. } => {
+                let out_id = *outputs.first()?;
+                let grad = self.grad_accum[out_id].as_deref()?;
+                let norm: f32 = grad.iter().map(|x| x * x).sum::<f32>().sqrt();
+                Some(norm)
+            }
+            _ => None,
         }
     }
 }
@@ -1037,7 +1168,7 @@ mod tests {
         let mut tape = Tape::new(registry);
         let inp = tape.alloc(vec![1.0, 2.0], vec![2]);
         let out = tape.alloc(vec![3.0, 4.0], vec![2]);
-        tape.record_opaque(OpaqueKey::DeltaRule, vec![inp], vec![out], vec![]);
+        tape.record_opaque(OpaqueKey::DeltaRule, vec![inp], vec![out], vec![], None);
         tape.seed_grad(out, vec![1.0, 1.0]);
         tape.backward(out);
         // Opaque backward doubles: d_inp = 2 * d_out = [2, 2]
@@ -2196,5 +2327,117 @@ mod tests {
             assert!((g - 1.0).abs() < 1e-6,
                 "STE grad[{i}]: expected 1.0, got {g}");
         }
+    }
+
+    // ── Test Class 4: Observation correctness ────────────────────────
+
+    /// alloc_named stores role and level metadata on TapeBuf.
+    #[test]
+    fn test_alloc_named_stores_metadata() {
+        let mut tape = Tape::new_empty();
+        let data = vec![1.0f32, 2.0, 3.0];
+        let id = tape.alloc_named(data.clone(), vec![3], obs::DGD_DELTA, Some(2));
+        assert_eq!(tape.bufs[id].role, Some(obs::DGD_DELTA));
+        assert_eq!(tape.bufs[id].level, Some(2));
+        assert_eq!(&tape.bufs[id].data, &data);
+        assert!(!tape.bufs[id].is_param);
+    }
+
+    /// alloc() leaves role=None, level=None (no behavioral change to existing paths).
+    #[test]
+    fn test_alloc_unnamed_has_no_metadata() {
+        let mut tape = Tape::new_empty();
+        let id = tape.alloc(vec![1.0f32], vec![1]);
+        assert_eq!(tape.bufs[id].role, None);
+        assert_eq!(tape.bufs[id].level, None);
+    }
+
+    /// Per-level keys: k=4 DeltaRule forward with all levels active records 4 opaque blocks,
+    /// each carrying the correct level tag (0, 1, 2, 3) from traced_active_level.
+    ///
+    /// Note: we test this via enumerate_opaque_blocks() directly since traced_cms_forward
+    /// requires a full MAGConfig + MAGParams setup. Instead we exercise record_opaque with
+    /// explicit level values and verify the query API.
+    #[test]
+    fn test_per_level_opaque_keys_distinct() {
+        use std::collections::HashMap;
+        // Minimal backward that does nothing — we only test recording/query, not backward.
+        fn noop_backward(
+            _d_outputs: &[&[f32]],
+            _saved: &[&[f32]],
+            _d_inputs: &mut [Vec<f32>],
+        ) {}
+
+        let mut registry: HashMap<OpaqueKey, OpaqueBackwardFn> = HashMap::new();
+        registry.insert(OpaqueKey::DeltaRule, noop_backward as OpaqueBackwardFn);
+
+        let mut tape = Tape::new(registry);
+
+        // Record 4 DeltaRule opaque blocks with levels 0..3.
+        for l in 0usize..4 {
+            let inp = tape.alloc(vec![0.0f32], vec![1]);
+            let out = tape.alloc(vec![0.0f32], vec![1]);
+            tape.record_opaque(OpaqueKey::DeltaRule,
+                vec![inp], vec![out], vec![], Some(l));
+        }
+
+        let blocks = tape.enumerate_opaque_blocks();
+        assert_eq!(blocks.len(), 4, "expected 4 opaque blocks");
+        for (expected_level, &(_, key, level)) in blocks.iter().enumerate() {
+            assert_eq!(key, OpaqueKey::DeltaRule);
+            assert_eq!(level, Some(expected_level),
+                "block {expected_level}: got level {level:?}");
+        }
+
+        // find_opaque_at_level should return exactly one match per level.
+        for l in 0usize..4 {
+            let ops = tape.find_opaque_at_level(OpaqueKey::DeltaRule, l);
+            assert_eq!(ops.len(), 1, "level {l} should have exactly 1 op");
+        }
+
+        // find_opaque_ops should return all 4.
+        assert_eq!(tape.find_opaque_ops(OpaqueKey::DeltaRule).len(), 4);
+    }
+
+    /// get_saved_by_role returns the data for a named buffer within an opaque op.
+    /// opaque_output_grad_norm returns a finite value after seeding.
+    #[test]
+    fn test_get_saved_by_role_and_grad_norm() {
+        use std::collections::HashMap;
+        fn noop_backward(
+            _d_outputs: &[&[f32]],
+            _saved: &[&[f32]],
+            _d_inputs: &mut [Vec<f32>],
+        ) {}
+
+        let mut registry: HashMap<OpaqueKey, OpaqueBackwardFn> = HashMap::new();
+        registry.insert(OpaqueKey::DeltaRule, noop_backward as OpaqueBackwardFn);
+
+        let delta_payload = vec![0.1f32, 0.2, 0.3];
+        let mut tape = Tape::new(registry);
+        let inp = tape.alloc(vec![1.0f32, 2.0, 3.0], vec![3]);
+        let out = tape.alloc(vec![4.0f32, 5.0, 6.0], vec![3]);
+        // Named saved buffer carrying DGD_DELTA role at level 1.
+        let saved_id = tape.alloc_named(delta_payload.clone(), vec![3], obs::DGD_DELTA, Some(1));
+        tape.record_opaque(OpaqueKey::DeltaRule,
+            vec![inp], vec![out], vec![saved_id], Some(1));
+
+        let ops = tape.find_opaque_at_level(OpaqueKey::DeltaRule, 1);
+        assert_eq!(ops.len(), 1);
+        let op_idx = ops[0];
+
+        // get_saved_by_role should return the exact payload.
+        let retrieved = tape.get_saved_by_role(op_idx, obs::DGD_DELTA)
+            .expect("DGD_DELTA role should be found");
+        assert_eq!(retrieved, delta_payload.as_slice());
+
+        // Seed the output gradient and check opaque_output_grad_norm.
+        let d_out = vec![1.0f32, 1.0, 1.0];
+        tape.grad_accum[out] = Some(d_out.clone());
+        let norm = tape.opaque_output_grad_norm(op_idx)
+            .expect("grad norm should be Some");
+        let expected_norm = (3.0f32).sqrt(); // sqrt(1^2 + 1^2 + 1^2)
+        assert!((norm - expected_norm).abs() < 1e-6,
+            "grad norm: expected {expected_norm}, got {norm}");
     }
 }

@@ -558,7 +558,7 @@ mod tests {
 
         let registry = register_opaque_vjps();
         crate::tape::with_tape(registry, |tape| {
-            let (_, y_id, emb_in, lp_in) = rule.record_on_tape(tape, &params, &embedded, seq_len, d, None);
+            let (_, y_id, emb_in, lp_in) = rule.record_on_tape(tape, &params, &embedded, seq_len, d, None, None);
             tape.seed_grad(y_id, d_y.clone());
             tape.backward(y_id);
             let de_tape = tape.get_grad(emb_in).unwrap();
@@ -593,7 +593,7 @@ mod tests {
 
         let registry = register_opaque_vjps();
         crate::tape::with_tape(registry, |tape| {
-            let (_, y_id, emb_in, lp_in) = rule.record_on_tape(tape, &params, &embedded, seq_len, d, None);
+            let (_, y_id, emb_in, lp_in) = rule.record_on_tape(tape, &params, &embedded, seq_len, d, None, None);
             tape.seed_grad(y_id, d_y.clone());
             tape.backward(y_id);
             let de_tape = tape.get_grad(emb_in).unwrap();
