@@ -157,9 +157,9 @@ if use_bpe:
 
 `build_state` is populated in the BPE resume block by attempting
 `nl_hecate.load_build_checkpoint(path)` first and falling back to
-`nl_hecate.load_checkpoint(path)` on exception — the same try/except pattern
-used in loop.py lines 136-141. The fallback produces `build_state = None`,
-which the context restore block handles via the backward-compatible fresh-init path.
+`nl_hecate.load_checkpoint(path)` on exception. The fallback produces
+`build_state = None`, which the context restore block handles via the
+backward-compatible fresh-init path.
 
 ---
 
