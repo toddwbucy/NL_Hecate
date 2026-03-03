@@ -66,7 +66,7 @@ def _load_jsonl_events(path: str, event_type: str) -> list[dict]:
                 continue
             try:
                 d = json.loads(line)
-                if d.get("event") == event_type:
+                if isinstance(d, dict) and d.get("event") == event_type:
                     events.append(d)
             except json.JSONDecodeError:
                 continue
@@ -160,9 +160,12 @@ def module_js(jsonl_path: str, out_dir: str, falsification_step: int = 20000) ->
         step = evt["step"]
         js_data = {f"{a}-{b}": None for a, b in pairs}
         for entry in evt.get("js_divergence", []):
+            if not isinstance(entry, dict):
+                continue
             key = entry.get("levels", "")
-            if key in valid_pair_keys:  # skip malformed / unexpected keys
-                js_data[key] = entry["js_div"]
+            val = entry.get("js_div")
+            if key in valid_pair_keys and val is not None:  # skip malformed / unexpected keys
+                js_data[key] = val
         rows.append({"step": step, **js_data})
         js_at_step[step] = js_data
 
@@ -392,11 +395,19 @@ def module_cluster(
     rows = []
 
     for evt in events:
-        step = evt["step"]
-        for lv in evt["levels"]:
+        if not isinstance(evt, dict):
+            continue
+        step = evt.get("step")
+        if step is None:
+            continue
+        for lv in evt.get("levels", []):
+            if not isinstance(lv, dict) or "level" not in lv:
+                continue
             level = lv["level"]
             m_norm = lv.get("m_norm", 0.0)
             top20 = lv.get("top20", [])
+            if not isinstance(top20, list):
+                top20 = []
 
             if not top20 or m_norm < 1e-6:
                 rows.append({
@@ -406,15 +417,21 @@ def module_cluster(
                 })
                 continue
 
-            top_ids = [e["id"] for e in top20[:CLUSTER_TOP_K]]
+            top_ids = [
+                e["id"] for e in top20[:CLUSTER_TOP_K]
+                if isinstance(e, dict) and isinstance(e.get("id"), int)
+            ]
+            if not top_ids:
+                continue
             top5_str = " | ".join(_decode_tok(tokenizer, tid) for tid in top_ids[:5])
 
             if nn_indices is not None:
-                # Count edges within the activated top-k set
+                # Count edges within the activated top-k set; skip OOB token ids
                 top_id_set = set(top_ids)
                 edges_in = sum(
                     sum(1 for nb in nn_indices[tid] if nb in top_id_set)
                     for tid in top_ids
+                    if tid < len(nn_indices)
                 )
                 n = len(top_ids)
                 max_possible = n * k_eff_nn  # use actual neighbour count (may be < SEMANTIC_KNN)
@@ -540,11 +557,13 @@ def module_align(
         step_label = compare_steps[i] if compare_steps else i
         loaded.append((step_label, cfg.d_model, cfg.k, context))
 
-    # If only one checkpoint, prepend a zero-init baseline at step 0
+    # If only one checkpoint, prepend a zero-init baseline.
+    # Use "init" as the baseline label so the pair is "init-<step>" even when
+    # the checkpoint's step label happens to be 0 (avoids ambiguous "0-0" pairs).
     if len(loaded) == 1:
         _, d, k, _ = loaded[0]
         zero_ctx = nl_hecate.ContextState(k, d)
-        loaded = [(0, d, k, zero_ctx)] + loaded
+        loaded = [("init", d, k, zero_ctx)] + loaded
 
     d = loaded[0][1]
     k = loaded[0][2]
