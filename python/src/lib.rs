@@ -1485,6 +1485,35 @@ fn save_build_checkpoint(
 }
 
 #[pyfunction]
+fn save_checkpoint_with_context(
+    path: &str, params: &MAGParams, cfg: &MAGConfig,
+    conductor: &Conductor, context: &ContextState,
+) -> PyResult<()> {
+    // For BPE-path runs: conductor has no attached stream (position lives in
+    // the sidecar .cursor.json). Serialise M_l matrices with a zeroed
+    // StreamCursor — callers must not use it for position resume.
+    let build_state = RustBuildResumeState {
+        conductor: RustConductorState {
+            k: conductor.inner.k,
+            chunk_sizes: conductor.inner.chunk_sizes.clone(),
+            step: conductor.inner.step(),
+        },
+        stream_cursor: StreamCursor {
+            position: 0,
+            chunk_id: 0,
+            pulse_id: 0,
+            rng_state: None,
+            content_hash: 0,
+        },
+        context: context.inner.clone(),
+        global_step: conductor.inner.step(),
+    };
+    rust_save_build_checkpoint(
+        std::path::Path::new(path), &params.inner, &cfg.inner, build_state,
+    ).map_err(|e| PyValueError::new_err(format!("save_checkpoint_with_context failed: {e}")))
+}
+
+#[pyfunction]
 fn load_checkpoint(path: &str) -> PyResult<(MAGParams, MAGConfig)> {
     let (params, config, _build_state) = rust_load_checkpoint(std::path::Path::new(path))
         .map_err(|e| PyValueError::new_err(format!("load_checkpoint failed: {e}")))?;
@@ -2191,6 +2220,7 @@ fn nl_hecate(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cms_compute_gradients, m)?)?;
     m.add_function(wrap_pyfunction!(save_checkpoint, m)?)?;
     m.add_function(wrap_pyfunction!(save_build_checkpoint, m)?)?;
+    m.add_function(wrap_pyfunction!(save_checkpoint_with_context, m)?)?;
     m.add_function(wrap_pyfunction!(load_checkpoint, m)?)?;
     m.add_function(wrap_pyfunction!(load_build_checkpoint, m)?)?;
     // CPU frequency-aware AdamW optimizer
