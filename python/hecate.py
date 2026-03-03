@@ -186,7 +186,7 @@ def _validate_config_cmd(path: str) -> int:
     human-readable report. Returns 1 if errors exist, 0 otherwise.
     """
     from engine.config import (
-        _GPU_CAPABLE, _TIER_2B, _TIER_3_RULES,
+        _TIER_1, _GPU_CAPABLE, _TIER_2B, _TIER_3_RULES,
     )
 
     errors: list[str] = []
