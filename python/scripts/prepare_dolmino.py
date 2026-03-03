@@ -9,10 +9,14 @@ FineWeb-Edu, and writes flat numpy arrays compatible with BpeDataLoader.
 No quality score filter — Dolmino-Mix is already curated upstream.
 No tokenizer training — reuses data/fineweb_edu/tokenizer.json.
 
+Default --min_text_len=2048 (~512 tokens) ensures every document in the stream
+can span at least one full L3 CMS period. Shorter documents are discarded.
+
 Usage:
     python scripts/prepare_dolmino.py
     python scripts/prepare_dolmino.py --target_tokens 1_000_000_000
     python scripts/prepare_dolmino.py --ingredient ingredient2 --output data/dolmino_i2
+    python scripts/prepare_dolmino.py --min_text_len 4096   # stricter: force 2× L3
 """
 
 import argparse
@@ -28,7 +32,11 @@ import numpy as np
 DEFAULT_SOURCE = "/bulk-store/training-datasets/dolmino_mix_100B/"
 DEFAULT_TOKENIZER = "data/fineweb_edu/tokenizer.json"
 EOT_ID = 3  # <|endoftext|> — same across all NL-Hecate pipelines
-MIN_TEXT_LEN = 100  # skip very short fragments
+# Default minimum document length in characters.
+# 2048 chars ≈ 512 tokens at ~4 chars/token — ensures every document spans
+# at least one full L3 CMS period. Shorter documents are discarded so the
+# token stream is composed entirely of genuinely long-range content.
+MIN_TEXT_LEN_DEFAULT = 2048
 
 
 def stream_jsonl_zst(path: Path):
@@ -82,8 +90,14 @@ def collect_shards(source_dir: Path, ingredient: str) -> list[Path]:
     return shards
 
 
-def stream_documents(shards: list[Path], target_chars: int) -> list[str]:
+def stream_documents(
+    shards: list[Path], target_chars: int, min_text_len: int
+) -> list[str]:
     """Stream documents from shards until target_chars reached.
+
+    Documents shorter than min_text_len chars are discarded. With the default
+    of 2048 chars (~512 tokens) every retained document spans at least one full
+    L3 CMS period, making the stream suitable for diagnosing L2/L3 activation.
 
     Documents are accumulated as strings (not tokens) to allow a seeded
     train/val split at the document level before tokenization.
@@ -97,7 +111,7 @@ def stream_documents(shards: list[Path], target_chars: int) -> list[str]:
         for rec in stream_jsonl_zst(shard):
             total_records += 1
             text = rec.get("text", "")
-            if not text or len(text) < MIN_TEXT_LEN:
+            if not text or len(text) < min_text_len:
                 skipped += 1
                 continue
             docs.append(text)
@@ -116,7 +130,7 @@ def stream_documents(shards: list[Path], target_chars: int) -> list[str]:
 
     print(
         f"\n  Streamed {total_records:,} records → {len(docs):,} kept, "
-        f"{skipped:,} skipped (<{MIN_TEXT_LEN} chars)"
+        f"{skipped:,} skipped (<{min_text_len} chars)"
     )
     print(f"  Total chars: {total_chars:,}")
     return docs
@@ -198,6 +212,16 @@ def main() -> None:
         default=DEFAULT_TOKENIZER,
         help=f"Path to existing BPE tokenizer json (default: {DEFAULT_TOKENIZER})",
     )
+    parser.add_argument(
+        "--min_text_len",
+        type=int,
+        default=MIN_TEXT_LEN_DEFAULT,
+        help=(
+            "Minimum document length in characters. Documents shorter than this "
+            "are discarded before tokenization. Default 2048 ≈ 512 tokens — "
+            "ensures every document spans at least one full L3 CMS period."
+        ),
+    )
     args = parser.parse_args()
 
     source_dir = Path(args.source)
@@ -226,9 +250,12 @@ def main() -> None:
     # Accumulate strings (not tokens) — 3-5x smaller than token arrays.
     # At 100M tokens / ~4 chars-per-token: ~400MB string data.
     target_chars = int(args.target_tokens * 4.5)  # headroom for tokenization ratio
-    print(f"\nStep 2: Streaming documents (target ≈ {args.target_tokens:,} tokens)...")
+    print(
+        f"\nStep 2: Streaming documents "
+        f"(target ≈ {args.target_tokens:,} tokens, min_text_len={args.min_text_len:,} chars)..."
+    )
     t0 = time.time()
-    docs = stream_documents(shards, target_chars)
+    docs = stream_documents(shards, target_chars, args.min_text_len)
     print(f"  Done in {time.time() - t0:.1f}s")
 
     if len(docs) < 10:
@@ -290,7 +317,10 @@ def main() -> None:
     if not dest_tok.exists():
         shutil.copy2(tokenizer_path, dest_tok)
 
-    source_label = f"dolmino-mix-100b (ingredient={args.ingredient})"
+    source_label = (
+        f"dolmino-mix-100b (ingredient={args.ingredient}, "
+        f"min_text_len={args.min_text_len})"
+    )
     meta = {
         "vocab_size": actual_vocab,
         "tokenizer": "tokenizer.json",
@@ -320,6 +350,7 @@ def main() -> None:
         "val_ratio": args.val_ratio,
         "source": source_label,
         "ingredient": args.ingredient,
+        "min_text_len": args.min_text_len,
     }
     with open(out_dir / "meta.json", "w") as f:
         json.dump(meta, f, indent=2)
@@ -339,6 +370,7 @@ def main() -> None:
     print(f"  Train tokens: {len(train_input):,}  ({train_mb:.1f} MB)")
     print(f"  Val tokens:   {len(val_input):,}  ({val_mb:.1f} MB)")
     print("  Mask ratio:   0.0% (all tokens are valid targets)")
+    print(f"  Min doc len:  {args.min_text_len:,} chars (~{args.min_text_len//4} tokens)")
     print(f"{'=' * 60}")
 
 

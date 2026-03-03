@@ -12,6 +12,11 @@ CONTRACT
                 /bulk-store/training-datasets/dolmino_mix_100B/)
               - Source format: subdirectories each containing *.jsonl.zst shards
               - Records have at minimum a `text` field (string)
+              - Default --min_text_len=2048 chars (~512 tokens) discards short
+                documents so every retained document spans at least one full L3
+                CMS period. This is a diagnostic requirement, not a quality
+                filter — the goal is to force L2/L3 to encounter long-range
+                structure that could not come from FineWeb-Edu short articles.
               - An existing 32K BPE tokenizer at data/fineweb_edu/tokenizer.json
                 with EOT id=3 — do NOT train a new tokenizer
               - Python environment with `zstandard`, `tokenizers`, `numpy`
@@ -193,4 +198,8 @@ Options:
   --val_ratio      Fraction of documents held out for validation (default: 0.05)
   --seed           Random seed for shuffle/split (default: 42)
   --tokenizer      Path to BPE tokenizer json (default: data/fineweb_edu/tokenizer.json)
+  --min_text_len   Minimum document length in chars (default: 2048 ≈ 512 tokens).
+                   Documents shorter than this are discarded. 2048 ensures every
+                   document spans at least one full L3 CMS period — the diagnostic
+                   requirement for meaningful L2/L3 gate activation testing.
 ```
