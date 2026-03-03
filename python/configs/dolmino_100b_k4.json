@@ -1,0 +1,38 @@
+{
+  "description": "Dolmino-Mix 100B — k=4 CMS build (ingredient1, d=512)",
+  "model": {
+    "d_model": 512,
+    "num_heads": 8,
+    "seq_len": 512,
+    "window_size": 512,
+    "vocab_size": 32000,
+    "k": 4,
+    "chunk_sizes": [1, 8, 64, 512],
+    "memory_rule": "titans",
+    "composition": "mag",
+    "projection_kind": "adaptive",
+    "self_generated_values": false,
+    "self_ref_chunk_size": 1,
+    "momentum_kind": "none",
+    "momentum_d_hidden": 0
+  },
+  "build": {
+    "lr": 0.0006,
+    "steps": 100000,
+    "optimizer": "adamw_gpu",
+    "warmup_steps": 1000,
+    "weight_decay": 0.1,
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "max_grad_norm": 1.0,
+    "save_path": "checkpoints/dolmino_100b_k4.json",
+    "save_every": 5000,
+    "log_every": 10,
+    "eval_every": 5000,
+    "eval_max_chunks": 50
+  },
+  "data": {
+    "path": "data/dolmino_100b",
+    "format": "sharegpt"
+  }
+}
