@@ -15,9 +15,10 @@ work and variant expansion.
 
 **Guarantees**:
 - Every combination expressible in a config JSON maps to exactly one tier
-- `BuildConfig.from_file()` raises a `ConfigError` with tier context if the requested combination
-  requires GPU and is not Tier 1
-- A `hecate.py validate-config <path>` dry-run subcommand exists to check configs before runs
+- `BuildConfig.validate_gpu_tier()` raises a `ValueError` with tier context if GPU is requested
+  and the combination has no GPU kernels. This is called after CLI overrides are applied so that
+  `--cpu` takes effect before the check (V-05 is not in `from_file()`).
+- A `hecate.py --validate-config <path>` dry-run flag exists to check configs before runs
 - The "blessed" production config (TitansLMM + MAG + k=4 + EMA momentum) is the normative Tier 1
   reference and will always run on GPU without modification
 - Tier 2 and Tier 3 combinations always run correctly on CPU regardless of GPU availability
@@ -160,7 +161,7 @@ defaults that resolve to the Tier 1 canonical config when combined.
     "composition":       "mag",
     "attentional_bias":  "l2",
     "retention":         "l2_weight_decay",
-    "momentum":          "ema",
+    "momentum_kind":     "ema",
     "k":                 4,
     "chunk_sizes":       [1, 8, 64, 512]
   }
@@ -271,11 +272,11 @@ ConfigWarning: '{field}' is Tier 3 (research stub). Not production-ready.
 
 ## The `validate-config` Subcommand
 
-`hecate.py validate-config <path>` performs a dry-run config check without launching training.
+`hecate.py --validate-config <path>` performs a dry-run config check without launching training.
 It runs all V-01 through V-06 rules and reports:
 
-```
-$ python hecate.py validate-config configs/my_experiment.json
+```text
+$ python hecate.py --validate-config configs/my_experiment.json
 
 Config: configs/my_experiment.json
   memory_rule:      moneta          (Tier 2b — CPU only)
@@ -314,7 +315,7 @@ configuration:
     "composition":       "mag",
     "attentional_bias":  "l2",
     "retention":         "l2_weight_decay",
-    "momentum":          "ema",
+    "momentum_kind":     "ema",
     "k":                 4,
     "chunk_sizes":       [1, 8, 64, 512],
     "m_norm_max":        [100.0, 100.0, 100.0, 100.0]

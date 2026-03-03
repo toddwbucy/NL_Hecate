@@ -192,14 +192,18 @@ def _validate_config_cmd(path: str) -> int:
     errors: list[str] = []
     warn_msgs: list[str] = []
 
+    bcfg: "BuildConfig | None" = None
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         try:
             bcfg = BuildConfig.from_file(path)
-            bcfg.validate_gpu_tier()  # V-05: explicit after load (no CLI overrides)
         except ValueError as exc:
             errors.append(str(exc))
-            bcfg = None
+        if bcfg is not None:
+            try:
+                bcfg.validate_gpu_tier()  # V-05: explicit after load (no CLI overrides)
+            except ValueError as exc:
+                errors.append(str(exc))
         for w in caught:
             warn_msgs.append(str(w.message))
 

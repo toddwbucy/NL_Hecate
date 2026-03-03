@@ -15,6 +15,9 @@ _TIER_3_RULES = {"lattice", "atlas", "atlas_omega", "swiglu_mlp", "swiglu"}
 _GPU_CAPABLE = _TIER_1 | _TIER_2A  # Tier 1 + Tier 2a have CUDA kernels
 # Rules that support ema / delta_momentum (V-02)
 _MOMENTUM_RULES = {"titans", "atlas", "atlas_omega"}
+# Enum sets for direct field validation
+_ATTENTIONAL_BIASES = {"l2", "l1", "lp", "kl", "huber"}
+_RETENTION_KINDS = {"l2_weight_decay", "kl_divergence", "elastic_net", "sphere_normalization"}
 
 
 class BuildConfig:
@@ -165,22 +168,31 @@ class BuildConfig:
             raise ValueError("self_generated_values requires projection_kind='adaptive'")
         if self.self_ref_chunk_size > 1 and self.projection_kind != "adaptive":
             raise ValueError("self_ref_chunk_size > 1 requires projection_kind='adaptive'")
+        # Enum validation for new MIRAS knob fields
+        if self.attentional_bias is not None and self.attentional_bias not in _ATTENTIONAL_BIASES:
+            raise ValueError(
+                f"attentional_bias must be one of {sorted(_ATTENTIONAL_BIASES)}, "
+                f"got '{self.attentional_bias}'")
+        if self.retention is not None and self.retention not in _RETENTION_KINDS:
+            raise ValueError(
+                f"retention must be one of {sorted(_RETENTION_KINDS)}, "
+                f"got '{self.retention}'")
         # V-01: retention–rule compatibility
         if self.retention == "sphere_normalization" and self.memory_rule != "lattice":
             raise ValueError(
-                f"retention 'sphere_normalization' requires memory_rule 'lattice_osr', "
-                f"got '{self.memory_rule}'. Use retention 'l2_weight_decay' for {self.memory_rule}.")
+                f"retention 'sphere_normalization' requires memory_rule 'lattice', "
+                f"got '{self.memory_rule}'. Use retention 'l2_weight_decay' for '{self.memory_rule}'.")
         if self.retention == "kl_divergence" and self.memory_rule != "memora":
             raise ValueError(
                 f"retention 'kl_divergence' requires memory_rule 'memora', "
-                f"got '{self.memory_rule}'. Use retention 'l2_weight_decay' for {self.memory_rule}.")
+                f"got '{self.memory_rule}'. Use retention 'l2_weight_decay' for '{self.memory_rule}'.")
         # V-02: momentum–rule compatibility
         if self.momentum_kind in ("ema", "delta_momentum"):
             if self.memory_rule not in _MOMENTUM_RULES:
                 raise ValueError(
-                    f"momentum '{self.momentum_kind}' requires memory_rule 'titans_lmm' or "
-                    f"'atlas_omega', got '{self.memory_rule}'. "
-                    f"Use momentum 'none' for {self.memory_rule}.")
+                    f"momentum '{self.momentum_kind}' requires memory_rule 'titans' or "
+                    f"'atlas'/'atlas_omega', got '{self.memory_rule}'. "
+                    f"Use momentum_kind 'none' for '{self.memory_rule}'.")
         # V-06: Tier 3 always warns (non-fatal)
         if self.memory_rule in _TIER_3_RULES:
             warnings.warn(
