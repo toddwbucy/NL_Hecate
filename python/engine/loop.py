@@ -142,13 +142,20 @@ def run_build(bcfg: BuildConfig):
             sidecar = Path(str(bcfg.load) + ".cursor.json")
             if sidecar.exists() and active_loader is not None:
                 cursor = json.loads(sidecar.read_text())
-                try:
-                    active_loader.restore(cursor)
-                    print(f"  Resuming from step {resume_step}")
-                    print(f"  Stream position: {cursor['position']:,} / {cursor['total_tokens']:,} tokens")
-                except (CursorMismatchError, CursorOutOfBounds) as e:
-                    print(f"  ERROR: cursor mismatch — {e}")
-                    return
+                # Multi-slot sidecars contain {"slots": [...]} — skip flat restore
+                # here; the per-slot restore block below (bpe_loaders section)
+                # handles them. Calling active_loader.restore() on a slots dict
+                # would raise KeyError before that block could run.
+                is_multi_slot = isinstance(cursor, dict) and isinstance(cursor.get("slots"), list)
+                if not is_multi_slot:
+                    try:
+                        active_loader.restore(cursor)
+                        print(f"  Resuming from step {resume_step}")
+                        print(f"  Stream position: {cursor['position']:,} / {cursor['total_tokens']:,} tokens")
+                    except (CursorMismatchError, CursorOutOfBounds) as e:
+                        print(f"  ERROR: cursor mismatch — {e}")
+                        return
+                # else: multi-slot sidecar — handled in the bpe_loaders block below
             else:
                 print("  Loaded checkpoint as warm-start (no cursor sidecar — data position reset to 0)")
         else:
@@ -336,6 +343,30 @@ def run_build(bcfg: BuildConfig):
             loader_b = BpeDataLoader(bcfg.data_path, split="train")
             loader_b.position = b * slot_size
             bpe_loaders.append(loader_b)
+        # If a cursor sidecar exists, restore per-slot positions.
+        # The sidecar may be from: (a) a multi-slot run {"slots": [...]},
+        # or (b) a single-slot run (flat dict) — the latter can't restore
+        # per-slot positions so we fall back to partition-start offsets.
+        if bcfg.load:
+            sidecar = Path(str(bcfg.load) + ".cursor.json")
+            if sidecar.exists():
+                saved = json.loads(sidecar.read_text())
+                slot_cursors = (
+                    saved.get("slots")
+                    if isinstance(saved, dict) and isinstance(saved.get("slots"), list)
+                    else None
+                )
+                if slot_cursors is not None and len(slot_cursors) == len(bpe_loaders):
+                    try:
+                        for loader_b, cur in zip(bpe_loaders, slot_cursors, strict=True):
+                            loader_b.restore(cur)
+                        print(f"  Resuming {len(bpe_loaders)} slots from saved positions")
+                    except (CursorMismatchError, CursorOutOfBounds) as e:
+                        print(f"  ERROR: slot cursor mismatch — {e}")
+                        return
+                else:
+                    print("  Warning: slot count mismatch in sidecar — "
+                          "resetting all slots to partition start")
 
     gpu_model = None
     if use_gpu:
@@ -878,8 +909,11 @@ def run_build(bcfg: BuildConfig):
                 nl_hecate.save_checkpoint(ckpt_path, params, cfg)
             else:
                 nl_hecate.save_build_checkpoint(ckpt_path, params, cfg, conductor, context)
-            if active_loader is not None:
-                sidecar = Path(str(ckpt_path) + ".cursor.json")
+            sidecar = Path(str(ckpt_path) + ".cursor.json")
+            if bpe_loaders:
+                sidecar.write_text(json.dumps(
+                    {"slots": [loader.cursor() for loader in bpe_loaders]}, indent=2))
+            elif active_loader is not None:
                 sidecar.write_text(json.dumps(active_loader.cursor(), indent=2))
             print(f"  [checkpoint saved: {ckpt_path}]")
 
@@ -1017,8 +1051,11 @@ def run_build(bcfg: BuildConfig):
         nl_hecate.save_checkpoint(final_path, params, cfg)
     else:
         nl_hecate.save_build_checkpoint(final_path, params, cfg, conductor, context)
-    if active_loader is not None:
-        sidecar = Path(str(final_path) + ".cursor.json")
+    sidecar = Path(str(final_path) + ".cursor.json")
+    if bpe_loaders:
+        sidecar.write_text(json.dumps(
+            {"slots": [loader.cursor() for loader in bpe_loaders]}, indent=2))
+    elif active_loader is not None:
         sidecar.write_text(json.dumps(active_loader.cursor(), indent=2))
 
     # ── Summary ───────────────────────────────────────────────────────
