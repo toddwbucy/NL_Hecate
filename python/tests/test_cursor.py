@@ -230,13 +230,13 @@ def test_multi_slot_cursor_roundtrip(tmp_path):
     slots[0].next_chunk(seq_len)
     slots[1].next_chunk(seq_len)   # slot 1: position = slot_size*1 + seq_len
 
-    saved_positions = [l.position  for l in slots]
-    saved_chunk_ids = [l._chunk_id for l in slots]
+    saved_positions = [loader.position  for loader in slots]
+    saved_chunk_ids = [loader._chunk_id for loader in slots]
 
     # Write sidecar ({"slots": [...]})
     ckpt_path = tmp_path / "model_step10.safetensors"
     sidecar   = Path(str(ckpt_path) + ".cursor.json")
-    sidecar.write_text(json.dumps({"slots": [l.cursor() for l in slots]}, indent=2))
+    sidecar.write_text(json.dumps({"slots": [loader.cursor() for loader in slots]}, indent=2))
 
     # Reconstruct fresh slot loaders and restore
     saved = json.loads(sidecar.read_text())

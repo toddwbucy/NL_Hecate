@@ -351,8 +351,12 @@ def run_build(bcfg: BuildConfig):
             sidecar = Path(str(bcfg.load) + ".cursor.json")
             if sidecar.exists():
                 saved = json.loads(sidecar.read_text())
-                slot_cursors = saved.get("slots") if isinstance(saved, dict) else None
-                if slot_cursors and len(slot_cursors) == len(bpe_loaders):
+                slot_cursors = (
+                    saved.get("slots")
+                    if isinstance(saved, dict) and isinstance(saved.get("slots"), list)
+                    else None
+                )
+                if slot_cursors is not None and len(slot_cursors) == len(bpe_loaders):
                     try:
                         for loader_b, cur in zip(bpe_loaders, slot_cursors, strict=True):
                             loader_b.restore(cur)
