@@ -123,12 +123,14 @@ training-validated — it is Tier 2a, not Tier 1.
 or be CPU-only (2b). Not training-validated. Supported for research and experimentation.
 
 **Tier 2a — GPU-capable, not training-validated**:
+
 | memory_rule | composition | k | Status |
 |---|---|---|---|
 | `delta_rule` | `mag` · `mac` · `mal` | 1 · 2 · 4 | Has CUDA kernels (S2-M1), not trained |
 | `hebbian` | `mag` · `mac` · `mal` | 1 · 2 · 4 | Has CUDA kernels (S2-M1), not trained |
 
 **Tier 2b — CPU-only, no GPU kernels**:
+
 | memory_rule | composition | k | Status |
 |---|---|---|---|
 | `moneta` | `mag` · `mac` · `mal` | 1 · 2 · 4 | CPU-complete, no GPU kernels |
@@ -212,8 +214,10 @@ defaults that resolve to the Tier 1 canonical config when combined.
 
 ## Validation Rules
 
-`BuildConfig.from_file()` enforces the following at load time. All errors include the tier of
-the combination that was requested and a suggested fix.
+`BuildConfig.from_file()` enforces V-01, V-02, V-03, V-04, and V-06 at load time.
+V-05 (GPU tier check) is enforced by `BuildConfig.validate_gpu_tier()` after CLI overrides
+are applied, so `--cpu` takes effect before the check. All errors include the tier context
+and a suggested fix.
 
 ### Rule V-01: Retention–Rule compatibility
 `sphere_normalization` is only valid with `memory_rule: lattice_osr`.
@@ -238,7 +242,7 @@ When `composition: mac`, `window_size >= 2 * seq_len` must hold.
 Error template:
 ```text
 ConfigError: composition 'mac' requires window_size >= 2 * seq_len
-  Got window_size={w}, seq_len={s}. Set window_size >= {2s}.
+  Got window_size={w}, seq_len={s}. Set window_size >= 2 * {s}.
 ```
 
 ### Rule V-04: k / chunk_sizes coherence

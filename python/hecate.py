@@ -197,7 +197,7 @@ def _validate_config_cmd(path: str) -> int:
         warnings.simplefilter("always")
         try:
             bcfg = BuildConfig.from_file(path)
-        except ValueError as exc:
+        except (ValueError, OSError) as exc:
             errors.append(str(exc))
         if bcfg is not None:
             try:
