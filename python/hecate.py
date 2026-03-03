@@ -31,6 +31,7 @@ import os
 import random
 import sys
 import time
+import warnings
 
 import nl_hecate
 from engine.config import BuildConfig
@@ -63,6 +64,8 @@ modes:
                       help="Raw REPL mode (no ChatML)")
     mode.add_argument("--prompt", type=str, default=None,
                       help="One-shot generation from a text prompt")
+    mode.add_argument("--validate-config", type=str, default=None, metavar="CONFIG",
+                      help="Dry-run config validation (V-01..V-06) without launching build")
 
     # ── Build arguments ────────────────────────────────────────────────
     build = parser.add_argument_group("build options")
@@ -80,6 +83,10 @@ modes:
                        help="Comma-separated chunk sizes per level")
     build.add_argument("--memory_rule", type=str, default=None)
     build.add_argument("--composition", type=str, default=None)
+    build.add_argument("--attentional_bias", type=str, default=None,
+                       help="Inner-loop loss: l2, l1, lp, kl, huber")
+    build.add_argument("--retention", type=str, default=None,
+                       help="Memory decay: l2_weight_decay, kl_divergence, elastic_net, sphere_normalization")
     build.add_argument("--checkpoint_interval", type=int, default=None,
                        help="Gradient checkpointing interval")
     build.add_argument("--save_path", type=str, default=None)
@@ -172,12 +179,84 @@ def _load_model(args):
     return params, cfg, tokenizer, gpu_model
 
 
+def _validate_config_cmd(path: str) -> int:
+    """Dry-run config validation (V-01..V-06) without launching a build.
+
+    Loads the config, captures any ValueError / warnings, and prints a
+    human-readable report. Returns 1 if errors exist, 0 otherwise.
+    """
+    from engine.config import (
+        _GPU_CAPABLE, _TIER_2B, _TIER_3_RULES,
+    )
+
+    errors: list[str] = []
+    warn_msgs: list[str] = []
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        try:
+            bcfg = BuildConfig.from_file(path)
+            bcfg.validate_gpu_tier()  # V-05: explicit after load (no CLI overrides)
+        except ValueError as exc:
+            errors.append(str(exc))
+            bcfg = None
+        for w in caught:
+            warn_msgs.append(str(w.message))
+
+    print(f"\nConfig: {path}")
+
+    if bcfg is not None:
+        rule = bcfg.memory_rule
+        if rule in _GPU_CAPABLE:
+            tier_label = "Tier 1" if rule == "titans" else "Tier 2a — GPU-capable"
+        elif rule in _TIER_2B:
+            tier_label = "Tier 2b — CPU only"
+        elif rule in _TIER_3_RULES:
+            tier_label = "Tier 3 — research stub"
+        else:
+            tier_label = "unknown tier"
+
+        check = lambda ok: "✓" if ok else "✗"
+        print(f"  memory_rule:      {rule:<20} ({tier_label})")
+        print(f"  composition:      {bcfg.composition:<20} {check(True)}")
+        bias = bcfg.attentional_bias or "(default)"
+        ret  = bcfg.retention or "(default)"
+        print(f"  attentional_bias: {bias:<20} {check(True)}")
+        print(f"  retention:        {ret:<20} {check(True)}")
+        print(f"  momentum:         {bcfg.momentum_kind:<20} {check(True)}")
+        print(f"  k:                {bcfg.k:<20} {check(True)}")
+        device = "cuda" if bcfg.gpu else "cpu"
+        gpu_ok = not bcfg.gpu or rule in _GPU_CAPABLE
+        print(f"  device:           {device:<20} {check(gpu_ok)}")
+
+    print()
+    for msg in warn_msgs:
+        print(f"WARNING: {msg}")
+    for msg in errors:
+        print(f"ERROR: {msg}")
+
+    n_err = len(errors)
+    n_warn = len(warn_msgs)
+    device = "cuda" if (bcfg is not None and bcfg.gpu) else "cpu"
+    if n_err == 0:
+        print(f"\n{n_err} errors, {n_warn} warnings. Config is VALID for {device}.")
+        return 0
+    else:
+        print(f"\n{n_err} error(s), {n_warn} warning(s). Config is INVALID.")
+        return 1
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
 
     if args.seed is not None:
         random.seed(args.seed)
+
+    # ── validate-config dry-run ────────────────────────────────────────
+    if args.validate_config:
+        rc = _validate_config_cmd(args.validate_config)
+        sys.exit(rc)
 
     # ── Validate mode ─────────────────────────────────────────────────
     mode_count = sum([args.build, args.chat, args.interactive, args.prompt is not None])

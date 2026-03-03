@@ -3,8 +3,18 @@
 import argparse
 import json
 import math
+import warnings
 from pathlib import Path
 from typing import Any
+
+# Tier taxonomy for V-05/V-06 validation (spec: 01_variant_tier_policy.md)
+_TIER_1 = {"titans"}
+_TIER_2A = {"delta", "hebbian"}
+_TIER_2B = {"moneta", "yaad", "memora", "trellis"}
+_TIER_3_RULES = {"lattice", "atlas", "atlas_omega", "swiglu_mlp", "swiglu"}
+_GPU_CAPABLE = _TIER_1 | _TIER_2A  # Tier 1 + Tier 2a have CUDA kernels
+# Rules that support ema / delta_momentum (V-02)
+_MOMENTUM_RULES = {"titans", "atlas", "atlas_omega"}
 
 
 class BuildConfig:
@@ -31,6 +41,9 @@ class BuildConfig:
     self_ref_chunk_size: int = 1             # chunkwise self-ref (1 = sequential)
     momentum_kind: str = "none"             # "none", "ema", "delta_momentum", "deep_momentum"
     momentum_d_hidden: int = 0              # momentum MLP hidden dim (0 = d*d matrix)
+    attentional_bias: str | None = None     # inner-loop loss: "l2", "l1", "lp", "kl", "huber"
+    retention: str | None = None            # decay mechanism: "l2_weight_decay", "kl_divergence",
+    #                                       #   "elastic_net", "sphere_normalization"
 
     # Memory enable flag (False = SWA-only baseline, no CMS memory modules)
     memory_enabled: bool = True
@@ -152,6 +165,33 @@ class BuildConfig:
             raise ValueError("self_generated_values requires projection_kind='adaptive'")
         if self.self_ref_chunk_size > 1 and self.projection_kind != "adaptive":
             raise ValueError("self_ref_chunk_size > 1 requires projection_kind='adaptive'")
+        # V-01: retention–rule compatibility
+        if self.retention == "sphere_normalization" and self.memory_rule != "lattice":
+            raise ValueError(
+                f"retention 'sphere_normalization' requires memory_rule 'lattice_osr', "
+                f"got '{self.memory_rule}'. Use retention 'l2_weight_decay' for {self.memory_rule}.")
+        if self.retention == "kl_divergence" and self.memory_rule != "memora":
+            raise ValueError(
+                f"retention 'kl_divergence' requires memory_rule 'memora', "
+                f"got '{self.memory_rule}'. Use retention 'l2_weight_decay' for {self.memory_rule}.")
+        # V-02: momentum–rule compatibility
+        if self.momentum_kind in ("ema", "delta_momentum"):
+            if self.memory_rule not in _MOMENTUM_RULES:
+                raise ValueError(
+                    f"momentum '{self.momentum_kind}' requires memory_rule 'titans_lmm' or "
+                    f"'atlas_omega', got '{self.memory_rule}'. "
+                    f"Use momentum 'none' for {self.memory_rule}.")
+        # V-06: Tier 3 always warns (non-fatal)
+        if self.memory_rule in _TIER_3_RULES:
+            warnings.warn(
+                f"memory_rule '{self.memory_rule}' is Tier 3 (research stub). Not production-ready. "
+                f"Proceeding on CPU. See specs/infrastructure/01_variant_tier_policy.md.",
+                stacklevel=3)
+        if self.momentum_kind == "deep_momentum":
+            warnings.warn(
+                f"momentum 'deep_momentum' is Tier 3 (research stub). Not production-ready. "
+                f"Proceeding on CPU. See specs/infrastructure/01_variant_tier_policy.md.",
+                stacklevel=3)
         if self.data_format not in ("byte", "sharegpt"):
             raise ValueError(
                 f"data_format must be 'byte' or 'sharegpt', got '{self.data_format}'")
@@ -277,6 +317,8 @@ class BuildConfig:
             "self_ref_chunk_size": "self_ref_chunk_size",
             "momentum_kind": "momentum_kind",
             "momentum_d_hidden": "momentum_d_hidden",
+            "attentional_bias": "attentional_bias",
+            "retention": "retention",
         }
         for cli_name, cfg_name in mapping.items():
             val = getattr(args, cli_name, None)
@@ -293,6 +335,25 @@ class BuildConfig:
         if getattr(args, "self_generated_values", None) is not None:
             self.self_generated_values = args.self_generated_values
         self._validate()
+        self.validate_gpu_tier()  # V-05: checked after --cpu/--gpu are applied
+
+    def validate_gpu_tier(self) -> None:
+        """V-05: raise if GPU is requested but the rule has no GPU kernels.
+
+        Separate from _validate() so --cpu CLI override is applied first.
+        Call explicitly after from_file() when no CLI overrides are used
+        (e.g., in the validate-config subcommand).
+        """
+        if self.gpu and self.memory_rule not in _GPU_CAPABLE:
+            tier = "3" if self.memory_rule in _TIER_3_RULES else "2b"
+            raise ValueError(
+                f"'{self.memory_rule}' is Tier {tier} — no GPU kernels available.\n"
+                f"  This combination runs on CPU only. Either:\n"
+                f"    (a) add \"gpu\": false to your config build section, or\n"
+                f"    (b) pass --cpu at the command line, or\n"
+                f"    (c) use a Tier 1 or Tier 2a memory_rule (titans_lmm, delta_rule, hebbian)\n"
+                f"       to run on GPU.\n"
+                f"  See specs/infrastructure/01_variant_tier_policy.md for the full tier matrix.")
 
 
 def cosine_lr(step: int, warmup_steps: int, total_steps: int, lr_peak: float,
