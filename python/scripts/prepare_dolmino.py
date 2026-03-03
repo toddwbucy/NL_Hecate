@@ -116,7 +116,7 @@ def stream_documents(
         for rec in stream_jsonl_zst(shard):
             total_records += 1
             text = rec.get("text", "")
-            if not text or len(text) < min_text_len:
+            if not isinstance(text, str) or len(text) < min_text_len:
                 skipped += 1
                 continue
             docs.append(text)
@@ -283,9 +283,10 @@ def main() -> None:
     rng = np.random.RandomState(args.seed)
     indices = rng.permutation(len(docs))
     n_val = max(1, int(len(docs) * args.val_ratio))
-    val_set = set(indices[:n_val].tolist())
+    val_indices = indices[:n_val].tolist()
+    val_set = set(val_indices)
     train_docs = [docs[i] for i in range(len(docs)) if i not in val_set]
-    val_docs = [docs[i] for i in val_set]
+    val_docs = [docs[i] for i in val_indices]
     print(f"  Train: {len(train_docs):,} docs, Val: {len(val_docs):,} docs")
 
     # Free original list immediately — we hold train/val references
