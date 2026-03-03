@@ -2037,6 +2037,10 @@ impl GpuModel {
         py: Python<'_>,
     ) -> PyResult<PyObject> {
         let s = self.cfg.swa.seq_len;
+        let v = self.cfg.swa.vocab_size;
+        if s == 0 {
+            return Err(PyValueError::new_err("seq_len must be > 0"));
+        }
         if input_ids.is_empty() || input_ids.len() % s != 0
             || target_ids.len() != input_ids.len()
         {
@@ -2044,6 +2048,20 @@ impl GpuModel {
                 "input/target length must be batch_size * seq_len {} (got {})",
                 s, input_ids.len()
             )));
+        }
+        if let Some(&max_id) = input_ids.iter().max() {
+            if max_id >= v {
+                return Err(PyValueError::new_err(format!(
+                    "input_ids contains {} >= vocab_size {}", max_id, v
+                )));
+            }
+        }
+        if let Some(&max_id) = target_ids.iter().max() {
+            if max_id >= v {
+                return Err(PyValueError::new_err(format!(
+                    "target_ids contains {} >= vocab_size {}", max_id, v
+                )));
+            }
         }
 
         // The traced forward runs on CPU — pull host copies of params and context.

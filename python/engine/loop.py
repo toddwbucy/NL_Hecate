@@ -720,12 +720,15 @@ def run_build(bcfg: BuildConfig):
             if (gpu_model is not None
                     and hasattr(gpu_model, "tape_forward_summary")
                     and input_ids is not None and target_ids is not None):
-                tape_sum = gpu_model.tape_forward_summary(
-                    input_ids, target_ids, pulse
-                )
-                print_tape_summary(tape_sum, step)
-                if jsonl:
-                    jsonl.log(event="tape_summary", step=step, **tape_sum)
+                try:
+                    tape_sum = gpu_model.tape_forward_summary(
+                        input_ids, target_ids, pulse
+                    )
+                    print_tape_summary(tape_sum, step)
+                    if jsonl:
+                        jsonl.log(event="tape_summary", step=step, **tape_sum)
+                except Exception as exc:  # non-fatal — tape diagnostic must not abort training
+                    print(f"  [tape] WARNING: tape_forward_summary failed at step {step}: {exc}")
             if bcfg.k > 1:
                 fires_str = "  ".join(f"L{i}:{level_fire_counts[i]}" for i in range(bcfg.k))
                 print(f"    [fires] {fires_str}")

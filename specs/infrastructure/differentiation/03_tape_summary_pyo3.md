@@ -22,7 +22,8 @@ CONTRACT
 
   Guarantees: - TapeSummary returned as a Python dict with schema:
                   {
-                    "step": int,
+                    "loss": float,
+                    "total_blocks": int,
                     "levels": [
                       {
                         "level": int,
@@ -33,9 +34,7 @@ CONTRACT
                                                     # 0.0 if not present
                       },
                       ...
-                    ],
-                    "total_blocks": int,
-                    "loss": float
+                    ]
                   }
               - Runs one traced forward + backward; does NOT update weights or
                   optimizer state (read-only diagnostic)
@@ -45,7 +44,8 @@ CONTRACT
   Cost:       - One additional forward+backward per eval call (~same cost as
                   a normal training step but without AdamW update)
               - Tape arena allocation proportional to sequence length and k
-              - No PCIe traffic for weights; only input_ids/target_ids cross bus
+              - PCIe traffic: host params and context are transferred GPU→CPU
+                  via to_host() before extraction (one-way, read-only copy)
 
   Trade-off:  - eval_every overhead doubles for steps where tape_forward_summary
                   is called (one GPU forward for loss eval + one traced forward
@@ -294,11 +294,11 @@ fn test_tape_summary_has_blocks()
 // Numerical: output_grad_norm > 0 for active levels after backward
 fn test_tape_summary_active_level_has_nonzero_gnorm()
 
-// Guarantee: dormant level (block_count == 0) has output_grad_norm == 0.0
-fn test_tape_summary_dormant_level_zero_gnorm()
-
 // Guarantee: extract_tape_summary does not modify params (read-only)
 fn test_tape_summary_does_not_update_params()
+
+// Guarantee: loss is finite and positive
+fn test_tape_summary_loss_is_finite()
 ```
 
 ---
