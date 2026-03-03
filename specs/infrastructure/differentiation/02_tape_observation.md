@@ -233,7 +233,7 @@ impl Tape {
     /// Get the saved buffer with the given role from an opaque op.
     /// Returns None if the op is not Opaque or no saved buffer has that role.
     pub fn get_saved_by_role(&self, op_idx: usize, role: &str) -> Option<&[f32]> {
-        match &self.ops[op_idx] {
+        match self.ops.get(op_idx)? {
             TapeOp::Opaque { saved, .. } => {
                 saved.iter().find_map(|&id| {
                     if self.bufs[id].role.map_or(false, |r| r == role) {
@@ -260,7 +260,7 @@ impl Tape {
     /// Get the gradient norm for an opaque block's first output.
     /// Useful for level-boundary gradient flow measurement after backward().
     pub fn opaque_output_grad_norm(&self, op_idx: usize) -> Option<f32> {
-        match &self.ops[op_idx] {
+        match self.ops.get(op_idx)? {
             TapeOp::Opaque { outputs, .. } => {
                 let out_id = *outputs.first()?;
                 let grad = self.grad_accum[out_id].as_deref()?;
