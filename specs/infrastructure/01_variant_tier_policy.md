@@ -58,7 +58,7 @@ work and variant expansion.
 NL-Hecate is not a single model — it is a composition framework. A user constructs an NLM by
 selecting values for six orthogonal knobs. The config JSON is the bill of materials.
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────────┐
 │                    NLM Bill of Materials                            │
 ├─────────────────────┬───────────────────────────────────────────────┤
@@ -219,7 +219,7 @@ the combination that was requested and a suggested fix.
 `sphere_normalization` is only valid with `memory_rule: lattice_osr`.
 `kl_divergence` is only valid with `memory_rule: memora`.
 Error template:
-```
+```text
 ConfigError: retention 'sphere_normalization' requires memory_rule 'lattice_osr'
   You requested memory_rule '{rule}'. Use retention 'l2_weight_decay' for {rule}.
 ```
@@ -228,7 +228,7 @@ ConfigError: retention 'sphere_normalization' requires memory_rule 'lattice_osr'
 `ema` and `delta_momentum` require `memory_rule` in `{titans_lmm, atlas_omega}`.
 `deep_momentum` is Tier 3 regardless of memory rule.
 Error template:
-```
+```text
 ConfigError: momentum 'ema' requires memory_rule 'titans_lmm' or 'atlas_omega'
   You requested memory_rule '{rule}'. Use momentum 'none' for {rule}.
 ```
@@ -236,7 +236,7 @@ ConfigError: momentum 'ema' requires memory_rule 'titans_lmm' or 'atlas_omega'
 ### Rule V-03: MAC window size
 When `composition: mac`, `window_size >= 2 * seq_len` must hold.
 Error template:
-```
+```text
 ConfigError: composition 'mac' requires window_size >= 2 * seq_len
   Got window_size={w}, seq_len={s}. Set window_size >= {2s}.
 ```
@@ -244,14 +244,14 @@ ConfigError: composition 'mac' requires window_size >= 2 * seq_len
 ### Rule V-04: k / chunk_sizes coherence
 `len(chunk_sizes) == k`.
 Error template:
-```
+```text
 ConfigError: k={k} but len(chunk_sizes)={n}. chunk_sizes must have exactly k entries.
 ```
 
 ### Rule V-05: GPU tier check (when device=cuda requested)
 When `device: "cuda"` (explicit or inferred from CUDA_VISIBLE_DEVICES), the combination
 must be Tier 1 or Tier 2a (has GPU kernels). Tier 2b and Tier 3 combinations trigger:
-```
+```text
 ConfigError: '{memory_rule}' is Tier {tier} — no GPU kernels available.
   This combination runs on CPU only. Either:
     (a) set device: "cpu" to run intentionally on CPU, or
@@ -263,7 +263,7 @@ ConfigError: '{memory_rule}' is Tier {tier} — no GPU kernels available.
 ### Rule V-06: Tier 3 always warns
 Any Tier 3 combination (lattice_osr, atlas_omega, swiglu_mlp, deep_momentum) emits a
 non-fatal warning at config load time regardless of device:
-```
+```text
 ConfigWarning: '{field}' is Tier 3 (research stub). Not production-ready.
   Proceeding on CPU. See specs/infrastructure/01_variant_tier_policy.md.
 ```

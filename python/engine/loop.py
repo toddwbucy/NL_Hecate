@@ -185,8 +185,16 @@ def run_build(bcfg: BuildConfig):
                 self_ref_chunk_size=cfg.self_ref_chunk_size,
                 momentum_kind=cfg.momentum_kind,
                 momentum_d_hidden=cfg.momentum_d_hidden,
-                attentional_bias=cfg.attentional_bias,
-                retention=cfg.retention,
+                attentional_bias=(
+                    bcfg.attentional_bias
+                    if bcfg.attentional_bias is not None
+                    else getattr(cfg, "attentional_bias", None)
+                ),
+                retention=(
+                    bcfg.retention
+                    if bcfg.retention is not None
+                    else getattr(cfg, "retention", None)
+                ),
                 intermediate_size=bcfg.intermediate_size,
                 theta_floor=theta_floor,
                 theta_ceil=theta_ceil,

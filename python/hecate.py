@@ -220,7 +220,8 @@ def _validate_config_cmd(path: str) -> int:
         else:
             tier_label = "unknown tier"
 
-        check = lambda ok: "✓" if ok else "✗"
+        def check(ok: bool) -> str:
+            return "✓" if ok else "✗"
         print(f"  memory_rule:      {rule:<20} ({tier_label})")
         print(f"  composition:      {bcfg.composition:<20} {check(True)}")
         bias = bcfg.attentional_bias or "(default)"
