@@ -1,17 +1,16 @@
 {
-  "_comment": "Gate activation warmup diagnostic. See specs/infrastructure/09_gate_warmup.md. k=4 Delta Rule + 3-phase gate warmup. Task: task_fd444d (blocked pending corpus pipeline task_9d40f5).",
+  "description": "Gate activation warmup diagnostic — k=4 Delta Rule + 3-phase gate warmup on C4 (995M tokens, Llama tokenizer). Task: task_fd444d.",
+  "notes": "See specs/infrastructure/09_gate_warmup.md. Phase 2 decays gate_warmup.theta_floor_init → 0 over gate_warmup.gate_warmup_decay_steps. Falsification checks L2/L3 θ against gate_warmup.l2_theta_threshold / l3_theta_threshold.",
   "model": {
     "d_model": 256,
     "num_heads": 4,
     "seq_len": 512,
     "window_size": 256,
-    "vocab_size": 50257,
+    "vocab_size": 32000,
     "k": 4,
     "memory_rule": "delta",
     "composition": "mag",
     "memory_reset": "carry_forward",
-    "b_theta": [-4.6, -5.6, -4.6, -4.6],
-    "b_alpha": [3.0, 4.0, 4.5, 5.0],
     "theta_floor": [0.0, 0.0, 0.0, 0.0],
     "theta_ceil": [1.0, 1.0, 1.0, 1.0],
     "m_norm_max": [100.0, 100.0, 100.0, 100.0]
@@ -41,7 +40,7 @@
     "log_file": "python/runs/gate_warmup_diagnostic.jsonl"
   },
   "data": {
-    "path": "python/data/PLACEHOLDER_validated_corpus_tokens.bin",
-    "format": "byte"
+    "path": "python/data/c4",
+    "format": "sharegpt"
   }
 }
