@@ -172,6 +172,16 @@ def main():
     parser.add_argument("--trajectory", action="store_true", help="Show full per-fire trajectory")
     args = parser.parse_args()
 
+    if not (0.0 < args.alpha <= 1.0):
+        parser.error(f"--alpha must be in (0, 1], got {args.alpha}")
+    if not (0.0 < args.threshold < 1.0):
+        parser.error(f"--threshold must be in (0, 1), got {args.threshold}")
+    if args.window < 1:
+        parser.error(f"--window must be >= 1, got {args.window}")
+    if args.labels and len(args.labels) > len(args.logs):
+        parser.error(
+            f"--labels has {len(args.labels)} entries but only {len(args.logs)} log(s) provided")
+
     labels = args.labels or [Path(p).stem for p in args.logs]
     if len(labels) < len(args.logs):
         labels += [Path(p).stem for p in args.logs[len(labels):]]
