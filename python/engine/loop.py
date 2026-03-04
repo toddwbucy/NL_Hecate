@@ -2,6 +2,14 @@
 
 import gc
 import json
+import sys
+from pathlib import Path as _Path
+
+# Ensure the python/ directory is on sys.path so `engine` is importable
+# regardless of where the script is invoked from.
+_pkg_root = _Path(__file__).resolve().parent.parent
+if str(_pkg_root) not in sys.path:
+    sys.path.insert(0, str(_pkg_root))
 import math
 import os
 import time
