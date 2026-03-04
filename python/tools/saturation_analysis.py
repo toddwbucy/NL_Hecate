@@ -106,7 +106,11 @@ def print_report(label: str, results: dict, show_trajectory: bool = False):
         peak = data["peak_gnorm"]
         n = data["fire_count"]
 
-        status = f"SATURATING (onset step {onset})" if onset else f"active  (current ratio {ratio:.3f})"
+        status = (
+            f"SATURATING (onset step {onset})"
+            if onset is not None
+            else f"active  (current ratio {ratio:.3f})"
+        )
         print(f"\n  L{level}  fires={n}  peak_gnorm={peak:.6f}  {status}")
 
         if show_trajectory:
@@ -143,10 +147,9 @@ def print_comparison(labels: list[str], all_results: list[dict]):
     max_len = max(len(t) for t in trajs)
     step_size = max(1, max_len // 20)
 
-    header = f"  {'fire':>5}  {'step':>7}  " + "  ".join(f"{l:>10}" for l in labels)
+    header = f"  {'fire':>5}  {'step':>7}  " + "  ".join(f"{label:>10}" for label in labels)
     print(header)
     for i in range(0, max_len, step_size):
-        row = f"  {i:>5}  "
         step_val = ""
         cols = []
         for traj in trajs:
@@ -189,12 +192,13 @@ def main():
     for label, results in zip(labels, all_results):
         l0 = results.get(0, {})
         onset = l0.get("saturation_onset_step")
-        ratio = l0.get("final_ratio", "?")
+        ratio = l0.get("final_ratio")
         peak = l0.get("peak_gnorm", 0)
-        if onset:
+        if onset is not None:
             print(f"  {label}: SATURATED at step {onset}  (peak gnorm {peak:.4f})")
         else:
-            print(f"  {label}: not yet saturated  current ratio={ratio:.3f}  peak={peak:.4f}")
+            ratio_str = f"{ratio:.3f}" if ratio is not None else "?"
+            print(f"  {label}: not yet saturated  current ratio={ratio_str}  peak={peak:.4f}")
             # Extrapolate: fit linear decay to last 20% of ratio trajectory
             traj = l0.get("trajectory", [])
             if len(traj) > 20:

@@ -264,6 +264,15 @@ class BuildConfig:
             if self.gate_warmup_l3_threshold <= 0:
                 raise ValueError(
                     f"gate_warmup_l3_threshold must be > 0, got {self.gate_warmup_l3_threshold}")
+        if not (0.0 < self.saturation_ema_alpha <= 1.0):
+            raise ValueError(
+                f"saturation_ema_alpha must be in (0, 1], got {self.saturation_ema_alpha}")
+        if not (0.0 < self.saturation_threshold < 1.0):
+            raise ValueError(
+                f"saturation_threshold must be in (0, 1), got {self.saturation_threshold}")
+        if self.saturation_window < 1:
+            raise ValueError(
+                f"saturation_window must be >= 1, got {self.saturation_window}")
 
     @property
     def head_dim(self) -> int:

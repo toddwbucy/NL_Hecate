@@ -634,15 +634,14 @@ def run_build(bcfg: BuildConfig):
                             round(_sat_ema[i] / _sat_peak[i], 4)
                             if _sat_peak[i] > 1e-10 else 1.0
                         )
-                    if not log_this:
-                        jsonl.log(
-                            event="slow_level_fire",
-                            step=step,
-                            active_levels=list(pulse.active_levels),
-                            level_grad_norms=[round(n, 6) for n in level_gnorms],
-                            saturation_ema=sat_ema_snap,
-                            saturation_ratio=sat_ratio_snap,
-                        )
+                    jsonl.log(
+                        event="slow_level_fire",
+                        step=step,
+                        active_levels=list(pulse.active_levels),
+                        level_grad_norms=[round(n, 6) for n in level_gnorms],
+                        saturation_ema=sat_ema_snap,
+                        saturation_ratio=sat_ratio_snap,
+                    )
         elif gpu_model is not None and adamw_opt is None:
             loss = gpu_model.step(input_ids, target_ids, pulse, current_lr)
         elif gpu_model is not None and adamw_opt is not None:
