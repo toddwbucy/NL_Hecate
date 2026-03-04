@@ -96,6 +96,14 @@ class BuildConfig:
     tape_every: int = 0          # 0 = same as eval_every; set to a multiple (e.g. 4×) to run
     #                            # tape_forward_summary less often (it runs a CPU forward pass)
 
+    # Parameter saturation detection (task_962e72)
+    # Tracks per-level EMA of gradient norm at each slow_level_fire event.
+    # saturation_ratio = ema_gnorm / peak_gnorm → 1.0 at peak, → 0 at saturation.
+    # Emits level_saturation JSONL event when ratio < threshold for `saturation_window` fires.
+    saturation_ema_alpha: float = 0.1    # EMA decay — higher = more reactive, lower = smoother
+    saturation_threshold: float = 0.15  # ratio below which a level is considered saturating
+    saturation_window: int = 5           # consecutive fires below threshold to confirm saturation
+
     # Gradient checkpointing (VRAM optimization for memory rules)
     checkpoint_interval: int | None = None  # None = full trajectory; C = store M every C steps
 
@@ -256,6 +264,15 @@ class BuildConfig:
             if self.gate_warmup_l3_threshold <= 0:
                 raise ValueError(
                     f"gate_warmup_l3_threshold must be > 0, got {self.gate_warmup_l3_threshold}")
+        if not (0.0 < self.saturation_ema_alpha <= 1.0):
+            raise ValueError(
+                f"saturation_ema_alpha must be in (0, 1], got {self.saturation_ema_alpha}")
+        if not (0.0 < self.saturation_threshold < 1.0):
+            raise ValueError(
+                f"saturation_threshold must be in (0, 1), got {self.saturation_threshold}")
+        if self.saturation_window < 1:
+            raise ValueError(
+                f"saturation_window must be >= 1, got {self.saturation_window}")
 
     @property
     def head_dim(self) -> int:
