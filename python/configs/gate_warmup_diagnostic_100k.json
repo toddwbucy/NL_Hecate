@@ -1,5 +1,5 @@
 {
-  "description": "Gate activation warmup diagnostic — k=4 Delta Rule + 3-phase gate warmup on C4, 100K steps. Cold-start control run. Also serves as checkpoint factory for warm_start_10k_raw.json (GPU1 repeated-exposure test). Task: task_fd444d.",
+  "description": "Gate activation warmup diagnostic — k=4 Delta Rule + 3-phase gate warmup on C4, 100K steps. Cold-start control run. RESUMED from step 15K (step-20K falsification tripped: L2 θ=0.00145 < 0.005, L3 θ=0.00050 < 0.001 — gates fell post-scaffold as expected). Falsification disabled for continuation; the NO-GO at 20K is itself valid experimental data. eval_every updated to 512 for L2/L3 cadence alignment. Task: task_fd444d.",
   "model": {
     "d_model": 256,
     "num_heads": 4,
@@ -18,11 +18,12 @@
   "gate_warmup": {
     "theta_floor_init": [0.0, 0.0, 0.005, 0.001],
     "gate_warmup_decay_steps": 10000,
-    "falsification_step": 20000,
+    "falsification_step": 0,
     "l2_theta_threshold": 0.005,
     "l3_theta_threshold": 0.001
   },
   "build": {
+    "load": "checkpoints/gate_warmup_diagnostic_100k_step15000.safetensors",
     "lr": 3e-4,
     "batch_size": 8,
     "steps": 100000,
@@ -34,7 +35,7 @@
     "warmup_steps": 500,
     "max_grad_norm": 1.0,
     "log_every": 250,
-    "eval_every": 250,
+    "eval_every": 512,
     "eval_max_chunks": 50,
     "tape_every": 1000,
     "probe_max_tokens": 20,
