@@ -565,22 +565,40 @@ def run_build(bcfg: BuildConfig):
         log_this = (step % bcfg.log_every == 0 or step == end_step - 1
                     or (step < 100 and step % 10 == 0))
 
+        # Detect slow-level fires (L2+) to emit targeted gradient events regardless of log_every.
+        # LCM(log_every=250, L2=64)=8000 → only 1 logged step per 8000 catches L2.
+        # LCM(250, 512)=64000 → L3 is NEVER visible in a 25K run without this.
+        slow_level_fires = any(
+            pulse.active_levels[i]
+            for i in range(2, len(pulse.active_levels))
+        ) if len(pulse.active_levels) > 2 else False
+        need_gnorms = log_this or slow_level_fires
+
         if gpu_model is not None and use_adamw_gpu:
             loss, g_norm = gpu_model.step_adamw(
                 input_ids, target_ids, pulse, current_lr,
                 beta1=bcfg.beta1, beta2=bcfg.beta2, eps=1e-8,
                 weight_decay=bcfg.weight_decay,
                 max_grad_norm=bcfg.max_grad_norm,
-                collect_level_gnorms=log_this,
+                collect_level_gnorms=need_gnorms,
             )
             # Component 1+2: collect per-level gnorms for monitoring (active steps only)
-            if log_this and hasattr(gpu_model, "level_grad_norms"):
+            if need_gnorms and hasattr(gpu_model, "level_grad_norms"):
                 level_gnorms = gpu_model.level_grad_norms()
                 for i, n in enumerate(level_gnorms):
                     if (i < len(level_gnorm_history)
                             and i < len(pulse.active_levels)
                             and pulse.active_levels[i]):
                         level_gnorm_history[i].append(n)
+                # Emit a dedicated event for slow-level fires so their gradient
+                # dynamics are visible even when this step isn't a log_every step.
+                if slow_level_fires and not log_this and jsonl:
+                    jsonl.log(
+                        event="slow_level_fire",
+                        step=step,
+                        active_levels=list(pulse.active_levels),
+                        level_grad_norms=[round(n, 6) for n in level_gnorms],
+                    )
         elif gpu_model is not None and adamw_opt is None:
             loss = gpu_model.step(input_ids, target_ids, pulse, current_lr)
         elif gpu_model is not None and adamw_opt is not None:
