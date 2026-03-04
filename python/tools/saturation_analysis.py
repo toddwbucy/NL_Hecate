@@ -218,7 +218,7 @@ def main():
                     s0, s1 = tail[0]["step"], tail[-1]["step"]
                     if r0 > r1 and s1 > s0:
                         decay_per_step = (r0 - r1) / (s1 - s0)
-                        if decay_per_step > 0:
+                        if decay_per_step > 0 and r1 > args.threshold:
                             steps_to_threshold = (r1 - args.threshold) / decay_per_step
                             predicted = int(s1 + steps_to_threshold)
                             print(f"          linear extrapolation → saturation ~step {predicted}")
