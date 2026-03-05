@@ -39,7 +39,7 @@
 
 // Copy a single 4-byte float from global to shared memory asynchronously.
 // Uses inline PTX: cp.async.ca.shared.global [dst], [src], 4;
-__device__ __forceinline__ void cp_async_f32(float* smem_dst, const float* gmem_src) {
+__device__ __forceinline__ void cp_async_f32_titans(float* smem_dst, const float* gmem_src) {
     uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
     asm volatile(
         "cp.async.ca.shared.global [%0], [%1], 4;\n"
@@ -48,15 +48,15 @@ __device__ __forceinline__ void cp_async_f32(float* smem_dst, const float* gmem_
 }
 
 // Commit all prior cp.async instructions into a group.
-__device__ __forceinline__ void cp_async_commit() {
+__device__ __forceinline__ void cp_async_commit_titans() {
     asm volatile("cp.async.commit_group;\n" ::);
 }
 
 // Wait until at most N groups are still in flight.
-// cp_async_wait<0>() waits for ALL groups to complete.
-// cp_async_wait<1>() waits until at most 1 group remains (pipeline depth=1).
+// cp_async_wait_titans<0>() waits for ALL groups to complete.
+// cp_async_wait_titans<1>() waits until at most 1 group remains (pipeline depth=1).
 template <int N>
-__device__ __forceinline__ void cp_async_wait() {
+__device__ __forceinline__ void cp_async_wait_titans() {
     asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
 }
 
@@ -138,11 +138,11 @@ __global__ void titans_forward_kernel(
     int cur = 0;
     if (seq_len > 0) {
         for (int i = tid; i < d; i += blockDim.x) {
-            cp_async_f32(&buf_k[0 * d + i], &k_mem[0 * d + i]);
-            cp_async_f32(&buf_v[0 * d + i], &v_mem[0 * d + i]);
-            cp_async_f32(&buf_q[0 * d + i], &q_mem[0 * d + i]);
+            cp_async_f32_titans(&buf_k[0 * d + i], &k_mem[0 * d + i]);
+            cp_async_f32_titans(&buf_v[0 * d + i], &v_mem[0 * d + i]);
+            cp_async_f32_titans(&buf_q[0 * d + i], &q_mem[0 * d + i]);
         }
-        cp_async_commit();
+        cp_async_commit_titans();
     }
 
     for (int t = 0; t < seq_len; t++) {
@@ -151,19 +151,19 @@ __global__ void titans_forward_kernel(
         // Prefetch token t+1 into alternate buffer (overlaps with compute)
         if (t + 1 < seq_len) {
             for (int i = tid; i < d; i += blockDim.x) {
-                cp_async_f32(&buf_k[next * d + i], &k_mem[(t + 1) * d + i]);
-                cp_async_f32(&buf_v[next * d + i], &v_mem[(t + 1) * d + i]);
-                cp_async_f32(&buf_q[next * d + i], &q_mem[(t + 1) * d + i]);
+                cp_async_f32_titans(&buf_k[next * d + i], &k_mem[(t + 1) * d + i]);
+                cp_async_f32_titans(&buf_v[next * d + i], &v_mem[(t + 1) * d + i]);
+                cp_async_f32_titans(&buf_q[next * d + i], &q_mem[(t + 1) * d + i]);
             }
-            cp_async_commit();
+            cp_async_commit_titans();
         }
 
         // Wait for current buffer to be ready.
         // <1>: one prefetch still in flight (next token). <0>: flush all on final iteration.
         if (t + 1 < seq_len) {
-            cp_async_wait<1>();
+            cp_async_wait_titans<1>();
         } else {
-            cp_async_wait<0>();
+            cp_async_wait_titans<0>();
         }
         __syncthreads();
 
