@@ -1,5 +1,5 @@
 {
-  "description": "Dolmino-Mix 100B — k=4 CMS build (ingredient1, d=512)",
+  "description": "Dolmino-Mix 100B — k=4 CMS Delta Rule cold-start build (d=512, ingredient1 common_crawl). 100K steps on 1B-token dolmino dataset. eval_every=1028 (2×L3), save_every=5126 (10×L3+6). Delta series baseline.",
   "model": {
     "d_model": 512,
     "num_heads": 8,
@@ -8,13 +8,10 @@
     "vocab_size": 32000,
     "k": 4,
     "chunk_sizes": [1, 8, 64, 512],
-    "memory_rule": "titans",
+    "memory_rule": "delta",
     "composition": "mag",
-    "projection_kind": "adaptive",
-    "self_generated_values": false,
-    "self_ref_chunk_size": 1,
-    "momentum_kind": "none",
-    "momentum_d_hidden": 0
+    "memory_reset": "carry_forward",
+    "theta_floor": [0.0, 0.0, 0.0, 0.0]
   },
   "build": {
     "lr": 0.0006,
@@ -25,11 +22,15 @@
     "beta1": 0.9,
     "beta2": 0.999,
     "max_grad_norm": 1.0,
-    "save_path": "checkpoints/dolmino_100b_k4.json",
-    "save_every": 5000,
+    "save_path": "checkpoints/dolmino_100b_k4.safetensors",
+    "save_every": 5126,
     "log_every": 10,
-    "eval_every": 5000,
-    "eval_max_chunks": 50
+    "eval_every": 1028,
+    "eval_max_chunks": 50,
+    "tape_every": 1000,
+    "probe_max_tokens": 20,
+    "probe_prompts": 1,
+    "log_file": "runs/dolmino_100b_k4.jsonl"
   },
   "data": {
     "path": "data/dolmino_100b",
