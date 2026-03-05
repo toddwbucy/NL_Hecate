@@ -5,9 +5,16 @@
 /// code (PTX/SASS), NOT LLVM IR — making them opaque to AD (compiled machine code).
 /// Analytical backward kernels provide gradients for these opaque regions.
 ///
-/// Multi-architecture support: nvcc embeds SASS for sm_86/89/90 plus PTX
-/// for compute_86 as a forward-compatible fallback. The CUDA runtime
-/// automatically selects the correct variant at kernel launch time.
+/// Multi-architecture support: nvcc embeds SASS for sm_86/89/90a plus PTX
+/// for compute_90a and compute_86 as forward-compatible fallbacks. The CUDA
+/// runtime automatically selects the correct variant at kernel launch time.
+///
+/// Architecture targets:
+///   sm_86  — Ampere (A6000, RTX 3090)
+///   sm_89  — Ada Lovelace (RTX 4090)
+///   sm_90a — Hopper (H100, H200) — enables TMA, cp.async pipeline
+///   compute_90a PTX — forward-compat for Hopper+ (Blackwell JIT-compiles this)
+///   compute_86 PTX  — legacy fallback for sm >= 86 without native SASS
 
 fn main() {
     #[cfg(feature = "cuda")]
@@ -21,9 +28,10 @@ fn main() {
             // Architecture-specific SASS (native performance)
             .flag("-gencode").flag("arch=compute_86,code=sm_86")   // A6000, RTX 3090
             .flag("-gencode").flag("arch=compute_89,code=sm_89")   // RTX 4090, RTX 2000 Ada
-            .flag("-gencode").flag("arch=compute_90,code=sm_90")   // H100
-            // PTX fallback (JIT-compiled for future GPUs >= sm_86)
-            .flag("-gencode").flag("arch=compute_86,code=compute_86")
+            .flag("-gencode").flag("arch=compute_90a,code=sm_90a") // H100, H200 (TMA-enabled)
+            // PTX fallback (JIT-compiled for future GPUs)
+            .flag("-gencode").flag("arch=compute_90a,code=compute_90a") // Hopper+ (Blackwell)
+            .flag("-gencode").flag("arch=compute_86,code=compute_86")   // Ampere+ (legacy)
             .flag("-O2")
             .flag("--use_fast_math")
             .flag("-Xcompiler")

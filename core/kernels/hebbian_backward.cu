@@ -10,8 +10,33 @@
 // NOT shared memory. At d=512, d_M[d*d] = 1MB — exceeds GPU smem limits.
 
 #include <cuda_runtime.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+// ══════════════════════════════════════════════════════════════════════
+// Hopper cp.async helpers (sm_90a / sm_80+)
+// ══════════════════════════════════════════════════════════════════════
+#if __CUDA_ARCH__ >= 800
+
+__device__ __forceinline__ void cp_async_f32_hebb_bwd(float* smem_dst, const float* gmem_src) {
+    uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 4;\n"
+        :: "r"(smem_addr), "l"(gmem_src)
+    );
+}
+
+__device__ __forceinline__ void cp_async_commit_hebb_bwd() {
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+
+template <int N>
+__device__ __forceinline__ void cp_async_wait_hebb_bwd() {
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+}
+
+#endif // __CUDA_ARCH__ >= 800
 
 static inline void check_cuda_launch(const char* kernel_name, int d, int smem_bytes) {
     cudaError_t err = cudaGetLastError();
@@ -47,9 +72,20 @@ __global__ void hebbian_backward_kernel(
     int tid = threadIdx.x;
     int dd = d * d;
 
-    // Shared: only reduce_buf[blockDim.x]
+    // ── Shared memory layout ──
+    // Legacy (sm_86/89): reduce_buf[blockDim.x]
+    // Hopper (sm_80+):   reduce_buf[blockDim.x] + k_buf[2*d] + v_buf[2*d]
+    //                    + q_buf[2*d] + dy_buf[2*d]
     extern __shared__ float smem[];
     float* reduce_buf = smem;
+
+#if __CUDA_ARCH__ >= 800
+    // Double-buffered vector staging (after reduce_buf)
+    float* buf_k  = smem + blockDim.x;
+    float* buf_v  = buf_k + 2 * d;
+    float* buf_q  = buf_v + 2 * d;
+    float* buf_dy = buf_q + 2 * d;
+#endif
 
     // Init d_M = 0
     for (int idx = tid; idx < dd; idx += blockDim.x) {
@@ -57,6 +93,111 @@ __global__ void hebbian_backward_kernel(
     }
     __syncthreads();
 
+#if __CUDA_ARCH__ >= 800
+    // ── Hopper/Ampere path: cp.async prefetch for backward loop ──
+    // Prefetch the last token (seq_len-1) into buffer 0
+    int cur = 0;
+    int t_last = seq_len - 1;
+    for (int i = tid; i < d; i += blockDim.x) {
+        cp_async_f32_hebb_bwd(&buf_k[0 * d + i],  &k_mem[t_last * d + i]);
+        cp_async_f32_hebb_bwd(&buf_v[0 * d + i],  &v_mem[t_last * d + i]);
+        cp_async_f32_hebb_bwd(&buf_q[0 * d + i],  &q_mem[t_last * d + i]);
+        cp_async_f32_hebb_bwd(&buf_dy[0 * d + i], &d_y[t_last * d + i]);
+    }
+    cp_async_commit_hebb_bwd();
+
+    for (int t = seq_len - 1; t >= 0; t--) {
+        int next = 1 - cur;
+
+        // Prefetch token t-1 into alternate buffer
+        if (t > 0) {
+            for (int i = tid; i < d; i += blockDim.x) {
+                cp_async_f32_hebb_bwd(&buf_k[next * d + i],  &k_mem[(t - 1) * d + i]);
+                cp_async_f32_hebb_bwd(&buf_v[next * d + i],  &v_mem[(t - 1) * d + i]);
+                cp_async_f32_hebb_bwd(&buf_q[next * d + i],  &q_mem[(t - 1) * d + i]);
+                cp_async_f32_hebb_bwd(&buf_dy[next * d + i], &d_y[(t - 1) * d + i]);
+            }
+            cp_async_commit_hebb_bwd();
+        }
+
+        // Wait for current buffer
+        cp_async_wait_hebb_bwd<1>();
+        __syncthreads();
+
+        const float* k_t   = &buf_k[cur * d];
+        const float* v_t   = &buf_v[cur * d];
+        const float* q_t   = &buf_q[cur * d];
+        const float* d_y_t = &buf_dy[cur * d];
+        const float* m_t = m_states + t * dd;
+        const float* m_next = m_states + (t + 1) * dd;
+        float alpha_t = alpha[t];
+
+        // d_M += outer(d_y_t, q_t)
+        for (int idx = tid; idx < dd; idx += blockDim.x) {
+            int i = idx / d;
+            int j = idx % d;
+            d_M[idx] += d_y_t[i] * q_t[j];
+        }
+        __syncthreads();
+
+        // d_q_t = M_{t+1}^T @ d_y_t
+        if (tid < d) {
+            float sum = 0.0f;
+            for (int i = 0; i < d; i++) {
+                sum += m_next[i * d + tid] * d_y_t[i];
+            }
+            d_q_mem[t * d + tid] = sum;
+        }
+        __syncthreads();
+
+        // d_alpha = -sum(M_t * d_M)
+        {
+            float local_sum = 0.0f;
+            for (int idx = tid; idx < dd; idx += blockDim.x) {
+                local_sum += m_t[idx] * d_M[idx];
+            }
+            reduce_buf[tid] = local_sum;
+            __syncthreads();
+            for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+                if (tid < s) reduce_buf[tid] += reduce_buf[tid + s];
+                __syncthreads();
+            }
+            if (tid == 0) d_alpha[t] = -reduce_buf[0];
+            __syncthreads();
+        }
+
+        // d_v[i] = sum_j d_M[i,j] * k_t[j] (from outer product)
+        if (tid < d) {
+            float sum = 0.0f;
+            for (int j = 0; j < d; j++) {
+                sum += d_M[tid * d + j] * k_t[j];
+            }
+            d_v_mem[t * d + tid] = sum;
+        }
+
+        // d_k[j] = sum_i d_M[i,j] * v_t[i] (from outer product)
+        if (tid < d) {
+            float sum = 0.0f;
+            for (int i = 0; i < d; i++) {
+                sum += d_M[i * d + tid] * v_t[i];
+            }
+            d_k_mem[t * d + tid] = sum;
+        }
+        __syncthreads();
+
+        // d_M_prev = (1-alpha) * d_M
+        float retention = 1.0f - alpha_t;
+        for (int idx = tid; idx < dd; idx += blockDim.x) {
+            d_M[idx] = retention * d_M[idx];
+        }
+        __syncthreads();
+
+        cur = next;
+    }
+
+#else
+    // ── Legacy path (sm_86/89): direct global memory access ──
+    // Unchanged from original — byte-identical behavior.
     for (int t = seq_len - 1; t >= 0; t--) {
         const float* k_t = k_mem + t * d;
         const float* v_t = v_mem + t * d;
@@ -126,6 +267,7 @@ __global__ void hebbian_backward_kernel(
         }
         __syncthreads();
     }
+#endif // __CUDA_ARCH__ >= 800
 
     // Store d_m_initial
     for (int idx = tid; idx < dd; idx += blockDim.x) {
@@ -260,8 +402,8 @@ extern "C" void hebbian_backward_segment_f32_cuda(
     dim3 grid(1);
     dim3 block(block_size);
 
-    // Shared: reduce_buf[block_size] only
-    int smem_bytes = block_size * sizeof(float);
+    // Shared memory layout: same as main backward kernel
+    int smem_bytes = (block_size + 8 * d) * sizeof(float);
 
     float* d_M_work = nullptr;
     check_cuda_alloc("hebbian_backward_segment: cudaMalloc d_M_work",
@@ -297,8 +439,11 @@ extern "C" void hebbian_backward_f32_cuda(
     dim3 grid(1);
     dim3 block(block_size);
 
-    // Shared: reduce_buf[block_size] only
-    int smem_bytes = block_size * sizeof(float);
+    // Shared memory layout:
+    //   Legacy: reduce_buf[block_size]
+    //   Hopper: + k_buf[2*d] + v_buf[2*d] + q_buf[2*d] + dy_buf[2*d]
+    // Host allocates the maximum so the kernel works on any architecture.
+    int smem_bytes = (block_size + 8 * d) * sizeof(float);
 
     float* d_M_work = nullptr;
     check_cuda_alloc("hebbian_backward: cudaMalloc d_M_work",

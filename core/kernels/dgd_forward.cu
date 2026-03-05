@@ -27,8 +27,36 @@
 // Source: HOPE (2512.24695) Eq 88, Eq 121; core/src/dgd.rs
 
 #include <cuda_runtime.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+// ══════════════════════════════════════════════════════════════════════
+// Hopper cp.async helpers (sm_90a / sm_80+)
+// cp.async copies 4/8/16 bytes from global to shared memory asynchronously.
+// The SM continues executing while the copy engine handles the transfer.
+// Suffix _dgd avoids ODR conflicts with other translation units.
+// ══════════════════════════════════════════════════════════════════════
+#if __CUDA_ARCH__ >= 800
+
+__device__ __forceinline__ void cp_async_f32_dgd(float* smem_dst, const float* gmem_src) {
+    uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 4;\n"
+        :: "r"(smem_addr), "l"(gmem_src)
+    );
+}
+
+__device__ __forceinline__ void cp_async_commit_dgd() {
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+
+template <int N>
+__device__ __forceinline__ void cp_async_wait_dgd() {
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+}
+
+#endif // __CUDA_ARCH__ >= 800
 
 static inline void check_cuda_launch(const char* kernel_name, int d, int smem_bytes) {
     cudaError_t err = cudaGetLastError();
@@ -60,10 +88,20 @@ __global__ void dgd_forward_kernel(
     int tid = threadIdx.x;
     int dd = d * d;
 
-    // Shared memory: only small working buffers
+    // ── Shared memory layout ──
+    // Legacy (sm_86/89): prediction[d] + error[d] = 2*d floats
+    // Hopper (sm_80+):   prediction[d] + error[d] + k_buf[2*d] + v_buf[2*d]
+    //                    + q_buf[2*d] = 8*d floats
     extern __shared__ float smem[];
     float* prediction = smem;           // [d]
     float* error_buf = smem + d;        // [d]
+
+#if __CUDA_ARCH__ >= 800
+    // Double-buffered vector staging for cp.async prefetch.
+    float* buf_k = smem + 2 * d;       // [2*d]
+    float* buf_v = smem + 4 * d;       // [2*d]
+    float* buf_q = smem + 6 * d;       // [2*d]
+#endif
 
     // Store M_0 to m_states from m_initial
     for (int idx = tid; idx < dd; idx += blockDim.x) {
@@ -71,6 +109,86 @@ __global__ void dgd_forward_kernel(
     }
     __syncthreads();
 
+#if __CUDA_ARCH__ >= 800
+    // ── Hopper/Ampere path: cp.async double-buffered vector prefetch ──
+    // Prefetch token 0 vectors into buffer 0
+    int cur = 0;
+    for (int i = tid; i < d; i += blockDim.x) {
+        cp_async_f32_dgd(&buf_k[0 * d + i], &k_mem[0 * d + i]);
+        cp_async_f32_dgd(&buf_v[0 * d + i], &v_mem[0 * d + i]);
+        cp_async_f32_dgd(&buf_q[0 * d + i], &q_mem[0 * d + i]);
+    }
+    cp_async_commit_dgd();
+
+    // Sequential token loop
+    for (int t = 0; t < seq_len; t++) {
+        int next = 1 - cur;
+
+        // Prefetch token t+1 into alternate buffer (overlaps with compute)
+        if (t + 1 < seq_len) {
+            for (int i = tid; i < d; i += blockDim.x) {
+                cp_async_f32_dgd(&buf_k[next * d + i], &k_mem[(t + 1) * d + i]);
+                cp_async_f32_dgd(&buf_v[next * d + i], &v_mem[(t + 1) * d + i]);
+                cp_async_f32_dgd(&buf_q[next * d + i], &q_mem[(t + 1) * d + i]);
+            }
+            cp_async_commit_dgd();
+        }
+
+        // Wait for current buffer to be ready
+        cp_async_wait_dgd<1>();
+        __syncthreads();
+
+        // Pointers to current buffer's vectors
+        const float* k_t = &buf_k[cur * d];
+        const float* v_t = &buf_v[cur * d];
+        const float* q_t = &buf_q[cur * d];
+        float alpha_t = alpha[t];
+        float theta_t = theta[t];
+        int m_t_off = t * dd;
+        int m_next_off = (t + 1) * dd;
+
+        // ── prediction[i] = sum_j M_t[i,j] * k_t[j] ──
+        if (tid < d) {
+            float sum = 0.0f;
+            for (int j = 0; j < d; j++) {
+                sum += m_states[m_t_off + tid * d + j] * k_t[j];
+            }
+            prediction[tid] = sum;
+        }
+        __syncthreads();
+
+        // ── error[i] = prediction[i] - v_t[i] ──
+        if (tid < d) {
+            error_buf[tid] = prediction[tid] - v_t[tid];
+        }
+        __syncthreads();
+
+        // ── M_{t+1}[i,j] = (1-alpha_t) * M_t[i,j] - theta_t * error[i] * k_t[j] ──
+        float retention = 1.0f - alpha_t;
+        for (int idx = tid; idx < dd; idx += blockDim.x) {
+            int i = idx / d;
+            int j = idx % d;
+            m_states[m_next_off + idx] = retention * m_states[m_t_off + idx]
+                                         - theta_t * error_buf[i] * k_t[j];
+        }
+        __syncthreads();
+
+        // ── y_t[i] = sum_j M_{t+1}[i,j] * q_t[j] ──
+        if (tid < d) {
+            float sum = 0.0f;
+            for (int j = 0; j < d; j++) {
+                sum += m_states[m_next_off + tid * d + j] * q_t[j];
+            }
+            y[t * d + tid] = sum;
+        }
+        __syncthreads();
+
+        cur = next;
+    }
+
+#else
+    // ── Legacy path (sm_86/89): direct global memory access ──
+    // Unchanged from original — byte-identical behavior.
     // Sequential token loop
     for (int t = 0; t < seq_len; t++) {
         const float* k_t = k_mem + t * d;
@@ -117,6 +235,7 @@ __global__ void dgd_forward_kernel(
         }
         __syncthreads();
     }
+#endif // __CUDA_ARCH__ >= 800
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -144,6 +263,12 @@ __global__ void dgd_forward_ckpt_kernel(
     float* prediction = smem;
     float* error_buf = smem + d;
 
+#if __CUDA_ARCH__ >= 800
+    float* buf_k = smem + 2 * d;       // [2*d]
+    float* buf_v = smem + 4 * d;       // [2*d]
+    float* buf_q = smem + 6 * d;       // [2*d]
+#endif
+
     // Load M_0 into workspace
     for (int idx = tid; idx < dd; idx += blockDim.x) {
         m_work[idx] = m_initial[idx];
@@ -158,6 +283,84 @@ __global__ void dgd_forward_ckpt_kernel(
 
     int ckpt_idx = 1;  // next checkpoint slot
 
+#if __CUDA_ARCH__ >= 800
+    // ── Hopper/Ampere path: cp.async double-buffered vector prefetch ──
+    int cur = 0;
+    for (int i = tid; i < d; i += blockDim.x) {
+        cp_async_f32_dgd(&buf_k[0 * d + i], &k_mem[0 * d + i]);
+        cp_async_f32_dgd(&buf_v[0 * d + i], &v_mem[0 * d + i]);
+        cp_async_f32_dgd(&buf_q[0 * d + i], &q_mem[0 * d + i]);
+    }
+    cp_async_commit_dgd();
+
+    for (int t = 0; t < seq_len; t++) {
+        int next = 1 - cur;
+
+        if (t + 1 < seq_len) {
+            for (int i = tid; i < d; i += blockDim.x) {
+                cp_async_f32_dgd(&buf_k[next * d + i], &k_mem[(t + 1) * d + i]);
+                cp_async_f32_dgd(&buf_v[next * d + i], &v_mem[(t + 1) * d + i]);
+                cp_async_f32_dgd(&buf_q[next * d + i], &q_mem[(t + 1) * d + i]);
+            }
+            cp_async_commit_dgd();
+        }
+
+        cp_async_wait_dgd<1>();
+        __syncthreads();
+
+        const float* k_t = &buf_k[cur * d];
+        const float* v_t = &buf_v[cur * d];
+        const float* q_t = &buf_q[cur * d];
+        float alpha_t = alpha[t];
+        float theta_t = theta[t];
+
+        // prediction = M @ k
+        if (tid < d) {
+            float sum = 0.0f;
+            for (int j = 0; j < d; j++) {
+                sum += m_work[tid * d + j] * k_t[j];
+            }
+            prediction[tid] = sum;
+        }
+        __syncthreads();
+
+        if (tid < d) {
+            error_buf[tid] = prediction[tid] - v_t[tid];
+        }
+        __syncthreads();
+
+        float retention = 1.0f - alpha_t;
+        for (int idx = tid; idx < dd; idx += blockDim.x) {
+            int i = idx / d;
+            int j = idx % d;
+            m_work[idx] = retention * m_work[idx] - theta_t * error_buf[i] * k_t[j];
+        }
+        __syncthreads();
+
+        // Store checkpoint if at interval boundary or final step
+        if (((t + 1) % checkpoint_interval == 0) || (t + 1 == seq_len)) {
+            int off = ckpt_idx * dd;
+            for (int idx = tid; idx < dd; idx += blockDim.x) {
+                m_states[off + idx] = m_work[idx];
+            }
+            ckpt_idx++;
+        }
+
+        // y = M @ q (always written)
+        if (tid < d) {
+            float sum = 0.0f;
+            for (int j = 0; j < d; j++) {
+                sum += m_work[tid * d + j] * q_t[j];
+            }
+            y[t * d + tid] = sum;
+        }
+        __syncthreads();
+
+        cur = next;
+    }
+
+#else
+    // ── Legacy path (sm_86/89): direct global memory access ──
     for (int t = 0; t < seq_len; t++) {
         const float* k_t = k_mem + t * d;
         const float* v_t = v_mem + t * d;
@@ -207,6 +410,7 @@ __global__ void dgd_forward_ckpt_kernel(
         }
         __syncthreads();
     }
+#endif // __CUDA_ARCH__ >= 800
 }
 
 extern "C" void dgd_forward_ckpt_f32_cuda(
@@ -222,7 +426,12 @@ extern "C" void dgd_forward_ckpt_f32_cuda(
     dim3 grid(1);
     dim3 block(block_size);
 
-    int smem_bytes = 2 * d * sizeof(float);
+    // Shared memory layout:
+    //   Legacy (sm_86/89): prediction[d] + error[d] = 2*d floats
+    //   Hopper (sm_80+):   prediction[d] + error[d] + k_buf[2*d] + v_buf[2*d]
+    //                      + q_buf[2*d] = 8*d floats
+    // Host allocates the maximum (8*d) so the kernel works on any architecture.
+    int smem_bytes = 8 * d * sizeof(float);
 
     float* m_work = nullptr;
     check_cuda_alloc("dgd_forward_ckpt: cudaMalloc m_work",
@@ -251,7 +460,12 @@ extern "C" void dgd_forward_f32_cuda(
     dim3 grid(1);
     dim3 block(block_size);
 
-    int smem_bytes = 2 * d * sizeof(float);
+    // Shared memory layout:
+    //   Legacy (sm_86/89): prediction[d] + error[d] = 2*d floats
+    //   Hopper (sm_80+):   prediction[d] + error[d] + k_buf[2*d] + v_buf[2*d]
+    //                      + q_buf[2*d] = 8*d floats
+    // Host allocates the maximum (8*d) so the kernel works on any architecture.
+    int smem_bytes = 8 * d * sizeof(float);
 
     dgd_forward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_initial,
