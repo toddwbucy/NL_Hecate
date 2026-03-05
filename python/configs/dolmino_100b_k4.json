@@ -1,5 +1,5 @@
 {
-  "description": "Dolmino-Mix 100B — k=4 CMS Delta Rule cold-start build (d=512, ingredient1 common_crawl). 100K steps on 1B-token dolmino dataset. eval_every=1028 (2×L3), save_every=5126 (10×L3+6). Delta series baseline.",
+  "description": "Dolmino-Mix 100B — k=4 CMS Delta Rule cold-start build (d=512, ingredient1 common_crawl). 100K steps on 1B-token dolmino dataset. eval_every=1028 (2×L3+4), save_every=5126 (10×L3+6). Delta series baseline.",
   "model": {
     "d_model": 512,
     "num_heads": 8,
