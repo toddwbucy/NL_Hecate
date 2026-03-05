@@ -397,8 +397,8 @@ extern "C" void hebbian_backward_segment_f32_cuda(
     float* d_alpha, float* d_m_out,
     int t_start, int t_end, int d)
 {
-    if (d > 1024) {
-        fprintf(stderr, "hebbian_backward_segment_f32_cuda: d=%d exceeds maximum supported dimension (1024). "
+    if (d <= 0 || d > 1024) {
+        fprintf(stderr, "hebbian_backward_segment_f32_cuda: d=%d has invalid dimension (must be 1..=1024). "
                         "Kernel restructuring needed for d > 1024.\n", d);
         exit(1);
     }
@@ -439,8 +439,8 @@ extern "C" void hebbian_backward_f32_cuda(
     float* d_alpha, float* d_m_initial,
     int seq_len, int d)
 {
-    if (d > 1024) {
-        fprintf(stderr, "hebbian_backward_f32_cuda: d=%d exceeds maximum supported dimension (1024). "
+    if (d <= 0 || d > 1024) {
+        fprintf(stderr, "hebbian_backward_f32_cuda: d=%d has invalid dimension (must be 1..=1024). "
                         "Kernel restructuring needed for d > 1024.\n", d);
         exit(1);
     }

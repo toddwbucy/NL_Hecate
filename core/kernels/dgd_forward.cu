@@ -432,9 +432,14 @@ extern "C" void dgd_forward_ckpt_f32_cuda(
     float* m_states, float* y,
     int seq_len, int d, int checkpoint_interval)
 {
-    if (d > 1024) {
-        fprintf(stderr, "dgd_forward_ckpt_f32_cuda: d=%d exceeds maximum supported dimension (1024). "
+    if (d <= 0 || d > 1024) {
+        fprintf(stderr, "dgd_forward_ckpt_f32_cuda: d=%d has invalid dimension (must be 1..=1024). "
                         "Kernel restructuring needed for d > 1024.\n", d);
+        exit(1);
+    }
+    if (checkpoint_interval <= 0) {
+        fprintf(stderr, "dgd_forward_ckpt_f32_cuda: checkpoint_interval=%d must be > 0.\n",
+                checkpoint_interval);
         exit(1);
     }
     int dd = d * d;
@@ -475,8 +480,8 @@ extern "C" void dgd_forward_f32_cuda(
     float* m_states, float* y,
     int seq_len, int d)
 {
-    if (d > 1024) {
-        fprintf(stderr, "dgd_forward_f32_cuda: d=%d exceeds maximum supported dimension (1024). "
+    if (d <= 0 || d > 1024) {
+        fprintf(stderr, "dgd_forward_f32_cuda: d=%d has invalid dimension (must be 1..=1024). "
                         "Kernel restructuring needed for d > 1024.\n", d);
         exit(1);
     }
