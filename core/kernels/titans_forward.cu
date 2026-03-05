@@ -136,12 +136,14 @@ __global__ void titans_forward_kernel(
     // ── Hopper/Ampere path: cp.async double-buffered vector prefetch ──
     // Prefetch token 0 vectors into buffer 0
     int cur = 0;
-    for (int i = tid; i < d; i += blockDim.x) {
-        cp_async_f32(&buf_k[0 * d + i], &k_mem[0 * d + i]);
-        cp_async_f32(&buf_v[0 * d + i], &v_mem[0 * d + i]);
-        cp_async_f32(&buf_q[0 * d + i], &q_mem[0 * d + i]);
+    if (seq_len > 0) {
+        for (int i = tid; i < d; i += blockDim.x) {
+            cp_async_f32(&buf_k[0 * d + i], &k_mem[0 * d + i]);
+            cp_async_f32(&buf_v[0 * d + i], &v_mem[0 * d + i]);
+            cp_async_f32(&buf_q[0 * d + i], &q_mem[0 * d + i]);
+        }
+        cp_async_commit();
     }
-    cp_async_commit();
 
     for (int t = 0; t < seq_len; t++) {
         int next = 1 - cur;
@@ -156,8 +158,13 @@ __global__ void titans_forward_kernel(
             cp_async_commit();
         }
 
-        // Wait for current buffer to be ready
-        cp_async_wait<1>();
+        // Wait for current buffer to be ready.
+        // <1>: one prefetch still in flight (next token). <0>: flush all on final iteration.
+        if (t + 1 < seq_len) {
+            cp_async_wait<1>();
+        } else {
+            cp_async_wait<0>();
+        }
         __syncthreads();
 
         // Pointers to current buffer's vectors
@@ -423,6 +430,10 @@ extern "C" void titans_forward_f32_cuda(
     // Host allocates the maximum (8*d) so the kernel works on any architecture.
     // On sm_86/89 the extra shared memory is allocated but unused — no cost.
     int smem_bytes = 8 * d * sizeof(float);
+
+    // Hopper path may exceed the 48KB default dynamic shared memory limit at large d.
+    cudaFuncSetAttribute(titans_forward_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
 
     titans_forward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, eta,

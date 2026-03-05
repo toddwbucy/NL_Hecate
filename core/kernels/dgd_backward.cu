@@ -118,13 +118,15 @@ __global__ void dgd_backward_kernel(
     // Prefetch the last token (seq_len-1) into buffer 0
     int cur = 0;
     int t_last = seq_len - 1;
-    for (int i = tid; i < d; i += blockDim.x) {
-        cp_async_f32_dgd_bwd(&buf_k[0 * d + i],  &k_mem[t_last * d + i]);
-        cp_async_f32_dgd_bwd(&buf_v[0 * d + i],  &v_mem[t_last * d + i]);
-        cp_async_f32_dgd_bwd(&buf_q[0 * d + i],  &q_mem[t_last * d + i]);
-        cp_async_f32_dgd_bwd(&buf_dy[0 * d + i], &d_y[t_last * d + i]);
+    if (seq_len > 0) {
+        for (int i = tid; i < d; i += blockDim.x) {
+            cp_async_f32_dgd_bwd(&buf_k[0 * d + i],  &k_mem[t_last * d + i]);
+            cp_async_f32_dgd_bwd(&buf_v[0 * d + i],  &v_mem[t_last * d + i]);
+            cp_async_f32_dgd_bwd(&buf_q[0 * d + i],  &q_mem[t_last * d + i]);
+            cp_async_f32_dgd_bwd(&buf_dy[0 * d + i], &d_y[t_last * d + i]);
+        }
+        cp_async_commit_dgd_bwd();
     }
-    cp_async_commit_dgd_bwd();
 
     // Reverse token loop
     for (int t = seq_len - 1; t >= 0; t--) {
@@ -141,8 +143,13 @@ __global__ void dgd_backward_kernel(
             cp_async_commit_dgd_bwd();
         }
 
-        // Wait for current buffer
-        cp_async_wait_dgd_bwd<1>();
+        // Wait for current buffer.
+        // On the last iteration (t==0) no next prefetch was issued, so drain all groups.
+        if (t > 0) {
+            cp_async_wait_dgd_bwd<1>();
+        } else {
+            cp_async_wait_dgd_bwd<0>();
+        }
         __syncthreads();
 
         const float* k_t   = &buf_k[cur * d];
@@ -344,13 +351,15 @@ __global__ void dgd_backward_segment_kernel(
     // ── Hopper/Ampere path: cp.async prefetch for backward segment loop ──
     int cur = 0;
     int t_last = t_end - 1;
-    for (int i = tid; i < d; i += blockDim.x) {
-        cp_async_f32_dgd_bwd(&buf_k[0 * d + i],  &k_mem[t_last * d + i]);
-        cp_async_f32_dgd_bwd(&buf_v[0 * d + i],  &v_mem[t_last * d + i]);
-        cp_async_f32_dgd_bwd(&buf_q[0 * d + i],  &q_mem[t_last * d + i]);
-        cp_async_f32_dgd_bwd(&buf_dy[0 * d + i], &d_y[t_last * d + i]);
+    if (t_end > t_start) {
+        for (int i = tid; i < d; i += blockDim.x) {
+            cp_async_f32_dgd_bwd(&buf_k[0 * d + i],  &k_mem[t_last * d + i]);
+            cp_async_f32_dgd_bwd(&buf_v[0 * d + i],  &v_mem[t_last * d + i]);
+            cp_async_f32_dgd_bwd(&buf_q[0 * d + i],  &q_mem[t_last * d + i]);
+            cp_async_f32_dgd_bwd(&buf_dy[0 * d + i], &d_y[t_last * d + i]);
+        }
+        cp_async_commit_dgd_bwd();
     }
-    cp_async_commit_dgd_bwd();
 
     // Reverse loop over segment tokens
     for (int t = t_end - 1; t >= t_start; t--) {
@@ -367,7 +376,12 @@ __global__ void dgd_backward_segment_kernel(
             cp_async_commit_dgd_bwd();
         }
 
-        cp_async_wait_dgd_bwd<1>();
+        // On the last iteration (t==t_start) no next prefetch was issued, drain all groups.
+        if (t > t_start) {
+            cp_async_wait_dgd_bwd<1>();
+        } else {
+            cp_async_wait_dgd_bwd<0>();
+        }
         __syncthreads();
 
         int seg_t = t - t_start;
@@ -542,6 +556,8 @@ extern "C" void dgd_backward_segment_f32_cuda(
     check_cuda_alloc("dgd_backward_segment: cudaMalloc d_M_work",
                      cudaMalloc(&d_M_work, dd * sizeof(float)));
 
+    cudaFuncSetAttribute(dgd_backward_segment_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     dgd_backward_segment_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_states, d_y,
         d_m_seed,
@@ -587,6 +603,8 @@ extern "C" void dgd_backward_f32_cuda(
     check_cuda_alloc("dgd_backward: cudaMalloc d_M_work",
                      cudaMalloc(&d_M_work, dd * sizeof(float)));
 
+    cudaFuncSetAttribute(dgd_backward_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     dgd_backward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_states, d_y,
         d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta, d_m_initial,

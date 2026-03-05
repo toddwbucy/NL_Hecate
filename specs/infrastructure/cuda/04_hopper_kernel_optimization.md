@@ -25,7 +25,8 @@ CONTRACT
               No runtime cost — sm_90a kernels replace PTX JIT on Hopper GPUs.
   Trade-off:  TMA and cp.async add code complexity to kernel source. The
               non-Hopper code paths (sm_86/89) remain unchanged — Hopper-specific
-              code is #ifdef-guarded by __CUDA_ARCH__ >= 900. This means two code
+              code is #ifdef-guarded by __CUDA_ARCH__ >= 800 (cp.async available
+              on Ampere sm_80+, not just Hopper). This means two code
               paths per kernel to maintain. The alternative (single code path) leaves
               significant H100 performance on the table. At d=2048 (the 1B model
               target), memory latency hiding is critical.
@@ -95,8 +96,9 @@ prefetching and latency hiding become essential.
 
 **Why sm_90a not sm_90**: The `a` suffix enables TMA, thread block clusters, and
 other Hopper-specific features. Without it, nvcc generates generic Hopper code that
-doesn't use TMA instructions. The `a` is required for `__CUDA_ARCH__ >= 900` guards
-to enable TMA intrinsics.
+doesn't use TMA instructions. The `a` is required for TMA intrinsics. cp.async uses
+`__CUDA_ARCH__ >= 800` (available on Ampere+), while future TMA phases would
+use `>= 900`.
 
 **Binary size**: Adding one gencode target adds ~1-2 MB to the fat binary (17 kernels
 × ~100 KB SASS each). Acceptable.
@@ -132,9 +134,10 @@ const NATIVE_SM_VERSIONS: &[i32] = &[86, 89, 90];
 All Hopper-specific code is guarded by `__CUDA_ARCH__`:
 
 ```cuda
-#if __CUDA_ARCH__ >= 900
-    // Hopper path: TMA + cp.async
-    tma_prefetch_k_v_q(/* ... */);
+#if __CUDA_ARCH__ >= 800
+    // Ampere+ path: cp.async double-buffered vector prefetch
+    // cp.async available on sm_80+ (Ampere, Ada, Hopper, Blackwell)
+    cp_async_prefetch_k_v_q(/* ... */);
 #else
     // Legacy path: direct global loads (unchanged)
     // sm_86, sm_89 continue to use current code
@@ -168,11 +171,13 @@ __shared__ float v_buf[2][D_MAX];
 __shared__ float q_buf[2][D_MAX];
 int cur = 0;  // current buffer index
 
-// Prefetch token 0 into buffer 0
-cp_async_prefetch(k_buf[0], k_mem, d);
-cp_async_prefetch(v_buf[0], v_mem, d);
-cp_async_prefetch(q_buf[0], q_mem, d);
-cp_async_commit_group();
+// Prefetch token 0 into buffer 0 (guard against seq_len==0)
+if (seq_len > 0) {
+    cp_async_prefetch(k_buf[0], k_mem, d);
+    cp_async_prefetch(v_buf[0], v_mem, d);
+    cp_async_prefetch(q_buf[0], q_mem, d);
+    cp_async_commit_group();
+}
 
 for (int t = 0; t < seq_len; t++) {
     int next = 1 - cur;
@@ -183,8 +188,13 @@ for (int t = 0; t < seq_len; t++) {
         cp_async_prefetch(q_buf[next], q_mem + (t+1)*d, d);
         cp_async_commit_group();
     }
-    // Wait for current buffer to be ready
-    cp_async_wait_group(1);  // wait all but 1 outstanding group
+    // Wait for current buffer to be ready.
+    // <1>: one prefetch still in flight (next token). <0>: flush all on final iteration.
+    if (t + 1 < seq_len) {
+        cp_async_wait_group(1);
+    } else {
+        cp_async_wait_group(0);
+    }
     __syncthreads();
 
     // Compute with k_buf[cur], v_buf[cur], q_buf[cur]

@@ -113,12 +113,14 @@ __global__ void dgd_forward_kernel(
     // ── Hopper/Ampere path: cp.async double-buffered vector prefetch ──
     // Prefetch token 0 vectors into buffer 0
     int cur = 0;
-    for (int i = tid; i < d; i += blockDim.x) {
-        cp_async_f32_dgd(&buf_k[0 * d + i], &k_mem[0 * d + i]);
-        cp_async_f32_dgd(&buf_v[0 * d + i], &v_mem[0 * d + i]);
-        cp_async_f32_dgd(&buf_q[0 * d + i], &q_mem[0 * d + i]);
+    if (seq_len > 0) {
+        for (int i = tid; i < d; i += blockDim.x) {
+            cp_async_f32_dgd(&buf_k[0 * d + i], &k_mem[0 * d + i]);
+            cp_async_f32_dgd(&buf_v[0 * d + i], &v_mem[0 * d + i]);
+            cp_async_f32_dgd(&buf_q[0 * d + i], &q_mem[0 * d + i]);
+        }
+        cp_async_commit_dgd();
     }
-    cp_async_commit_dgd();
 
     // Sequential token loop
     for (int t = 0; t < seq_len; t++) {
@@ -134,8 +136,13 @@ __global__ void dgd_forward_kernel(
             cp_async_commit_dgd();
         }
 
-        // Wait for current buffer to be ready
-        cp_async_wait_dgd<1>();
+        // Wait for current buffer to be ready.
+        // On the last iteration no next prefetch was issued, so drain all groups.
+        if (t + 1 < seq_len) {
+            cp_async_wait_dgd<1>();
+        } else {
+            cp_async_wait_dgd<0>();
+        }
         __syncthreads();
 
         // Pointers to current buffer's vectors
@@ -286,12 +293,14 @@ __global__ void dgd_forward_ckpt_kernel(
 #if __CUDA_ARCH__ >= 800
     // ── Hopper/Ampere path: cp.async double-buffered vector prefetch ──
     int cur = 0;
-    for (int i = tid; i < d; i += blockDim.x) {
-        cp_async_f32_dgd(&buf_k[0 * d + i], &k_mem[0 * d + i]);
-        cp_async_f32_dgd(&buf_v[0 * d + i], &v_mem[0 * d + i]);
-        cp_async_f32_dgd(&buf_q[0 * d + i], &q_mem[0 * d + i]);
+    if (seq_len > 0) {
+        for (int i = tid; i < d; i += blockDim.x) {
+            cp_async_f32_dgd(&buf_k[0 * d + i], &k_mem[0 * d + i]);
+            cp_async_f32_dgd(&buf_v[0 * d + i], &v_mem[0 * d + i]);
+            cp_async_f32_dgd(&buf_q[0 * d + i], &q_mem[0 * d + i]);
+        }
+        cp_async_commit_dgd();
     }
-    cp_async_commit_dgd();
 
     for (int t = 0; t < seq_len; t++) {
         int next = 1 - cur;
@@ -305,7 +314,11 @@ __global__ void dgd_forward_ckpt_kernel(
             cp_async_commit_dgd();
         }
 
-        cp_async_wait_dgd<1>();
+        if (t + 1 < seq_len) {
+            cp_async_wait_dgd<1>();
+        } else {
+            cp_async_wait_dgd<0>();
+        }
         __syncthreads();
 
         const float* k_t = &buf_k[cur * d];
@@ -437,6 +450,8 @@ extern "C" void dgd_forward_ckpt_f32_cuda(
     check_cuda_alloc("dgd_forward_ckpt: cudaMalloc m_work",
                      cudaMalloc(&m_work, dd * sizeof(float)));
 
+    cudaFuncSetAttribute(dgd_forward_ckpt_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     dgd_forward_ckpt_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_initial,
         m_states, y, m_work, seq_len, d, checkpoint_interval);
@@ -467,6 +482,8 @@ extern "C" void dgd_forward_f32_cuda(
     // Host allocates the maximum (8*d) so the kernel works on any architecture.
     int smem_bytes = 8 * d * sizeof(float);
 
+    cudaFuncSetAttribute(dgd_forward_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     dgd_forward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_initial,
         m_states, y, seq_len, d);

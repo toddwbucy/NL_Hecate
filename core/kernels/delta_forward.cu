@@ -127,12 +127,14 @@ __global__ void delta_forward_kernel(
     // ── Hopper/Ampere path: cp.async double-buffered vector prefetch ──
     // Prefetch token 0 vectors into buffer 0
     int cur = 0;
-    for (int i = tid; i < d; i += blockDim.x) {
-        cp_async_f32_delta(&buf_k[0 * d + i], &k_mem[0 * d + i]);
-        cp_async_f32_delta(&buf_v[0 * d + i], &v_mem[0 * d + i]);
-        cp_async_f32_delta(&buf_q[0 * d + i], &q_mem[0 * d + i]);
+    if (seq_len > 0) {
+        for (int i = tid; i < d; i += blockDim.x) {
+            cp_async_f32_delta(&buf_k[0 * d + i], &k_mem[0 * d + i]);
+            cp_async_f32_delta(&buf_v[0 * d + i], &v_mem[0 * d + i]);
+            cp_async_f32_delta(&buf_q[0 * d + i], &q_mem[0 * d + i]);
+        }
+        cp_async_commit_delta();
     }
-    cp_async_commit_delta();
 
     for (int t = 0; t < seq_len; t++) {
         int next = 1 - cur;
@@ -148,7 +150,11 @@ __global__ void delta_forward_kernel(
         }
 
         // Wait for current buffer to be ready
-        cp_async_wait_delta<1>();
+        if (t + 1 < seq_len) {
+            cp_async_wait_delta<1>();
+        } else {
+            cp_async_wait_delta<0>();
+        }
         __syncthreads();
 
         // Pointers to current buffer's vectors
@@ -357,8 +363,8 @@ extern "C" void delta_forward_ckpt_f32_cuda(
 
     // Shared memory: prediction[d] + error[d] = 2*d floats.
     // Checkpointed kernel does not use cp.async (single-block, no batch),
-    // but allocate 8*d to match the batched kernel's maximum for consistency.
-    int smem_bytes = 8 * d * sizeof(float);
+    // so only the two working buffers are needed.
+    int smem_bytes = 2 * d * sizeof(float);
 
     // Allocate M workspace in global memory
     float* m_work = nullptr;
@@ -395,6 +401,9 @@ extern "C" void delta_forward_f32_cuda(
     // Host allocates the maximum (8*d) so the kernel works on any architecture.
     // On sm_86/89 the extra shared memory is allocated but unused — no cost.
     int smem_bytes = 8 * d * sizeof(float);
+
+    cudaFuncSetAttribute(delta_forward_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
 
     delta_forward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_initial,

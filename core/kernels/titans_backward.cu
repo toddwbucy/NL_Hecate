@@ -135,14 +135,16 @@ __global__ void titans_backward_kernel(
     // ── Hopper/Ampere path: cp.async prefetch for backward loop ──
     // Prefetch the last token (seq_len-1) into buffer 0
     int cur = 0;
-    int t_last = seq_len - 1;
-    for (int i = tid; i < d; i += blockDim.x) {
-        cp_async_f32_bwd(&buf_k[0 * d + i],  &k_mem[t_last * d + i]);
-        cp_async_f32_bwd(&buf_v[0 * d + i],  &v_mem[t_last * d + i]);
-        cp_async_f32_bwd(&buf_q[0 * d + i],  &q_mem[t_last * d + i]);
-        cp_async_f32_bwd(&buf_dy[0 * d + i], &d_y[t_last * d + i]);
+    if (seq_len > 0) {
+        int t_last = seq_len - 1;
+        for (int i = tid; i < d; i += blockDim.x) {
+            cp_async_f32_bwd(&buf_k[0 * d + i],  &k_mem[t_last * d + i]);
+            cp_async_f32_bwd(&buf_v[0 * d + i],  &v_mem[t_last * d + i]);
+            cp_async_f32_bwd(&buf_q[0 * d + i],  &q_mem[t_last * d + i]);
+            cp_async_f32_bwd(&buf_dy[0 * d + i], &d_y[t_last * d + i]);
+        }
+        cp_async_commit_bwd();
     }
-    cp_async_commit_bwd();
 
     for (int t = seq_len - 1; t >= 0; t--) {
         int next = 1 - cur;
@@ -158,8 +160,13 @@ __global__ void titans_backward_kernel(
             cp_async_commit_bwd();
         }
 
-        // Wait for current buffer
-        cp_async_wait_bwd<1>();
+        // Wait for current buffer.
+        // <1>: one prefetch still in flight (prev token). <0>: flush all on final iteration.
+        if (t > 0) {
+            cp_async_wait_bwd<1>();
+        } else {
+            cp_async_wait_bwd<0>();
+        }
         __syncthreads();
 
         const float* k_t   = &buf_k[cur * d];
@@ -554,8 +561,9 @@ extern "C" void titans_backward_segment_f32_cuda(
     dim3 grid(1);
     dim3 block(block_size);
 
-    // Shared memory: same layout as main backward kernel
-    int smem_bytes = (3 * d + block_size + 8 * d) * sizeof(float);
+    // Shared memory: prediction[d] + error[d] + d_error[d] + reduce_buf[block_size]
+    // Segment kernel does NOT use cp.async — no double-buffer allocation needed.
+    int smem_bytes = (3 * d + block_size) * sizeof(float);
 
     // Allocate d_M and d_S workspaces
     float* d_M_work = nullptr;
@@ -610,6 +618,10 @@ extern "C" void titans_backward_f32_cuda(
     //   Hopper: + k_buf[2*d] + v_buf[2*d] + q_buf[2*d] + dy_buf[2*d]
     // Host allocates the maximum so the kernel works on any architecture.
     int smem_bytes = (3 * d + block_size + 8 * d) * sizeof(float);
+
+    // Hopper path may exceed the 48KB default dynamic shared memory limit at large d.
+    cudaFuncSetAttribute(titans_backward_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
 
     // Allocate per-batch d_M and d_S workspaces (batch_size * dd each).
     // d_m_initial and d_s_initial are zeroed by caller; accumulated via atomicAdd.

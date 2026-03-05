@@ -148,13 +148,15 @@ __global__ void delta_backward_kernel(
     // Prefetch the last token (seq_len-1) into buffer 0
     int cur = 0;
     int t_last = seq_len - 1;
-    for (int i = tid; i < d; i += blockDim.x) {
-        cp_async_f32_delta_bwd(&buf_k[0 * d + i],  &k_mem[t_last * d + i]);
-        cp_async_f32_delta_bwd(&buf_v[0 * d + i],  &v_mem[t_last * d + i]);
-        cp_async_f32_delta_bwd(&buf_q[0 * d + i],  &q_mem[t_last * d + i]);
-        cp_async_f32_delta_bwd(&buf_dy[0 * d + i], &d_y[t_last * d + i]);
+    if (seq_len > 0) {
+        for (int i = tid; i < d; i += blockDim.x) {
+            cp_async_f32_delta_bwd(&buf_k[0 * d + i],  &k_mem[t_last * d + i]);
+            cp_async_f32_delta_bwd(&buf_v[0 * d + i],  &v_mem[t_last * d + i]);
+            cp_async_f32_delta_bwd(&buf_q[0 * d + i],  &q_mem[t_last * d + i]);
+            cp_async_f32_delta_bwd(&buf_dy[0 * d + i], &d_y[t_last * d + i]);
+        }
+        cp_async_commit_delta_bwd();
     }
-    cp_async_commit_delta_bwd();
 
     // Reverse token loop
     for (int t = seq_len - 1; t >= 0; t--) {
@@ -172,7 +174,11 @@ __global__ void delta_backward_kernel(
         }
 
         // Wait for current buffer
-        cp_async_wait_delta_bwd<1>();
+        if (t > 0) {
+            cp_async_wait_delta_bwd<1>();
+        } else {
+            cp_async_wait_delta_bwd<0>();
+        }
         __syncthreads();
 
         const float* k_t   = &buf_k[cur * d];
@@ -524,8 +530,8 @@ extern "C" void delta_backward_segment_f32_cuda(
     // Shared memory layout:
     //   Legacy: prediction[d] + error[d] + d_error[d] + reduce_buf[block_size]
     //   Hopper: + k_buf[2*d] + v_buf[2*d] + q_buf[2*d] + dy_buf[2*d]
-    // Host allocates the maximum so the kernel works on any architecture.
-    int smem_bytes = (3 * d + block_size + 8 * d) * sizeof(float);
+    // Segment kernel does not use cp.async — only needs the legacy layout.
+    int smem_bytes = (3 * d + block_size) * sizeof(float);
 
     // Allocate d_M workspace in global memory
     float* d_M_work = nullptr;
@@ -580,6 +586,9 @@ extern "C" void delta_backward_f32_cuda(
                      cudaMalloc(&d_M_work, (size_t)batch_size * dd * sizeof(float)));
     check_cuda_alloc("delta_backward: cudaMemset d_M_work",
                      cudaMemset(d_M_work, 0, (size_t)batch_size * dd * sizeof(float)));
+
+    cudaFuncSetAttribute(delta_backward_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
 
     delta_backward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_states, d_y,
