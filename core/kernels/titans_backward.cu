@@ -132,7 +132,7 @@ __global__ void titans_backward_kernel(
     __syncthreads();
 
 #if __CUDA_ARCH__ >= 800
-    // ── Hopper/Ampere path: cp.async prefetch for backward loop ──
+    // ── Ampere+ path: cp.async prefetch for backward loop ──
     // Prefetch the last token (seq_len-1) into buffer 0
     int cur = 0;
     if (seq_len > 0) {
@@ -175,7 +175,7 @@ __global__ void titans_backward_kernel(
         const float* d_y_t = &buf_dy[cur * d];
 
 #else
-    // ── Legacy path (sm_86/89): direct global memory access ──
+    // ── Pre-Ampere path: direct global memory access ──
     for (int t = seq_len - 1; t >= 0; t--) {
         const float* k_t = k_mem + t * d;
         const float* v_t = v_mem + t * d;
@@ -544,6 +544,11 @@ extern "C" void titans_backward_segment_f32_cuda(
     float* d_m_out, float* d_s_out,
     int t_start, int t_end, int d)
 {
+    if (d > 1024) {
+        fprintf(stderr, "titans_backward_segment_f32_cuda: d=%d exceeds maximum supported dimension (1024). "
+                        "Kernel restructuring needed for d > 1024.\n", d);
+        exit(1);
+    }
     int dd = d * d;
     // Cap at d (not dd): backward kernels require ~2× more registers than
     // forward due to prediction/error reconstruction. At d=512, block_size=1024
@@ -598,6 +603,11 @@ extern "C" void titans_backward_f32_cuda(
     float* d_m_initial, float* d_s_initial,
     int seq_len, int d, int batch_size)
 {
+    if (d > 1024) {
+        fprintf(stderr, "titans_backward_f32_cuda: d=%d exceeds maximum supported dimension (1024). "
+                        "Kernel restructuring needed for d > 1024.\n", d);
+        exit(1);
+    }
     int dd = d * d;
     // Cap at d (not dd): backward kernels require ~2× more registers than
     // forward due to prediction/error reconstruction. At d=512, block_size=1024

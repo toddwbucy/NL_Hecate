@@ -156,48 +156,50 @@ This ensures:
 **Target**: titans_forward.cu lines 83-89, the per-token vector loads.
 
 **Current pattern** (synchronous):
-```cuda
-for (int t = 0; t < seq_len; t++) {
-    const float* k_t = k_mem + t * d;   // pointer arithmetic
-    const float* v_t = v_mem + t * d;   // loads happen on first access
-    const float* q_t = q_mem + t * d;   // stalls if not in L1
+```rust
+// Per-token loop: loads stall if vectors not in L1 cache
+for t in 0..seq_len {
+    let k_t: &[f32; D] = &k_mem[t * d..(t + 1) * d];
+    let v_t: &[f32; D] = &v_mem[t * d..(t + 1) * d];
+    let q_t: &[f32; D] = &q_mem[t * d..(t + 1) * d];
     // ... compute with k_t, v_t, q_t ...
 }
 ```
 
-**Hopper pattern** (async prefetch, double-buffered):
-```cuda
+**Ampere+ pattern** (async prefetch, double-buffered):
+```rust
 // Shared memory: two vector buffers for double-buffering
-__shared__ float k_buf[2][D_MAX];  // D_MAX = compile-time max d
-__shared__ float v_buf[2][D_MAX];
-__shared__ float q_buf[2][D_MAX];
-int cur = 0;  // current buffer index
+// where D: Dim, T: DeviceFloat
+let mut k_buf: [[T; D]; 2];
+let mut v_buf: [[T; D]; 2];
+let mut q_buf: [[T; D]; 2];
+let mut cur: usize = 0;
 
 // Prefetch token 0 into buffer 0 (guard against seq_len==0)
-if (seq_len > 0) {
-    cp_async_prefetch(k_buf[0], k_mem, d);
-    cp_async_prefetch(v_buf[0], v_mem, d);
-    cp_async_prefetch(q_buf[0], q_mem, d);
+if seq_len > 0 {
+    cp_async_prefetch(&mut k_buf[0], &k_mem[0..d]);
+    cp_async_prefetch(&mut v_buf[0], &v_mem[0..d]);
+    cp_async_prefetch(&mut q_buf[0], &q_mem[0..d]);
     cp_async_commit_group();
 }
 
-for (int t = 0; t < seq_len; t++) {
-    int next = 1 - cur;
+for t in 0..seq_len {
+    let next = 1 - cur;
     // Prefetch token t+1 into alternate buffer (overlaps with compute)
-    if (t + 1 < seq_len) {
-        cp_async_prefetch(k_buf[next], k_mem + (t+1)*d, d);
-        cp_async_prefetch(v_buf[next], v_mem + (t+1)*d, d);
-        cp_async_prefetch(q_buf[next], q_mem + (t+1)*d, d);
+    if t + 1 < seq_len {
+        cp_async_prefetch(&mut k_buf[next], &k_mem[(t + 1) * d..(t + 2) * d]);
+        cp_async_prefetch(&mut v_buf[next], &v_mem[(t + 1) * d..(t + 2) * d]);
+        cp_async_prefetch(&mut q_buf[next], &q_mem[(t + 1) * d..(t + 2) * d]);
         cp_async_commit_group();
     }
     // Wait for current buffer to be ready.
-    // <1>: one prefetch still in flight (next token). <0>: flush all on final iteration.
-    if (t + 1 < seq_len) {
+    // wait(1): one prefetch still in flight. wait(0): flush all on final iteration.
+    if t + 1 < seq_len {
         cp_async_wait_group(1);
     } else {
         cp_async_wait_group(0);
     }
-    __syncthreads();
+    sync_threads();
 
     // Compute with k_buf[cur], v_buf[cur], q_buf[cur]
     // ... prediction, error, S/M update, readout ...
@@ -218,10 +220,10 @@ prefetching hides the ~400 cycle global memory latency.
 **Target**: The matrix-vector products `prediction = M @ k` and `y = M @ q`.
 
 **Current pattern**: Each thread reads M row-by-row from global memory:
-```cuda
+```rust
 // prediction[tid] = dot(M[tid, :], k)
-float sum = 0.0f;
-for (int j = 0; j < d; j++) {
+let mut sum: f32 = 0.0;
+for j in 0..d {
     sum += m_states[m_t_off + tid * d + j] * k_t[j];
 }
 ```
@@ -231,43 +233,46 @@ At d=2048, this is 8 KB per row × d rows = 32 MB of reads per matvec. The L2 ca
 between threads) causes cache line waste.
 
 **TMA pattern** (tile-based async load):
-```cuda
-// TMA descriptor set up once at kernel launch (host-side)
+```rust
+// TMA descriptor: set up once at kernel launch (host-side)
 // Describes M as a 2D tensor: [d rows × d cols], row-major, fp32
 
 // In kernel: load M rows in tiles of TILE_ROWS
-#define TILE_ROWS 32
-__shared__ float m_tile[2][TILE_ROWS][D_MAX];  // double-buffered
-int cur_tile = 0;
+// where D: Dim, T: DeviceFloat
+const TILE_ROWS: usize = 32;
+let mut m_tile: [[[T; D]; TILE_ROWS]; 2];  // double-buffered
+let mut cur_tile: usize = 0;
 
 // Load first tile
-tma_load_2d(m_tile[0], tma_desc_M, /*row_offset=*/0, /*col_offset=*/0,
-            TILE_ROWS, d);
+tma_load_2d(&mut m_tile[0], &tma_desc_m, 0, 0, TILE_ROWS, d);
 tma_commit();
 
-for (int row_start = 0; row_start < d; row_start += TILE_ROWS) {
-    int next_tile = 1 - cur_tile;
+let mut row_start = 0;
+while row_start < d {
+    let next_tile = 1 - cur_tile;
     // Prefetch next tile
-    if (row_start + TILE_ROWS < d) {
-        tma_load_2d(m_tile[next_tile], tma_desc_M,
+    if row_start + TILE_ROWS < d {
+        tma_load_2d(&mut m_tile[next_tile], &tma_desc_m,
                     row_start + TILE_ROWS, 0, TILE_ROWS, d);
         tma_commit();
     }
     tma_wait(1);
-    __syncthreads();
+    sync_threads();
 
     // Compute partial predictions from this tile
-    for (int r = 0; r < TILE_ROWS && (row_start + r) < d; r++) {
-        int row = row_start + r;
-        if (tid == row) {
-            float sum = 0.0f;
-            for (int j = 0; j < d; j++) {
+    for r in 0..TILE_ROWS {
+        let row = row_start + r;
+        if row >= d { break; }
+        if tid == row {
+            let mut sum: f32 = 0.0;
+            for j in 0..d {
                 sum += m_tile[cur_tile][r][j] * k_shared[j];
             }
             prediction[row] = sum;
         }
     }
     cur_tile = next_tile;
+    row_start += TILE_ROWS;
 }
 ```
 
@@ -289,8 +294,8 @@ store-back is possible but adds complexity. Phase 2 focuses on read-side only.
 The S/M update loop (titans_forward.cu lines 113-119) writes d² elements back to
 global memory with thread-strided access:
 
-```cuda
-for (int idx = tid; idx < dd; idx += blockDim.x) {
+```rust
+for idx in (tid..dd).step_by(block_dim_x) {
     s_states[m_next_off + idx] = s_new;
     m_states[m_next_off + idx] = retention * m_states[m_t_off + idx] + s_new;
 }
@@ -335,8 +340,8 @@ Delta, Hebbian).
   code — this is expected and harmless.
 - **sm_86 regression**: Run full test suite. sm_86 SASS must be byte-identical
   to pre-change binary (verified via `cuobjdump` diffing the fat binary).
-- **Code path test**: Verify `#if __CUDA_ARCH__ >= 900` code compiles without
-  errors when targeted at sm_90a.
+- **Code path test**: Verify `#if __CUDA_ARCH__ >= 800` code compiles without
+  errors when targeted at sm_86, sm_89, and sm_90a.
 
 ### 6.2 H100 Pod (rented, 2-4 hours)
 

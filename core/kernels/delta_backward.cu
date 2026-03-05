@@ -13,7 +13,7 @@
 // NOT shared memory. At d=512, d_M[d*d] = 1MB — exceeds GPU smem limits.
 // Only small buffers (prediction[d], error[d], d_error[d], reduce_buf) in smem.
 //
-// Hopper (sm_80+) optimization:
+// Ampere+ (sm_80+) optimization:
 //   When __CUDA_ARCH__ >= 800, the backward loop prefetches the PREVIOUS token's
 //   k/v/q/d_y vectors via cp.async while computing on the current token.
 //   The backward loop runs t = seq_len-1 down to 0, so "next to prefetch"
@@ -40,7 +40,7 @@
 #include <stdlib.h>
 
 // ══════════════════════════════════════════════════════════════════════
-// Hopper cp.async helpers (sm_80+)
+// Ampere+ cp.async helpers (sm_80+)
 // _delta_bwd suffix avoids ODR conflicts with forward and titans helpers.
 // ══════════════════════════════════════════════════════════════════════
 #if __CUDA_ARCH__ >= 800
@@ -120,8 +120,8 @@ __global__ void delta_backward_kernel(
     d_M        += b * dd;  // each batch element has its own d_M workspace
 
     // ── Shared memory layout ──
-    // Legacy (sm_86/89): prediction[d] + error[d] + d_error[d] + reduce_buf[blockDim.x]
-    // Hopper (sm_80+):   prediction[d] + error[d] + d_error[d] + reduce_buf[blockDim.x]
+    // Pre-Ampere: prediction[d] + error[d] + d_error[d] + reduce_buf[blockDim.x]
+    // Ampere+ (sm_80+):   prediction[d] + error[d] + d_error[d] + reduce_buf[blockDim.x]
     //                    + k_buf[2*d] + v_buf[2*d] + q_buf[2*d] + dy_buf[2*d]
     extern __shared__ float smem[];
     float* prediction = smem;                    // [d]
@@ -187,7 +187,7 @@ __global__ void delta_backward_kernel(
         const float* d_y_t = &buf_dy[cur * d];
 
 #else
-    // ── Legacy path (sm_86/89): direct global memory access ──
+    // ── Pre-Ampere path: direct global memory access ──
     // Unchanged from original — byte-identical behavior.
 
     // Reverse token loop
@@ -513,6 +513,11 @@ extern "C" void delta_backward_segment_f32_cuda(
     float* d_alpha, float* d_theta, float* d_m_out,
     int t_start, int t_end, int d)
 {
+    if (d > 1024) {
+        fprintf(stderr, "delta_backward_segment_f32_cuda: d=%d exceeds maximum supported dimension (1024). "
+                        "Kernel restructuring needed for d > 1024.\n", d);
+        exit(1);
+    }
     int dd = d * d;
     // Cap at min(d, 512): __launch_bounds__(512) constrains nvcc to 128 regs/thread.
     // Launching with >512 threads would need >65536 registers/block — exceeds sm_89
@@ -558,6 +563,11 @@ extern "C" void delta_backward_f32_cuda(
     float* d_alpha, float* d_theta, float* d_m_initial,
     int seq_len, int d, int batch_size)
 {
+    if (d > 1024) {
+        fprintf(stderr, "delta_backward_f32_cuda: d=%d exceeds maximum supported dimension (1024). "
+                        "Kernel restructuring needed for d > 1024.\n", d);
+        exit(1);
+    }
     int dd = d * d;
     // Cap at min(d, 512): __launch_bounds__(512) constrains nvcc to 128 regs/thread.
     // Launching with >512 threads would need >65536 registers/block — exceeds sm_89

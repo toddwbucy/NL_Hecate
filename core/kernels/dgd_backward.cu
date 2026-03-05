@@ -29,7 +29,7 @@
 #include <stdlib.h>
 
 // ══════════════════════════════════════════════════════════════════════
-// Hopper cp.async helpers (sm_90a / sm_80+)
+// Ampere+ cp.async helpers (sm_80+)
 // Suffix _dgd_bwd avoids ODR conflicts with forward TU and other kernels.
 // ══════════════════════════════════════════════════════════════════════
 #if __CUDA_ARCH__ >= 800
@@ -90,8 +90,8 @@ __global__ void dgd_backward_kernel(
     int dd = d * d;
 
     // ── Shared memory layout ──
-    // Legacy (sm_86/89): prediction[d] + error[d] + d_error[d] + reduce_buf[blockDim.x]
-    // Hopper (sm_80+):   prediction[d] + error[d] + d_error[d] + reduce_buf[blockDim.x]
+    // Pre-Ampere: prediction[d] + error[d] + d_error[d] + reduce_buf[blockDim.x]
+    // Ampere+ (sm_80+):   prediction[d] + error[d] + d_error[d] + reduce_buf[blockDim.x]
     //                    + k_buf[2*d] + v_buf[2*d] + q_buf[2*d] + dy_buf[2*d]
     extern __shared__ float smem[];
     float* prediction = smem;                    // [d]
@@ -114,7 +114,7 @@ __global__ void dgd_backward_kernel(
     __syncthreads();
 
 #if __CUDA_ARCH__ >= 800
-    // ── Hopper/Ampere path: cp.async prefetch for backward loop ──
+    // ── Ampere+ path: cp.async prefetch for backward loop ──
     // Prefetch the last token (seq_len-1) into buffer 0
     int cur = 0;
     int t_last = seq_len - 1;
@@ -158,7 +158,7 @@ __global__ void dgd_backward_kernel(
         const float* d_y_t = &buf_dy[cur * d];
 
 #else
-    // ── Legacy path (sm_86/89): direct global memory access ──
+    // ── Pre-Ampere path: direct global memory access ──
     // Reverse token loop
     for (int t = seq_len - 1; t >= 0; t--) {
         const float* k_t = k_mem + t * d;
@@ -348,7 +348,7 @@ __global__ void dgd_backward_segment_kernel(
     __syncthreads();
 
 #if __CUDA_ARCH__ >= 800
-    // ── Hopper/Ampere path: cp.async prefetch for backward segment loop ──
+    // ── Ampere+ path: cp.async prefetch for backward segment loop ──
     int cur = 0;
     int t_last = t_end - 1;
     if (t_end > t_start) {
@@ -391,7 +391,7 @@ __global__ void dgd_backward_segment_kernel(
         const float* d_y_t = &buf_dy[cur * d];
 
 #else
-    // ── Legacy path (sm_86/89): direct global memory access ──
+    // ── Pre-Ampere path: direct global memory access ──
     // Reverse loop over segment tokens
     for (int t = t_end - 1; t >= t_start; t--) {
         int seg_t = t - t_start;
@@ -531,6 +531,11 @@ extern "C" void dgd_backward_segment_f32_cuda(
     float* d_alpha, float* d_theta, float* d_m_out,
     int t_start, int t_end, int d)
 {
+    if (d > 1024) {
+        fprintf(stderr, "dgd_backward_segment_f32_cuda: d=%d exceeds maximum supported dimension (1024). "
+                        "Kernel restructuring needed for d > 1024.\n", d);
+        exit(1);
+    }
     int dd = d * d;
     // Cap at d (not dd): backward kernels require ~2× more registers than
     // forward due to prediction/error reconstruction. At d=512, block_size=1024
@@ -548,7 +553,7 @@ extern "C" void dgd_backward_segment_f32_cuda(
 
     // Shared memory layout:
     //   Legacy: prediction[d] + error[d] + d_error[d] + reduce_buf[block_size]
-    //   Hopper: + k_buf[2*d] + v_buf[2*d] + q_buf[2*d] + dy_buf[2*d]
+    //   Ampere+: + k_buf[2*d] + v_buf[2*d] + q_buf[2*d] + dy_buf[2*d]
     // Host allocates the maximum so the kernel works on any architecture.
     int smem_bytes = (3 * d + block_size + 8 * d) * sizeof(float);
 
@@ -579,6 +584,11 @@ extern "C" void dgd_backward_f32_cuda(
     float* d_alpha, float* d_theta, float* d_m_initial,
     int seq_len, int d)
 {
+    if (d > 1024) {
+        fprintf(stderr, "dgd_backward_f32_cuda: d=%d exceeds maximum supported dimension (1024). "
+                        "Kernel restructuring needed for d > 1024.\n", d);
+        exit(1);
+    }
     int dd = d * d;
     // Cap at d (not dd): backward kernels require ~2× more registers than
     // forward due to prediction/error reconstruction. At d=512, block_size=1024
@@ -596,7 +606,7 @@ extern "C" void dgd_backward_f32_cuda(
 
     // Shared memory layout:
     //   Legacy: prediction[d] + error[d] + d_error[d] + reduce_buf[block_size]
-    //   Hopper: + k_buf[2*d] + v_buf[2*d] + q_buf[2*d] + dy_buf[2*d]
+    //   Ampere+: + k_buf[2*d] + v_buf[2*d] + q_buf[2*d] + dy_buf[2*d]
     // Host allocates the maximum so the kernel works on any architecture.
     int smem_bytes = (3 * d + block_size + 8 * d) * sizeof(float);
 

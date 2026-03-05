@@ -15,7 +15,7 @@
 #include <stdlib.h>
 
 // ══════════════════════════════════════════════════════════════════════
-// Hopper cp.async helpers (sm_90a / sm_80+)
+// Ampere+ cp.async helpers (sm_80+)
 // cp.async copies 4/8/16 bytes from global to shared memory asynchronously.
 // The SM continues executing while the copy engine handles the transfer.
 // ══════════════════════════════════════════════════════════════════════
@@ -76,8 +76,8 @@ __global__ void hebbian_forward_kernel(
     int dd = d * d;
 
     // ── Shared memory layout ──
-    // Legacy (sm_86/89): no shared memory needed
-    // Hopper (sm_80+):   k_buf[2*d] + v_buf[2*d] + q_buf[2*d] = 6*d floats
+    // Pre-Ampere: no shared memory needed
+    // Ampere+ (sm_80+):   k_buf[2*d] + v_buf[2*d] + q_buf[2*d] = 6*d floats
     extern __shared__ float smem[];
 
 #if __CUDA_ARCH__ >= 800
@@ -94,7 +94,7 @@ __global__ void hebbian_forward_kernel(
     __syncthreads();
 
 #if __CUDA_ARCH__ >= 800
-    // ── Hopper/Ampere path: cp.async double-buffered vector prefetch ──
+    // ── Ampere+ path: cp.async double-buffered vector prefetch ──
     // Prefetch token 0 vectors into buffer 0
     int cur = 0;
     if (seq_len > 0) {
@@ -160,7 +160,7 @@ __global__ void hebbian_forward_kernel(
     }
 
 #else
-    // ── Legacy path (sm_86/89): direct global memory access ──
+    // ── Pre-Ampere path: direct global memory access ──
     // Unchanged from original — byte-identical behavior.
     for (int t = 0; t < seq_len; t++) {
         const float* k_t = k_mem + t * d;
@@ -270,6 +270,11 @@ extern "C" void hebbian_forward_ckpt_f32_cuda(
     float* m_states, float* y,
     int seq_len, int d, int checkpoint_interval)
 {
+    if (d > 1024) {
+        fprintf(stderr, "hebbian_forward_ckpt_f32_cuda: d=%d exceeds maximum supported dimension (1024). "
+                        "Kernel restructuring needed for d > 1024.\n", d);
+        exit(1);
+    }
     int dd = d * d;
     // block_size = min(d*d, 1024). For d <= 1024, min(d*d, 1024) >= d always holds.
     // d > 1024 requires kernel restructuring (prediction loop must stride).
@@ -302,6 +307,11 @@ extern "C" void hebbian_forward_f32_cuda(
     float* m_states, float* y,
     int seq_len, int d)
 {
+    if (d > 1024) {
+        fprintf(stderr, "hebbian_forward_f32_cuda: d=%d exceeds maximum supported dimension (1024). "
+                        "Kernel restructuring needed for d > 1024.\n", d);
+        exit(1);
+    }
     int dd = d * d;
     // block_size = min(d*d, 1024). For d <= 1024, min(d*d, 1024) >= d always holds.
     // d > 1024 requires kernel restructuring (prediction loop must stride).
@@ -311,8 +321,8 @@ extern "C" void hebbian_forward_f32_cuda(
     dim3 block(block_size);
 
     // Shared memory layout:
-    //   Legacy (sm_86/89): no shared memory needed
-    //   Hopper (sm_80+):   k_buf[2*d] + v_buf[2*d] + q_buf[2*d] = 6*d floats
+    //   Pre-Ampere: no shared memory needed
+    //   Ampere+ (sm_80+):   k_buf[2*d] + v_buf[2*d] + q_buf[2*d] = 6*d floats
     // Host allocates the maximum (6*d) so the kernel works on any architecture.
     // On sm_86/89 the extra shared memory is allocated but unused — no cost.
     int smem_bytes = 6 * d * sizeof(float);

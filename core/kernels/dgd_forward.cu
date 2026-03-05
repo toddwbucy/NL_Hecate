@@ -32,7 +32,7 @@
 #include <stdlib.h>
 
 // ══════════════════════════════════════════════════════════════════════
-// Hopper cp.async helpers (sm_90a / sm_80+)
+// Ampere+ cp.async helpers (sm_80+)
 // cp.async copies 4/8/16 bytes from global to shared memory asynchronously.
 // The SM continues executing while the copy engine handles the transfer.
 // Suffix _dgd avoids ODR conflicts with other translation units.
@@ -89,8 +89,8 @@ __global__ void dgd_forward_kernel(
     int dd = d * d;
 
     // ── Shared memory layout ──
-    // Legacy (sm_86/89): prediction[d] + error[d] = 2*d floats
-    // Hopper (sm_80+):   prediction[d] + error[d] + k_buf[2*d] + v_buf[2*d]
+    // Pre-Ampere: prediction[d] + error[d] = 2*d floats
+    // Ampere+ (sm_80+):   prediction[d] + error[d] + k_buf[2*d] + v_buf[2*d]
     //                    + q_buf[2*d] = 8*d floats
     extern __shared__ float smem[];
     float* prediction = smem;           // [d]
@@ -110,7 +110,7 @@ __global__ void dgd_forward_kernel(
     __syncthreads();
 
 #if __CUDA_ARCH__ >= 800
-    // ── Hopper/Ampere path: cp.async double-buffered vector prefetch ──
+    // ── Ampere+ path: cp.async double-buffered vector prefetch ──
     // Prefetch token 0 vectors into buffer 0
     int cur = 0;
     if (seq_len > 0) {
@@ -194,7 +194,7 @@ __global__ void dgd_forward_kernel(
     }
 
 #else
-    // ── Legacy path (sm_86/89): direct global memory access ──
+    // ── Pre-Ampere path: direct global memory access ──
     // Unchanged from original — byte-identical behavior.
     // Sequential token loop
     for (int t = 0; t < seq_len; t++) {
@@ -291,7 +291,7 @@ __global__ void dgd_forward_ckpt_kernel(
     int ckpt_idx = 1;  // next checkpoint slot
 
 #if __CUDA_ARCH__ >= 800
-    // ── Hopper/Ampere path: cp.async double-buffered vector prefetch ──
+    // ── Ampere+ path: cp.async double-buffered vector prefetch ──
     int cur = 0;
     if (seq_len > 0) {
         for (int i = tid; i < d; i += blockDim.x) {
@@ -373,7 +373,7 @@ __global__ void dgd_forward_ckpt_kernel(
     }
 
 #else
-    // ── Legacy path (sm_86/89): direct global memory access ──
+    // ── Pre-Ampere path: direct global memory access ──
     for (int t = 0; t < seq_len; t++) {
         const float* k_t = k_mem + t * d;
         const float* v_t = v_mem + t * d;
@@ -432,6 +432,11 @@ extern "C" void dgd_forward_ckpt_f32_cuda(
     float* m_states, float* y,
     int seq_len, int d, int checkpoint_interval)
 {
+    if (d > 1024) {
+        fprintf(stderr, "dgd_forward_ckpt_f32_cuda: d=%d exceeds maximum supported dimension (1024). "
+                        "Kernel restructuring needed for d > 1024.\n", d);
+        exit(1);
+    }
     int dd = d * d;
     // block_size = min(d*d, 1024). For d <= 1024, min(d*d, 1024) >= d always holds.
     // d > 1024 requires kernel restructuring (prediction loop must stride).
@@ -441,8 +446,8 @@ extern "C" void dgd_forward_ckpt_f32_cuda(
     dim3 block(block_size);
 
     // Shared memory layout:
-    //   Legacy (sm_86/89): prediction[d] + error[d] = 2*d floats
-    //   Hopper (sm_80+):   prediction[d] + error[d] + k_buf[2*d] + v_buf[2*d]
+    //   Pre-Ampere: prediction[d] + error[d] = 2*d floats
+    //   Ampere+ (sm_80+):   prediction[d] + error[d] + k_buf[2*d] + v_buf[2*d]
     //                      + q_buf[2*d] = 8*d floats
     // Host allocates the maximum (8*d) so the kernel works on any architecture.
     int smem_bytes = 8 * d * sizeof(float);
@@ -470,6 +475,11 @@ extern "C" void dgd_forward_f32_cuda(
     float* m_states, float* y,
     int seq_len, int d)
 {
+    if (d > 1024) {
+        fprintf(stderr, "dgd_forward_f32_cuda: d=%d exceeds maximum supported dimension (1024). "
+                        "Kernel restructuring needed for d > 1024.\n", d);
+        exit(1);
+    }
     int dd = d * d;
     // block_size = min(d*d, 1024). For d <= 1024, min(d*d, 1024) >= d always holds.
     // d > 1024 requires kernel restructuring (prediction loop must stride).
@@ -479,8 +489,8 @@ extern "C" void dgd_forward_f32_cuda(
     dim3 block(block_size);
 
     // Shared memory layout:
-    //   Legacy (sm_86/89): prediction[d] + error[d] = 2*d floats
-    //   Hopper (sm_80+):   prediction[d] + error[d] + k_buf[2*d] + v_buf[2*d]
+    //   Pre-Ampere: prediction[d] + error[d] = 2*d floats
+    //   Ampere+ (sm_80+):   prediction[d] + error[d] + k_buf[2*d] + v_buf[2*d]
     //                      + q_buf[2*d] = 8*d floats
     // Host allocates the maximum (8*d) so the kernel works on any architecture.
     int smem_bytes = 8 * d * sizeof(float);

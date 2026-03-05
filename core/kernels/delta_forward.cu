@@ -22,7 +22,7 @@
 // At d=512, M[d*d] = 1MB — far exceeds GPU shared memory limits (48-100KB).
 // Only small working buffers (prediction[d], error[d]) use shared memory.
 //
-// Hopper (sm_80+) optimization:
+// Ampere+ (sm_80+) optimization:
 //   When __CUDA_ARCH__ >= 800, the per-token loop uses cp.async to prefetch
 //   the next token's k/v/q vectors into shared memory while computing on the
 //   current token. Double-buffered: two sets of k/v/q buffers, alternating.
@@ -35,7 +35,7 @@
 #include <stdlib.h>
 
 // ══════════════════════════════════════════════════════════════════════
-// Hopper cp.async helpers (sm_80+)
+// Ampere+ cp.async helpers (sm_80+)
 // cp.async copies 4/8/16 bytes from global to shared memory asynchronously.
 // The SM continues executing while the copy engine handles the transfer.
 // _delta suffix avoids ODR conflicts with titans_forward.cu helpers.
@@ -103,8 +103,8 @@ __global__ void delta_forward_kernel(
     y         += b * seq_len * d;
 
     // ── Shared memory layout ──
-    // Legacy (sm_86/89): prediction[d] + error[d] = 2*d floats
-    // Hopper (sm_80+):   prediction[d] + error[d] + k_buf[2*d] + v_buf[2*d]
+    // Pre-Ampere: prediction[d] + error[d] = 2*d floats
+    // Ampere+ (sm_80+):   prediction[d] + error[d] + k_buf[2*d] + v_buf[2*d]
     //                    + q_buf[2*d] = 8*d floats
     extern __shared__ float smem[];
     float* prediction = smem;           // [d]
@@ -124,7 +124,7 @@ __global__ void delta_forward_kernel(
     __syncthreads();
 
 #if __CUDA_ARCH__ >= 800
-    // ── Hopper/Ampere path: cp.async double-buffered vector prefetch ──
+    // ── Ampere+ path: cp.async double-buffered vector prefetch ──
     // Prefetch token 0 vectors into buffer 0
     int cur = 0;
     if (seq_len > 0) {
@@ -207,7 +207,7 @@ __global__ void delta_forward_kernel(
     }
 
 #else
-    // ── Legacy path (sm_86/89): direct global memory access ──
+    // ── Pre-Ampere path: direct global memory access ──
     // Unchanged from original — byte-identical behavior.
     for (int t = 0; t < seq_len; t++) {
         const float* k_t = k_mem + t * d;
@@ -354,6 +354,11 @@ extern "C" void delta_forward_ckpt_f32_cuda(
     float* m_states, float* y,
     int seq_len, int d, int checkpoint_interval)
 {
+    if (d > 1024) {
+        fprintf(stderr, "delta_forward_ckpt_f32_cuda: d=%d exceeds maximum supported dimension (1024). "
+                        "Kernel restructuring needed for d > 1024.\n", d);
+        exit(1);
+    }
     int dd = d * d;
     // block_size = min(d*d, 1024). For d <= 1024, min(d*d, 1024) >= d always holds.
     // d > 1024 requires kernel restructuring (prediction loop must stride).
@@ -388,6 +393,11 @@ extern "C" void delta_forward_f32_cuda(
     float* m_states, float* y,
     int seq_len, int d, int batch_size)
 {
+    if (d > 1024) {
+        fprintf(stderr, "delta_forward_f32_cuda: d=%d exceeds maximum supported dimension (1024). "
+                        "Kernel restructuring needed for d > 1024.\n", d);
+        exit(1);
+    }
     int dd = d * d;
     // block_size = min(d*d, 1024). For d <= 1024, min(d*d, 1024) >= d always holds.
     // d > 1024 requires kernel restructuring (prediction loop must stride).
@@ -397,8 +407,8 @@ extern "C" void delta_forward_f32_cuda(
     dim3 block(block_size);
 
     // Shared memory layout:
-    //   Legacy (sm_86/89): prediction[d] + error[d] = 2*d floats
-    //   Hopper (sm_80+):   prediction[d] + error[d] + k_buf[2*d] + v_buf[2*d]
+    //   Pre-Ampere: prediction[d] + error[d] = 2*d floats
+    //   Ampere+ (sm_80+):   prediction[d] + error[d] + k_buf[2*d] + v_buf[2*d]
     //                      + q_buf[2*d] = 8*d floats
     // Host allocates the maximum (8*d) so the kernel works on any architecture.
     // On sm_86/89 the extra shared memory is allocated but unused — no cost.

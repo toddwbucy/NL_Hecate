@@ -133,7 +133,7 @@ __global__ void titans_forward_kernel(
     __syncthreads();
 
 #if __CUDA_ARCH__ >= 800
-    // ── Hopper/Ampere path: cp.async double-buffered vector prefetch ──
+    // ── Ampere+ path: cp.async double-buffered vector prefetch ──
     // Prefetch token 0 vectors into buffer 0
     int cur = 0;
     if (seq_len > 0) {
@@ -220,7 +220,7 @@ __global__ void titans_forward_kernel(
     }
 
 #else
-    // ── Legacy path (sm_86/89): direct global memory access ──
+    // ── Pre-Ampere path: direct global memory access ──
     // Unchanged from original — byte-identical behavior.
     for (int t = 0; t < seq_len; t++) {
         const float* k_t = k_mem + t * d;
@@ -380,6 +380,11 @@ extern "C" void titans_forward_ckpt_f32_cuda(
     float* m_states, float* s_states, float* y,
     int seq_len, int d, int checkpoint_interval)
 {
+    if (d > 1024) {
+        fprintf(stderr, "titans_forward_ckpt_f32_cuda: d=%d exceeds maximum supported dimension (1024). "
+                        "Kernel restructuring needed for d > 1024.\n", d);
+        exit(1);
+    }
     int dd = d * d;
     // block_size = min(d*d, 1024). For d <= 1024, min(d*d, 1024) >= d always holds.
     // d > 1024 requires kernel restructuring (prediction loop must stride).
@@ -417,6 +422,11 @@ extern "C" void titans_forward_f32_cuda(
     float* m_states, float* s_states, float* y,
     int seq_len, int d, int batch_size)
 {
+    if (d > 1024) {
+        fprintf(stderr, "titans_forward_f32_cuda: d=%d exceeds maximum supported dimension (1024). "
+                        "Kernel restructuring needed for d > 1024.\n", d);
+        exit(1);
+    }
     int dd = d * d;
     // block_size = min(d*d, 1024). For d <= 1024, min(d*d, 1024) >= d always holds.
     // d > 1024 requires kernel restructuring (prediction loop must stride).
