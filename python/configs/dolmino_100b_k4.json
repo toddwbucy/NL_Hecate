@@ -32,6 +32,9 @@
     "probe_prompts": 1,
     "log_file": "runs/dolmino_100b_k4.jsonl"
   },
+  "gate_warmup": {
+    "falsification_step": 0
+  },
   "data": {
     "path": "data/dolmino_100b",
     "format": "sharegpt"
