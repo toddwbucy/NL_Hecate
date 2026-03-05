@@ -355,8 +355,9 @@ extern "C" void delta_forward_ckpt_f32_cuda(
     int seq_len, int d, int checkpoint_interval)
 {
     int dd = d * d;
+    // block_size = min(d*d, 1024). For d <= 1024, min(d*d, 1024) >= d always holds.
+    // d > 1024 requires kernel restructuring (prediction loop must stride).
     int block_size = (dd < 1024) ? dd : 1024;
-    if (block_size < d) block_size = d;
 
     dim3 grid(1);
     dim3 block(block_size);
@@ -388,8 +389,9 @@ extern "C" void delta_forward_f32_cuda(
     int seq_len, int d, int batch_size)
 {
     int dd = d * d;
+    // block_size = min(d*d, 1024). For d <= 1024, min(d*d, 1024) >= d always holds.
+    // d > 1024 requires kernel restructuring (prediction loop must stride).
     int block_size = (dd < 1024) ? dd : 1024;
-    if (block_size < d) block_size = d;
 
     dim3 grid(batch_size);
     dim3 block(block_size);
@@ -402,8 +404,9 @@ extern "C" void delta_forward_f32_cuda(
     // On sm_86/89 the extra shared memory is allocated but unused — no cost.
     int smem_bytes = 8 * d * sizeof(float);
 
-    cudaFuncSetAttribute(delta_forward_kernel,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    check_cuda_alloc("delta_forward: cudaFuncSetAttribute",
+                     cudaFuncSetAttribute(delta_forward_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
 
     delta_forward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_initial,

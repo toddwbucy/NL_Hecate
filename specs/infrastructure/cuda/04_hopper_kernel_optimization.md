@@ -34,6 +34,9 @@ CONTRACT
   Source:     NVIDIA Hopper Tuning Guide (CUDA 12.8); NVIDIA CUDA Programming Guide
               §9 (CUDA Graphs), §B.28 (TMA); H100 Architecture Whitepaper.
               NL-Hecate: core/build.rs, core/src/dispatch.rs, core/kernels/titans_forward.cu.
+              HADES: hecate_specs/hopper-kernel-optimization (this spec);
+              extends hecate_specs/dgd_kernels, hecate_specs/swiglu_kernels,
+              hecate_specs/cuda-graph-capture, hecate_specs/variant-tier-policy.
 ```
 
 ---
@@ -131,7 +134,7 @@ const NATIVE_SM_VERSIONS: &[i32] = &[86, 89, 90];
 
 ### 4.1 Architecture Guard Pattern
 
-All Hopper-specific code is guarded by `__CUDA_ARCH__`:
+All cp.async code is guarded by `__CUDA_ARCH__ >= 800` (Ampere and later):
 
 ```cuda
 #if __CUDA_ARCH__ >= 800
@@ -139,14 +142,13 @@ All Hopper-specific code is guarded by `__CUDA_ARCH__`:
     // cp.async available on sm_80+ (Ampere, Ada, Hopper, Blackwell)
     cp_async_prefetch_k_v_q(/* ... */);
 #else
-    // Legacy path: direct global loads (unchanged)
-    // sm_86, sm_89 continue to use current code
+    // Pre-Ampere path: direct global loads (unchanged)
 #endif
 ```
 
 This ensures:
-- sm_86/89 kernels are **byte-identical** to current — no regression risk
-- sm_90a kernels use Hopper features — new performance
+- Pre-Ampere kernels (< sm_80) are **byte-identical** to current — no regression risk
+- sm_86/89/90a kernels all use cp.async prefetch — Ampere, Ada, Hopper benefit
 - A single .cu source file produces both variants in the fat binary
 
 ### 4.2 cp.async Prefetch for k/v/q Vectors (Phase 1 — all kernels)

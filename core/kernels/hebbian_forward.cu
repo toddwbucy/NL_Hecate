@@ -271,8 +271,9 @@ extern "C" void hebbian_forward_ckpt_f32_cuda(
     int seq_len, int d, int checkpoint_interval)
 {
     int dd = d * d;
+    // block_size = min(d*d, 1024). For d <= 1024, min(d*d, 1024) >= d always holds.
+    // d > 1024 requires kernel restructuring (prediction loop must stride).
     int block_size = (dd < 1024) ? dd : 1024;
-    if (block_size < d) block_size = d;
 
     dim3 grid(1);
     dim3 block(block_size);
@@ -302,8 +303,9 @@ extern "C" void hebbian_forward_f32_cuda(
     int seq_len, int d)
 {
     int dd = d * d;
+    // block_size = min(d*d, 1024). For d <= 1024, min(d*d, 1024) >= d always holds.
+    // d > 1024 requires kernel restructuring (prediction loop must stride).
     int block_size = (dd < 1024) ? dd : 1024;
-    if (block_size < d) block_size = d;
 
     dim3 grid(1);
     dim3 block(block_size);
@@ -315,8 +317,9 @@ extern "C" void hebbian_forward_f32_cuda(
     // On sm_86/89 the extra shared memory is allocated but unused — no cost.
     int smem_bytes = 6 * d * sizeof(float);
 
-    cudaFuncSetAttribute(hebbian_forward_kernel,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    check_cuda_alloc("hebbian_forward: cudaFuncSetAttribute",
+                     cudaFuncSetAttribute(hebbian_forward_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
 
     hebbian_forward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, m_initial,

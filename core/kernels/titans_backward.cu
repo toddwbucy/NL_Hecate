@@ -10,7 +10,7 @@
 // NOT shared memory. At d=512, d_M+d_S = 2MB — far exceeds GPU smem limits.
 // Only small buffers (prediction[d], error[d], d_error[d], reduce_buf) in smem.
 //
-// Hopper (sm_90a) optimization:
+// Ampere+ (sm_80+) optimization:
 //   When __CUDA_ARCH__ >= 800, the backward loop prefetches the PREVIOUS token's
 //   k/v/q/d_y vectors via cp.async while computing on the current token.
 //   The backward loop runs t = seq_len-1 down to 0, so "next to prefetch"
@@ -22,7 +22,7 @@
 #include <stdlib.h>
 
 // ══════════════════════════════════════════════════════════════════════
-// Hopper cp.async helpers (sm_90a / sm_80+)
+// Ampere+ cp.async helpers (sm_80+)
 // ══════════════════════════════════════════════════════════════════════
 #if __CUDA_ARCH__ >= 800
 
@@ -107,8 +107,8 @@ __global__ void titans_backward_kernel(
     d_S      += b * dd;
 
     // Shared memory layout:
-    //   Legacy (sm_86/89): prediction[d] + error[d] + d_error[d] + reduce_buf[blockDim.x]
-    //   Hopper (sm_90a+):  prediction[d] + error[d] + d_error[d] + reduce_buf[blockDim.x]
+    //   Pre-Ampere: prediction[d] + error[d] + d_error[d] + reduce_buf[blockDim.x]
+    //   Ampere+ (sm_80+):  prediction[d] + error[d] + d_error[d] + reduce_buf[blockDim.x]
     //                      + k_buf[2*d] + v_buf[2*d] + q_buf[2*d] + dy_buf[2*d]
     extern __shared__ float smem[];
     float* prediction = smem;
@@ -614,14 +614,15 @@ extern "C" void titans_backward_f32_cuda(
     dim3 block(block_size);
 
     // Shared memory layout:
-    //   Legacy: prediction[d] + error[d] + d_error[d] + reduce_buf[block_size]
-    //   Hopper: + k_buf[2*d] + v_buf[2*d] + q_buf[2*d] + dy_buf[2*d]
+    //   Pre-Ampere: prediction[d] + error[d] + d_error[d] + reduce_buf[block_size]
+    //   Ampere+ (sm_80+): + k_buf[2*d] + v_buf[2*d] + q_buf[2*d] + dy_buf[2*d]
     // Host allocates the maximum so the kernel works on any architecture.
     int smem_bytes = (3 * d + block_size + 8 * d) * sizeof(float);
 
-    // Hopper path may exceed the 48KB default dynamic shared memory limit at large d.
-    cudaFuncSetAttribute(titans_backward_kernel,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    // Ampere+ path may exceed the 48KB default dynamic shared memory limit at large d.
+    check_cuda_alloc("titans_backward: cudaFuncSetAttribute",
+                     cudaFuncSetAttribute(titans_backward_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
 
     // Allocate per-batch d_M and d_S workspaces (batch_size * dd each).
     // d_m_initial and d_s_initial are zeroed by caller; accumulated via atomicAdd.

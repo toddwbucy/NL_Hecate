@@ -17,13 +17,13 @@
 // At d=512, M+S = 2MB — far exceeds GPU shared memory limits (48-100KB).
 // Only small working buffers (prediction[d], error[d]) use shared memory.
 //
-// Hopper (sm_90a) optimization:
-//   When __CUDA_ARCH__ >= 900, the per-token loop uses cp.async to prefetch
+// Ampere+ (sm_80+) optimization:
+//   When __CUDA_ARCH__ >= 800, the per-token loop uses cp.async to prefetch
 //   the next token's k/v/q vectors into shared memory while computing on the
 //   current token. Double-buffered: two sets of k/v/q buffers, alternating.
 //   This hides global memory latency for vector loads. At d=2048 each vector
 //   is 8KB — the ~400 cycle latency becomes free with async prefetch.
-//   The sm_86/89 path is unchanged (direct global memory access).
+//   The pre-Ampere path uses direct global memory access.
 
 #include <cuda_runtime.h>
 #include <stdint.h>
@@ -31,7 +31,7 @@
 #include <stdlib.h>
 
 // ══════════════════════════════════════════════════════════════════════
-// Hopper cp.async helpers (sm_90a / sm_80+)
+// Ampere+ cp.async helpers (sm_80+)
 // cp.async copies 4/8/16 bytes from global to shared memory asynchronously.
 // The SM continues executing while the copy engine handles the transfer.
 // ══════════════════════════════════════════════════════════════════════
@@ -110,8 +110,8 @@ __global__ void titans_forward_kernel(
     y         += b * seq_len * d;
 
     // ── Shared memory layout ──
-    // Legacy (sm_86/89): prediction[d] + error[d] = 2*d floats
-    // Hopper (sm_90a+):  prediction[d] + error[d] + k_buf[2][d] + v_buf[2][d]
+    // Pre-Ampere: prediction[d] + error[d] = 2*d floats
+    // Ampere+ (sm_80+):  prediction[d] + error[d] + k_buf[2][d] + v_buf[2][d]
     //                    + q_buf[2][d] = 8*d floats
     extern __shared__ float smem[];
     float* prediction = smem;           // [d]
@@ -381,8 +381,9 @@ extern "C" void titans_forward_ckpt_f32_cuda(
     int seq_len, int d, int checkpoint_interval)
 {
     int dd = d * d;
+    // block_size = min(d*d, 1024). For d <= 1024, min(d*d, 1024) >= d always holds.
+    // d > 1024 requires kernel restructuring (prediction loop must stride).
     int block_size = (dd < 1024) ? dd : 1024;
-    if (block_size < d) block_size = d;
 
     dim3 grid(1);
     dim3 block(block_size);
@@ -417,23 +418,25 @@ extern "C" void titans_forward_f32_cuda(
     int seq_len, int d, int batch_size)
 {
     int dd = d * d;
+    // block_size = min(d*d, 1024). For d <= 1024, min(d*d, 1024) >= d always holds.
+    // d > 1024 requires kernel restructuring (prediction loop must stride).
     int block_size = (dd < 1024) ? dd : 1024;
-    if (block_size < d) block_size = d;
 
     dim3 grid(batch_size);
     dim3 block(block_size);
 
     // Shared memory layout:
-    //   Legacy (sm_86/89): prediction[d] + error[d] = 2*d floats
-    //   Hopper (sm_90a+):  prediction[d] + error[d] + k_buf[2*d] + v_buf[2*d]
+    //   Pre-Ampere: prediction[d] + error[d] = 2*d floats
+    //   Ampere+ (sm_80+):  prediction[d] + error[d] + k_buf[2*d] + v_buf[2*d]
     //                      + q_buf[2*d] = 8*d floats
     // Host allocates the maximum (8*d) so the kernel works on any architecture.
-    // On sm_86/89 the extra shared memory is allocated but unused — no cost.
+    // On pre-Ampere the extra shared memory is allocated but unused — no cost.
     int smem_bytes = 8 * d * sizeof(float);
 
-    // Hopper path may exceed the 48KB default dynamic shared memory limit at large d.
-    cudaFuncSetAttribute(titans_forward_kernel,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    // Ampere+ path may exceed the 48KB default dynamic shared memory limit at large d.
+    check_cuda_alloc("titans_forward: cudaFuncSetAttribute",
+                     cudaFuncSetAttribute(titans_forward_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
 
     titans_forward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, eta,

@@ -556,8 +556,9 @@ extern "C" void dgd_backward_segment_f32_cuda(
     check_cuda_alloc("dgd_backward_segment: cudaMalloc d_M_work",
                      cudaMalloc(&d_M_work, dd * sizeof(float)));
 
-    cudaFuncSetAttribute(dgd_backward_segment_kernel,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    check_cuda_alloc("dgd_backward_segment: cudaFuncSetAttribute",
+                     cudaFuncSetAttribute(dgd_backward_segment_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
     dgd_backward_segment_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_states, d_y,
         d_m_seed,
@@ -603,8 +604,9 @@ extern "C" void dgd_backward_f32_cuda(
     check_cuda_alloc("dgd_backward: cudaMalloc d_M_work",
                      cudaMalloc(&d_M_work, dd * sizeof(float)));
 
-    cudaFuncSetAttribute(dgd_backward_kernel,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    check_cuda_alloc("dgd_backward: cudaFuncSetAttribute",
+                     cudaFuncSetAttribute(dgd_backward_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
     dgd_backward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_states, d_y,
         d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta, d_m_initial,

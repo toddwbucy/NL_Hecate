@@ -433,8 +433,9 @@ extern "C" void dgd_forward_ckpt_f32_cuda(
     int seq_len, int d, int checkpoint_interval)
 {
     int dd = d * d;
+    // block_size = min(d*d, 1024). For d <= 1024, min(d*d, 1024) >= d always holds.
+    // d > 1024 requires kernel restructuring (prediction loop must stride).
     int block_size = (dd < 1024) ? dd : 1024;
-    if (block_size < d) block_size = d;
 
     dim3 grid(1);
     dim3 block(block_size);
@@ -450,8 +451,9 @@ extern "C" void dgd_forward_ckpt_f32_cuda(
     check_cuda_alloc("dgd_forward_ckpt: cudaMalloc m_work",
                      cudaMalloc(&m_work, dd * sizeof(float)));
 
-    cudaFuncSetAttribute(dgd_forward_ckpt_kernel,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    check_cuda_alloc("dgd_forward_ckpt: cudaFuncSetAttribute",
+                     cudaFuncSetAttribute(dgd_forward_ckpt_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
     dgd_forward_ckpt_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_initial,
         m_states, y, m_work, seq_len, d, checkpoint_interval);
@@ -469,8 +471,9 @@ extern "C" void dgd_forward_f32_cuda(
     int seq_len, int d)
 {
     int dd = d * d;
+    // block_size = min(d*d, 1024). For d <= 1024, min(d*d, 1024) >= d always holds.
+    // d > 1024 requires kernel restructuring (prediction loop must stride).
     int block_size = (dd < 1024) ? dd : 1024;
-    if (block_size < d) block_size = d;
 
     dim3 grid(1);
     dim3 block(block_size);
@@ -482,8 +485,9 @@ extern "C" void dgd_forward_f32_cuda(
     // Host allocates the maximum (8*d) so the kernel works on any architecture.
     int smem_bytes = 8 * d * sizeof(float);
 
-    cudaFuncSetAttribute(dgd_forward_kernel,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    check_cuda_alloc("dgd_forward: cudaFuncSetAttribute",
+                     cudaFuncSetAttribute(dgd_forward_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
     dgd_forward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_initial,
         m_states, y, seq_len, d);

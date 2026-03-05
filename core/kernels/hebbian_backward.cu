@@ -455,8 +455,9 @@ extern "C" void hebbian_backward_f32_cuda(
     check_cuda_alloc("hebbian_backward: cudaMalloc d_M_work",
                      cudaMalloc(&d_M_work, dd * sizeof(float)));
 
-    cudaFuncSetAttribute(hebbian_backward_kernel,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    check_cuda_alloc("hebbian_backward: cudaFuncSetAttribute",
+                     cudaFuncSetAttribute(hebbian_backward_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
 
     hebbian_backward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, m_states, d_y,

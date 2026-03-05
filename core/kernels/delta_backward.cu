@@ -587,8 +587,9 @@ extern "C" void delta_backward_f32_cuda(
     check_cuda_alloc("delta_backward: cudaMemset d_M_work",
                      cudaMemset(d_M_work, 0, (size_t)batch_size * dd * sizeof(float)));
 
-    cudaFuncSetAttribute(delta_backward_kernel,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    check_cuda_alloc("delta_backward: cudaFuncSetAttribute",
+                     cudaFuncSetAttribute(delta_backward_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
 
     delta_backward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_states, d_y,
