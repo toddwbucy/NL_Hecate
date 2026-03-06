@@ -309,8 +309,8 @@ extern "C" void hebbian_forward_f32_cuda(
     float* m_states, float* y,
     int seq_len, int d)
 {
-    if (d <= 0 || 8 * d * (int)sizeof(float) > 163840) {
-        fprintf(stderr, "hebbian_forward_f32_cuda: d=%d out of range (must be 1..=5120).\n", d);
+    if (d <= 0 || 6 * d * (int)sizeof(float) > 163840) {
+        fprintf(stderr, "hebbian_forward_f32_cuda: d=%d out of range (must be 1..=6826).\n", d);
         exit(1);
     }
     int dd = d * d;

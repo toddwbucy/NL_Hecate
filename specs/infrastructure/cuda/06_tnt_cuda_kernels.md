@@ -1,6 +1,6 @@
 # TNT CUDA Kernels — Chunkwise Parallelism on GPU
 
-```
+```text
 CONTRACT
   Purpose   : GPU acceleration for TNT hierarchical memory via batched kernel reuse
   Expects   : Existing Titans/Delta CUDA kernels with batch_size parameter;
@@ -32,13 +32,14 @@ sequential recurrence kernel is needed. Only lightweight helper kernels for:
 
 ## Algorithm (GPU Path)
 
-```
-for shard in shards:                           // Sequential (Rust loop)
-    tnt_broadcast_m(M_G → [M_G; N])           // Helper kernel
-    slice shard tokens into N local chunks
-    titans_forward(batch_size=N)               // REUSE existing kernel
-    tnt_shard_summary_mean(local_y → k,v)      // Helper kernel
-    tnt_global_update(M_G, k, v, alpha)        // Helper kernel
+```rust
+for shard_idx in 0..n_shards {                     // Sequential (Rust loop)
+    tnt_broadcast_m(&m_global, &mut m_locals, n);  // Helper kernel
+    let chunk = &embedded[shard_start..shard_end];  // Slice shard tokens
+    titans_forward(batch_size = n, chunk, &m_locals, &mut y_local);  // REUSE
+    tnt_shard_summary_mean(&y_local, &mut k_sum, &mut v_sum);       // Helper
+    tnt_global_update(&mut m_global, &k_sum, &v_sum, alpha);        // Helper
+}
 ```
 
 ## New CUDA Kernels
@@ -54,7 +55,7 @@ for shard in shards:                           // Sequential (Rust loop)
 - Grid=(1), Block=(min(d, 1024)), parallel reduction over d dimensions
 
 **`tnt_global_update_f32_cuda(global_m, k_sum, v_sum, d, alpha)`**
-- M_G[i,j] = alpha * M_G[i,j] + v_sum[i] * k_sum[j]
+- `M_G[i,j] = alpha * M_G[i,j] + v_sum[i] * k_sum[j]`
 - Grid=(1), Block=(min(d*d, 1024)), in-place update
 
 ### Backward Helpers
@@ -104,24 +105,29 @@ At d=1024, C_G=64, C_L=8, N=8, k=4 levels:
 
 ## Backward Path (GPU)
 
-```
-for shard in shards.reverse():                     // Reverse shard loop (Rust)
+```rust
+for shard_idx in (0..n_shards).rev() {             // Reverse shard loop
     // Step 1: Reverse global update
-    tnt_global_update_backward(d_m_carry, k, v → d_m_old, d_k_sum, d_v_sum)
+    tnt_global_update_backward(&d_m_carry, &k, &v, &mut d_m_old, &mut d_k_sum, &mut d_v_sum);
 
     // Step 2: Reverse summary mean
-    tnt_shard_summary_mean_backward(d_k_sum, d_v_sum → d_local_y_global)
+    tnt_shard_summary_mean_backward(&d_k_sum, &d_v_sum, &mut d_local_y_global);
 
     // Step 3: Combine upstream + global gradients
-    tnt_combine_gradients(d_y_upstream_shard, d_local_y_global → d_y_combined)
+    tnt_combine_gradients(&d_y_upstream_shard, &d_local_y_global, &mut d_y_combined);
 
     // Step 4: Batched inner backward (reuse existing kernel)
-    titans_backward(batch_size=N, d_y_combined → d_embedded_shard, d_m_inner)
+    titans_backward(batch_size = n, &d_y_combined, &mut d_embedded, &mut d_m_initial);
+
+    // Step 4b: Reduce per-local d_m_initial into d_m_old (broadcast backward)
+    for b in 0..n { saxpy(1.0, &d_m_initial[b], &mut d_m_old); }
 
     // Step 5: Gate backward into temp buffers, saxpy-accumulate into level_grads
-    gate_backward(temp_bufs); saxpy(1.0, temp → level_grads)
+    gate_backward(&mut tmp_bufs); saxpy(1.0, &tmp_bufs, &mut level_grads);
 
     // Step 6: d_m_carry = d_m_old (chain across shards)
+    d_m_carry = d_m_old;
+}
 ```
 
 Key implementation detail: `gate_backward_cuda` OVERWRITES its output buffers

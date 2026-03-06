@@ -652,6 +652,17 @@ fn gpu_memory_backward(
                             &mut d_m_initial, &mut d_s_initial,
                             cl, d, n_batch,
                         );
+
+                        // Reduce per-local d_m_initial → shared global M gradient.
+                        // Forward broadcasts one global_m to N copies; backward must
+                        // sum all N local d_m_initial slices back into d_m_old.
+                        for b in 0..n_batch {
+                            unsafe {
+                                crate::cuda_ffi::saxpy_cuda(
+                                    1.0, d_m_initial.as_ptr().add(b * dd), d_m_old.ptr(), dd as i32,
+                                );
+                            }
+                        }
                     }
                     GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states } => {
                         let mut d_m_initial = GpuBuf::zeros(n_batch * dd);
@@ -663,6 +674,15 @@ fn gpu_memory_backward(
                             &mut d_alpha_shard, &mut d_theta_shard, &mut d_m_initial,
                             cl, d, n_batch,
                         );
+
+                        // Reduce per-local d_m_initial → shared global M gradient.
+                        for b in 0..n_batch {
+                            unsafe {
+                                crate::cuda_ffi::saxpy_cuda(
+                                    1.0, d_m_initial.as_ptr().add(b * dd), d_m_old.ptr(), dd as i32,
+                                );
+                            }
+                        }
                     }
                     _ => unreachable!("TNT inner cache must be Titans or Delta"),
                 }

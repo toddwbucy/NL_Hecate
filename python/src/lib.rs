@@ -453,6 +453,24 @@ impl MAGConfig {
                         nl_hecate_core::parallel::ParallelConfig::chunkwise(chunk_sizes.get(0).copied().unwrap_or(1))
                     }
                     "tnt" | "tnt_hierarchical" => {
+                        if tnt_global_chunk_size == 0 {
+                            return Err(PyValueError::new_err("tnt_global_chunk_size must be >= 1"));
+                        }
+                        if tnt_local_chunk_size == 0 {
+                            return Err(PyValueError::new_err("tnt_local_chunk_size must be >= 1"));
+                        }
+                        if tnt_local_chunk_size > tnt_global_chunk_size {
+                            return Err(PyValueError::new_err(format!(
+                                "tnt_local_chunk_size ({}) must be <= tnt_global_chunk_size ({})",
+                                tnt_local_chunk_size, tnt_global_chunk_size
+                            )));
+                        }
+                        if tnt_global_chunk_size % tnt_local_chunk_size != 0 {
+                            return Err(PyValueError::new_err(format!(
+                                "tnt_global_chunk_size ({}) must be divisible by tnt_local_chunk_size ({})",
+                                tnt_global_chunk_size, tnt_local_chunk_size
+                            )));
+                        }
                         nl_hecate_core::parallel::ParallelConfig {
                             strategy: nl_hecate_core::parallel::ParallelStrategy::TNTHierarchical,
                             chunk_size: tnt_local_chunk_size,

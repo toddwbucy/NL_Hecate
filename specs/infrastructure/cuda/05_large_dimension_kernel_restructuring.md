@@ -66,7 +66,7 @@ C wrapper guards change from hard `d > 1024` rejection to shared-memory-based li
 - Forward kernels: 8*d floats = 32*d bytes. At d=5120: 160KB (within Hopper 228KB).
 - Backward kernels: (3*d + block + 8*d) floats. At d=2048, block=1024: ~91KB (within Ampere 99KB).
 
-Guard formula: `8 * d * sizeof(float) > 163840` rejects d > 5120 (conservative Hopper limit).
+Guard formula: `smem_multiplier * d * sizeof(float) > 163840` rejects configurations exceeding 160KB (conservative Hopper limit). Per-kernel multipliers match actual shared memory layout: 8 for forward (Delta/Titans/DGD), 6 for Hebbian forward, 2 for checkpoint-mode forward. Source: NVIDIA CUDA Programming Guide §16.5.1, validated empirically on sm_86 (Ampere, 100KB) and sm_90 (Hopper, 228KB).
 
 ## Block Size Policy
 

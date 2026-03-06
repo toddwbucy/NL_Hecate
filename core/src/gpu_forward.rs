@@ -339,7 +339,9 @@ pub fn gpu_cms_forward(
         let effective_active = pulse.active_levels[level]
             || matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp);
         if effective_active {
-            if is_tnt && !matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp) {
+            if is_tnt
+                && matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM | MemoryRuleKind::DeltaRule)
+            {
                 // TNT path: shard-parallel memory processing via gpu_tnt_forward.
                 let parallel_cfg = cfg.parallel.as_ref().unwrap();
                 let (y_level, mem_cache) = gpu_tnt_forward(
