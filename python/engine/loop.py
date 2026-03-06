@@ -174,6 +174,92 @@ def run_build(bcfg: BuildConfig):
             resume_step = build_state["global_step"]
             print(f"  Resuming from step {resume_step}")
             print(f"  Stream position: {build_state['stream_position']}")
+        # ── Push-up level stacking ────────────────────────────────────
+        if bcfg.extend_k is not None:
+            loaded_k = cfg.k
+            target_k = bcfg.extend_k
+            if target_k != loaded_k + 1:
+                print(f"  ERROR: extend_k={target_k} must be loaded_k+1={loaded_k + 1}")
+                return
+            chunk_template = [1, 8, 64, 512]
+            if target_k > len(chunk_template):
+                print(f"  ERROR: extend_k={target_k} exceeds max supported k={len(chunk_template)}")
+                return
+            new_chunks = chunk_template[:target_k]
+            # Rebuild MAGConfig with the new k (carry all other fields from loaded cfg)
+            new_cfg = nl_hecate.MAGConfig(
+                d_model=cfg.d_model, num_heads=cfg.num_heads,
+                head_dim=cfg.head_dim, seq_len=cfg.seq_len,
+                window_size=cfg.window_size, vocab_size=cfg.vocab_size,
+                memory_enabled=cfg.memory_enabled, k=target_k,
+                chunk_sizes=new_chunks,
+                memory_rule=cfg.memory_rule, composition=cfg.composition,
+                checkpoint_interval=bcfg.checkpoint_interval,
+                projection_kind=cfg.projection_kind,
+                self_generated_values=cfg.self_generated_values,
+                self_ref_chunk_size=cfg.self_ref_chunk_size,
+                momentum_kind=cfg.momentum_kind,
+                momentum_d_hidden=cfg.momentum_d_hidden,
+                attentional_bias=(
+                    bcfg.attentional_bias
+                    if bcfg.attentional_bias is not None
+                    else getattr(cfg, "attentional_bias", None)
+                ),
+                retention=(
+                    bcfg.retention
+                    if bcfg.retention is not None
+                    else getattr(cfg, "retention", None)
+                ),
+                intermediate_size=bcfg.intermediate_size,
+                theta_floor=bcfg.theta_floor,
+                theta_ceil=bcfg.theta_ceil,
+                m_norm_max=bcfg.m_norm_max,
+                parallel_strategy=(
+                    bcfg.parallel_strategy
+                    if bcfg.parallel_strategy is not None
+                    else getattr(cfg, "parallel_strategy", None)
+                ),
+                tnt_global_chunk_size=(
+                    bcfg.tnt_global_chunk_size
+                    if bcfg.tnt_global_chunk_size is not None
+                    else getattr(cfg, "tnt_global_chunk_size", None)
+                ),
+                tnt_local_chunk_size=(
+                    bcfg.tnt_local_chunk_size
+                    if bcfg.tnt_local_chunk_size is not None
+                    else getattr(cfg, "tnt_local_chunk_size", None)
+                ),
+            )
+            if bcfg.push_up:
+                params = nl_hecate.extend_params_push_up(params, new_cfg, bcfg.seed)
+                print(f"  Push-up: k={loaded_k} → k={target_k}, "
+                      f"chunks={new_chunks}")
+            else:
+                print("  ERROR: extend_k set but push_up=false — "
+                      "only push-up stacking is implemented")
+                return
+            cfg = new_cfg
+            resume_step = 0
+            build_state = None
+
+        # ── Data cursor override (for push-up or manual reposition) ──
+        if bcfg.data_seek is not None and active_loader is not None:
+            if bcfg.batch_size > 1:
+                print("  ERROR: data_seek with batch_size>1 is not supported yet")
+                return
+            try:
+                active_loader.restore({
+                    "position": bcfg.data_seek,
+                    "total_tokens": active_loader.total_tokens,
+                    "content_hash": 0,  # skip hash validation on manual seek
+                    "chunk_id": 0,
+                    "seq_len": bcfg.seq_len,
+                })
+            except (CursorMismatchError, CursorOutOfBounds) as e:
+                print(f"  ERROR: data_seek failed — {e}")
+                return
+            print(f"  Data cursor overridden → position {bcfg.data_seek:,}")
+
         bcfg.d_model = cfg.d_model
         bcfg.num_heads = cfg.num_heads
         bcfg.k = cfg.k

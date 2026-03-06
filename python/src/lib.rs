@@ -920,6 +920,18 @@ fn mag_init_params(cfg: &MAGConfig, seed: u64) -> MAGParams {
     }
 }
 
+/// Push-up level stacking: shift existing levels to slower frequencies,
+/// insert fresh L0 at the fast end.
+///
+/// `new_cfg.k` must equal `old.k + 1`. SWA weights and persistent tokens
+/// are preserved exactly. Old level[i] → new level[i+1].
+#[pyfunction]
+fn extend_params_push_up(old: &MAGParams, new_cfg: &MAGConfig, seed: u64) -> MAGParams {
+    MAGParams {
+        inner: old.inner.extend_push_up(&new_cfg.inner, seed),
+    }
+}
+
 fn validate_mag_seq_lens(cfg: &MAGConfig, input_ids: &[usize], target_ids: &[usize]) -> PyResult<()> {
     let expected = cfg.inner.swa.seq_len;
     let vocab = cfg.inner.swa.vocab_size;
@@ -2265,6 +2277,7 @@ fn nl_hecate(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<MAGForwardCache>()?;
     m.add_function(wrap_pyfunction!(mag_create_config, m)?)?;
     m.add_function(wrap_pyfunction!(mag_init_params, m)?)?;
+    m.add_function(wrap_pyfunction!(extend_params_push_up, m)?)?;
     m.add_function(wrap_pyfunction!(mag_forward, m)?)?;
     m.add_function(wrap_pyfunction!(mag_backward, m)?)?;
     m.add_function(wrap_pyfunction!(mag_compute_gradients, m)?)?;
