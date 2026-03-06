@@ -185,7 +185,17 @@ def run_build(bcfg: BuildConfig):
             if target_k > len(chunk_template):
                 print(f"  ERROR: extend_k={target_k} exceeds max supported k={len(chunk_template)}")
                 return
-            new_chunks = chunk_template[:target_k]
+            if bcfg.stack_up:
+                # Stack-up: preserve donor's chunk sizes, append next tier
+                canonical_prefix = chunk_template[:len(cfg.chunk_sizes)]
+                if list(cfg.chunk_sizes) != canonical_prefix:
+                    print(f"  ERROR: stack-up requires canonical chunk_sizes prefix "
+                          f"{canonical_prefix}, got {list(cfg.chunk_sizes)}")
+                    return
+                new_chunks = list(cfg.chunk_sizes) + [chunk_template[target_k - 1]]
+            else:
+                # Push-up: use canonical template (levels shift frequencies)
+                new_chunks = chunk_template[:target_k]
             # Rebuild MAGConfig with the new k (carry all other fields from loaded cfg)
             new_cfg = nl_hecate.MAGConfig(
                 d_model=cfg.d_model, num_heads=cfg.num_heads,
@@ -234,9 +244,13 @@ def run_build(bcfg: BuildConfig):
                 params = nl_hecate.extend_params_push_up(params, new_cfg, bcfg.seed)
                 print(f"  Push-up: k={loaded_k} → k={target_k}, "
                       f"chunks={new_chunks}")
+            elif bcfg.stack_up:
+                params = nl_hecate.extend_params_stack_up(params, new_cfg, bcfg.seed)
+                print(f"  Stack-up: k={loaded_k} → k={target_k}, "
+                      f"chunks={new_chunks}")
             else:
-                print("  ERROR: extend_k set but push_up=false — "
-                      "only push-up stacking is implemented")
+                print("  ERROR: extend_k set but neither push_up nor stack_up — "
+                      "set one of them to true")
                 return
             cfg = new_cfg
             resume_step = 0

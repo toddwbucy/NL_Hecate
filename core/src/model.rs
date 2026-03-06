@@ -2206,6 +2206,124 @@ impl MAGParams {
         new_params
     }
 
+    /// Stack-up level extension: keep existing levels in place, add fresh level at top.
+    ///
+    /// Existing level[i] stays at level[i] (same firing frequency).
+    /// New level[k] is added at the slowest frequency with fresh Xavier init.
+    /// SWA weights and persistent tokens are preserved exactly (bitwise).
+    pub fn extend_stack_up(&self, new_cfg: &MAGConfig, seed: u64) -> MAGParams {
+        let old_k = self.levels.len();
+        assert_eq!(
+            new_cfg.k,
+            old_k + 1,
+            "extend_stack_up requires new_cfg.k ({}) == old_k + 1 ({})",
+            new_cfg.k,
+            old_k + 1,
+        );
+        let old_d = new_cfg.swa.d_model;
+        assert_eq!(
+            self.swa.w_q.len(), old_d * old_d,
+            "d_model mismatch: existing SWA w_q size {} vs expected d_model={}",
+            self.swa.w_q.len(), old_d,
+        );
+        assert_eq!(
+            self.swa.w_embed.len(), new_cfg.swa.vocab_size * old_d,
+            "vocab_size mismatch: existing w_embed size {} vs expected {}",
+            self.swa.w_embed.len(), new_cfg.swa.vocab_size * old_d,
+        );
+        assert_eq!(
+            self.persistent_tokens.len(), new_cfg.n_persistent * old_d,
+            "n_persistent mismatch: existing persistent_tokens len {} vs expected {}",
+            self.persistent_tokens.len(), new_cfg.n_persistent * old_d,
+        );
+
+        // Validate per-level shape invariants before cloning
+        let d = old_d;
+        for i in 0..old_k {
+            let lev = &self.levels[i];
+            // Core projections: w_k_mem, w_v_mem, w_q_mem are [d, d] (Bf16Storage)
+            assert_eq!(
+                lev.w_k_mem.len(), d * d,
+                "extend_stack_up: level[{}] w_k_mem size {} vs expected d*d={}",
+                i, lev.w_k_mem.len(), d * d,
+            );
+            // Conv1D: present iff kernel_size > 0
+            let ks = new_cfg.kernel_size;
+            assert_eq!(
+                lev.w_k_conv.len(), d * ks,
+                "extend_stack_up: level[{}] w_k_conv size {} vs expected d*kernel_size={}",
+                i, lev.w_k_conv.len(), d * ks,
+            );
+            assert_eq!(
+                lev.w_q_conv.len(), d * ks,
+                "extend_stack_up: level[{}] w_q_conv size {} vs expected d*kernel_size={}",
+                i, lev.w_q_conv.len(), d * ks,
+            );
+            // Frequency gate: present iff Learned schedule
+            let has_freq = matches!(new_cfg.frequency_schedule, FrequencySchedule::Learned(_));
+            let expect_freq_w = if has_freq { d } else { 0 };
+            let expect_freq_b = if has_freq { 1 } else { 0 };
+            assert_eq!(
+                lev.w_freq.len(), expect_freq_w,
+                "extend_stack_up: level[{}] w_freq size {} vs expected {}",
+                i, lev.w_freq.len(), expect_freq_w,
+            );
+            assert_eq!(
+                lev.b_freq.len(), expect_freq_b,
+                "extend_stack_up: level[{}] b_freq size {} vs expected {}",
+                i, lev.b_freq.len(), expect_freq_b,
+            );
+            // Atlas Omega projection: always allocated as [d, 2*d] (zero-init for non-Atlas)
+            assert_eq!(
+                lev.w_omega.len(), d * 2 * d,
+                "extend_stack_up: level[{}] w_omega size {} vs expected d*2*d={}",
+                i, lev.w_omega.len(), d * 2 * d,
+            );
+            // Self-referential init memories: present iff Adaptive projection
+            let has_self_ref = matches!(new_cfg.projection_kind, ProjectionKind::Adaptive);
+            let expect_self_ref = if has_self_ref { d * d } else { 0 };
+            assert_eq!(
+                lev.m_k_init.len(), expect_self_ref,
+                "extend_stack_up: level[{}] m_k_init size {} vs expected {} (projection_kind mismatch)",
+                i, lev.m_k_init.len(), expect_self_ref,
+            );
+            assert_eq!(
+                lev.m_v_init.len(), expect_self_ref,
+                "extend_stack_up: level[{}] m_v_init size {} vs expected {}",
+                i, lev.m_v_init.len(), expect_self_ref,
+            );
+            assert_eq!(
+                lev.m_q_init.len(), expect_self_ref,
+                "extend_stack_up: level[{}] m_q_init size {} vs expected {}",
+                i, lev.m_q_init.len(), expect_self_ref,
+            );
+        }
+
+        // Init fresh params with new_cfg — gives us correctly initialized levels
+        let mut new_params = MAGParams::init(new_cfg, seed);
+
+        // Preserve SWA (attention branch) exactly
+        new_params.swa = self.swa.clone();
+
+        // Keep existing levels in place: old level[i] → new level[i]
+        for i in 0..old_k {
+            new_params.levels[i] = self.levels[i].clone();
+        }
+        // new_params.levels[old_k] stays as fresh init from MAGParams::init
+
+        // Keep alpha logits in place: old alpha[i] → new alpha[i]
+        for i in 0..old_k {
+            new_params.alpha_mem[i] = self.alpha_mem[i];
+            new_params.alpha_refl[i] = self.alpha_refl[i];
+        }
+        // new alpha[old_k] already 0.0 from init (uniform 1/k contribution)
+
+        // Preserve persistent tokens (MAC composition, if any)
+        new_params.persistent_tokens = self.persistent_tokens.clone();
+
+        new_params
+    }
+
     /// Create zero-initialized shadow for gradient accumulation.
     pub fn zeros_like(cfg: &MAGConfig) -> Self {
         let d = cfg.swa.d_model;
