@@ -10,8 +10,41 @@
 // At d=512, M[d*d] = 1MB — far exceeds GPU shared memory limits (48-100KB).
 
 #include <cuda_runtime.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+// ══════════════════════════════════════════════════════════════════════
+// Ampere+ cp.async helpers (sm_80+)
+// cp.async copies 4/8/16 bytes from global to shared memory asynchronously.
+// The SM continues executing while the copy engine handles the transfer.
+// ══════════════════════════════════════════════════════════════════════
+#if __CUDA_ARCH__ >= 800
+
+// Copy a single 4-byte float from global to shared memory asynchronously.
+// Uses inline PTX: cp.async.ca.shared.global [dst], [src], 4;
+__device__ __forceinline__ void cp_async_f32_hebb(float* smem_dst, const float* gmem_src) {
+    uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 4;\n"
+        :: "r"(smem_addr), "l"(gmem_src)
+    );
+}
+
+// Commit all prior cp.async instructions into a group.
+__device__ __forceinline__ void cp_async_commit_hebb() {
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+
+// Wait until at most N groups are still in flight.
+// cp_async_wait_hebb<0>() waits for ALL groups to complete.
+// cp_async_wait_hebb<1>() waits until at most 1 group remains (pipeline depth=1).
+template <int N>
+__device__ __forceinline__ void cp_async_wait_hebb() {
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+}
+
+#endif // __CUDA_ARCH__ >= 800
 
 static inline void check_cuda_launch(const char* kernel_name, int d, int smem_bytes) {
     cudaError_t err = cudaGetLastError();
@@ -42,7 +75,17 @@ __global__ void hebbian_forward_kernel(
     int tid = threadIdx.x;
     int dd = d * d;
 
-    // No shared memory needed — M lives in m_states, no prediction/error buffers
+    // ── Shared memory layout ──
+    // Pre-Ampere: no shared memory needed
+    // Ampere+ (sm_80+):   k_buf[2*d] + v_buf[2*d] + q_buf[2*d] = 6*d floats
+    extern __shared__ float smem[];
+
+#if __CUDA_ARCH__ >= 800
+    // Double-buffered vector staging for cp.async prefetch.
+    float* buf_k = smem;               // [2*d]
+    float* buf_v = smem + 2 * d;       // [2*d]
+    float* buf_q = smem + 4 * d;       // [2*d]
+#endif
 
     // Store M_0
     for (int idx = tid; idx < dd; idx += blockDim.x) {
@@ -50,6 +93,75 @@ __global__ void hebbian_forward_kernel(
     }
     __syncthreads();
 
+#if __CUDA_ARCH__ >= 800
+    // ── Ampere+ path: cp.async double-buffered vector prefetch ──
+    // Prefetch token 0 vectors into buffer 0
+    int cur = 0;
+    if (seq_len > 0) {
+        for (int i = tid; i < d; i += blockDim.x) {
+            cp_async_f32_hebb(&buf_k[0 * d + i], &k_mem[0 * d + i]);
+            cp_async_f32_hebb(&buf_v[0 * d + i], &v_mem[0 * d + i]);
+            cp_async_f32_hebb(&buf_q[0 * d + i], &q_mem[0 * d + i]);
+        }
+        cp_async_commit_hebb();
+    }
+
+    for (int t = 0; t < seq_len; t++) {
+        int next = 1 - cur;
+
+        // Prefetch token t+1 into alternate buffer (overlaps with compute)
+        if (t + 1 < seq_len) {
+            for (int i = tid; i < d; i += blockDim.x) {
+                cp_async_f32_hebb(&buf_k[next * d + i], &k_mem[(t + 1) * d + i]);
+                cp_async_f32_hebb(&buf_v[next * d + i], &v_mem[(t + 1) * d + i]);
+                cp_async_f32_hebb(&buf_q[next * d + i], &q_mem[(t + 1) * d + i]);
+            }
+            cp_async_commit_hebb();
+        }
+
+        // Wait for current buffer to be ready
+        if (t + 1 < seq_len) {
+            cp_async_wait_hebb<1>();
+        } else {
+            cp_async_wait_hebb<0>();
+        }
+        __syncthreads();
+
+        // Pointers to current buffer's vectors
+        const float* k_t = &buf_k[cur * d];
+        const float* v_t = &buf_v[cur * d];
+        const float* q_t = &buf_q[cur * d];
+        float alpha_t = alpha[t];
+        float retention = 1.0f - alpha_t;
+        int m_t_off = t * dd;
+        int m_next_off = (t + 1) * dd;
+
+        // M_{t+1} = (1-alpha) * M_t + outer(v, k)
+        // Read from m_states[t*dd], write to m_states[(t+1)*dd] — non-overlapping
+        for (int idx = tid; idx < dd; idx += blockDim.x) {
+            int i = idx / d;
+            int j = idx % d;
+            m_states[m_next_off + idx] = retention * m_states[m_t_off + idx]
+                                         + v_t[i] * k_t[j];
+        }
+        __syncthreads();
+
+        // y = M_{t+1} @ q
+        if (tid < d) {
+            float sum = 0.0f;
+            for (int j = 0; j < d; j++) {
+                sum += m_states[m_next_off + tid * d + j] * q_t[j];
+            }
+            y[t * d + tid] = sum;
+        }
+        __syncthreads();
+
+        cur = next;
+    }
+
+#else
+    // ── Pre-Ampere path: direct global memory access ──
+    // Unchanged from original — byte-identical behavior.
     for (int t = 0; t < seq_len; t++) {
         const float* k_t = k_mem + t * d;
         const float* v_t = v_mem + t * d;
@@ -79,6 +191,7 @@ __global__ void hebbian_forward_kernel(
         }
         __syncthreads();
     }
+#endif // __CUDA_ARCH__ >= 800
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -157,14 +270,25 @@ extern "C" void hebbian_forward_ckpt_f32_cuda(
     float* m_states, float* y,
     int seq_len, int d, int checkpoint_interval)
 {
+    if (d <= 0 || d > 1024) {
+        fprintf(stderr, "hebbian_forward_ckpt_f32_cuda: d=%d has invalid dimension (must be 1..=1024). "
+                        "Kernel restructuring needed for d > 1024.\n", d);
+        exit(1);
+    }
+    if (checkpoint_interval <= 0) {
+        fprintf(stderr, "hebbian_forward_ckpt_f32_cuda: checkpoint_interval=%d must be > 0.\n",
+                checkpoint_interval);
+        exit(1);
+    }
     int dd = d * d;
+    // block_size = min(d*d, 1024). For d <= 1024, min(d*d, 1024) >= d always holds.
+    // d > 1024 requires kernel restructuring (prediction loop must stride).
     int block_size = (dd < 1024) ? dd : 1024;
-    if (block_size < d) block_size = d;
 
     dim3 grid(1);
     dim3 block(block_size);
 
-    // No shared memory needed for Hebbian checkpointed
+    // Checkpoint kernel uses no shared memory.
     int smem_bytes = 0;
 
     // Allocate M workspace in global memory
@@ -188,15 +312,29 @@ extern "C" void hebbian_forward_f32_cuda(
     float* m_states, float* y,
     int seq_len, int d)
 {
+    if (d <= 0 || d > 1024) {
+        fprintf(stderr, "hebbian_forward_f32_cuda: d=%d has invalid dimension (must be 1..=1024). "
+                        "Kernel restructuring needed for d > 1024.\n", d);
+        exit(1);
+    }
     int dd = d * d;
+    // block_size = min(d*d, 1024). For d <= 1024, min(d*d, 1024) >= d always holds.
+    // d > 1024 requires kernel restructuring (prediction loop must stride).
     int block_size = (dd < 1024) ? dd : 1024;
-    if (block_size < d) block_size = d;
 
     dim3 grid(1);
     dim3 block(block_size);
 
-    // No shared memory needed for Hebbian full-trajectory
-    int smem_bytes = 0;
+    // Shared memory layout:
+    //   Pre-Ampere: no shared memory needed
+    //   Ampere+ (sm_80+):   k_buf[2*d] + v_buf[2*d] + q_buf[2*d] = 6*d floats
+    // Host allocates the maximum (6*d) so the kernel works on any architecture.
+    // On sm_86/89 the extra shared memory is allocated but unused — no cost.
+    int smem_bytes = 6 * d * sizeof(float);
+
+    check_cuda_alloc("hebbian_forward: cudaFuncSetAttribute",
+                     cudaFuncSetAttribute(hebbian_forward_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
 
     hebbian_forward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, m_initial,

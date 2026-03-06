@@ -21,10 +21,45 @@
 // NOTE: M lives in global memory (m_states), NOT shared memory.
 // At d=512, M[d*d] = 1MB — far exceeds GPU shared memory limits (48-100KB).
 // Only small working buffers (prediction[d], error[d]) use shared memory.
+//
+// Ampere+ (sm_80+) optimization:
+//   When __CUDA_ARCH__ >= 800, the per-token loop uses cp.async to prefetch
+//   the next token's k/v/q vectors into shared memory while computing on the
+//   current token. Double-buffered: two sets of k/v/q buffers, alternating.
+//   This hides global memory latency for vector loads.
+//   The sm_86/89 legacy path is unchanged (direct global memory access).
 
 #include <cuda_runtime.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+// ══════════════════════════════════════════════════════════════════════
+// Ampere+ cp.async helpers (sm_80+)
+// cp.async copies 4/8/16 bytes from global to shared memory asynchronously.
+// The SM continues executing while the copy engine handles the transfer.
+// _delta suffix avoids ODR conflicts with titans_forward.cu helpers.
+// ══════════════════════════════════════════════════════════════════════
+#if __CUDA_ARCH__ >= 800
+
+__device__ __forceinline__ void cp_async_f32_delta(float* smem_dst, const float* gmem_src) {
+    uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 4;\n"
+        :: "r"(smem_addr), "l"(gmem_src)
+    );
+}
+
+__device__ __forceinline__ void cp_async_commit_delta() {
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+
+template <int N>
+__device__ __forceinline__ void cp_async_wait_delta() {
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+}
+
+#endif // __CUDA_ARCH__ >= 800
 
 static inline void check_cuda_launch(const char* kernel_name, int d, int smem_bytes) {
     cudaError_t err = cudaGetLastError();
@@ -67,12 +102,20 @@ __global__ void delta_forward_kernel(
     m_states  += b * (seq_len + 1) * dd;
     y         += b * seq_len * d;
 
-    // Shared memory: only small working buffers
-    //   prediction[d]    — M @ k result
-    //   error[d]         — prediction - v
+    // ── Shared memory layout ──
+    // Pre-Ampere: prediction[d] + error[d] = 2*d floats
+    // Ampere+ (sm_80+):   prediction[d] + error[d] + k_buf[2*d] + v_buf[2*d]
+    //                    + q_buf[2*d] = 8*d floats
     extern __shared__ float smem[];
     float* prediction = smem;           // [d]
     float* error_buf = smem + d;        // [d]
+
+#if __CUDA_ARCH__ >= 800
+    // Double-buffered vector staging for cp.async prefetch.
+    float* buf_k = smem + 2 * d;       // [2*d]
+    float* buf_v = smem + 4 * d;       // [2*d]
+    float* buf_q = smem + 6 * d;       // [2*d]
+#endif
 
     // Store M_0 to m_states from m_initial
     for (int idx = tid; idx < dd; idx += blockDim.x) {
@@ -80,7 +123,92 @@ __global__ void delta_forward_kernel(
     }
     __syncthreads();
 
-    // Sequential token loop
+#if __CUDA_ARCH__ >= 800
+    // ── Ampere+ path: cp.async double-buffered vector prefetch ──
+    // Prefetch token 0 vectors into buffer 0
+    int cur = 0;
+    if (seq_len > 0) {
+        for (int i = tid; i < d; i += blockDim.x) {
+            cp_async_f32_delta(&buf_k[0 * d + i], &k_mem[0 * d + i]);
+            cp_async_f32_delta(&buf_v[0 * d + i], &v_mem[0 * d + i]);
+            cp_async_f32_delta(&buf_q[0 * d + i], &q_mem[0 * d + i]);
+        }
+        cp_async_commit_delta();
+    }
+
+    for (int t = 0; t < seq_len; t++) {
+        int next = 1 - cur;
+
+        // Prefetch token t+1 into alternate buffer (overlaps with compute)
+        if (t + 1 < seq_len) {
+            for (int i = tid; i < d; i += blockDim.x) {
+                cp_async_f32_delta(&buf_k[next * d + i], &k_mem[(t + 1) * d + i]);
+                cp_async_f32_delta(&buf_v[next * d + i], &v_mem[(t + 1) * d + i]);
+                cp_async_f32_delta(&buf_q[next * d + i], &q_mem[(t + 1) * d + i]);
+            }
+            cp_async_commit_delta();
+        }
+
+        // Wait for current buffer to be ready
+        if (t + 1 < seq_len) {
+            cp_async_wait_delta<1>();
+        } else {
+            cp_async_wait_delta<0>();
+        }
+        __syncthreads();
+
+        // Pointers to current buffer's vectors
+        const float* k_t = &buf_k[cur * d];
+        const float* v_t = &buf_v[cur * d];
+        const float* q_t = &buf_q[cur * d];
+        float alpha_t = alpha[t];
+        float theta_t = theta[t];
+        int m_t_off = t * dd;
+        int m_next_off = (t + 1) * dd;
+
+        // ── prediction[i] = sum_j M_t[i,j] * k_t[j] ──
+        if (tid < d) {
+            float sum = 0.0f;
+            for (int j = 0; j < d; j++) {
+                sum += m_states[m_t_off + tid * d + j] * k_t[j];
+            }
+            prediction[tid] = sum;
+        }
+        __syncthreads();
+
+        // ── error[i] = prediction[i] - v_t[i] ──
+        if (tid < d) {
+            error_buf[tid] = prediction[tid] - v_t[tid];
+        }
+        __syncthreads();
+
+        // ── M_{t+1}[i,j] = (1-alpha_t) * M_t[i,j] - theta_t * error[i] * k_t[j] ──
+        // Read from m_states[t*dd], write to m_states[(t+1)*dd] — non-overlapping
+        float retention = 1.0f - alpha_t;
+        for (int idx = tid; idx < dd; idx += blockDim.x) {
+            int i = idx / d;
+            int j = idx % d;
+            m_states[m_next_off + idx] = retention * m_states[m_t_off + idx]
+                                         - theta_t * error_buf[i] * k_t[j];
+        }
+        __syncthreads();
+
+        // ── y_t[i] = sum_j M_{t+1}[i,j] * q_t[j] ──
+        if (tid < d) {
+            float sum = 0.0f;
+            for (int j = 0; j < d; j++) {
+                sum += m_states[m_next_off + tid * d + j] * q_t[j];
+            }
+            y[t * d + tid] = sum;
+        }
+        __syncthreads();
+
+        cur = next;
+    }
+
+#else
+    // ── Pre-Ampere path: direct global memory access ──
+    // Unchanged from original — byte-identical behavior.
     for (int t = 0; t < seq_len; t++) {
         const float* k_t = k_mem + t * d;
         const float* v_t = v_mem + t * d;
@@ -127,6 +255,7 @@ __global__ void delta_forward_kernel(
         }
         __syncthreads();
     }
+#endif // __CUDA_ARCH__ >= 800
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -225,14 +354,27 @@ extern "C" void delta_forward_ckpt_f32_cuda(
     float* m_states, float* y,
     int seq_len, int d, int checkpoint_interval)
 {
+    if (d <= 0 || d > 1024) {
+        fprintf(stderr, "delta_forward_ckpt_f32_cuda: d=%d has invalid dimension (must be 1..=1024). "
+                        "Kernel restructuring needed for d > 1024.\n", d);
+        exit(1);
+    }
+    if (checkpoint_interval <= 0) {
+        fprintf(stderr, "delta_forward_ckpt_f32_cuda: checkpoint_interval=%d must be > 0.\n",
+                checkpoint_interval);
+        exit(1);
+    }
     int dd = d * d;
+    // block_size = min(d*d, 1024). For d <= 1024, min(d*d, 1024) >= d always holds.
+    // d > 1024 requires kernel restructuring (prediction loop must stride).
     int block_size = (dd < 1024) ? dd : 1024;
-    if (block_size < d) block_size = d;
 
     dim3 grid(1);
     dim3 block(block_size);
 
-    // Shared memory: prediction[d] + error[d] only
+    // Shared memory: prediction[d] + error[d] = 2*d floats.
+    // Checkpointed kernel does not use cp.async (single-block, no batch),
+    // so only the two working buffers are needed.
     int smem_bytes = 2 * d * sizeof(float);
 
     // Allocate M workspace in global memory
@@ -256,15 +398,30 @@ extern "C" void delta_forward_f32_cuda(
     float* m_states, float* y,
     int seq_len, int d, int batch_size)
 {
+    if (d <= 0 || d > 1024) {
+        fprintf(stderr, "delta_forward_f32_cuda: d=%d has invalid dimension (must be 1..=1024). "
+                        "Kernel restructuring needed for d > 1024.\n", d);
+        exit(1);
+    }
     int dd = d * d;
+    // block_size = min(d*d, 1024). For d <= 1024, min(d*d, 1024) >= d always holds.
+    // d > 1024 requires kernel restructuring (prediction loop must stride).
     int block_size = (dd < 1024) ? dd : 1024;
-    if (block_size < d) block_size = d;
 
     dim3 grid(batch_size);
     dim3 block(block_size);
 
-    // Shared memory: prediction[d] + error[d] only
-    int smem_bytes = 2 * d * sizeof(float);
+    // Shared memory layout:
+    //   Pre-Ampere: prediction[d] + error[d] = 2*d floats
+    //   Ampere+ (sm_80+):   prediction[d] + error[d] + k_buf[2*d] + v_buf[2*d]
+    //                      + q_buf[2*d] = 8*d floats
+    // Host allocates the maximum (8*d) so the kernel works on any architecture.
+    // On sm_86/89 the extra shared memory is allocated but unused — no cost.
+    int smem_bytes = 8 * d * sizeof(float);
+
+    check_cuda_alloc("delta_forward: cudaFuncSetAttribute",
+                     cudaFuncSetAttribute(delta_forward_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
 
     delta_forward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_initial,

@@ -13,6 +13,12 @@
 // NOT shared memory. At d=512, d_M[d*d] = 1MB — exceeds GPU smem limits.
 // Only small buffers (prediction[d], error[d], d_error[d], reduce_buf) in smem.
 //
+// Ampere+ (sm_80+) optimization:
+//   When __CUDA_ARCH__ >= 800, the backward loop prefetches the PREVIOUS token's
+//   k/v/q/d_y vectors via cp.async while computing on the current token.
+//   The backward loop runs t = seq_len-1 down to 0, so "next to prefetch"
+//   is token t-1. Double-buffered shared memory staging.
+//
 // Reverse loop (t = s-1 down to 0):
 //   d_M += outer(d_y_t, q_t)                    (from readout y = M @ q)
 //   d_q_t[j] = sum_i M_{t+1}[i,j] * d_y_t[i]   (matvec transpose)
@@ -29,8 +35,34 @@
 // This file is compiled by nvcc into machine code (opaque to AD).
 
 #include <cuda_runtime.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+// ══════════════════════════════════════════════════════════════════════
+// Ampere+ cp.async helpers (sm_80+)
+// _delta_bwd suffix avoids ODR conflicts with forward and titans helpers.
+// ══════════════════════════════════════════════════════════════════════
+#if __CUDA_ARCH__ >= 800
+
+__device__ __forceinline__ void cp_async_f32_delta_bwd(float* smem_dst, const float* gmem_src) {
+    uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 4;\n"
+        :: "r"(smem_addr), "l"(gmem_src)
+    );
+}
+
+__device__ __forceinline__ void cp_async_commit_delta_bwd() {
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+
+template <int N>
+__device__ __forceinline__ void cp_async_wait_delta_bwd() {
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+}
+
+#endif // __CUDA_ARCH__ >= 800
 
 static inline void check_cuda_launch(const char* kernel_name, int d, int smem_bytes) {
     cudaError_t err = cudaGetLastError();
@@ -87,12 +119,23 @@ __global__ void delta_backward_kernel(
     d_theta    += b * seq_len;
     d_M        += b * dd;  // each batch element has its own d_M workspace
 
-    // Shared memory: only small working buffers
+    // ── Shared memory layout ──
+    // Pre-Ampere: prediction[d] + error[d] + d_error[d] + reduce_buf[blockDim.x]
+    // Ampere+ (sm_80+):   prediction[d] + error[d] + d_error[d] + reduce_buf[blockDim.x]
+    //                    + k_buf[2*d] + v_buf[2*d] + q_buf[2*d] + dy_buf[2*d]
     extern __shared__ float smem[];
     float* prediction = smem;                    // [d]
     float* error_buf = smem + d;                 // [d]
     float* d_error = smem + 2 * d;               // [d]
     float* reduce_buf = smem + 3 * d;            // [blockDim.x]
+
+#if __CUDA_ARCH__ >= 800
+    // Double-buffered vector staging (after reduce_buf)
+    float* buf_k  = smem + 3 * d + blockDim.x;
+    float* buf_v  = buf_k + 2 * d;
+    float* buf_q  = buf_v + 2 * d;
+    float* buf_dy = buf_q + 2 * d;
+#endif
 
     // Initialize d_M = 0
     for (int idx = tid; idx < dd; idx += blockDim.x) {
@@ -100,12 +143,60 @@ __global__ void delta_backward_kernel(
     }
     __syncthreads();
 
+#if __CUDA_ARCH__ >= 800
+    // ── Hopper/Ampere path: cp.async prefetch for backward loop ──
+    // Prefetch the last token (seq_len-1) into buffer 0
+    int cur = 0;
+    int t_last = seq_len - 1;
+    if (seq_len > 0) {
+        for (int i = tid; i < d; i += blockDim.x) {
+            cp_async_f32_delta_bwd(&buf_k[0 * d + i],  &k_mem[t_last * d + i]);
+            cp_async_f32_delta_bwd(&buf_v[0 * d + i],  &v_mem[t_last * d + i]);
+            cp_async_f32_delta_bwd(&buf_q[0 * d + i],  &q_mem[t_last * d + i]);
+            cp_async_f32_delta_bwd(&buf_dy[0 * d + i], &d_y[t_last * d + i]);
+        }
+        cp_async_commit_delta_bwd();
+    }
+
+    // Reverse token loop
+    for (int t = seq_len - 1; t >= 0; t--) {
+        int next = 1 - cur;
+
+        // Prefetch token t-1 into alternate buffer
+        if (t > 0) {
+            for (int i = tid; i < d; i += blockDim.x) {
+                cp_async_f32_delta_bwd(&buf_k[next * d + i],  &k_mem[(t - 1) * d + i]);
+                cp_async_f32_delta_bwd(&buf_v[next * d + i],  &v_mem[(t - 1) * d + i]);
+                cp_async_f32_delta_bwd(&buf_q[next * d + i],  &q_mem[(t - 1) * d + i]);
+                cp_async_f32_delta_bwd(&buf_dy[next * d + i], &d_y[(t - 1) * d + i]);
+            }
+            cp_async_commit_delta_bwd();
+        }
+
+        // Wait for current buffer
+        if (t > 0) {
+            cp_async_wait_delta_bwd<1>();
+        } else {
+            cp_async_wait_delta_bwd<0>();
+        }
+        __syncthreads();
+
+        const float* k_t   = &buf_k[cur * d];
+        const float* v_t   = &buf_v[cur * d];
+        const float* q_t   = &buf_q[cur * d];
+        const float* d_y_t = &buf_dy[cur * d];
+
+#else
+    // ── Pre-Ampere path: direct global memory access ──
+    // Unchanged from original — byte-identical behavior.
+
     // Reverse token loop
     for (int t = seq_len - 1; t >= 0; t--) {
         const float* k_t = k_mem + t * d;
         const float* v_t = v_mem + t * d;
         const float* q_t = q_mem + t * d;
         const float* d_y_t = d_y + t * d;
+#endif
         const float* m_t = m_states + t * dd;
         const float* m_next = m_states + (t + 1) * dd;
         float alpha_t = alpha[t];
@@ -234,6 +325,10 @@ __global__ void delta_backward_kernel(
             d_M[idx] = retention * d_M[idx] + d_error[i] * k_t[j];
         }
         __syncthreads();
+
+#if __CUDA_ARCH__ >= 800
+        cur = next;
+#endif
     }
 
     // ── Accumulate d_m_initial across batch elements (atomicAdd) ──
@@ -418,6 +513,11 @@ extern "C" void delta_backward_segment_f32_cuda(
     float* d_alpha, float* d_theta, float* d_m_out,
     int t_start, int t_end, int d)
 {
+    if (d <= 0 || d > 1024) {
+        fprintf(stderr, "delta_backward_segment_f32_cuda: d=%d has invalid dimension (must be 1..=1024). "
+                        "Kernel restructuring needed for d > 1024.\n", d);
+        exit(1);
+    }
     int dd = d * d;
     // Cap at min(d, 512): __launch_bounds__(512) constrains nvcc to 128 regs/thread.
     // Launching with >512 threads would need >65536 registers/block — exceeds sm_89
@@ -432,7 +532,10 @@ extern "C" void delta_backward_segment_f32_cuda(
     dim3 grid(1);
     dim3 block(block_size);
 
-    // Shared: prediction[d] + error[d] + d_error[d] + reduce_buf[block_size]
+    // Shared memory layout:
+    //   Legacy: prediction[d] + error[d] + d_error[d] + reduce_buf[block_size]
+    //   Hopper: + k_buf[2*d] + v_buf[2*d] + q_buf[2*d] + dy_buf[2*d]
+    // Segment kernel does not use cp.async — only needs the legacy layout.
     int smem_bytes = (3 * d + block_size) * sizeof(float);
 
     // Allocate d_M workspace in global memory
@@ -460,6 +563,11 @@ extern "C" void delta_backward_f32_cuda(
     float* d_alpha, float* d_theta, float* d_m_initial,
     int seq_len, int d, int batch_size)
 {
+    if (d <= 0 || d > 1024) {
+        fprintf(stderr, "delta_backward_f32_cuda: d=%d has invalid dimension (must be 1..=1024). "
+                        "Kernel restructuring needed for d > 1024.\n", d);
+        exit(1);
+    }
     int dd = d * d;
     // Cap at min(d, 512): __launch_bounds__(512) constrains nvcc to 128 regs/thread.
     // Launching with >512 threads would need >65536 registers/block — exceeds sm_89
@@ -474,8 +582,11 @@ extern "C" void delta_backward_f32_cuda(
     dim3 grid(batch_size);
     dim3 block(block_size);
 
-    // Shared: prediction[d] + error[d] + d_error[d] + reduce_buf[block_size]
-    int smem_bytes = (3 * d + block_size) * sizeof(float);
+    // Shared memory layout:
+    //   Legacy: prediction[d] + error[d] + d_error[d] + reduce_buf[block_size]
+    //   Hopper: + k_buf[2*d] + v_buf[2*d] + q_buf[2*d] + dy_buf[2*d]
+    // Host allocates the maximum so the kernel works on any architecture.
+    int smem_bytes = (3 * d + block_size + 8 * d) * sizeof(float);
 
     // Allocate per-batch d_M workspaces (batch_size * dd floats, contiguous)
     // Each batch block uses its own slice: d_M_work + b*dd.
@@ -485,6 +596,10 @@ extern "C" void delta_backward_f32_cuda(
                      cudaMalloc(&d_M_work, (size_t)batch_size * dd * sizeof(float)));
     check_cuda_alloc("delta_backward: cudaMemset d_M_work",
                      cudaMemset(d_M_work, 0, (size_t)batch_size * dd * sizeof(float)));
+
+    check_cuda_alloc("delta_backward: cudaFuncSetAttribute",
+                     cudaFuncSetAttribute(delta_backward_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
 
     delta_backward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_states, d_y,

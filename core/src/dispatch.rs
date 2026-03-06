@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 ///
 /// Describes which code path actually runs kernels:
 /// - `RustReference`: pure Rust (always available, AD-compatible)
-/// - `CudaNative`: architecture-specific SASS (sm_86/89/90)
+/// - `CudaNative`: architecture-specific SASS (sm_86/89/90a)
 /// - `CudaPtx`: JIT-compiled PTX for architectures without explicit SASS
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
@@ -33,6 +33,12 @@ pub enum Backend {
 }
 
 /// Known SM versions with embedded SASS in the fat binary.
+/// sm_86: Ampere (A6000, RTX 3090)
+/// sm_89: Ada Lovelace (RTX 4090)
+/// sm_90: Hopper (H100, H200) — sm_90a SASS with TMA/cp.async support
+///        Note: H100/H200 report sm_version=90 at runtime; the CUDA runtime
+///        selects sm_90a SASS from the fat binary automatically.
+/// sm_100: Blackwell (B100, B200) — covered by compute_90a PTX fallback
 const NATIVE_SM_VERSIONS: &[i32] = &[86, 89, 90];
 
 /// Minimum supported SM version (PTX fallback baseline).
