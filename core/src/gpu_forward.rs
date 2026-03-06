@@ -17,6 +17,8 @@ use crate::gpu_params::{GpuMAGParams, GpuContextState};
 use crate::model::{MAGConfig, MemoryRuleKind};
 #[cfg(feature = "cuda")]
 use crate::conductor::Pulse;
+#[cfg(feature = "cuda")]
+use crate::parallel::ParallelStrategy;
 
 // ══════════════════════════════════════════════════════════════════════
 // GpuCMSCache — forward activations on GPU (consumed by backward)
@@ -155,6 +157,24 @@ pub enum GpuMemoryCache {
         up_buf:    GpuBuf<f32>,   // [s × inter]
         fused_buf: GpuBuf<f32>,   // [s × inter]
         cache_buf: GpuBuf<f32>,   // [s × inter] sigmoid(gate_out)
+    },
+    /// TNT hierarchical — per-shard inner caches + global state trajectory.
+    /// The inner caches are Titans/Delta/etc. caches, one per shard.
+    TNT {
+        /// Inner memory cache per shard (Titans/Delta/Hebbian variant).
+        shard_inner_caches: Vec<GpuMemoryCache>,
+        /// Local outputs per shard [shard_len, d] — needed for summary backward.
+        shard_y_bufs: Vec<GpuBuf<f32>>,
+        /// Summary key vectors [d] per shard.
+        k_summaries: Vec<GpuBuf<f32>>,
+        /// Summary value vectors [d] per shard.
+        v_summaries: Vec<GpuBuf<f32>>,
+        /// Global M state BEFORE each shard update [d*d] per shard (num_shards entries).
+        global_m_before: Vec<GpuBuf<f32>>,
+        /// TNT config: n_locals, global_chunk_size, local_chunk_size.
+        n_locals: usize,
+        global_chunk_size: usize,
+        local_chunk_size: usize,
     },
 }
 
@@ -308,12 +328,28 @@ pub fn gpu_cms_forward(
     let mut memory_caches = Vec::with_capacity(cfg.k);
     let mut y_per_level = Vec::with_capacity(cfg.k);
 
+    // Check if TNT parallelization is active
+    let is_tnt = cfg.parallel.as_ref()
+        .map(|p| p.strategy == ParallelStrategy::TNTHierarchical)
+        .unwrap_or(false);
+
     for level in 0..cfg.k {
         // SwiGLU is always active regardless of pulse (no M state to update).
         // Mirrors CPU path in mag.rs: let active = active || matches!(cfg.memory_rule, SwiGluMlp).
         let effective_active = pulse.active_levels[level]
             || matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp);
         if effective_active {
+            if is_tnt && !matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp) {
+                // TNT path: shard-parallel memory processing via gpu_tnt_forward.
+                let parallel_cfg = cfg.parallel.as_ref().unwrap();
+                let (y_level, mem_cache) = gpu_tnt_forward(
+                    &params.levels[level], cfg, &embedded,
+                    &mut context.memory[level],
+                    s, d, level, bs, parallel_cfg,
+                );
+                y_per_level.push(y_level);
+                memory_caches.push(Some(mem_cache));
+            } else {
             // Active level: compute projections, gates, and memory update on GPU.
             let (y_level, mem_cache) = gpu_memory_forward(
                 &params.levels[level], cfg, &embedded,
@@ -322,6 +358,7 @@ pub fn gpu_cms_forward(
             );
             y_per_level.push(y_level);
             memory_caches.push(Some(mem_cache));
+            }
         } else {
             // Frozen level: read-only M @ q_mem on GPU.
             // Each batch element has distinct embeddings, so compute Y = Q @ M^T
@@ -613,6 +650,254 @@ fn gpu_memory_forward(
         }
         _ => panic!("GPU-resident forward only supports DeltaRule, TitansLMM, HebbianRule, DGD, SwiGluMlp. Got {:?}", cfg.memory_rule),
     }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// TNT GPU forward — chunkwise parallelism via shard loop
+// ══════════════════════════════════════════════════════════════════════
+
+/// TNT GPU forward: split sequence into shards, run N local memories in parallel
+/// per shard using existing Titans/Delta kernels with batch_size=N.
+///
+/// Only supports matrix-based rules (DeltaRule, TitansLMM) —
+/// these are the rules with CUDA kernels that support batch_size.
+///
+/// Shard loop is sequential in Rust (O(seq_len/C_G) iterations, typically 8-16).
+/// Within each shard, N local memories run in parallel via the batched kernel.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn gpu_tnt_forward(
+    level_params: &crate::gpu_params::GpuMemoryLevelParams,
+    cfg: &MAGConfig,
+    embedded: &GpuBuf<f32>,       // [bs*s, d] — full sequence embeddings
+    context_m: &mut GpuBuf<f32>,  // [d*d] — carry-forward global M (bs=1 for TNT)
+    s: usize,                      // seq_len
+    d: usize,
+    level: usize,
+    batch_size: usize,
+    parallel_cfg: &crate::parallel::ParallelConfig,
+) -> (GpuBuf<f32>, GpuMemoryCache) {
+    // TNT operates on single sequences (batch_size=1 at the outer level).
+    // The inner batch dimension is n_locals (N parallel local memories).
+    assert_eq!(batch_size, 1, "TNT GPU forward requires batch_size=1 (TNT uses inner batch for N local memories)");
+    assert!(
+        matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM | MemoryRuleKind::DeltaRule),
+        "TNT GPU forward only supports TitansLMM and DeltaRule, got {:?}", cfg.memory_rule,
+    );
+
+    let dd = d * d;
+    let cg = parallel_cfg.tnt_global_chunk_size;
+    let cl = parallel_cfg.tnt_local_chunk_size;
+    assert!(cl <= cg && cl >= 1 && cg >= 1);
+
+    let num_shards = (s + cg - 1) / cg;
+    let d_i32 = i32::try_from(d).expect("d exceeds i32::MAX");
+    let m_norm_max = cfg.max_m_norm(level);
+
+    // Full output buffer: [s, d]
+    let mut y_full = GpuBuf::<f32>::zeros(s * d);
+
+    // Per-shard caches for backward
+    let mut shard_inner_caches = Vec::with_capacity(num_shards);
+    let mut shard_y_bufs = Vec::with_capacity(num_shards);
+    let mut k_summaries = Vec::with_capacity(num_shards);
+    let mut v_summaries = Vec::with_capacity(num_shards);
+    let mut global_m_before = Vec::with_capacity(num_shards);
+
+    for shard_idx in 0..num_shards {
+        let shard_start = shard_idx * cg;
+        let shard_end = (shard_start + cg).min(s);
+        let shard_len = shard_end - shard_start;
+
+        // Number of local chunks in this shard
+        let n_batch = (shard_len + cl - 1) / cl;
+
+        // Save global M state before this shard's update (for backward)
+        let mut m_snapshot = GpuBuf::<f32>::zeros(dd);
+        unsafe {
+            let rc = gpu_buf_memcpy_d2d(
+                m_snapshot.ptr() as *mut std::ffi::c_void,
+                context_m.as_ptr() as *const std::ffi::c_void,
+                dd * 4,
+            );
+            assert_eq!(rc, 0);
+        }
+        global_m_before.push(m_snapshot);
+
+        // Step 1: Broadcast global M → N copies for local memories
+        let mut m_broadcast = GpuBuf::<f32>::zeros(n_batch * dd);
+        crate::dispatch::tnt_broadcast_m_dd(context_m, &mut m_broadcast, n_batch, d);
+
+        // Step 2: Compute memory projections for the shard's tokens
+        let shard_embedded_slice = embedded.slice(shard_start * d, shard_len * d);
+        let shard_tokens_i32 = i32::try_from(shard_len).expect("shard_len exceeds i32::MAX");
+
+        let mut k_mem = GpuBuf::zeros(shard_len * d);
+        let mut v_mem = GpuBuf::zeros(shard_len * d);
+        let mut q_mem = GpuBuf::zeros(shard_len * d);
+
+        // Copy shard embeddings to owned buffer for cuBLAS
+        let mut shard_embedded = GpuBuf::<f32>::zeros(shard_len * d);
+        unsafe {
+            gpu_buf_memcpy_d2d(
+                shard_embedded.ptr() as *mut std::ffi::c_void,
+                shard_embedded_slice.as_ptr() as *const std::ffi::c_void,
+                shard_len * d * 4,
+            );
+        }
+
+        crate::dispatch::cublas_matmul_transb_dd(&shard_embedded, &level_params.w_k_mem, &mut k_mem, shard_len, d, d, 0.0);
+        crate::dispatch::cublas_matmul_transb_dd(&shard_embedded, &level_params.w_v_mem, &mut v_mem, shard_len, d, d, 0.0);
+        crate::dispatch::cublas_matmul_transb_dd(&shard_embedded, &level_params.w_q_mem, &mut q_mem, shard_len, d, d, 0.0);
+
+        // Step 3: Compute gates for shard tokens
+        let mut alpha = GpuBuf::zeros(shard_len);
+        let mut theta = GpuBuf::zeros(shard_len);
+        unsafe {
+            crate::cuda_ffi::gate_compute_cuda(
+                k_mem.as_ptr(), v_mem.as_ptr(), level_params.w_alpha.as_ptr(),
+                level_params.b_alpha.as_ptr(), alpha.ptr(),
+                shard_tokens_i32, d_i32, 0,
+            );
+            crate::cuda_ffi::gate_compute_cuda(
+                k_mem.as_ptr(), v_mem.as_ptr(), level_params.w_theta.as_ptr(),
+                level_params.b_theta.as_ptr(), theta.ptr(),
+                shard_tokens_i32, d_i32, 1,
+            );
+            let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
+            let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
+            if theta_floor > 0.0 || theta_ceil < f32::MAX {
+                crate::cuda_ffi::clamp_f32_cuda(theta.ptr(), shard_tokens_i32, theta_floor, theta_ceil);
+            }
+        }
+
+        // Step 4: Pad to [n_batch, cl, d] layout for batched kernel
+        // Tokens within a shard are already in sequential local-chunk order.
+        // Pad the last local chunk to cl tokens with zeros if needed.
+        let padded_len = n_batch * cl;
+        let (k_mem_b, v_mem_b, q_mem_b, alpha_b, theta_b) = if shard_len == padded_len {
+            // No padding needed — exact fit
+            (k_mem, v_mem, q_mem, alpha, theta)
+        } else {
+            // Pad with zeros (allocate padded buffers, copy actual data)
+            let mut kp = GpuBuf::zeros(padded_len * d);
+            let mut vp = GpuBuf::zeros(padded_len * d);
+            let mut qp = GpuBuf::zeros(padded_len * d);
+            let mut ap = GpuBuf::zeros(padded_len);
+            let mut tp = GpuBuf::zeros(padded_len);
+            unsafe {
+                gpu_buf_memcpy_d2d(kp.ptr() as *mut _, k_mem.as_ptr() as *const _, shard_len * d * 4);
+                gpu_buf_memcpy_d2d(vp.ptr() as *mut _, v_mem.as_ptr() as *const _, shard_len * d * 4);
+                gpu_buf_memcpy_d2d(qp.ptr() as *mut _, q_mem.as_ptr() as *const _, shard_len * d * 4);
+                gpu_buf_memcpy_d2d(ap.ptr() as *mut _, alpha.as_ptr() as *const _, shard_len * 4);
+                gpu_buf_memcpy_d2d(tp.ptr() as *mut _, theta.as_ptr() as *const _, shard_len * 4);
+            }
+            (kp, vp, qp, ap, tp)
+        };
+
+        // Step 5: Run the batched memory kernel with batch_size=n_batch, seq_len=cl
+        let m_initial_slice = m_broadcast.slice(0, n_batch * dd);
+        let mut y_local = GpuBuf::zeros(padded_len * d);
+
+        let inner_cache = match cfg.memory_rule {
+            MemoryRuleKind::TitansLMM => {
+                // Compute eta gate for shard tokens (unpadded first, then pad)
+                let mut eta = GpuBuf::zeros(shard_len);
+                unsafe {
+                    crate::cuda_ffi::gate_compute_cuda(
+                        k_mem_b.as_ptr(), v_mem_b.as_ptr(), level_params.w_eta.as_ptr(),
+                        level_params.b_eta.as_ptr(), eta.ptr(),
+                        shard_tokens_i32, d_i32, 0,
+                    );
+                }
+                let eta_b = if shard_len == padded_len {
+                    eta
+                } else {
+                    let mut ep = GpuBuf::zeros(padded_len);
+                    unsafe { gpu_buf_memcpy_d2d(ep.ptr() as *mut _, eta.as_ptr() as *const _, shard_len * 4); }
+                    ep
+                };
+
+                let s_initial_buf = GpuBuf::zeros(n_batch * dd);
+                let s_initial_slice = s_initial_buf.slice(0, n_batch * dd);
+                let mut m_states = GpuBuf::zeros(n_batch * (cl + 1) * dd);
+                let mut s_states = GpuBuf::zeros(n_batch * (cl + 1) * dd);
+                crate::dispatch::titans_forward_dd(
+                    &k_mem_b, &v_mem_b, &q_mem_b,
+                    &alpha_b, &theta_b, &eta_b,
+                    &m_initial_slice, &s_initial_slice,
+                    &mut m_states, &mut s_states, &mut y_local, cl, d, n_batch,
+                );
+                GpuMemoryCache::Titans {
+                    k_mem: k_mem_b, v_mem: v_mem_b, q_mem: q_mem_b,
+                    alpha: alpha_b, theta: theta_b, eta: eta_b,
+                    m_states, s_states,
+                }
+            }
+            MemoryRuleKind::DeltaRule => {
+                let mut m_states = GpuBuf::zeros(n_batch * (cl + 1) * dd);
+                crate::dispatch::delta_forward_dd(
+                    &k_mem_b, &v_mem_b, &q_mem_b,
+                    &alpha_b, &theta_b,
+                    &m_initial_slice, &mut m_states, &mut y_local, cl, d, n_batch,
+                );
+                GpuMemoryCache::Delta {
+                    k_mem: k_mem_b, v_mem: v_mem_b, q_mem: q_mem_b,
+                    alpha: alpha_b, theta: theta_b, m_states,
+                }
+            }
+            _ => unreachable!(), // asserted above
+        };
+
+        crate::dispatch::cuda_sync();
+
+        // Step 6: Copy unpadded local outputs to full output buffer
+        // y_local is [n_batch, cl, d] batched layout — we need [shard_len, d]
+        // Since batched layout is contiguous and matches the sequential order,
+        // just copy the first shard_len*d elements.
+        unsafe {
+            gpu_buf_memcpy_d2d(
+                (y_full.ptr() as *mut u8).add(shard_start * d * 4) as *mut std::ffi::c_void,
+                y_local.as_ptr() as *const std::ffi::c_void,
+                shard_len * d * 4,
+            );
+        }
+
+        // Step 7: Compute shard summary (mean-pooling on GPU)
+        // Use the unpadded shard output for summary
+        let mut shard_y = GpuBuf::<f32>::zeros(shard_len * d);
+        unsafe {
+            gpu_buf_memcpy_d2d(
+                shard_y.ptr() as *mut std::ffi::c_void,
+                y_local.as_ptr() as *const std::ffi::c_void,
+                shard_len * d * 4,
+            );
+        }
+        let mut k_sum = GpuBuf::<f32>::zeros(d);
+        let mut v_sum = GpuBuf::<f32>::zeros(d);
+        crate::dispatch::tnt_shard_summary_mean_dd(&shard_y, &mut k_sum, &mut v_sum, shard_len, d);
+
+        // Step 8: Update global M via outer product
+        crate::dispatch::tnt_global_update_dd(context_m, &k_sum, &v_sum, d, 0.95);
+        crate::dispatch::cuda_sync();
+
+        // Apply m_norm_clamp to global M after update
+        unsafe {
+            crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d_i32, m_norm_max);
+        }
+
+        // Save caches for backward
+        shard_inner_caches.push(inner_cache);
+        shard_y_bufs.push(shard_y);
+        k_summaries.push(k_sum);
+        v_summaries.push(v_sum);
+    }
+
+    let n_locals_final = if num_shards > 0 { (cg.min(s) + cl - 1) / cl } else { 1 };
+    (y_full, GpuMemoryCache::TNT {
+        shard_inner_caches, shard_y_bufs, k_summaries, v_summaries,
+        global_m_before, n_locals: n_locals_final, global_chunk_size: cg, local_chunk_size: cl,
+    })
 }
 
 // ══════════════════════════════════════════════════════════════════════

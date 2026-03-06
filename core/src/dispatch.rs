@@ -2368,3 +2368,93 @@ pub fn cuda_sync() {
     let rc = unsafe { cudaDeviceSynchronize() };
     assert_eq!(rc, 0, "cudaDeviceSynchronize failed: error code {rc}");
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// TNT helper kernel dispatch (device-to-device)
+// ══════════════════════════════════════════════════════════════════════
+
+/// Broadcast global M to N contiguous copies on device.
+#[cfg(feature = "cuda")]
+pub fn tnt_broadcast_m_dd(
+    m_src: &GpuBuf<f32>, m_dst: &mut GpuBuf<f32>,
+    n_local: usize, d: usize,
+) {
+    unsafe {
+        crate::cuda_ffi::tnt_broadcast_m_f32_cuda(
+            m_src.as_ptr(), m_dst.ptr(),
+            n_local as i32, d as i32,
+        );
+    }
+}
+
+/// Mean-pool local outputs into shard summary on device.
+#[cfg(feature = "cuda")]
+pub fn tnt_shard_summary_mean_dd(
+    local_y: &GpuBuf<f32>, k_sum: &mut GpuBuf<f32>, v_sum: &mut GpuBuf<f32>,
+    shard_len: usize, d: usize,
+) {
+    unsafe {
+        crate::cuda_ffi::tnt_shard_summary_mean_f32_cuda(
+            local_y.as_ptr(), k_sum.ptr(), v_sum.ptr(),
+            shard_len as i32, d as i32,
+        );
+    }
+}
+
+/// Update global M via outer product on device.
+#[cfg(feature = "cuda")]
+pub fn tnt_global_update_dd(
+    global_m: &mut GpuBuf<f32>, k_sum: &GpuBuf<f32>, v_sum: &GpuBuf<f32>,
+    d: usize, alpha: f32,
+) {
+    unsafe {
+        crate::cuda_ffi::tnt_global_update_f32_cuda(
+            global_m.ptr(), k_sum.as_ptr(), v_sum.as_ptr(),
+            d as i32, alpha,
+        );
+    }
+}
+
+/// Backward through global M update on device.
+#[cfg(feature = "cuda")]
+pub fn tnt_global_update_backward_dd(
+    d_m_new: &GpuBuf<f32>, k_sum: &GpuBuf<f32>, v_sum: &GpuBuf<f32>,
+    d_m_old: &mut GpuBuf<f32>, d_k_sum: &mut GpuBuf<f32>, d_v_sum: &mut GpuBuf<f32>,
+    d: usize, alpha: f32,
+) {
+    unsafe {
+        crate::cuda_ffi::tnt_global_update_backward_f32_cuda(
+            d_m_new.as_ptr(), k_sum.as_ptr(), v_sum.as_ptr(),
+            d_m_old.ptr(), d_k_sum.ptr(), d_v_sum.ptr(),
+            d as i32, alpha,
+        );
+    }
+}
+
+/// Backward through mean-pooling shard summary on device.
+#[cfg(feature = "cuda")]
+pub fn tnt_shard_summary_mean_backward_dd(
+    d_k_sum: &GpuBuf<f32>, d_v_sum: &GpuBuf<f32>,
+    d_local_y: &mut GpuBuf<f32>, shard_len: usize, d: usize,
+) {
+    unsafe {
+        crate::cuda_ffi::tnt_shard_summary_mean_backward_f32_cuda(
+            d_k_sum.as_ptr(), d_v_sum.as_ptr(),
+            d_local_y.ptr(), shard_len as i32, d as i32,
+        );
+    }
+}
+
+/// Combine upstream + global gradient contributions on device.
+#[cfg(feature = "cuda")]
+pub fn tnt_combine_gradients_dd(
+    d_y_upstream: &GpuBuf<f32>, d_y_global: &GpuBuf<f32>,
+    d_y_combined: &mut GpuBuf<f32>, n: usize,
+) {
+    unsafe {
+        crate::cuda_ffi::tnt_combine_gradients_f32_cuda(
+            d_y_upstream.as_ptr(), d_y_global.as_ptr(),
+            d_y_combined.ptr(), n as i32,
+        );
+    }
+}

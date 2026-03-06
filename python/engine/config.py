@@ -63,6 +63,11 @@ class BuildConfig:
     donor_layers: list[int] | None = None  # which Llama layers to transplant (e.g. [0,5,10,15])
     donor_weights: str | None = None       # path to extracted donor weights .pt file
 
+    # Parallelization strategy (TNT chunkwise, associative scan, etc.)
+    parallel_strategy: str | None = None   # "tnt_hierarchical", "chunkwise", or None (sequential)
+    tnt_global_chunk_size: int = 64        # shard size for TNT
+    tnt_local_chunk_size: int = 8          # local chunk size within TNT shard
+
     # Build
     lr: float = 0.01
     steps: int = 500

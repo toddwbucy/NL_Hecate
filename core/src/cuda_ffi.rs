@@ -415,6 +415,63 @@ extern "C" {
     /// Simple SAXPY: y[i] += alpha * x[i]. For small buffers.
     pub(crate) fn saxpy_cuda(alpha: f32, x: *const f32, y: *mut f32, n: i32);
 
+    // ── TNT helper kernels (chunkwise parallelism glue) ─────────────────
+
+    /// Broadcast global M to N contiguous copies for parallel local memories.
+    pub(crate) fn tnt_broadcast_m_f32_cuda(
+        m_src: *const f32,   // [d*d]
+        m_dst: *mut f32,     // [N*d*d]
+        n_local: i32,
+        d: i32,
+    );
+
+    /// Mean-pool local outputs into shard summary vectors.
+    pub(crate) fn tnt_shard_summary_mean_f32_cuda(
+        local_y: *const f32,  // [shard_len, d]
+        k_sum: *mut f32,      // [d]
+        v_sum: *mut f32,      // [d]
+        shard_len: i32,
+        d: i32,
+    );
+
+    /// Update global M via outer product: M[i,j] = alpha*M[i,j] + v[i]*k[j].
+    pub(crate) fn tnt_global_update_f32_cuda(
+        global_m: *mut f32,    // [d*d]
+        k_sum: *const f32,     // [d]
+        v_sum: *const f32,     // [d]
+        d: i32,
+        alpha: f32,
+    );
+
+    /// Backward through global M update outer product.
+    pub(crate) fn tnt_global_update_backward_f32_cuda(
+        d_m_new: *const f32,   // [d*d]
+        k_sum: *const f32,     // [d]
+        v_sum: *const f32,     // [d]
+        d_m_old: *mut f32,     // [d*d]
+        d_k_sum: *mut f32,     // [d] — pre-zeroed
+        d_v_sum: *mut f32,     // [d] — pre-zeroed
+        d: i32,
+        alpha: f32,
+    );
+
+    /// Backward through mean-pooling shard summary.
+    pub(crate) fn tnt_shard_summary_mean_backward_f32_cuda(
+        d_k_sum: *const f32,   // [d]
+        d_v_sum: *const f32,   // [d]
+        d_local_y: *mut f32,   // [shard_len, d] — accumulated
+        shard_len: i32,
+        d: i32,
+    );
+
+    /// Combine upstream + global gradient contributions (element-wise add).
+    pub(crate) fn tnt_combine_gradients_f32_cuda(
+        d_y_upstream: *const f32,
+        d_y_global: *const f32,
+        d_y_combined: *mut f32,
+        n: i32,
+    );
+
     // ── AdamW optimizer kernels ─────────────────────────────────────────
 
     /// Fused AdamW weight update. Updates w, m, v in-place on device.
