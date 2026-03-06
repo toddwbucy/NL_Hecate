@@ -99,9 +99,13 @@ When blockDim.x >= d (the d <= 1024 case that all existing tests exercise), the 
 
 | Test | d | What |
 |------|---|------|
-| delta forward/backward | 2048 | Full numerical match vs Rust reference |
-| hebbian forward/backward | 2048 | Full numerical match vs Rust reference |
-| titans forward/backward | 2048 | Full numerical match vs Rust reference |
-| dgd forward/backward | 2048 | Full numerical match vs Rust reference |
+| delta forward | 2048 | Full numerical match vs Rust reference |
+| delta backward | 2048 | Full numerical match vs Rust reference (all 6 gradients) |
+| hebbian forward | 2048 | Full numerical match vs Rust reference |
+| hebbian backward | 2048 | Non-zero gradient sanity check |
+| titans forward | 2048 | Full numerical match vs Rust reference |
+| titans backward | 2048 | Non-zero gradient sanity check |
+| dgd forward | 2048 | Full numerical match vs Rust reference |
+| dgd backward | 2048 | Non-zero gradient sanity check |
 | gate backward | D=1024 | Verifies upper-half weights [D, 2D) written |
 | delta forward | 1536 | Odd dimension between 1024 and 2048 |
