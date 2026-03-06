@@ -291,6 +291,8 @@ class BuildConfig:
                 raise ValueError(f"extend_k must be >= 2, got {self.extend_k}")
         if self.push_up and self.extend_k is None:
             raise ValueError("push_up=true requires extend_k to be set")
+        if self.data_seek is not None and self.data_seek < 0:
+            raise ValueError(f"data_seek must be >= 0, got {self.data_seek}")
 
     @property
     def head_dim(self) -> int:

@@ -231,8 +231,8 @@ def run_build(bcfg: BuildConfig):
                 print(f"  Push-up: k={loaded_k} → k={target_k}, "
                       f"chunks={new_chunks}")
             else:
-                print(f"  ERROR: extend_k set but push_up=false — "
-                      f"only push-up stacking is implemented")
+                print("  ERROR: extend_k set but push_up=false — "
+                      "only push-up stacking is implemented")
                 return
             cfg = new_cfg
             resume_step = 0
@@ -240,6 +240,9 @@ def run_build(bcfg: BuildConfig):
 
         # ── Data cursor override (for push-up or manual reposition) ──
         if bcfg.data_seek is not None and active_loader is not None:
+            if bcfg.batch_size > 1:
+                print("  ERROR: data_seek with batch_size>1 is not supported yet")
+                return
             active_loader.restore({
                 "position": bcfg.data_seek,
                 "total_tokens": active_loader.total_tokens,

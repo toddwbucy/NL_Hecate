@@ -1,6 +1,7 @@
 {
   "description": "Push-up Phase 2: Extend k=1→k=2. Trained L0 becomes L1, fresh L0 inserted. 10K steps.",
   "model": {
+    "k": 2,
     "d_model": 512,
     "num_heads": 8,
     "seq_len": 512,

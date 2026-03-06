@@ -2162,6 +2162,23 @@ impl MAGParams {
             new_cfg.k,
             old_k + 1,
         );
+        // Structural compatibility: d_model, vocab_size, n_persistent must match
+        let old_d = new_cfg.swa.d_model;
+        assert_eq!(
+            self.swa.w_q.len(), old_d * old_d,
+            "d_model mismatch: existing SWA w_q size {} vs expected d_model={}",
+            self.swa.w_q.len(), old_d,
+        );
+        assert_eq!(
+            self.swa.w_embed.len(), new_cfg.swa.vocab_size * old_d,
+            "vocab_size mismatch: existing w_embed size {} vs expected {}",
+            self.swa.w_embed.len(), new_cfg.swa.vocab_size * old_d,
+        );
+        assert_eq!(
+            self.persistent_tokens.len(), new_cfg.n_persistent * old_d,
+            "n_persistent mismatch: existing persistent_tokens len {} vs expected {}",
+            self.persistent_tokens.len(), new_cfg.n_persistent * old_d,
+        );
 
         // Init fresh params with new_cfg — gives us a correctly initialized L0
         // (Xavier projections, level-0 gate biases, Conv1D, frequency gates, etc.)

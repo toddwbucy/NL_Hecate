@@ -1,6 +1,7 @@
 {
   "description": "Push-up Phase 3: Extend k=2→k=3. Trained levels shift up, fresh L0 inserted. 10K steps.",
   "model": {
+    "k": 3,
     "d_model": 512,
     "num_heads": 8,
     "seq_len": 512,

@@ -1,6 +1,7 @@
 {
   "description": "Push-up Phase 4: Extend k=3→k=4. Full CMS stack with warm-started levels. 100K steps from corpus start.",
   "model": {
+    "k": 4,
     "d_model": 512,
     "num_heads": 8,
     "seq_len": 512,
