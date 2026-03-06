@@ -187,6 +187,11 @@ def run_build(bcfg: BuildConfig):
                 return
             if bcfg.stack_up:
                 # Stack-up: preserve donor's chunk sizes, append next tier
+                canonical_prefix = chunk_template[:len(cfg.chunk_sizes)]
+                if list(cfg.chunk_sizes) != canonical_prefix:
+                    print(f"  ERROR: stack-up requires canonical chunk_sizes prefix "
+                          f"{canonical_prefix}, got {list(cfg.chunk_sizes)}")
+                    return
                 new_chunks = list(cfg.chunk_sizes) + [chunk_template[target_k - 1]]
             else:
                 # Push-up: use canonical template (levels shift frequencies)

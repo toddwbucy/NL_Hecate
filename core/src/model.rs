@@ -2261,11 +2261,26 @@ impl MAGParams {
             );
             // Frequency gate: present iff Learned schedule
             let has_freq = matches!(new_cfg.frequency_schedule, FrequencySchedule::Learned(_));
-            let expect_freq = if has_freq { d } else { 0 };
+            let expect_freq_w = if has_freq { d } else { 0 };
+            let expect_freq_b = if has_freq { 1 } else { 0 };
             assert_eq!(
-                lev.w_freq.len(), expect_freq,
+                lev.w_freq.len(), expect_freq_w,
                 "extend_stack_up: level[{}] w_freq size {} vs expected {}",
-                i, lev.w_freq.len(), expect_freq,
+                i, lev.w_freq.len(), expect_freq_w,
+            );
+            assert_eq!(
+                lev.b_freq.len(), expect_freq_b,
+                "extend_stack_up: level[{}] b_freq size {} vs expected {}",
+                i, lev.b_freq.len(), expect_freq_b,
+            );
+            // Atlas Omega projection: [d, 2*d] when rule is AtlasOmega, else empty
+            let expect_omega = if matches!(new_cfg.memory_rule, MemoryRuleKind::AtlasOmega) {
+                d * 2 * d
+            } else { 0 };
+            assert_eq!(
+                lev.w_omega.len(), expect_omega,
+                "extend_stack_up: level[{}] w_omega size {} vs expected {}",
+                i, lev.w_omega.len(), expect_omega,
             );
             // Self-referential init memories: present iff Adaptive projection
             let has_self_ref = matches!(new_cfg.projection_kind, ProjectionKind::Adaptive);
@@ -2274,6 +2289,16 @@ impl MAGParams {
                 lev.m_k_init.len(), expect_self_ref,
                 "extend_stack_up: level[{}] m_k_init size {} vs expected {} (projection_kind mismatch)",
                 i, lev.m_k_init.len(), expect_self_ref,
+            );
+            assert_eq!(
+                lev.m_v_init.len(), expect_self_ref,
+                "extend_stack_up: level[{}] m_v_init size {} vs expected {}",
+                i, lev.m_v_init.len(), expect_self_ref,
+            );
+            assert_eq!(
+                lev.m_q_init.len(), expect_self_ref,
+                "extend_stack_up: level[{}] m_q_init size {} vs expected {}",
+                i, lev.m_q_init.len(), expect_self_ref,
             );
         }
 
