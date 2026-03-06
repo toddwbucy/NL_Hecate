@@ -154,19 +154,19 @@ __global__ void dgd_forward_kernel(
         int m_t_off = t * dd;
         int m_next_off = (t + 1) * dd;
 
-        // ── prediction[i] = sum_j M_t[i,j] * k_t[j] ──
-        if (tid < d) {
+        // ── prediction[i] = sum_j M_t[i,j] * k_t[j] (strided: supports d > blockDim.x) ──
+        for (int row = tid; row < d; row += blockDim.x) {
             float sum = 0.0f;
             for (int j = 0; j < d; j++) {
-                sum += m_states[m_t_off + tid * d + j] * k_t[j];
+                sum += m_states[m_t_off + row * d + j] * k_t[j];
             }
-            prediction[tid] = sum;
+            prediction[row] = sum;
         }
         __syncthreads();
 
-        // ── error[i] = prediction[i] - v_t[i] ──
-        if (tid < d) {
-            error_buf[tid] = prediction[tid] - v_t[tid];
+        // ── error[i] = prediction[i] - v_t[i] (strided: supports d > blockDim.x) ──
+        for (int row = tid; row < d; row += blockDim.x) {
+            error_buf[row] = prediction[row] - v_t[row];
         }
         __syncthreads();
 
@@ -180,13 +180,13 @@ __global__ void dgd_forward_kernel(
         }
         __syncthreads();
 
-        // ── y_t[i] = sum_j M_{t+1}[i,j] * q_t[j] ──
-        if (tid < d) {
+        // ── y_t[i] = sum_j M_{t+1}[i,j] * q_t[j] (strided: supports d > blockDim.x) ──
+        for (int row = tid; row < d; row += blockDim.x) {
             float sum = 0.0f;
             for (int j = 0; j < d; j++) {
-                sum += m_states[m_next_off + tid * d + j] * q_t[j];
+                sum += m_states[m_next_off + row * d + j] * q_t[j];
             }
-            y[t * d + tid] = sum;
+            y[t * d + row] = sum;
         }
         __syncthreads();
 
@@ -206,19 +206,19 @@ __global__ void dgd_forward_kernel(
         int m_t_off = t * dd;
         int m_next_off = (t + 1) * dd;
 
-        // ── prediction[i] = sum_j M_t[i,j] * k_t[j] ──
-        if (tid < d) {
+        // ── prediction[i] = sum_j M_t[i,j] * k_t[j] (strided: supports d > blockDim.x) ──
+        for (int row = tid; row < d; row += blockDim.x) {
             float sum = 0.0f;
             for (int j = 0; j < d; j++) {
-                sum += m_states[m_t_off + tid * d + j] * k_t[j];
+                sum += m_states[m_t_off + row * d + j] * k_t[j];
             }
-            prediction[tid] = sum;
+            prediction[row] = sum;
         }
         __syncthreads();
 
-        // ── error[i] = prediction[i] - v_t[i] ──
-        if (tid < d) {
-            error_buf[tid] = prediction[tid] - v_t[tid];
+        // ── error[i] = prediction[i] - v_t[i] (strided: supports d > blockDim.x) ──
+        for (int row = tid; row < d; row += blockDim.x) {
+            error_buf[row] = prediction[row] - v_t[row];
         }
         __syncthreads();
 
@@ -232,13 +232,13 @@ __global__ void dgd_forward_kernel(
         }
         __syncthreads();
 
-        // ── y_t[i] = sum_j M_{t+1}[i,j] * q_t[j] ──
-        if (tid < d) {
+        // ── y_t[i] = sum_j M_{t+1}[i,j] * q_t[j] (strided: supports d > blockDim.x) ──
+        for (int row = tid; row < d; row += blockDim.x) {
             float sum = 0.0f;
             for (int j = 0; j < d; j++) {
-                sum += m_states[m_next_off + tid * d + j] * q_t[j];
+                sum += m_states[m_next_off + row * d + j] * q_t[j];
             }
-            y[t * d + tid] = sum;
+            y[t * d + row] = sum;
         }
         __syncthreads();
     }
@@ -327,18 +327,18 @@ __global__ void dgd_forward_ckpt_kernel(
         float alpha_t = alpha[t];
         float theta_t = theta[t];
 
-        // prediction = M @ k
-        if (tid < d) {
+        // prediction = M @ k (strided: supports d > blockDim.x)
+        for (int row = tid; row < d; row += blockDim.x) {
             float sum = 0.0f;
             for (int j = 0; j < d; j++) {
-                sum += m_work[tid * d + j] * k_t[j];
+                sum += m_work[row * d + j] * k_t[j];
             }
-            prediction[tid] = sum;
+            prediction[row] = sum;
         }
         __syncthreads();
 
-        if (tid < d) {
-            error_buf[tid] = prediction[tid] - v_t[tid];
+        for (int row = tid; row < d; row += blockDim.x) {
+            error_buf[row] = prediction[row] - v_t[row];
         }
         __syncthreads();
 
@@ -359,13 +359,13 @@ __global__ void dgd_forward_ckpt_kernel(
             ckpt_idx++;
         }
 
-        // y = M @ q (always written)
-        if (tid < d) {
+        // y = M @ q (always written, strided: supports d > blockDim.x)
+        for (int row = tid; row < d; row += blockDim.x) {
             float sum = 0.0f;
             for (int j = 0; j < d; j++) {
-                sum += m_work[tid * d + j] * q_t[j];
+                sum += m_work[row * d + j] * q_t[j];
             }
-            y[t * d + tid] = sum;
+            y[t * d + row] = sum;
         }
         __syncthreads();
 
@@ -381,18 +381,18 @@ __global__ void dgd_forward_ckpt_kernel(
         float alpha_t = alpha[t];
         float theta_t = theta[t];
 
-        // prediction = M @ k
-        if (tid < d) {
+        // prediction = M @ k (strided: supports d > blockDim.x)
+        for (int row = tid; row < d; row += blockDim.x) {
             float sum = 0.0f;
             for (int j = 0; j < d; j++) {
-                sum += m_work[tid * d + j] * k_t[j];
+                sum += m_work[row * d + j] * k_t[j];
             }
-            prediction[tid] = sum;
+            prediction[row] = sum;
         }
         __syncthreads();
 
-        if (tid < d) {
-            error_buf[tid] = prediction[tid] - v_t[tid];
+        for (int row = tid; row < d; row += blockDim.x) {
+            error_buf[row] = prediction[row] - v_t[row];
         }
         __syncthreads();
 
@@ -413,13 +413,13 @@ __global__ void dgd_forward_ckpt_kernel(
             ckpt_idx++;
         }
 
-        // y = M @ q (always written)
-        if (tid < d) {
+        // y = M @ q (always written, strided: supports d > blockDim.x)
+        for (int row = tid; row < d; row += blockDim.x) {
             float sum = 0.0f;
             for (int j = 0; j < d; j++) {
-                sum += m_work[tid * d + j] * q_t[j];
+                sum += m_work[row * d + j] * q_t[j];
             }
-            y[t * d + tid] = sum;
+            y[t * d + row] = sum;
         }
         __syncthreads();
     }
@@ -432,9 +432,8 @@ extern "C" void dgd_forward_ckpt_f32_cuda(
     float* m_states, float* y,
     int seq_len, int d, int checkpoint_interval)
 {
-    if (d <= 0 || d > 1024) {
-        fprintf(stderr, "dgd_forward_ckpt_f32_cuda: d=%d has invalid dimension (must be 1..=1024). "
-                        "Kernel restructuring needed for d > 1024.\n", d);
+    if (d <= 0 || 8 * d * (int)sizeof(float) > 163840) {
+        fprintf(stderr, "dgd_forward_ckpt_f32_cuda: d=%d out of range (must be 1..=5120).\n", d);
         exit(1);
     }
     if (checkpoint_interval <= 0) {
@@ -443,8 +442,6 @@ extern "C" void dgd_forward_ckpt_f32_cuda(
         exit(1);
     }
     int dd = d * d;
-    // block_size = min(d*d, 1024). For d <= 1024, min(d*d, 1024) >= d always holds.
-    // d > 1024 requires kernel restructuring (prediction loop must stride).
     int block_size = (dd < 1024) ? dd : 1024;
 
     dim3 grid(1);
@@ -480,14 +477,11 @@ extern "C" void dgd_forward_f32_cuda(
     float* m_states, float* y,
     int seq_len, int d)
 {
-    if (d <= 0 || d > 1024) {
-        fprintf(stderr, "dgd_forward_f32_cuda: d=%d has invalid dimension (must be 1..=1024). "
-                        "Kernel restructuring needed for d > 1024.\n", d);
+    if (d <= 0 || 8 * d * (int)sizeof(float) > 163840) {
+        fprintf(stderr, "dgd_forward_f32_cuda: d=%d out of range (must be 1..=5120).\n", d);
         exit(1);
     }
     int dd = d * d;
-    // block_size = min(d*d, 1024). For d <= 1024, min(d*d, 1024) >= d always holds.
-    // d > 1024 requires kernel restructuring (prediction loop must stride).
     int block_size = (dd < 1024) ? dd : 1024;
 
     dim3 grid(1);

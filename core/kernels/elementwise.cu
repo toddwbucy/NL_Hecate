@@ -215,7 +215,7 @@ extern "C" void gate_compute_cuda(
     const float* bias_ptr, float* gate_out,
     int seq_len, int d, int activation)
 {
-    int block = (d < 512) ? d : 512;
+    int block = (d < 1024) ? d : 1024;
     if (block < 32) block = 32;  // minimum warp
     gate_compute_kernel<<<seq_len, block>>>(
         k_mem, v_mem, w_gate, bias_ptr, gate_out, seq_len, d, activation);

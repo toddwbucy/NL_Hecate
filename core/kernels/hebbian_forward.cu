@@ -146,13 +146,13 @@ __global__ void hebbian_forward_kernel(
         }
         __syncthreads();
 
-        // y = M_{t+1} @ q
-        if (tid < d) {
+        // y = M_{t+1} @ q (strided: supports d > blockDim.x)
+        for (int row = tid; row < d; row += blockDim.x) {
             float sum = 0.0f;
             for (int j = 0; j < d; j++) {
-                sum += m_states[m_next_off + tid * d + j] * q_t[j];
+                sum += m_states[m_next_off + row * d + j] * q_t[j];
             }
-            y[t * d + tid] = sum;
+            y[t * d + row] = sum;
         }
         __syncthreads();
 
@@ -181,13 +181,13 @@ __global__ void hebbian_forward_kernel(
         }
         __syncthreads();
 
-        // y = M_{t+1} @ q
-        if (tid < d) {
+        // y = M_{t+1} @ q (strided: supports d > blockDim.x)
+        for (int row = tid; row < d; row += blockDim.x) {
             float sum = 0.0f;
             for (int j = 0; j < d; j++) {
-                sum += m_states[m_next_off + tid * d + j] * q_t[j];
+                sum += m_states[m_next_off + row * d + j] * q_t[j];
             }
-            y[t * d + tid] = sum;
+            y[t * d + row] = sum;
         }
         __syncthreads();
     }
@@ -252,13 +252,13 @@ __global__ void hebbian_forward_ckpt_kernel(
             ckpt_idx++;
         }
 
-        // y = M @ q (always)
-        if (tid < d) {
+        // y = M @ q (always, strided: supports d > blockDim.x)
+        for (int row = tid; row < d; row += blockDim.x) {
             float sum = 0.0f;
             for (int j = 0; j < d; j++) {
-                sum += m_work[tid * d + j] * q_t[j];
+                sum += m_work[row * d + j] * q_t[j];
             }
-            y[t * d + tid] = sum;
+            y[t * d + row] = sum;
         }
         __syncthreads();
     }
@@ -270,9 +270,8 @@ extern "C" void hebbian_forward_ckpt_f32_cuda(
     float* m_states, float* y,
     int seq_len, int d, int checkpoint_interval)
 {
-    if (d <= 0 || d > 1024) {
-        fprintf(stderr, "hebbian_forward_ckpt_f32_cuda: d=%d has invalid dimension (must be 1..=1024). "
-                        "Kernel restructuring needed for d > 1024.\n", d);
+    if (d <= 0 || 8 * d * (int)sizeof(float) > 163840) {
+        fprintf(stderr, "hebbian_forward_ckpt_f32_cuda: d=%d out of range (must be 1..=5120).\n", d);
         exit(1);
     }
     if (checkpoint_interval <= 0) {
@@ -281,8 +280,6 @@ extern "C" void hebbian_forward_ckpt_f32_cuda(
         exit(1);
     }
     int dd = d * d;
-    // block_size = min(d*d, 1024). For d <= 1024, min(d*d, 1024) >= d always holds.
-    // d > 1024 requires kernel restructuring (prediction loop must stride).
     int block_size = (dd < 1024) ? dd : 1024;
 
     dim3 grid(1);
@@ -312,14 +309,11 @@ extern "C" void hebbian_forward_f32_cuda(
     float* m_states, float* y,
     int seq_len, int d)
 {
-    if (d <= 0 || d > 1024) {
-        fprintf(stderr, "hebbian_forward_f32_cuda: d=%d has invalid dimension (must be 1..=1024). "
-                        "Kernel restructuring needed for d > 1024.\n", d);
+    if (d <= 0 || 8 * d * (int)sizeof(float) > 163840) {
+        fprintf(stderr, "hebbian_forward_f32_cuda: d=%d out of range (must be 1..=5120).\n", d);
         exit(1);
     }
     int dd = d * d;
-    // block_size = min(d*d, 1024). For d <= 1024, min(d*d, 1024) >= d always holds.
-    // d > 1024 requires kernel restructuring (prediction loop must stride).
     int block_size = (dd < 1024) ? dd : 1024;
 
     dim3 grid(1);
