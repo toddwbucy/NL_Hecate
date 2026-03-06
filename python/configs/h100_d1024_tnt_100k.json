@@ -1,5 +1,5 @@
 {
-  "description": "H100 TNT 100K production run — d=1024, k=4, Titans MAG with TNT chunkwise parallelization. N=8 local memories per shard (C_G=64, C_L=8). Based on 200-step benchmark (946 tok/s). m_norm_max guards against NaN divergence. Dolmino-100B dataset.",
+  "description": "H100 TNT 100K production run — d=1024, k=4, Titans MAG with TNT chunkwise parallelization. N=8 local memories per shard (C_G=64, C_L=8). Based on 200-step benchmark (946 tok/s). v2: lr halved to 0.0003 (sqrt(d) scaling from d=512), m_norm_max tightened to 50.0 after NaN at step 3220 in v1. Dolmino-100B dataset.",
   "model": {
     "d_model": 1024,
     "num_heads": 16,
@@ -18,7 +18,7 @@
     "tnt_local_chunk_size": 8
   },
   "build": {
-    "lr": 0.0006,
+    "lr": 0.0003,
     "steps": 100000,
     "optimizer": "adamw_gpu",
     "warmup_steps": 1000,
@@ -43,5 +43,5 @@
     "path": "data/dolmino_100b",
     "format": "sharegpt"
   },
-  "m_norm_max": [100.0, 100.0, 100.0, 100.0]
+  "m_norm_max": [50.0, 50.0, 50.0, 50.0]
 }
