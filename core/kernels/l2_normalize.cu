@@ -75,11 +75,6 @@ extern "C" void l2_normalize_rows_f32_cuda(
     if (n_rows <= 0 || d <= 0) return;
 
     int block_size = (d < 1024) ? d : 1024;
-    // Round up to power of 2 for reduction
-    int rounded = 1;
-    while (rounded < block_size) rounded <<= 1;
-    if (rounded > 1024) rounded >>= 1;
-    block_size = rounded;
 
     dim3 grid(n_rows);
     dim3 block(block_size);
@@ -170,10 +165,6 @@ extern "C" void l2_normalize_backward_f32_cuda(
     if (n_rows <= 0 || d <= 0) return;
 
     int block_size = (d < 1024) ? d : 1024;
-    int rounded = 1;
-    while (rounded < block_size) rounded <<= 1;
-    if (rounded > 1024) rounded >>= 1;
-    block_size = rounded;
 
     dim3 grid(n_rows);
     dim3 block(block_size);

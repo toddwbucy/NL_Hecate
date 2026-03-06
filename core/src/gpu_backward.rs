@@ -649,8 +649,16 @@ fn gpu_memory_backward(
                 let mut d_eta_shard = GpuBuf::zeros(shard_tokens);
                 let has_eta = matches!(inner_cache, GpuMemoryCache::Titans { .. });
 
+                // Extract k/q norms and normalized k/q refs for Step 5b (L2 backward),
+                // avoiding a redundant rematch after the inner backward kernel.
+                let (shard_k_norms, shard_q_norms, shard_k_mem, shard_q_mem) = match inner_cache {
+                    GpuMemoryCache::Titans { k_mem, q_mem, k_norms, q_norms, .. } => (k_norms, q_norms, k_mem, q_mem),
+                    GpuMemoryCache::Delta { k_mem, q_mem, k_norms, q_norms, .. } => (k_norms, q_norms, k_mem, q_mem),
+                    _ => unreachable!("TNT inner cache must be Titans or Delta"),
+                };
+
                 match inner_cache {
-                    GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states, s_states, k_norms: _, q_norms: _ } => {
+                    GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states, s_states, .. } => {
                         let mut d_m_initial = GpuBuf::zeros(n_batch * dd);
                         let mut d_s_initial = GpuBuf::zeros(n_batch * dd);
 
@@ -674,7 +682,7 @@ fn gpu_memory_backward(
                             }
                         }
                     }
-                    GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states, k_norms: _, q_norms: _ } => {
+                    GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states, .. } => {
                         let mut d_m_initial = GpuBuf::zeros(n_batch * dd);
 
                         crate::dispatch::delta_backward_dd(
@@ -714,11 +722,6 @@ fn gpu_memory_backward(
                 // d_k_shard/d_q_shard are gradients w.r.t. normalized k/q from the inner
                 // backward kernel. Transform to gradients w.r.t. raw projections.
                 {
-                    let (shard_k_norms, shard_q_norms, shard_k_mem, shard_q_mem) = match inner_cache {
-                        GpuMemoryCache::Titans { k_mem, q_mem, k_norms, q_norms, .. } => (k_norms, q_norms, k_mem, q_mem),
-                        GpuMemoryCache::Delta { k_mem, q_mem, k_norms, q_norms, .. } => (k_norms, q_norms, k_mem, q_mem),
-                        _ => unreachable!(),
-                    };
                     let mut d_k_raw = GpuBuf::zeros(shard_tokens * d);
                     let mut d_q_raw = GpuBuf::zeros(shard_tokens * d);
                     unsafe {
