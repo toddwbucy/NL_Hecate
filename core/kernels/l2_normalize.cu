@@ -143,9 +143,9 @@ __global__ void l2_normalize_backward_kernel(
     float dot_val = smem[0];
 
     // Phase 2: d_in depends on whether forward used the norm or the eps clamp.
-    // If norm > eps: d_in = (d_out - x_norm * dot(d_out, x_norm)) / norm  (sphere Jacobian)
-    // If norm <= eps: forward was x/eps (linear scaling), so d_in = d_out / eps
-    if (norm > eps) {
+    // If norm >= eps: d_in = (d_out - x_norm * dot(d_out, x_norm)) / norm  (sphere Jacobian)
+    // If norm < eps: forward was x/eps (linear scaling), so d_in = d_out / eps
+    if (norm >= eps) {
         for (int j = tid; j < d; j += blockDim.x) {
             d_in_row[j] = (d_out_row[j] - x_norm_row[j] * dot_val) * inv_norm;
         }

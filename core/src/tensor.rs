@@ -325,7 +325,7 @@ pub fn l2_normalize_rows_backward(
         let d_out_row = &d_out[i * d..(i + 1) * d];
         let x_norm_row = &x_norm[i * d..(i + 1) * d];
         let d_in_row = &mut d_in[i * d..(i + 1) * d];
-        if norms[i] > eps {
+        if norms[i] >= eps {
             // Sphere Jacobian: d_in = (d_out - x_norm * dot(d_out, x_norm)) / norm
             let inv_norm = 1.0 / norms[i];
             let mut dot = 0.0f32;
