@@ -185,6 +185,13 @@ impl<T: GpuElement> GpuBuf<T> {
         }
     }
 
+    /// Deep-copy this buffer into a new owned allocation (device-to-device).
+    pub fn dup(&self) -> GpuBuf<T> {
+        let new = GpuBuf::new(self.len);
+        new.copy_from_device(self);
+        new
+    }
+
     /// Copy from another GpuBuf (device-to-device). Lengths must match.
     pub fn copy_from_device(&self, src: &GpuBuf<T>) {
         assert_eq!(src.len, self.len, "GpuBuf::copy_from_device: length mismatch");

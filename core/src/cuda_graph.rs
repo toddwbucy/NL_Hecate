@@ -236,6 +236,10 @@ pub struct GpuLevelScratch {
     /// Initial momentum state for Titans — [bs * d*d]; zeros(1) for non-Titans.
     /// Persistent (not transient) so captured graph nodes reference a stable device pointer.
     pub s_initial: GpuBuf<f32>,
+    /// Pre-normalization L2 norms of key rows — [bs * s]
+    pub k_norms: GpuBuf<f32>,
+    /// Pre-normalization L2 norms of query rows — [bs * s]
+    pub q_norms: GpuBuf<f32>,
 }
 
 #[cfg(feature = "cuda")]
@@ -266,6 +270,8 @@ impl GpuLevelScratch {
             } else {
                 GpuBuf::zeros(1)  // dummy — never used
             },
+            k_norms: GpuBuf::zeros(bs * s),
+            q_norms: GpuBuf::zeros(bs * s),
         }
     }
 

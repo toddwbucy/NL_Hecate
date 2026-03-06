@@ -309,13 +309,20 @@ pub fn delta_rule_opaque_backward(
     let fm_kind = decode_feature_map_kind(fm_kind_f32, fm_sigma);
     let has_fm = !matches!(fm_kind, crate::feature_map::FeatureMapKind::Identity);
 
+    // Detect L2 norms presence: new format has extra_meta with 7 elements (+ seq_len + d + kernel_size = 10).
+    // Old format has 6 extras → meta.len() = 9. New format → meta.len() = 10, has_norms at meta[8].
+    let has_norms = saved[0].len() >= 10;
+
     // Read frozen FM weights from tape buffers if non-Identity.
-    // Layout: saved[15]=fm_z_k, saved[16]=fm_z_q, saved[17]=w_rand, saved[18]=b_rand.
+    // Layout (with norms): saved[17]=fm_z_k, saved[18]=fm_z_q, saved[19]=w_rand, saved[20]=b_rand.
+    // Layout (without norms, backward compat): saved[15]=fm_z_k, saved[16]=fm_z_q, saved[17]=w_rand, saved[18]=b_rand.
+    let fm_base = if has_norms { 17 } else { 15 };
     let (fm_z_k_mem, fm_z_q_mem, w_rand, b_rand) = if has_fm {
-        assert!(saved.len() > 18,
-            "delta_rule_opaque_backward: has_fm=true but saved.len()={} < 19 — \
-             tape may be from an incompatible version", saved.len());
-        (saved[15].to_vec(), saved[16].to_vec(), saved[17].to_vec(), saved[18].to_vec())
+        assert!(saved.len() > fm_base + 3,
+            "delta_rule_opaque_backward: has_fm=true but saved.len()={} < {} — \
+             tape may be from an incompatible version", saved.len(), fm_base + 4);
+        (saved[fm_base].to_vec(), saved[fm_base + 1].to_vec(),
+         saved[fm_base + 2].to_vec(), saved[fm_base + 3].to_vec())
     } else {
         (vec![], vec![], vec![], vec![])
     };
@@ -347,6 +354,8 @@ pub fn delta_rule_opaque_backward(
         error: saved[12].to_vec(),
         grad_outer: saved[13].to_vec(),
         y: saved[14].to_vec(),
+        k_mem_norms: if has_norms { saved[15].to_vec() } else { vec![] },
+        q_mem_norms: if has_norms { saved[16].to_vec() } else { vec![] },
         k_conv_cache, q_conv_cache,
         fm_z_k_mem, fm_z_q_mem,
     };
@@ -362,23 +371,26 @@ pub fn delta_rule_opaque_backward(
 
 /// Titans LMM opaque backward adapter.
 ///
-/// Saved buffer layout (TitansLMM, no DeltaMomentum):
+/// Saved buffer layout (TitansLMM, no DeltaMomentum, with L2 norms):
 ///   saved[0]     = meta: [seq_len, d, bias, sign_sharpness, mk_f32, theta_floor, theta_ceil,
-///                         fm_kind, sigma, kernel_size]
+///                         fm_kind, sigma, has_norms(1.0), kernel_size]
 ///   saved[1]     = level_params_flat
 ///   saved[2]     = embedded
 ///   saved[3..17] = cache fields (m_states, s_states, k_mem, v_mem, q_mem, concat_kv,
 ///                                alpha_pre, alpha, theta_pre, theta, eta_pre, eta,
 ///                                error, grad_outer, y)
-///   saved[18]    = fm_z_k_mem  (if non-Identity, fm_base=18)
-///   saved[19]    = fm_z_q_mem
-///   saved[20]    = w_rand
-///   saved[21]    = b_rand
+///   saved[18]    = k_mem_norms (L2 norms for normalization backward)
+///   saved[19]    = q_mem_norms
+///   saved[20]    = fm_z_k_mem  (if non-Identity, fm_base=20)
+///   saved[21]    = fm_z_q_mem
+///   saved[22]    = w_rand
+///   saved[23]    = b_rand
 ///   saved[N-4..] = conv cache (always at tail)
 ///
-/// With DeltaMomentum: decay shifts all fm indices by 1 (fm_base=19).
+/// With DeltaMomentum: decay at saved[20], fm shifts to fm_base=21.
 ///
-/// Backward-compat: old recordings have meta len=8 (no fm_kind/sigma).
+/// Backward-compat: old recordings without norms have meta.len() <= 9,
+/// norms_offset=0, fm_base=18/19.
 ///   len guard `saved[0].len() > 8` safely detects new format.
 pub fn titans_lmm_opaque_backward(
     d_outputs: &[&[f32]],
@@ -416,8 +428,19 @@ pub fn titans_lmm_opaque_backward(
     let fm_kind = decode_feature_map_kind(fm_kind_f32, fm_sigma);
     let has_fm = !matches!(fm_kind, crate::feature_map::FeatureMapKind::Identity);
 
-    // Base index for fm buffers: 18 (EMA/None) or 19 (DeltaMomentum).
-    let fm_base = if momentum_kind == crate::model::MomentumKind::DeltaMomentum { 19 } else { 18 };
+    // Detect L2 norms presence: new format has extra_meta with 8 elements (+ seq_len + d + kernel_size = 11).
+    // Old format has 7 extras → meta.len() = 10. New format → meta.len() = 11.
+    let has_norms = saved[0].len() >= 11;
+
+    // Base index for fm buffers shifts by +2 when norms present.
+    // Without norms: fm_base = 18 (EMA/None) or 19 (DeltaMomentum).
+    // With norms:    fm_base = 20 (EMA/None) or 21 (DeltaMomentum).
+    let norms_offset = if has_norms { 2 } else { 0 };
+    let fm_base = if momentum_kind == crate::model::MomentumKind::DeltaMomentum {
+        19 + norms_offset
+    } else {
+        18 + norms_offset
+    };
 
     // Read frozen FM weights and z caches from tape if non-Identity.
     let (fm_z_k_mem, fm_z_q_mem, w_rand, b_rand) = if has_fm {
@@ -441,6 +464,9 @@ pub fn titans_lmm_opaque_backward(
         restore_conv_cache(&saved[n-4..])
     } else { (None, None) };
 
+    // Decay index shifts by +2 when norms are present.
+    let decay_idx = 18 + norms_offset;
+
     let cache = TitansLMMCache {
         seq_len, d,
         m_states: saved[3].to_vec(),
@@ -458,13 +484,15 @@ pub fn titans_lmm_opaque_backward(
         error: saved[15].to_vec(),
         grad_outer: saved[16].to_vec(),
         y: saved[17].to_vec(),
+        k_mem_norms: if has_norms { saved[18].to_vec() } else { vec![] },
+        q_mem_norms: if has_norms { saved[19].to_vec() } else { vec![] },
         momentum_kind,
         decay: if momentum_kind == crate::model::MomentumKind::DeltaMomentum {
-            assert!(saved.len() > 18,
-                "DeltaMomentum opaque backward requires decay buffer at saved[18] \
+            assert!(saved.len() > decay_idx,
+                "DeltaMomentum opaque backward requires decay buffer at saved[{}] \
                  but only {} entries saved — tape corrupt or from incompatible version",
-                saved.len());
-            saved[18].to_vec()
+                decay_idx, saved.len());
+            saved[decay_idx].to_vec()
         } else { vec![] },
         deep_cache: None, // Deep momentum backward through opaque adapter is future work
         deep_d_hidden: 0,
@@ -1044,7 +1072,8 @@ impl OpaqueVjp for DeltaRule {
             crate::feature_map::FeatureMapKind::RandomFourier { sigma } => sigma,
             _ => 1.0,
         };
-        let extra_meta = [crate::moneta::bias_to_f32(self.bias), self.sign_sharpness, self.theta_floor, self.theta_ceil, fm_kind_f32, fm_sigma];
+        // extra_meta[6] = 1.0 signals L2 norms are present (backward compat flag).
+        let extra_meta = [crate::moneta::bias_to_f32(self.bias), self.sign_sharpness, self.theta_floor, self.theta_ceil, fm_kind_f32, fm_sigma, 1.0];
         let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
             record_common_inputs(tape, level_params, embedded, seq_len, d, &extra_meta);
 
@@ -1066,11 +1095,13 @@ impl OpaqueVjp for DeltaRule {
             tape.alloc_named(cache.error, vec![], crate::tape::obs::DGD_DELTA, level),
             tape.alloc(cache.grad_outer, vec![]),
             tape.alloc(cache.y, vec![]),
+            tape.alloc(cache.k_mem_norms, vec![]),  // saved[15]: L2 norms for k
+            tape.alloc(cache.q_mem_norms, vec![]),  // saved[16]: L2 norms for q
         ];
 
         // Save feature map z caches and frozen FM weights before conv caches (if non-Identity).
         // Gated on fm_kind (not cache emptiness) so ELU — which has empty w_rand — is included.
-        // Backward reads: fm_z_k at saved[15], fm_z_q at [16], w_rand at [17], b_rand at [18].
+        // Backward reads: fm_z_k at saved[17], fm_z_q at [18], w_rand at [19], b_rand at [20].
         if !matches!(self.feature_map, crate::feature_map::FeatureMapKind::Identity) {
             cache_ids.push(tape.alloc(cache.fm_z_k_mem, vec![]));
             cache_ids.push(tape.alloc(cache.fm_z_q_mem, vec![]));
@@ -1114,7 +1145,8 @@ impl OpaqueVjp for TitansLMM {
             crate::feature_map::FeatureMapKind::RandomFourier { sigma } => sigma,
             _ => 1.0,
         };
-        let extra_meta = [crate::moneta::bias_to_f32(self.bias), self.sign_sharpness, mk_f32, self.theta_floor, self.theta_ceil, fm_kind_f32, fm_sigma];
+        // extra_meta[7] = 1.0 signals L2 norms are present (backward compat flag).
+        let extra_meta = [crate::moneta::bias_to_f32(self.bias), self.sign_sharpness, mk_f32, self.theta_floor, self.theta_ceil, fm_kind_f32, fm_sigma, 1.0];
         let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
             record_common_inputs(tape, level_params, embedded, seq_len, d, &extra_meta);
 
@@ -1136,10 +1168,12 @@ impl OpaqueVjp for TitansLMM {
             tape.alloc(cache.error, vec![]),
             tape.alloc(cache.grad_outer, vec![]),
             tape.alloc(cache.y, vec![]),
+            tape.alloc(cache.k_mem_norms, vec![]),  // saved[18]: L2 norms for k
+            tape.alloc(cache.q_mem_norms, vec![]),  // saved[19]: L2 norms for q
         ];
 
         // Save DeltaMomentum decay buffer — keyed on momentum_kind, not emptiness,
-        // so backward can rely on saved[18] being present for DeltaMomentum.
+        // so backward can rely on saved[20] being present for DeltaMomentum.
         if self.momentum_kind == crate::model::MomentumKind::DeltaMomentum {
             assert!(!cache.decay.is_empty(),
                 "DeltaMomentum forward produced empty decay buffer — step() bug");
@@ -1148,7 +1182,7 @@ impl OpaqueVjp for TitansLMM {
 
         // Save feature map z caches and frozen FM weights before conv caches (if non-Identity).
         // Gated on fm_kind (not cache emptiness) so ELU — which has empty w_rand — is included.
-        // fm_base = 18 (EMA/None) or 19 (DeltaMomentum); layout matches backward adapter.
+        // fm_base = 20 (EMA/None) or 21 (DeltaMomentum); layout matches backward adapter.
         if !matches!(self.feature_map, crate::feature_map::FeatureMapKind::Identity) {
             cache_ids.push(tape.alloc(cache.fm_z_k_mem, vec![]));
             cache_ids.push(tape.alloc(cache.fm_z_q_mem, vec![]));
