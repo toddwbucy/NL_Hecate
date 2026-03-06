@@ -340,6 +340,7 @@ pub fn gpu_cms_forward(
             || matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp);
         if effective_active {
             if is_tnt
+                && bs == 1
                 && matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM | MemoryRuleKind::DeltaRule)
             {
                 // TNT path: shard-parallel memory processing via gpu_tnt_forward.
@@ -741,11 +742,12 @@ fn gpu_tnt_forward(
         // Copy shard embeddings to owned buffer for cuBLAS
         let mut shard_embedded = GpuBuf::<f32>::zeros(shard_len * d);
         unsafe {
-            gpu_buf_memcpy_d2d(
+            let rc = gpu_buf_memcpy_d2d(
                 shard_embedded.ptr() as *mut std::ffi::c_void,
                 shard_embedded_slice.as_ptr() as *const std::ffi::c_void,
                 shard_len * d * 4,
             );
+            assert_eq!(rc, 0, "TNT shard D2D memcpy failed (rc={rc})");
         }
 
         crate::dispatch::cublas_matmul_transb_dd(&shard_embedded, &level_params.w_k_mem, &mut k_mem, shard_len, d, d, 0.0);
@@ -858,22 +860,24 @@ fn gpu_tnt_forward(
         // Since batched layout is contiguous and matches the sequential order,
         // just copy the first shard_len*d elements.
         unsafe {
-            gpu_buf_memcpy_d2d(
+            let rc = gpu_buf_memcpy_d2d(
                 (y_full.ptr() as *mut u8).add(shard_start * d * 4) as *mut std::ffi::c_void,
                 y_local.as_ptr() as *const std::ffi::c_void,
                 shard_len * d * 4,
             );
+            assert_eq!(rc, 0, "TNT y_full D2D memcpy failed (rc={rc})");
         }
 
         // Step 7: Compute shard summary (mean-pooling on GPU)
         // Use the unpadded shard output for summary
         let mut shard_y = GpuBuf::<f32>::zeros(shard_len * d);
         unsafe {
-            gpu_buf_memcpy_d2d(
+            let rc = gpu_buf_memcpy_d2d(
                 shard_y.ptr() as *mut std::ffi::c_void,
                 y_local.as_ptr() as *const std::ffi::c_void,
                 shard_len * d * 4,
             );
+            assert_eq!(rc, 0, "TNT shard_y D2D memcpy failed (rc={rc})");
         }
         let mut k_sum = GpuBuf::<f32>::zeros(d);
         let mut v_sum = GpuBuf::<f32>::zeros(d);

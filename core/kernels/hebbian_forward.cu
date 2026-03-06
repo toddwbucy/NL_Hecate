@@ -279,6 +279,11 @@ extern "C" void hebbian_forward_ckpt_f32_cuda(
                 checkpoint_interval);
         exit(1);
     }
+    long long dd64 = (long long)d * d;
+    if (dd64 > INT_MAX || (long long)(seq_len + 1) * dd64 > INT_MAX) {
+        fprintf(stderr, "hebbian_forward_ckpt_f32_cuda: d=%d seq_len=%d would overflow int32 indices.\n", d, seq_len);
+        exit(1);
+    }
     int dd = d * d;
     int block_size = (dd < 1024) ? dd : 1024;
 
@@ -311,6 +316,11 @@ extern "C" void hebbian_forward_f32_cuda(
 {
     if (d <= 0 || 6 * d * (int)sizeof(float) > 163840) {
         fprintf(stderr, "hebbian_forward_f32_cuda: d=%d out of range (must be 1..=6826).\n", d);
+        exit(1);
+    }
+    long long dd64 = (long long)d * d;
+    if (dd64 > INT_MAX || (long long)(seq_len + 1) * dd64 > INT_MAX) {
+        fprintf(stderr, "hebbian_forward_f32_cuda: d=%d seq_len=%d would overflow int32 indices.\n", d, seq_len);
         exit(1);
     }
     int dd = d * d;

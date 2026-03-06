@@ -95,13 +95,15 @@ At d=1024, C_G=64, C_L=8, N=8, k=4 levels:
 
 ## Equations Traced
 
-| Equation | Collection | Relationship |
-|----------|-----------|-------------|
-| eq-003-chunkwise-compression | tnt_equations | implements |
-| eq-005-global-memory-update | tnt_equations | implements |
-| eq-006-hierarchical-memory | tnt_equations | implements |
-| eq-014-n-local-memories-update | tnt_equations | implements |
-| eq-013-general-hierarchical-memory | tnt_equations | cites |
+| Equation | Collection | HADES ID | Relationship |
+|----------|-----------|----------|-------------|
+| eq-003-chunkwise-compression | tnt_equations | `tnt_equations/eq-003-chunkwise-compression` | implements |
+| eq-005-global-memory-update | tnt_equations | `tnt_equations/eq-005-global-memory-update` | implements |
+| eq-006-hierarchical-memory | tnt_equations | `tnt_equations/eq-006-hierarchical-memory` | implements |
+| eq-014-n-local-memories-update | tnt_equations | `tnt_equations/eq-014-n-local-memories-update` | implements |
+| eq-013-general-hierarchical-memory | tnt_equations | `tnt_equations/eq-013-general-hierarchical-memory` | cites |
+
+Paper: TNT — Improving Chunkwise Training for Titans (arXiv: 2511.07343)
 
 ## Backward Path (GPU)
 

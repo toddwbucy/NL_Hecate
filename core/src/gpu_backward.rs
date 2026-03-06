@@ -552,6 +552,7 @@ fn gpu_memory_backward(
             shard_inner_caches, shard_y_bufs, k_summaries, v_summaries,
             global_m_before, n_locals: _, global_chunk_size, local_chunk_size,
         } => {
+            assert_eq!(batch_size, 1, "TNT backward currently supports batch_size=1 only");
             let cg = *global_chunk_size;
             let cl = *local_chunk_size;
             let num_shards = shard_inner_caches.len();
