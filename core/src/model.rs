@@ -2273,14 +2273,11 @@ impl MAGParams {
                 "extend_stack_up: level[{}] b_freq size {} vs expected {}",
                 i, lev.b_freq.len(), expect_freq_b,
             );
-            // Atlas Omega projection: [d, 2*d] when rule is AtlasOmega, else empty
-            let expect_omega = if matches!(new_cfg.memory_rule, MemoryRuleKind::AtlasOmega) {
-                d * 2 * d
-            } else { 0 };
+            // Atlas Omega projection: always allocated as [d, 2*d] (zero-init for non-Atlas)
             assert_eq!(
-                lev.w_omega.len(), expect_omega,
-                "extend_stack_up: level[{}] w_omega size {} vs expected {}",
-                i, lev.w_omega.len(), expect_omega,
+                lev.w_omega.len(), d * 2 * d,
+                "extend_stack_up: level[{}] w_omega size {} vs expected d*2*d={}",
+                i, lev.w_omega.len(), d * 2 * d,
             );
             // Self-referential init memories: present iff Adaptive projection
             let has_self_ref = matches!(new_cfg.projection_kind, ProjectionKind::Adaptive);
