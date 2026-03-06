@@ -215,6 +215,10 @@ pub struct DeltaRuleCache {
     pub fm_z_k_mem: Vec<f32>,
     /// Feature map pre-activations for queries: [seq_len * d]. Empty for Identity.
     pub fm_z_q_mem: Vec<f32>,
+    /// Pre-normalization L2 norms of k_mem rows: [seq_len].
+    pub k_mem_norms: Vec<f32>,
+    /// Pre-normalization L2 norms of q_mem rows: [seq_len].
+    pub q_mem_norms: Vec<f32>,
 }
 
 impl MemoryRule for DeltaRule {
@@ -291,6 +295,10 @@ impl MemoryRule for DeltaRule {
         // Conv1D key/query preprocessing (after projection, before memory loop)
         let (k_conv_cache, q_conv_cache) = crate::conv1d::apply_conv1d_to_kq(
             &mut k_mem, &mut q_mem, level_params, seq_len, d);
+
+        // L2-normalize keys and queries (Titans paper: "normalize queries and keys using l_2-norm")
+        let k_mem_norms = crate::tensor::l2_normalize_rows(&mut k_mem, seq_len, d);
+        let q_mem_norms = crate::tensor::l2_normalize_rows(&mut q_mem, seq_len, d);
 
         // Allocate cache — seed M_0 from initial_m if provided, else zeros
         let mut m_states = vec![0.0f32; (seq_len + 1) * d * d];
@@ -391,6 +399,7 @@ impl MemoryRule for DeltaRule {
             alpha_pre, alpha, theta_pre, theta, error, grad_outer, y: y.clone(),
             k_conv_cache, q_conv_cache,
             fm_z_k_mem, fm_z_q_mem,
+            k_mem_norms, q_mem_norms,
         };
 
         (y, cache)
@@ -577,6 +586,22 @@ impl MemoryRule for DeltaRule {
 
             // Update d_m for next (earlier) token
             d_m = d_m_prev;
+        }
+
+        // ── L2 normalization backward ──
+        // Guard: old tape recordings may have empty norms (backward compat).
+        if !cache.k_mem_norms.is_empty() {
+            let mut d_k_raw = vec![0.0f32; s * d];
+            crate::tensor::l2_normalize_rows_backward(
+                &d_k_mem, &cache.k_mem, &cache.k_mem_norms,
+                &mut d_k_raw, s, d);
+            d_k_mem = d_k_raw;
+
+            let mut d_q_raw = vec![0.0f32; s * d];
+            crate::tensor::l2_normalize_rows_backward(
+                &d_q_mem, &cache.q_mem, &cache.q_mem_norms,
+                &mut d_q_raw, s, d);
+            d_q_mem = d_q_raw;
         }
 
         // ── Conv1D backward (before projection backward) ──

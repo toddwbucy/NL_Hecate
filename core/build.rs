@@ -60,6 +60,7 @@ fn main() {
             .file("kernels/swiglu_forward.cu")
             .file("kernels/swiglu_backward.cu")
             .file("kernels/m_norm_clamp.cu")
+            .file("kernels/l2_normalize.cu")
             .file("kernels/gate_backward.cu")
             .file("kernels/tnt_forward.cu")
             .file("kernels/tnt_backward.cu")
@@ -85,6 +86,7 @@ fn main() {
         println!("cargo:rerun-if-changed=kernels/swiglu_forward.cu");
         println!("cargo:rerun-if-changed=kernels/swiglu_backward.cu");
         println!("cargo:rerun-if-changed=kernels/m_norm_clamp.cu");
+        println!("cargo:rerun-if-changed=kernels/l2_normalize.cu");
         println!("cargo:rerun-if-changed=kernels/gate_backward.cu");
         println!("cargo:rerun-if-changed=kernels/tnt_forward.cu");
         println!("cargo:rerun-if-changed=kernels/tnt_backward.cu");

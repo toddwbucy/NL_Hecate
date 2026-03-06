@@ -333,7 +333,7 @@ fn gpu_memory_backward(
     let bs_s = batch_size * s;
 
     match mem_cache {
-        GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states } => {
+        GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states, k_norms, q_norms } => {
             let mut d_k_mem = GpuBuf::zeros(bsd);
             let mut d_v_mem = GpuBuf::zeros(bsd);
             let mut d_q_mem = GpuBuf::zeros(bsd);
@@ -362,13 +362,14 @@ fn gpu_memory_backward(
 
             accumulate_projection_grads(
                 level_params, embedded,
-                k_mem, v_mem, alpha, Some(theta), None,
+                k_mem, v_mem, q_mem, alpha, Some(theta), None,
                 &d_k_mem, &d_v_mem, &d_q_mem,
                 &d_alpha, Some(&d_theta), None,
+                k_norms, q_norms,
                 level_grads, s, d, batch_size,
             )
         }
-        GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states, s_states } => {
+        GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states, s_states, k_norms, q_norms } => {
             let mut d_k_mem = GpuBuf::zeros(bsd);
             let mut d_v_mem = GpuBuf::zeros(bsd);
             let mut d_q_mem = GpuBuf::zeros(bsd);
@@ -400,13 +401,14 @@ fn gpu_memory_backward(
 
             accumulate_projection_grads(
                 level_params, embedded,
-                k_mem, v_mem, alpha, Some(theta), Some(eta),
+                k_mem, v_mem, q_mem, alpha, Some(theta), Some(eta),
                 &d_k_mem, &d_v_mem, &d_q_mem,
                 &d_alpha, Some(&d_theta), Some(&d_eta),
+                k_norms, q_norms,
                 level_grads, s, d, batch_size,
             )
         }
-        GpuMemoryCache::Hebbian { k_mem, v_mem, q_mem, alpha, m_states } => {
+        GpuMemoryCache::Hebbian { k_mem, v_mem, q_mem, alpha, m_states, k_norms, q_norms } => {
             // Hebbian kernels don't yet support batch_size > 1
             assert_eq!(batch_size, 1, "Hebbian batch_size > 1 not yet supported");
             let sd = s * d;
@@ -426,14 +428,15 @@ fn gpu_memory_backward(
             // Hebbian has no theta or eta — pass None
             accumulate_projection_grads(
                 level_params, embedded,
-                k_mem, v_mem, alpha, None, None,
+                k_mem, v_mem, q_mem, alpha, None, None,
                 &d_k_mem, &d_v_mem, &d_q_mem,
                 &d_alpha, None, None,
+                k_norms, q_norms,
                 level_grads, s, d, 1,
             )
         }
         // ── Checkpointed variants: segment-based backward ──────────
-        GpuMemoryCache::DeltaCkpt { k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, checkpoint_interval } => {
+        GpuMemoryCache::DeltaCkpt { k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, checkpoint_interval, k_norms, q_norms } => {
             let c = *checkpoint_interval;
             let (d_k_mem, d_v_mem, d_q_mem, d_alpha, mut d_theta) =
                 delta_backward_checkpointed(k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, d_y, s, d, c);
@@ -449,13 +452,14 @@ fn gpu_memory_backward(
             }
             accumulate_projection_grads(
                 level_params, embedded,
-                k_mem, v_mem, alpha, Some(theta), None,
+                k_mem, v_mem, q_mem, alpha, Some(theta), None,
                 &d_k_mem, &d_v_mem, &d_q_mem,
                 &d_alpha, Some(&d_theta), None,
+                k_norms, q_norms,
                 level_grads, s, d, 1,
             )
         }
-        GpuMemoryCache::TitansCkpt { k_mem, v_mem, q_mem, alpha, theta, eta, m_checkpoints, s_checkpoints, checkpoint_interval } => {
+        GpuMemoryCache::TitansCkpt { k_mem, v_mem, q_mem, alpha, theta, eta, m_checkpoints, s_checkpoints, checkpoint_interval, k_norms, q_norms } => {
             let c = *checkpoint_interval;
             let (d_k_mem, d_v_mem, d_q_mem, d_alpha, mut d_theta, d_eta) =
                 titans_backward_checkpointed(k_mem, v_mem, q_mem, alpha, theta, eta, m_checkpoints, s_checkpoints, d_y, s, d, c);
@@ -471,26 +475,28 @@ fn gpu_memory_backward(
             }
             accumulate_projection_grads(
                 level_params, embedded,
-                k_mem, v_mem, alpha, Some(theta), Some(eta),
+                k_mem, v_mem, q_mem, alpha, Some(theta), Some(eta),
                 &d_k_mem, &d_v_mem, &d_q_mem,
                 &d_alpha, Some(&d_theta), Some(&d_eta),
+                k_norms, q_norms,
                 level_grads, s, d, 1,
             )
         }
-        GpuMemoryCache::HebbianCkpt { k_mem, v_mem, q_mem, alpha, m_checkpoints, checkpoint_interval } => {
+        GpuMemoryCache::HebbianCkpt { k_mem, v_mem, q_mem, alpha, m_checkpoints, checkpoint_interval, k_norms, q_norms } => {
             let c = *checkpoint_interval;
             let (d_k_mem, d_v_mem, d_q_mem, d_alpha) =
                 hebbian_backward_checkpointed(k_mem, v_mem, q_mem, alpha, m_checkpoints, d_y, s, d, c);
             accumulate_projection_grads(
                 level_params, embedded,
-                k_mem, v_mem, alpha, None, None,
+                k_mem, v_mem, q_mem, alpha, None, None,
                 &d_k_mem, &d_v_mem, &d_q_mem,
                 &d_alpha, None, None,
+                k_norms, q_norms,
                 level_grads, s, d, 1,
             )
         }
         // ── DGD: same structure as Delta (uses delta_backward kernels) ──
-        GpuMemoryCache::DGD { k_mem, v_mem, q_mem, alpha, theta, m_states } => {
+        GpuMemoryCache::DGD { k_mem, v_mem, q_mem, alpha, theta, m_states, k_norms, q_norms } => {
             let mut d_k_mem = GpuBuf::zeros(bsd);
             let mut d_v_mem = GpuBuf::zeros(bsd);
             let mut d_q_mem = GpuBuf::zeros(bsd);
@@ -519,13 +525,14 @@ fn gpu_memory_backward(
 
             accumulate_projection_grads(
                 level_params, embedded,
-                k_mem, v_mem, alpha, Some(theta), None,
+                k_mem, v_mem, q_mem, alpha, Some(theta), None,
                 &d_k_mem, &d_v_mem, &d_q_mem,
                 &d_alpha, Some(&d_theta), None,
+                k_norms, q_norms,
                 level_grads, s, d, batch_size,
             )
         }
-        GpuMemoryCache::DGDCkpt { k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, checkpoint_interval } => {
+        GpuMemoryCache::DGDCkpt { k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, checkpoint_interval, k_norms, q_norms } => {
             let c = *checkpoint_interval;
             let (d_k_mem, d_v_mem, d_q_mem, d_alpha, mut d_theta) =
                 delta_backward_checkpointed(k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, d_y, s, d, c);
@@ -541,9 +548,10 @@ fn gpu_memory_backward(
             }
             accumulate_projection_grads(
                 level_params, embedded,
-                k_mem, v_mem, alpha, Some(theta), None,
+                k_mem, v_mem, q_mem, alpha, Some(theta), None,
                 &d_k_mem, &d_v_mem, &d_q_mem,
                 &d_alpha, Some(&d_theta), None,
+                k_norms, q_norms,
                 level_grads, s, d, 1,
             )
         }
@@ -641,8 +649,16 @@ fn gpu_memory_backward(
                 let mut d_eta_shard = GpuBuf::zeros(shard_tokens);
                 let has_eta = matches!(inner_cache, GpuMemoryCache::Titans { .. });
 
+                // Extract k/q norms and normalized k/q refs for Step 5b (L2 backward),
+                // avoiding a redundant rematch after the inner backward kernel.
+                let (shard_k_norms, shard_q_norms, shard_k_mem, shard_q_mem) = match inner_cache {
+                    GpuMemoryCache::Titans { k_mem, q_mem, k_norms, q_norms, .. } => (k_norms, q_norms, k_mem, q_mem),
+                    GpuMemoryCache::Delta { k_mem, q_mem, k_norms, q_norms, .. } => (k_norms, q_norms, k_mem, q_mem),
+                    _ => unreachable!("TNT inner cache must be Titans or Delta"),
+                };
+
                 match inner_cache {
-                    GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states, s_states } => {
+                    GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states, s_states, .. } => {
                         let mut d_m_initial = GpuBuf::zeros(n_batch * dd);
                         let mut d_s_initial = GpuBuf::zeros(n_batch * dd);
 
@@ -666,7 +682,7 @@ fn gpu_memory_backward(
                             }
                         }
                     }
-                    GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states } => {
+                    GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states, .. } => {
                         let mut d_m_initial = GpuBuf::zeros(n_batch * dd);
 
                         crate::dispatch::delta_backward_dd(
@@ -700,6 +716,26 @@ fn gpu_memory_backward(
                             );
                         }
                     }
+                }
+
+                // Step 5b: L2 normalization backward for k/q per shard.
+                // d_k_shard/d_q_shard are gradients w.r.t. normalized k/q from the inner
+                // backward kernel. Transform to gradients w.r.t. raw projections.
+                {
+                    let mut d_k_raw = GpuBuf::zeros(shard_tokens * d);
+                    let mut d_q_raw = GpuBuf::zeros(shard_tokens * d);
+                    unsafe {
+                        crate::cuda_ffi::l2_normalize_backward_f32_cuda(
+                            d_k_shard.as_ptr(), shard_k_mem.as_ptr(), shard_k_norms.as_ptr(),
+                            d_k_raw.ptr(), shard_tokens as i32, d as i32, 1e-8,
+                        );
+                        crate::cuda_ffi::l2_normalize_backward_f32_cuda(
+                            d_q_shard.as_ptr(), shard_q_mem.as_ptr(), shard_q_norms.as_ptr(),
+                            d_q_raw.ptr(), shard_tokens as i32, d as i32, 1e-8,
+                        );
+                    }
+                    d_k_shard = d_k_raw;
+                    d_q_shard = d_q_raw;
                 }
 
                 // Step 6: Accumulate unpadded shard gradients into full-sequence totals.
@@ -1071,8 +1107,9 @@ fn hebbian_backward_checkpointed(
 fn accumulate_projection_grads(
     level_params: &GpuMemoryLevelParams,
     embedded: &GpuBuf<f32>,
-    k_mem: &GpuBuf<f32>,               // gate inputs (forward cache)
+    k_mem: &GpuBuf<f32>,               // gate inputs (forward cache, normalized)
     v_mem: &GpuBuf<f32>,
+    q_mem: &GpuBuf<f32>,               // normalized q projection (for L2 backward)
     alpha: &GpuBuf<f32>,               // gate outputs (forward cache)
     theta: Option<&GpuBuf<f32>>,       // softplus output; None for Hebbian
     eta: Option<&GpuBuf<f32>>,         // sigmoid output; None for Delta/Hebbian/DGD
@@ -1082,6 +1119,8 @@ fn accumulate_projection_grads(
     d_alpha: &GpuBuf<f32>,             // per-token upstream gate gradients
     d_theta: Option<&GpuBuf<f32>>,
     d_eta: Option<&GpuBuf<f32>>,
+    k_norms: &GpuBuf<f32>,            // L2 norms from forward normalization
+    q_norms: &GpuBuf<f32>,
     level_grads: &mut GpuLevelGrads,
     s: usize,
     d: usize,
@@ -1089,17 +1128,34 @@ fn accumulate_projection_grads(
 ) -> GpuBuf<f32> {
     let bs_s = batch_size * s;
     let bsd = bs_s * d;
+    let d_i32 = d as i32;
+    let n_rows = bs_s as i32;
+
+    // L2 normalization backward: d_k_mem and d_q_mem are gradients w.r.t. normalized k/q.
+    // Transform to gradients w.r.t. raw (pre-normalization) projections.
+    let mut d_k_raw = GpuBuf::zeros(bsd);
+    let mut d_q_raw = GpuBuf::zeros(bsd);
+    unsafe {
+        crate::cuda_ffi::l2_normalize_backward_f32_cuda(
+            d_k_mem.as_ptr(), k_mem.as_ptr(), k_norms.as_ptr(),
+            d_k_raw.ptr(), n_rows, d_i32, 1e-8,
+        );
+        crate::cuda_ffi::l2_normalize_backward_f32_cuda(
+            d_q_mem.as_ptr(), q_mem.as_ptr(), q_norms.as_ptr(),
+            d_q_raw.ptr(), n_rows, d_i32, 1e-8,
+        );
+    }
 
     // Projection weight grads: d_W[d,d] = d_proj^T[d, bs*s] @ embedded[bs*s, d]
-    gpu_matmul_transa_dd(d_k_mem, embedded, &mut level_grads.d_w_k_mem, d, bs_s, d);
+    gpu_matmul_transa_dd(&d_k_raw, embedded, &mut level_grads.d_w_k_mem, d, bs_s, d);
     gpu_matmul_transa_dd(d_v_mem, embedded, &mut level_grads.d_w_v_mem, d, bs_s, d);
-    gpu_matmul_transa_dd(d_q_mem, embedded, &mut level_grads.d_w_q_mem, d, bs_s, d);
+    gpu_matmul_transa_dd(&d_q_raw, embedded, &mut level_grads.d_w_q_mem, d, bs_s, d);
 
     // d_embedded from memory projections
     let mut d_embedded = GpuBuf::zeros(bsd);
-    crate::dispatch::cublas_matmul_acc_dd(d_k_mem, &level_params.w_k_mem, &mut d_embedded, bs_s, d, d);
+    crate::dispatch::cublas_matmul_acc_dd(&d_k_raw, &level_params.w_k_mem, &mut d_embedded, bs_s, d, d);
     crate::dispatch::cublas_matmul_acc_dd(d_v_mem, &level_params.w_v_mem, &mut d_embedded, bs_s, d, d);
-    crate::dispatch::cublas_matmul_acc_dd(d_q_mem, &level_params.w_q_mem, &mut d_embedded, bs_s, d, d);
+    crate::dispatch::cublas_matmul_acc_dd(&d_q_raw, &level_params.w_q_mem, &mut d_embedded, bs_s, d, d);
 
     // Gate backward: accumulate d_w_alpha/theta/eta and d_b_alpha/theta/eta.
     // sigmoid(logit_theta) recovered from softplus output as 1 - exp(-theta).

@@ -86,6 +86,8 @@ pub enum GpuMemoryCache {
         alpha: GpuBuf<f32>,     // [s]
         theta: GpuBuf<f32>,     // [s]
         m_states: GpuBuf<f32>,  // [(s+1)*d*d]
+        k_norms: GpuBuf<f32>,  // [s] — L2 norms before normalization
+        q_norms: GpuBuf<f32>,  // [s]
     },
     Titans {
         k_mem: GpuBuf<f32>,
@@ -96,6 +98,8 @@ pub enum GpuMemoryCache {
         eta: GpuBuf<f32>,
         m_states: GpuBuf<f32>,  // [(s+1)*d*d]
         s_states: GpuBuf<f32>,  // [(s+1)*d*d]
+        k_norms: GpuBuf<f32>,
+        q_norms: GpuBuf<f32>,
     },
     Hebbian {
         k_mem: GpuBuf<f32>,
@@ -103,6 +107,8 @@ pub enum GpuMemoryCache {
         q_mem: GpuBuf<f32>,
         alpha: GpuBuf<f32>,
         m_states: GpuBuf<f32>,
+        k_norms: GpuBuf<f32>,
+        q_norms: GpuBuf<f32>,
     },
     // ── DGD (Delta Gradient Descent) — HOPE inner-loop optimizer ─────
     DGD {
@@ -112,6 +118,8 @@ pub enum GpuMemoryCache {
         alpha: GpuBuf<f32>,     // [s]
         theta: GpuBuf<f32>,     // [s]
         m_states: GpuBuf<f32>,  // [(s+1)*d*d]
+        k_norms: GpuBuf<f32>,
+        q_norms: GpuBuf<f32>,
     },
     // ── Checkpointed variants (gradient checkpointing) ──────────────
     DeltaCkpt {
@@ -122,6 +130,8 @@ pub enum GpuMemoryCache {
         theta: GpuBuf<f32>,
         m_checkpoints: GpuBuf<f32>,  // [num_ckpt * d*d]
         checkpoint_interval: usize,
+        k_norms: GpuBuf<f32>,
+        q_norms: GpuBuf<f32>,
     },
     TitansCkpt {
         k_mem: GpuBuf<f32>,
@@ -133,6 +143,8 @@ pub enum GpuMemoryCache {
         m_checkpoints: GpuBuf<f32>,
         s_checkpoints: GpuBuf<f32>,
         checkpoint_interval: usize,
+        k_norms: GpuBuf<f32>,
+        q_norms: GpuBuf<f32>,
     },
     HebbianCkpt {
         k_mem: GpuBuf<f32>,
@@ -141,6 +153,8 @@ pub enum GpuMemoryCache {
         alpha: GpuBuf<f32>,
         m_checkpoints: GpuBuf<f32>,
         checkpoint_interval: usize,
+        k_norms: GpuBuf<f32>,
+        q_norms: GpuBuf<f32>,
     },
     DGDCkpt {
         k_mem: GpuBuf<f32>,
@@ -150,6 +164,8 @@ pub enum GpuMemoryCache {
         theta: GpuBuf<f32>,
         m_checkpoints: GpuBuf<f32>,  // [num_ckpt * d*d]
         checkpoint_interval: usize,
+        k_norms: GpuBuf<f32>,
+        q_norms: GpuBuf<f32>,
     },
     /// SwiGLU MLP — no M state. All activations saved for weight grad computation.
     SwiGlu {
@@ -487,6 +503,14 @@ fn gpu_memory_forward(
     crate::dispatch::cublas_matmul_transb_dd(embedded, &level_params.w_v_mem, &mut v_mem, bs * s, d, d, 0.0);
     crate::dispatch::cublas_matmul_transb_dd(embedded, &level_params.w_q_mem, &mut q_mem, bs * s, d, d, 0.0);
 
+    // L2-normalize keys and queries (Titans paper: "normalize queries and keys using l_2-norm")
+    let mut k_norms = GpuBuf::zeros(bs * s);
+    let mut q_norms = GpuBuf::zeros(bs * s);
+    unsafe {
+        crate::cuda_ffi::l2_normalize_rows_f32_cuda(k_mem.ptr(), k_norms.ptr(), tokens_i32, d_i32, 1e-8);
+        crate::cuda_ffi::l2_normalize_rows_f32_cuda(q_mem.ptr(), q_norms.ptr(), tokens_i32, d_i32, 1e-8);
+    }
+
     // Compute per-token gates: alpha[bs*s], theta[bs*s]
     // b_alpha and b_theta are passed as device pointers (CUDA-graph-capture-safe):
     // the graph captures the stable pointer; optimizer updates the value in-place.
@@ -537,7 +561,7 @@ fn gpu_memory_forward(
                     );
                 }
             }
-            (y, GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states })
+            (y, GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states, k_norms, q_norms })
         }
         (None, MemoryRuleKind::TitansLMM) => {
             // Compute eta gate for all bs*s tokens (Titans uses 3 gates: alpha, theta, eta)
@@ -563,7 +587,7 @@ fn gpu_memory_forward(
                     );
                 }
             }
-            (y, GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states, s_states })
+            (y, GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states, s_states, k_norms, q_norms })
         }
         (None, MemoryRuleKind::HebbianRule) => {
             assert_eq!(bs, 1, "Hebbian GPU forward with batch_size > 1 is not supported");
@@ -577,7 +601,7 @@ fn gpu_memory_forward(
             // Hebbian is bs=1 only (asserted above), single slot copy.
             copy_final_m_batch(&m_states, context_m, s, dd, 1);
             unsafe { crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d_i32, m_norm_max); }
-            (y, GpuMemoryCache::Hebbian { k_mem, v_mem, q_mem, alpha, m_states })
+            (y, GpuMemoryCache::Hebbian { k_mem, v_mem, q_mem, alpha, m_states, k_norms, q_norms })
         }
         // ── Checkpointed paths (checkpoint_interval=Some(c)) ──
         // Gradient checkpointing with batch_size>1 is not supported — ablation configs
@@ -595,7 +619,7 @@ fn gpu_memory_forward(
             crate::dispatch::cuda_sync();
             copy_final_m(&m_checkpoints, context_m, (num_ckpt - 1) * dd, dd);
             unsafe { crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d_i32, m_norm_max); }
-            (y, GpuMemoryCache::DeltaCkpt { k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, checkpoint_interval: c })
+            (y, GpuMemoryCache::DeltaCkpt { k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, checkpoint_interval: c, k_norms, q_norms })
         }
         (Some(c), MemoryRuleKind::TitansLMM) => {
             assert_eq!(bs, 1, "checkpoint_interval with batch_size>1 not supported");
@@ -614,7 +638,7 @@ fn gpu_memory_forward(
             crate::dispatch::cuda_sync();
             copy_final_m(&m_checkpoints, context_m, (num_ckpt - 1) * dd, dd);
             unsafe { crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d_i32, m_norm_max); }
-            (y, GpuMemoryCache::TitansCkpt { k_mem, v_mem, q_mem, alpha, theta, eta, m_checkpoints, s_checkpoints, checkpoint_interval: c })
+            (y, GpuMemoryCache::TitansCkpt { k_mem, v_mem, q_mem, alpha, theta, eta, m_checkpoints, s_checkpoints, checkpoint_interval: c, k_norms, q_norms })
         }
         (Some(c), MemoryRuleKind::HebbianRule) => {
             assert_eq!(bs, 1, "checkpoint_interval with batch_size>1 not supported");
@@ -629,7 +653,7 @@ fn gpu_memory_forward(
             crate::dispatch::cuda_sync();
             copy_final_m(&m_checkpoints, context_m, (num_ckpt - 1) * dd, dd);
             unsafe { crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d_i32, m_norm_max); }
-            (y, GpuMemoryCache::HebbianCkpt { k_mem, v_mem, q_mem, alpha, m_checkpoints, checkpoint_interval: c })
+            (y, GpuMemoryCache::HebbianCkpt { k_mem, v_mem, q_mem, alpha, m_checkpoints, checkpoint_interval: c, k_norms, q_norms })
         }
         // ── SwiGLU: stateless MLP, no M state, no m_norm_clamp ──────────
         (_, MemoryRuleKind::SwiGluMlp) => {
@@ -757,6 +781,14 @@ fn gpu_tnt_forward(
         crate::dispatch::cublas_matmul_transb_dd(&shard_embedded, &level_params.w_v_mem, &mut v_mem, shard_len, d, d, 0.0);
         crate::dispatch::cublas_matmul_transb_dd(&shard_embedded, &level_params.w_q_mem, &mut q_mem, shard_len, d, d, 0.0);
 
+        // L2-normalize keys and queries (Titans paper: "normalize queries and keys using l_2-norm")
+        let mut shard_k_norms = GpuBuf::zeros(shard_len);
+        let mut shard_q_norms = GpuBuf::zeros(shard_len);
+        unsafe {
+            crate::cuda_ffi::l2_normalize_rows_f32_cuda(k_mem.ptr(), shard_k_norms.ptr(), shard_tokens_i32, d_i32, 1e-8);
+            crate::cuda_ffi::l2_normalize_rows_f32_cuda(q_mem.ptr(), shard_q_norms.ptr(), shard_tokens_i32, d_i32, 1e-8);
+        }
+
         // Step 3: Compute gates for shard tokens
         let mut alpha = GpuBuf::zeros(shard_len);
         let mut theta = GpuBuf::zeros(shard_len);
@@ -847,6 +879,7 @@ fn gpu_tnt_forward(
                     k_mem: k_mem_b, v_mem: v_mem_b, q_mem: q_mem_b,
                     alpha: alpha_b, theta: theta_b, eta: eta_b,
                     m_states, s_states,
+                    k_norms: shard_k_norms.dup(), q_norms: shard_q_norms.dup(),
                 }
             }
             MemoryRuleKind::DeltaRule => {
@@ -859,6 +892,7 @@ fn gpu_tnt_forward(
                 GpuMemoryCache::Delta {
                     k_mem: k_mem_b, v_mem: v_mem_b, q_mem: q_mem_b,
                     alpha: alpha_b, theta: theta_b, m_states,
+                    k_norms: shard_k_norms.dup(), q_norms: shard_q_norms.dup(),
                 }
             }
             _ => unreachable!(), // asserted above
@@ -957,6 +991,12 @@ fn gpu_memory_forward_into_scratch(
     crate::dispatch::cublas_matmul_transb_dd(embedded, &level_params.w_v_mem, &mut scratch.v_mem, bs * s, d, d, 0.0);
     crate::dispatch::cublas_matmul_transb_dd(embedded, &level_params.w_q_mem, &mut scratch.q_mem, bs * s, d, d, 0.0);
 
+    // L2-normalize keys and queries (Titans paper: "normalize queries and keys using l_2-norm")
+    unsafe {
+        crate::cuda_ffi::l2_normalize_rows_f32_cuda(scratch.k_mem.ptr(), scratch.k_norms.ptr(), tokens_i32, d_i32, 1e-8);
+        crate::cuda_ffi::l2_normalize_rows_f32_cuda(scratch.q_mem.ptr(), scratch.q_norms.ptr(), tokens_i32, d_i32, 1e-8);
+    }
+
     // Gates into pre-allocated scratch.alpha, theta (device pointers — graph-capture-safe)
     unsafe {
         crate::cuda_ffi::gate_compute_cuda(
@@ -1046,6 +1086,8 @@ unsafe fn memory_cache_from_scratch(
             alpha:    GpuBuf::from_raw_non_owning(scratch.alpha.ptr(), bs * s),
             theta:    GpuBuf::from_raw_non_owning(scratch.theta.ptr(), bs * s),
             m_states: GpuBuf::from_raw_non_owning(scratch.m_states.ptr(), bs * (s + 1) * dd),
+            k_norms:  GpuBuf::from_raw_non_owning(scratch.k_norms.ptr(), bs * s),
+            q_norms:  GpuBuf::from_raw_non_owning(scratch.q_norms.ptr(), bs * s),
         }),
         (None, MemoryRuleKind::TitansLMM) => Some(GpuMemoryCache::Titans {
             k_mem:    GpuBuf::from_raw_non_owning(scratch.k_mem.ptr(), bs * s * d),
@@ -1056,6 +1098,8 @@ unsafe fn memory_cache_from_scratch(
             eta:      GpuBuf::from_raw_non_owning(scratch.eta.ptr(), bs * s),
             m_states: GpuBuf::from_raw_non_owning(scratch.m_states.ptr(), bs * (s + 1) * dd),
             s_states: GpuBuf::from_raw_non_owning(scratch.s_states.ptr(), bs * (s + 1) * dd),
+            k_norms:  GpuBuf::from_raw_non_owning(scratch.k_norms.ptr(), bs * s),
+            q_norms:  GpuBuf::from_raw_non_owning(scratch.q_norms.ptr(), bs * s),
         }),
         _ => None,  // Unsupported rule — caller (gpu_cms_replay) returns None → standard dispatch
     }

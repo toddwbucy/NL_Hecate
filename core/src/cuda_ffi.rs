@@ -319,6 +319,24 @@ extern "C" {
     /// No-op if m_norm_max <= 0 or >= 1e30.
     pub(crate) fn m_norm_clamp_f32_cuda(m: *mut f32, d: i32, m_norm_max: f32);
 
+    // ── L2 key/query normalization ──────────────────────────────────
+
+    /// Normalize each row of x to unit L2 norm in-place.
+    /// Stores pre-normalization norms in `norms` buffer.
+    /// Titans paper (2501.00663): "normalize queries and keys using l_2-norm"
+    pub(crate) fn l2_normalize_rows_f32_cuda(
+        x: *mut f32, norms: *mut f32,
+        n_rows: i32, d: i32, eps: f32,
+    );
+
+    /// Backward through L2 row normalization.
+    /// d_in = (d_out - x_norm * dot(d_out, x_norm)) / max(norm, eps)
+    pub(crate) fn l2_normalize_backward_f32_cuda(
+        d_out: *const f32, x_norm: *const f32, norms: *const f32,
+        d_in: *mut f32,
+        n_rows: i32, d: i32, eps: f32,
+    );
+
     // ── Embedding kernels ─────────────────────────────────────────────
 
     /// Gather rows from embedding table by token ID.

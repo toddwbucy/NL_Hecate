@@ -285,6 +285,66 @@ pub fn frobenius_dot_f32(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
+/// L2-normalize each row of a [n_rows, d] matrix in-place.
+/// Returns the pre-normalization L2 norms (one per row).
+/// Titans paper (2501.00663): "normalize queries and keys using l_2-norm"
+pub fn l2_normalize_rows(x: &mut [f32], n_rows: usize, d: usize) -> Vec<f32> {
+    debug_assert_eq!(x.len(), n_rows * d);
+    let eps = 1e-8f32;
+    let mut norms = vec![0.0f32; n_rows];
+    for i in 0..n_rows {
+        let row = &mut x[i * d..(i + 1) * d];
+        let mut sq_sum = 0.0f32;
+        for j in 0..d {
+            sq_sum += row[j] * row[j];
+        }
+        let norm = sq_sum.sqrt();
+        norms[i] = norm;
+        let inv_norm = 1.0 / norm.max(eps);
+        for j in 0..d {
+            row[j] *= inv_norm;
+        }
+    }
+    norms
+}
+
+/// Backward through L2 row normalization.
+/// Given d_out (gradient w.r.t. normalized), x_norm (normalized vectors),
+/// and norms (pre-normalization L2 norms), computes d_in (gradient w.r.t. raw input).
+/// d_in = (d_out - x_norm * dot(d_out, x_norm)) / max(norm, eps)
+pub fn l2_normalize_rows_backward(
+    d_out: &[f32], x_norm: &[f32], norms: &[f32],
+    d_in: &mut [f32], n_rows: usize, d: usize,
+) {
+    debug_assert_eq!(d_out.len(), n_rows * d);
+    debug_assert_eq!(x_norm.len(), n_rows * d);
+    debug_assert_eq!(norms.len(), n_rows);
+    debug_assert_eq!(d_in.len(), n_rows * d);
+    let eps = 1e-8f32;
+    for i in 0..n_rows {
+        let d_out_row = &d_out[i * d..(i + 1) * d];
+        let x_norm_row = &x_norm[i * d..(i + 1) * d];
+        let d_in_row = &mut d_in[i * d..(i + 1) * d];
+        if norms[i] >= eps {
+            // Sphere Jacobian: d_in = (d_out - x_norm * dot(d_out, x_norm)) / norm
+            let inv_norm = 1.0 / norms[i];
+            let mut dot = 0.0f32;
+            for j in 0..d {
+                dot += d_out_row[j] * x_norm_row[j];
+            }
+            for j in 0..d {
+                d_in_row[j] = (d_out_row[j] - x_norm_row[j] * dot) * inv_norm;
+            }
+        } else {
+            // Forward was x/eps (linear scaling), so backward is d_out/eps
+            let inv_eps = 1.0 / eps;
+            for j in 0..d {
+                d_in_row[j] = d_out_row[j] * inv_eps;
+            }
+        }
+    }
+}
+
 /// Normalized SiLU: silu(x) / ||silu(x)|| * sqrt(d).
 /// Smooth, bounded activation for Trellis two-pass compression.
 /// Returns (output, silu_values, silu_norm) for backward.
