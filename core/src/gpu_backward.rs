@@ -362,7 +362,7 @@ fn gpu_memory_backward(
 
             accumulate_projection_grads(
                 level_params, embedded,
-                k_mem, v_mem, alpha, Some(theta), None,
+                k_mem, v_mem, q_mem, alpha, Some(theta), None,
                 &d_k_mem, &d_v_mem, &d_q_mem,
                 &d_alpha, Some(&d_theta), None,
                 k_norms, q_norms,
@@ -401,7 +401,7 @@ fn gpu_memory_backward(
 
             accumulate_projection_grads(
                 level_params, embedded,
-                k_mem, v_mem, alpha, Some(theta), Some(eta),
+                k_mem, v_mem, q_mem, alpha, Some(theta), Some(eta),
                 &d_k_mem, &d_v_mem, &d_q_mem,
                 &d_alpha, Some(&d_theta), Some(&d_eta),
                 k_norms, q_norms,
@@ -428,7 +428,7 @@ fn gpu_memory_backward(
             // Hebbian has no theta or eta — pass None
             accumulate_projection_grads(
                 level_params, embedded,
-                k_mem, v_mem, alpha, None, None,
+                k_mem, v_mem, q_mem, alpha, None, None,
                 &d_k_mem, &d_v_mem, &d_q_mem,
                 &d_alpha, None, None,
                 k_norms, q_norms,
@@ -452,7 +452,7 @@ fn gpu_memory_backward(
             }
             accumulate_projection_grads(
                 level_params, embedded,
-                k_mem, v_mem, alpha, Some(theta), None,
+                k_mem, v_mem, q_mem, alpha, Some(theta), None,
                 &d_k_mem, &d_v_mem, &d_q_mem,
                 &d_alpha, Some(&d_theta), None,
                 k_norms, q_norms,
@@ -475,7 +475,7 @@ fn gpu_memory_backward(
             }
             accumulate_projection_grads(
                 level_params, embedded,
-                k_mem, v_mem, alpha, Some(theta), Some(eta),
+                k_mem, v_mem, q_mem, alpha, Some(theta), Some(eta),
                 &d_k_mem, &d_v_mem, &d_q_mem,
                 &d_alpha, Some(&d_theta), Some(&d_eta),
                 k_norms, q_norms,
@@ -488,7 +488,7 @@ fn gpu_memory_backward(
                 hebbian_backward_checkpointed(k_mem, v_mem, q_mem, alpha, m_checkpoints, d_y, s, d, c);
             accumulate_projection_grads(
                 level_params, embedded,
-                k_mem, v_mem, alpha, None, None,
+                k_mem, v_mem, q_mem, alpha, None, None,
                 &d_k_mem, &d_v_mem, &d_q_mem,
                 &d_alpha, None, None,
                 k_norms, q_norms,
@@ -525,7 +525,7 @@ fn gpu_memory_backward(
 
             accumulate_projection_grads(
                 level_params, embedded,
-                k_mem, v_mem, alpha, Some(theta), None,
+                k_mem, v_mem, q_mem, alpha, Some(theta), None,
                 &d_k_mem, &d_v_mem, &d_q_mem,
                 &d_alpha, Some(&d_theta), None,
                 k_norms, q_norms,
@@ -548,7 +548,7 @@ fn gpu_memory_backward(
             }
             accumulate_projection_grads(
                 level_params, embedded,
-                k_mem, v_mem, alpha, Some(theta), None,
+                k_mem, v_mem, q_mem, alpha, Some(theta), None,
                 &d_k_mem, &d_v_mem, &d_q_mem,
                 &d_alpha, Some(&d_theta), None,
                 k_norms, q_norms,
@@ -1106,6 +1106,7 @@ fn accumulate_projection_grads(
     embedded: &GpuBuf<f32>,
     k_mem: &GpuBuf<f32>,               // gate inputs (forward cache, normalized)
     v_mem: &GpuBuf<f32>,
+    q_mem: &GpuBuf<f32>,               // normalized q projection (for L2 backward)
     alpha: &GpuBuf<f32>,               // gate outputs (forward cache)
     theta: Option<&GpuBuf<f32>>,       // softplus output; None for Hebbian
     eta: Option<&GpuBuf<f32>>,         // sigmoid output; None for Delta/Hebbian/DGD

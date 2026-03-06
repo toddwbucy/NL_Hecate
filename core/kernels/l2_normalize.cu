@@ -32,8 +32,9 @@ __global__ void l2_normalize_rows_kernel(
     }
 
     // Warp-level reduction
+    unsigned mask = __activemask();
     for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-        local_sum += __shfl_down_sync(0xffffffff, local_sum, offset);
+        local_sum += __shfl_down_sync(mask, local_sum, offset);
     }
 
     // Cross-warp reduction via shared memory
@@ -48,7 +49,7 @@ __global__ void l2_normalize_rows_kernel(
     if (warp_id == 0) {
         float val = (lane < n_warps) ? smem[lane] : 0.0f;
         for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-            val += __shfl_down_sync(0xffffffff, val, offset);
+            val += __shfl_down_sync(mask, val, offset);
         }
         if (lane == 0) smem[0] = val;
     }
@@ -121,8 +122,9 @@ __global__ void l2_normalize_backward_kernel(
     }
 
     // Warp-level reduction
+    unsigned mask = __activemask();
     for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-        local_dot += __shfl_down_sync(0xffffffff, local_dot, offset);
+        local_dot += __shfl_down_sync(mask, local_dot, offset);
     }
 
     // Cross-warp reduction
@@ -137,7 +139,7 @@ __global__ void l2_normalize_backward_kernel(
     if (warp_id == 0) {
         float val = (lane < n_warps) ? smem[lane] : 0.0f;
         for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-            val += __shfl_down_sync(0xffffffff, val, offset);
+            val += __shfl_down_sync(mask, val, offset);
         }
         if (lane == 0) smem[0] = val;
     }
@@ -145,9 +147,18 @@ __global__ void l2_normalize_backward_kernel(
 
     float dot_val = smem[0];
 
-    // Phase 2: d_in = (d_out - x_norm * dot) / norm
-    for (int j = tid; j < d; j += blockDim.x) {
-        d_in_row[j] = (d_out_row[j] - x_norm_row[j] * dot_val) * inv_norm;
+    // Phase 2: d_in depends on whether forward used the norm or the eps clamp.
+    // If norm > eps: d_in = (d_out - x_norm * dot(d_out, x_norm)) / norm  (sphere Jacobian)
+    // If norm <= eps: forward was x/eps (linear scaling), so d_in = d_out / eps
+    if (norm > eps) {
+        for (int j = tid; j < d; j += blockDim.x) {
+            d_in_row[j] = (d_out_row[j] - x_norm_row[j] * dot_val) * inv_norm;
+        }
+    } else {
+        float inv_eps = 1.0f / eps;
+        for (int j = tid; j < d; j += blockDim.x) {
+            d_in_row[j] = d_out_row[j] * inv_eps;
+        }
     }
 }
 

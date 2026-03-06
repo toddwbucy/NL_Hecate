@@ -389,9 +389,9 @@ pub fn delta_rule_opaque_backward(
 ///
 /// With DeltaMomentum: decay at saved[20], fm shifts to fm_base=21.
 ///
-/// Backward-compat: old recordings without norms have meta.len() <= 9,
+/// Backward-compat: old recordings without norms have meta.len() <= 10,
 /// norms_offset=0, fm_base=18/19.
-///   len guard `saved[0].len() > 8` safely detects new format.
+///   len guard `saved[0].len() >= 11` detects new format with L2 norms.
 pub fn titans_lmm_opaque_backward(
     d_outputs: &[&[f32]],
     saved: &[&[f32]],

@@ -12,25 +12,25 @@
 
 ## Motivation
 
-Without normalization, ||k_t|| ~ O(sqrt(d)). The memory update contains the outer product:
-```
+Without normalization, `||k_t|| ~ O(sqrt(d))`. The memory update contains the outer product:
+```text
 grad = (M @ k_t - v_t) * k_t^T
 ```
-||grad||_F scales as ||k_t||^2 ~ d. At d=1024, memory updates are ~1024x larger than intended, causing M_norm divergence and NaN within ~1300 steps. At d=512 the m_norm_clamp catches it; at d=1024 it overwhelms the clamp.
+`||grad||_F` scales as `||k_t||^2 ~ d`. At d=1024, memory updates are ~1024x larger than intended, causing M_norm divergence and NaN within ~1300 steps. At d=512 the `m_norm_clamp` catches it; at d=1024 it overwhelms the clamp.
 
-With normalization, ||k_t|| = 1 regardless of d, and ||grad||_F depends only on the prediction error magnitude.
+With normalization, `||k_t|| = 1` regardless of d, and `||grad||_F` depends only on the prediction error magnitude.
 
 ## Per-Row L2 Normalization
 
 Forward (per token row):
-```
+```text
 norm_t = ||k_raw_t||_2
 k_norm_t = k_raw_t / max(norm_t, eps)
 ```
-eps = 1e-8 (prevents division by zero for degenerate rows).
+`eps` = 1e-8 (prevents division by zero for degenerate rows).
 
 Backward (per token row):
-```
+```text
 dot_t = <d_k_norm_t, k_norm_t>
 d_k_raw_t = (d_k_norm_t - k_norm_t * dot_t) / max(norm_t, eps)
 ```

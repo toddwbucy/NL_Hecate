@@ -325,13 +325,22 @@ pub fn l2_normalize_rows_backward(
         let d_out_row = &d_out[i * d..(i + 1) * d];
         let x_norm_row = &x_norm[i * d..(i + 1) * d];
         let d_in_row = &mut d_in[i * d..(i + 1) * d];
-        let inv_norm = 1.0 / norms[i].max(eps);
-        let mut dot = 0.0f32;
-        for j in 0..d {
-            dot += d_out_row[j] * x_norm_row[j];
-        }
-        for j in 0..d {
-            d_in_row[j] = (d_out_row[j] - x_norm_row[j] * dot) * inv_norm;
+        if norms[i] > eps {
+            // Sphere Jacobian: d_in = (d_out - x_norm * dot(d_out, x_norm)) / norm
+            let inv_norm = 1.0 / norms[i];
+            let mut dot = 0.0f32;
+            for j in 0..d {
+                dot += d_out_row[j] * x_norm_row[j];
+            }
+            for j in 0..d {
+                d_in_row[j] = (d_out_row[j] - x_norm_row[j] * dot) * inv_norm;
+            }
+        } else {
+            // Forward was x/eps (linear scaling), so backward is d_out/eps
+            let inv_eps = 1.0 / eps;
+            for j in 0..d {
+                d_in_row[j] = d_out_row[j] * inv_eps;
+            }
         }
     }
 }
