@@ -210,29 +210,29 @@ __global__ void delta_backward_kernel(
         }
         __syncthreads();
 
-        // ── d_q_t[j] = sum_i M_{t+1}[i,j] * d_y_t[i] ──
-        if (tid < d) {
+        // ── d_q_t[j] = sum_i M_{t+1}[i,j] * d_y_t[i] (strided: supports d > blockDim.x) ──
+        for (int col = tid; col < d; col += blockDim.x) {
             float sum = 0.0f;
             for (int i = 0; i < d; i++) {
-                sum += m_next[i * d + tid] * d_y_t[i];
+                sum += m_next[i * d + col] * d_y_t[i];
             }
-            d_q_mem[t * d + tid] = sum;
+            d_q_mem[t * d + col] = sum;
         }
         __syncthreads();
 
-        // ── Recompute: prediction = M_t @ k_t ──
-        if (tid < d) {
+        // ── Recompute: prediction = M_t @ k_t (strided) ──
+        for (int row = tid; row < d; row += blockDim.x) {
             float sum = 0.0f;
             for (int j = 0; j < d; j++) {
-                sum += m_t[tid * d + j] * k_t[j];
+                sum += m_t[row * d + j] * k_t[j];
             }
-            prediction[tid] = sum;
+            prediction[row] = sum;
         }
         __syncthreads();
 
-        // ── error = prediction - v_t ──
-        if (tid < d) {
-            error_buf[tid] = prediction[tid] - v_t[tid];
+        // ── error = prediction - v_t (strided) ──
+        for (int row = tid; row < d; row += blockDim.x) {
+            error_buf[row] = prediction[row] - v_t[row];
         }
         __syncthreads();
 
@@ -279,39 +279,38 @@ __global__ void delta_backward_kernel(
             __syncthreads();
         }
 
-        // ── d_error[i] = sum_j (-theta_t * d_M[i,j]) * k_t[j] ──
-        if (tid < d) {
+        // ── d_error[i] = sum_j (-theta_t * d_M[i,j]) * k_t[j] (strided) ──
+        for (int row = tid; row < d; row += blockDim.x) {
             float sum = 0.0f;
             for (int j = 0; j < d; j++) {
-                sum += (-theta_t * d_M[tid * d + j]) * k_t[j];
+                sum += (-theta_t * d_M[row * d + j]) * k_t[j];
             }
-            d_error[tid] = sum;
+            d_error[row] = sum;
         }
         __syncthreads();
 
-        // ── d_k_mem_t[j] += sum_i d_grad[i,j] * error[i] ──
-        // d_grad[i,j] = -theta_t * d_M[i,j]
-        if (tid < d) {
+        // ── d_k_mem_t[j] += sum_i d_grad[i,j] * error[i] (strided) ──
+        for (int col = tid; col < d; col += blockDim.x) {
             float sum = 0.0f;
             for (int i = 0; i < d; i++) {
-                sum += (-theta_t * d_M[i * d + tid]) * error_buf[i];
+                sum += (-theta_t * d_M[i * d + col]) * error_buf[i];
             }
-            d_k_mem[t * d + tid] = sum;
+            d_k_mem[t * d + col] = sum;
         }
         __syncthreads();
 
-        // ── d_k_mem_t[j] += sum_i M_t[i,j] * d_error[i]  (from prediction = M @ k chain) ──
-        if (tid < d) {
+        // ── d_k_mem_t[j] += sum_i M_t[i,j] * d_error[i] (strided) ──
+        for (int col = tid; col < d; col += blockDim.x) {
             float sum = 0.0f;
             for (int i = 0; i < d; i++) {
-                sum += m_t[i * d + tid] * d_error[i];
+                sum += m_t[i * d + col] * d_error[i];
             }
-            d_k_mem[t * d + tid] += sum;
+            d_k_mem[t * d + col] += sum;
         }
 
-        // ── d_v_mem_t[i] = -d_error[i] ──
-        if (tid < d) {
-            d_v_mem[t * d + tid] = -d_error[tid];
+        // ── d_v_mem_t[i] = -d_error[i] (strided) ──
+        for (int row = tid; row < d; row += blockDim.x) {
+            d_v_mem[t * d + row] = -d_error[row];
         }
         __syncthreads();
 
@@ -399,25 +398,25 @@ __global__ void delta_backward_segment_kernel(
         }
         __syncthreads();
 
-        // d_q_t
-        if (tid < d) {
+        // d_q_t (strided: supports d > blockDim.x)
+        for (int col = tid; col < d; col += blockDim.x) {
             float sum = 0.0f;
             for (int i = 0; i < d; i++) {
-                sum += m_next[i * d + tid] * d_y_t[i];
+                sum += m_next[i * d + col] * d_y_t[i];
             }
-            d_q_mem[t * d + tid] = sum;
+            d_q_mem[t * d + col] = sum;
         }
         __syncthreads();
 
-        // Recompute prediction/error from M_t
-        if (tid < d) {
+        // Recompute prediction/error from M_t (strided)
+        for (int row = tid; row < d; row += blockDim.x) {
             float sum = 0.0f;
-            for (int j = 0; j < d; j++) sum += m_t[tid * d + j] * k_t[j];
-            prediction[tid] = sum;
+            for (int j = 0; j < d; j++) sum += m_t[row * d + j] * k_t[j];
+            prediction[row] = sum;
         }
         __syncthreads();
-        if (tid < d) {
-            error_buf[tid] = prediction[tid] - v_t[tid];
+        for (int row = tid; row < d; row += blockDim.x) {
+            error_buf[row] = prediction[row] - v_t[row];
         }
         __syncthreads();
 
@@ -455,36 +454,36 @@ __global__ void delta_backward_segment_kernel(
             __syncthreads();
         }
 
-        // d_error
-        if (tid < d) {
+        // d_error (strided: supports d > blockDim.x)
+        for (int row = tid; row < d; row += blockDim.x) {
             float sum = 0.0f;
             for (int j = 0; j < d; j++) {
-                sum += (-theta_t * d_M[tid * d + j]) * k_t[j];
+                sum += (-theta_t * d_M[row * d + j]) * k_t[j];
             }
-            d_error[tid] = sum;
+            d_error[row] = sum;
         }
         __syncthreads();
 
-        // d_k_mem
-        if (tid < d) {
+        // d_k_mem (strided)
+        for (int col = tid; col < d; col += blockDim.x) {
             float sum = 0.0f;
             for (int i = 0; i < d; i++) {
-                sum += (-theta_t * d_M[i * d + tid]) * error_buf[i];
+                sum += (-theta_t * d_M[i * d + col]) * error_buf[i];
             }
-            d_k_mem[t * d + tid] = sum;
+            d_k_mem[t * d + col] = sum;
         }
         __syncthreads();
-        if (tid < d) {
+        for (int col = tid; col < d; col += blockDim.x) {
             float sum = 0.0f;
             for (int i = 0; i < d; i++) {
-                sum += m_t[i * d + tid] * d_error[i];
+                sum += m_t[i * d + col] * d_error[i];
             }
-            d_k_mem[t * d + tid] += sum;
+            d_k_mem[t * d + col] += sum;
         }
 
-        // d_v_mem
-        if (tid < d) {
-            d_v_mem[t * d + tid] = -d_error[tid];
+        // d_v_mem (strided)
+        for (int row = tid; row < d; row += blockDim.x) {
+            d_v_mem[t * d + row] = -d_error[row];
         }
         __syncthreads();
 
@@ -513,9 +512,8 @@ extern "C" void delta_backward_segment_f32_cuda(
     float* d_alpha, float* d_theta, float* d_m_out,
     int t_start, int t_end, int d)
 {
-    if (d <= 0 || d > 1024) {
-        fprintf(stderr, "delta_backward_segment_f32_cuda: d=%d has invalid dimension (must be 1..=1024). "
-                        "Kernel restructuring needed for d > 1024.\n", d);
+    if (d <= 0) {
+        fprintf(stderr, "delta_backward_segment_f32_cuda: d=%d must be > 0.\n", d);
         exit(1);
     }
     int dd = d * d;
@@ -537,6 +535,12 @@ extern "C" void delta_backward_segment_f32_cuda(
     //   Hopper: + k_buf[2*d] + v_buf[2*d] + q_buf[2*d] + dy_buf[2*d]
     // Segment kernel does not use cp.async — only needs the legacy layout.
     int smem_bytes = (3 * d + block_size) * sizeof(float);
+
+    if (smem_bytes > 163840) {
+        fprintf(stderr, "delta_backward_segment_f32_cuda: d=%d requires %d bytes shared memory (limit 163840).\n",
+                d, smem_bytes);
+        exit(1);
+    }
 
     // Allocate d_M workspace in global memory
     float* d_M_work = nullptr;
@@ -563,9 +567,8 @@ extern "C" void delta_backward_f32_cuda(
     float* d_alpha, float* d_theta, float* d_m_initial,
     int seq_len, int d, int batch_size)
 {
-    if (d <= 0 || d > 1024) {
-        fprintf(stderr, "delta_backward_f32_cuda: d=%d has invalid dimension (must be 1..=1024). "
-                        "Kernel restructuring needed for d > 1024.\n", d);
+    if (d <= 0) {
+        fprintf(stderr, "delta_backward_f32_cuda: d=%d must be > 0.\n", d);
         exit(1);
     }
     int dd = d * d;
@@ -587,6 +590,12 @@ extern "C" void delta_backward_f32_cuda(
     //   Hopper: + k_buf[2*d] + v_buf[2*d] + q_buf[2*d] + dy_buf[2*d]
     // Host allocates the maximum so the kernel works on any architecture.
     int smem_bytes = (3 * d + block_size + 8 * d) * sizeof(float);
+
+    if (smem_bytes > 163840) {
+        fprintf(stderr, "delta_backward_f32_cuda: d=%d requires %d bytes shared memory (limit 163840).\n",
+                d, smem_bytes);
+        exit(1);
+    }
 
     // Allocate per-batch d_M workspaces (batch_size * dd floats, contiguous)
     // Each batch block uses its own slice: d_M_work + b*dd.

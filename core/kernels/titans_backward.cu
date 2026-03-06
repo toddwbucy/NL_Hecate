@@ -197,13 +197,13 @@ __global__ void titans_backward_kernel(
         }
         __syncthreads();
 
-        // d_q_t = M_{t+1}^T @ d_y_t
-        if (tid < d) {
+        // d_q_t = M_{t+1}^T @ d_y_t (strided: supports d > blockDim.x)
+        for (int col = tid; col < d; col += blockDim.x) {
             float sum = 0.0f;
             for (int i = 0; i < d; i++) {
-                sum += m_next[i * d + tid] * d_y_t[i];
+                sum += m_next[i * d + col] * d_y_t[i];
             }
-            d_q_mem[t * d + tid] = sum;
+            d_q_mem[t * d + col] = sum;
         }
         __syncthreads();
 
@@ -250,15 +250,15 @@ __global__ void titans_backward_kernel(
             __syncthreads();
         }
 
-        // Recompute prediction = M_t @ k, error = prediction - v
-        if (tid < d) {
+        // Recompute prediction = M_t @ k, error = prediction - v (strided: supports d > blockDim.x)
+        for (int row = tid; row < d; row += blockDim.x) {
             float sum = 0.0f;
-            for (int j = 0; j < d; j++) sum += m_t[tid * d + j] * k_t[j];
-            prediction[tid] = sum;
+            for (int j = 0; j < d; j++) sum += m_t[row * d + j] * k_t[j];
+            prediction[row] = sum;
         }
         __syncthreads();
-        if (tid < d) {
-            error_buf[tid] = prediction[tid] - v_t[tid];
+        for (int row = tid; row < d; row += blockDim.x) {
+            error_buf[row] = prediction[row] - v_t[row];
         }
         __syncthreads();
 
@@ -281,38 +281,38 @@ __global__ void titans_backward_kernel(
         }
 
         // d_grad = -theta * d_S
-        // d_error[i] = sum_j d_grad[i,j] * k_t[j]
-        if (tid < d) {
+        // d_error[i] = sum_j d_grad[i,j] * k_t[j] (strided: supports d > blockDim.x)
+        for (int row = tid; row < d; row += blockDim.x) {
             float sum = 0.0f;
             for (int j = 0; j < d; j++) {
-                sum += (-theta_t * d_S[tid * d + j]) * k_t[j];
+                sum += (-theta_t * d_S[row * d + j]) * k_t[j];
             }
-            d_error[tid] = sum;
+            d_error[row] = sum;
         }
         __syncthreads();
 
-        // d_k[j] = sum_i d_grad[i,j] * error[i]
-        if (tid < d) {
+        // d_k[j] = sum_i d_grad[i,j] * error[i] (strided: supports d > blockDim.x)
+        for (int col = tid; col < d; col += blockDim.x) {
             float sum = 0.0f;
             for (int i = 0; i < d; i++) {
-                sum += (-theta_t * d_S[i * d + tid]) * error_buf[i];
+                sum += (-theta_t * d_S[i * d + col]) * error_buf[i];
             }
-            d_k_mem[t * d + tid] = sum;
+            d_k_mem[t * d + col] = sum;
         }
         __syncthreads();
 
-        // d_k[j] += sum_i M_t[i,j] * d_error[i] (from prediction chain)
-        if (tid < d) {
+        // d_k[j] += sum_i M_t[i,j] * d_error[i] (strided: supports d > blockDim.x)
+        for (int col = tid; col < d; col += blockDim.x) {
             float sum = 0.0f;
             for (int i = 0; i < d; i++) {
-                sum += m_t[i * d + tid] * d_error[i];
+                sum += m_t[i * d + col] * d_error[i];
             }
-            d_k_mem[t * d + tid] += sum;
+            d_k_mem[t * d + col] += sum;
         }
 
-        // d_v[i] = -d_error[i]
-        if (tid < d) {
-            d_v_mem[t * d + tid] = -d_error[tid];
+        // d_v[i] = -d_error[i] (strided: supports d > blockDim.x)
+        for (int row = tid; row < d; row += blockDim.x) {
+            d_v_mem[t * d + row] = -d_error[row];
         }
         __syncthreads();
 
@@ -404,13 +404,13 @@ __global__ void titans_backward_segment_kernel(
         }
         __syncthreads();
 
-        // d_q_t
-        if (tid < d) {
+        // d_q_t (strided: supports d > blockDim.x)
+        for (int col = tid; col < d; col += blockDim.x) {
             float sum = 0.0f;
             for (int i = 0; i < d; i++) {
-                sum += m_next[i * d + tid] * d_y_t[i];
+                sum += m_next[i * d + col] * d_y_t[i];
             }
-            d_q_mem[t * d + tid] = sum;
+            d_q_mem[t * d + col] = sum;
         }
         __syncthreads();
 
@@ -454,15 +454,15 @@ __global__ void titans_backward_segment_kernel(
             __syncthreads();
         }
 
-        // Recompute prediction/error
-        if (tid < d) {
+        // Recompute prediction/error (strided: supports d > blockDim.x)
+        for (int row = tid; row < d; row += blockDim.x) {
             float sum = 0.0f;
-            for (int j = 0; j < d; j++) sum += m_t[tid * d + j] * k_t[j];
-            prediction[tid] = sum;
+            for (int j = 0; j < d; j++) sum += m_t[row * d + j] * k_t[j];
+            prediction[row] = sum;
         }
         __syncthreads();
-        if (tid < d) {
-            error_buf[tid] = prediction[tid] - v_t[tid];
+        for (int row = tid; row < d; row += blockDim.x) {
+            error_buf[row] = prediction[row] - v_t[row];
         }
         __syncthreads();
 
@@ -484,36 +484,36 @@ __global__ void titans_backward_segment_kernel(
             __syncthreads();
         }
 
-        // d_error
-        if (tid < d) {
+        // d_error (strided: supports d > blockDim.x)
+        for (int row = tid; row < d; row += blockDim.x) {
             float sum = 0.0f;
             for (int j = 0; j < d; j++) {
-                sum += (-theta_t * d_S[tid * d + j]) * k_t[j];
+                sum += (-theta_t * d_S[row * d + j]) * k_t[j];
             }
-            d_error[tid] = sum;
+            d_error[row] = sum;
         }
         __syncthreads();
 
-        // d_k_mem
-        if (tid < d) {
+        // d_k_mem (strided: supports d > blockDim.x)
+        for (int col = tid; col < d; col += blockDim.x) {
             float sum = 0.0f;
             for (int i = 0; i < d; i++) {
-                sum += (-theta_t * d_S[i * d + tid]) * error_buf[i];
+                sum += (-theta_t * d_S[i * d + col]) * error_buf[i];
             }
-            d_k_mem[t * d + tid] = sum;
+            d_k_mem[t * d + col] = sum;
         }
         __syncthreads();
-        if (tid < d) {
+        for (int col = tid; col < d; col += blockDim.x) {
             float sum = 0.0f;
             for (int i = 0; i < d; i++) {
-                sum += m_t[i * d + tid] * d_error[i];
+                sum += m_t[i * d + col] * d_error[i];
             }
-            d_k_mem[t * d + tid] += sum;
+            d_k_mem[t * d + col] += sum;
         }
 
-        // d_v_mem
-        if (tid < d) {
-            d_v_mem[t * d + tid] = -d_error[tid];
+        // d_v_mem (strided: supports d > blockDim.x)
+        for (int row = tid; row < d; row += blockDim.x) {
+            d_v_mem[t * d + row] = -d_error[row];
         }
         __syncthreads();
 
@@ -544,20 +544,16 @@ extern "C" void titans_backward_segment_f32_cuda(
     float* d_m_out, float* d_s_out,
     int t_start, int t_end, int d)
 {
-    if (d <= 0 || d > 1024) {
-        fprintf(stderr, "titans_backward_segment_f32_cuda: d=%d has invalid dimension (must be 1..=1024). "
-                        "Kernel restructuring needed for d > 1024.\n", d);
+    if (d <= 0) {
+        fprintf(stderr, "titans_backward_segment_f32_cuda: d=%d must be > 0.\n", d);
         exit(1);
     }
     int dd = d * d;
     // Cap at d (not dd): backward kernels require ~2× more registers than
     // forward due to prediction/error reconstruction. At d=512, block_size=1024
     // leaves only 64 regs/thread — too few. Using d=512 gives 128 regs/thread.
+    // Strided loops handle d > blockDim.x correctly.
     int block_size = (d < 1024) ? d : 1024;
-    // Ceil to smallest power-of-2 >= block_size, then cap at 1024.
-    // Must round UP (not down): backward kernels write shared prediction[]/
-    // error_buf[] via "if (tid < d)". With blockDim.x < d, threads in [blockDim.x, d)
-    // never exist → those slots are uninitialised → incorrect gradients.
     int rounded = 1;
     while (rounded < block_size) rounded <<= 1;
     if (rounded > 1024) rounded >>= 1;
@@ -569,6 +565,12 @@ extern "C" void titans_backward_segment_f32_cuda(
     // Shared memory: prediction[d] + error[d] + d_error[d] + reduce_buf[block_size]
     // Segment kernel does NOT use cp.async — no double-buffer allocation needed.
     int smem_bytes = (3 * d + block_size) * sizeof(float);
+
+    if (smem_bytes > 163840) {
+        fprintf(stderr, "titans_backward_segment_f32_cuda: d=%d requires %d bytes shared memory (limit 163840).\n",
+                d, smem_bytes);
+        exit(1);
+    }
 
     // Allocate d_M and d_S workspaces
     float* d_M_work = nullptr;
@@ -603,9 +605,8 @@ extern "C" void titans_backward_f32_cuda(
     float* d_m_initial, float* d_s_initial,
     int seq_len, int d, int batch_size)
 {
-    if (d <= 0 || d > 1024) {
-        fprintf(stderr, "titans_backward_f32_cuda: d=%d has invalid dimension (must be 1..=1024). "
-                        "Kernel restructuring needed for d > 1024.\n", d);
+    if (d <= 0) {
+        fprintf(stderr, "titans_backward_f32_cuda: d=%d must be > 0.\n", d);
         exit(1);
     }
     int dd = d * d;
@@ -628,6 +629,12 @@ extern "C" void titans_backward_f32_cuda(
     //   Ampere+ (sm_80+): + k_buf[2*d] + v_buf[2*d] + q_buf[2*d] + dy_buf[2*d]
     // Host allocates the maximum so the kernel works on any architecture.
     int smem_bytes = (3 * d + block_size + 8 * d) * sizeof(float);
+
+    if (smem_bytes > 163840) {
+        fprintf(stderr, "titans_backward_f32_cuda: d=%d requires %d bytes shared memory (limit 163840).\n",
+                d, smem_bytes);
+        exit(1);
+    }
 
     // Ampere+ path may exceed the 48KB default dynamic shared memory limit at large d.
     check_cuda_alloc("titans_backward: cudaFuncSetAttribute",
