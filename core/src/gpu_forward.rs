@@ -171,8 +171,7 @@ pub enum GpuMemoryCache {
         v_summaries: Vec<GpuBuf<f32>>,
         /// Global M state BEFORE each shard update [d*d] per shard (num_shards entries).
         global_m_before: Vec<GpuBuf<f32>>,
-        /// TNT config: n_locals, global_chunk_size, local_chunk_size.
-        n_locals: usize,
+        /// TNT config: global_chunk_size, local_chunk_size.
         global_chunk_size: usize,
         local_chunk_size: usize,
     },
@@ -899,10 +898,9 @@ fn gpu_tnt_forward(
         v_summaries.push(v_sum);
     }
 
-    let n_locals_final = if num_shards > 0 { (cg.min(s) + cl - 1) / cl } else { 1 };
     (y_full, GpuMemoryCache::TNT {
         shard_inner_caches, shard_y_bufs, k_summaries, v_summaries,
-        global_m_before, n_locals: n_locals_final, global_chunk_size: cg, local_chunk_size: cl,
+        global_m_before, global_chunk_size: cg, local_chunk_size: cl,
     })
 }
 

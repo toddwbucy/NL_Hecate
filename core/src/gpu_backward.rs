@@ -550,7 +550,7 @@ fn gpu_memory_backward(
         // ── TNT: reverse shard loop with batched inner backward ──────
         GpuMemoryCache::TNT {
             shard_inner_caches, shard_y_bufs, k_summaries, v_summaries,
-            global_m_before, n_locals: _, global_chunk_size, local_chunk_size,
+            global_m_before, global_chunk_size, local_chunk_size,
         } => {
             assert_eq!(batch_size, 1, "TNT backward currently supports batch_size=1 only");
             let cg = *global_chunk_size;
@@ -600,11 +600,12 @@ fn gpu_memory_backward(
                 // Combine upstream d_y with d_local_y_global: d_y_combined = upstream + global
                 let mut d_y_upstream_shard = GpuBuf::zeros(shard_len * d);
                 unsafe {
-                    crate::gpu_forward::gpu_buf_memcpy_d2d(
+                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
                         d_y_upstream_shard.ptr() as *mut std::ffi::c_void,
                         d_y_shard_slice.as_ptr() as *const std::ffi::c_void,
                         shard_len * d * 4,
                     );
+                    assert_eq!(rc, 0, "TNT backward: d_y upstream copy failed (rc={rc})");
                 }
                 let mut d_y_combined = GpuBuf::zeros(shard_len * d);
                 crate::dispatch::tnt_combine_gradients_dd(
@@ -619,11 +620,12 @@ fn gpu_memory_backward(
                 } else {
                     let mut dp = GpuBuf::zeros(padded_len * d);
                     unsafe {
-                        crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
                             dp.ptr() as *mut std::ffi::c_void,
                             d_y_combined.as_ptr() as *const std::ffi::c_void,
                             shard_len * d * 4,
                         );
+                        assert_eq!(rc, 0, "TNT backward: d_y padding copy failed (rc={rc})");
                     }
                     dp
                 };

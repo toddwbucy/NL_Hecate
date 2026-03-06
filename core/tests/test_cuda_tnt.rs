@@ -1,3 +1,4 @@
+#![cfg(feature = "cuda")]
 /// GPU TNT parity tests.
 ///
 /// Verifies that gpu_cms_forward with TNT parallelization produces the same
