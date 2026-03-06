@@ -25,6 +25,12 @@ fn main() {
         cc::Build::new()
             .cuda(true)
             .cudart("shared")
+            // Force optimized CUDA compilation even in debug builds.
+            // nvcc -G (device debug) doubles register usage, causing "too many
+            // resources requested for launch" at d >= 1536 (80+ regs × 1024
+            // threads exceeds the 65536-register-per-SM limit on Ampere).
+            .opt_level(2)
+            .debug(false)
             // Architecture-specific SASS (native performance)
             .flag("-gencode").flag("arch=compute_86,code=sm_86")   // A6000, RTX 3090
             .flag("-gencode").flag("arch=compute_89,code=sm_89")   // RTX 4090, RTX 2000 Ada

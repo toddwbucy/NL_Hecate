@@ -146,13 +146,13 @@ __global__ void hebbian_backward_kernel(
         }
         __syncthreads();
 
-        // d_q_t = M_{t+1}^T @ d_y_t
-        if (tid < d) {
+        // d_q_t = M_{t+1}^T @ d_y_t (strided: supports d > blockDim.x)
+        for (int col = tid; col < d; col += blockDim.x) {
             float sum = 0.0f;
             for (int i = 0; i < d; i++) {
-                sum += m_next[i * d + tid] * d_y_t[i];
+                sum += m_next[i * d + col] * d_y_t[i];
             }
-            d_q_mem[t * d + tid] = sum;
+            d_q_mem[t * d + col] = sum;
         }
         __syncthreads();
 
@@ -172,22 +172,22 @@ __global__ void hebbian_backward_kernel(
             __syncthreads();
         }
 
-        // d_v[i] = sum_j d_M[i,j] * k_t[j] (from outer product)
-        if (tid < d) {
+        // d_v[i] = sum_j d_M[i,j] * k_t[j] (strided: supports d > blockDim.x)
+        for (int row = tid; row < d; row += blockDim.x) {
             float sum = 0.0f;
             for (int j = 0; j < d; j++) {
-                sum += d_M[tid * d + j] * k_t[j];
+                sum += d_M[row * d + j] * k_t[j];
             }
-            d_v_mem[t * d + tid] = sum;
+            d_v_mem[t * d + row] = sum;
         }
 
-        // d_k[j] = sum_i d_M[i,j] * v_t[i] (from outer product)
-        if (tid < d) {
+        // d_k[j] = sum_i d_M[i,j] * v_t[i] (strided: supports d > blockDim.x)
+        for (int col = tid; col < d; col += blockDim.x) {
             float sum = 0.0f;
             for (int i = 0; i < d; i++) {
-                sum += d_M[i * d + tid] * v_t[i];
+                sum += d_M[i * d + col] * v_t[i];
             }
-            d_k_mem[t * d + tid] = sum;
+            d_k_mem[t * d + col] = sum;
         }
         __syncthreads();
 
@@ -203,7 +203,6 @@ __global__ void hebbian_backward_kernel(
 
 #else
     // ── Pre-Ampere path: direct global memory access ──
-    // Unchanged from original — byte-identical behavior.
     for (int t = seq_len - 1; t >= 0; t--) {
         const float* k_t = k_mem + t * d;
         const float* v_t = v_mem + t * d;
@@ -221,13 +220,13 @@ __global__ void hebbian_backward_kernel(
         }
         __syncthreads();
 
-        // d_q_t = M_{t+1}^T @ d_y_t
-        if (tid < d) {
+        // d_q_t = M_{t+1}^T @ d_y_t (strided: supports d > blockDim.x)
+        for (int col = tid; col < d; col += blockDim.x) {
             float sum = 0.0f;
             for (int i = 0; i < d; i++) {
-                sum += m_next[i * d + tid] * d_y_t[i];
+                sum += m_next[i * d + col] * d_y_t[i];
             }
-            d_q_mem[t * d + tid] = sum;
+            d_q_mem[t * d + col] = sum;
         }
         __syncthreads();
 
@@ -247,22 +246,22 @@ __global__ void hebbian_backward_kernel(
             __syncthreads();
         }
 
-        // d_v[i] = sum_j d_M[i,j] * k_t[j] (from outer product)
-        if (tid < d) {
+        // d_v[i] = sum_j d_M[i,j] * k_t[j] (strided: supports d > blockDim.x)
+        for (int row = tid; row < d; row += blockDim.x) {
             float sum = 0.0f;
             for (int j = 0; j < d; j++) {
-                sum += d_M[tid * d + j] * k_t[j];
+                sum += d_M[row * d + j] * k_t[j];
             }
-            d_v_mem[t * d + tid] = sum;
+            d_v_mem[t * d + row] = sum;
         }
 
-        // d_k[j] = sum_i d_M[i,j] * v_t[i] (from outer product)
-        if (tid < d) {
+        // d_k[j] = sum_i d_M[i,j] * v_t[i] (strided: supports d > blockDim.x)
+        for (int col = tid; col < d; col += blockDim.x) {
             float sum = 0.0f;
             for (int i = 0; i < d; i++) {
-                sum += d_M[i * d + tid] * v_t[i];
+                sum += d_M[i * d + col] * v_t[i];
             }
-            d_k_mem[t * d + tid] = sum;
+            d_k_mem[t * d + col] = sum;
         }
         __syncthreads();
 
@@ -332,13 +331,13 @@ __global__ void hebbian_backward_segment_kernel(
         }
         __syncthreads();
 
-        // d_q_t
-        if (tid < d) {
+        // d_q_t (strided: supports d > blockDim.x)
+        for (int col = tid; col < d; col += blockDim.x) {
             float sum = 0.0f;
             for (int i = 0; i < d; i++) {
-                sum += m_next[i * d + tid] * d_y_t[i];
+                sum += m_next[i * d + col] * d_y_t[i];
             }
-            d_q_mem[t * d + tid] = sum;
+            d_q_mem[t * d + col] = sum;
         }
         __syncthreads();
 
@@ -358,20 +357,20 @@ __global__ void hebbian_backward_segment_kernel(
             __syncthreads();
         }
 
-        // d_v, d_k from outer product
-        if (tid < d) {
+        // d_v, d_k from outer product (strided: supports d > blockDim.x)
+        for (int row = tid; row < d; row += blockDim.x) {
             float sum = 0.0f;
             for (int j = 0; j < d; j++) {
-                sum += d_M[tid * d + j] * k_t[j];
+                sum += d_M[row * d + j] * k_t[j];
             }
-            d_v_mem[t * d + tid] = sum;
+            d_v_mem[t * d + row] = sum;
         }
-        if (tid < d) {
+        for (int col = tid; col < d; col += blockDim.x) {
             float sum = 0.0f;
             for (int i = 0; i < d; i++) {
-                sum += d_M[i * d + tid] * v_t[i];
+                sum += d_M[i * d + col] * v_t[i];
             }
-            d_k_mem[t * d + tid] = sum;
+            d_k_mem[t * d + col] = sum;
         }
         __syncthreads();
 
@@ -397,9 +396,8 @@ extern "C" void hebbian_backward_segment_f32_cuda(
     float* d_alpha, float* d_m_out,
     int t_start, int t_end, int d)
 {
-    if (d <= 0 || d > 1024) {
-        fprintf(stderr, "hebbian_backward_segment_f32_cuda: d=%d has invalid dimension (must be 1..=1024). "
-                        "Kernel restructuring needed for d > 1024.\n", d);
+    if (d <= 0 || 8 * d * (int)sizeof(float) > 163840) {
+        fprintf(stderr, "hebbian_backward_segment_f32_cuda: d=%d out of range (must be 1..=5120).\n", d);
         exit(1);
     }
     int dd = d * d;
@@ -439,9 +437,8 @@ extern "C" void hebbian_backward_f32_cuda(
     float* d_alpha, float* d_m_initial,
     int seq_len, int d)
 {
-    if (d <= 0 || d > 1024) {
-        fprintf(stderr, "hebbian_backward_f32_cuda: d=%d has invalid dimension (must be 1..=1024). "
-                        "Kernel restructuring needed for d > 1024.\n", d);
+    if (d <= 0 || 8 * d * (int)sizeof(float) > 163840) {
+        fprintf(stderr, "hebbian_backward_f32_cuda: d=%d out of range (must be 1..=5120).\n", d);
         exit(1);
     }
     int dd = d * d;
