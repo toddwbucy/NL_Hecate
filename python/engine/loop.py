@@ -185,7 +185,12 @@ def run_build(bcfg: BuildConfig):
             if target_k > len(chunk_template):
                 print(f"  ERROR: extend_k={target_k} exceeds max supported k={len(chunk_template)}")
                 return
-            new_chunks = chunk_template[:target_k]
+            if bcfg.stack_up:
+                # Stack-up: preserve donor's chunk sizes, append next tier
+                new_chunks = list(cfg.chunk_sizes) + [chunk_template[target_k - 1]]
+            else:
+                # Push-up: use canonical template (levels shift frequencies)
+                new_chunks = chunk_template[:target_k]
             # Rebuild MAGConfig with the new k (carry all other fields from loaded cfg)
             new_cfg = nl_hecate.MAGConfig(
                 d_model=cfg.d_model, num_heads=cfg.num_heads,

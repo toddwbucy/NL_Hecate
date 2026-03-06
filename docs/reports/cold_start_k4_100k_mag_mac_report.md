@@ -2,7 +2,7 @@
 
 **Date**: 2026-03-06
 **Experiments**: EXP-09 (MAC), EXP-10 (MAG)
-**Verdict**: Cold-start k=4 CMS is a dead end. L3 never activates. L2 is effectively dead. Progressive stacking (push-up) is required.
+**Verdict**: Cold-start k=4 CMS is a dead end. L3 never activates. L2 is effectively dead. Progressive stacking — either push-up or stack-up — is required.
 
 ## Executive Summary
 
@@ -14,7 +14,10 @@ Two parallel 100K-step runs compared MAG (memory gates attention) and MAC (memor
 4. **Level 1 shows weak, intermittent activity** — gnorm ~0.1-0.25 when active, but flagged dead 133 times.
 5. **Only Level 0 learns** — carries the entire gradient signal (gnorm 1.2-2.4 at convergence).
 
-This conclusively demonstrates that cold-start k=4 cannot bootstrap higher CMS levels. The push-up progressive stacking approach (train k=1, promote to L1, add fresh L0, repeat) is the necessary path forward.
+This conclusively demonstrates that cold-start k=4 cannot bootstrap higher CMS levels. Progressive stacking is the recommended path forward, with two strategies under evaluation:
+
+- **Push-up** (PR #176): Train k=1, shift trained levels to slower frequencies (level[i] → level[i+1]), add fresh L0 at the fastest tier. Trained weights change firing rate.
+- **Stack-up** (PR #178): Train k=1, keep existing levels in place (level[i] → level[i]), add fresh level at the slowest (top) tier. Trained weights retain their original firing rate.
 
 ## Configuration
 
@@ -125,8 +128,9 @@ The cold-start k=4 failure has a clear mechanism:
 
 ### What to try next
 
-- **Push-up progressive stacking** (implemented in PR #176): Train k=1 until converged, promote trained memory to L1, add fresh L0, repeat until k=4. Each level starts with a pretrained state that has already learned useful representations.
-- **Warm-start from k=1 checkpoint**: Use the MAG k=1 run (already converged) as the seed for push-up phase 2 (k=2).
+- **Push-up progressive stacking** (PR #176): Train k=1 until converged, shift trained levels to slower frequencies (level[i] → level[i+1]), add fresh L0 at the fastest tier. Each level starts with a pretrained state.
+- **Stack-up progressive stacking** (PR #178): Train k=1 until converged, keep existing levels in place, add a fresh level at the slowest (top) tier. Trained weights retain their original firing rate context.
+- **Warm-start from k=1 checkpoint**: Use the MAG k=1 run (already converged) as the seed for phase 2 (k=2) under either strategy.
 
 ## Artifacts
 

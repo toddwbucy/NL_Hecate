@@ -400,6 +400,8 @@ class BuildConfig:
             self.self_generated_values = args.self_generated_values
         if getattr(args, "push_up", None) is not None:
             self.push_up = args.push_up
+        if getattr(args, "stack_up", None) is not None:
+            self.stack_up = args.stack_up
         self._validate()
         self.validate_gpu_tier()  # V-05: checked after --cpu/--gpu are applied
 

@@ -2237,6 +2237,46 @@ impl MAGParams {
             self.persistent_tokens.len(), new_cfg.n_persistent * old_d,
         );
 
+        // Validate per-level shape invariants before cloning
+        let d = old_d;
+        for i in 0..old_k {
+            let lev = &self.levels[i];
+            // Core projections: w_k_mem, w_v_mem, w_q_mem are [d, d] (Bf16Storage)
+            assert_eq!(
+                lev.w_k_mem.len(), d * d,
+                "extend_stack_up: level[{}] w_k_mem size {} vs expected d*d={}",
+                i, lev.w_k_mem.len(), d * d,
+            );
+            // Conv1D: present iff kernel_size > 0
+            let ks = new_cfg.kernel_size;
+            assert_eq!(
+                lev.w_k_conv.len(), d * ks,
+                "extend_stack_up: level[{}] w_k_conv size {} vs expected d*kernel_size={}",
+                i, lev.w_k_conv.len(), d * ks,
+            );
+            assert_eq!(
+                lev.w_q_conv.len(), d * ks,
+                "extend_stack_up: level[{}] w_q_conv size {} vs expected d*kernel_size={}",
+                i, lev.w_q_conv.len(), d * ks,
+            );
+            // Frequency gate: present iff Learned schedule
+            let has_freq = matches!(new_cfg.frequency_schedule, FrequencySchedule::Learned(_));
+            let expect_freq = if has_freq { d } else { 0 };
+            assert_eq!(
+                lev.w_freq.len(), expect_freq,
+                "extend_stack_up: level[{}] w_freq size {} vs expected {}",
+                i, lev.w_freq.len(), expect_freq,
+            );
+            // Self-referential init memories: present iff Adaptive projection
+            let has_self_ref = matches!(new_cfg.projection_kind, ProjectionKind::Adaptive);
+            let expect_self_ref = if has_self_ref { d * d } else { 0 };
+            assert_eq!(
+                lev.m_k_init.len(), expect_self_ref,
+                "extend_stack_up: level[{}] m_k_init size {} vs expected {} (projection_kind mismatch)",
+                i, lev.m_k_init.len(), expect_self_ref,
+            );
+        }
+
         // Init fresh params with new_cfg — gives us correctly initialized levels
         let mut new_params = MAGParams::init(new_cfg, seed);
 
