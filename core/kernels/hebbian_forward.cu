@@ -287,7 +287,7 @@ extern "C" void hebbian_forward_ckpt_f32_cuda(
     long long num_ckpts64 = (seq_len == 0)
         ? 1LL
         : ((long long)seq_len + checkpoint_interval - 1) / checkpoint_interval + 1;
-    if (dd64 > INT_MAX || num_ckpts64 * dd64 > INT_MAX) {
+    if (dd64 > INT_MAX || num_ckpts64 * dd64 > INT_MAX || (long long)seq_len * d > INT_MAX) {
         fprintf(stderr, "hebbian_forward_ckpt_f32_cuda: d=%d seq_len=%d ckpt_interval=%d would overflow int32 indices.\n",
                 d, seq_len, checkpoint_interval);
         exit(1);

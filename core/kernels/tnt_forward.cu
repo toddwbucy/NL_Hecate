@@ -54,7 +54,8 @@ void tnt_broadcast_m_f32_cuda(
         fprintf(stderr, "tnt_broadcast_m_f32_cuda: d=%d and N=%d must be > 0\n", d, N);
         abort();
     }
-    int dd = d * d;
+    long long dd64 = (long long)d * d;
+    int dd = (int)dd64;
     int block = (dd < 1024) ? dd : 1024;
     tnt_broadcast_m_kernel<<<1, block>>>(m_src, m_dst, N, dd);
     check_cuda_launch_tnt("tnt_broadcast_m", d);
@@ -129,7 +130,8 @@ void tnt_global_update_f32_cuda(
         fprintf(stderr, "tnt_global_update_f32_cuda: d=%d must be > 0\n", d);
         abort();
     }
-    int dd = d * d;
+    long long dd64 = (long long)d * d;
+    int dd = (int)dd64;
     int block = (dd < 1024) ? dd : 1024;
     tnt_global_update_kernel<<<1, block>>>(global_m, k_sum, v_sum, d, alpha);
     check_cuda_launch_tnt("tnt_global_update", d);

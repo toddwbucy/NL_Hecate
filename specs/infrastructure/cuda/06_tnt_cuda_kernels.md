@@ -95,13 +95,13 @@ At d=1024, C_G=64, C_L=8, N=8, k=4 levels:
 
 ## Equations Traced
 
-| Equation | Collection | HADES ID | Relationship |
-|----------|-----------|----------|-------------|
-| eq-003-chunkwise-compression | tnt_equations | `tnt_equations/eq-003-chunkwise-compression` | implements |
-| eq-005-global-memory-update | tnt_equations | `tnt_equations/eq-005-global-memory-update` | implements |
-| eq-006-hierarchical-memory | tnt_equations | `tnt_equations/eq-006-hierarchical-memory` | implements |
-| eq-014-n-local-memories-update | tnt_equations | `tnt_equations/eq-014-n-local-memories-update` | implements |
-| eq-013-general-hierarchical-memory | tnt_equations | `tnt_equations/eq-013-general-hierarchical-memory` | cites |
+| Equation | Collection | HADES ID | Source | Relationship |
+|----------|-----------|----------|--------|-------------|
+| eq-003-chunkwise-compression | tnt_equations | `tnt_equations/eq-003-chunkwise-compression` | TNT §3.1, arXiv:2511.07343 | implements |
+| eq-005-global-memory-update | tnt_equations | `tnt_equations/eq-005-global-memory-update` | TNT §3.2, arXiv:2511.07343 | implements |
+| eq-006-hierarchical-memory | tnt_equations | `tnt_equations/eq-006-hierarchical-memory` | TNT §3.2, arXiv:2511.07343 | implements |
+| eq-014-n-local-memories-update | tnt_equations | `tnt_equations/eq-014-n-local-memories-update` | TNT §3.3, arXiv:2511.07343 | implements |
+| eq-013-general-hierarchical-memory | tnt_equations | `tnt_equations/eq-013-general-hierarchical-memory` | TNT §3.1, arXiv:2511.07343 | cites |
 
 Paper: TNT — Improving Chunkwise Training for Titans (arXiv: 2511.07343)
 

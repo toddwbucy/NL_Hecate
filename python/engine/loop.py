@@ -221,9 +221,21 @@ def run_build(bcfg: BuildConfig):
                 theta_floor=theta_floor,
                 theta_ceil=theta_ceil,
                 m_norm_max=m_norm_max,
-                parallel_strategy=bcfg.parallel_strategy,
-                tnt_global_chunk_size=bcfg.tnt_global_chunk_size,
-                tnt_local_chunk_size=bcfg.tnt_local_chunk_size,
+                parallel_strategy=(
+                    bcfg.parallel_strategy
+                    if bcfg.parallel_strategy is not None
+                    else getattr(cfg, "parallel_strategy", None)
+                ),
+                tnt_global_chunk_size=(
+                    bcfg.tnt_global_chunk_size
+                    if bcfg.tnt_global_chunk_size is not None
+                    else getattr(cfg, "tnt_global_chunk_size", None)
+                ),
+                tnt_local_chunk_size=(
+                    bcfg.tnt_local_chunk_size
+                    if bcfg.tnt_local_chunk_size is not None
+                    else getattr(cfg, "tnt_local_chunk_size", None)
+                ),
             )
     else:
         cfg = nl_hecate.MAGConfig(

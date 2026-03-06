@@ -234,8 +234,12 @@ pub fn gpu_cms_forward(
     // ── CUDA Graph capture phase (one-time at warmup_steps) ────────────
     if context.cuda_graph.should_capture() && context.forward_scratch.is_some() {
         // Check that the memory rule is supported for graph capture.
+        let is_tnt_mode = cfg.parallel.as_ref()
+            .map(|p| p.strategy == ParallelStrategy::TNTHierarchical)
+            .unwrap_or(false);
         let can_capture = matches!(cfg.memory_rule, MemoryRuleKind::DeltaRule | MemoryRuleKind::TitansLMM)
-            && cfg.checkpoint_interval.is_none();
+            && cfg.checkpoint_interval.is_none()
+            && !is_tnt_mode;
 
         if can_capture {
             gpu_cms_capture_all_patterns(params, cfg, &input_ids_i32, &target_ids_i32, pulse, context, bs);
@@ -789,11 +793,16 @@ fn gpu_tnt_forward(
             let mut ap = GpuBuf::zeros(padded_len);
             let mut tp = GpuBuf::zeros(padded_len);
             unsafe {
-                gpu_buf_memcpy_d2d(kp.ptr() as *mut _, k_mem.as_ptr() as *const _, shard_len * d * 4);
-                gpu_buf_memcpy_d2d(vp.ptr() as *mut _, v_mem.as_ptr() as *const _, shard_len * d * 4);
-                gpu_buf_memcpy_d2d(qp.ptr() as *mut _, q_mem.as_ptr() as *const _, shard_len * d * 4);
-                gpu_buf_memcpy_d2d(ap.ptr() as *mut _, alpha.as_ptr() as *const _, shard_len * 4);
-                gpu_buf_memcpy_d2d(tp.ptr() as *mut _, theta.as_ptr() as *const _, shard_len * 4);
+                let rc = gpu_buf_memcpy_d2d(kp.ptr() as *mut _, k_mem.as_ptr() as *const _, shard_len * d * 4);
+                assert_eq!(rc, 0, "TNT pad copy kp failed (rc={rc})");
+                let rc = gpu_buf_memcpy_d2d(vp.ptr() as *mut _, v_mem.as_ptr() as *const _, shard_len * d * 4);
+                assert_eq!(rc, 0, "TNT pad copy vp failed (rc={rc})");
+                let rc = gpu_buf_memcpy_d2d(qp.ptr() as *mut _, q_mem.as_ptr() as *const _, shard_len * d * 4);
+                assert_eq!(rc, 0, "TNT pad copy qp failed (rc={rc})");
+                let rc = gpu_buf_memcpy_d2d(ap.ptr() as *mut _, alpha.as_ptr() as *const _, shard_len * 4);
+                assert_eq!(rc, 0, "TNT pad copy alpha failed (rc={rc})");
+                let rc = gpu_buf_memcpy_d2d(tp.ptr() as *mut _, theta.as_ptr() as *const _, shard_len * 4);
+                assert_eq!(rc, 0, "TNT pad copy theta failed (rc={rc})");
             }
             (kp, vp, qp, ap, tp)
         };
@@ -817,7 +826,10 @@ fn gpu_tnt_forward(
                     eta
                 } else {
                     let mut ep = GpuBuf::zeros(padded_len);
-                    unsafe { gpu_buf_memcpy_d2d(ep.ptr() as *mut _, eta.as_ptr() as *const _, shard_len * 4); }
+                    unsafe {
+                        let rc = gpu_buf_memcpy_d2d(ep.ptr() as *mut _, eta.as_ptr() as *const _, shard_len * 4);
+                        assert_eq!(rc, 0, "TNT pad copy eta failed (rc={rc})");
+                    }
                     ep
                 };
 

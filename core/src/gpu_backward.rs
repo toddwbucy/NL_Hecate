@@ -561,9 +561,8 @@ fn gpu_memory_backward(
             let mut d_k_mem_total = GpuBuf::<f32>::zeros(s * d);
             let mut d_v_mem_total = GpuBuf::<f32>::zeros(s * d);
             let mut d_q_mem_total = GpuBuf::<f32>::zeros(s * d);
-            let mut d_alpha_total = GpuBuf::<f32>::zeros(s);
-            let mut d_theta_total = GpuBuf::<f32>::zeros(s);
-            let mut d_eta_total: Option<GpuBuf<f32>> = None;
+            // Note: d_alpha/d_theta/d_eta per-shard grads feed directly into gate_backward
+            // for per-shard gate weight grads, accumulated via tmp buffers + saxpy into level_grads.
 
             // Reverse shard iteration: propagate d_m through global updates
             // Start with zero d_m_carry (no downstream gradient past last shard)
@@ -718,21 +717,6 @@ fn gpu_memory_backward(
                         1.0, d_q_shard.as_ptr(), d_q_mem_total.ptr().add(shard_start * d),
                         (shard_len * d) as i32,
                     );
-                    crate::cuda_ffi::saxpy_cuda(
-                        1.0, d_alpha_shard.as_ptr(), d_alpha_total.ptr().add(shard_start),
-                        shard_len as i32,
-                    );
-                    crate::cuda_ffi::saxpy_cuda(
-                        1.0, d_theta_shard.as_ptr(), d_theta_total.ptr().add(shard_start),
-                        shard_len as i32,
-                    );
-                    if has_eta {
-                        let eta_total = d_eta_total.get_or_insert_with(|| GpuBuf::zeros(s));
-                        crate::cuda_ffi::saxpy_cuda(
-                            1.0, d_eta_shard.as_ptr(), eta_total.ptr().add(shard_start),
-                            shard_len as i32,
-                        );
-                    }
                 }
 
                 // Step 7: Gate backward per shard → temp buffers → accumulate into level_grads.
