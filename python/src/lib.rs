@@ -280,6 +280,9 @@ impl MAGConfig {
         m_norm_max=None,
         feature_map="identity",
         feature_map_sigma=1.0,
+        parallel_strategy=None,
+        tnt_global_chunk_size=64,
+        tnt_local_chunk_size=8,
     ))]
     fn new(
         d_model: usize,
@@ -321,6 +324,9 @@ impl MAGConfig {
         m_norm_max: Option<Vec<f32>>,
         feature_map: &str,
         feature_map_sigma: f32,
+        parallel_strategy: Option<&str>,
+        tnt_global_chunk_size: usize,
+        tnt_local_chunk_size: usize,
     ) -> PyResult<Self> {
         if d_model != num_heads * head_dim {
             return Err(PyValueError::new_err(format!(
@@ -439,6 +445,47 @@ impl MAGConfig {
                 "Unknown feature_map '{feature_map}'. Expected: identity, random_fourier, elu"
             ))),
         };
+        let parallel_cfg = match parallel_strategy {
+            Some(s) => {
+                let pcfg = match s.to_lowercase().as_str() {
+                    "sequential" | "none" => nl_hecate_core::parallel::ParallelConfig::sequential(),
+                    "chunkwise" | "chunkwise_gd" => {
+                        nl_hecate_core::parallel::ParallelConfig::chunkwise(chunk_sizes.get(0).copied().unwrap_or(1))
+                    }
+                    "tnt" | "tnt_hierarchical" => {
+                        if tnt_global_chunk_size == 0 {
+                            return Err(PyValueError::new_err("tnt_global_chunk_size must be >= 1"));
+                        }
+                        if tnt_local_chunk_size == 0 {
+                            return Err(PyValueError::new_err("tnt_local_chunk_size must be >= 1"));
+                        }
+                        if tnt_local_chunk_size > tnt_global_chunk_size {
+                            return Err(PyValueError::new_err(format!(
+                                "tnt_local_chunk_size ({}) must be <= tnt_global_chunk_size ({})",
+                                tnt_local_chunk_size, tnt_global_chunk_size
+                            )));
+                        }
+                        if tnt_global_chunk_size % tnt_local_chunk_size != 0 {
+                            return Err(PyValueError::new_err(format!(
+                                "tnt_global_chunk_size ({}) must be divisible by tnt_local_chunk_size ({})",
+                                tnt_global_chunk_size, tnt_local_chunk_size
+                            )));
+                        }
+                        nl_hecate_core::parallel::ParallelConfig {
+                            strategy: nl_hecate_core::parallel::ParallelStrategy::TNTHierarchical,
+                            chunk_size: tnt_local_chunk_size,
+                            tnt_global_chunk_size,
+                            tnt_local_chunk_size,
+                        }
+                    }
+                    _ => return Err(PyValueError::new_err(format!(
+                        "Unknown parallel_strategy '{s}'. Expected: sequential, chunkwise, tnt_hierarchical"
+                    ))),
+                };
+                Some(pcfg)
+            }
+            None => None,
+        };
         Ok(MAGConfig {
             inner: RustMAGConfig {
                 swa: RustConfig {
@@ -465,7 +512,7 @@ impl MAGConfig {
                 d_compress: d_compress.unwrap_or(0),
                 lambda_k: lambda_k.unwrap_or(0.0),
                 lambda_v: lambda_v.unwrap_or(0.0),
-                parallel: None,
+                parallel: parallel_cfg,
                 retention: ret_kind,
                 m3: m3_cfg,
                 frequency_schedule: freq_sched,
@@ -806,6 +853,9 @@ impl MAGForwardCache {
     m_norm_max=None,
     feature_map="identity",
     feature_map_sigma=1.0,
+    parallel_strategy=None,
+    tnt_global_chunk_size=64,
+    tnt_local_chunk_size=8,
 ))]
 fn mag_create_config(
     d_model: usize,
@@ -847,6 +897,9 @@ fn mag_create_config(
     m_norm_max: Option<Vec<f32>>,
     feature_map: &str,
     feature_map_sigma: f32,
+    parallel_strategy: Option<&str>,
+    tnt_global_chunk_size: usize,
+    tnt_local_chunk_size: usize,
 ) -> PyResult<MAGConfig> {
     MAGConfig::new(
         d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled,
@@ -856,6 +909,7 @@ fn mag_create_config(
         projection_kind, self_generated_values, momentum_kind, momentum_d_hidden,
         theta_floor, theta_ceil, intermediate_size, m_norm_max,
         feature_map, feature_map_sigma,
+        parallel_strategy, tnt_global_chunk_size, tnt_local_chunk_size,
     )
 }
 

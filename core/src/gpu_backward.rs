@@ -547,6 +547,248 @@ fn gpu_memory_backward(
                 level_grads, s, d, 1,
             )
         }
+        // ── TNT: reverse shard loop with batched inner backward ──────
+        GpuMemoryCache::TNT {
+            shard_inner_caches, shard_y_bufs, k_summaries, v_summaries,
+            global_m_before, global_chunk_size, local_chunk_size,
+        } => {
+            assert_eq!(batch_size, 1, "TNT backward currently supports batch_size=1 only");
+            let cg = *global_chunk_size;
+            let cl = *local_chunk_size;
+            let num_shards = shard_inner_caches.len();
+
+            // Accumulators for projection weight grads across all shards
+            let mut d_k_mem_total = GpuBuf::<f32>::zeros(s * d);
+            let mut d_v_mem_total = GpuBuf::<f32>::zeros(s * d);
+            let mut d_q_mem_total = GpuBuf::<f32>::zeros(s * d);
+            // Note: d_alpha/d_theta/d_eta per-shard grads feed directly into gate_backward
+            // for per-shard gate weight grads, accumulated via tmp buffers + saxpy into level_grads.
+
+            // Reverse shard iteration: propagate d_m through global updates
+            // Start with zero d_m_carry (no downstream gradient past last shard)
+            let mut d_m_carry = GpuBuf::zeros(dd);
+
+            for shard_idx in (0..num_shards).rev() {
+                let shard_start = shard_idx * cg;
+                let shard_end = (shard_start + cg).min(s);
+                let shard_len = shard_end - shard_start;
+                let n_batch = (shard_len + cl - 1) / cl;
+
+                // Step 1: Backward through global M update
+                // Forward: m_new = alpha * m_old + v_sum ⊗ k_sum
+                // d_m_new = d_m_carry (gradient from subsequent shards)
+                let mut d_m_old = GpuBuf::zeros(dd);
+                let mut d_k_sum = GpuBuf::zeros(d);
+                let mut d_v_sum = GpuBuf::zeros(d);
+                crate::dispatch::tnt_global_update_backward_dd(
+                    &d_m_carry, &k_summaries[shard_idx], &v_summaries[shard_idx],
+                    &mut d_m_old, &mut d_k_sum, &mut d_v_sum, d, 0.95,
+                );
+
+                // Step 2: Backward through shard summary mean
+                // d_local_y_global = backward of mean(local_y) → d_k_sum, d_v_sum
+                let mut d_local_y_global = GpuBuf::zeros(shard_len * d);
+                crate::dispatch::tnt_shard_summary_mean_backward_dd(
+                    &d_k_sum, &d_v_sum, &mut d_local_y_global, shard_len, d,
+                );
+
+                // Step 3: Combine upstream d_y with d_local_y from global path
+                // d_y_combined[t] = d_y[t] + d_local_y_global[t]
+                let d_y_shard_slice = d_y.slice(shard_start * d, shard_len * d);
+
+                // Combine upstream d_y with d_local_y_global: d_y_combined = upstream + global
+                let mut d_y_upstream_shard = GpuBuf::zeros(shard_len * d);
+                unsafe {
+                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        d_y_upstream_shard.ptr() as *mut std::ffi::c_void,
+                        d_y_shard_slice.as_ptr() as *const std::ffi::c_void,
+                        shard_len * d * 4,
+                    );
+                    assert_eq!(rc, 0, "TNT backward: d_y upstream copy failed (rc={rc})");
+                }
+                let mut d_y_combined = GpuBuf::zeros(shard_len * d);
+                crate::dispatch::tnt_combine_gradients_dd(
+                    &d_y_upstream_shard, &d_local_y_global,
+                    &mut d_y_combined, shard_len * d,
+                );
+
+                // Step 4: Pad d_y_combined to [n_batch, cl, d] layout if needed
+                let padded_len = n_batch * cl;
+                let d_y_padded = if shard_len == padded_len {
+                    d_y_combined
+                } else {
+                    let mut dp = GpuBuf::zeros(padded_len * d);
+                    unsafe {
+                        let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                            dp.ptr() as *mut std::ffi::c_void,
+                            d_y_combined.as_ptr() as *const std::ffi::c_void,
+                            shard_len * d * 4,
+                        );
+                        assert_eq!(rc, 0, "TNT backward: d_y padding copy failed (rc={rc})");
+                    }
+                    dp
+                };
+
+                // Step 5: Run inner backward kernel (Titans/Delta with batch_size=n_batch)
+                let inner_cache = &shard_inner_caches[shard_idx];
+                let shard_tokens = padded_len;
+                let mut d_k_shard = GpuBuf::zeros(shard_tokens * d);
+                let mut d_v_shard = GpuBuf::zeros(shard_tokens * d);
+                let mut d_q_shard = GpuBuf::zeros(shard_tokens * d);
+                let mut d_alpha_shard = GpuBuf::zeros(shard_tokens);
+                let mut d_theta_shard = GpuBuf::zeros(shard_tokens);
+                // d_eta_shard hoisted out of match for use in gate backward (Step 7)
+                let mut d_eta_shard = GpuBuf::zeros(shard_tokens);
+                let has_eta = matches!(inner_cache, GpuMemoryCache::Titans { .. });
+
+                match inner_cache {
+                    GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states, s_states } => {
+                        let mut d_m_initial = GpuBuf::zeros(n_batch * dd);
+                        let mut d_s_initial = GpuBuf::zeros(n_batch * dd);
+
+                        crate::dispatch::titans_backward_dd(
+                            k_mem, v_mem, q_mem, alpha, theta, eta,
+                            m_states, s_states, &d_y_padded,
+                            &mut d_k_shard, &mut d_v_shard, &mut d_q_shard,
+                            &mut d_alpha_shard, &mut d_theta_shard, &mut d_eta_shard,
+                            &mut d_m_initial, &mut d_s_initial,
+                            cl, d, n_batch,
+                        );
+
+                        // Reduce per-local d_m_initial → shared global M gradient.
+                        // Forward broadcasts one global_m to N copies; backward must
+                        // sum all N local d_m_initial slices back into d_m_old.
+                        for b in 0..n_batch {
+                            unsafe {
+                                crate::cuda_ffi::saxpy_cuda(
+                                    1.0, d_m_initial.as_ptr().add(b * dd), d_m_old.ptr(), dd as i32,
+                                );
+                            }
+                        }
+                    }
+                    GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states } => {
+                        let mut d_m_initial = GpuBuf::zeros(n_batch * dd);
+
+                        crate::dispatch::delta_backward_dd(
+                            k_mem, v_mem, q_mem, alpha, theta,
+                            m_states, &d_y_padded,
+                            &mut d_k_shard, &mut d_v_shard, &mut d_q_shard,
+                            &mut d_alpha_shard, &mut d_theta_shard, &mut d_m_initial,
+                            cl, d, n_batch,
+                        );
+
+                        // Reduce per-local d_m_initial → shared global M gradient.
+                        for b in 0..n_batch {
+                            unsafe {
+                                crate::cuda_ffi::saxpy_cuda(
+                                    1.0, d_m_initial.as_ptr().add(b * dd), d_m_old.ptr(), dd as i32,
+                                );
+                            }
+                        }
+                    }
+                    _ => unreachable!("TNT inner cache must be Titans or Delta"),
+                }
+
+                // CS-39 straight-through: zero d_theta where theta was clamped
+                let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
+                let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
+                if theta_floor > 0.0 || theta_ceil < f32::MAX {
+                    if let GpuMemoryCache::Titans { theta, .. } | GpuMemoryCache::Delta { theta, .. } = inner_cache {
+                        unsafe {
+                            crate::cuda_ffi::theta_clamp_mask_cuda(
+                                theta.as_ptr(), d_theta_shard.ptr(), shard_tokens as i32, theta_floor, theta_ceil,
+                            );
+                        }
+                    }
+                }
+
+                // Step 6: Accumulate unpadded shard gradients into full-sequence totals.
+                // Only copy the first shard_len elements (skip zero-padding from last chunk).
+                unsafe {
+                    crate::cuda_ffi::saxpy_cuda(
+                        1.0, d_k_shard.as_ptr(), d_k_mem_total.ptr().add(shard_start * d),
+                        (shard_len * d) as i32,
+                    );
+                    crate::cuda_ffi::saxpy_cuda(
+                        1.0, d_v_shard.as_ptr(), d_v_mem_total.ptr().add(shard_start * d),
+                        (shard_len * d) as i32,
+                    );
+                    crate::cuda_ffi::saxpy_cuda(
+                        1.0, d_q_shard.as_ptr(), d_q_mem_total.ptr().add(shard_start * d),
+                        (shard_len * d) as i32,
+                    );
+                }
+
+                // Step 7: Gate backward per shard → temp buffers → accumulate into level_grads.
+                // gate_backward_cuda OVERWRITES output buffers (not +=), so we write to
+                // temporaries and saxpy-add into level_grads after each shard.
+                {
+                    let mut tmp_dw_alpha = GpuBuf::zeros(2 * d);
+                    let mut tmp_db_alpha = GpuBuf::zeros(1);
+                    let mut tmp_dw_theta = GpuBuf::zeros(2 * d);
+                    let mut tmp_db_theta = GpuBuf::zeros(1);
+                    let mut tmp_dw_eta   = GpuBuf::zeros(2 * d);
+                    let mut tmp_db_eta   = GpuBuf::zeros(1);
+
+                    match inner_cache {
+                        GpuMemoryCache::Titans { k_mem, v_mem, alpha, theta, eta, .. } => {
+                            crate::dispatch::gate_backward_dd(
+                                &d_alpha_shard, alpha,
+                                Some(&d_theta_shard), Some(theta),
+                                Some(&d_eta_shard), Some(eta),
+                                k_mem, v_mem,
+                                &mut tmp_dw_alpha, &mut tmp_db_alpha,
+                                &mut tmp_dw_theta, &mut tmp_db_theta,
+                                &mut tmp_dw_eta,   &mut tmp_db_eta,
+                                shard_tokens, d,
+                            );
+                        }
+                        GpuMemoryCache::Delta { k_mem, v_mem, alpha, theta, .. } => {
+                            crate::dispatch::gate_backward_dd(
+                                &d_alpha_shard, alpha,
+                                Some(&d_theta_shard), Some(theta),
+                                None, None,
+                                k_mem, v_mem,
+                                &mut tmp_dw_alpha, &mut tmp_db_alpha,
+                                &mut tmp_dw_theta, &mut tmp_db_theta,
+                                &mut tmp_dw_eta,   &mut tmp_db_eta,
+                                shard_tokens, d,
+                            );
+                        }
+                        _ => unreachable!(),
+                    }
+
+                    // Accumulate temp gate grads into level_grads (saxpy: dst += 1.0 * src)
+                    unsafe {
+                        crate::cuda_ffi::saxpy_cuda(1.0, tmp_dw_alpha.as_ptr(), level_grads.d_w_alpha.ptr(), (2 * d) as i32);
+                        crate::cuda_ffi::saxpy_cuda(1.0, tmp_db_alpha.as_ptr(), level_grads.d_b_alpha.ptr(), 1);
+                        crate::cuda_ffi::saxpy_cuda(1.0, tmp_dw_theta.as_ptr(), level_grads.d_w_theta.ptr(), (2 * d) as i32);
+                        crate::cuda_ffi::saxpy_cuda(1.0, tmp_db_theta.as_ptr(), level_grads.d_b_theta.ptr(), 1);
+                        if has_eta {
+                            crate::cuda_ffi::saxpy_cuda(1.0, tmp_dw_eta.as_ptr(), level_grads.d_w_eta.ptr(), (2 * d) as i32);
+                            crate::cuda_ffi::saxpy_cuda(1.0, tmp_db_eta.as_ptr(), level_grads.d_b_eta.ptr(), 1);
+                        }
+                    }
+                }
+
+                // Step 8: Propagate d_m_carry backward
+                // d_m_carry for the previous shard = d_m_old from this shard
+                d_m_carry = d_m_old;
+            }
+
+            // Projection weight grads: d_W[d,d] = d_proj^T[d, s] @ embedded[s, d]
+            gpu_matmul_transa_dd(&d_k_mem_total, embedded, &mut level_grads.d_w_k_mem, d, s, d);
+            gpu_matmul_transa_dd(&d_v_mem_total, embedded, &mut level_grads.d_w_v_mem, d, s, d);
+            gpu_matmul_transa_dd(&d_q_mem_total, embedded, &mut level_grads.d_w_q_mem, d, s, d);
+
+            // d_embedded from memory projections: d_emb = d_k @ W_k + d_v @ W_v + d_q @ W_q
+            let mut d_embedded = GpuBuf::zeros(s * d);
+            crate::dispatch::cublas_matmul_acc_dd(&d_k_mem_total, &level_params.w_k_mem, &mut d_embedded, s, d, d);
+            crate::dispatch::cublas_matmul_acc_dd(&d_v_mem_total, &level_params.w_v_mem, &mut d_embedded, s, d, d);
+            crate::dispatch::cublas_matmul_acc_dd(&d_q_mem_total, &level_params.w_q_mem, &mut d_embedded, s, d, d);
+
+            d_embedded
+        }
         // ── SwiGLU: stateless MLP, direct weight grads ───────────────
         GpuMemoryCache::SwiGlu { gate_buf, up_buf, fused_buf, cache_buf } => {
             let inter = cfg.intermediate_size;

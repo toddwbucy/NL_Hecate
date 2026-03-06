@@ -1,0 +1,46 @@
+{
+  "description": "H100 throughput benchmark at d=1024 using TNT chunkwise parallelization. Uses Titans memory rule with TNT hierarchical parallel strategy. N=8 local memories per shard (C_G=64, C_L=8), reducing serial depth from 512 to ~16 steps.",
+  "model": {
+    "d_model": 1024,
+    "num_heads": 16,
+    "seq_len": 512,
+    "window_size": 1024,
+    "vocab_size": 32000,
+    "k": 4,
+    "chunk_sizes": [1, 8, 64, 512],
+    "memory_rule": "titans",
+    "composition": "mag",
+    "momentum_kind": "none",
+    "momentum_d_hidden": 0,
+    "theta_floor": [0.0, 0.0, 0.0, 0.0],
+    "parallel_strategy": "tnt_hierarchical",
+    "tnt_global_chunk_size": 64,
+    "tnt_local_chunk_size": 8
+  },
+  "build": {
+    "lr": 0.0006,
+    "steps": 200,
+    "optimizer": "adamw_gpu",
+    "warmup_steps": 10,
+    "weight_decay": 0.1,
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "max_grad_norm": 1.0,
+    "save_path": "checkpoints/h100_d1024_tnt_benchmark.safetensors",
+    "save_every": 0,
+    "log_every": 10,
+    "eval_every": 0,
+    "eval_max_chunks": 0,
+    "tape_every": 0,
+    "probe_max_tokens": 0,
+    "probe_prompts": 0,
+    "log_file": "runs/h100_d1024_tnt_benchmark.jsonl"
+  },
+  "gate_warmup": {
+    "falsification_step": 0
+  },
+  "data": {
+    "path": "data/dolmino_100b",
+    "format": "sharegpt"
+  }
+}

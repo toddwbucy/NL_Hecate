@@ -221,6 +221,21 @@ def run_build(bcfg: BuildConfig):
                 theta_floor=theta_floor,
                 theta_ceil=theta_ceil,
                 m_norm_max=m_norm_max,
+                parallel_strategy=(
+                    bcfg.parallel_strategy
+                    if bcfg.parallel_strategy is not None
+                    else getattr(cfg, "parallel_strategy", None)
+                ),
+                tnt_global_chunk_size=(
+                    bcfg.tnt_global_chunk_size
+                    if bcfg.tnt_global_chunk_size is not None
+                    else getattr(cfg, "tnt_global_chunk_size", None)
+                ),
+                tnt_local_chunk_size=(
+                    bcfg.tnt_local_chunk_size
+                    if bcfg.tnt_local_chunk_size is not None
+                    else getattr(cfg, "tnt_local_chunk_size", None)
+                ),
             )
     else:
         cfg = nl_hecate.MAGConfig(
@@ -247,6 +262,9 @@ def run_build(bcfg: BuildConfig):
             theta_ceil=bcfg.theta_ceil,
             intermediate_size=bcfg.intermediate_size,
             m_norm_max=bcfg.m_norm_max,
+            parallel_strategy=bcfg.parallel_strategy,
+            tnt_global_chunk_size=bcfg.tnt_global_chunk_size,
+            tnt_local_chunk_size=bcfg.tnt_local_chunk_size,
         )
         params = nl_hecate.mag_init_params(cfg, bcfg.seed)
         if bcfg.donor_weights is not None:
@@ -543,6 +561,9 @@ def run_build(bcfg: BuildConfig):
                     theta_floor=warmup_floor,
                     theta_ceil=list(cfg.theta_ceil) if list(cfg.theta_ceil) else None,
                     m_norm_max=list(cfg.m_norm_max) if list(cfg.m_norm_max) else None,
+                    parallel_strategy=bcfg.parallel_strategy,
+                    tnt_global_chunk_size=bcfg.tnt_global_chunk_size,
+                    tnt_local_chunk_size=bcfg.tnt_local_chunk_size,
                 )
         elif (bcfg.gate_warmup_theta_floor_init is not None
               and step == bcfg.gate_warmup_decay_steps):
@@ -570,6 +591,9 @@ def run_build(bcfg: BuildConfig):
                     theta_floor=final_floor,
                     theta_ceil=list(cfg.theta_ceil) if list(cfg.theta_ceil) else None,
                     m_norm_max=list(cfg.m_norm_max) if list(cfg.m_norm_max) else None,
+                    parallel_strategy=bcfg.parallel_strategy,
+                    tnt_global_chunk_size=bcfg.tnt_global_chunk_size,
+                    tnt_local_chunk_size=bcfg.tnt_local_chunk_size,
                 )
 
         use_cosine = (adamw_opt is not None or use_adamw_gpu)
