@@ -9,8 +9,7 @@
     "memory_rule": "titans",
     "composition": "mag",
     "momentum_kind": "ema",
-    "momentum_d_hidden": 0,
-    "m_norm_max": [100.0, 100.0, 100.0, 100.0]
+    "momentum_d_hidden": 0
   },
   "build": {
     "lr": 0.0006,
