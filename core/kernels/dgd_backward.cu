@@ -531,8 +531,8 @@ extern "C" void dgd_backward_segment_f32_cuda(
     float* d_alpha, float* d_theta, float* d_m_out,
     int t_start, int t_end, int d)
 {
-    if (d <= 0 || 8 * d * (int)sizeof(float) > 163840) {
-        fprintf(stderr, "dgd_backward_segment_f32_cuda: d=%d out of range (must be 1..=5120).\n", d);
+    if (d <= 0) {
+        fprintf(stderr, "dgd_backward_segment_f32_cuda: d=%d must be > 0.\n", d);
         exit(1);
     }
     int dd = d * d;
@@ -555,6 +555,12 @@ extern "C" void dgd_backward_segment_f32_cuda(
     //   Ampere+: + k_buf[2*d] + v_buf[2*d] + q_buf[2*d] + dy_buf[2*d]
     // Host allocates the maximum so the kernel works on any architecture.
     int smem_bytes = (3 * d + block_size + 8 * d) * sizeof(float);
+
+    if (smem_bytes > 163840) {
+        fprintf(stderr, "dgd_backward_segment_f32_cuda: d=%d requires %d bytes shared memory (limit 163840).\n",
+                d, smem_bytes);
+        exit(1);
+    }
 
     float* d_M_work = nullptr;
     check_cuda_alloc("dgd_backward_segment: cudaMalloc d_M_work",
@@ -583,8 +589,8 @@ extern "C" void dgd_backward_f32_cuda(
     float* d_alpha, float* d_theta, float* d_m_initial,
     int seq_len, int d)
 {
-    if (d <= 0 || 8 * d * (int)sizeof(float) > 163840) {
-        fprintf(stderr, "dgd_backward_f32_cuda: d=%d out of range (must be 1..=5120).\n", d);
+    if (d <= 0) {
+        fprintf(stderr, "dgd_backward_f32_cuda: d=%d must be > 0.\n", d);
         exit(1);
     }
     int dd = d * d;
@@ -607,6 +613,12 @@ extern "C" void dgd_backward_f32_cuda(
     //   Ampere+: + k_buf[2*d] + v_buf[2*d] + q_buf[2*d] + dy_buf[2*d]
     // Host allocates the maximum so the kernel works on any architecture.
     int smem_bytes = (3 * d + block_size + 8 * d) * sizeof(float);
+
+    if (smem_bytes > 163840) {
+        fprintf(stderr, "dgd_backward_f32_cuda: d=%d requires %d bytes shared memory (limit 163840).\n",
+                d, smem_bytes);
+        exit(1);
+    }
 
     float* d_M_work = nullptr;
     check_cuda_alloc("dgd_backward: cudaMalloc d_M_work",

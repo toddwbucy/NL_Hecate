@@ -7,7 +7,7 @@
 - **Cost**: Zero performance regression at d <= 1024 (strided loop with single iteration = same code path). Negligible overhead at d > 1024 (extra loop iterations amortized over d^2 matrix operations).
 - **Trade-off**: Simplicity over specialization. A single code path handles all d values rather than separate kernels for different ranges.
 - **Position**: `specs/infrastructure/cuda/05_large_dimension_kernel_restructuring.md`
-- **Source**: Empirical — H100 testing of d=2048 HOPE model hit silent data corruption from unwritten elements.
+- **Source**: Empirical — H100 testing of d=2048 HOPE model hit silent data corruption from unwritten elements. Pure CUDA infrastructure (block size limits, shared memory carve-outs); no paper equations apply. NVIDIA CUDA Programming Guide §5.2.3 (Thread Block Size), §16.5.1 (Shared Memory). Cross-ref: `specs/infrastructure/cuda/04_hopper_kernel_optimization.md` §4 (shared memory budget tables).
 
 ## Root Cause
 

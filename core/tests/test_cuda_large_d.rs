@@ -16,6 +16,7 @@
 
 mod cuda_test_utils;
 use cuda_test_utils::{rand_buf, check_close};
+use serial_test::serial;
 
 use nl_hecate_core::dispatch::{
     delta_forward_dispatch, delta_backward_dispatch,
@@ -263,6 +264,7 @@ fn rust_titans_forward(
 // ══════════════════════════════════════════════════════════════════════
 
 #[test]
+#[serial(cuda)]
 fn test_cuda_delta_forward_d2048() {
     let d = 2048;
     let seq_len = 2;
@@ -294,6 +296,7 @@ fn test_cuda_delta_forward_d2048() {
 }
 
 #[test]
+#[serial(cuda)]
 fn test_cuda_delta_backward_d2048() {
     let d = 2048;
     let seq_len = 2;
@@ -346,6 +349,7 @@ fn test_cuda_delta_backward_d2048() {
 // ══════════════════════════════════════════════════════════════════════
 
 #[test]
+#[serial(cuda)]
 fn test_cuda_hebbian_forward_d2048() {
     let d = 2048;
     let seq_len = 2;
@@ -375,6 +379,7 @@ fn test_cuda_hebbian_forward_d2048() {
 }
 
 #[test]
+#[serial(cuda)]
 fn test_cuda_hebbian_backward_d2048() {
     let d = 2048;
     let seq_len = 2;
@@ -420,6 +425,7 @@ fn test_cuda_hebbian_backward_d2048() {
 // ══════════════════════════════════════════════════════════════════════
 
 #[test]
+#[serial(cuda)]
 fn test_cuda_titans_forward_d2048() {
     let d = 2048;
     let seq_len = 2;
@@ -456,6 +462,7 @@ fn test_cuda_titans_forward_d2048() {
 }
 
 #[test]
+#[serial(cuda)]
 fn test_cuda_titans_backward_d2048() {
     let d = 2048;
     let seq_len = 2;
@@ -511,6 +518,7 @@ fn test_cuda_titans_backward_d2048() {
 // ══════════════════════════════════════════════════════════════════════
 
 #[test]
+#[serial(cuda)]
 fn test_cuda_dgd_forward_d2048() {
     let d = 2048;
     let seq_len = 2;
@@ -538,6 +546,7 @@ fn test_cuda_dgd_forward_d2048() {
 }
 
 #[test]
+#[serial(cuda)]
 fn test_cuda_dgd_backward_d2048() {
     let d = 2048;
     let seq_len = 2;
@@ -583,6 +592,7 @@ fn test_cuda_dgd_backward_d2048() {
 // ══════════════════════════════════════════════════════════════════════
 
 #[test]
+#[serial(cuda)]
 fn test_cuda_gate_backward_d1024() {
     use nl_hecate_core::gpu_buf::GpuBuf;
     use nl_hecate_core::dispatch::gate_backward_dd;
@@ -668,6 +678,7 @@ fn test_cuda_gate_backward_d1024() {
 // ══════════════════════════════════════════════════════════════════════
 
 #[test]
+#[serial(cuda)]
 fn test_cuda_delta_forward_d1536() {
     let d = 1536;
     let seq_len = 2;

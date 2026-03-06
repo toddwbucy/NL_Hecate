@@ -354,8 +354,8 @@ extern "C" void delta_forward_ckpt_f32_cuda(
     float* m_states, float* y,
     int seq_len, int d, int checkpoint_interval)
 {
-    if (d <= 0 || 8 * d * (int)sizeof(float) > 163840) {
-        fprintf(stderr, "delta_forward_ckpt_f32_cuda: d=%d out of range (must be 1..=5120).\n", d);
+    if (d <= 0 || 2 * d * (int)sizeof(float) > 163840) {
+        fprintf(stderr, "delta_forward_ckpt_f32_cuda: d=%d out of range.\n", d);
         exit(1);
     }
     if (checkpoint_interval <= 0) {
