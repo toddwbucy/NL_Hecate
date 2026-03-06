@@ -2146,6 +2146,49 @@ impl MAGParams {
         // (per CS-18: orchestration belongs in Python).
     }
 
+    /// Push-up level stacking: shift existing levels to slower frequencies,
+    /// insert a fresh L0 at the fast end.
+    ///
+    /// `new_cfg` must have `k == self.levels.len() + 1`.
+    /// SWA weights and persistent tokens are preserved exactly (bitwise).
+    /// Old level[i] becomes new level[i+1]; new level[0] gets fresh Xavier init
+    /// with level-0 default gate biases from `MAGParams::init`.
+    pub fn extend_push_up(&self, new_cfg: &MAGConfig, seed: u64) -> MAGParams {
+        let old_k = self.levels.len();
+        assert_eq!(
+            new_cfg.k,
+            old_k + 1,
+            "extend_push_up requires new_cfg.k ({}) == old_k + 1 ({})",
+            new_cfg.k,
+            old_k + 1,
+        );
+
+        // Init fresh params with new_cfg — gives us a correctly initialized L0
+        // (Xavier projections, level-0 gate biases, Conv1D, frequency gates, etc.)
+        let mut new_params = MAGParams::init(new_cfg, seed);
+
+        // Preserve SWA (attention branch) exactly
+        new_params.swa = self.swa.clone();
+
+        // Shift old levels up: old level[i] → new level[i+1]
+        for i in 0..old_k {
+            new_params.levels[i + 1] = self.levels[i].clone();
+        }
+        // new_params.levels[0] stays as fresh init from MAGParams::init
+
+        // Shift alpha logits: old alpha[i] → new alpha[i+1], new alpha[0] = 0.0
+        for i in 0..old_k {
+            new_params.alpha_mem[i + 1] = self.alpha_mem[i];
+            new_params.alpha_refl[i + 1] = self.alpha_refl[i];
+        }
+        // new alpha[0] already 0.0 from init (uniform 1/k contribution)
+
+        // Preserve persistent tokens (MAC composition, if any)
+        new_params.persistent_tokens = self.persistent_tokens.clone();
+
+        new_params
+    }
+
     /// Create zero-initialized shadow for gradient accumulation.
     pub fn zeros_like(cfg: &MAGConfig) -> Self {
         let d = cfg.swa.d_model;

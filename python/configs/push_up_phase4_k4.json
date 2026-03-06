@@ -1,0 +1,42 @@
+{
+  "description": "Push-up Phase 4: Extend k=3→k=4. Full CMS stack with warm-started levels. 100K steps from corpus start.",
+  "model": {
+    "d_model": 512,
+    "num_heads": 8,
+    "seq_len": 512,
+    "window_size": 512,
+    "vocab_size": 32000,
+    "memory_rule": "titans",
+    "composition": "mag",
+    "momentum_kind": "ema",
+    "momentum_d_hidden": 0,
+    "m_norm_max": [100.0, 100.0, 100.0, 100.0]
+  },
+  "build": {
+    "lr": 0.0006,
+    "steps": 100000,
+    "optimizer": "adamw_gpu",
+    "warmup_steps": 1000,
+    "weight_decay": 0.1,
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "max_grad_norm": 1.0,
+    "save_path": "checkpoints/push_up_phase4_k4.safetensors",
+    "save_every": 5126,
+    "log_every": 10,
+    "eval_every": 1028,
+    "eval_max_chunks": 50,
+    "tape_every": 1000,
+    "probe_max_tokens": 20,
+    "probe_prompts": 1,
+    "log_file": "runs/push_up_phase4_k4.jsonl",
+    "load": "checkpoints/push_up_phase3_k3.safetensors",
+    "extend_k": 4,
+    "push_up": true,
+    "data_seek": 0
+  },
+  "data": {
+    "path": "data/dolmino_100b",
+    "format": "sharegpt"
+  }
+}

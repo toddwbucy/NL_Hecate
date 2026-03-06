@@ -131,6 +131,11 @@ class BuildConfig:
     gate_warmup_l2_threshold: float = 0.005
     gate_warmup_l3_threshold: float = 0.001
 
+    # Push-up level stacking (specs/infrastructure/07_push_up_level_stacking.md)
+    extend_k: int | None = None       # Target k (must be loaded_k + 1)
+    push_up: bool = False             # Shift existing levels to slower frequencies
+    data_seek: int | None = None      # Override data cursor to this token position
+
     # Runtime
     gpu: bool = True  # GPU by default; --cpu to override
     load: str | None = None
@@ -278,6 +283,14 @@ class BuildConfig:
         if self.saturation_window < 1:
             raise ValueError(
                 f"saturation_window must be >= 1, got {self.saturation_window}")
+        # Push-up level stacking validation
+        if self.extend_k is not None:
+            if self.load is None:
+                raise ValueError("extend_k requires 'load' to be set (checkpoint to extend from)")
+            if self.extend_k < 2:
+                raise ValueError(f"extend_k must be >= 2, got {self.extend_k}")
+        if self.push_up and self.extend_k is None:
+            raise ValueError("push_up=true requires extend_k to be set")
 
     @property
     def head_dim(self) -> int:
@@ -359,6 +372,8 @@ class BuildConfig:
             "momentum_d_hidden": "momentum_d_hidden",
             "attentional_bias": "attentional_bias",
             "retention": "retention",
+            "extend_k": "extend_k",
+            "data_seek": "data_seek",
         }
         for cli_name, cfg_name in mapping.items():
             val = getattr(args, cli_name, None)
@@ -374,6 +389,8 @@ class BuildConfig:
         # store_true with default=None: only override if explicitly passed
         if getattr(args, "self_generated_values", None) is not None:
             self.self_generated_values = args.self_generated_values
+        if getattr(args, "push_up", None) is not None:
+            self.push_up = args.push_up
         self._validate()
         self.validate_gpu_tier()  # V-05: checked after --cpu/--gpu are applied
 

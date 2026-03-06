@@ -1,0 +1,37 @@
+{
+  "description": "Push-up Phase 1: Titans LMM d=512 k=1 MAG+EMA seed run. Train L0 for 10K steps, then promote to L1 in phase 2.",
+  "model": {
+    "d_model": 512,
+    "num_heads": 8,
+    "seq_len": 512,
+    "window_size": 512,
+    "vocab_size": 32000,
+    "k": 1,
+    "chunk_sizes": [1],
+    "memory_rule": "titans",
+    "composition": "mag",
+    "momentum_kind": "ema",
+    "momentum_d_hidden": 0,
+    "m_norm_max": [100.0]
+  },
+  "build": {
+    "lr": 0.0006,
+    "steps": 10000,
+    "optimizer": "adamw_gpu",
+    "warmup_steps": 500,
+    "weight_decay": 0.1,
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "max_grad_norm": 1.0,
+    "save_path": "checkpoints/push_up_phase1_k1.safetensors",
+    "save_every": 2500,
+    "log_every": 10,
+    "eval_every": 500,
+    "eval_max_chunks": 50,
+    "log_file": "runs/push_up_phase1_k1.jsonl"
+  },
+  "data": {
+    "path": "data/dolmino_100b",
+    "format": "sharegpt"
+  }
+}
