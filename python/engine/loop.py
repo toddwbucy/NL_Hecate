@@ -181,7 +181,11 @@ def run_build(bcfg: BuildConfig):
             if target_k != loaded_k + 1:
                 print(f"  ERROR: extend_k={target_k} must be loaded_k+1={loaded_k + 1}")
                 return
-            new_chunks = [1, 8, 64, 512][:target_k]
+            chunk_template = [1, 8, 64, 512]
+            if target_k > len(chunk_template):
+                print(f"  ERROR: extend_k={target_k} exceeds max supported k={len(chunk_template)}")
+                return
+            new_chunks = chunk_template[:target_k]
             # Rebuild MAGConfig with the new k (carry all other fields from loaded cfg)
             new_cfg = nl_hecate.MAGConfig(
                 d_model=cfg.d_model, num_heads=cfg.num_heads,
@@ -243,13 +247,17 @@ def run_build(bcfg: BuildConfig):
             if bcfg.batch_size > 1:
                 print("  ERROR: data_seek with batch_size>1 is not supported yet")
                 return
-            active_loader.restore({
-                "position": bcfg.data_seek,
-                "total_tokens": active_loader.total_tokens,
-                "content_hash": 0,  # skip hash validation on manual seek
-                "chunk_id": 0,
-                "seq_len": bcfg.seq_len,
-            })
+            try:
+                active_loader.restore({
+                    "position": bcfg.data_seek,
+                    "total_tokens": active_loader.total_tokens,
+                    "content_hash": 0,  # skip hash validation on manual seek
+                    "chunk_id": 0,
+                    "seq_len": bcfg.seq_len,
+                })
+            except (CursorMismatchError, CursorOutOfBounds) as e:
+                print(f"  ERROR: data_seek failed — {e}")
+                return
             print(f"  Data cursor overridden → position {bcfg.data_seek:,}")
 
         bcfg.d_model = cfg.d_model
