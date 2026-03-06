@@ -326,8 +326,12 @@ extern "C" void hebbian_forward_f32_cuda(
         fprintf(stderr, "hebbian_forward_f32_cuda: d=%d out of range (must be 1..=6826).\n", d);
         exit(1);
     }
+    if (seq_len < 0) {
+        fprintf(stderr, "hebbian_forward_f32_cuda: seq_len=%d must be >= 0.\n", seq_len);
+        exit(1);
+    }
     long long dd64 = (long long)d * d;
-    if (dd64 > INT_MAX || (long long)(seq_len + 1) * dd64 > INT_MAX) {
+    if (dd64 > INT_MAX || (long long)(seq_len + 1) * dd64 > INT_MAX || (long long)seq_len * d > INT_MAX) {
         fprintf(stderr, "hebbian_forward_f32_cuda: d=%d seq_len=%d would overflow int32 indices.\n", d, seq_len);
         exit(1);
     }
