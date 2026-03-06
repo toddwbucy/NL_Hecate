@@ -932,6 +932,17 @@ fn extend_params_push_up(old: &MAGParams, new_cfg: &MAGConfig, seed: u64) -> MAG
     }
 }
 
+/// Stack-up level extension: keep existing levels in place, add fresh level at top.
+///
+/// `new_cfg.k` must equal `old.k + 1`. SWA weights and persistent tokens
+/// are preserved exactly. Old level[i] → new level[i], fresh level[k] at top.
+#[pyfunction]
+fn extend_params_stack_up(old: &MAGParams, new_cfg: &MAGConfig, seed: u64) -> MAGParams {
+    MAGParams {
+        inner: old.inner.extend_stack_up(&new_cfg.inner, seed),
+    }
+}
+
 fn validate_mag_seq_lens(cfg: &MAGConfig, input_ids: &[usize], target_ids: &[usize]) -> PyResult<()> {
     let expected = cfg.inner.swa.seq_len;
     let vocab = cfg.inner.swa.vocab_size;
@@ -2278,6 +2289,7 @@ fn nl_hecate(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(mag_create_config, m)?)?;
     m.add_function(wrap_pyfunction!(mag_init_params, m)?)?;
     m.add_function(wrap_pyfunction!(extend_params_push_up, m)?)?;
+    m.add_function(wrap_pyfunction!(extend_params_stack_up, m)?)?;
     m.add_function(wrap_pyfunction!(mag_forward, m)?)?;
     m.add_function(wrap_pyfunction!(mag_backward, m)?)?;
     m.add_function(wrap_pyfunction!(mag_compute_gradients, m)?)?;

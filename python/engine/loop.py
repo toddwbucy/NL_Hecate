@@ -234,9 +234,13 @@ def run_build(bcfg: BuildConfig):
                 params = nl_hecate.extend_params_push_up(params, new_cfg, bcfg.seed)
                 print(f"  Push-up: k={loaded_k} → k={target_k}, "
                       f"chunks={new_chunks}")
+            elif bcfg.stack_up:
+                params = nl_hecate.extend_params_stack_up(params, new_cfg, bcfg.seed)
+                print(f"  Stack-up: k={loaded_k} → k={target_k}, "
+                      f"chunks={new_chunks}")
             else:
-                print("  ERROR: extend_k set but push_up=false — "
-                      "only push-up stacking is implemented")
+                print("  ERROR: extend_k set but neither push_up nor stack_up — "
+                      "set one of them to true")
                 return
             cfg = new_cfg
             resume_step = 0

@@ -131,9 +131,10 @@ class BuildConfig:
     gate_warmup_l2_threshold: float = 0.005
     gate_warmup_l3_threshold: float = 0.001
 
-    # Push-up level stacking (specs/infrastructure/07_push_up_level_stacking.md)
+    # Level stacking (specs/infrastructure/07_push_up_level_stacking.md)
     extend_k: int | None = None       # Target k (must be loaded_k + 1)
     push_up: bool = False             # Shift existing levels to slower frequencies
+    stack_up: bool = False            # Keep existing levels, add fresh level at top
     data_seek: int | None = None      # Override data cursor to this token position
 
     # Runtime
@@ -283,14 +284,20 @@ class BuildConfig:
         if self.saturation_window < 1:
             raise ValueError(
                 f"saturation_window must be >= 1, got {self.saturation_window}")
-        # Push-up level stacking validation
+        # Level stacking validation
         if self.extend_k is not None:
             if self.load is None:
                 raise ValueError("extend_k requires 'load' to be set (checkpoint to extend from)")
             if self.extend_k < 2:
                 raise ValueError(f"extend_k must be >= 2, got {self.extend_k}")
+            if not self.push_up and not self.stack_up:
+                raise ValueError("extend_k requires either push_up=true or stack_up=true")
+            if self.push_up and self.stack_up:
+                raise ValueError("push_up and stack_up are mutually exclusive")
         if self.push_up and self.extend_k is None:
             raise ValueError("push_up=true requires extend_k to be set")
+        if self.stack_up and self.extend_k is None:
+            raise ValueError("stack_up=true requires extend_k to be set")
         if self.data_seek is not None and self.data_seek < 0:
             raise ValueError(f"data_seek must be >= 0, got {self.data_seek}")
 

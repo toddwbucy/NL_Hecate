@@ -2206,6 +2206,62 @@ impl MAGParams {
         new_params
     }
 
+    /// Stack-up level extension: keep existing levels in place, add fresh level at top.
+    ///
+    /// Existing level[i] stays at level[i] (same firing frequency).
+    /// New level[k] is added at the slowest frequency with fresh Xavier init.
+    /// SWA weights and persistent tokens are preserved exactly (bitwise).
+    pub fn extend_stack_up(&self, new_cfg: &MAGConfig, seed: u64) -> MAGParams {
+        let old_k = self.levels.len();
+        assert_eq!(
+            new_cfg.k,
+            old_k + 1,
+            "extend_stack_up requires new_cfg.k ({}) == old_k + 1 ({})",
+            new_cfg.k,
+            old_k + 1,
+        );
+        let old_d = new_cfg.swa.d_model;
+        assert_eq!(
+            self.swa.w_q.len(), old_d * old_d,
+            "d_model mismatch: existing SWA w_q size {} vs expected d_model={}",
+            self.swa.w_q.len(), old_d,
+        );
+        assert_eq!(
+            self.swa.w_embed.len(), new_cfg.swa.vocab_size * old_d,
+            "vocab_size mismatch: existing w_embed size {} vs expected {}",
+            self.swa.w_embed.len(), new_cfg.swa.vocab_size * old_d,
+        );
+        assert_eq!(
+            self.persistent_tokens.len(), new_cfg.n_persistent * old_d,
+            "n_persistent mismatch: existing persistent_tokens len {} vs expected {}",
+            self.persistent_tokens.len(), new_cfg.n_persistent * old_d,
+        );
+
+        // Init fresh params with new_cfg — gives us correctly initialized levels
+        let mut new_params = MAGParams::init(new_cfg, seed);
+
+        // Preserve SWA (attention branch) exactly
+        new_params.swa = self.swa.clone();
+
+        // Keep existing levels in place: old level[i] → new level[i]
+        for i in 0..old_k {
+            new_params.levels[i] = self.levels[i].clone();
+        }
+        // new_params.levels[old_k] stays as fresh init from MAGParams::init
+
+        // Keep alpha logits in place: old alpha[i] → new alpha[i]
+        for i in 0..old_k {
+            new_params.alpha_mem[i] = self.alpha_mem[i];
+            new_params.alpha_refl[i] = self.alpha_refl[i];
+        }
+        // new alpha[old_k] already 0.0 from init (uniform 1/k contribution)
+
+        // Preserve persistent tokens (MAC composition, if any)
+        new_params.persistent_tokens = self.persistent_tokens.clone();
+
+        new_params
+    }
+
     /// Create zero-initialized shadow for gradient accumulation.
     pub fn zeros_like(cfg: &MAGConfig) -> Self {
         let d = cfg.swa.d_model;
