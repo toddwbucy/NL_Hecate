@@ -79,7 +79,9 @@ Guard formula: `8 * d * sizeof(float) > 163840` rejects d > 5120 (conservative H
 | Kernel | Layout | Bytes |
 |--------|--------|-------|
 | Forward (Ampere) | 8*d floats | 64KB |
-| Forward (ckpt) | 2*d floats | 16KB |
+| Forward (ckpt, delta/titans) | 2*d floats | 16KB |
+| Forward (ckpt, dgd) | 8*d floats | 64KB |
+| Forward (ckpt, hebbian) | 0 | 0 |
 | Backward (main) | (3*d + block + 8*d) floats | ~91KB |
 | Backward (segment) | (3*d + block) floats | ~28KB |
 

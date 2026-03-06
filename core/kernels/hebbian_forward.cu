@@ -270,8 +270,8 @@ extern "C" void hebbian_forward_ckpt_f32_cuda(
     float* m_states, float* y,
     int seq_len, int d, int checkpoint_interval)
 {
-    if (d <= 0) {
-        fprintf(stderr, "hebbian_forward_ckpt_f32_cuda: d=%d must be > 0.\n", d);
+    if (d <= 0 || d > 46340) {
+        fprintf(stderr, "hebbian_forward_ckpt_f32_cuda: d=%d out of range (must be 1..=46340).\n", d);
         exit(1);
     }
     if (checkpoint_interval <= 0) {
