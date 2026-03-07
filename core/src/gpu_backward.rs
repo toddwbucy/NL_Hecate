@@ -33,6 +33,9 @@ pub struct GpuMAGGrads {
     pub d_w_unembed: GpuBuf<f32>,
     // Per-level memory gradients
     pub levels: Vec<GpuLevelGrads>,
+    /// Per-level L2 norm of d_y_combined (output gradient entering each level's
+    /// backward). Length k. 0.0 for inactive levels. Populated by gpu_cms_backward().
+    pub level_output_gnorms: Vec<f32>,
 }
 
 /// Per-level gradient buffers on GPU.
@@ -157,6 +160,7 @@ pub fn gpu_cms_backward(
             let inter = if cfg.memory_rule == MemoryRuleKind::SwiGluMlp { cfg.intermediate_size } else { 0 };
             (0..cfg.k).map(|_| GpuLevelGrads::zeros_mlp(d, inter)).collect()
         },
+        level_output_gnorms: vec![0.0f32; cfg.k],
     };
 
     // ── Stage 7: Cross-entropy backward ──────────────────────────────
@@ -229,6 +233,29 @@ pub fn gpu_cms_backward(
             crate::cuda_ffi::saxpy_cuda(
                 scale - 1.0, d_y_combined.as_ptr(), d_y_combined.ptr(), bsd as i32,
             );
+        }
+    }
+
+    // ── Capture d_y_combined L2 norm for GPU tape summary ──────────
+    {
+        let mut scratch = GpuBuf::zeros(256);
+        let mut num_blocks: i32 = 0;
+        let err = unsafe {
+            crate::cuda_ffi::grad_norm_sq_cuda(
+                d_y_combined.as_ptr(), scratch.ptr(), bsd as i32, &mut num_blocks,
+            )
+        };
+        assert_eq!(err, 0, "grad_norm_sq_cuda for d_y_combined failed");
+        crate::dispatch::cuda_sync();
+        let nb = num_blocks as usize;
+        let mut host = vec![0.0f32; nb];
+        scratch.slice(0, nb).copy_to_host(&mut host);
+        let sq_sum: f64 = host.iter().map(|x| *x as f64).sum();
+        let d_y_norm = sq_sum.sqrt() as f32;
+        for level in 0..cfg.k {
+            if cache.pulse.active_levels[level] {
+                grads.level_output_gnorms[level] = d_y_norm;
+            }
         }
     }
 

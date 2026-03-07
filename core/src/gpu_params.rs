@@ -350,6 +350,27 @@ impl GpuContextState {
         }
     }
 
+    /// Upload host M matrices into existing GPU buffers (in-place).
+    /// Broadcasts slot-0 to all batch slots. Preserves scratch/cuda_graph state.
+    /// Used by gpu_tape_forward_summary to restore context after diagnostic.
+    pub fn upload_memory(&mut self, host: &crate::conductor::ContextState) {
+        let dd = self.d * self.d;
+        let bytes = dd * 4;
+        for (i, m) in host.memory.iter().enumerate() {
+            let slot0 = GpuBuf::<f32>::from_host(m);
+            for b in 0..self.batch_size {
+                unsafe {
+                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        (self.memory[i].ptr() as *mut u8).add(b * bytes) as *mut std::ffi::c_void,
+                        slot0.as_ptr() as *const std::ffi::c_void,
+                        bytes,
+                    );
+                    assert_eq!(rc, 0, "upload_memory D2D copy failed for level {i} slot {b}");
+                }
+            }
+        }
+    }
+
     /// Upload from host ContextState and broadcast to all batch_size slots.
     /// Used for checkpoint restore: host M is written to every slot so all
     /// batch elements start from the same saved context.
