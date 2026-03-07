@@ -185,9 +185,9 @@ fn gpu_tape_forward_summary(
         &pulse.inner, &mut self.context,
     );
 
-    // GPU backward (produces grads with level_output_gnorms)
+    // GPU backward (collect_output_gnorms=true for diagnostic)
     let grads = nl_hecate_core::gpu_backward::gpu_cms_backward(
-        &self.params, &self.cfg, &cache,
+        &self.params, &self.cfg, &cache, true,
     );
 
     // Restore context (diagnostic must not modify state)

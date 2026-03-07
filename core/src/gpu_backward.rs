@@ -239,7 +239,8 @@ pub fn gpu_cms_backward(
 
     // ── Capture d_y_combined L2 norm for GPU tape summary (opt-in) ──
     if collect_output_gnorms {
-        let mut scratch = GpuBuf::zeros(256);
+        let max_blocks = (bsd + 255) / 256;
+        let mut scratch = GpuBuf::zeros(max_blocks);
         let mut num_blocks: i32 = 0;
         let err = unsafe {
             crate::cuda_ffi::grad_norm_sq_cuda(
