@@ -969,9 +969,14 @@ def run_build(bcfg: BuildConfig):
                 # The Rust binding rejects target_ids >= vocab_size; masked batches are
                 # normal (all-user-turn chunks) and should not generate warning noise.
                 try:
-                    tape_sum = gpu_model.tape_forward_summary(
-                        input_ids, target_ids, pulse
-                    )
+                    if hasattr(gpu_model, "gpu_tape_forward_summary"):
+                        tape_sum = gpu_model.gpu_tape_forward_summary(
+                            input_ids, target_ids, pulse
+                        )
+                    else:
+                        tape_sum = gpu_model.tape_forward_summary(
+                            input_ids, target_ids, pulse
+                        )
                 except (ValueError, KeyError, TypeError, OSError) as exc:
                     print(f"  [tape] WARNING: tape_forward_summary failed at step {step}: {exc}")
                 else:

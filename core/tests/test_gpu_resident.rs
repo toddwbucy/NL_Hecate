@@ -122,7 +122,7 @@ fn test_gpu_multistep_loss_decrease() {
     let mut losses = Vec::new();
     for _step in 0..5 {
         let (loss, cache) = gpu_cms_forward(&gpu_params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx);
-        let grads = nl_hecate_core::gpu_backward::gpu_cms_backward(&gpu_params, &cfg, &cache);
+        let grads = nl_hecate_core::gpu_backward::gpu_cms_backward(&gpu_params, &cfg, &cache, false);
         nl_hecate_core::gpu_backward::gpu_weight_update(&mut gpu_params, &grads, 0.01);
         losses.push(loss);
     }

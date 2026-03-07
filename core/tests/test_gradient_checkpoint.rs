@@ -73,7 +73,7 @@ fn run_fwd_bwd(cfg: &MAGConfig) -> (f32, nl_hecate_core::model::MAGParams) {
     let (input_ids, target_ids) = make_test_data(cfg.swa.seq_len, cfg.swa.vocab_size);
 
     let (loss, cache) = gpu_cms_forward(&gpu_params, cfg, &input_ids, &target_ids, &pulse, &mut context);
-    let grads = gpu_cms_backward(&gpu_params, cfg, &cache);
+    let grads = gpu_cms_backward(&gpu_params, cfg, &cache, false);
     let grads_host = grads.to_host(cfg);
 
     (loss, grads_host)

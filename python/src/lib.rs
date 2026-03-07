@@ -1736,7 +1736,7 @@ impl GpuModel {
         );
 
         let grads = nl_hecate_core::gpu_backward::gpu_cms_backward(
-            &self.params, &self.cfg, &cache,
+            &self.params, &self.cfg, &cache, false,
         );
 
         nl_hecate_core::gpu_backward::gpu_weight_update(
@@ -1788,7 +1788,7 @@ impl GpuModel {
             &pulse.inner, &mut self.context,
         );
         let grads = nl_hecate_core::gpu_backward::gpu_cms_backward(
-            &self.params, &self.cfg, &cache,
+            &self.params, &self.cfg, &cache, false,
         );
         // Download gradients to host as MAGParams
         let host_grads = grads.to_host(&self.cfg);
@@ -1861,7 +1861,7 @@ impl GpuModel {
 
         // Backward
         let mut grads = nl_hecate_core::gpu_backward::gpu_cms_backward(
-            &self.params, &self.cfg, &cache,
+            &self.params, &self.cfg, &cache, false,
         );
 
         // Lazy-init AdamW state
@@ -1945,7 +1945,7 @@ impl GpuModel {
 
         // Backward
         let mut grads = nl_hecate_core::gpu_backward::gpu_cms_backward(
-            &self.params, &self.cfg, &cache,
+            &self.params, &self.cfg, &cache, false,
         );
 
         // Lazy-init AdamW state
@@ -2206,6 +2206,101 @@ impl GpuModel {
             ldict.set_item("block_count", lvl.block_count)?;
             ldict.set_item("output_grad_norm", lvl.output_grad_norm)?;
             ldict.set_item("dgd_delta_norm", lvl.dgd_delta_norm)?;
+            levels_list.append(ldict)?;
+        }
+        dict.set_item("levels", levels_list)?;
+
+        Ok(dict.into())
+    }
+
+    /// GPU-resident tape summary — fast path.
+    ///
+    /// Runs one GPU forward+backward (no optimizer step) and captures per-level
+    /// output gradient norms from d_y_combined. Same dict schema as
+    /// tape_forward_summary() but avoids the GPU→CPU param copy and CPU traced
+    /// forward that make the CPU path ~10x slower.
+    ///
+    /// dgd_delta_norm is always 0.0 on this path — use tape_forward_summary()
+    /// for DGD delta inspection.
+    fn gpu_tape_forward_summary(
+        &mut self,
+        input_ids: Vec<usize>,
+        target_ids: Vec<usize>,
+        pulse: &Pulse,
+        py: Python<'_>,
+    ) -> PyResult<PyObject> {
+        let s = self.cfg.swa.seq_len;
+        let v = self.cfg.swa.vocab_size;
+        if s == 0 {
+            return Err(PyValueError::new_err("seq_len must be > 0"));
+        }
+        if input_ids.is_empty() || input_ids.len() % s != 0
+            || target_ids.len() != input_ids.len()
+        {
+            return Err(PyValueError::new_err(format!(
+                "input/target length must be batch_size * seq_len {} (got {})",
+                s, input_ids.len()
+            )));
+        }
+        if let Some(&max_id) = input_ids.iter().max() {
+            if max_id >= v {
+                return Err(PyValueError::new_err(format!(
+                    "input_ids contains {} >= vocab_size {}", max_id, v
+                )));
+            }
+        }
+        if let Some(&max_id) = target_ids.iter().max() {
+            if max_id >= v {
+                return Err(PyValueError::new_err(format!(
+                    "target_ids contains {} >= vocab_size {}", max_id, v
+                )));
+            }
+        }
+
+        // Batched context save/restore only handles slot 0 — reject batch_size > 1
+        if self.context.batch_size > 1 {
+            return Err(PyValueError::new_err(
+                "gpu_tape_forward_summary currently requires batch_size == 1"
+            ));
+        }
+
+        // Save context to host (lightweight: k * d*d * 4 bytes)
+        let saved_ctx = self.context.to_host(self.cfg.k);
+
+        // GPU forward (modifies context M states)
+        let (loss, cache) = nl_hecate_core::gpu_forward::gpu_cms_forward(
+            &self.params, &self.cfg, &input_ids, &target_ids,
+            &pulse.inner, &mut self.context,
+        );
+
+        // GPU backward (populates level_output_gnorms)
+        let grads = nl_hecate_core::gpu_backward::gpu_cms_backward(
+            &self.params, &self.cfg, &cache, true,
+        );
+
+        // Restore context (diagnostic must not modify state)
+        self.context.upload_memory(&saved_ctx);
+
+        // Build same dict schema as tape_forward_summary
+        let rule_name = format!("{:?}", self.cfg.memory_rule);
+        let dict = PyDict::new(py);
+        dict.set_item("loss", loss)?;
+
+        let active_count: usize = (0..self.cfg.k)
+            .filter(|&l| pulse.inner.active_levels[l])
+            .count();
+        dict.set_item("total_blocks", active_count)?;
+
+        let levels_list = pyo3::types::PyList::empty(py);
+        for level in 0..self.cfg.k {
+            let ldict = PyDict::new(py);
+            ldict.set_item("level", level)?;
+            ldict.set_item("opaque_key", &rule_name)?;
+            ldict.set_item("block_count",
+                if pulse.inner.active_levels[level] { 1usize } else { 0usize })?;
+            ldict.set_item("output_grad_norm",
+                grads.level_output_gnorms[level])?;
+            ldict.set_item("dgd_delta_norm", 0.0f32)?;
             levels_list.append(ldict)?;
         }
         dict.set_item("levels", levels_list)?;
