@@ -1736,7 +1736,7 @@ impl GpuModel {
         );
 
         let grads = nl_hecate_core::gpu_backward::gpu_cms_backward(
-            &self.params, &self.cfg, &cache,
+            &self.params, &self.cfg, &cache, false,
         );
 
         nl_hecate_core::gpu_backward::gpu_weight_update(
@@ -1788,7 +1788,7 @@ impl GpuModel {
             &pulse.inner, &mut self.context,
         );
         let grads = nl_hecate_core::gpu_backward::gpu_cms_backward(
-            &self.params, &self.cfg, &cache,
+            &self.params, &self.cfg, &cache, false,
         );
         // Download gradients to host as MAGParams
         let host_grads = grads.to_host(&self.cfg);
@@ -1861,7 +1861,7 @@ impl GpuModel {
 
         // Backward
         let mut grads = nl_hecate_core::gpu_backward::gpu_cms_backward(
-            &self.params, &self.cfg, &cache,
+            &self.params, &self.cfg, &cache, false,
         );
 
         // Lazy-init AdamW state
@@ -1945,7 +1945,7 @@ impl GpuModel {
 
         // Backward
         let mut grads = nl_hecate_core::gpu_backward::gpu_cms_backward(
-            &self.params, &self.cfg, &cache,
+            &self.params, &self.cfg, &cache, false,
         );
 
         // Lazy-init AdamW state
@@ -2257,6 +2257,13 @@ impl GpuModel {
             }
         }
 
+        // Batched context save/restore only handles slot 0 — reject batch_size > 1
+        if self.context.batch_size > 1 {
+            return Err(PyValueError::new_err(
+                "gpu_tape_forward_summary currently requires batch_size == 1"
+            ));
+        }
+
         // Save context to host (lightweight: k * d*d * 4 bytes)
         let saved_ctx = self.context.to_host(self.cfg.k);
 
@@ -2268,7 +2275,7 @@ impl GpuModel {
 
         // GPU backward (populates level_output_gnorms)
         let grads = nl_hecate_core::gpu_backward::gpu_cms_backward(
-            &self.params, &self.cfg, &cache,
+            &self.params, &self.cfg, &cache, true,
         );
 
         // Restore context (diagnostic must not modify state)

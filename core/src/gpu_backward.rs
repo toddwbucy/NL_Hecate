@@ -134,6 +134,7 @@ pub fn gpu_cms_backward(
     params: &GpuMAGParams,
     cfg: &MAGConfig,
     cache: &GpuCMSCache,
+    collect_output_gnorms: bool,
     // Note: error_buffers not supported in GPU path — frozen levels
     // only get q_mem projection gradient which is accumulated in d_embedded.
 ) -> GpuMAGGrads {
@@ -236,8 +237,8 @@ pub fn gpu_cms_backward(
         }
     }
 
-    // ── Capture d_y_combined L2 norm for GPU tape summary ──────────
-    {
+    // ── Capture d_y_combined L2 norm for GPU tape summary (opt-in) ──
+    if collect_output_gnorms {
         let mut scratch = GpuBuf::zeros(256);
         let mut num_blocks: i32 = 0;
         let err = unsafe {

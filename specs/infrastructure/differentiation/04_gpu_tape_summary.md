@@ -24,7 +24,7 @@ CONTRACT
                   tape_forward_summary() (spec 03):
                   {
                     "loss": float,
-                    "total_blocks": int,    # always k (one per level)
+                    "total_blocks": int,    # number of active levels this step
                     "levels": [
                       {
                         "level": int,
@@ -77,7 +77,7 @@ CONTRACT
 
 The current `tape_forward_summary()` (spec 03) does this:
 
-```
+```text
 GPU params ──copy──▶ CPU params ──traced_forward──▶ CPU tape ──backward──▶ query
    (PCIe)              (slow)                        (slow)               (fast)
 ```
