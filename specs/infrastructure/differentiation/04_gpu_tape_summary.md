@@ -125,7 +125,8 @@ let mut level_output_gnorms = vec![0.0f32; cfg.k];
 // Compute L2 norm of d_y_combined on GPU using existing kernel
 let d_y_norm = {
     let mut num_blocks: i32 = 0;
-    let mut scratch = GpuBuf::zeros(256); // max blocks
+    let max_blocks = (bsd + 255) / 256;
+    let mut scratch = GpuBuf::zeros(max_blocks);
     let err = unsafe {
         crate::cuda_ffi::grad_norm_sq_cuda(
             d_y_combined.as_ptr(), scratch.ptr(), bsd as i32, &mut num_blocks,
