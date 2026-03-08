@@ -323,6 +323,9 @@ class BuildConfig:
             if self.promotion_cooldown < 0:
                 raise ValueError(
                     f"promotion_cooldown must be >= 0, got {self.promotion_cooldown}")
+            if not (0.0 <= self.promotion_rewind_pct <= 1.0):
+                raise ValueError(
+                    f"promotion_rewind_pct must be in [0.0, 1.0], got {self.promotion_rewind_pct}")
 
     @property
     def head_dim(self) -> int:
