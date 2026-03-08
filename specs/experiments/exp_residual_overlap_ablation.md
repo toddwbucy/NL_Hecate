@@ -13,6 +13,7 @@ CONTRACT
              validate gradient flow fix before scaling
   Position : Experiment — prerequisite to multi-block stacking and 170M scaling
   Source   : Residual stream spec (specs/infrastructure/13_residual_stream.md)
+             Rewind math (lines 39-42) is original experimental design, not paper-derived.
 ```
 
 ## Hypothesis

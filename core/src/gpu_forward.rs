@@ -264,7 +264,8 @@ pub fn gpu_cms_forward(
         let is_tnt_mode = cfg.parallel.as_ref()
             .map(|p| p.strategy == ParallelStrategy::TNTHierarchical)
             .unwrap_or(false);
-        let can_capture = matches!(cfg.memory_rule, MemoryRuleKind::DeltaRule | MemoryRuleKind::TitansLMM)
+        let can_capture = !cfg.residual
+            && matches!(cfg.memory_rule, MemoryRuleKind::DeltaRule | MemoryRuleKind::TitansLMM)
             && cfg.checkpoint_interval.is_none()
             && !is_tnt_mode;
 

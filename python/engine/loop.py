@@ -135,6 +135,7 @@ def run_build(bcfg: BuildConfig):
     # ── Resume from checkpoint or init fresh ──────────────────────────
     resume_step = 0
     build_state = None
+    _restored_level_start_cursor: int | None = None
     if bcfg.load:
         print(f"Loading checkpoint: {bcfg.load}")
         if use_bpe:
@@ -163,6 +164,9 @@ def run_build(bcfg: BuildConfig):
                     except (CursorMismatchError, CursorOutOfBounds) as e:
                         print(f"  ERROR: cursor mismatch — {e}")
                         return
+                # Restore level_start_cursor if persisted (for correct rewind after resume).
+                if isinstance(cursor, dict) and "level_start_cursor" in cursor:
+                    _restored_level_start_cursor = cursor["level_start_cursor"]
                 # else: multi-slot sidecar — handled in the bpe_loaders block below
             else:
                 print("  Loaded checkpoint as warm-start (no cursor sidecar — data position reset to 0)")
@@ -570,8 +574,10 @@ def run_build(bcfg: BuildConfig):
     _sat_below_count: list[int] = [0] * bcfg.k
     _sat_announced: list[bool] = [False] * bcfg.k  # fire once per level
     _last_promotion_step: int = resume_step  # auto-promote cooldown anchor
-    _level_start_cursor: int = (active_loader.cursor()["position"]
-                                if active_loader is not None else 0)
+    _level_start_cursor: int = (
+        _restored_level_start_cursor if _restored_level_start_cursor is not None
+        else (active_loader.cursor()["position"] if active_loader is not None else 0)
+    )
     # Ratio-stability promotion: track rolling ratio history for stdev computation.
     # Promotion fires when stdev(ratio) < threshold for `streak` consecutive samples.
     _sat_ratio_history: list[deque] = [
@@ -1177,9 +1183,12 @@ def run_build(bcfg: BuildConfig):
             sidecar = Path(str(ckpt_path) + ".cursor.json")
             if bpe_loaders:
                 sidecar.write_text(json.dumps(
-                    {"slots": [loader.cursor() for loader in bpe_loaders]}, indent=2))
+                    {"slots": [loader.cursor() for loader in bpe_loaders],
+                     "level_start_cursor": _level_start_cursor}, indent=2))
             elif active_loader is not None:
-                sidecar.write_text(json.dumps(active_loader.cursor(), indent=2))
+                cursor_data = active_loader.cursor()
+                cursor_data["level_start_cursor"] = _level_start_cursor
+                sidecar.write_text(json.dumps(cursor_data, indent=2))
             print(f"  [checkpoint saved: {ckpt_path}]")
 
             # Component 3: per-level parameter drift (||M_t||_F vs ||M_0||_F)
@@ -1308,8 +1317,10 @@ def run_build(bcfg: BuildConfig):
             nl_hecate.save_checkpoint_with_context(
                 promo_ckpt, params, cfg, conductor, promo_ctx)
             if active_loader is not None:
+                promo_cursor = active_loader.cursor()
+                promo_cursor["level_start_cursor"] = _level_start_cursor
                 Path(str(promo_ckpt) + ".cursor.json").write_text(
-                    json.dumps(active_loader.cursor(), indent=2))
+                    json.dumps(promo_cursor, indent=2))
             print(f"  Checkpoint: {promo_ckpt}")
 
             if jsonl:
@@ -1398,6 +1409,11 @@ def run_build(bcfg: BuildConfig):
                 cursor = active_loader.cursor()
                 cur_pos = cursor["position"]
                 if bcfg.promotion_rewind_pct > 0.0:
+                    if bcfg.batch_size > 1:
+                        raise RuntimeError(
+                            "promotion_rewind_pct with batch_size > 1 is not implemented; "
+                            "rewind must be applied to each slot loader"
+                        )
                     # Rewind by a fraction of tokens consumed during THIS level's phase only.
                     tokens_this_level = cur_pos - _level_start_cursor
                     rewind_tokens = int(tokens_this_level * bcfg.promotion_rewind_pct)
@@ -1449,9 +1465,12 @@ def run_build(bcfg: BuildConfig):
     sidecar = Path(str(final_path) + ".cursor.json")
     if bpe_loaders:
         sidecar.write_text(json.dumps(
-            {"slots": [loader.cursor() for loader in bpe_loaders]}, indent=2))
+            {"slots": [loader.cursor() for loader in bpe_loaders],
+             "level_start_cursor": _level_start_cursor}, indent=2))
     elif active_loader is not None:
-        sidecar.write_text(json.dumps(active_loader.cursor(), indent=2))
+        final_cursor = active_loader.cursor()
+        final_cursor["level_start_cursor"] = _level_start_cursor
+        sidecar.write_text(json.dumps(final_cursor, indent=2))
 
     # ── Summary ───────────────────────────────────────────────────────
     print(f"\n{'=' * 60}")
