@@ -24,6 +24,10 @@ pub struct GpuSWAParams {
     pub w_v: GpuBuf<f32>,       // [d, d]
     pub w_o: GpuBuf<f32>,       // [d, d]
     pub w_unembed: GpuBuf<f32>, // [d, vocab]
+    pub ln_attn_gamma: GpuBuf<f32>,  // [d]
+    pub ln_attn_beta: GpuBuf<f32>,   // [d]
+    pub ln_mem_gamma: GpuBuf<f32>,   // [d]
+    pub ln_mem_beta: GpuBuf<f32>,    // [d]
 }
 
 #[cfg(feature = "cuda")]
@@ -36,6 +40,10 @@ impl GpuSWAParams {
             w_v: GpuBuf::from_host(&host.w_v),
             w_o: GpuBuf::from_host(&host.w_o),
             w_unembed: GpuBuf::from_host(&host.w_unembed),
+            ln_attn_gamma: GpuBuf::from_host(&host.ln_attn_gamma),
+            ln_attn_beta: GpuBuf::from_host(&host.ln_attn_beta),
+            ln_mem_gamma: GpuBuf::from_host(&host.ln_mem_gamma),
+            ln_mem_beta: GpuBuf::from_host(&host.ln_mem_beta),
         }
     }
 
@@ -47,15 +55,9 @@ impl GpuSWAParams {
             w_v: vec![0.0f32; cfg_d * cfg_d],
             w_o: vec![0.0f32; cfg_d * cfg_d],
             w_unembed: vec![0.0f32; cfg_d * cfg_v],
-            // LN params are not GPU-resident yet (CPU-path only for now).
-            // Initialize to identity (gamma=1, beta=0) so to_host produces
-            // valid params. This is intentional: GPU forward doesn't support
-            // residual=true yet, so these values are never used in the GPU path.
-            // When GPU residual support is added, these must round-trip actual
-            // LN weights from/to GPU buffers.
-            ln_attn_gamma: vec![1.0f32; cfg_d],
+            ln_attn_gamma: vec![0.0f32; cfg_d],
             ln_attn_beta: vec![0.0f32; cfg_d],
-            ln_mem_gamma: vec![1.0f32; cfg_d],
+            ln_mem_gamma: vec![0.0f32; cfg_d],
             ln_mem_beta: vec![0.0f32; cfg_d],
         };
         self.w_embed.copy_to_host(&mut p.w_embed);
@@ -64,6 +66,10 @@ impl GpuSWAParams {
         self.w_v.copy_to_host(&mut p.w_v);
         self.w_o.copy_to_host(&mut p.w_o);
         self.w_unembed.copy_to_host(&mut p.w_unembed);
+        self.ln_attn_gamma.copy_to_host(&mut p.ln_attn_gamma);
+        self.ln_attn_beta.copy_to_host(&mut p.ln_attn_beta);
+        self.ln_mem_gamma.copy_to_host(&mut p.ln_mem_gamma);
+        self.ln_mem_beta.copy_to_host(&mut p.ln_mem_beta);
         p
     }
 }

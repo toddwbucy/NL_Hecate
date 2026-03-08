@@ -144,6 +144,8 @@ class BuildConfig:
     promotion_stability_window: int = 50   # Ratio samples to compute rolling stdev over
     promotion_stability_streak: int = 50   # Consecutive low-stdev samples to confirm plateau
     promotion_stability_threshold: float = 0.025  # Stdev below this = ratio has stabilized
+    promotion_rewind_pct: float = 0.0  # Fraction of THIS level's steps to rewind data cursor on push-up
+    #                                  # 0.0 = no rewind (cursor continues), 0.25 = 25% rewind, 1.0 = full rewind
 
     # Residual stream + pre-LayerNorm (specs/infrastructure/13_residual_stream.md)
     residual: bool = False  # True = additive residual, no sigmoid gating
@@ -367,7 +369,7 @@ class BuildConfig:
             pm = raw["promotion"]
             for pk in ("auto_promote", "target_k", "promotion_cooldown",
                        "promotion_stability_window", "promotion_stability_streak",
-                       "promotion_stability_threshold"):
+                       "promotion_stability_threshold", "promotion_rewind_pct"):
                 if pk in pm:
                     flat[pk] = pm[pk]
         for key in list(raw.keys()):

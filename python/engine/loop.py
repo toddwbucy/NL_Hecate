@@ -415,11 +415,8 @@ def run_build(bcfg: BuildConfig):
         raise RuntimeError(
             "optimizer=adamw_gpu requires GPU and a CUDA-enabled build"
         )
-    if use_gpu and bcfg.residual:
-        raise RuntimeError(
-            "residual=true requires CUDA LayerNorm kernels (not yet implemented). "
-            "Use CPU (--cpu) or set residual=false."
-        )
+    # Note: GPU + residual=true is supported for training (gpu_cms_forward).
+    # Serving paths (prefill/single_token) still assert !residual until adapted.
     if bcfg.load and use_gpu and not use_bpe:
         raise RuntimeError(
             "GPU resume with context restore is not yet implemented for byte-level builds. "
@@ -573,6 +570,8 @@ def run_build(bcfg: BuildConfig):
     _sat_below_count: list[int] = [0] * bcfg.k
     _sat_announced: list[bool] = [False] * bcfg.k  # fire once per level
     _last_promotion_step: int = resume_step  # auto-promote cooldown anchor
+    _level_start_cursor: int = (active_loader.cursor()["position"]
+                                if active_loader is not None else 0)
     # Ratio-stability promotion: track rolling ratio history for stdev computation.
     # Promotion fires when stdev(ratio) < threshold for `streak` consecutive samples.
     _sat_ratio_history: list[deque] = [
@@ -1397,7 +1396,27 @@ def run_build(bcfg: BuildConfig):
 
             if active_loader is not None:
                 cursor = active_loader.cursor()
-                print(f"  Data cursor: {cursor['position']:,} (continues naturally)")
+                cur_pos = cursor["position"]
+                if bcfg.promotion_rewind_pct > 0.0:
+                    # Rewind by a fraction of tokens consumed during THIS level's phase only.
+                    tokens_this_level = cur_pos - _level_start_cursor
+                    rewind_tokens = int(tokens_this_level * bcfg.promotion_rewind_pct)
+                    new_pos = max(0, cur_pos - rewind_tokens)
+                    active_loader.restore({
+                        "position": new_pos,
+                        "total_tokens": active_loader.total_tokens,
+                        "content_hash": 0,
+                        "chunk_id": 0,
+                        "seq_len": bcfg.seq_len,
+                        "dataset_path": str(active_loader.dataset_path),
+                    })
+                    print(f"  Data cursor: {cur_pos:,} → {new_pos:,} "
+                          f"(rewound {bcfg.promotion_rewind_pct:.0%} of {tokens_this_level:,} "
+                          f"tokens from this level)")
+                else:
+                    print(f"  Data cursor: {cur_pos:,} (continues naturally)")
+                _level_start_cursor = (active_loader.cursor()["position"]
+                                       if active_loader is not None else 0)
             print(f"  Promotion complete, continuing at step {step + 1}\n")
 
     t_end = time.perf_counter()
