@@ -260,6 +260,8 @@ def run_build(bcfg: BuildConfig):
                 bcfg.m_norm_max = ext_m_norm
             resume_step = 0
             build_state = None
+            # New phase — persisted level_start_cursor from prior phase is stale.
+            _restored_level_start_cursor = None
 
         # ── Data cursor override (for push-up or manual reposition) ──
         if bcfg.data_seek is not None and active_loader is not None:
@@ -278,6 +280,9 @@ def run_build(bcfg: BuildConfig):
                 print(f"  ERROR: data_seek failed — {e}")
                 return
             print(f"  Data cursor overridden → position {bcfg.data_seek:,}")
+            # Manual seek starts a new phase — stale level_start_cursor would
+            # include pre-seek tokens in rewind calculation.
+            _restored_level_start_cursor = None
 
         bcfg.d_model = cfg.d_model
         bcfg.num_heads = cfg.num_heads
@@ -1316,11 +1321,15 @@ def run_build(bcfg: BuildConfig):
             os.makedirs(os.path.dirname(promo_ckpt) or ".", exist_ok=True)
             nl_hecate.save_checkpoint_with_context(
                 promo_ckpt, params, cfg, conductor, promo_ctx)
-            if active_loader is not None:
+            promo_sidecar = Path(str(promo_ckpt) + ".cursor.json")
+            if bpe_loaders:
+                promo_sidecar.write_text(json.dumps(
+                    {"slots": [loader.cursor() for loader in bpe_loaders],
+                     "level_start_cursor": _level_start_cursor}, indent=2))
+            elif active_loader is not None:
                 promo_cursor = active_loader.cursor()
                 promo_cursor["level_start_cursor"] = _level_start_cursor
-                Path(str(promo_ckpt) + ".cursor.json").write_text(
-                    json.dumps(promo_cursor, indent=2))
+                promo_sidecar.write_text(json.dumps(promo_cursor, indent=2))
             print(f"  Checkpoint: {promo_ckpt}")
 
             if jsonl:

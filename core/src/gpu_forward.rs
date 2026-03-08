@@ -490,11 +490,9 @@ pub fn gpu_cms_forward(
         }
         // Output projection on residual
         crate::dispatch::cublas_matmul_transb_dd(&res_final, &params.swa.w_o, &mut projected, bs * s, d, d, 0.0);
-        // Fill gate with all-ones (identity for backward) and gated_out = attn_out
-        // for cache shape stability. Backward reads gate for sigmoid_backward —
-        // must be ones so gradients pass through correctly.
-        let ones_host = vec![1.0f32; n_tokens * d];
-        gate = GpuBuf::from_host(&ones_host);
+        // Residual backward never reads gate (additive gradient routing bypasses
+        // sigmoid_backward entirely). Gate stays zeros for cache shape stability.
+        // gated_out = attn_out for cache shape stability (also unused by residual backward).
         unsafe {
             crate::cuda_ffi::saxpy_cuda(1.0, attn_out.as_ptr(), gated_out.ptr(), total_i32);
         }
