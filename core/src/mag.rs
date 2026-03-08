@@ -68,13 +68,18 @@ pub struct MAGForwardCache {
     pub logits: Vec<f32>,      // projected @ W_unembed: [seq_len, vocab]
 }
 
-/// MAG forward pass. Returns (loss, cache).
+/// MAG forward pass (k=1 fast-path). Returns (loss, cache).
+///
+/// Does NOT support residual stream mode. Use `cms_forward` for residual=true.
 pub fn mag_forward(
     params: &MAGParams,
     cfg: &MAGConfig,
     input_ids: &[usize],
     target_ids: &[usize],
 ) -> (f32, MAGForwardCache) {
+    assert!(!cfg.residual,
+        "mag_forward: residual=true is not supported in the k=1 fast-path. \
+         Use cms_forward/cms_backward instead.");
     let swa_cfg = &cfg.swa;
     let s = swa_cfg.seq_len;
     let d = swa_cfg.d_model;
@@ -186,7 +191,9 @@ pub fn mag_forward(
     (loss, cache)
 }
 
-/// MAG full backward pass. Returns parameter gradients.
+/// MAG full backward pass (k=1 fast-path). Returns parameter gradients.
+///
+/// Does NOT support residual stream mode. Use `cms_backward` for residual=true.
 pub fn mag_backward(
     params: &MAGParams,
     cfg: &MAGConfig,
@@ -194,6 +201,9 @@ pub fn mag_backward(
     input_ids: &[usize],
     target_ids: &[usize],
 ) -> MAGParams {
+    assert!(!cfg.residual,
+        "mag_backward: residual=true is not supported in the k=1 fast-path. \
+         Use cms_forward/cms_backward instead.");
     let swa_cfg = &cfg.swa;
     let s = swa_cfg.seq_len;
     let d = swa_cfg.d_model;
@@ -689,8 +699,13 @@ pub fn cms_forward(
         for i in 0..(s * d) {
             res_final[i] += y_combined[i];
         }
-        let empty = vec![0.0f32; 0]; // placeholder, not used in backward
-        (empty.clone(), empty, Some(res_final.clone()), res_final)
+        // Fill gate/gated_out with identity values to preserve [s*d] shape invariant.
+        // gate = 1.0 (all-open) and gated_out = attn_out (passthrough) — not used in
+        // residual backward, but keeps the cache shape contract intact for any code
+        // that inspects these fields generically.
+        let gate = vec![1.0f32; s * d];
+        let gated_out = attn_out.clone();
+        (gate, gated_out, Some(res_final.clone()), res_final)
     } else {
         // Legacy path: gate = sigmoid(y_combined), gated_out = attn_out * gate
         let mut gate = vec![0.0f32; s * d];
@@ -1359,6 +1374,10 @@ pub fn cms_backward(
     }
 
     // ── Frequency gate backward (straight-through estimator) ────────
+    // d_freq_embedded: gradient from freq gate w.r.t. embedded (via mean-pool).
+    // In residual mode, this must bypass LN_mem backward (freq gates operate on
+    // raw embedded, not on LN_mem output). Stored here and added to d_embedded later.
+    let mut d_freq_embedded = vec![0.0f32; s * d];
     if let Some(ref fc) = cache.freq_cache {
         // Compute surrogate gradient signal for frequency gates
         let d_gate_values = compute_gate_surrogate(
@@ -1378,12 +1397,24 @@ pub fn cms_backward(
             }
         }
 
-        // d_embedded_mean contributes to d_mem_input via mean-pool backward:
+        // d_embedded_mean contributes via mean-pool backward:
+        // In residual mode: route directly to d_embedded (freq gates use raw embedded,
+        // not LN_mem output), so we store in d_freq_embedded and apply after LN backward.
+        // In legacy mode: route through d_mem_input_total (same as d_embedded).
         let inv_s = 1.0 / s as f32;
-        for t in 0..s {
-            let base = t * d;
-            for j in 0..d {
-                d_mem_input_total[base + j] += d_embedded_mean[j] * inv_s;
+        if cfg.residual {
+            for t in 0..s {
+                let base = t * d;
+                for j in 0..d {
+                    d_freq_embedded[base + j] += d_embedded_mean[j] * inv_s;
+                }
+            }
+        } else {
+            for t in 0..s {
+                let base = t * d;
+                for j in 0..d {
+                    d_mem_input_total[base + j] += d_embedded_mean[j] * inv_s;
+                }
             }
         }
     }
@@ -1510,6 +1541,13 @@ pub fn cms_backward(
         }
         d_emb
     };
+
+    // ── Frequency gate gradient (residual mode): add directly to d_embedded ──
+    // In residual mode, freq gate grads bypass LN_mem (freq gates use raw embedded).
+    // d_freq_embedded is zero when freq schedule is Fixed (no-op addition).
+    for i in 0..(s * d) {
+        d_embedded[i] += d_freq_embedded[i];
+    }
 
     // ── Stage 1: Embedding scatter-add ───────────────────────────────
     for t in 0..s {

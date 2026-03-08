@@ -267,10 +267,15 @@ pub(crate) fn mag_check_weight_gradient(
 }
 
 /// Compute gradients of loss with respect to all CMS parameters.
-/// Delegates to `tape_compute_gradients()` (Wengert tape path).
+/// Delegates to `tape_compute_gradients()` (Wengert tape path) when residual=false.
+///
+/// When `cfg.residual == true`, always uses the hand-written backward path
+/// (`cms_compute_gradients_handwritten`) because `traced_cms_forward` does not
+/// record the residual stream or LayerNorm operations on the tape. Using the
+/// tape path with residual=true would produce incorrect gradients.
 ///
 /// The hand-written backward path is preserved as `cms_compute_gradients_handwritten()`
-/// for use as a test oracle.
+/// for use as a test oracle (and as the primary path when residual=true).
 #[allow(dead_code)]
 pub fn cms_compute_gradients(
     params: &MAGParams,
@@ -281,7 +286,13 @@ pub fn cms_compute_gradients(
     context: &mut ContextState,
     error_buffers: &mut [ErrorBuffer],
 ) -> (f32, MAGParams) {
-    tape_compute_gradients(params, cfg, input_ids, target_ids, pulse, context, error_buffers)
+    if cfg.residual {
+        // Tape path doesn't support residual stream / LayerNorm yet.
+        // Use hand-written backward which has full residual support.
+        cms_compute_gradients_handwritten(params, cfg, input_ids, target_ids, pulse, context, error_buffers)
+    } else {
+        tape_compute_gradients(params, cfg, input_ids, target_ids, pulse, context, error_buffers)
+    }
 }
 
 /// Hand-written backward path (cms_forward + cms_backward).

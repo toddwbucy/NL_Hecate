@@ -217,6 +217,9 @@ pub fn gpu_cms_forward(
     let hd = cfg.swa.head_dim;
     let ws = cfg.swa.window_size;
 
+    assert!(!cfg.residual,
+        "gpu_cms_forward: residual=true is not supported in the GPU path yet. \
+         Use the CPU path (cms_forward + cms_backward) for residual stream models.");
     assert!(s > 0, "seq_len must be > 0");
     // Derive batch_size from input length; default to 1 for single-sequence calls
     assert!(input_ids.len() >= s, "input_ids too short");

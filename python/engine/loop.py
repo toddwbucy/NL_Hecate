@@ -285,6 +285,7 @@ def run_build(bcfg: BuildConfig):
         bcfg.self_generated_values = cfg.self_generated_values
         bcfg.self_ref_chunk_size = cfg.self_ref_chunk_size
         bcfg.momentum_d_hidden = cfg.momentum_d_hidden
+        bcfg.residual = cfg.residual
         # Apply theta clamps from BuildConfig onto loaded cfg (allows
         # adding clamps to an existing checkpoint that didn't have them).
         # MAGConfig is frozen, so rebuild if clamps changed.
