@@ -415,6 +415,11 @@ def run_build(bcfg: BuildConfig):
         raise RuntimeError(
             "optimizer=adamw_gpu requires GPU and a CUDA-enabled build"
         )
+    if use_gpu and bcfg.residual:
+        raise RuntimeError(
+            "residual=true requires CUDA LayerNorm kernels (not yet implemented). "
+            "Use CPU (--cpu) or set residual=false."
+        )
     if bcfg.load and use_gpu and not use_bpe:
         raise RuntimeError(
             "GPU resume with context restore is not yet implemented for byte-level builds. "
