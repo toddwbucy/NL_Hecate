@@ -78,7 +78,8 @@ fn spike_config_a() -> MAGConfig {
         intermediate_size: 0,
         m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
-    }
+                residual: false,
+}
 }
 
 /// Config B: TitansLMM + MAL + k=2 — momentum rule + sequential composition.
@@ -120,7 +121,8 @@ fn spike_config_b() -> MAGConfig {
         intermediate_size: 0,
         m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
-    }
+                residual: false,
+}
 }
 
 /// Config C: HebbianRule + MAG + k=1 — non-gradient rule + single level.
@@ -162,7 +164,8 @@ fn spike_config_c() -> MAGConfig {
         intermediate_size: 0,
         m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
-    }
+                residual: false,
+}
 }
 
 /// Result of a training run, capturing loss trajectory and final state.
@@ -774,7 +777,8 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
         intermediate_size: if rule == MemoryRuleKind::SwiGluMlp { 4 * d_model } else { 0 },
         m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
-    }
+                residual: false,
+}
 }
 
 /// Classify a rule into a family for setting expectations.

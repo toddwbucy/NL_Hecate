@@ -113,7 +113,8 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
         intermediate_size: 0,
         m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
-    }
+                residual: false,
+}
 }
 
 /// Per-level memory size for rule-aware ContextState construction.

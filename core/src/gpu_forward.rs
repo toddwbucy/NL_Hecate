@@ -217,6 +217,9 @@ pub fn gpu_cms_forward(
     let hd = cfg.swa.head_dim;
     let ws = cfg.swa.window_size;
 
+    assert!(!cfg.residual,
+        "gpu_cms_forward: residual=true is not supported in the GPU path yet. \
+         Use the CPU path (cms_forward + cms_backward) for residual stream models.");
     assert!(s > 0, "seq_len must be > 0");
     // Derive batch_size from input length; default to 1 for single-sequence calls
     assert!(input_ids.len() >= s, "input_ids too short");
@@ -1711,6 +1714,7 @@ pub fn gpu_prefill_forward(
     let ws = cfg.swa.window_size;
 
     assert_eq!(d, nh * hd);
+    assert!(!cfg.residual, "gpu_prefill_forward: residual=true requires CUDA LayerNorm kernels (not yet implemented). Use CPU path.");
     assert!(input_ids.len() >= s);
 
     // Upload input_ids
@@ -1921,6 +1925,7 @@ pub fn gpu_single_token_forward(
     let hd = cfg.swa.head_dim;
     let window_size = cfg.swa.window_size;
 
+    assert!(!cfg.residual, "gpu_single_token_forward: residual=true requires CUDA LayerNorm kernels (not yet implemented). Use CPU path.");
     assert!(token_id < v, "token_id {} >= vocab_size {}", token_id, v);
     assert!(kv_cache.len > 0, "KV cache must be populated via prefill first");
     assert!(kv_cache.len < kv_cache.max_len, "KV cache full: {} >= {}", kv_cache.len, kv_cache.max_len);

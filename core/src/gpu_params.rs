@@ -47,6 +47,16 @@ impl GpuSWAParams {
             w_v: vec![0.0f32; cfg_d * cfg_d],
             w_o: vec![0.0f32; cfg_d * cfg_d],
             w_unembed: vec![0.0f32; cfg_d * cfg_v],
+            // LN params are not GPU-resident yet (CPU-path only for now).
+            // Initialize to identity (gamma=1, beta=0) so to_host produces
+            // valid params. This is intentional: GPU forward doesn't support
+            // residual=true yet, so these values are never used in the GPU path.
+            // When GPU residual support is added, these must round-trip actual
+            // LN weights from/to GPU buffers.
+            ln_attn_gamma: vec![1.0f32; cfg_d],
+            ln_attn_beta: vec![0.0f32; cfg_d],
+            ln_mem_gamma: vec![1.0f32; cfg_d],
+            ln_mem_beta: vec![0.0f32; cfg_d],
         };
         self.w_embed.copy_to_host(&mut p.w_embed);
         self.w_q.copy_to_host(&mut p.w_q);

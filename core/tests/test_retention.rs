@@ -66,7 +66,8 @@ fn tiny_config(rule: MemoryRuleKind, retention: RetentionKind) -> MAGConfig {
         intermediate_size: 0,
         m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
-    }
+                residual: false,
+}
 }
 
 fn context_memory_size(cfg: &MAGConfig) -> usize {

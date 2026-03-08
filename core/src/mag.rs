@@ -68,13 +68,18 @@ pub struct MAGForwardCache {
     pub logits: Vec<f32>,      // projected @ W_unembed: [seq_len, vocab]
 }
 
-/// MAG forward pass. Returns (loss, cache).
+/// MAG forward pass (k=1 fast-path). Returns (loss, cache).
+///
+/// Does NOT support residual stream mode. Use `cms_forward` for residual=true.
 pub fn mag_forward(
     params: &MAGParams,
     cfg: &MAGConfig,
     input_ids: &[usize],
     target_ids: &[usize],
 ) -> (f32, MAGForwardCache) {
+    assert!(!cfg.residual,
+        "mag_forward: residual=true is not supported in the k=1 fast-path. \
+         Use cms_forward/cms_backward instead.");
     let swa_cfg = &cfg.swa;
     let s = swa_cfg.seq_len;
     let d = swa_cfg.d_model;
@@ -186,7 +191,9 @@ pub fn mag_forward(
     (loss, cache)
 }
 
-/// MAG full backward pass. Returns parameter gradients.
+/// MAG full backward pass (k=1 fast-path). Returns parameter gradients.
+///
+/// Does NOT support residual stream mode. Use `cms_backward` for residual=true.
 pub fn mag_backward(
     params: &MAGParams,
     cfg: &MAGConfig,
@@ -194,6 +201,9 @@ pub fn mag_backward(
     input_ids: &[usize],
     target_ids: &[usize],
 ) -> MAGParams {
+    assert!(!cfg.residual,
+        "mag_backward: residual=true is not supported in the k=1 fast-path. \
+         Use cms_forward/cms_backward instead.");
     let swa_cfg = &cfg.swa;
     let s = swa_cfg.seq_len;
     let d = swa_cfg.d_model;
@@ -379,6 +389,65 @@ pub fn mag_backward(
     grads
 }
 
+// ── LayerNorm ────────────────────────────────────────────────────────
+
+/// Pre-LayerNorm: x_hat = gamma * (x - mean) / sqrt(var + eps) + beta
+/// Returns (output, mean_cache, rstd_cache) for backward pass.
+pub fn layer_norm(
+    x: &[f32], gamma: &[f32], beta: &[f32],
+    n: usize, d: usize, eps: f32,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    assert_eq!(x.len(), n * d);
+    assert_eq!(gamma.len(), d);
+    assert_eq!(beta.len(), d);
+    let mut out = vec![0.0f32; n * d];
+    let mut mean_cache = vec![0.0f32; n];
+    let mut rstd_cache = vec![0.0f32; n];
+    for i in 0..n {
+        let row = &x[i * d..(i + 1) * d];
+        let mean: f32 = row.iter().sum::<f32>() / d as f32;
+        let var: f32 = row.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / d as f32;
+        let rstd = 1.0 / (var + eps).sqrt();
+        mean_cache[i] = mean;
+        rstd_cache[i] = rstd;
+        for j in 0..d {
+            out[i * d + j] = gamma[j] * (row[j] - mean) * rstd + beta[j];
+        }
+    }
+    (out, mean_cache, rstd_cache)
+}
+
+/// LayerNorm backward: returns (d_x, d_gamma, d_beta).
+pub fn layer_norm_backward(
+    d_out: &[f32], x: &[f32], gamma: &[f32],
+    mean_cache: &[f32], rstd_cache: &[f32],
+    n: usize, d: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let mut d_x = vec![0.0f32; n * d];
+    let mut d_gamma = vec![0.0f32; d];
+    let mut d_beta = vec![0.0f32; d];
+    let d_f = d as f32;
+    for i in 0..n {
+        let mean = mean_cache[i];
+        let rstd = rstd_cache[i];
+        let mut sum1 = 0.0f32;
+        let mut sum2 = 0.0f32;
+        for j in 0..d {
+            let x_hat = (x[i * d + j] - mean) * rstd;
+            let dy = d_out[i * d + j];
+            d_gamma[j] += dy * x_hat;
+            d_beta[j] += dy;
+            sum1 += dy * gamma[j];
+            sum2 += dy * gamma[j] * x_hat;
+        }
+        for j in 0..d {
+            let x_hat = (x[i * d + j] - mean) * rstd;
+            d_x[i * d + j] = rstd / d_f * (d_f * d_out[i * d + j] * gamma[j] - sum1 - x_hat * sum2);
+        }
+    }
+    (d_x, d_gamma, d_beta)
+}
+
 // ── CMS (Continuous Memory Systems) ─────────────────────────────────
 
 /// Cache for CMS forward pass — multiple frequency levels.
@@ -405,6 +474,21 @@ pub struct CMSForwardCache {
     pub logits: Vec<f32>,
     /// Which levels were active this step.
     pub pulse: Pulse,
+    // ── Residual stream caches (None when residual=false) ──────────
+    /// LN_attn intermediates for backward.
+    pub ln_attn_mean: Option<Vec<f32>>,
+    pub ln_attn_rstd: Option<Vec<f32>>,
+    /// LN_attn output (fed into QKV projections).
+    pub ln_attn_out: Option<Vec<f32>>,
+    /// LN_mem intermediates for backward.
+    pub ln_mem_mean: Option<Vec<f32>>,
+    pub ln_mem_rstd: Option<Vec<f32>>,
+    /// LN_mem output (fed into memory levels).
+    pub ln_mem_out: Option<Vec<f32>>,
+    /// Residual after attention skip: embedded + attn_out.
+    pub residual_after_attn: Option<Vec<f32>>,
+    /// Final residual (after memory add): feeds into w_o.
+    pub residual_final: Option<Vec<f32>>,
     /// Frequency gate cache for backward (None if Fixed schedule).
     pub freq_cache: Option<FreqGateCache>,
 }
@@ -472,18 +556,68 @@ pub fn cms_forward(
     };
     let pulse = &effective_pulse;
 
-    // Stage 2a: Attention branch — QKV projections (fused transpose-matmul via cuBLAS)
+    // ── Residual vs. Legacy path ─────────────────────────────────────
+    //
+    // When cfg.residual == true:
+    //   embedded → LN_attn → QKV → SWA → attn_out
+    //   residual = embedded + attn_out
+    //   residual → LN_mem → CMS memory → y_combined
+    //   residual = residual + y_combined   (gradient = 1.0, no sigmoid)
+    //   residual → w_o → unembed → loss
+    //
+    // When cfg.residual == false:
+    //   Original gated path (backward compatible).
+
+    // Stage 2a: Pre-LN for attention (optional) + QKV projections
+    let (ln_attn_out_opt, ln_attn_mean, ln_attn_rstd) = if cfg.residual {
+        let (out, mean, rstd) = layer_norm(
+            &embedded, &params.swa.ln_attn_gamma, &params.swa.ln_attn_beta, s, d, 1e-5,
+        );
+        (Some(out), Some(mean), Some(rstd))
+    } else {
+        (None, None, None)
+    };
+
+    // QKV input: LN output when residual=true, raw embedded otherwise.
+    let qkv_input = ln_attn_out_opt.as_deref().unwrap_or(&embedded);
+
     let mut q = vec![0.0f32; s * d];
     let mut k = vec![0.0f32; s * d];
     let mut vv = vec![0.0f32; s * d];
-    crate::dispatch::matmul_transb_dispatch(&embedded, &params.swa.w_q, &mut q, s, d, d);
-    crate::dispatch::matmul_transb_dispatch(&embedded, &params.swa.w_k, &mut k, s, d, d);
-    crate::dispatch::matmul_transb_dispatch(&embedded, &params.swa.w_v, &mut vv, s, d, d);
+    crate::dispatch::matmul_transb_dispatch(qkv_input, &params.swa.w_q, &mut q, s, d, d);
+    crate::dispatch::matmul_transb_dispatch(qkv_input, &params.swa.w_k, &mut k, s, d, d);
+    crate::dispatch::matmul_transb_dispatch(qkv_input, &params.swa.w_v, &mut vv, s, d, d);
 
     // Stage 3a: SWA Attention
     let mut attn_out = vec![0.0f32; s * d];
     let mut attn_weights = vec![0.0f32; nh * s * ws];
     crate::dispatch::swa_forward_dispatch(&q, &k, &vv, &mut attn_out, &mut attn_weights, s, nh, hd, ws);
+
+    // Stage 4a: Residual skip 1 — attention (when residual=true)
+    let residual_after_attn = if cfg.residual {
+        let mut res = embedded.clone();
+        for i in 0..(s * d) {
+            res[i] += attn_out[i];
+        }
+        Some(res)
+    } else {
+        None
+    };
+
+    // Stage 4b: Pre-LN for memory (when residual=true)
+    let (ln_mem_out_opt, ln_mem_mean, ln_mem_rstd) = if cfg.residual {
+        let res = residual_after_attn.as_ref().unwrap();
+        let (out, mean, rstd) = layer_norm(
+            res, &params.swa.ln_mem_gamma, &params.swa.ln_mem_beta, s, d, 1e-5,
+        );
+        (Some(out), Some(mean), Some(rstd))
+    } else {
+        (None, None, None)
+    };
+
+    // Memory input: LN_mem output (reads enriched residual) when residual=true,
+    // raw embedded (original path) otherwise.
+    let mem_input = ln_mem_out_opt.as_deref().unwrap_or(&embedded);
 
     // Stage 2b+3b: Memory branch — HOPE variant dispatch
     //
@@ -493,16 +627,16 @@ pub fn cms_forward(
     // Sequential: chained with global re-init from slowest level
     let (y_per_level, memory_caches, q_mem_per_level, frozen_memories) = match cfg.hope_variant {
         HopeVariant::Chained => {
-            chained_level_outputs(params, cfg, &embedded, pulse, context, s, d)
+            chained_level_outputs(params, cfg, mem_input, pulse, context, s, d)
         }
         HopeVariant::Nested => {
-            nested_level_outputs(params, cfg, &embedded, pulse, context, s, d)
+            nested_level_outputs(params, cfg, mem_input, pulse, context, s, d)
         }
         HopeVariant::Sequential => {
-            sequential_level_outputs(params, cfg, &embedded, pulse, context, s, d)
+            sequential_level_outputs(params, cfg, mem_input, pulse, context, s, d)
         }
         HopeVariant::FreqGated | HopeVariant::Independent => {
-            // Default: each level independently processes embedded
+            // Default: each level independently processes mem_input
             let mut memory_caches: Vec<Option<MemoryCache>> = Vec::with_capacity(cfg.k);
             let mut q_mem_per_level: Vec<Option<Vec<f32>>> = Vec::with_capacity(cfg.k);
             let mut frozen_memories: Vec<Option<Vec<f32>>> = Vec::with_capacity(cfg.k);
@@ -511,7 +645,7 @@ pub fn cms_forward(
             for level in 0..cfg.k {
                 let active = pulse.active_levels[level];
                 let (y_level, mc, qm, fm) = run_level_memory(
-                    params, cfg, level, &embedded, s, d, active, context,
+                    params, cfg, level, mem_input, s, d, active, context,
                 );
                 y_per_level.push(y_level);
                 memory_caches.push(mc);
@@ -529,16 +663,8 @@ pub fn cms_forward(
     // output IS y_combined (RETURN h). No aggregation sum.
     //
     // FreqGated/Independent/Nested (Eqs 71, 72, 74): levels process independently —
-    // outputs are summed with 1/sqrt(k) normalization for k>2.
-    //
-    // Why 1/sqrt(k) for k>2: additive sum grows linearly with k, pushing sigmoid
-    // into saturation where gradients vanish. 1/sqrt(k) keeps signal variance
-    // constant (analogous to attention's 1/sqrt(d) scaling).
-    //
-    // Why not normalize k=2: the 1/sqrt(k) factor also scales the backward gradient
-    // to all memory parameters, slowing outer-loop learning of gate biases (b_theta,
-    // b_alpha). At k=2, this cost outweighs the benefit since the signal isn't large
-    // enough to cause saturation.
+    // outputs are summed with 1/sqrt(k) normalization for k>2 (only when !residual;
+    // residual path uses pure additive without sigmoid so no saturation concern).
     let y_combined = match cfg.hope_variant {
         HopeVariant::Chained | HopeVariant::Sequential => {
             // Serial pipeline: final level's output is the result (spec: RETURN h)
@@ -552,7 +678,9 @@ pub fn cms_forward(
                     combined[i] += y_level[i];
                 }
             }
-            if cfg.k > 2 {
+            // Only apply 1/sqrt(k) when NOT using residual (sigmoid path needs it
+            // to avoid saturation; residual path doesn't use sigmoid).
+            if !cfg.residual && cfg.k > 2 {
                 let scale = 1.0 / (cfg.k as f32).sqrt();
                 for i in 0..(s * d) {
                     combined[i] *= scale;
@@ -562,17 +690,37 @@ pub fn cms_forward(
         }
     };
 
-    // Stage 4: Gating — gate = sigmoid(y_combined), gated_out = attn_out * gate
-    let mut gate = vec![0.0f32; s * d];
-    let mut gated_out = vec![0.0f32; s * d];
-    for i in 0..(s * d) {
-        gate[i] = sigmoid_f32(y_combined[i]);
-        gated_out[i] = attn_out[i] * gate[i];
-    }
+    // Stage 4-5: Gating vs. Residual path
+    let (gate, gated_out, residual_final, w_o_input) = if cfg.residual {
+        // Residual path: pure additive, no sigmoid gating.
+        // residual = residual_after_attn + y_combined
+        let res_attn = residual_after_attn.as_ref().unwrap();
+        let mut res_final = res_attn.clone();
+        for i in 0..(s * d) {
+            res_final[i] += y_combined[i];
+        }
+        // Fill gate/gated_out with identity values to preserve [s*d] shape invariant.
+        // gate = 1.0 (all-open) and gated_out = attn_out (passthrough) — not used in
+        // residual backward, but keeps the cache shape contract intact for any code
+        // that inspects these fields generically.
+        let gate = vec![1.0f32; s * d];
+        let gated_out = attn_out.clone();
+        (gate, gated_out, Some(res_final.clone()), res_final)
+    } else {
+        // Legacy path: gate = sigmoid(y_combined), gated_out = attn_out * gate
+        let mut gate = vec![0.0f32; s * d];
+        let mut gated_out = vec![0.0f32; s * d];
+        for i in 0..(s * d) {
+            gate[i] = sigmoid_f32(y_combined[i]);
+            gated_out[i] = attn_out[i] * gate[i];
+        }
+        (gate, gated_out, None, vec![]) // w_o_input unused, gated_out used instead
+    };
 
     // Stage 5: Output projection (fused transpose-matmul via cuBLAS)
     let mut projected = vec![0.0f32; s * d];
-    crate::dispatch::matmul_transb_dispatch(&gated_out, &params.swa.w_o, &mut projected, s, d, d);
+    let proj_input = if cfg.residual { &w_o_input } else { &gated_out };
+    crate::dispatch::matmul_transb_dispatch(proj_input, &params.swa.w_o, &mut projected, s, d, d);
 
     // Stage 6: Unembed
     let mut logits = vec![0.0f32; s * v];
@@ -586,6 +734,9 @@ pub fn cms_forward(
         memory_caches, q_mem_per_level, frozen_memories,
         y_per_level, y_combined,
         gate, gated_out, projected, logits,
+        ln_attn_mean, ln_attn_rstd, ln_attn_out: ln_attn_out_opt,
+        ln_mem_mean, ln_mem_rstd, ln_mem_out: ln_mem_out_opt,
+        residual_after_attn, residual_final,
         pulse: pulse.clone(),
         freq_cache,
     };
@@ -991,26 +1142,45 @@ pub fn cms_backward(
     crate::dispatch::matmul_dispatch(&projected_t, &d_logits, &mut grads.swa.w_unembed, d, s, v);
 
     // ── Stage 5: Output projection backward ──────────────────────────
-    let mut d_gated_out = vec![0.0f32; s * d];
-    crate::dispatch::matmul_dispatch(&d_projected, &params.swa.w_o, &mut d_gated_out, s, d, d);
+    // w_o input was residual_final when residual=true, gated_out when false.
+    let w_o_input_cache = if cfg.residual {
+        cache.residual_final.as_ref().unwrap().as_slice()
+    } else {
+        &cache.gated_out
+    };
+    let mut d_w_o_input = vec![0.0f32; s * d];
+    crate::dispatch::matmul_dispatch(&d_projected, &params.swa.w_o, &mut d_w_o_input, s, d, d);
 
     let mut d_projected_t = vec![0.0f32; d * s];
     transpose_f32(&d_projected, &mut d_projected_t, s, d);
-    crate::dispatch::matmul_dispatch(&d_projected_t, &cache.gated_out, &mut grads.swa.w_o, d, s, d);
+    crate::dispatch::matmul_dispatch(&d_projected_t, w_o_input_cache, &mut grads.swa.w_o, d, s, d);
 
-    // ── Stage 4: Gating backward ─────────────────────────────────────
-    let mut d_attn_out = vec![0.0f32; s * d];
-    let mut d_gate = vec![0.0f32; s * d];
-    for i in 0..(s * d) {
-        d_attn_out[i] = d_gated_out[i] * cache.gate[i];
-        d_gate[i] = d_gated_out[i] * cache.attn_out[i];
-    }
-
-    // gate = sigmoid(y_combined) → d_y_combined = d_gate * gate * (1 - gate)
-    let mut d_y_combined = vec![0.0f32; s * d];
-    for i in 0..(s * d) {
-        d_y_combined[i] = d_gate[i] * cache.gate[i] * (1.0 - cache.gate[i]);
-    }
+    // ── Stage 4: Residual vs. Gating backward ─────────────────────────
+    let (mut d_attn_out, mut d_y_combined) = if cfg.residual {
+        // Residual path: d_w_o_input = d_residual_final
+        // residual_final = residual_after_attn + y_combined
+        // → d_residual_after_attn = d_residual_final (gradient = 1.0)
+        // → d_y_combined = d_residual_final (gradient = 1.0)
+        let d_residual = d_w_o_input.clone();
+        let d_y_comb = d_w_o_input; // moved
+        // d_attn_out comes from residual_after_attn = embedded + attn_out
+        // → d_attn_out = d_residual (gradient = 1.0)
+        (d_residual.clone(), d_y_comb)
+    } else {
+        // Legacy gating backward
+        let mut d_attn_out = vec![0.0f32; s * d];
+        let mut d_gate = vec![0.0f32; s * d];
+        for i in 0..(s * d) {
+            d_attn_out[i] = d_w_o_input[i] * cache.gate[i];
+            d_gate[i] = d_w_o_input[i] * cache.attn_out[i];
+        }
+        // gate = sigmoid(y_combined) → d_y_combined = d_gate * gate * (1 - gate)
+        let mut d_y_combined = vec![0.0f32; s * d];
+        for i in 0..(s * d) {
+            d_y_combined[i] = d_gate[i] * cache.gate[i] * (1.0 - cache.gate[i]);
+        }
+        (d_attn_out, d_y_combined)
+    };
 
     // Chain rule for aggregation backward.
     //
@@ -1021,13 +1191,14 @@ pub fn cms_backward(
     // error buffers when applicable.
     //
     // FreqGated/Independent/Nested: y_combined = sum, so d_y_combined distributes
-    // to all levels equally (with 1/sqrt(k) scaling for k>2).
+    // to all levels equally (with 1/sqrt(k) scaling for k>2 in legacy mode only).
     match cfg.hope_variant {
         HopeVariant::Chained | HopeVariant::Sequential => {
             // No scaling needed — d_y_combined goes only to last level (handled below)
         }
         _ => {
-            if cfg.k > 2 {
+            // Only apply 1/sqrt(k) in legacy (non-residual) mode; residual doesn't use it.
+            if !cfg.residual && cfg.k > 2 {
                 let scale = 1.0 / (cfg.k as f32).sqrt();
                 for i in 0..(s * d) {
                     d_y_combined[i] *= scale;
@@ -1037,10 +1208,18 @@ pub fn cms_backward(
     }
 
     // ── Stage 3b: Per-level memory backward ──────────────────────────
+    // Memory backward uses `mem_input_cache` (= LN_mem output when residual,
+    // = embedded when legacy) as the "embedded" input to memory rules.
+    let mem_input_cache = if cfg.residual {
+        cache.ln_mem_out.as_ref().unwrap().as_slice()
+    } else {
+        &cache.embedded
+    };
+
     // For aggregated variants: d_y_combined distributes to each level.
     // For Chained/Sequential: only the last level receives d_y_combined.
     let chained_backward = matches!(cfg.hope_variant, HopeVariant::Chained | HopeVariant::Sequential);
-    let mut d_embedded_mem_total = vec![0.0f32; s * d];
+    let mut d_mem_input_total = vec![0.0f32; s * d];
 
     for level in 0..cfg.k {
         // Chained/Sequential: only last level gets gradient from y_combined
@@ -1052,25 +1231,25 @@ pub fn cms_backward(
                 let frozen_m = cache.frozen_memories[level].as_ref().unwrap();
                 let (mem_grads, _d_embedded_mem) = match cfg.memory_rule {
                     MemoryRuleKind::Moneta => moneta_read_only_backward(
-                        &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.d_hidden,
+                        &params.levels[level], frozen_m, q_mem, &d_y_combined, mem_input_cache, s, d, cfg.d_hidden,
                     ),
                     MemoryRuleKind::YAAD => yaad_read_only_backward(
-                        &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.d_hidden,
+                        &params.levels[level], frozen_m, q_mem, &d_y_combined, mem_input_cache, s, d, cfg.d_hidden,
                     ),
                     MemoryRuleKind::MEMORA => memora_read_only_backward(
-                        &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.d_hidden,
+                        &params.levels[level], frozen_m, q_mem, &d_y_combined, mem_input_cache, s, d, cfg.d_hidden,
                     ),
                     MemoryRuleKind::LatticeOSR => lattice_read_only_backward(
-                        &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.m_slots,
+                        &params.levels[level], frozen_m, q_mem, &d_y_combined, mem_input_cache, s, d, cfg.m_slots,
                     ),
                     MemoryRuleKind::Trellis => trellis_read_only_backward(
-                        &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.d_compress,
+                        &params.levels[level], frozen_m, q_mem, &d_y_combined, mem_input_cache, s, d, cfg.d_compress,
                     ),
                     MemoryRuleKind::HebbianRule | MemoryRuleKind::AtlasOmega => delta_rule_read_only_backward(
-                        &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, &crate::feature_map::FeatureMapKind::Identity,
+                        &params.levels[level], frozen_m, q_mem, &d_y_combined, mem_input_cache, s, d, &crate::feature_map::FeatureMapKind::Identity,
                     ),
                     _ => delta_rule_read_only_backward(
-                        &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, &cfg.feature_map,
+                        &params.levels[level], frozen_m, q_mem, &d_y_combined, mem_input_cache, s, d, &cfg.feature_map,
                     ),
                 };
                 error_buffers[level].accumulate(&mem_grads);
@@ -1082,37 +1261,37 @@ pub fn cms_backward(
             let mem_cache = cache.memory_caches[level].as_ref().unwrap();
             let (mem_grads, d_embedded_mem) = match mem_cache {
                 MemoryCache::Delta(delta_cache) => {
-                    DeltaRule::from_cfg_level(cfg, level).step_backward(&params.levels[level], delta_cache, &d_y_combined, &cache.embedded)
+                    DeltaRule::from_cfg_level(cfg, level).step_backward(&params.levels[level], delta_cache, &d_y_combined, mem_input_cache)
                 }
                 MemoryCache::Titans(titans_cache) => {
-                    TitansLMM::from_cfg_level(cfg, level).step_backward(&params.levels[level], titans_cache, &d_y_combined, &cache.embedded)
+                    TitansLMM::from_cfg_level(cfg, level).step_backward(&params.levels[level], titans_cache, &d_y_combined, mem_input_cache)
                 }
                 MemoryCache::Hebbian(hebbian_cache) => {
-                    HebbianRule.step_backward(&params.levels[level], hebbian_cache, &d_y_combined, &cache.embedded)
+                    HebbianRule.step_backward(&params.levels[level], hebbian_cache, &d_y_combined, mem_input_cache)
                 }
                 MemoryCache::Moneta(moneta_cache) => {
-                    Moneta::from_cfg_level(cfg, level).step_backward(&params.levels[level], moneta_cache, &d_y_combined, &cache.embedded)
+                    Moneta::from_cfg_level(cfg, level).step_backward(&params.levels[level], moneta_cache, &d_y_combined, mem_input_cache)
                 }
                 MemoryCache::YAAD(yaad_cache) => {
                     let rule = YAAD { d_hidden: cfg.d_hidden, delta: cfg.delta, lambda_local: cfg.lambda_local, lambda_2: cfg.lambda_2 };
-                    rule.step_backward(&params.levels[level], yaad_cache, &d_y_combined, &cache.embedded)
+                    rule.step_backward(&params.levels[level], yaad_cache, &d_y_combined, mem_input_cache)
                 }
                 MemoryCache::MEMORA(memora_cache) => {
                     let rule = MEMORA { d_hidden: cfg.d_hidden };
-                    rule.step_backward(&params.levels[level], memora_cache, &d_y_combined, &cache.embedded)
+                    rule.step_backward(&params.levels[level], memora_cache, &d_y_combined, mem_input_cache)
                 }
                 MemoryCache::Lattice(lattice_cache) => {
                     let rule = LatticeOSR { m_slots: cfg.m_slots, variant: cfg.lattice_variant };
-                    rule.step_backward(&params.levels[level], lattice_cache, &d_y_combined, &cache.embedded)
+                    rule.step_backward(&params.levels[level], lattice_cache, &d_y_combined, mem_input_cache)
                 }
                 MemoryCache::Trellis(trellis_cache) => {
-                    Trellis::from_cfg_level(cfg, level).step_backward(&params.levels[level], trellis_cache, &d_y_combined, &cache.embedded)
+                    Trellis::from_cfg_level(cfg, level).step_backward(&params.levels[level], trellis_cache, &d_y_combined, mem_input_cache)
                 }
                 MemoryCache::Atlas(atlas_cache) => {
-                    AtlasOmega.step_backward(&params.levels[level], atlas_cache, &d_y_combined, &cache.embedded)
+                    AtlasOmega.step_backward(&params.levels[level], atlas_cache, &d_y_combined, mem_input_cache)
                 }
                 MemoryCache::SwiGlu(swiglu_cache) => {
-                    SwiGluMlp::from_cfg(cfg).step_backward(&params.levels[level], swiglu_cache, &d_y_combined, &cache.embedded)
+                    SwiGluMlp::from_cfg(cfg).step_backward(&params.levels[level], swiglu_cache, &d_y_combined, mem_input_cache)
                 }
                 MemoryCache::SelfRef(sr_cache) => {
                     let (d_emb, sr_grads) = self_ref_step_backward(sr_cache, &d_y_combined, cfg.self_generated_values);
@@ -1139,7 +1318,7 @@ pub fn cms_backward(
             };
             grads.levels[level].accumulate(&mem_grads);
             for i in 0..(s * d) {
-                d_embedded_mem_total[i] += d_embedded_mem[i];
+                d_mem_input_total[i] += d_embedded_mem[i];
             }
         } else {
             // Frozen level: read-only backward (rule-aware dispatch)
@@ -1151,35 +1330,35 @@ pub fn cms_backward(
                 let q_mem = cache.q_mem_per_level[level].as_ref()
                     .expect("Adaptive frozen level should have q_mem from self_ref_read_only");
                 self_ref_read_only_backward(
-                    frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d,
+                    frozen_m, q_mem, &d_y_combined, mem_input_cache, s, d,
                 )
             } else {
                 let q_mem = cache.q_mem_per_level[level].as_ref().unwrap();
                 match cfg.memory_rule {
                     MemoryRuleKind::Moneta => moneta_read_only_backward(
-                        &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.d_hidden,
+                        &params.levels[level], frozen_m, q_mem, &d_y_combined, mem_input_cache, s, d, cfg.d_hidden,
                     ),
                     MemoryRuleKind::YAAD => yaad_read_only_backward(
-                        &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.d_hidden,
+                        &params.levels[level], frozen_m, q_mem, &d_y_combined, mem_input_cache, s, d, cfg.d_hidden,
                     ),
                     MemoryRuleKind::MEMORA => memora_read_only_backward(
-                        &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.d_hidden,
+                        &params.levels[level], frozen_m, q_mem, &d_y_combined, mem_input_cache, s, d, cfg.d_hidden,
                     ),
                     MemoryRuleKind::LatticeOSR => lattice_read_only_backward(
-                        &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.m_slots,
+                        &params.levels[level], frozen_m, q_mem, &d_y_combined, mem_input_cache, s, d, cfg.m_slots,
                     ),
                     MemoryRuleKind::Trellis => trellis_read_only_backward(
-                        &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, cfg.d_compress,
+                        &params.levels[level], frozen_m, q_mem, &d_y_combined, mem_input_cache, s, d, cfg.d_compress,
                     ),
                     MemoryRuleKind::HebbianRule | MemoryRuleKind::AtlasOmega => delta_rule_read_only_backward(
-                        &params.levels[level], frozen_m, q_mem, &d_y_combined, &cache.embedded, s, d, &crate::feature_map::FeatureMapKind::Identity,
+                        &params.levels[level], frozen_m, q_mem, &d_y_combined, mem_input_cache, s, d, &crate::feature_map::FeatureMapKind::Identity,
                     ),
                     _ => delta_rule_read_only_backward(
                         &params.levels[level],
                         frozen_m,
                         q_mem,
                         &d_y_combined,
-                        &cache.embedded,
+                        mem_input_cache,
                         s,
                         d,
                         &cfg.feature_map,
@@ -1189,12 +1368,16 @@ pub fn cms_backward(
             // Frozen level grads go to error buffer, not direct grads
             error_buffers[level].accumulate(&mem_grads);
             for i in 0..(s * d) {
-                d_embedded_mem_total[i] += d_embedded_mem[i];
+                d_mem_input_total[i] += d_embedded_mem[i];
             }
         }
     }
 
     // ── Frequency gate backward (straight-through estimator) ────────
+    // d_freq_embedded: gradient from freq gate w.r.t. embedded (via mean-pool).
+    // In residual mode, this must bypass LN_mem backward (freq gates operate on
+    // raw embedded, not on LN_mem output). Stored here and added to d_embedded later.
+    let mut d_freq_embedded = vec![0.0f32; s * d];
     if let Some(ref fc) = cache.freq_cache {
         // Compute surrogate gradient signal for frequency gates
         let d_gate_values = compute_gate_surrogate(
@@ -1214,16 +1397,64 @@ pub fn cms_backward(
             }
         }
 
-        // d_embedded_mean contributes to d_embedded via mean-pool backward:
-        // d_embedded[t, j] += d_embedded_mean[j] / seq_len for all t
+        // d_embedded_mean contributes via mean-pool backward:
+        // In residual mode: route directly to d_embedded (freq gates use raw embedded,
+        // not LN_mem output), so we store in d_freq_embedded and apply after LN backward.
+        // In legacy mode: route through d_mem_input_total (same as d_embedded).
         let inv_s = 1.0 / s as f32;
-        for t in 0..s {
-            let base = t * d;
-            for j in 0..d {
-                d_embedded_mem_total[base + j] += d_embedded_mean[j] * inv_s;
+        if cfg.residual {
+            for t in 0..s {
+                let base = t * d;
+                for j in 0..d {
+                    d_freq_embedded[base + j] += d_embedded_mean[j] * inv_s;
+                }
+            }
+        } else {
+            for t in 0..s {
+                let base = t * d;
+                for j in 0..d {
+                    d_mem_input_total[base + j] += d_embedded_mean[j] * inv_s;
+                }
             }
         }
     }
+
+    // ── LN_mem backward + residual gradient routing ─────────────────
+    // When residual=true: d_mem_input_total is d(LN_mem output).
+    // We need to: (1) compute LN_mem backward → d_residual_after_attn,
+    //             (2) accumulate LN_mem param gradients,
+    //             (3) add to d_attn_out (from residual skip 1).
+    // When residual=false: d_mem_input_total is d(embedded) from memory
+    // branch — handled the same as before, just with a different name.
+    let mut d_embedded_mem_total = if cfg.residual {
+        let res_attn = cache.residual_after_attn.as_ref().unwrap();
+        let (d_ln_mem_input, d_ln_mem_gamma, d_ln_mem_beta) = layer_norm_backward(
+            &d_mem_input_total, res_attn,
+            &params.swa.ln_mem_gamma,
+            cache.ln_mem_mean.as_ref().unwrap(),
+            cache.ln_mem_rstd.as_ref().unwrap(),
+            s, d,
+        );
+        // Accumulate LN_mem param gradients
+        for j in 0..d {
+            grads.swa.ln_mem_gamma[j] += d_ln_mem_gamma[j];
+            grads.swa.ln_mem_beta[j] += d_ln_mem_beta[j];
+        }
+        // d_ln_mem_input = gradient w.r.t. residual_after_attn from memory→LN path.
+        // d_attn_out already holds d_residual_final (from w_o backward through skip 2).
+        // Total d_residual_after_attn = d_residual_final + d_ln_mem_input.
+        // From skip 1 (residual_after_attn = embedded + attn_out):
+        //   d_attn_out = d_residual_after_attn (gradient = 1.0)
+        //   d_embedded += d_residual_after_attn (gradient = 1.0)
+        for i in 0..(s * d) {
+            d_attn_out[i] += d_ln_mem_input[i];
+        }
+        // d_embedded contribution from skip 1 = d_residual_after_attn = d_attn_out.
+        // We capture this AFTER the addition so it includes both d_residual_final and d_ln_mem_input.
+        d_attn_out.clone()
+    } else {
+        d_mem_input_total
+    };
 
     // ── Stage 3a: SWA Attention backward ─────────────────────────────
     let mut d_q = vec![0.0f32; s * d];
@@ -1238,27 +1469,84 @@ pub fn cms_backward(
     );
 
     // ── Stage 2a: QKV projection backward ────────────────────────────
-    let mut d_embedded = vec![0.0f32; s * d];
+    // QKV input was LN_attn output when residual=true, embedded when false.
+    let qkv_input_cache = if cfg.residual {
+        cache.ln_attn_out.as_ref().unwrap().as_slice()
+    } else {
+        &cache.embedded
+    };
 
-    crate::dispatch::matmul_acc_dispatch(&d_q, &params.swa.w_q, &mut d_embedded, s, d, d);
-    crate::dispatch::matmul_acc_dispatch(&d_k, &params.swa.w_k, &mut d_embedded, s, d, d);
-    crate::dispatch::matmul_acc_dispatch(&d_v, &params.swa.w_v, &mut d_embedded, s, d, d);
+    let mut d_qkv_input = vec![0.0f32; s * d];
+    crate::dispatch::matmul_acc_dispatch(&d_q, &params.swa.w_q, &mut d_qkv_input, s, d, d);
+    crate::dispatch::matmul_acc_dispatch(&d_k, &params.swa.w_k, &mut d_qkv_input, s, d, d);
+    crate::dispatch::matmul_acc_dispatch(&d_v, &params.swa.w_v, &mut d_qkv_input, s, d, d);
 
     let mut d_q_t = vec![0.0f32; d * s];
     transpose_f32(&d_q, &mut d_q_t, s, d);
-    crate::dispatch::matmul_dispatch(&d_q_t, &cache.embedded, &mut grads.swa.w_q, d, s, d);
+    crate::dispatch::matmul_dispatch(&d_q_t, qkv_input_cache, &mut grads.swa.w_q, d, s, d);
 
     let mut d_k_t = vec![0.0f32; d * s];
     transpose_f32(&d_k, &mut d_k_t, s, d);
-    crate::dispatch::matmul_dispatch(&d_k_t, &cache.embedded, &mut grads.swa.w_k, d, s, d);
+    crate::dispatch::matmul_dispatch(&d_k_t, qkv_input_cache, &mut grads.swa.w_k, d, s, d);
 
     let mut d_v_t = vec![0.0f32; d * s];
     transpose_f32(&d_v, &mut d_v_t, s, d);
-    crate::dispatch::matmul_dispatch(&d_v_t, &cache.embedded, &mut grads.swa.w_v, d, s, d);
+    crate::dispatch::matmul_dispatch(&d_v_t, qkv_input_cache, &mut grads.swa.w_v, d, s, d);
 
-    // ── Combine d_embedded from both branches ────────────────────────
+    // ── LN_attn backward + combine into d_embedded ──────────────────
+    let mut d_embedded = if cfg.residual {
+        // d_qkv_input = d(LN_attn output). Backprop through LN_attn → d_embedded.
+        let (d_ln_attn_input, d_ln_attn_gamma, d_ln_attn_beta) = layer_norm_backward(
+            &d_qkv_input, &cache.embedded,
+            &params.swa.ln_attn_gamma,
+            cache.ln_attn_mean.as_ref().unwrap(),
+            cache.ln_attn_rstd.as_ref().unwrap(),
+            s, d,
+        );
+        // Accumulate LN_attn param gradients
+        for j in 0..d {
+            grads.swa.ln_attn_gamma[j] += d_ln_attn_gamma[j];
+            grads.swa.ln_attn_beta[j] += d_ln_attn_beta[j];
+        }
+        // d_embedded has contributions from:
+        //   (1) d_ln_attn_input (attention branch through LN_attn)
+        //   (2) d_attn_out (residual skip 1: gradient = 1.0 → d_embedded = d_attn_out)
+        //       But d_attn_out was already routed to SWA backward. The residual skip
+        //       means d_embedded += d_residual_after_attn = d_attn_out + d_ln_mem_input.
+        //       d_attn_out already includes d_ln_mem_input from the add above.
+        //       So d_embedded = d_ln_attn_input + d_attn_out.
+        //
+        //   But wait — d_attn_out was consumed by SWA backward. We need to also add
+        //   d_embedded += d_attn_out for the residual skip connection.
+        //   Actually, d_attn_out = d_residual_final (from w_o) + d_ln_mem_input.
+        //   The skip connection: residual_after_attn = embedded + attn_out
+        //   → d_embedded += d_residual_after_attn, d_attn_out += d_residual_after_attn
+        //   d_residual_after_attn = d_residual_final + d_ln_mem_input (from skip 2 + LN_mem)
+        //   This was already set up: d_attn_out = d_residual_final.clone() + d_ln_mem_input
+        //   And d_embedded should get the same d_residual_after_attn.
+        //   So: d_embedded = d_ln_attn_input + d_residual_after_attn
+        //     = d_ln_attn_input + (d_residual_final + d_ln_mem_input)
+        //   The d_residual_final + d_ln_mem_input was stored in d_embedded_mem_total.
+        let mut d_emb = d_ln_attn_input;
+        for i in 0..(s * d) {
+            d_emb[i] += d_embedded_mem_total[i];
+        }
+        d_emb
+    } else {
+        // Legacy path: d_qkv_input = d_embedded from QKV projections
+        // Also add d_embedded_mem_total from memory branch
+        let mut d_emb = d_qkv_input;
+        for i in 0..(s * d) {
+            d_emb[i] += d_embedded_mem_total[i];
+        }
+        d_emb
+    };
+
+    // ── Frequency gate gradient (residual mode): add directly to d_embedded ──
+    // In residual mode, freq gate grads bypass LN_mem (freq gates use raw embedded).
+    // d_freq_embedded is zero when freq schedule is Fixed (no-op addition).
     for i in 0..(s * d) {
-        d_embedded[i] += d_embedded_mem_total[i];
+        d_embedded[i] += d_freq_embedded[i];
     }
 
     // ── Stage 1: Embedding scatter-add ───────────────────────────────

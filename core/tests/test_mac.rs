@@ -329,7 +329,8 @@ fn test_mac_vs_mag() {
         intermediate_size: 0,
         m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
-    };
+                residual: false,
+};
     let cfg_mac = MAGConfig {
         swa: swa_mac, memory_enabled: true,
         memory_rule: MemoryRuleKind::DeltaRule,
@@ -356,7 +357,8 @@ fn test_mac_vs_mag() {
         intermediate_size: 0,
         m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
-    };
+                residual: false,
+};
 
     let seq_len = 8;
     let vocab_size = 16;

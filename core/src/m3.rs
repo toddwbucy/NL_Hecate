@@ -421,6 +421,10 @@ pub fn flatten_mag_params(params: &MAGParams) -> Vec<f32> {
     flat.extend_from_slice(&params.swa.w_v);
     flat.extend_from_slice(&params.swa.w_o);
     flat.extend_from_slice(&params.swa.w_unembed);
+    flat.extend_from_slice(&params.swa.ln_attn_gamma);
+    flat.extend_from_slice(&params.swa.ln_attn_beta);
+    flat.extend_from_slice(&params.swa.ln_mem_gamma);
+    flat.extend_from_slice(&params.swa.ln_mem_beta);
 
     // Memory levels
     for level in &params.levels {
@@ -485,6 +489,10 @@ pub fn unflatten_to_mag_grads(flat: &[f32], template: &MAGParams) -> MAGParams {
         w_v: take(flat, &mut offset, template.swa.w_v.len()),
         w_o: take(flat, &mut offset, template.swa.w_o.len()),
         w_unembed: take(flat, &mut offset, template.swa.w_unembed.len()),
+        ln_attn_gamma: take(flat, &mut offset, template.swa.ln_attn_gamma.len()),
+        ln_attn_beta: take(flat, &mut offset, template.swa.ln_attn_beta.len()),
+        ln_mem_gamma: take(flat, &mut offset, template.swa.ln_mem_gamma.len()),
+        ln_mem_beta: take(flat, &mut offset, template.swa.ln_mem_beta.len()),
     };
 
     let mut levels = Vec::with_capacity(template.levels.len());

@@ -66,7 +66,8 @@ fn make_tnt_config(rule: MemoryRuleKind) -> MAGConfig {
         intermediate_size: 0,
         m_norm_max: vec![],
         feature_map: FeatureMapKind::Identity,
-    }
+            residual: false,
+}
 }
 
 fn make_test_data(s: usize, v: usize) -> (Vec<usize>, Vec<usize>) {

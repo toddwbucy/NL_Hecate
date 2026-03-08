@@ -206,6 +206,14 @@ pub struct SWAParams {
     pub w_v: Vec<f32>,
     pub w_o: Vec<f32>,
     pub w_unembed: Vec<f32>,
+    /// Pre-LayerNorm scale for attention branch: [d], init: ones.
+    pub ln_attn_gamma: Vec<f32>,
+    /// Pre-LayerNorm shift for attention branch: [d], init: zeros.
+    pub ln_attn_beta: Vec<f32>,
+    /// Pre-LayerNorm scale for memory branch: [d], init: ones.
+    pub ln_mem_gamma: Vec<f32>,
+    /// Pre-LayerNorm shift for memory branch: [d], init: zeros.
+    pub ln_mem_beta: Vec<f32>,
 }
 
 impl SWAParams {
@@ -237,7 +245,12 @@ impl SWAParams {
         let mut w_unembed = vec![0.0f32; d * v];
         rng.fill_uniform(&mut w_unembed, unembed_scale);
 
-        SWAParams { w_embed, w_q, w_k, w_v, w_o, w_unembed }
+        let ln_attn_gamma = vec![1.0f32; d];
+        let ln_attn_beta = vec![0.0f32; d];
+        let ln_mem_gamma = vec![1.0f32; d];
+        let ln_mem_beta = vec![0.0f32; d];
+
+        SWAParams { w_embed, w_q, w_k, w_v, w_o, w_unembed, ln_attn_gamma, ln_attn_beta, ln_mem_gamma, ln_mem_beta }
     }
 
     /// Create a zero-initialized shadow for gradient accumulation.
@@ -251,6 +264,10 @@ impl SWAParams {
             w_v: vec![0.0f32; d * d],
             w_o: vec![0.0f32; d * d],
             w_unembed: vec![0.0f32; d * v],
+            ln_attn_gamma: vec![0.0f32; d],
+            ln_attn_beta: vec![0.0f32; d],
+            ln_mem_gamma: vec![0.0f32; d],
+            ln_mem_beta: vec![0.0f32; d],
         }
     }
 
@@ -258,6 +275,8 @@ impl SWAParams {
     pub fn num_params(&self) -> usize {
         self.w_embed.len() + self.w_q.len() + self.w_k.len()
             + self.w_v.len() + self.w_o.len() + self.w_unembed.len()
+            + self.ln_attn_gamma.len() + self.ln_attn_beta.len()
+            + self.ln_mem_gamma.len() + self.ln_mem_beta.len()
     }
 
     /// Outer-loop weight update: param -= lr * grad for all projection weights.
@@ -273,6 +292,10 @@ impl SWAParams {
         step(&mut self.w_v, &grads.w_v, lr);
         step(&mut self.w_o, &grads.w_o, lr);
         step(&mut self.w_unembed, &grads.w_unembed, lr);
+        step(&mut self.ln_attn_gamma, &grads.ln_attn_gamma, lr);
+        step(&mut self.ln_attn_beta, &grads.ln_attn_beta, lr);
+        step(&mut self.ln_mem_gamma, &grads.ln_mem_gamma, lr);
+        step(&mut self.ln_mem_beta, &grads.ln_mem_beta, lr);
     }
 }
 
@@ -763,9 +786,16 @@ pub struct MAGConfig {
     /// ELU: element-wise elu(k)+1, non-negative outputs (linear attention style).
     #[serde(default)]
     pub feature_map: FeatureMapKind,
+    /// Enable residual stream with pre-LayerNorm (specs/infrastructure/13_residual_stream.md).
+    /// When true: embedded + attn + memory via additive residual, no sigmoid gating.
+    /// When false: original MAG gated path (backward compatible).
+    #[serde(default = "default_false")]
+    pub residual: bool,
 }
 
 fn default_one() -> usize { 1 }
+
+fn default_false() -> bool { false }
 
 fn default_sign_sharpness() -> f32 { 10.0 }
 
@@ -870,6 +900,7 @@ impl MAGConfig {
             intermediate_size: 0,
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
+            residual: false,
         }
     }
 
@@ -910,6 +941,7 @@ impl MAGConfig {
             intermediate_size: 0,
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
+            residual: false,
         }
     }
 
@@ -950,6 +982,7 @@ impl MAGConfig {
             intermediate_size: 0,
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
+            residual: false,
         }
     }
 
@@ -991,6 +1024,7 @@ impl MAGConfig {
             intermediate_size: 0,
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
+            residual: false,
         }
     }
 
@@ -1032,6 +1066,7 @@ impl MAGConfig {
             intermediate_size: 0,
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
+            residual: false,
         }
     }
 
@@ -1073,6 +1108,7 @@ impl MAGConfig {
             intermediate_size: 0,
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
+            residual: false,
         }
     }
 
@@ -1113,6 +1149,7 @@ impl MAGConfig {
             intermediate_size: 0,
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
+            residual: false,
         }
     }
 
@@ -1153,6 +1190,7 @@ impl MAGConfig {
             intermediate_size: 0,
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
+            residual: false,
         }
     }
 
@@ -1193,6 +1231,7 @@ impl MAGConfig {
             intermediate_size: 0,
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
+            residual: false,
         }
     }
 
@@ -1233,6 +1272,7 @@ impl MAGConfig {
             intermediate_size: 0,
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
+            residual: false,
         }
     }
 
@@ -1283,6 +1323,7 @@ impl MAGConfig {
             intermediate_size: 0,
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
+            residual: false,
         }
     }
 
@@ -1333,6 +1374,7 @@ impl MAGConfig {
             intermediate_size: 0,
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
+            residual: false,
         }
     }
 
@@ -1383,6 +1425,7 @@ impl MAGConfig {
             intermediate_size: 0,
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
+            residual: false,
         }
     }
 
@@ -1433,6 +1476,7 @@ impl MAGConfig {
             intermediate_size: 0,
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
+            residual: false,
         }
     }
 
@@ -1483,6 +1527,7 @@ impl MAGConfig {
             intermediate_size: 0,
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
+            residual: false,
         }
     }
 
@@ -1533,6 +1578,7 @@ impl MAGConfig {
             intermediate_size: 0,
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
+            residual: false,
         }
     }
 
@@ -1574,6 +1620,7 @@ impl MAGConfig {
             intermediate_size: 0,
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
+            residual: false,
         }
     }
 
@@ -1615,6 +1662,7 @@ impl MAGConfig {
             intermediate_size: 0,
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
+            residual: false,
         }
     }
 
@@ -1659,6 +1707,7 @@ impl MAGConfig {
             intermediate_size: 0,
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
+            residual: false,
         }
     }
 
@@ -1703,6 +1752,7 @@ impl MAGConfig {
             intermediate_size: 0,
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
+            residual: false,
         }
     }
 
@@ -1743,6 +1793,7 @@ impl MAGConfig {
             intermediate_size: 0,
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
+            residual: false,
         }
     }
 
@@ -1783,6 +1834,7 @@ impl MAGConfig {
             intermediate_size: 0,
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
+            residual: false,
         }
     }
 
@@ -1823,6 +1875,7 @@ impl MAGConfig {
             intermediate_size: 0,
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
+            residual: false,
         }
     }
 
@@ -1863,6 +1916,7 @@ impl MAGConfig {
             intermediate_size: 0,
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
+            residual: false,
         }
     }
 
@@ -1904,6 +1958,7 @@ impl MAGConfig {
             intermediate_size: 0,
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
+            residual: false,
         }
     }
 
@@ -1944,6 +1999,7 @@ impl MAGConfig {
             intermediate_size: 0,
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
+            residual: false,
         }
     }
 
@@ -1985,6 +2041,7 @@ impl MAGConfig {
             intermediate_size: 0,
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
+            residual: false,
         }
     }
 
@@ -2026,6 +2083,7 @@ impl MAGConfig {
             intermediate_size: 0,
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
+            residual: false,
         }
     }
 }
@@ -2191,7 +2249,19 @@ impl MAGParams {
         for i in 0..old_k {
             new_params.levels[i + 1] = self.levels[i].clone();
         }
-        // new_params.levels[0] stays as fresh init from MAGParams::init
+        // Clone old L0's projection weights into new L0 for scale-matched init.
+        // Without this, fresh Xavier weights (~0.025 RMS) are dwarfed by trained
+        // projections (~0.15 RMS), producing ~0 gradient for L0 (signal swamping).
+        // Gate biases (b_alpha, b_theta, b_eta) are kept at level-0 defaults
+        // from MAGParams::init so firing-frequency semantics are preserved.
+        let donor = &self.levels[0];
+        new_params.levels[0].w_k_mem = donor.w_k_mem.clone();
+        new_params.levels[0].w_v_mem = donor.w_v_mem.clone();
+        new_params.levels[0].w_q_mem = donor.w_q_mem.clone();
+        new_params.levels[0].w_alpha = donor.w_alpha.clone();
+        new_params.levels[0].w_theta = donor.w_theta.clone();
+        new_params.levels[0].w_eta = donor.w_eta.clone();
+        new_params.levels[0].w_omega = donor.w_omega.clone();
 
         // Shift alpha logits: old alpha[i] → new alpha[i+1], new alpha[0] = 0.0
         for i in 0..old_k {

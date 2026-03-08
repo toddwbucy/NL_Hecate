@@ -372,7 +372,8 @@ fn tiny_delta_config() -> MAGConfig {
         intermediate_size: 0,
         m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
-    }
+                residual: false,
+}
 }
 
 #[test]

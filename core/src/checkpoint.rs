@@ -57,6 +57,14 @@ pub fn save_safetensors(
     tensors.push(("swa.w_o".into(),      enc(&params.swa.w_o)));
     tensors.push(("lm_head.weight".into(), enc(&params.swa.w_unembed)));
 
+    // LayerNorm params (only save if non-trivial to save space on old models)
+    if !params.swa.ln_attn_gamma.is_empty() {
+        tensors.push(("ln_attn.gamma".into(), enc(&params.swa.ln_attn_gamma)));
+        tensors.push(("ln_attn.beta".into(),  enc(&params.swa.ln_attn_beta)));
+        tensors.push(("ln_mem.gamma".into(),   enc(&params.swa.ln_mem_gamma)));
+        tensors.push(("ln_mem.beta".into(),    enc(&params.swa.ln_mem_beta)));
+    }
+
     // CMS aggregation logits
     if !params.alpha_mem.is_empty() {
         tensors.push(("alpha_mem".into(), enc(&params.alpha_mem)));
@@ -268,6 +276,11 @@ pub fn load_safetensors(
     };
 
     // Reconstruct SWAParams
+    let d = config.swa.d_model;
+    let ln_attn_gamma = { let v = get("ln_attn.gamma"); if v.is_empty() { vec![1.0f32; d] } else { v } };
+    let ln_attn_beta  = { let v = get("ln_attn.beta");  if v.is_empty() { vec![0.0f32; d] } else { v } };
+    let ln_mem_gamma  = { let v = get("ln_mem.gamma");   if v.is_empty() { vec![1.0f32; d] } else { v } };
+    let ln_mem_beta   = { let v = get("ln_mem.beta");    if v.is_empty() { vec![0.0f32; d] } else { v } };
     let swa = SWAParams {
         w_embed:   get("embed.weight"),
         w_q:       get("swa.w_q"),
@@ -275,6 +288,10 @@ pub fn load_safetensors(
         w_v:       get("swa.w_v"),
         w_o:       get("swa.w_o"),
         w_unembed: get("lm_head.weight"),
+        ln_attn_gamma,
+        ln_attn_beta,
+        ln_mem_gamma,
+        ln_mem_beta,
     };
 
     // Reconstruct per-level MemoryLevelParams
