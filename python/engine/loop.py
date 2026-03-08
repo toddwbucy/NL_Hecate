@@ -1434,11 +1434,11 @@ def run_build(bcfg: BuildConfig):
                     new_pos = max(0, cur_pos - rewind_tokens)
                     active_loader.restore({
                         "position": new_pos,
-                        "total_tokens": active_loader.total_tokens,
+                        "total_tokens": cursor["total_tokens"],
                         "content_hash": 0,
                         "chunk_id": 0,
                         "seq_len": bcfg.seq_len,
-                        "dataset_path": str(active_loader.dataset_path),
+                        "dataset_path": cursor["dataset_path"],
                     })
                     print(f"  Data cursor: {cur_pos:,} → {new_pos:,} "
                           f"(rewound {bcfg.promotion_rewind_pct:.0%} of {tokens_this_level:,} "
