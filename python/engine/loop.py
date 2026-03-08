@@ -164,6 +164,11 @@ def run_build(bcfg: BuildConfig):
                     except (CursorMismatchError, CursorOutOfBounds) as e:
                         print(f"  ERROR: cursor mismatch — {e}")
                         return
+                if is_multi_slot and len(cursor["slots"]) != bcfg.batch_size:
+                    print(
+                        "  ERROR: cursor sidecar was saved with "
+                        f"{len(cursor['slots'])} slot(s) but current batch_size={bcfg.batch_size}")
+                    return
                 # Restore level_start_cursor if persisted (for correct rewind after resume).
                 if isinstance(cursor, dict) and "level_start_cursor" in cursor:
                     _restored_level_start_cursor = cursor["level_start_cursor"]
