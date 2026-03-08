@@ -227,7 +227,8 @@ fn test_titans_vs_delta() {
         intermediate_size: 0,
         m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
-    };
+                residual: false,
+};
     let cfg_titans = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
         memory_rule: MemoryRuleKind::TitansLMM,
@@ -254,7 +255,8 @@ fn test_titans_vs_delta() {
         intermediate_size: 0,
         m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
-    };
+                residual: false,
+};
 
     let input_ids: Vec<usize> = (0..swa.seq_len).map(|t| t % swa.vocab_size).collect();
     let target_ids: Vec<usize> = (1..=swa.seq_len).map(|t| t % swa.vocab_size).collect();
@@ -371,7 +373,8 @@ fn test_titans_m_norm_clamp_cpu() {
         intermediate_size: 0,
         m_norm_max: vec![m_norm_max_val],
         feature_map: FeatureMapKind::Identity,
-    };
+            residual: false,
+};
 
     let params = MAGParams::init(&cfg, 42);
     let input_ids: Vec<usize> = (0..seq_len).map(|t| t % cfg.swa.vocab_size).collect();

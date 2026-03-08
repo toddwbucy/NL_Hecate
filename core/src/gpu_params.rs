@@ -47,6 +47,12 @@ impl GpuSWAParams {
             w_v: vec![0.0f32; cfg_d * cfg_d],
             w_o: vec![0.0f32; cfg_d * cfg_d],
             w_unembed: vec![0.0f32; cfg_d * cfg_v],
+            // LN params are not GPU-resident yet (CPU-path only for now).
+            // Initialize to identity so to_host produces valid params.
+            ln_attn_gamma: vec![1.0f32; cfg_d],
+            ln_attn_beta: vec![0.0f32; cfg_d],
+            ln_mem_gamma: vec![1.0f32; cfg_d],
+            ln_mem_beta: vec![0.0f32; cfg_d],
         };
         self.w_embed.copy_to_host(&mut p.w_embed);
         self.w_q.copy_to_host(&mut p.w_q);

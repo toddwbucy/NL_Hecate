@@ -632,6 +632,10 @@ pub fn traced_cms_forward(
         gated_out,
         projected,
         logits,
+        // Traced forward doesn't support residual path yet (tape records legacy path).
+        ln_attn_mean: None, ln_attn_rstd: None, ln_attn_out: None,
+        ln_mem_mean: None, ln_mem_rstd: None, ln_mem_out: None,
+        residual_after_attn: None, residual_final: None,
         pulse: pulse.clone(),
         freq_cache,
     };

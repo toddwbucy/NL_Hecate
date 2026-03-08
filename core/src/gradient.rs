@@ -341,6 +341,12 @@ pub fn tape_compute_gradients(
             w_v: tape.get_param_grad(param_ids.w_v),
             w_o: tape.get_param_grad(param_ids.w_o),
             w_unembed: tape.get_param_grad(param_ids.w_unembed),
+            // LN gradients: tape-based forward doesn't use LN yet (residual=false path).
+            // Zero-init for compatibility.
+            ln_attn_gamma: vec![0.0f32; cfg.swa.d_model],
+            ln_attn_beta: vec![0.0f32; cfg.swa.d_model],
+            ln_mem_gamma: vec![0.0f32; cfg.swa.d_model],
+            ln_mem_beta: vec![0.0f32; cfg.swa.d_model],
         };
 
         // ── Extract per-level parameter gradients ───────────────

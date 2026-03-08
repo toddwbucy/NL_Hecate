@@ -70,7 +70,8 @@ fn delta_k1_config(fm: FeatureMapKind) -> MAGConfig {
         intermediate_size: 0,
         m_norm_max: vec![],
         feature_map: fm,
-    }
+            residual: false,
+}
 }
 
 fn make_data(seq_len: usize, vocab: usize) -> (Vec<usize>, Vec<usize>) {

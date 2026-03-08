@@ -67,7 +67,8 @@ struct LevelState {
 /// SWA parameter optimizer state (always updates, not frequency-gated).
 #[derive(Clone)]
 struct SwaState {
-    /// Moment buffers for: w_embed, w_q, w_k, w_v, w_o, w_unembed.
+    /// Moment buffers for: w_embed, w_q, w_k, w_v, w_o, w_unembed,
+    /// ln_attn_gamma, ln_attn_beta, ln_mem_gamma, ln_mem_beta.
     bufs: Vec<MomentBuf>,
     step: u32,
 }
@@ -133,6 +134,10 @@ impl FrequencyAwareAdamW {
                 MomentBuf::zeros(params.swa.w_v.len()),
                 MomentBuf::zeros(params.swa.w_o.len()),
                 MomentBuf::zeros(params.swa.w_unembed.len()),
+                MomentBuf::zeros(params.swa.ln_attn_gamma.len()),
+                MomentBuf::zeros(params.swa.ln_attn_beta.len()),
+                MomentBuf::zeros(params.swa.ln_mem_gamma.len()),
+                MomentBuf::zeros(params.swa.ln_mem_beta.len()),
             ],
             step: 0,
         };
@@ -206,6 +211,10 @@ impl FrequencyAwareAdamW {
             for g in grads.swa.w_v.iter() { norm_sq += (*g as f64) * (*g as f64); }
             for g in grads.swa.w_o.iter() { norm_sq += (*g as f64) * (*g as f64); }
             for g in grads.swa.w_unembed.iter() { norm_sq += (*g as f64) * (*g as f64); }
+            for g in grads.swa.ln_attn_gamma.iter() { norm_sq += (*g as f64) * (*g as f64); }
+            for g in grads.swa.ln_attn_beta.iter() { norm_sq += (*g as f64) * (*g as f64); }
+            for g in grads.swa.ln_mem_gamma.iter() { norm_sq += (*g as f64) * (*g as f64); }
+            for g in grads.swa.ln_mem_beta.iter() { norm_sq += (*g as f64) * (*g as f64); }
             // Level grads
             for lg in grads.levels.iter() {
                 for g in lg.w_k_mem.master().iter() { norm_sq += (*g as f64) * (*g as f64); }
@@ -249,6 +258,10 @@ impl FrequencyAwareAdamW {
                 for g in grads.swa.w_v.iter_mut() { *g *= scale; }
                 for g in grads.swa.w_o.iter_mut() { *g *= scale; }
                 for g in grads.swa.w_unembed.iter_mut() { *g *= scale; }
+                for g in grads.swa.ln_attn_gamma.iter_mut() { *g *= scale; }
+                for g in grads.swa.ln_attn_beta.iter_mut() { *g *= scale; }
+                for g in grads.swa.ln_mem_gamma.iter_mut() { *g *= scale; }
+                for g in grads.swa.ln_mem_beta.iter_mut() { *g *= scale; }
                 for lg in grads.levels.iter_mut() {
                     for g in lg.w_k_mem.master_mut().iter_mut() { *g *= scale; }
                     for g in lg.w_v_mem.master_mut().iter_mut() { *g *= scale; }
@@ -296,6 +309,10 @@ impl FrequencyAwareAdamW {
             (params.swa.w_v.as_mut_slice(), grads.swa.w_v.as_slice()),
             (params.swa.w_o.as_mut_slice(), grads.swa.w_o.as_slice()),
             (params.swa.w_unembed.as_mut_slice(), grads.swa.w_unembed.as_slice()),
+            (params.swa.ln_attn_gamma.as_mut_slice(), grads.swa.ln_attn_gamma.as_slice()),
+            (params.swa.ln_attn_beta.as_mut_slice(), grads.swa.ln_attn_beta.as_slice()),
+            (params.swa.ln_mem_gamma.as_mut_slice(), grads.swa.ln_mem_gamma.as_slice()),
+            (params.swa.ln_mem_beta.as_mut_slice(), grads.swa.ln_mem_beta.as_slice()),
         ];
         for (idx, (p, g)) in swa_pairs.into_iter().enumerate() {
             let buf = &mut self.swa.bufs[idx];

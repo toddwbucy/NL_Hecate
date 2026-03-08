@@ -283,6 +283,7 @@ impl MAGConfig {
         parallel_strategy=None,
         tnt_global_chunk_size=64,
         tnt_local_chunk_size=8,
+        residual=false,
     ))]
     fn new(
         d_model: usize,
@@ -327,6 +328,7 @@ impl MAGConfig {
         parallel_strategy: Option<&str>,
         tnt_global_chunk_size: usize,
         tnt_local_chunk_size: usize,
+        residual: bool,
     ) -> PyResult<Self> {
         if d_model != num_heads * head_dim {
             return Err(PyValueError::new_err(format!(
@@ -546,6 +548,7 @@ impl MAGConfig {
                 intermediate_size,
                 m_norm_max: m_norm_max.unwrap_or_default(),
                 feature_map: fm_kind,
+                residual,
             },
         })
     }
@@ -629,6 +632,9 @@ impl MAGConfig {
             RustFeatureMapKind::ELU => ("elu".to_string(), None),
         }
     }
+
+    #[getter]
+    fn residual(&self) -> bool { self.inner.residual }
 }
 
 // ── MAGParams ──────────────────────────────────────────────────────
@@ -856,6 +862,7 @@ impl MAGForwardCache {
     parallel_strategy=None,
     tnt_global_chunk_size=64,
     tnt_local_chunk_size=8,
+    residual=false,
 ))]
 fn mag_create_config(
     d_model: usize,
@@ -900,6 +907,7 @@ fn mag_create_config(
     parallel_strategy: Option<&str>,
     tnt_global_chunk_size: usize,
     tnt_local_chunk_size: usize,
+    residual: bool,
 ) -> PyResult<MAGConfig> {
     MAGConfig::new(
         d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled,
@@ -910,6 +918,7 @@ fn mag_create_config(
         theta_floor, theta_ceil, intermediate_size, m_norm_max,
         feature_map, feature_map_sigma,
         parallel_strategy, tnt_global_chunk_size, tnt_local_chunk_size,
+        residual,
     )
 }
 

@@ -81,7 +81,8 @@ impl EdgeConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
-        }
+                    residual: false,
+}
     }
 
     /// Micro model: d=64, 4 heads, seq=16, vocab=256, k=1 DeltaRule MAG.

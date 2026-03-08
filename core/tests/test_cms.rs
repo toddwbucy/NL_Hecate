@@ -227,7 +227,8 @@ fn test_k2_beats_k1() {
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
 
-        };
+        residual: false,
+};
     // k=2 config
     let cfg_k2 = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
@@ -257,7 +258,8 @@ fn test_k2_beats_k1() {
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
 
-        };
+        residual: false,
+};
 
     let input_ids: Vec<usize> = (0..swa.seq_len).map(|t| t % swa.vocab_size).collect();
     let target_ids: Vec<usize> = (1..=swa.seq_len).map(|t| t % swa.vocab_size).collect();
@@ -451,7 +453,8 @@ fn test_k4_vs_k2_multiscale() {
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
 
-        };
+        residual: false,
+};
     let cfg_k4 = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
         memory_rule: MemoryRuleKind::DeltaRule,
@@ -480,7 +483,8 @@ fn test_k4_vs_k2_multiscale() {
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
 
-        };
+        residual: false,
+};
 
     let slow_period = 8;
     let num_regimes = 4;
@@ -586,7 +590,8 @@ fn test_k4_diagnostics() {
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
 
-        };
+        residual: false,
+};
 
     let (input_ids, target_ids) = make_multiscale_data(
         cfg.swa.seq_len, cfg.swa.vocab_size, 8, 4, 42,
@@ -870,7 +875,8 @@ fn test_cms_stability_boundary() {
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
 
-        };
+        residual: false,
+};
     let cfg_k2 = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
         memory_rule: MemoryRuleKind::DeltaRule,
@@ -899,7 +905,8 @@ fn test_cms_stability_boundary() {
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
 
-        };
+        residual: false,
+};
 
     let slow_period = 8;
     let num_regimes = 4;
@@ -1102,7 +1109,8 @@ fn test_k4_normalization_magnitude() {
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
 
-        };
+        residual: false,
+};
     let params_k4 = MAGParams::init(&cfg_k4, 42);
     let mut context = ContextState::new(cfg_k4.k, cfg_k4.swa.d_model);
     let pulse = Pulse { global_step: 0, active_levels: vec![true, true, true, true] };
@@ -1184,7 +1192,8 @@ fn test_k4_uniform_init_stable() {
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
 
-        };
+        residual: false,
+};
 
     let (input_ids, target_ids) = make_multiscale_data(
         cfg.swa.seq_len, cfg.swa.vocab_size, 8, 4, 42,
@@ -1252,7 +1261,8 @@ fn test_k4_normalized_stable() {
             m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
 
-        };
+        residual: false,
+};
 
     let (input_ids, target_ids) = make_multiscale_data(
         swa.seq_len, swa.vocab_size, 8, 4, 42,

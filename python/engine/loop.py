@@ -196,6 +196,10 @@ def run_build(bcfg: BuildConfig):
             else:
                 # Push-up: use canonical template (levels shift frequencies)
                 new_chunks = chunk_template[:target_k]
+            # Extend m_norm_max to target_k if needed
+            ext_m_norm = bcfg.m_norm_max
+            if ext_m_norm is not None and len(ext_m_norm) < target_k:
+                ext_m_norm = list(ext_m_norm) + [ext_m_norm[-1]] * (target_k - len(ext_m_norm))
             # Rebuild MAGConfig with the new k (carry all other fields from loaded cfg)
             new_cfg = nl_hecate.MAGConfig(
                 d_model=cfg.d_model, num_heads=cfg.num_heads,
@@ -223,22 +227,15 @@ def run_build(bcfg: BuildConfig):
                 intermediate_size=bcfg.intermediate_size,
                 theta_floor=bcfg.theta_floor,
                 theta_ceil=bcfg.theta_ceil,
-                m_norm_max=bcfg.m_norm_max,
+                m_norm_max=ext_m_norm,
                 parallel_strategy=(
                     bcfg.parallel_strategy
                     if bcfg.parallel_strategy is not None
                     else getattr(cfg, "parallel_strategy", None)
                 ),
-                tnt_global_chunk_size=(
-                    bcfg.tnt_global_chunk_size
-                    if bcfg.tnt_global_chunk_size is not None
-                    else getattr(cfg, "tnt_global_chunk_size", None)
-                ),
-                tnt_local_chunk_size=(
-                    bcfg.tnt_local_chunk_size
-                    if bcfg.tnt_local_chunk_size is not None
-                    else getattr(cfg, "tnt_local_chunk_size", None)
-                ),
+                tnt_global_chunk_size=bcfg.tnt_global_chunk_size,
+                tnt_local_chunk_size=bcfg.tnt_local_chunk_size,
+                residual=bcfg.residual,
             )
             if bcfg.push_up:
                 params = nl_hecate.extend_params_push_up(params, new_cfg, bcfg.seed)
@@ -253,6 +250,10 @@ def run_build(bcfg: BuildConfig):
                       "set one of them to true")
                 return
             cfg = new_cfg
+            bcfg.k = target_k
+            bcfg.chunk_sizes = new_chunks
+            if ext_m_norm is not None:
+                bcfg.m_norm_max = ext_m_norm
             resume_step = 0
             build_state = None
 
@@ -336,6 +337,7 @@ def run_build(bcfg: BuildConfig):
                     if bcfg.tnt_local_chunk_size is not None
                     else getattr(cfg, "tnt_local_chunk_size", None)
                 ),
+                residual=bcfg.residual,
             )
     else:
         cfg = nl_hecate.MAGConfig(
@@ -365,6 +367,7 @@ def run_build(bcfg: BuildConfig):
             parallel_strategy=bcfg.parallel_strategy,
             tnt_global_chunk_size=bcfg.tnt_global_chunk_size,
             tnt_local_chunk_size=bcfg.tnt_local_chunk_size,
+            residual=bcfg.residual,
         )
         params = nl_hecate.mag_init_params(cfg, bcfg.seed)
         if bcfg.donor_weights is not None:
@@ -563,6 +566,12 @@ def run_build(bcfg: BuildConfig):
     _sat_peak: list[float] = [0.0] * bcfg.k
     _sat_below_count: list[int] = [0] * bcfg.k
     _sat_announced: list[bool] = [False] * bcfg.k  # fire once per level
+    _last_promotion_step: int = resume_step  # auto-promote cooldown anchor
+    # Ratio-stability promotion: track rolling ratio history for stdev computation.
+    # Promotion fires when stdev(ratio) < threshold for `streak` consecutive samples.
+    _sat_ratio_history: list[deque] = [
+        deque(maxlen=bcfg.promotion_stability_window) for _ in range(bcfg.k)]
+    _sat_stability_streak: list[int] = [0] * bcfg.k
     # Initial per-level M norms captured before training for drift tracking.
     # Captured here (pre-loop) so it reflects the true restored/initialized state,
     # not state after the first optimizer step.
@@ -664,6 +673,7 @@ def run_build(bcfg: BuildConfig):
                     parallel_strategy=bcfg.parallel_strategy,
                     tnt_global_chunk_size=bcfg.tnt_global_chunk_size,
                     tnt_local_chunk_size=bcfg.tnt_local_chunk_size,
+                    residual=bcfg.residual,
                 )
         elif (bcfg.gate_warmup_theta_floor_init is not None
               and step == bcfg.gate_warmup_decay_steps):
@@ -694,6 +704,7 @@ def run_build(bcfg: BuildConfig):
                     parallel_strategy=bcfg.parallel_strategy,
                     tnt_global_chunk_size=bcfg.tnt_global_chunk_size,
                     tnt_local_chunk_size=bcfg.tnt_local_chunk_size,
+                    residual=bcfg.residual,
                 )
 
         use_cosine = (adamw_opt is not None or use_adamw_gpu)
@@ -774,6 +785,42 @@ def run_build(bcfg: BuildConfig):
                         saturation_ema=sat_ema_snap,
                         saturation_ratio=sat_ratio_snap,
                     )
+                # Auto-promote: track L0 ratio stability when slow levels don't fire (k<3)
+                if bcfg.auto_promote and not slow_level_fires:
+                    for i, g in enumerate(level_gnorms):
+                        if i < bcfg.k and i < len(pulse.active_levels) and pulse.active_levels[i]:
+                            _sat_ema[i] = (bcfg.saturation_ema_alpha * g
+                                           + (1 - bcfg.saturation_ema_alpha) * _sat_ema[i])
+                            _sat_peak[i] = max(_sat_peak[i], _sat_ema[i])
+                            ratio = (_sat_ema[i] / _sat_peak[i]
+                                     if _sat_peak[i] > 1e-10 else 1.0)
+                            _sat_ratio_history[i].append(ratio)
+                            # Stability check: trimmed stdev of ratio window.
+                            # Trim top/bottom 10% to filter gnorm outliers from
+                            # mixed-difficulty data (easy boilerplate vs hard passages).
+                            if len(_sat_ratio_history[i]) >= bcfg.promotion_stability_window:
+                                rh = sorted(_sat_ratio_history[i])
+                                trim_n = max(1, len(rh) // 10)
+                                rh = rh[trim_n:-trim_n]
+                                mean_r = sum(rh) / len(rh)
+                                var_r = sum((x - mean_r) ** 2 for x in rh) / (len(rh) - 1)
+                                stdev_r = var_r ** 0.5
+                                if stdev_r < bcfg.promotion_stability_threshold:
+                                    _sat_stability_streak[i] += 1
+                                else:
+                                    _sat_stability_streak[i] = 0
+                                if (_sat_stability_streak[i] >= bcfg.promotion_stability_streak
+                                        and not _sat_announced[i]):
+                                    _sat_announced[i] = True
+                                    if jsonl:
+                                        jsonl.log(
+                                            event="level_plateau",
+                                            step=step, level=i,
+                                            ratio_stdev=round(stdev_r, 6),
+                                            ratio_mean=round(mean_r, 4),
+                                            peak_gnorm=round(_sat_peak[i], 8),
+                                            ema_gnorm=round(_sat_ema[i], 8),
+                                        )
         elif gpu_model is not None and adamw_opt is None:
             loss = gpu_model.step(input_ids, target_ids, pulse, current_lr)
         elif gpu_model is not None and adamw_opt is not None:
@@ -1235,6 +1282,117 @@ def run_build(bcfg: BuildConfig):
                 finally:
                     full_restore(gpu_model, ckpt_snapshot)
                     gpu_model.reset_optimizer()  # probes corrupt AdamW moments
+
+        # ── Auto-promotion: L0 saturated → push up to k+1 ──────────
+        if (bcfg.auto_promote and _sat_announced[0]
+                and bcfg.k < bcfg.target_k
+                and step - _last_promotion_step >= bcfg.promotion_cooldown):
+            old_k = bcfg.k
+            new_k = old_k + 1
+            print(f"\n{'=' * 60}")
+            print(f"  AUTO-PROMOTION: L0 saturated at step {step}")
+            print(f"  Extending k={old_k} → k={new_k}")
+            print(f"{'=' * 60}")
+
+            # Save pre-promotion checkpoint
+            params = gpu_model.to_host_params()
+            promo_ctx = gpu_model.to_host_context()
+            p = Path(_safetensors_path(bcfg.save_path))
+            promo_ckpt = str(p.with_stem(f"{p.stem}_pre_k{new_k}_step{step}"))
+            os.makedirs(os.path.dirname(promo_ckpt) or ".", exist_ok=True)
+            nl_hecate.save_checkpoint_with_context(
+                promo_ckpt, params, cfg, conductor, promo_ctx)
+            if active_loader is not None:
+                Path(str(promo_ckpt) + ".cursor.json").write_text(
+                    json.dumps(active_loader.cursor(), indent=2))
+            print(f"  Checkpoint: {promo_ckpt}")
+
+            if jsonl:
+                cursor_pos = (active_loader.cursor()["position"]
+                              if active_loader is not None else 0)
+                jsonl.log(event="auto_promotion", step=step,
+                          old_k=old_k, new_k=new_k,
+                          cursor_position=cursor_pos,
+                          saturation_ema=list(_sat_ema[:old_k]),
+                          saturation_peak=list(_sat_peak[:old_k]))
+
+            # Build new MAGConfig(k+1)
+            chunk_template = [1, 8, 64, 512]
+            new_chunks = chunk_template[:new_k]
+            new_m_norm = None
+            if bcfg.m_norm_max is not None:
+                new_m_norm = list(bcfg.m_norm_max) + [bcfg.m_norm_max[-1]]
+            new_cfg = nl_hecate.MAGConfig(
+                d_model=cfg.d_model, num_heads=cfg.num_heads,
+                head_dim=cfg.head_dim, seq_len=cfg.seq_len,
+                window_size=cfg.window_size, vocab_size=cfg.vocab_size,
+                memory_enabled=cfg.memory_enabled, k=new_k,
+                chunk_sizes=new_chunks,
+                memory_rule=cfg.memory_rule, composition=cfg.composition,
+                checkpoint_interval=bcfg.checkpoint_interval,
+                projection_kind=cfg.projection_kind,
+                self_generated_values=cfg.self_generated_values,
+                self_ref_chunk_size=cfg.self_ref_chunk_size,
+                momentum_kind=cfg.momentum_kind,
+                momentum_d_hidden=cfg.momentum_d_hidden,
+                attentional_bias=getattr(cfg, "attentional_bias", None),
+                retention=getattr(cfg, "retention", None),
+                intermediate_size=bcfg.intermediate_size,
+                theta_floor=None, theta_ceil=None,
+                m_norm_max=new_m_norm,
+                parallel_strategy=getattr(cfg, "parallel_strategy", None),
+                tnt_global_chunk_size=bcfg.tnt_global_chunk_size,
+                tnt_local_chunk_size=bcfg.tnt_local_chunk_size,
+                residual=bcfg.residual,
+            )
+
+            # Push-up: shift trained levels to slower frequencies, fresh L0
+            params = nl_hecate.extend_params_push_up(params, new_cfg, bcfg.seed)
+            cfg = new_cfg
+            print(f"  Push-up complete: chunks={new_chunks}")
+
+            # Rebuild GPU model (fresh optimizer state for new parameter layout)
+            del gpu_model
+            gc.collect()
+            periodic = (bcfg.memory_reset == "periodic")
+            gpu_model = nl_hecate.GpuModel.from_params(
+                params, cfg, batch_size=bcfg.batch_size, memory_reset=periodic)
+
+            # Fresh conductor and context for new k
+            conductor = nl_hecate.Conductor(new_k, new_chunks)
+            context = nl_hecate.ContextState(new_k, bcfg.d_model)
+            error_buffers = nl_hecate.ErrorBufferList(new_k, bcfg.d_model)
+
+            # Update config state
+            bcfg.k = new_k
+            bcfg.chunk_sizes = new_chunks
+            if new_m_norm is not None:
+                bcfg.m_norm_max = new_m_norm
+
+            # Reset all per-level tracking for new k
+            _sat_ema = [0.0] * new_k
+            _sat_peak = [0.0] * new_k
+            _sat_below_count = [0] * new_k
+            _sat_announced = [False] * new_k
+            _sat_ratio_history = [
+                deque(maxlen=bcfg.promotion_stability_window) for _ in range(new_k)]
+            _sat_stability_streak = [0] * new_k
+            _last_promotion_step = step
+            level_gnorm_history = [deque(maxlen=_DEAD_LEVEL_WINDOW) for _ in range(new_k)]
+            level_fire_counts = [0] * new_k
+            level_gnorms = []
+            if hasattr(gpu_model, "memory_norms"):
+                level_param_norms_init = list(gpu_model.memory_norms())
+            if new_k >= 4:
+                level3_total_fires = 0
+                level3_active_fires = 0
+                level3_prev_fires = 0
+                level3_prev_active = 0
+
+            if active_loader is not None:
+                cursor = active_loader.cursor()
+                print(f"  Data cursor: {cursor['position']:,} (continues naturally)")
+            print(f"  Promotion complete, continuing at step {step + 1}\n")
 
     t_end = time.perf_counter()
     elapsed = t_end - t_start

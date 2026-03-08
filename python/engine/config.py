@@ -137,6 +137,17 @@ class BuildConfig:
     stack_up: bool = False            # Keep existing levels, add fresh level at top
     data_seek: int | None = None      # Override data cursor to this token position
 
+    # Auto-promotion (specs/infrastructure/12_metric_driven_promotion.md)
+    auto_promote: bool = False       # Enable convergence-driven level promotion
+    target_k: int = 4                # Maximum k to promote to
+    promotion_cooldown: int = 2000   # Min steps at current k before allowing promotion
+    promotion_stability_window: int = 50   # Ratio samples to compute rolling stdev over
+    promotion_stability_streak: int = 50   # Consecutive low-stdev samples to confirm plateau
+    promotion_stability_threshold: float = 0.025  # Stdev below this = ratio has stabilized
+
+    # Residual stream + pre-LayerNorm (specs/infrastructure/13_residual_stream.md)
+    residual: bool = False  # True = additive residual, no sigmoid gating
+
     # Runtime
     gpu: bool = True  # GPU by default; --cpu to override
     load: str | None = None
@@ -300,6 +311,16 @@ class BuildConfig:
             raise ValueError("stack_up=true requires extend_k to be set")
         if self.data_seek is not None and self.data_seek < 0:
             raise ValueError(f"data_seek must be >= 0, got {self.data_seek}")
+        # Auto-promotion validation
+        if self.auto_promote:
+            if self.target_k < 2:
+                raise ValueError(
+                    f"target_k must be >= 2 for auto_promote, got {self.target_k}")
+            # extend_k is compatible with auto_promote: manual extend at startup,
+            # then auto_promote handles subsequent promotions at runtime
+            if self.promotion_cooldown < 0:
+                raise ValueError(
+                    f"promotion_cooldown must be >= 0, got {self.promotion_cooldown}")
 
     @property
     def head_dim(self) -> int:
@@ -341,8 +362,17 @@ class BuildConfig:
             if "l3_theta_threshold" in gw:
                 flat["gate_warmup_l3_threshold"] = gw["l3_theta_threshold"]
         # Top-level overrides (for flat configs)
+        # promotion section (12_metric_driven_promotion.md)
+        if "promotion" in raw:
+            pm = raw["promotion"]
+            for pk in ("auto_promote", "target_k", "promotion_cooldown",
+                       "promotion_stability_window", "promotion_stability_streak",
+                       "promotion_stability_threshold"):
+                if pk in pm:
+                    flat[pk] = pm[pk]
         for key in list(raw.keys()):
-            if key not in ("model", "build", "data", "gate_warmup", "notes", "description"):
+            if key not in ("model", "build", "data", "gate_warmup", "promotion",
+                           "notes", "description"):
                 flat[key] = raw[key]
         # Rename head_dim if present (derived, not stored)
         flat.pop("head_dim", None)

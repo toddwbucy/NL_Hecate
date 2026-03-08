@@ -438,7 +438,8 @@ fn test_k1_learned_is_noop() {
         intermediate_size: 0,
         m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
-    };
+                residual: false,
+};
     let params = MAGParams::init(&cfg, 42);
     let d = cfg.swa.d_model;
     let input_ids: Vec<usize> = (0..cfg.swa.seq_len).collect();
@@ -573,7 +574,8 @@ fn test_anneal_uses_fixed_schedule() {
         intermediate_size: 0,
         m_norm_max: vec![],
             feature_map: FeatureMapKind::Identity,
-    };
+                residual: false,
+};
 
     let params = MAGParams::init(&cfg, 42);
     let d = cfg.swa.d_model;
