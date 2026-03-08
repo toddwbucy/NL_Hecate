@@ -32,6 +32,10 @@ struct MomentSWA {
     m_v: GpuBuf<f32>,       v_v: GpuBuf<f32>,
     m_o: GpuBuf<f32>,       v_o: GpuBuf<f32>,
     m_unembed: GpuBuf<f32>, v_unembed: GpuBuf<f32>,
+    m_ln_attn_gamma: GpuBuf<f32>, v_ln_attn_gamma: GpuBuf<f32>,
+    m_ln_attn_beta: GpuBuf<f32>,  v_ln_attn_beta: GpuBuf<f32>,
+    m_ln_mem_gamma: GpuBuf<f32>,  v_ln_mem_gamma: GpuBuf<f32>,
+    m_ln_mem_beta: GpuBuf<f32>,   v_ln_mem_beta: GpuBuf<f32>,
 }
 
 /// First/second moment buffers for one memory level.
@@ -91,6 +95,14 @@ impl GpuAdamWState {
             v_o: GpuBuf::zeros(params.swa.w_o.len()),
             m_unembed: GpuBuf::zeros(params.swa.w_unembed.len()),
             v_unembed: GpuBuf::zeros(params.swa.w_unembed.len()),
+            m_ln_attn_gamma: GpuBuf::zeros(params.swa.ln_attn_gamma.len()),
+            v_ln_attn_gamma: GpuBuf::zeros(params.swa.ln_attn_gamma.len()),
+            m_ln_attn_beta: GpuBuf::zeros(params.swa.ln_attn_beta.len()),
+            v_ln_attn_beta: GpuBuf::zeros(params.swa.ln_attn_beta.len()),
+            m_ln_mem_gamma: GpuBuf::zeros(params.swa.ln_mem_gamma.len()),
+            v_ln_mem_gamma: GpuBuf::zeros(params.swa.ln_mem_gamma.len()),
+            m_ln_mem_beta: GpuBuf::zeros(params.swa.ln_mem_beta.len()),
+            v_ln_mem_beta: GpuBuf::zeros(params.swa.ln_mem_beta.len()),
         };
 
         let levels = params.levels.iter().map(|lp| MomentLevel {
@@ -230,6 +242,14 @@ pub fn gpu_adamw_update(
               lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
     adamw_one(&mut params.swa.w_unembed, &grads.d_w_unembed, &mut s.m_unembed, &mut s.v_unembed,
               lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
+    adamw_one(&mut params.swa.ln_attn_gamma, &grads.d_ln_attn_gamma, &mut s.m_ln_attn_gamma, &mut s.v_ln_attn_gamma,
+              lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
+    adamw_one(&mut params.swa.ln_attn_beta, &grads.d_ln_attn_beta, &mut s.m_ln_attn_beta, &mut s.v_ln_attn_beta,
+              lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
+    adamw_one(&mut params.swa.ln_mem_gamma, &grads.d_ln_mem_gamma, &mut s.m_ln_mem_gamma, &mut s.v_ln_mem_gamma,
+              lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
+    adamw_one(&mut params.swa.ln_mem_beta, &grads.d_ln_mem_beta, &mut s.m_ln_mem_beta, &mut s.v_ln_mem_beta,
+              lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
 
     // ── Per-level memory weights (Pulse-gated) ───────────────────────
     for (i, lg) in grads.levels.iter().enumerate() {
@@ -324,6 +344,10 @@ fn gpu_grad_norm(grads: &GpuMAGGrads, state: &mut GpuAdamWState) -> f32 {
     accum(&grads.d_w_v);
     accum(&grads.d_w_o);
     accum(&grads.d_w_unembed);
+    accum(&grads.d_ln_attn_gamma);
+    accum(&grads.d_ln_attn_beta);
+    accum(&grads.d_ln_mem_gamma);
+    accum(&grads.d_ln_mem_beta);
 
     // Level grads
     for lg in &grads.levels {
@@ -417,6 +441,10 @@ fn gpu_scale_grads(grads: &mut GpuMAGGrads, scale: f32) {
     scale_buf(&mut grads.d_w_v);
     scale_buf(&mut grads.d_w_o);
     scale_buf(&mut grads.d_w_unembed);
+    scale_buf(&mut grads.d_ln_attn_gamma);
+    scale_buf(&mut grads.d_ln_attn_beta);
+    scale_buf(&mut grads.d_ln_mem_gamma);
+    scale_buf(&mut grads.d_ln_mem_beta);
 
     for lg in &mut grads.levels {
         scale_buf(&mut lg.d_w_k_mem);
