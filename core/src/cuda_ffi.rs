@@ -319,6 +319,16 @@ extern "C" {
     /// No-op if m_norm_max <= 0 or >= 1e30.
     pub(crate) fn m_norm_clamp_f32_cuda(m: *mut f32, d: i32, m_norm_max: f32);
 
+    // ── DGD delta norm ───────────────────────────────────────────────
+
+    /// Compute ‖M @ k - v‖₂ — the DGD prediction error norm.
+    /// M is [d,d], k is [d], v is [d]. Writes scalar norm to norm_out[0].
+    /// Source: HOPE (2512.24695) Eq 88 — error = M@k - v
+    pub(crate) fn dgd_delta_norm_cuda(
+        m: *const f32, k: *const f32, v: *const f32,
+        norm_out: *mut f32, d: i32,
+    );
+
     // ── L2 key/query normalization ──────────────────────────────────
 
     /// Normalize each row of x to unit L2 norm in-place.
