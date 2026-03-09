@@ -213,6 +213,9 @@ impl GpuMemoryCache {
     /// Source: HOPE (2512.24695) Eq 88 — error = M@k - v
     /// Spec:   specs/infrastructure/16_dgd_delta_norm_gpu.md
     pub fn dgd_delta_norm(&self, s: usize, d: usize, batch_size: usize) -> f32 {
+        if s == 0 {
+            return 0.0; // No tokens processed, no error to measure
+        }
         // Diagnostic reads batch slot 0 only. Callers must ensure bs==1
         // (gpu_tape_forward_summary guards this at entry).
         debug_assert!(
