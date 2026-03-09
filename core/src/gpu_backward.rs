@@ -31,6 +31,11 @@ pub struct GpuMAGGrads {
     pub d_w_v: GpuBuf<f32>,
     pub d_w_o: GpuBuf<f32>,
     pub d_w_unembed: GpuBuf<f32>,
+    // LayerNorm gradients (residual path only; zeros when residual=false)
+    pub d_ln_attn_gamma: GpuBuf<f32>,
+    pub d_ln_attn_beta: GpuBuf<f32>,
+    pub d_ln_mem_gamma: GpuBuf<f32>,
+    pub d_ln_mem_beta: GpuBuf<f32>,
     // Per-level memory gradients
     pub levels: Vec<GpuLevelGrads>,
     /// Per-level L2 norm of d_y_combined (output gradient entering each level's
@@ -73,6 +78,10 @@ impl GpuMAGGrads {
         self.d_w_v.copy_to_host(&mut result.swa.w_v);
         self.d_w_o.copy_to_host(&mut result.swa.w_o);
         self.d_w_unembed.copy_to_host(&mut result.swa.w_unembed);
+        self.d_ln_attn_gamma.copy_to_host(&mut result.swa.ln_attn_gamma);
+        self.d_ln_attn_beta.copy_to_host(&mut result.swa.ln_attn_beta);
+        self.d_ln_mem_gamma.copy_to_host(&mut result.swa.ln_mem_gamma);
+        self.d_ln_mem_beta.copy_to_host(&mut result.swa.ln_mem_beta);
 
         for (i, lg) in self.levels.iter().enumerate() {
             let lp = &mut result.levels[i];
@@ -157,6 +166,10 @@ pub fn gpu_cms_backward(
         d_w_v: GpuBuf::zeros(d * d),
         d_w_o: GpuBuf::zeros(d * d),
         d_w_unembed: GpuBuf::zeros(d * v),
+        d_ln_attn_gamma: GpuBuf::zeros(d),
+        d_ln_attn_beta: GpuBuf::zeros(d),
+        d_ln_mem_gamma: GpuBuf::zeros(d),
+        d_ln_mem_beta: GpuBuf::zeros(d),
         levels: {
             let inter = if cfg.memory_rule == MemoryRuleKind::SwiGluMlp { cfg.intermediate_size } else { 0 };
             (0..cfg.k).map(|_| GpuLevelGrads::zeros_mlp(d, inter)).collect()
@@ -196,35 +209,67 @@ pub fn gpu_cms_backward(
     );
 
     // ── Stage 5: Output projection backward ──────────────────────────
-    // projected = gated_out @ W_O^T  →  d_gated_out = d_projected @ W_O
     let mut d_gated_out = GpuBuf::zeros(bsd);
-    crate::dispatch::cublas_matmul_dd(
-        &d_projected, &params.swa.w_o, &mut d_gated_out, bs * s, d, d, 0.0,
-    );
 
-    // d_w_o = d_projected^T @ gated_out → [d, bs*s] @ [bs*s, d] = [d, d]
-    gpu_matmul_transa_dd(
-        &d_projected, &cache.gated_out, &mut grads.d_w_o,
-        d, bs * s, d,
-    );
-
-    // ── Stage 4: Gating backward ─────────────────────────────────────
-    // gated_out = attn_out * gate
-    let mut d_attn_out = GpuBuf::zeros(bsd);
-    let mut d_gate = GpuBuf::zeros(bsd);
-    unsafe {
-        crate::cuda_ffi::gating_backward_cuda(
-            d_gated_out.as_ptr(), cache.attn_out.as_ptr(), cache.gate.as_ptr(),
-            d_attn_out.ptr(), d_gate.ptr(), bsd as i32,
+    if cfg.residual {
+        // Residual path: projected = residual_final @ W_O^T
+        // d_residual_final = d_projected @ W_O
+        let residual_final = cache.residual_final.as_ref()
+            .expect("residual_final must be Some when cfg.residual=true");
+        crate::dispatch::cublas_matmul_dd(
+            &d_projected, &params.swa.w_o, &mut d_gated_out, bs * s, d, d, 0.0,
+        );
+        // d_w_o = d_projected^T @ residual_final
+        gpu_matmul_transa_dd(
+            &d_projected, residual_final, &mut grads.d_w_o,
+            d, bs * s, d,
+        );
+    } else {
+        // Legacy path: projected = gated_out @ W_O^T
+        crate::dispatch::cublas_matmul_dd(
+            &d_projected, &params.swa.w_o, &mut d_gated_out, bs * s, d, d, 0.0,
+        );
+        gpu_matmul_transa_dd(
+            &d_projected, &cache.gated_out, &mut grads.d_w_o,
+            d, bs * s, d,
         );
     }
 
-    // d_y_combined = d_gate * gate * (1 - gate)  (sigmoid backward)
-    let mut d_y_combined = GpuBuf::zeros(bsd);
-    unsafe {
-        crate::cuda_ffi::sigmoid_backward_cuda(
-            d_gate.as_ptr(), cache.gate.as_ptr(), d_y_combined.ptr(), bsd as i32,
-        );
+    // ── Stage 4: Gating / residual gradient routing ───────────────────
+    let mut d_attn_out;
+    let d_y_combined;
+
+    if cfg.residual {
+        // Residual path: d_gated_out is d_residual_final
+        // residual_final = residual_after_attn + y_combined (additions)
+        // d_y_combined = d_residual_final (gradient = 1.0 through addition)
+        // d_residual_after_attn = d_residual_final (gradient = 1.0 through addition)
+        d_y_combined = GpuBuf::zeros(bsd);
+        unsafe {
+            crate::cuda_ffi::saxpy_cuda(1.0, d_gated_out.as_ptr(), d_y_combined.ptr(), bsd as i32);
+        }
+        let mut d_residual_after_attn = GpuBuf::zeros(bsd);
+        unsafe {
+            crate::cuda_ffi::saxpy_cuda(1.0, d_gated_out.as_ptr(), d_residual_after_attn.ptr(), bsd as i32);
+        }
+        // We'll use d_residual_after_attn later as d_attn_out (it splits into d_embedded + d_attn_out)
+        d_attn_out = d_residual_after_attn;
+    } else {
+        // Legacy: gated_out = attn_out * gate → gating_backward + sigmoid_backward
+        d_attn_out = GpuBuf::zeros(bsd);
+        let mut d_gate = GpuBuf::zeros(bsd);
+        unsafe {
+            crate::cuda_ffi::gating_backward_cuda(
+                d_gated_out.as_ptr(), cache.attn_out.as_ptr(), cache.gate.as_ptr(),
+                d_attn_out.ptr(), d_gate.ptr(), bsd as i32,
+            );
+        }
+        d_y_combined = GpuBuf::zeros(bsd);
+        unsafe {
+            crate::cuda_ffi::sigmoid_backward_cuda(
+                d_gate.as_ptr(), cache.gate.as_ptr(), d_y_combined.ptr(), bsd as i32,
+            );
+        }
     }
 
     // Scale for 1/sqrt(k) normalization (k>2)
@@ -262,35 +307,64 @@ pub fn gpu_cms_backward(
     }
 
     // ── Stage 3b: Per-level memory backward ──────────────────────────
-    let mut d_embedded_mem = GpuBuf::zeros(bsd);
+    // Memory input source: LN(residual) for residual, embedded for legacy
+    let mem_input_ref = if cfg.residual {
+        cache.ln_mem_out.as_ref().expect("ln_mem_out must be Some when cfg.residual=true")
+    } else {
+        &cache.embedded
+    };
+    let mut d_mem_input = GpuBuf::zeros(bsd);
 
     for level in 0..cfg.k {
         if cache.pulse.active_levels[level] {
             if let Some(ref mem_cache) = cache.memory_caches[level] {
                 let d_emb_level = gpu_memory_backward(
                     &params.levels[level], cfg, mem_cache,
-                    &d_y_combined, &cache.embedded,
+                    &d_y_combined, mem_input_ref,
                     &mut grads.levels[level],
                     s, d, level, bs,
                 );
-                // Accumulate d_embedded contribution
                 unsafe {
-                    crate::cuda_ffi::saxpy_cuda(1.0, d_emb_level.as_ptr(), d_embedded_mem.ptr(), bsd as i32);
+                    crate::cuda_ffi::saxpy_cuda(1.0, d_emb_level.as_ptr(), d_mem_input.ptr(), bsd as i32);
                 }
             }
         } else {
-            // Frozen level: y = q_mem @ M^T → d_q_mem = d_y @ M, d_embedded += d_q_mem @ W_q_mem
             let d_emb_level = gpu_memory_read_only_backward(
                 &params.levels[level], &cache.y_per_level[level],
-                &d_y_combined, &cache.embedded,
+                &d_y_combined, mem_input_ref,
                 &mut grads.levels[level],
-                // For read-only, we need the context M — but we don't have it in cache.
-                // In the full version we'd pass GpuContextState. For now, skip frozen grads.
                 s, d, bs,
             );
             unsafe {
-                crate::cuda_ffi::saxpy_cuda(1.0, d_emb_level.as_ptr(), d_embedded_mem.ptr(), bsd as i32);
+                crate::cuda_ffi::saxpy_cuda(1.0, d_emb_level.as_ptr(), d_mem_input.ptr(), bsd as i32);
             }
+        }
+    }
+
+    // ── LN_mem backward (residual path) ──────────────────────────────
+    if cfg.residual {
+        let residual_after_attn = cache.residual_after_attn.as_ref()
+            .expect("residual_after_attn must be Some");
+        let ln_mem_mean = cache.ln_mem_mean.as_ref().expect("ln_mem_mean");
+        let ln_mem_rstd = cache.ln_mem_rstd.as_ref().expect("ln_mem_rstd");
+        let mut d_residual_from_mem = GpuBuf::zeros(bsd);
+        unsafe {
+            crate::cuda_ffi::layer_norm_backward_cuda(
+                d_mem_input.as_ptr(),
+                residual_after_attn.as_ptr(),
+                params.swa.ln_mem_gamma.as_ptr(),
+                ln_mem_mean.as_ptr(),
+                ln_mem_rstd.as_ptr(),
+                d_residual_from_mem.ptr(),
+                grads.d_ln_mem_gamma.ptr(),
+                grads.d_ln_mem_beta.ptr(),
+                (bs * s) as i32, d as i32,
+            );
+        }
+        // d_attn_out already holds d_residual_after_attn from the addition backward.
+        // Add the LN_mem backward contribution to it.
+        unsafe {
+            crate::cuda_ffi::saxpy_cuda(1.0, d_residual_from_mem.as_ptr(), d_attn_out.ptr(), bsd as i32);
         }
     }
 
@@ -307,20 +381,55 @@ pub fn gpu_cms_backward(
     );
 
     // ── Stage 2a: QKV projection backward ────────────────────────────
-    // d_embedded += d_q @ W_q + d_k @ W_k + d_v @ W_v
+    // QKV source was LN(embedded) for residual, raw embedded for legacy
+    let qkv_source = if cfg.residual {
+        cache.ln_attn_out.as_ref().expect("ln_attn_out must be Some")
+    } else {
+        &cache.embedded
+    };
+    let mut d_qkv_source = GpuBuf::zeros(bsd);
+    crate::dispatch::cublas_matmul_acc_dd(&d_q, &params.swa.w_q, &mut d_qkv_source, bs * s, d, d);
+    crate::dispatch::cublas_matmul_acc_dd(&d_k, &params.swa.w_k, &mut d_qkv_source, bs * s, d, d);
+    crate::dispatch::cublas_matmul_acc_dd(&d_v, &params.swa.w_v, &mut d_qkv_source, bs * s, d, d);
+
+    // d_w_q = d_q^T @ qkv_source
+    gpu_matmul_transa_dd(&d_q, qkv_source, &mut grads.d_w_q, d, bs * s, d);
+    gpu_matmul_transa_dd(&d_k, qkv_source, &mut grads.d_w_k, d, bs * s, d);
+    gpu_matmul_transa_dd(&d_v, qkv_source, &mut grads.d_w_v, d, bs * s, d);
+
+    // ── LN_attn backward (residual path) ─────────────────────────────
     let mut d_embedded = GpuBuf::zeros(bsd);
-    crate::dispatch::cublas_matmul_acc_dd(&d_q, &params.swa.w_q, &mut d_embedded, bs * s, d, d);
-    crate::dispatch::cublas_matmul_acc_dd(&d_k, &params.swa.w_k, &mut d_embedded, bs * s, d, d);
-    crate::dispatch::cublas_matmul_acc_dd(&d_v, &params.swa.w_v, &mut d_embedded, bs * s, d, d);
-
-    // d_w_q = d_q^T @ embedded → [d, bs*s] @ [bs*s, d] = [d, d]
-    gpu_matmul_transa_dd(&d_q, &cache.embedded, &mut grads.d_w_q, d, bs * s, d);
-    gpu_matmul_transa_dd(&d_k, &cache.embedded, &mut grads.d_w_k, d, bs * s, d);
-    gpu_matmul_transa_dd(&d_v, &cache.embedded, &mut grads.d_w_v, d, bs * s, d);
-
-    // Combine d_embedded from attention + memory branches
-    unsafe {
-        crate::cuda_ffi::saxpy_cuda(1.0, d_embedded_mem.as_ptr(), d_embedded.ptr(), bsd as i32);
+    if cfg.residual {
+        // d_qkv_source flows through LN_attn backward to d_embedded
+        let ln_attn_mean = cache.ln_attn_mean.as_ref().expect("ln_attn_mean");
+        let ln_attn_rstd = cache.ln_attn_rstd.as_ref().expect("ln_attn_rstd");
+        unsafe {
+            crate::cuda_ffi::layer_norm_backward_cuda(
+                d_qkv_source.as_ptr(),
+                cache.embedded.as_ptr(),
+                params.swa.ln_attn_gamma.as_ptr(),
+                ln_attn_mean.as_ptr(),
+                ln_attn_rstd.as_ptr(),
+                d_embedded.ptr(),
+                grads.d_ln_attn_gamma.ptr(),
+                grads.d_ln_attn_beta.ptr(),
+                (bs * s) as i32, d as i32,
+            );
+        }
+        // Also add d_attn_out (which is d_residual_after_attn) to d_embedded
+        // because residual_after_attn = embedded + attn_out → d_embedded += d_residual_after_attn
+        unsafe {
+            crate::cuda_ffi::saxpy_cuda(1.0, d_attn_out.as_ptr(), d_embedded.ptr(), bsd as i32);
+        }
+    } else {
+        // Legacy: d_embedded from QKV projections
+        unsafe {
+            crate::cuda_ffi::saxpy_cuda(1.0, d_qkv_source.as_ptr(), d_embedded.ptr(), bsd as i32);
+        }
+        // Combine d_embedded from memory branch (legacy only — residual handles this through LN)
+        unsafe {
+            crate::cuda_ffi::saxpy_cuda(1.0, d_mem_input.as_ptr(), d_embedded.ptr(), bsd as i32);
+        }
     }
 
     // ── Stage 1: Embedding scatter-add ───────────────────────────────
