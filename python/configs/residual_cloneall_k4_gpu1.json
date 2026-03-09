@@ -1,5 +1,5 @@
 {
-  "description": "Arm B: residual=true, auto-promote k=1→k=4, no data rewind on push-up. GPU1.",
+  "description": "Clone-all k=4: copy trained L0 to all 4 levels, warmup to let them reorganize. GPU1.",
   "model": {
     "d_model": 512,
     "num_heads": 8,
@@ -19,25 +19,22 @@
     "lr": 0.0006,
     "steps": 60000,
     "optimizer": "adamw_gpu",
-    "warmup_steps": 500,
+    "warmup_steps": 200,
     "weight_decay": 0.1,
     "beta1": 0.9,
     "beta2": 0.999,
     "max_grad_norm": 1.0,
-    "save_path": "checkpoints/residual_norewind_gpu1.safetensors",
+    "load": "checkpoints/residual_norewind_gpu1_step10000.safetensors",
+    "extend_k": 4,
+    "clone_all": true,
+    "save_path": "checkpoints/residual_cloneall_k4_gpu1.safetensors",
     "save_every": 5000,
-    "log_every": 10,
-    "eval_every": 500,
-    "tape_every": 500,
+    "log_every": 8,
+    "eval_every": 512,
+    "tape_every": 512,
     "eval_max_chunks": 50,
-    "log_file": "runs/residual_norewind_gpu1.jsonl",
+    "log_file": "runs/residual_cloneall_k4_gpu1.jsonl",
     "saturation_window": 50
-  },
-  "promotion": {
-    "auto_promote": true,
-    "target_k": 4,
-    "promotion_cooldown": 2000,
-    "promotion_rewind_pct": 0.0
   },
   "data": {
     "path": "data/dolmino_100b",

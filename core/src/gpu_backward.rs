@@ -78,6 +78,10 @@ impl GpuMAGGrads {
         self.d_w_v.copy_to_host(&mut result.swa.w_v);
         self.d_w_o.copy_to_host(&mut result.swa.w_o);
         self.d_w_unembed.copy_to_host(&mut result.swa.w_unembed);
+        self.d_ln_attn_gamma.copy_to_host(&mut result.swa.ln_attn_gamma);
+        self.d_ln_attn_beta.copy_to_host(&mut result.swa.ln_attn_beta);
+        self.d_ln_mem_gamma.copy_to_host(&mut result.swa.ln_mem_gamma);
+        self.d_ln_mem_beta.copy_to_host(&mut result.swa.ln_mem_beta);
 
         for (i, lg) in self.levels.iter().enumerate() {
             let lp = &mut result.levels[i];

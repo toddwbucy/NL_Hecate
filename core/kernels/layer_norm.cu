@@ -11,6 +11,13 @@
  * Block: (block_dim,) — threads cooperate on the d dimension
  *
  * All fp32 (inner-loop precision requirement).
+ *
+ * OpaqueKey / opaque_adapters registry status:
+ * LayerNorm is intentionally NOT registered in the OpaqueKey/opaque_adapters
+ * registry. It is only used in the non-traced GPU forward path (gpu_forward.rs),
+ * not in traced_forward.rs. The tape/CPU path uses inline Rust LayerNorm
+ * (see mag.rs). If LayerNorm needs tape integration in the future, an
+ * OpaqueKey variant and backward adapter would need to be added to tape.rs.
  */
 
 #include <cuda_runtime.h>
