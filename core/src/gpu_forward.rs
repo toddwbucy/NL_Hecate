@@ -212,11 +212,17 @@ impl GpuMemoryCache {
     ///
     /// Source: HOPE (2512.24695) Eq 88 — error = M@k - v
     /// Spec:   specs/infrastructure/16_dgd_delta_norm_gpu.md
-    pub fn dgd_delta_norm(&self, s: usize, d: usize, _batch_size: usize) -> f32 {
+    pub fn dgd_delta_norm(&self, s: usize, d: usize, batch_size: usize) -> f32 {
+        // Diagnostic reads batch slot 0 only. Callers must ensure bs==1
+        // (gpu_tape_forward_summary guards this at entry).
+        debug_assert!(
+            batch_size <= 1,
+            "dgd_delta_norm only reads batch slot 0; caller must ensure batch_size <= 1 (got {})",
+            batch_size
+        );
         let dd = d * d;
 
         // Helper: compute ‖M @ k - v‖₂ from GPU buffers.
-        // Uses batch element 0 only (diagnostic reads the first/only batch slot).
         let compute_norm = |m_ptr: *const f32, k_ptr: *const f32, v_ptr: *const f32| -> f32 {
             let mut norm_out = GpuBuf::<f32>::zeros(1);
             unsafe {

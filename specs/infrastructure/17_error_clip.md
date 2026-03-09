@@ -86,9 +86,12 @@ this because it constrains total energy, not directional concentration.
 After computing `error_buf[row] = prediction[row] - v_t[row]` and before
 the M-update outer product, insert:
 
-```text
-if ‖error_buf‖₂ > error_clip:
-    error_buf *= error_clip / ‖error_buf‖₂
+```rust
+let norm = error_buf.iter().map(|e| e * e).sum::<f32>().sqrt();
+if norm > error_clip {
+    let scale = error_clip / norm;
+    for e in error_buf.iter_mut() { *e *= scale; }
+}
 ```
 
 This bounds the M-update:
@@ -257,6 +260,11 @@ When omitted or empty: no clipping (backward compatible).
    GPU backward matches FD within 10% tolerance
 5. **Zero overhead when disabled**: benchmark with error_clip=0.0 shows
    identical tok/s to current builds
+6. **Per-token clip**: inject a synthetic sequence where tokens 0..s/2 have
+   ‖e_t‖ < error_clip (should pass through unchanged) and tokens s/2..s have
+   ‖e_t‖ >> error_clip (should be rescaled to error_clip).  Dump error_buf
+   norms before/after the clip block via a debug kernel; verify the bound
+   holds at every token position, not just the last
 
 ---
 

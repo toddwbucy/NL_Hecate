@@ -17,8 +17,9 @@ CONTRACT
 
   Guarantees: - Per-(block, level) dgd_delta_norm in tape summary dict (replaces 0.0 placeholder)
               - GPU-only: no PCIe transfer of error vectors, only final scalar norms
-              - Norm computed from the LAST token's error in each level's forward pass
-                (the most diagnostic: it reflects M's state after processing the full sequence)
+              - Norm computed from the LAST token's PRE-UPDATE error:
+                ‖M_{s-1} @ k_{s-1} - v_{s-1}‖₂ (the error that drove the final M-update,
+                using M's state BEFORE the last update — not the post-update M_s)
               - CPU tape path (obs::DGD_DELTA) unchanged — still captures full error buffer
               - Forward kernel output buffer is OPTIONAL: controlled by non-null pointer
                 (zero overhead when diagnostic is off)
@@ -184,7 +185,7 @@ on the GPU path) is now populated with the actual norm:
             "levels": [
                 {
                     "level": 0,
-                    "gnorm": 0.020020,
+                    "output_grad_norm": 0.020020,
                     "m_norm": 0.9344,
                     "dgd_delta_norm": 1.2345,   # ◀─── was 0.0, now real
                     "opaque_key": "Titans",
@@ -256,9 +257,9 @@ def print_stacked_tape_summary(tape_summary: dict, step: int) -> None:
         {
             "block_index": 0,
             "levels": [
-                {"level": 0, "gnorm": 0.020, "m_norm": 0.93,
+                {"level": 0, "output_grad_norm": 0.020, "m_norm": 0.93,
                  "dgd_delta_norm": 1.23},
-                {"level": 1, "gnorm": 0.018, "m_norm": 0.33,
+                {"level": 1, "output_grad_norm": 0.018, "m_norm": 0.33,
                  "dgd_delta_norm": 0.87},
                 ...
             ]
