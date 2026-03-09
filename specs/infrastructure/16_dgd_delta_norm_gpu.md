@@ -72,7 +72,7 @@ but the GPU tape returns `dgd_delta_norm: 0.0` as a placeholder. This spec fills
 
 From HOPE (2512.24695) Eq 88 / Eq 121, the DGD update:
 
-```
+```text
 M_{t+1} = (1 - α_t) · M_t - θ_t · (M_t @ k_t - v_t) @ k_t^T
                                 ^^^^^^^^^^^^^^^^
                                   error vector e_t
@@ -87,202 +87,94 @@ window before it's consumed by the M-update. We compute its norm in that window.
 
 ---
 
-## 2. Architecture: Side-Channel Norm Output
+## 2. Architecture: Separate Post-Pass Kernel + Cache Extractor
 
-### 2.1 Kernel Signature Change
+### 2.1 Design Decision: Post-Pass Over In-Kernel
 
-Add an optional output pointer to both forward kernels:
+The original spec proposed adding `delta_norm_out` to the forward kernel signatures.
+The implementation chose a **separate post-pass kernel** instead, for three reasons:
 
-```cuda
-// titans_forward_kernel — MODIFIED signature
-__global__ void titans_forward_kernel(
-    const float* __restrict__ k_mem,      // [batch_size, seq_len, d]
-    const float* __restrict__ v_mem,      // [batch_size, seq_len, d]
-    const float* __restrict__ q_mem,      // [batch_size, seq_len, d]
-    const float* __restrict__ alpha,      // [batch_size, seq_len]
-    const float* __restrict__ theta,      // [batch_size, seq_len]
-    const float* __restrict__ eta,        // [batch_size, seq_len]
-    const float* __restrict__ m_initial,  // [batch_size, d*d]
-    const float* __restrict__ s_initial,  // [batch_size, d*d]
-    float* __restrict__ m_states,         // [batch_size, (seq_len+1)*d*d]
-    float* __restrict__ s_states,         // [batch_size, (seq_len+1)*d*d]
-    float* __restrict__ y,                // [batch_size, seq_len, d]
-    float* __restrict__ delta_norm_out,   // [batch_size] or NULL  ◀─── NEW
-    int seq_len, int d)
-```
+1. **Zero impact on forward kernels**: The Titans/DGD/Delta forward kernels are
+   performance-critical and already register-heavy. Adding a conditional norm
+   reduction inside the token loop risks register spills and instruction cache
+   pressure even when the diagnostic is off.
+2. **Simpler maintenance**: Forward kernel signatures are shared across full-trajectory,
+   checkpointed, and segment-based variants (12 kernels). Adding a parameter to all
+   12 would be high-touch. The post-pass kernel is a single function.
+3. **Cache already stores M and k/v**: The `GpuMemoryCache` variants retain `m_states`
+   (or `m_checkpoints`) and `k_mem`/`v_mem` from the forward pass. Computing
+   `‖M@k - v‖₂` from these buffers after the forward is complete requires no
+   additional data flow — just a separate kernel invocation.
 
-When `delta_norm_out == NULL`, no norm computation occurs — identical to current behavior.
-When non-null, the kernel writes `‖error_{seq_len-1}‖₂` (last token's error norm) for
-each batch element.
+### 2.2 Post-Pass Kernel: `dgd_delta_norm_cuda`
 
-Same change for `dgd_forward_kernel` (unbatched: `delta_norm_out` is `float*` to a single float, or NULL).
-
-### 2.2 Norm Computation in Token Loop
-
-After `error_buf` is populated (line 194 in titans_forward.cu), and only on the
-**last token** (`t == seq_len - 1`), compute the L2 norm:
+Implemented in `core/kernels/elementwise.cu`:
 
 ```cuda
-// After error computation, before M-update
-// Only on last token — the most diagnostic error sample
-if (t == seq_len - 1 && delta_norm_out != NULL) {
-    // Parallel sum-of-squares reduction using shared memory
-    // error_buf[d] already in smem — reuse prediction[] as scratch
-    float local_sq = 0.0f;
-    for (int row = tid; row < d; row += blockDim.x) {
-        local_sq += error_buf[row] * error_buf[row];
-    }
-
-    // Warp reduction
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-        local_sq += __shfl_down_sync(0xFFFFFFFF, local_sq, offset);
-    }
-
-    // Inter-warp reduction via shared memory (reuse prediction[] as scratch)
-    int warp_id = tid / warpSize;
-    int lane = tid % warpSize;
-    if (lane == 0) prediction[warp_id] = local_sq;
-    __syncthreads();
-
-    // Final reduce in warp 0
-    if (warp_id == 0) {
-        float val = (lane < (blockDim.x + warpSize - 1) / warpSize)
-                    ? prediction[lane] : 0.0f;
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-            val += __shfl_down_sync(0xFFFFFFFF, val, offset);
-        }
-        if (lane == 0) {
-            delta_norm_out[b] = sqrtf(val);  // L2 norm
-        }
-    }
-    __syncthreads();
-}
+// Single-block kernel: computes ‖M @ k - v‖₂
+// M is [d,d], k is [d], v is [d]. Writes scalar to norm_out[0].
+extern "C" void dgd_delta_norm_cuda(
+    const float* M, const float* k, const float* v,
+    float* norm_out, int d)
 ```
 
-Key design choices:
-- **Last token only**: The error after processing the full sequence is the most
-  meaningful diagnostic. Per-token norms would require `seq_len × batch_size` output
-  floats — overkill for NaN tracing.
-- **Reuse `prediction[]` as scratch**: After the error is computed, `prediction[]` is
-  dead until the next token. Safe to use for the reduction without additional smem.
-- **Warp shuffle + smem**: Standard two-phase reduction pattern. At d=512, blockDim=1024,
-  this is 32 warps → ~5 smem entries → negligible.
+Algorithm:
+1. **Matvec**: `prediction[row] = M[row,:] · k` (strided, shared memory)
+2. **Error + sum-of-squares**: `local_sq += (prediction[row] - v[row])²`
+3. **Warp reduction**: `__shfl_down_sync` within each warp
+4. **Inter-warp reduction**: via shared memory scratch (reuses `prediction[]`)
+5. **Final output**: `norm_out[0] = sqrt(total)`
 
-### 2.3 Checkpointed Forward Variants
+Block size is rounded up to the nearest warp boundary to ensure full-warp
+shuffle semantics. Single block launch — sufficient for d ≤ 1024.
 
-The checkpointed forward kernels (`titans_forward_ckpt_kernel`, `dgd_forward_ckpt_kernel`)
-have the same token loop structure. Apply the identical norm computation on the last
-token of the LAST chunk (the chunk containing `seq_len - 1`).
+### 2.3 Cache-Side Extractor: `GpuMemoryCache::dgd_delta_norm()`
 
-For the segment-based variants (TNT chunkwise), the error of the last token in the
-last segment is used. This is slightly different from the full-trajectory last token
-but still diagnostically meaningful.
+Implemented in `core/src/gpu_forward.rs` as a method on `GpuMemoryCache`.
+Extracts M, k, v from the forward cache and calls `dgd_delta_norm_cuda`:
+
+- **Delta / DGD / Titans**: Uses pre-update `M_{s-1}` at offset `(s-1)*dd` in
+  `m_states`, with `k_{s-1}` and `v_{s-1}`. This matches the error that drove
+  the final M-update: `e_{s-1} = M_{s-1} @ k_{s-1} - v_{s-1}`.
+- **Checkpointed variants** (DeltaCkpt / DGDCkpt / TitansCkpt): Uses the
+  second-to-last checkpoint as an approximation of the pre-update M. Exact when
+  `s` falls on a checkpoint boundary; at most `checkpoint_interval` tokens stale
+  otherwise. This is acceptable for a diagnostic signal.
+- **TNT**: Iterates shard inner caches, calls `dgd_delta_norm` recursively on each
+  shard's Titans/Delta cache, returns max across all shards.
+- **Hebbian / SwiGlu**: Returns 0.0 (no error vector in these rules).
+
+### 2.4 Wiring: GPU Tape Summary
+
+In `python/src/lib.rs`, `gpu_tape_forward_summary()` calls
+`cache.memory_caches[level].dgd_delta_norm(s, d, bs)` after the diagnostic
+forward pass and populates the `dgd_delta_norm` field in the returned dict.
+No forward kernel signature changes required.
 
 ---
 
-## 3. Rust FFI Changes
+## 4. Integration with Tape Summary
 
-### 3.1 C Wrapper Signatures
+### 4.1 GpuModel::gpu_tape_forward_summary()
 
-```c
-// In core/kernels/titans_forward.cu (C wrapper)
-extern "C" void titans_forward_cuda(
-    const float* k, const float* v, const float* q,
-    const float* alpha, const float* theta, const float* eta,
-    const float* m_init, const float* s_init,
-    float* m_states, float* s_states, float* y,
-    float* delta_norm_out,   // NULL disables norm output
-    int batch_size, int seq_len, int d)
-
-// In core/kernels/dgd_forward.cu (C wrapper)
-extern "C" void dgd_forward_cuda(
-    const float* k, const float* v, const float* q,
-    const float* alpha, const float* theta,
-    const float* m_init,
-    float* m_states, float* y,
-    float* delta_norm_out,   // NULL disables norm output
-    int seq_len, int d)
-```
-
-### 3.2 Rust cuda_ffi Bindings
+The GPU tape summary runs a diagnostic forward+backward. After the forward pass,
+the cache-side extractor computes `dgd_delta_norm` from the retained M and k/v
+buffers. No forward kernel signature changes needed — the norm is a post-pass
+computation on cached data.
 
 ```rust
-// In core/src/cuda_ffi.rs
-extern "C" {
-    pub fn titans_forward_cuda(
-        k: *const f32, v: *const f32, q: *const f32,
-        alpha: *const f32, theta: *const f32, eta: *const f32,
-        m_init: *const f32, s_init: *const f32,
-        m_states: *mut f32, s_states: *mut f32, y: *mut f32,
-        delta_norm_out: *mut f32,  // null_mut() disables
-        batch_size: i32, seq_len: i32, d: i32,
-    );
-
-    pub fn dgd_forward_cuda(
-        k: *const f32, v: *const f32, q: *const f32,
-        alpha: *const f32, theta: *const f32,
-        m_init: *const f32,
-        m_states: *mut f32, y: *mut f32,
-        delta_norm_out: *mut f32,  // null_mut() disables
-        seq_len: i32, d: i32,
-    );
-}
-```
-
-### 3.3 Forward Call Sites
-
-In `gpu_forward.rs` and `gpu_stacked_forward.rs`, the forward dispatch currently
-passes the existing arguments. Change to:
-
-```rust
-// Normal training step — no delta norm needed
-unsafe {
-    titans_forward_cuda(
-        /* existing args... */
-        std::ptr::null_mut(),  // delta_norm_out = NULL → no overhead
-        batch_size, seq_len, d,
-    );
-}
-
-// Diagnostic tape step — capture delta norm
-let mut delta_norm_buf = GpuBuf::<f32>::zeros(batch_size);
-unsafe {
-    titans_forward_cuda(
-        /* existing args... */
-        delta_norm_buf.ptr(),  // non-NULL → kernel computes norm
-        batch_size, seq_len, d,
-    );
-}
-// Read back the single float per batch element
-let mut delta_norms = vec![0.0f32; batch_size];
-delta_norm_buf.copy_to_host(&mut delta_norms);
-// delta_norms[0] = ‖error_{last_token}‖₂ for batch element 0
-```
-
----
-
-## 4. Integration with Stacked Tape Summary
-
-### 4.1 GpuStackedModel::gpu_stacked_tape_summary()
-
-Currently (spec 15 implementation), the tape summary method runs a diagnostic
-forward+backward. Modify the diagnostic forward to pass non-null `delta_norm_out`:
-
-```rust
-// In python/src/lib.rs, gpu_stacked_tape_summary()
-// For each block b, for each active level l:
-//   Run forward with delta_norm_out enabled
-//   Read back delta_norm scalar
-//   Store in tape dict as dgd_delta_norm
-
-// The forward call already dispatches per-level to Titans/DGD kernel.
-// Just pass the delta_norm_out pointer on diagnostic calls.
+// In python/src/lib.rs, gpu_tape_forward_summary()
+let delta_norm = cache.memory_caches[level]
+    .as_ref()
+    .map(|mc| mc.dgd_delta_norm(s, d, bs))
+    .unwrap_or(0.0);
+ldict.set_item("dgd_delta_norm", delta_norm)?;
 ```
 
 ### 4.2 Dict Schema Update
 
-The `dgd_delta_norm` field in the tape summary dict (currently hardcoded to 0.0 on
-GPU path) gets populated:
+The `dgd_delta_norm` field in the tape summary dict (previously hardcoded to 0.0
+on the GPU path) is now populated with the actual norm:
 
 ```python
 {
@@ -389,41 +281,33 @@ The `delta_norm_out` mechanism applies to any rule that computes `error = M@k - 
 For Hebbian levels, `dgd_delta_norm` remains 0.0 (no error vector exists).
 For MLP rules, a future spec could expose the MLP's internal loss as the diagnostic.
 
-The kernel-level NULL-pointer guard ensures zero overhead for rules that don't compute
-an error vector.
+The cache extractor returns 0.0 for these variants — zero overhead.
 
 ---
 
-## 7. Files to Create/Modify
+## 7. Files Modified
 
 | File | Change |
 |---|---|
-| `core/kernels/titans_forward.cu` | Add `delta_norm_out` parameter; warp reduction on last token |
-| `core/kernels/dgd_forward.cu` | Same as above |
-| `core/kernels/titans_forward.cu` (ckpt variant) | Same, on last token of last chunk |
-| `core/kernels/dgd_forward.cu` (ckpt variant) | Same |
-| `core/src/cuda_ffi.rs` | Update extern "C" signatures with `delta_norm_out` |
-| `core/src/gpu_forward.rs` | Pass `null_mut()` on normal calls |
-| `core/src/gpu_stacked_forward.rs` | Pass `null_mut()` on normal calls |
-| `python/src/lib.rs` | Pass non-null on diagnostic calls; populate `dgd_delta_norm` |
-| `python/engine/evaluation.py` | Show `Δ=` in stacked tape display |
+| `core/kernels/elementwise.cu` | `dgd_delta_norm_kernel` + `dgd_delta_norm_cuda` C wrapper |
+| `core/src/cuda_ffi.rs` | FFI declaration for `dgd_delta_norm_cuda` |
+| `core/src/gpu_forward.rs` | `GpuMemoryCache::dgd_delta_norm()` — cache-side extractor for all 10 variants |
+| `python/src/lib.rs` | Wire `dgd_delta_norm` into `gpu_tape_forward_summary()` |
 
+Forward kernel files (`titans_forward.cu`, `dgd_forward.cu`, etc.) are **unchanged**.
 New files: none.
 
 ---
 
 ## 8. Build Order
 
-1. Modify `titans_forward_kernel` signature + add norm reduction (CUDA)
-2. Modify `dgd_forward_kernel` same way (CUDA)
-3. Update C wrappers in both `.cu` files
-4. Update `cuda_ffi.rs` extern declarations
-5. Update all call sites in `gpu_forward.rs` / `gpu_stacked_forward.rs` to pass `null_mut()`
-6. `cargo build --release --features cuda` — verify compiles, all existing tests pass
-7. Wire non-null pointer in `gpu_stacked_tape_summary()` diagnostic path
-8. Update `evaluation.py` display
-9. `maturin develop --release --features cuda` — build Python bindings
-10. Smoke test: run stacked shakedown, verify `dgd_delta_norm > 0` in tape output
+1. Add `dgd_delta_norm_kernel` + C wrapper to `core/kernels/elementwise.cu`
+2. Add FFI declaration to `core/src/cuda_ffi.rs`
+3. Add `GpuMemoryCache::dgd_delta_norm()` method in `core/src/gpu_forward.rs`
+4. `cargo build --release --features cuda` — verify compiles, all existing tests pass
+5. Wire into `gpu_tape_forward_summary()` in `python/src/lib.rs`
+6. `maturin develop --release --features cuda` — build Python bindings
+7. Smoke test: run shakedown with `tape_device: "gpu"`, verify `dgd_delta_norm > 0`
 
 ---
 
@@ -433,35 +317,28 @@ New files: none.
 
 ```rust
 #[test]
-fn test_titans_forward_delta_norm_null() {
-    // Pass delta_norm_out = null_mut(). Verify output y matches existing test.
-    // Ensures NULL path has zero behavior change.
+fn test_dgd_delta_norm_matches_cpu() {
+    // Construct known M [d,d], k [d], v [d] on GPU.
+    // Call dgd_delta_norm_cuda, read back scalar.
+    // Compare against CPU: sqrt(sum((M@k - v)^2)). Tolerance: 1e-5.
 }
 
 #[test]
-fn test_titans_forward_delta_norm_value() {
-    // Pass delta_norm_out = allocated buffer. Run forward on known input.
-    // Verify delta_norm_out[0] = ||error_{last_token}||_2 matches CPU computation.
-}
-
-#[test]
-fn test_dgd_forward_delta_norm_matches_cpu() {
-    // Run both CPU dgd_step (core/src/dgd.rs) and CUDA dgd_forward_cuda.
-    // Compare final-token error norm. Tolerance: 1e-5.
+fn test_dgd_delta_norm_zero_error() {
+    // Set v = M @ k exactly. Verify norm_out ≈ 0.0.
 }
 ```
 
 ### Python integration tests
 
 ```python
-def test_stacked_tape_dgd_delta_nonzero():
+def test_tape_dgd_delta_nonzero():
     """After tape summary, Titans levels should have dgd_delta_norm > 0."""
-    summary = gpu_model.gpu_stacked_tape_summary(input_ids, target_ids, pulse)
-    for block in summary["blocks"]:
-        for lev in block["levels"]:
-            if lev["block_count"] > 0:
-                assert lev["dgd_delta_norm"] > 0, \
-                    f"block {block['block_index']} level {lev['level']}: delta=0"
+    summary = gpu_model.gpu_tape_forward_summary(input_ids, target_ids, pulse)
+    for lev in summary["levels"]:
+        if lev["block_count"] > 0:
+            assert lev["dgd_delta_norm"] > 0, \
+                f"level {lev['level']}: delta=0"
 ```
 
 ---

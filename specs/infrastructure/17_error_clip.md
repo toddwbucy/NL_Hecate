@@ -86,13 +86,13 @@ this because it constrains total energy, not directional concentration.
 After computing `error_buf[row] = prediction[row] - v_t[row]` and before
 the M-update outer product, insert:
 
-```
+```text
 if ‖error_buf‖₂ > error_clip:
     error_buf *= error_clip / ‖error_buf‖₂
 ```
 
 This bounds the M-update:
-```
+```text
 ‖θ·e_t ⊗ k_t‖_F = θ · ‖e_t‖ · ‖k_t‖ ≤ θ · error_clip · ‖k_t‖
 ```
 

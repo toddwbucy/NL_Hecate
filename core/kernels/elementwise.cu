@@ -350,6 +350,9 @@ extern "C" void dgd_delta_norm_cuda(
 {
     int dd = d * d;
     int block_size = (dd < 1024) ? dd : 1024;
+    // Round up to warp boundary — __shfl_down_sync requires full warps
+    block_size = ((block_size + warpSize - 1) / warpSize) * warpSize;
+    if (block_size > 1024) block_size = 1024;
     // Need at least d floats of smem for prediction + warp scratch
     int smem_bytes = d * sizeof(float);
     dgd_delta_norm_kernel<<<1, block_size, smem_bytes>>>(M, k, v, norm_out, d);

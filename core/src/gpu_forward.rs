@@ -199,93 +199,65 @@ pub enum GpuMemoryCache {
 
 #[cfg(feature = "cuda")]
 impl GpuMemoryCache {
-    /// Compute ‖M_final @ k_last - v_last‖₂ from the cached forward data.
+    /// Compute ‖M_{s-1} @ k_{s-1} - v_{s-1}‖₂ from the cached forward data.
     ///
-    /// For matrix-memory rules (Delta, Titans, DGD): extracts the last token's
-    /// prediction error norm from the final M state and last k/v vectors.
-    /// For Hebbian/SwiGlu/TNT: returns 0.0 (no error vector in these rules).
+    /// Uses the PRE-update M state (M_{s-1}) with the last token's k/v to match
+    /// the error that actually drove the final M-update: e_{s-1} = M_{s-1}@k - v.
+    /// For matrix-memory rules (Delta, Titans, DGD): reads from m_states cache.
+    /// For Hebbian/SwiGlu: returns 0.0 (no error vector).
+    /// For TNT: drills into shard inner caches, returns max across shards.
     ///
-    /// Checkpointed variants use the last checkpoint as an approximation of final M.
+    /// Checkpointed variants use the second-to-last checkpoint as an
+    /// approximation of the pre-update M (exact when s is a checkpoint boundary).
     ///
     /// Source: HOPE (2512.24695) Eq 88 — error = M@k - v
     /// Spec:   specs/infrastructure/16_dgd_delta_norm_gpu.md
-    pub fn dgd_delta_norm(&self, s: usize, d: usize, batch_size: usize) -> f32 {
+    pub fn dgd_delta_norm(&self, s: usize, d: usize, _batch_size: usize) -> f32 {
         let dd = d * d;
+
+        // Helper: compute ‖M @ k - v‖₂ from GPU buffers.
+        // Uses batch element 0 only (diagnostic reads the first/only batch slot).
+        let compute_norm = |m_ptr: *const f32, k_ptr: *const f32, v_ptr: *const f32| -> f32 {
+            let mut norm_out = GpuBuf::<f32>::zeros(1);
+            unsafe {
+                crate::cuda_ffi::dgd_delta_norm_cuda(m_ptr, k_ptr, v_ptr, norm_out.ptr(), d as i32);
+            }
+            crate::dispatch::cuda_sync();
+            let mut host = [0.0f32; 1];
+            norm_out.copy_to_host(&mut host);
+            host[0]
+        };
+
         match self {
             GpuMemoryCache::Delta { k_mem, v_mem, m_states, .. }
-            | GpuMemoryCache::DGD { k_mem, v_mem, m_states, .. } => {
-                // m_states layout: [bs*(s+1)*dd]. For batch elem 0, final M is at offset s*dd.
-                let m_final = m_states.slice(s * dd, dd);
+            | GpuMemoryCache::DGD { k_mem, v_mem, m_states, .. }
+            | GpuMemoryCache::Titans { k_mem, v_mem, m_states, .. } => {
+                // m_states layout: [bs*(s+1)*dd]. M_t is at offset t*dd.
+                // Error e_{s-1} = M_{s-1} @ k_{s-1} - v_{s-1} uses the PRE-update M.
+                let m_pre = m_states.slice((s - 1) * dd, dd);
                 let k_last = k_mem.slice((s - 1) * d, d);
                 let v_last = v_mem.slice((s - 1) * d, d);
-                let mut norm_out = GpuBuf::<f32>::zeros(1);
-                unsafe {
-                    crate::cuda_ffi::dgd_delta_norm_cuda(
-                        m_final.as_ptr(), k_last.as_ptr(), v_last.as_ptr(),
-                        norm_out.ptr(), d as i32,
-                    );
-                }
-                crate::dispatch::cuda_sync();
-                let mut host = [0.0f32; 1];
-                norm_out.copy_to_host(&mut host);
-                host[0]
-            }
-            GpuMemoryCache::Titans { k_mem, v_mem, m_states, .. } => {
-                // Same layout as Delta: batch elem 0, final M at offset s*dd
-                let m_final = m_states.slice(s * dd, dd);
-                let k_last = k_mem.slice((s - 1) * d, d);
-                let v_last = v_mem.slice((s - 1) * d, d);
-                let mut norm_out = GpuBuf::<f32>::zeros(1);
-                unsafe {
-                    crate::cuda_ffi::dgd_delta_norm_cuda(
-                        m_final.as_ptr(), k_last.as_ptr(), v_last.as_ptr(),
-                        norm_out.ptr(), d as i32,
-                    );
-                }
-                crate::dispatch::cuda_sync();
-                let mut host = [0.0f32; 1];
-                norm_out.copy_to_host(&mut host);
-                host[0]
+                compute_norm(m_pre.as_ptr(), k_last.as_ptr(), v_last.as_ptr())
             }
             GpuMemoryCache::DeltaCkpt { k_mem, v_mem, m_checkpoints, checkpoint_interval, .. }
-            | GpuMemoryCache::DGDCkpt { k_mem, v_mem, m_checkpoints, checkpoint_interval, .. } => {
-                // Last checkpoint is final M (final step is always checkpointed)
+            | GpuMemoryCache::DGDCkpt { k_mem, v_mem, m_checkpoints, checkpoint_interval, .. }
+            | GpuMemoryCache::TitansCkpt { k_mem, v_mem, m_checkpoints, checkpoint_interval, .. } => {
+                // Checkpoints store M at boundaries: M_0, M_c, M_2c, ..., M_s.
+                // Best available pre-update approximation: second-to-last checkpoint.
+                // For most configs (s % c == 0), the last checkpoint IS M_s (post-update).
+                // Use the second-to-last when available, else fall back to last.
                 let num_ckpt = (s + checkpoint_interval - 1) / checkpoint_interval + 1;
-                let m_final = m_checkpoints.slice((num_ckpt - 1) * dd, dd);
+                let ckpt_idx = if num_ckpt >= 2 { num_ckpt - 2 } else { 0 };
+                let m_approx = m_checkpoints.slice(ckpt_idx * dd, dd);
                 let k_last = k_mem.slice((s - 1) * d, d);
                 let v_last = v_mem.slice((s - 1) * d, d);
-                let mut norm_out = GpuBuf::<f32>::zeros(1);
-                unsafe {
-                    crate::cuda_ffi::dgd_delta_norm_cuda(
-                        m_final.as_ptr(), k_last.as_ptr(), v_last.as_ptr(),
-                        norm_out.ptr(), d as i32,
-                    );
-                }
-                crate::dispatch::cuda_sync();
-                let mut host = [0.0f32; 1];
-                norm_out.copy_to_host(&mut host);
-                host[0]
-            }
-            GpuMemoryCache::TitansCkpt { k_mem, v_mem, m_checkpoints, checkpoint_interval, .. } => {
-                let num_ckpt = (s + checkpoint_interval - 1) / checkpoint_interval + 1;
-                let m_final = m_checkpoints.slice((num_ckpt - 1) * dd, dd);
-                let k_last = k_mem.slice((s - 1) * d, d);
-                let v_last = v_mem.slice((s - 1) * d, d);
-                let mut norm_out = GpuBuf::<f32>::zeros(1);
-                unsafe {
-                    crate::cuda_ffi::dgd_delta_norm_cuda(
-                        m_final.as_ptr(), k_last.as_ptr(), v_last.as_ptr(),
-                        norm_out.ptr(), d as i32,
-                    );
-                }
-                crate::dispatch::cuda_sync();
-                let mut host = [0.0f32; 1];
-                norm_out.copy_to_host(&mut host);
-                host[0]
+                compute_norm(m_approx.as_ptr(), k_last.as_ptr(), v_last.as_ptr())
             }
             // TNT hierarchical — drill into shard inner caches and take max delta norm.
-            // Each shard's inner cache is a Titans/Delta GpuMemoryCache with its own M state.
-            // The last shard's final-token error is the most diagnostic (most context seen).
+            // Each shard's inner cache is a Titans/Delta GpuMemoryCache with its own
+            // M state. The inner cache batch dimension is n_batch (number of local
+            // chunks per shard), but dgd_delta_norm reads batch slot 0 only.
+            // We iterate all shards and take max — the last shard has the most context.
             GpuMemoryCache::TNT { shard_inner_caches, local_chunk_size, .. } => {
                 if shard_inner_caches.is_empty() {
                     return 0.0;
@@ -293,7 +265,9 @@ impl GpuMemoryCache {
                 let shard_s = *local_chunk_size;
                 let mut max_delta = 0.0f32;
                 for shard_cache in shard_inner_caches.iter() {
-                    let delta = shard_cache.dgd_delta_norm(shard_s, d, batch_size);
+                    // Pass batch_size=1 — inner caches use n_batch (local chunk count)
+                    // as their batch dim, but we only need slot 0's diagnostic.
+                    let delta = shard_cache.dgd_delta_norm(shard_s, d, 1);
                     if delta > max_delta {
                         max_delta = delta;
                     }
