@@ -329,6 +329,25 @@ extern "C" {
         norm_out: *mut f32, d: i32,
     );
 
+    // ── LayerNorm ────────────────────────────────────────────────────
+
+    /// LayerNorm forward: x_hat = (x - mean) / sqrt(var + eps), out = gamma * x_hat + beta.
+    /// One block per position. Caches mean and rstd for backward.
+    pub(crate) fn layer_norm_forward_cuda(
+        x: *const f32, gamma: *const f32, beta: *const f32,
+        out: *mut f32, mean_cache: *mut f32, rstd_cache: *mut f32,
+        n: i32, d: i32, eps: f32,
+    );
+
+    /// LayerNorm backward: three-term formula for d_x, atomicAdd for d_gamma/d_beta.
+    /// d_gamma and d_beta must be zeroed before call.
+    pub(crate) fn layer_norm_backward_cuda(
+        d_out: *const f32, x: *const f32,
+        gamma: *const f32, mean_cache: *const f32, rstd_cache: *const f32,
+        d_x: *mut f32, d_gamma: *mut f32, d_beta: *mut f32,
+        n: i32, d: i32,
+    );
+
     // ── L2 key/query normalization ──────────────────────────────────
 
     /// Normalize each row of x to unit L2 norm in-place.

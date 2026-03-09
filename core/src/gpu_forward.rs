@@ -54,10 +54,20 @@ pub struct GpuCMSCache {
     pub memory_caches: Vec<Option<GpuMemoryCache>>,
     pub y_per_level: Vec<GpuBuf<f32>>, // [bs*s, d] per level
 
-    // Combined + gating
+    // Combined + gating (non-residual path)
     pub y_combined: GpuBuf<f32>,      // [bs*s, d]
     pub gate: GpuBuf<f32>,            // [bs*s, d] sigmoid(y_combined)
     pub gated_out: GpuBuf<f32>,       // [bs*s, d] attn_out * gate
+
+    // Residual path caches (only populated when cfg.residual=true)
+    pub ln_attn_out: Option<GpuBuf<f32>>,     // [bs*s, d]
+    pub ln_attn_mean: Option<GpuBuf<f32>>,    // [bs*s]
+    pub ln_attn_rstd: Option<GpuBuf<f32>>,    // [bs*s]
+    pub ln_mem_out: Option<GpuBuf<f32>>,      // [bs*s, d]
+    pub ln_mem_mean: Option<GpuBuf<f32>>,     // [bs*s]
+    pub ln_mem_rstd: Option<GpuBuf<f32>>,     // [bs*s]
+    pub residual_after_attn: Option<GpuBuf<f32>>, // [bs*s, d]
+    pub residual_final: Option<GpuBuf<f32>>,      // [bs*s, d]
 
     // Post-gating
     pub projected: GpuBuf<f32>,       // [bs*s, d]
@@ -315,9 +325,7 @@ pub fn gpu_cms_forward(
     let hd = cfg.swa.head_dim;
     let ws = cfg.swa.window_size;
 
-    assert!(!cfg.residual,
-        "gpu_cms_forward: residual=true is not supported in the GPU path yet. \
-         Use the CPU path (cms_forward + cms_backward) for residual stream models.");
+    // residual=true is now supported via CUDA LayerNorm kernels.
     assert!(s > 0, "seq_len must be > 0");
     // Derive batch_size from input length; default to 1 for single-sequence calls
     assert!(input_ids.len() >= s, "input_ids too short");
@@ -354,7 +362,8 @@ pub fn gpu_cms_forward(
         let is_tnt_mode = cfg.parallel.as_ref()
             .map(|p| p.strategy == ParallelStrategy::TNTHierarchical)
             .unwrap_or(false);
-        let can_capture = matches!(cfg.memory_rule, MemoryRuleKind::DeltaRule | MemoryRuleKind::TitansLMM)
+        let can_capture = !cfg.residual
+            && matches!(cfg.memory_rule, MemoryRuleKind::DeltaRule | MemoryRuleKind::TitansLMM)
             && cfg.checkpoint_interval.is_none()
             && !is_tnt_mode;
 
@@ -405,14 +414,34 @@ pub fn gpu_cms_forward(
         );
     }
 
-    // ── Stage 2a: QKV projections (cuBLAS on GPU) ─────────────────────
-    // cuBLAS matmul treats batch_size*s as the M dimension automatically
+    // ── Stage 2a: Pre-LN for attention (residual path) + QKV projections ──
+    let n_tokens = bs * s;
+    let (ln_attn_out, ln_attn_mean, ln_attn_rstd) = if cfg.residual {
+        let mut out = GpuBuf::<f32>::zeros(n_tokens * d);
+        let mut mean = GpuBuf::<f32>::zeros(n_tokens);
+        let mut rstd = GpuBuf::<f32>::zeros(n_tokens);
+        unsafe {
+            crate::cuda_ffi::layer_norm_forward_cuda(
+                embedded.as_ptr(),
+                params.swa.ln_attn_gamma.as_ptr(),
+                params.swa.ln_attn_beta.as_ptr(),
+                out.ptr(), mean.ptr(), rstd.ptr(),
+                n_tokens as i32, d_i32, 1e-5,
+            );
+        }
+        (Some(out), Some(mean), Some(rstd))
+    } else {
+        (None, None, None)
+    };
+
+    // QKV source: LN output for residual path, raw embedded otherwise
+    let qkv_source = if cfg.residual { ln_attn_out.as_ref().unwrap() } else { &embedded };
     let mut q_f32 = GpuBuf::zeros(bs * s * d);
     let mut k_f32 = GpuBuf::zeros(bs * s * d);
     let mut v_f32 = GpuBuf::zeros(bs * s * d);
-    crate::dispatch::cublas_matmul_transb_dd(&embedded, &params.swa.w_q, &mut q_f32, bs * s, d, d, 0.0);
-    crate::dispatch::cublas_matmul_transb_dd(&embedded, &params.swa.w_k, &mut k_f32, bs * s, d, d, 0.0);
-    crate::dispatch::cublas_matmul_transb_dd(&embedded, &params.swa.w_v, &mut v_f32, bs * s, d, d, 0.0);
+    crate::dispatch::cublas_matmul_transb_dd(qkv_source, &params.swa.w_q, &mut q_f32, bs * s, d, d, 0.0);
+    crate::dispatch::cublas_matmul_transb_dd(qkv_source, &params.swa.w_k, &mut k_f32, bs * s, d, d, 0.0);
+    crate::dispatch::cublas_matmul_transb_dd(qkv_source, &params.swa.w_v, &mut v_f32, bs * s, d, d, 0.0);
 
     // ── Stage 3a: SWA attention (bf16 on GPU) ─────────────────────────
     let total = bs * s * d;
@@ -444,6 +473,39 @@ pub fn gpu_cms_forward(
         crate::cuda_ffi::bf16_to_f32_cuda(attn_out_bf16.as_ptr(), attn_out.ptr(), total_i32);
     }
 
+    // ── Residual skip 1: embedded + attn_out ────────────────────────
+    let (residual_after_attn, ln_mem_out, ln_mem_mean, ln_mem_rstd) = if cfg.residual {
+        // residual = embedded + attn_out
+        let mut residual = GpuBuf::<f32>::zeros(n_tokens * d);
+        unsafe {
+            // Copy embedded, then add attn_out
+            crate::cuda_ffi::saxpy_cuda(0.0, embedded.as_ptr(), residual.ptr(), total_i32); // zero residual
+        }
+        unsafe {
+            crate::cuda_ffi::saxpy_cuda(1.0, embedded.as_ptr(), residual.ptr(), total_i32);
+            crate::cuda_ffi::saxpy_cuda(1.0, attn_out.as_ptr(), residual.ptr(), total_i32);
+        }
+        // LN_mem on residual
+        let mut ln_out = GpuBuf::<f32>::zeros(n_tokens * d);
+        let mut mean = GpuBuf::<f32>::zeros(n_tokens);
+        let mut rstd = GpuBuf::<f32>::zeros(n_tokens);
+        unsafe {
+            crate::cuda_ffi::layer_norm_forward_cuda(
+                residual.as_ptr(),
+                params.swa.ln_mem_gamma.as_ptr(),
+                params.swa.ln_mem_beta.as_ptr(),
+                ln_out.ptr(), mean.ptr(), rstd.ptr(),
+                n_tokens as i32, d_i32, 1e-5,
+            );
+        }
+        (Some(residual), Some(ln_out), Some(mean), Some(rstd))
+    } else {
+        (None, None, None, None)
+    };
+
+    // Memory branch input: LN(residual) for residual path, raw embedded otherwise
+    let mem_input = if cfg.residual { ln_mem_out.as_ref().unwrap() } else { &embedded };
+
     // ── Stage 2b+3b: Memory branch per level ──────────────────────────
     let mut memory_caches = Vec::with_capacity(cfg.k);
     let mut y_per_level = Vec::with_capacity(cfg.k);
@@ -466,7 +528,7 @@ pub fn gpu_cms_forward(
                 // TNT path: shard-parallel memory processing via gpu_tnt_forward.
                 let parallel_cfg = cfg.parallel.as_ref().unwrap();
                 let (y_level, mem_cache) = gpu_tnt_forward(
-                    &params.levels[level], cfg, &embedded,
+                    &params.levels[level], cfg, mem_input,
                     &mut context.memory[level],
                     s, d, level, bs, parallel_cfg,
                 );
@@ -475,7 +537,7 @@ pub fn gpu_cms_forward(
             } else {
             // Active level: compute projections, gates, and memory update on GPU.
             let (y_level, mem_cache) = gpu_memory_forward(
-                &params.levels[level], cfg, &embedded,
+                &params.levels[level], cfg, mem_input,
                 &mut context.memory[level],
                 s, d, level, bs,
             );
@@ -487,7 +549,7 @@ pub fn gpu_cms_forward(
             // Each batch element has distinct embeddings, so compute Y = Q @ M^T
             // for all bs*s tokens simultaneously. Same frozen M for all batch elements.
             let y_level = gpu_memory_read_only(
-                &params.levels[level], &embedded,
+                &params.levels[level], mem_input,
                 &context.memory[level],
                 bs * s, d,
             );
@@ -510,17 +572,38 @@ pub fn gpu_cms_forward(
         }
     }
 
-    // ── Stage 4: Gating on GPU ────────────────────────────────────────
+    // ── Stage 4+5: Gating/residual → output projection ────────────────
     let mut gate = GpuBuf::<f32>::zeros(bs * s * d);
     let mut gated_out = GpuBuf::<f32>::zeros(bs * s * d);
-    unsafe {
-        crate::cuda_ffi::sigmoid_cuda(y_combined.as_ptr(), gate.ptr(), total_i32);
-        crate::cuda_ffi::elemwise_mul_cuda(attn_out.as_ptr(), gate.as_ptr(), gated_out.ptr(), total_i32);
-    }
-
-    // ── Stage 5: Output projection (cuBLAS on GPU) ────────────────────
     let mut projected = GpuBuf::<f32>::zeros(bs * s * d);
-    crate::dispatch::cublas_matmul_transb_dd(&gated_out, &params.swa.w_o, &mut projected, bs * s, d, d, 0.0);
+
+    let residual_final = if cfg.residual {
+        // Residual path: residual_final = residual_after_attn + y_combined (additive, no sigmoid)
+        let residual_attn = residual_after_attn.as_ref().unwrap();
+        let mut res_final = GpuBuf::<f32>::zeros(n_tokens * d);
+        unsafe {
+            // res_final = residual_after_attn + y_combined
+            crate::cuda_ffi::saxpy_cuda(1.0, residual_attn.as_ptr(), res_final.ptr(), total_i32);
+            crate::cuda_ffi::saxpy_cuda(1.0, y_combined.as_ptr(), res_final.ptr(), total_i32);
+        }
+        // Output projection on residual
+        crate::dispatch::cublas_matmul_transb_dd(&res_final, &params.swa.w_o, &mut projected, bs * s, d, d, 0.0);
+        // Residual backward never reads gate (additive gradient routing bypasses
+        // sigmoid_backward entirely). Gate stays zeros for cache shape stability.
+        // gated_out = attn_out for cache shape stability (also unused by residual backward).
+        unsafe {
+            crate::cuda_ffi::saxpy_cuda(1.0, attn_out.as_ptr(), gated_out.ptr(), total_i32);
+        }
+        Some(res_final)
+    } else {
+        // Legacy path: sigmoid gating
+        unsafe {
+            crate::cuda_ffi::sigmoid_cuda(y_combined.as_ptr(), gate.ptr(), total_i32);
+            crate::cuda_ffi::elemwise_mul_cuda(attn_out.as_ptr(), gate.as_ptr(), gated_out.ptr(), total_i32);
+        }
+        crate::dispatch::cublas_matmul_transb_dd(&gated_out, &params.swa.w_o, &mut projected, bs * s, d, d, 0.0);
+        None
+    };
 
     // ── Stage 6: Unembed (cuBLAS on GPU) ──────────────────────────────
     let mut logits = GpuBuf::<f32>::zeros(bs * s * v);
@@ -561,6 +644,10 @@ pub fn gpu_cms_forward(
         y_per_level,
         y_combined,
         gate, gated_out,
+        ln_attn_out, ln_attn_mean, ln_attn_rstd,
+        ln_mem_out, ln_mem_mean, ln_mem_rstd,
+        residual_after_attn,
+        residual_final,
         projected, logits,
         pulse: pulse.clone(),
         s, d, v, nh, hd, ws,
@@ -1562,6 +1649,10 @@ fn gpu_cms_replay(
         y_combined:          unsafe { GpuBuf::from_raw_non_owning(fwd.y_combined.ptr(), bs * s * d) },
         gate:                unsafe { GpuBuf::from_raw_non_owning(fwd.gate.ptr(), bs * s * d) },
         gated_out:           unsafe { GpuBuf::from_raw_non_owning(fwd.gated_out.ptr(), bs * s * d) },
+        // CUDA graph path is only used for non-residual configs (capture check excludes residual).
+        ln_attn_out: None, ln_attn_mean: None, ln_attn_rstd: None,
+        ln_mem_out: None, ln_mem_mean: None, ln_mem_rstd: None,
+        residual_after_attn: None, residual_final: None,
         projected:           unsafe { GpuBuf::from_raw_non_owning(fwd.projected.ptr(), bs * s * d) },
         logits:              unsafe { GpuBuf::from_raw_non_owning(fwd.logits.ptr(), bs * s * v) },
         pulse: pulse.clone(),

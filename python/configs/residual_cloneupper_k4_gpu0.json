@@ -1,0 +1,44 @@
+{
+  "description": "Clone-upper k=4: trained L0 cloned to L1-L3, fresh L0 at every-token. Data from 0. GPU0.",
+  "model": {
+    "d_model": 512,
+    "num_heads": 8,
+    "seq_len": 512,
+    "window_size": 512,
+    "vocab_size": 32000,
+    "k": 1,
+    "chunk_sizes": [1],
+    "memory_rule": "titans",
+    "composition": "mag",
+    "momentum_kind": "ema",
+    "momentum_d_hidden": 0,
+    "m_norm_max": [100.0],
+    "residual": true
+  },
+  "build": {
+    "lr": 0.0006,
+    "steps": 60000,
+    "optimizer": "adamw_gpu",
+    "warmup_steps": 500,
+    "weight_decay": 0.1,
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "max_grad_norm": 1.0,
+    "load": "checkpoints/residual_norewind_gpu1_step10000.safetensors",
+    "extend_k": 4,
+    "clone_upper": true,
+    "data_seek": 0,
+    "save_path": "checkpoints/residual_cloneupper_k4_gpu0.safetensors",
+    "save_every": 5000,
+    "log_every": 8,
+    "eval_every": 512,
+    "tape_every": 512,
+    "eval_max_chunks": 50,
+    "log_file": "runs/residual_cloneupper_k4_gpu0.jsonl",
+    "saturation_window": 50
+  },
+  "data": {
+    "path": "data/dolmino_100b",
+    "format": "dolmino"
+  }
+}

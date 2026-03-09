@@ -64,6 +64,7 @@ fn main() {
             .file("kernels/gate_backward.cu")
             .file("kernels/tnt_forward.cu")
             .file("kernels/tnt_backward.cu")
+            .file("kernels/layer_norm.cu")
             .compile("nl_hecate_cuda_kernels");
 
         println!("cargo:rustc-link-search=native={}/lib64", cuda_path);
