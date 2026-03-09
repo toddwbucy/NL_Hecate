@@ -204,6 +204,104 @@ pub enum GpuMemoryCache {
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// DGD delta norm extraction from cache
+// ══════════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "cuda")]
+impl GpuMemoryCache {
+    /// Compute ‖M_{s-1} @ k_{s-1} - v_{s-1}‖₂ from the cached forward data.
+    ///
+    /// Uses the PRE-update M state (M_{s-1}) with the last token's k/v to match
+    /// the error that actually drove the final M-update: e_{s-1} = M_{s-1}@k - v.
+    /// For matrix-memory rules (Delta, Titans, DGD): reads from m_states cache.
+    /// For Hebbian/SwiGlu: returns 0.0 (no error vector).
+    /// For TNT: drills into shard inner caches, returns max across shards.
+    ///
+    /// Checkpointed variants use the second-to-last checkpoint as an
+    /// approximation of the pre-update M (exact when s is a checkpoint boundary).
+    ///
+    /// Source: HOPE (2512.24695) Eq 88 — error = M@k - v
+    /// Spec:   specs/infrastructure/16_dgd_delta_norm_gpu.md
+    pub fn dgd_delta_norm(&self, s: usize, d: usize, batch_size: usize) -> f32 {
+        if s == 0 {
+            return 0.0; // No tokens processed, no error to measure
+        }
+        // Diagnostic reads batch slot 0 only. Callers must ensure bs==1
+        // (gpu_tape_forward_summary guards this at entry).
+        debug_assert!(
+            batch_size <= 1,
+            "dgd_delta_norm only reads batch slot 0; caller must ensure batch_size <= 1 (got {})",
+            batch_size
+        );
+        let dd = d * d;
+
+        // Helper: compute ‖M @ k - v‖₂ from GPU buffers.
+        let compute_norm = |m_ptr: *const f32, k_ptr: *const f32, v_ptr: *const f32| -> f32 {
+            let mut norm_out = GpuBuf::<f32>::zeros(1);
+            unsafe {
+                crate::cuda_ffi::dgd_delta_norm_cuda(m_ptr, k_ptr, v_ptr, norm_out.ptr(), d as i32);
+            }
+            crate::dispatch::cuda_sync();
+            let mut host = [0.0f32; 1];
+            norm_out.copy_to_host(&mut host);
+            host[0]
+        };
+
+        match self {
+            GpuMemoryCache::Delta { k_mem, v_mem, m_states, .. }
+            | GpuMemoryCache::DGD { k_mem, v_mem, m_states, .. }
+            | GpuMemoryCache::Titans { k_mem, v_mem, m_states, .. } => {
+                // m_states layout: [bs*(s+1)*dd]. M_t is at offset t*dd.
+                // Error e_{s-1} = M_{s-1} @ k_{s-1} - v_{s-1} uses the PRE-update M.
+                let m_pre = m_states.slice((s - 1) * dd, dd);
+                let k_last = k_mem.slice((s - 1) * d, d);
+                let v_last = v_mem.slice((s - 1) * d, d);
+                compute_norm(m_pre.as_ptr(), k_last.as_ptr(), v_last.as_ptr())
+            }
+            GpuMemoryCache::DeltaCkpt { k_mem, v_mem, m_checkpoints, checkpoint_interval, .. }
+            | GpuMemoryCache::DGDCkpt { k_mem, v_mem, m_checkpoints, checkpoint_interval, .. }
+            | GpuMemoryCache::TitansCkpt { k_mem, v_mem, m_checkpoints, checkpoint_interval, .. } => {
+                // Checkpoints store M at boundaries: M_0, M_c, M_2c, ..., M_s.
+                // Best available pre-update approximation: second-to-last checkpoint.
+                // For most configs (s % c == 0), the last checkpoint IS M_s (post-update).
+                // Use the second-to-last when available, else fall back to last.
+                let num_ckpt = (s + checkpoint_interval - 1) / checkpoint_interval + 1;
+                let ckpt_idx = if num_ckpt >= 2 { num_ckpt - 2 } else { 0 };
+                let m_approx = m_checkpoints.slice(ckpt_idx * dd, dd);
+                let k_last = k_mem.slice((s - 1) * d, d);
+                let v_last = v_mem.slice((s - 1) * d, d);
+                compute_norm(m_approx.as_ptr(), k_last.as_ptr(), v_last.as_ptr())
+            }
+            // TNT hierarchical — drill into shard inner caches and take max delta norm.
+            // Each shard's inner cache is a Titans/Delta GpuMemoryCache with its own
+            // M state. The inner cache batch dimension is n_batch (number of local
+            // chunks per shard), but dgd_delta_norm reads batch slot 0 only.
+            // We iterate all shards and take max — the last shard has the most context.
+            GpuMemoryCache::TNT { shard_inner_caches, local_chunk_size, .. } => {
+                if shard_inner_caches.is_empty() {
+                    return 0.0;
+                }
+                let shard_s = *local_chunk_size;
+                let mut max_delta = 0.0f32;
+                for shard_cache in shard_inner_caches.iter() {
+                    // Pass batch_size=1 — inner caches use n_batch (local chunk count)
+                    // as their batch dim, but we only need slot 0's diagnostic.
+                    let delta = shard_cache.dgd_delta_norm(shard_s, d, 1);
+                    if delta > max_delta {
+                        max_delta = delta;
+                    }
+                }
+                max_delta
+            }
+            // Hebbian has no error vector; SwiGlu has no M state
+            GpuMemoryCache::Hebbian { .. }
+            | GpuMemoryCache::HebbianCkpt { .. }
+            | GpuMemoryCache::SwiGlu { .. } => 0.0,
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // GPU-resident CMS forward
 // ══════════════════════════════════════════════════════════════════════
 

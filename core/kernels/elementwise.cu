@@ -281,3 +281,79 @@ extern "C" void theta_clamp_mask_cuda(
     int grid = (n + block - 1) / block;
     theta_clamp_mask_kernel<<<grid, block>>>(theta, d_theta, n, lo, hi);
 }
+
+// ── DGD Delta Norm ──────────────────────────────────────────────────
+//
+// Computes ‖M @ k - v‖₂ where M is [d,d], k is [d], v is [d].
+// Used as a diagnostic side-channel for the DGD prediction error.
+// Single block, d threads (strided for d > blockDim.x).
+//
+// Source: HOPE (2512.24695) Eq 88 — error = M@k - v
+// Spec:   specs/infrastructure/16_dgd_delta_norm_gpu.md
+
+__global__ void dgd_delta_norm_kernel(
+    const float* __restrict__ M,    // [d, d]
+    const float* __restrict__ k,    // [d]
+    const float* __restrict__ v,    // [d]
+    float* __restrict__ norm_out,   // [1] — scalar output
+    int d)
+{
+    int tid = threadIdx.x;
+
+    // Shared memory: prediction[d] (reused for warp scratch)
+    extern __shared__ float smem[];
+    float* prediction = smem;  // [d]
+
+    // Step 1: prediction = M @ k (matvec, strided)
+    for (int row = tid; row < d; row += blockDim.x) {
+        float sum = 0.0f;
+        for (int j = 0; j < d; j++) {
+            sum += M[row * d + j] * k[j];
+        }
+        prediction[row] = sum;
+    }
+    __syncthreads();
+
+    // Step 2: error = prediction - v, accumulate sum-of-squares
+    float local_sq = 0.0f;
+    for (int row = tid; row < d; row += blockDim.x) {
+        float err = prediction[row] - v[row];
+        local_sq += err * err;
+    }
+
+    // Step 3: Warp reduction
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        local_sq += __shfl_down_sync(0xFFFFFFFF, local_sq, offset);
+    }
+
+    // Step 4: Inter-warp reduction via shared memory
+    int warp_id = tid / warpSize;
+    int lane = tid % warpSize;
+    if (lane == 0) prediction[warp_id] = local_sq;  // reuse prediction as scratch
+    __syncthreads();
+
+    if (warp_id == 0) {
+        int n_warps = (blockDim.x + warpSize - 1) / warpSize;
+        float val = (lane < n_warps) ? prediction[lane] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+            val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+        }
+        if (lane == 0) {
+            norm_out[0] = sqrtf(val);
+        }
+    }
+}
+
+extern "C" void dgd_delta_norm_cuda(
+    const float* M, const float* k, const float* v,
+    float* norm_out, int d)
+{
+    int dd = d * d;
+    int block_size = (dd < 1024) ? dd : 1024;
+    // Round up to warp boundary — __shfl_down_sync requires full warps
+    block_size = ((block_size + warpSize - 1) / warpSize) * warpSize;
+    if (block_size > 1024) block_size = 1024;
+    // Need at least d floats of smem for prediction + warp scratch
+    int smem_bytes = d * sizeof(float);
+    dgd_delta_norm_kernel<<<1, block_size, smem_bytes>>>(M, k, v, norm_out, d);
+}

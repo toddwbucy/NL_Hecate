@@ -2229,8 +2229,8 @@ impl GpuModel {
     /// tape_forward_summary() but avoids the GPU→CPU param copy and CPU traced
     /// forward that make the CPU path ~10x slower.
     ///
-    /// dgd_delta_norm is always 0.0 on this path — use tape_forward_summary()
-    /// for DGD delta inspection.
+    /// dgd_delta_norm is computed from the GPU forward cache via the
+    /// dgd_delta_norm CUDA kernel (spec 16).
     fn gpu_tape_forward_summary(
         &mut self,
         input_ids: Vec<usize>,
@@ -2300,6 +2300,8 @@ impl GpuModel {
             .count();
         dict.set_item("total_blocks", active_count)?;
 
+        let d = self.cfg.swa.d_model;
+        let bs = input_ids.len() / s;
         let levels_list = pyo3::types::PyList::empty(py);
         for level in 0..self.cfg.k {
             let ldict = PyDict::new(py);
@@ -2309,7 +2311,12 @@ impl GpuModel {
                 if pulse.inner.active_levels[level] { 1usize } else { 0usize })?;
             ldict.set_item("output_grad_norm",
                 grads.level_output_gnorms[level])?;
-            ldict.set_item("dgd_delta_norm", 0.0f32)?;
+            // Compute DGD delta norm from forward cache (spec 16)
+            let delta_norm = cache.memory_caches[level]
+                .as_ref()
+                .map(|mc| mc.dgd_delta_norm(s, d, bs))
+                .unwrap_or(0.0);
+            ldict.set_item("dgd_delta_norm", delta_norm)?;
             levels_list.append(ldict)?;
         }
         dict.set_item("levels", levels_list)?;
