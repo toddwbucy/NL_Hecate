@@ -1,0 +1,44 @@
+{
+    "description": "Shakedown: stacked multi-block d=512 n_blocks=4 k=4 with TNT chunkwise. Same as shakedown_stacked_4b_k4 but with tnt_hierarchical parallel strategy. Tests 17x speedup claim vs full-trajectory.",
+    "model": {
+        "d_model": 512,
+        "num_heads": 8,
+        "seq_len": 512,
+        "window_size": 512,
+        "vocab_size": 50257,
+        "memory_rule": "titans",
+        "composition": "mag",
+        "k": 4,
+        "chunk_sizes": [1, 8, 64, 512],
+        "m_norm_max": [100.0, 100.0, 100.0, 100.0],
+        "error_clip": [50.0, 50.0, 50.0, 50.0],
+        "theta_ceil": [2.0, 2.0, 2.0, 2.0],
+        "residual": true,
+        "n_blocks": 4,
+        "parallel_strategy": "tnt_hierarchical",
+        "tnt_global_chunk_size": 64,
+        "tnt_local_chunk_size": 8
+    },
+    "build": {
+        "lr": 0.0003,
+        "steps": 10000,
+        "optimizer": "adamw_gpu_stacked",
+        "warmup_steps": 500,
+        "weight_decay": 0.1,
+        "beta1": 0.9,
+        "beta2": 0.999,
+        "max_grad_norm": 1.0,
+        "batch_size": 1,
+        "log_every": 8,
+        "eval_every": 512,
+        "save_every": 2500,
+        "save_path": "checkpoints/shakedown_stacked_4b_k4_tnt.safetensors",
+        "log_file": "runs/shakedown_stacked_4b_k4_tnt.jsonl",
+        "tape_every": 64,
+        "tape_device": "gpu"
+    },
+    "data": {
+        "path": "data/dolmino_smoke",
+        "format": "dolmino"
+    }
+}

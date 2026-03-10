@@ -1,3 +1,4 @@
+#define WARP_SZ 32
 // L2 Row Normalization — Forward + Backward CUDA Kernels
 //
 // Per-row L2 normalization for key/query vectors before memory operations.
@@ -33,22 +34,22 @@ __global__ void l2_normalize_rows_kernel(
 
     // Warp-level reduction
     unsigned mask = __activemask();
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+    for (int offset = WARP_SZ / 2; offset > 0; offset >>= 1) {
         local_sum += __shfl_down_sync(mask, local_sum, offset);
     }
 
     // Cross-warp reduction via shared memory
     extern __shared__ float smem[];
-    int warp_id = tid / warpSize;
-    int lane = tid % warpSize;
-    int n_warps = (blockDim.x + warpSize - 1) / warpSize;
+    int warp_id = tid / WARP_SZ;
+    int lane = tid % WARP_SZ;
+    int n_warps = (blockDim.x + WARP_SZ - 1) / WARP_SZ;
 
     if (lane == 0) smem[warp_id] = local_sum;
     __syncthreads();
 
     if (warp_id == 0) {
         float val = (lane < n_warps) ? smem[lane] : 0.0f;
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        for (int offset = WARP_SZ / 2; offset > 0; offset >>= 1) {
             val += __shfl_down_sync(mask, val, offset);
         }
         if (lane == 0) smem[0] = val;
@@ -118,22 +119,22 @@ __global__ void l2_normalize_backward_kernel(
 
     // Warp-level reduction
     unsigned mask = __activemask();
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+    for (int offset = WARP_SZ / 2; offset > 0; offset >>= 1) {
         local_dot += __shfl_down_sync(mask, local_dot, offset);
     }
 
     // Cross-warp reduction
     extern __shared__ float smem[];
-    int warp_id = tid / warpSize;
-    int lane = tid % warpSize;
-    int n_warps = (blockDim.x + warpSize - 1) / warpSize;
+    int warp_id = tid / WARP_SZ;
+    int lane = tid % WARP_SZ;
+    int n_warps = (blockDim.x + WARP_SZ - 1) / WARP_SZ;
 
     if (lane == 0) smem[warp_id] = local_dot;
     __syncthreads();
 
     if (warp_id == 0) {
         float val = (lane < n_warps) ? smem[lane] : 0.0f;
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        for (int offset = WARP_SZ / 2; offset > 0; offset >>= 1) {
             val += __shfl_down_sync(mask, val, offset);
         }
         if (lane == 0) smem[0] = val;

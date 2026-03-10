@@ -667,7 +667,7 @@ pub fn gpu_cms_forward(
 /// `context_m` is the carry-forward M state [d*d] — broadcast to all batch elements,
 /// then element-0's final M is written back after the forward pass.
 #[cfg(feature = "cuda")]
-fn gpu_memory_forward(
+pub(crate) fn gpu_memory_forward(
     level_params: &crate::gpu_params::GpuMemoryLevelParams,
     cfg: &MAGConfig,
     embedded: &GpuBuf<f32>,
@@ -888,7 +888,7 @@ fn gpu_memory_forward(
 /// Within each shard, N local memories run in parallel via the batched kernel.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
-fn gpu_tnt_forward(
+pub(crate) fn gpu_tnt_forward(
     level_params: &crate::gpu_params::GpuMemoryLevelParams,
     cfg: &MAGConfig,
     embedded: &GpuBuf<f32>,       // [bs*s, d] — full sequence embeddings
@@ -1756,7 +1756,7 @@ pub fn checkpoint_count(seq_len: usize, c: usize) -> usize {
 
 /// Frozen level: read-only y = M @ q_mem (all on GPU).
 #[cfg(feature = "cuda")]
-fn gpu_memory_read_only(
+pub(crate) fn gpu_memory_read_only(
     level_params: &crate::gpu_params::GpuMemoryLevelParams,
     embedded: &GpuBuf<f32>,
     context_m: &GpuBuf<f32>,   // [d*d] — read only

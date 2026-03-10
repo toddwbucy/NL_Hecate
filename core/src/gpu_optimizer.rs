@@ -172,7 +172,7 @@ impl GpuAdamWState {
 /// Helper: call the fused AdamW kernel for one (w, g, m, v) pair.
 #[cfg(feature = "cuda")]
 #[inline]
-fn adamw_one(
+pub(crate) fn adamw_one(
     w: &mut GpuBuf<f32>, g: &GpuBuf<f32>,
     m: &mut GpuBuf<f32>, v: &mut GpuBuf<f32>,
     lr: f32, beta1: f32, beta2: f32, eps: f32,
@@ -282,7 +282,14 @@ pub fn gpu_adamw_update(
                   lr, beta1, beta2, eps, lbc1_inv, lbc2_inv, weight_decay);
         adamw_one(&mut lp.b_theta, &lg.d_b_theta, &mut ml.m_b_theta, &mut ml.v_b_theta,
                   lr, beta1, beta2, eps, lbc1_inv, lbc2_inv, weight_decay);
-        // TODO(CS-39): clamp b_theta after update to prevent decay divergence
+        // CS-39: clamp b_theta to bound the bias component of inner-loop learning rate.
+        // softplus(b_theta) = theta_bias; clamping b_theta ∈ [-10, 2] keeps bias ∈ [~0, ~2.13].
+        // NOTE: w_theta · [k,v] can still push per-token theta higher. A full theta_ceil
+        // enforcement in the forward pass (via config.theta_ceil) is the proper long-term fix.
+        // This bias clamp is a first-order stabilizer — sufficient for shakedown builds.
+        unsafe {
+            crate::cuda_ffi::clamp_f32_cuda(lp.b_theta.ptr(), lp.b_theta.len() as i32, -10.0, 2.0);
+        }
         adamw_one(&mut lp.w_eta, &lg.d_w_eta, &mut ml.m_w_eta, &mut ml.v_w_eta,
                   lr, beta1, beta2, eps, lbc1_inv, lbc2_inv, weight_decay);
         adamw_one(&mut lp.b_eta, &lg.d_b_eta, &mut ml.m_b_eta, &mut ml.v_b_eta,

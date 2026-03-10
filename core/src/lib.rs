@@ -42,6 +42,7 @@ pub mod adamw;
 pub mod bf16;
 pub mod m3;
 pub mod cms_variants;
+pub mod stacked_model;
 #[cfg(feature = "cuda")]
 pub(crate) mod cuda_ffi;
 #[cfg(feature = "cuda")]
@@ -53,9 +54,15 @@ pub mod cuda_graph;
 #[cfg(feature = "cuda")]
 pub mod gpu_forward;
 #[cfg(feature = "cuda")]
+pub mod gpu_stacked_forward;
+#[cfg(feature = "cuda")]
 pub mod gpu_backward;
 #[cfg(feature = "cuda")]
+pub mod gpu_stacked_backward;
+#[cfg(feature = "cuda")]
 pub mod gpu_optimizer;
+#[cfg(feature = "cuda")]
+pub mod gpu_stacked_optimizer;
 pub mod dynamic_freq;
 pub mod conductor;
 pub mod context_stream;

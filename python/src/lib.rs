@@ -2401,6 +2401,302 @@ impl FrequencyAwareAdamW {
     }
 }
 
+// ── GpuStackedModel (multi-block architecture) ──────────────────────
+
+/// GPU-resident stacked multi-block model.
+/// N blocks of [SWA + CMS(k levels)] connected via residual stream.
+/// Shared embedding/unembedding + final LayerNorm across all blocks.
+#[cfg(feature = "cuda")]
+#[pyclass(unsendable)]
+struct GpuStackedModel {
+    params: nl_hecate_core::gpu_params::GpuStackedParams,
+    context: nl_hecate_core::gpu_params::GpuStackedContext,
+    cfg: nl_hecate_core::model::MAGConfig,
+    adamw_state: Option<nl_hecate_core::gpu_stacked_optimizer::GpuStackedAdamWState>,
+    n_blocks: usize,
+    /// TNT periodic reset mode. When true, context.memory[k] is zeroed after
+    /// each step where pulse.active_levels[k] is true (eq-006, 2511.07343).
+    memory_reset: bool,
+}
+
+#[cfg(feature = "cuda")]
+#[pymethods]
+impl GpuStackedModel {
+    /// Create from StackedMAGParams config.
+    #[new]
+    #[pyo3(signature = (cfg, n_blocks, seed, batch_size=1, memory_reset=false))]
+    fn new(
+        cfg: &MAGConfig, n_blocks: usize, seed: u64, batch_size: usize,
+        memory_reset: bool,
+    ) -> PyResult<Self> {
+        if batch_size == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err("batch_size must be >= 1"));
+        }
+        if n_blocks == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err("n_blocks must be >= 1"));
+        }
+        let host_params = nl_hecate_core::stacked_model::StackedMAGParams::init(
+            &cfg.inner, n_blocks, seed,
+        );
+        let gpu_params = nl_hecate_core::gpu_params::GpuStackedParams::from_host(&host_params);
+        let gpu_context = nl_hecate_core::gpu_params::GpuStackedContext::new(
+            n_blocks, cfg.inner.k, cfg.inner.swa.d_model, batch_size,
+        );
+        Ok(GpuStackedModel {
+            params: gpu_params,
+            context: gpu_context,
+            cfg: cfg.inner.clone(),
+            adamw_state: None,
+            n_blocks,
+            memory_reset,
+        })
+    }
+
+    /// Full GPU build step with AdamW optimizer. Returns (loss, grad_norm).
+    #[pyo3(signature = (input_ids, target_ids, pulse, lr, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.1, max_grad_norm=1.0))]
+    fn step_adamw(&mut self, input_ids: Vec<usize>, target_ids: Vec<usize>,
+                  pulse: &Pulse, lr: f32, beta1: f32, beta2: f32,
+                  eps: f32, weight_decay: f32, max_grad_norm: f32) -> PyResult<(f32, f32)> {
+        let s = self.cfg.swa.seq_len;
+        let v = self.cfg.swa.vocab_size;
+        if s == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err("seq_len must be > 0"));
+        }
+        if input_ids.is_empty() || input_ids.len() % s != 0 || target_ids.len() != input_ids.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("input/target length must be batch_size * seq_len {} (got {})", s, input_ids.len())));
+        }
+        let bs = input_ids.len() / s;
+        if bs != self.context.batch_size {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("batch mismatch: input has {} samples but context allocated for batch_size={}",
+                        bs, self.context.batch_size)));
+        }
+        if let Some(&max_id) = input_ids.iter().max() {
+            if max_id >= v {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("input_ids contains {} >= vocab_size {}", max_id, v)));
+            }
+        }
+
+        // Forward
+        let (loss, cache) = nl_hecate_core::gpu_stacked_forward::gpu_stacked_forward(
+            &self.params, &self.cfg, &input_ids, &target_ids,
+            &pulse.inner, &mut self.context,
+        );
+
+        // Backward
+        let mut grads = nl_hecate_core::gpu_stacked_backward::gpu_stacked_backward(
+            &self.params, &self.cfg, &cache,
+        );
+
+        // Lazy-init AdamW state
+        if self.adamw_state.is_none() {
+            self.adamw_state = Some(
+                nl_hecate_core::gpu_stacked_optimizer::GpuStackedAdamWState::from_params(&self.params)
+            );
+        }
+        let state = self.adamw_state.as_mut().unwrap();
+
+        // AdamW update (grads passed as &mut for in-place clipping)
+        let grad_norm = nl_hecate_core::gpu_stacked_optimizer::gpu_stacked_adamw_update(
+            &mut self.params, &mut grads, state,
+            &pulse.inner,
+            lr, beta1, beta2, eps, weight_decay, max_grad_norm,
+        );
+
+        // Weight tying: sync w_unembed^T → w_embed (same as single-block path).
+        // Without this, shared input/output embeddings diverge during training.
+        nl_hecate_core::gpu_stacked_optimizer::gpu_stacked_sync_embed_weights(
+            &mut self.params,
+            self.cfg.swa.d_model,
+            self.cfg.swa.vocab_size,
+        );
+
+        // TNT periodic reset (2511.07343 eq-006): after observing this step's final M,
+        // reset context.memory[k] to zeros for each level that fired this step.
+        // CS-32 compliant: reset happens after the step's advance, before the next step's observe.
+        if self.memory_reset {
+            for (k, &active) in pulse.inner.active_levels.iter().enumerate() {
+                if active {
+                    self.context.periodic_reset_level(k);
+                }
+            }
+        }
+
+        Ok((loss, grad_norm))
+    }
+
+    /// Update per-level theta_floor values on the live model config.
+    /// The new floor is applied starting from the next forward pass.
+    /// Length must equal k. Used by the gate warmup schedule in loop.py.
+    fn update_theta_floor(&mut self, floor: Vec<f32>) -> PyResult<()> {
+        if floor.len() != self.cfg.k {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "update_theta_floor: floor length {} != k {}",
+                floor.len(), self.cfg.k
+            )));
+        }
+        self.cfg.theta_floor = floor;
+        Ok(())
+    }
+
+    /// Total parameter count (downloads to host for counting -- use sparingly).
+    fn total_params(&self) -> usize {
+        let d = self.cfg.swa.d_model;
+        let v = self.cfg.swa.vocab_size;
+        let k = self.cfg.k;
+        let host = self.params.to_host(d, v, k);
+        host.num_params()
+    }
+
+    /// Reset all memory across all blocks.
+    fn reset_context(&mut self) {
+        self.context.reset();
+    }
+
+    /// Number of blocks.
+    #[getter]
+    fn n_blocks(&self) -> usize {
+        self.n_blocks
+    }
+
+    /// GPU-resident stacked tape summary -- per-(block, level) gradient diagnostics.
+    ///
+    /// Runs one GPU forward+backward (no optimizer step) and captures per-level
+    /// output gradient norms from d_y_combined in each block. Context is
+    /// saved and restored -- diagnostic does not modify model state.
+    fn gpu_stacked_tape_summary(
+        &mut self,
+        input_ids: Vec<usize>,
+        target_ids: Vec<usize>,
+        pulse: &Pulse,
+        py: Python<'_>,
+    ) -> PyResult<PyObject> {
+        let s = self.cfg.swa.seq_len;
+        let v = self.cfg.swa.vocab_size;
+        if s == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err("seq_len must be > 0"));
+        }
+        if input_ids.is_empty() || input_ids.len() % s != 0 || target_ids.len() != input_ids.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("input/target length must be batch_size * seq_len {} (got {})", s, input_ids.len())));
+        }
+        let bs = input_ids.len() / s;
+        if bs != self.context.batch_size {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("batch mismatch: input has {} samples but context allocated for batch_size={}",
+                        bs, self.context.batch_size)));
+        }
+        if let Some(&max_id) = input_ids.iter().max() {
+            if max_id >= v {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("input_ids contains {} >= vocab_size {}", max_id, v)));
+            }
+        }
+
+        // Capture M state norms from current context (before diagnostic forward)
+        let k = self.cfg.k;
+        let m_norms = self.context.memory_norms();
+
+        // Save context (deep clone -- D2D copy for each block's memory)
+        let saved_ctx = self.context.deep_clone();
+
+        // Forward (modifies context -- will be restored)
+        let (loss, cache) = nl_hecate_core::gpu_stacked_forward::gpu_stacked_forward(
+            &self.params, &self.cfg, &input_ids, &target_ids,
+            &pulse.inner, &mut self.context,
+        );
+
+        // Extract DGD delta norms from cache BEFORE backward consumes it.
+        // Per-(block, level) ||M_final @ k_last - v_last||_2
+        // Source: HOPE Eq 88, spec 16_dgd_delta_norm_gpu.md
+        let d = self.cfg.swa.d_model;
+        let bs = input_ids.len() / s;
+        let mut delta_norms: Vec<Vec<f32>> = Vec::with_capacity(self.n_blocks);
+        for block_cache in &cache.block_caches {
+            let mut block_deltas = Vec::with_capacity(k);
+            for level in 0..k {
+                if let Some(ref mem_cache) = block_cache.memory_caches[level] {
+                    block_deltas.push(mem_cache.dgd_delta_norm(s, d, bs));
+                } else {
+                    block_deltas.push(0.0);
+                }
+            }
+            delta_norms.push(block_deltas);
+        }
+
+        // Backward (collect level_output_gnorms)
+        let grads = nl_hecate_core::gpu_stacked_backward::gpu_stacked_backward(
+            &self.params, &self.cfg, &cache,
+        );
+
+        // Restore context
+        self.context = saved_ctx;
+
+        // Build Python dict
+        let dict = pyo3::types::PyDict::new(py);
+        dict.set_item("loss", loss)?;
+        dict.set_item("n_blocks", self.n_blocks)?;
+
+        let rule_name = format!("{:?}", self.cfg.memory_rule);
+
+        // Per-block breakdown
+        let blocks_list = pyo3::types::PyList::empty(py);
+        let mut agg_gnorms = vec![0.0f32; k]; // max gnorm per level across blocks
+
+        for (bi, bg) in grads.blocks.iter().enumerate() {
+            let bdict = pyo3::types::PyDict::new(py);
+            bdict.set_item("block_index", bi)?;
+
+            let levels_list = pyo3::types::PyList::empty(py);
+            for level in 0..k {
+                let ldict = pyo3::types::PyDict::new(py);
+                ldict.set_item("level", level)?;
+                ldict.set_item("opaque_key", &rule_name)?;
+                let active = pulse.inner.active_levels[level];
+                ldict.set_item("block_count", if active { 1usize } else { 0usize })?;
+                let gnorm = bg.level_output_gnorms[level];
+                ldict.set_item("output_grad_norm", gnorm)?;
+                ldict.set_item("dgd_delta_norm", delta_norms[bi][level])?;
+                ldict.set_item("m_norm", m_norms[bi][level])?;
+                levels_list.append(ldict)?;
+
+                if gnorm > agg_gnorms[level] {
+                    agg_gnorms[level] = gnorm;
+                }
+            }
+            bdict.set_item("levels", levels_list)?;
+            blocks_list.append(bdict)?;
+        }
+        dict.set_item("blocks", blocks_list)?;
+
+        // Aggregated levels (backward compat with print_tape_summary)
+        let mut total_active = 0usize;
+        let agg_levels_list = pyo3::types::PyList::empty(py);
+        for level in 0..k {
+            let ldict = pyo3::types::PyDict::new(py);
+            ldict.set_item("level", level)?;
+            ldict.set_item("opaque_key", &rule_name)?;
+            let active = pulse.inner.active_levels[level];
+            // For stacked models, block_count reflects how many blocks fired this level
+            let bc = if active { self.n_blocks } else { 0usize };
+            if active { total_active += self.n_blocks; }
+            ldict.set_item("block_count", bc)?;
+            ldict.set_item("output_grad_norm", agg_gnorms[level])?;
+            // Aggregate delta norm: max across blocks for this level
+            let max_delta = delta_norms.iter().map(|bd| bd[level]).fold(0.0f32, f32::max);
+            ldict.set_item("dgd_delta_norm", max_delta)?;
+            agg_levels_list.append(ldict)?;
+        }
+        dict.set_item("levels", agg_levels_list)?;
+        dict.set_item("total_blocks", total_active)?;
+
+        Ok(dict.into())
+    }
+
+}
+
 // ── Module ───────────────────────────────────────────────────────────
 
 #[pymodule]
@@ -2448,5 +2744,7 @@ fn nl_hecate(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // GPU-resident model
     #[cfg(feature = "cuda")]
     m.add_class::<GpuModel>()?;
+    #[cfg(feature = "cuda")]
+    m.add_class::<GpuStackedModel>()?;
     Ok(())
 }
