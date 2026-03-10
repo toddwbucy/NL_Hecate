@@ -1341,17 +1341,17 @@ pub fn traced_stacked_forward(
                 let w_q_mem_id = tape.register_param(&w_q_f32, vec![d, d]);
                 let q_mem_id = traced_matmul_transb(tape, ln_mem_out_id, w_q_mem_id, s, d, d);
 
-                let (y_data, _q_mem_data) = match cfg.memory_rule {
-                    MemoryRuleKind::DeltaRule | MemoryRuleKind::TitansLMM
-                        | MemoryRuleKind::HebbianRule | MemoryRuleKind::AtlasOmega =>
-                    {
-                        delta_rule_read_only(lp, &ln_mem_data, frozen_ref, s, d, &cfg.feature_map)
-                    }
-                    _ => delta_rule_read_only(lp, &ln_mem_data, frozen_ref, s, d, &cfg.feature_map),
-                };
+                let (y_data, _q_mem_data) = delta_rule_read_only(
+                    lp, &ln_mem_data, frozen_ref, s, d, &cfg.feature_map,
+                );
 
                 let fk = frozen_opaque_key(cfg.memory_rule);
-                let meta = vec![s as f32, d as f32, 0.0f32, 1.0f32]; // Identity FM
+                let (fm_kind_f32, fm_sigma) = match &cfg.feature_map {
+                    crate::feature_map::FeatureMapKind::Identity => (0.0f32, 1.0f32),
+                    crate::feature_map::FeatureMapKind::RandomFourier { sigma } => (1.0f32, *sigma),
+                    crate::feature_map::FeatureMapKind::ELU => (2.0f32, 1.0f32),
+                };
+                let meta = vec![s as f32, d as f32, fm_kind_f32, fm_sigma];
                 let meta_id = tape.alloc(meta, vec![]);
                 let m_saved = tape.alloc(frozen_ref.to_vec(), vec![]);
                 let y_id = tape.alloc(y_data, vec![s, d]);
@@ -1374,7 +1374,9 @@ pub fn traced_stacked_forward(
         // ── Residual skip 2: residual_after_attn + y_combined ──
         residual_id = traced_add(tape, residual_after_attn_id, combined_id);
 
-        // Register w_o (not applied in stacked path — matches GPU forward)
+        // Register w_o for gradient tracking. NOT applied as output projection
+        // in stacked path — matches gpu_stacked_forward.rs lines 239-241 where
+        // w_o is explicitly skipped. The residual stream carries raw attn_out.
         let w_o_id = tape.register_param(&block.w_o, vec![d, d]);
 
         block_param_ids.push(TracedBlockParamIds {

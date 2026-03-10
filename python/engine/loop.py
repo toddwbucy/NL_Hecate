@@ -1111,8 +1111,13 @@ def run_build(bcfg: BuildConfig):
                 # The Rust binding rejects target_ids >= vocab_size; masked batches are
                 # normal (all-user-turn chunks) and should not generate warning noise.
                 try:
-                    if is_stacked and tape_device == "cpu" and hasattr(gpu_model, "cpu_stacked_tape_summary"):
+                    if is_stacked and tape_device == "cpu":
                         # Stacked model -- CPU Wengert tape for full gradient observability
+                        if not hasattr(gpu_model, "cpu_stacked_tape_summary"):
+                            raise RuntimeError(
+                                "tape_device='cpu' requested for stacked model but "
+                                "cpu_stacked_tape_summary() is unavailable"
+                            )
                         tape_sum = gpu_model.cpu_stacked_tape_summary(
                             input_ids, target_ids, pulse
                         )
@@ -1283,7 +1288,12 @@ def run_build(bcfg: BuildConfig):
                     and input_ids is not None and target_ids is not None
                     and max(target_ids) < bcfg.vocab_size):
                 try:
-                    if tape_device_stacked == "cpu" and hasattr(gpu_model, "cpu_stacked_tape_summary"):
+                    if tape_device_stacked == "cpu":
+                        if not hasattr(gpu_model, "cpu_stacked_tape_summary"):
+                            raise RuntimeError(
+                                "tape_device='cpu' requested for stacked model but "
+                                "cpu_stacked_tape_summary() is unavailable"
+                            )
                         tape_sum = gpu_model.cpu_stacked_tape_summary(
                             input_ids, target_ids, pulse
                         )
