@@ -28,6 +28,7 @@ use memmap2::Mmap;
 
 use crate::bf16::Bf16Storage;
 use crate::model::{BuildResumeState, MAGConfig, MAGParams, MemoryLevelParams, SWAParams};
+use crate::stacked_model::{BlockParams, StackedMAGParams};
 
 // ── Save ─────────────────────────────────────────────────────────────
 
@@ -359,6 +360,367 @@ pub fn load_safetensors(
     Ok((params, config, build_state))
 }
 
+// ── Stacked checkpoint save/load ────────────────────────────────────
+// Spec: specs/infrastructure/22_stacked_extend_k_per_block.md
+// Hierarchical keys: shared.* for embed/unembed/ln_final, block.{n}.* for per-block.
+
+/// Save StackedMAGParams + config as a safetensors binary checkpoint.
+///
+/// Uses hierarchical keys: shared.embed.weight, block.0.swa.w_q, block.0.level.0.w_k, etc.
+/// The metadata includes "stacked":"true" and "n_blocks":"N" for format detection.
+pub fn save_stacked_safetensors(
+    path: &Path,
+    params: &StackedMAGParams,
+    config: &MAGConfig,
+    n_blocks: usize,
+    build_state: Option<&BuildResumeState>,
+) -> io::Result<()> {
+    let mut tensors: Vec<(String, Vec<u8>)> = Vec::new();
+
+    fn enc(data: &[f32]) -> Vec<u8> {
+        data.iter().flat_map(|f| f.to_le_bytes()).collect()
+    }
+
+    // Shared parameters
+    tensors.push(("shared.embed.weight".into(), enc(&params.w_embed)));
+    tensors.push(("shared.lm_head.weight".into(), enc(&params.w_unembed)));
+    tensors.push(("shared.ln_final.gamma".into(), enc(&params.ln_final_gamma)));
+    tensors.push(("shared.ln_final.beta".into(), enc(&params.ln_final_beta)));
+
+    // Per-block parameters
+    for (b, block) in params.blocks.iter().enumerate() {
+        let bp = format!("block.{b}");
+
+        // SWA projections
+        tensors.push((format!("{bp}.swa.w_q"), enc(&block.w_q)));
+        tensors.push((format!("{bp}.swa.w_k"), enc(&block.w_k)));
+        tensors.push((format!("{bp}.swa.w_v"), enc(&block.w_v)));
+        tensors.push((format!("{bp}.swa.w_o"), enc(&block.w_o)));
+
+        // LayerNorms
+        tensors.push((format!("{bp}.ln_attn.gamma"), enc(&block.ln_attn_gamma)));
+        tensors.push((format!("{bp}.ln_attn.beta"), enc(&block.ln_attn_beta)));
+        tensors.push((format!("{bp}.ln_mem.gamma"), enc(&block.ln_mem_gamma)));
+        tensors.push((format!("{bp}.ln_mem.beta"), enc(&block.ln_mem_beta)));
+
+        // CMS aggregation logits
+        if !block.alpha_mem.is_empty() {
+            tensors.push((format!("{bp}.alpha_mem"), enc(&block.alpha_mem)));
+        }
+        if !block.alpha_refl.is_empty() {
+            tensors.push((format!("{bp}.alpha_refl"), enc(&block.alpha_refl)));
+        }
+
+        // Per-level memory weights
+        for (i, lp) in block.levels.iter().enumerate() {
+            let p = format!("{bp}.level.{i}");
+            encode_level_tensors(&mut tensors, &p, lp)?;
+        }
+    }
+
+    // Metadata
+    let config_json = serde_json::to_string(config)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let build_state_json = match build_state {
+        Some(bs) => serde_json::to_string(bs)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+        None => "null".to_string(),
+    };
+
+    let mut header = serde_json::Map::new();
+    let mut meta = serde_json::Map::new();
+    meta.insert("version".into(),     serde_json::Value::String("2".into()));
+    meta.insert("format".into(),      serde_json::Value::String("nl_hecate_v2_stacked".into()));
+    meta.insert("stacked".into(),     serde_json::Value::String("true".into()));
+    meta.insert("n_blocks".into(),    serde_json::Value::String(n_blocks.to_string()));
+    meta.insert("created_at".into(),  serde_json::Value::String(now_epoch()));
+    meta.insert("config".into(),      serde_json::Value::String(config_json));
+    meta.insert("build_state".into(), serde_json::Value::String(build_state_json));
+    header.insert("__metadata__".into(), serde_json::Value::Object(meta));
+
+    let mut data_offset: usize = 0;
+    for (name, bytes) in &tensors {
+        let n = bytes.len();
+        header.insert(name.clone(), serde_json::json!({
+            "dtype": "F32",
+            "shape": [n / 4],
+            "data_offsets": [data_offset, data_offset + n],
+        }));
+        data_offset += n;
+    }
+
+    let header_bytes = serde_json::to_vec(&header)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let raw_len = header_bytes.len();
+    let padded_len = (raw_len + 7) & !7usize;
+
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(&(padded_len as u64).to_le_bytes())?;
+    file.write_all(&header_bytes)?;
+    if padded_len > raw_len {
+        file.write_all(&vec![0x20u8; padded_len - raw_len])?;
+    }
+    for (_, bytes) in &tensors {
+        file.write_all(bytes)?;
+    }
+
+    Ok(())
+}
+
+/// Load a stacked safetensors checkpoint.
+///
+/// Returns (StackedMAGParams, MAGConfig, n_blocks, Option<BuildResumeState>).
+/// Detects n_blocks by scanning header keys for the highest block.{n} prefix.
+pub fn load_stacked_safetensors(
+    path: &Path,
+) -> io::Result<(StackedMAGParams, MAGConfig, usize, Option<BuildResumeState>)> {
+    let file = std::fs::File::open(path)?;
+    let mmap = unsafe { Mmap::map(&file)? };
+    let bytes: &[u8] = &mmap;
+
+    if bytes.len() < 8 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "safetensors: file too small"));
+    }
+    let header_len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+    if bytes.len() < 8 + header_len {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "safetensors: truncated header"));
+    }
+    let header_slice = std::str::from_utf8(&bytes[8..8 + header_len])
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let header_json = header_slice.trim_end();
+    let header: serde_json::Value = serde_json::from_str(header_json)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    let meta = header["__metadata__"].as_object().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "safetensors: missing __metadata__")
+    })?;
+
+    let config_str = meta.get("config")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "safetensors: missing config"))?;
+    let config: MAGConfig = serde_json::from_str(config_str)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    let build_state: Option<BuildResumeState> = match meta.get("build_state").and_then(|v| v.as_str()) {
+        Some("null") | None => None,
+        Some(s) => Some(
+            serde_json::from_str(s)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+        ),
+    };
+
+    // Detect n_blocks from header keys
+    let n_blocks = meta.get("n_blocks")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            // Fallback: scan keys for highest block.{n}
+            let mut max_b = 0usize;
+            if let Some(obj) = header.as_object() {
+                for key in obj.keys() {
+                    if let Some(rest) = key.strip_prefix("block.") {
+                        if let Some(dot) = rest.find('.') {
+                            if let Ok(b) = rest[..dot].parse::<usize>() {
+                                max_b = max_b.max(b + 1);
+                            }
+                        }
+                    }
+                }
+            }
+            max_b
+        });
+
+    if n_blocks == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stacked safetensors: could not determine n_blocks (no block.* keys found)",
+        ));
+    }
+
+    let data_region = &bytes[8 + header_len..];
+
+    let get = |name: &str| -> Vec<f32> {
+        let offsets = header.get(name)
+            .and_then(|v| v.get("data_offsets"))
+            .and_then(|v| v.as_array());
+        if let Some(offs) = offsets {
+            if offs.len() == 2 {
+                let s = offs[0].as_u64().unwrap_or(0) as usize;
+                let e = offs[1].as_u64().unwrap_or(0) as usize;
+                if e <= data_region.len() && e >= s {
+                    return data_region[s..e].chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .collect();
+                }
+            }
+        }
+        vec![]
+    };
+
+    // Shared params
+    let w_embed = get("shared.embed.weight");
+    let w_unembed = get("shared.lm_head.weight");
+    let d = config.swa.d_model;
+    let ln_final_gamma = { let v = get("shared.ln_final.gamma"); if v.is_empty() { vec![1.0f32; d] } else { v } };
+    let ln_final_beta = { let v = get("shared.ln_final.beta"); if v.is_empty() { vec![0.0f32; d] } else { v } };
+
+    // Per-block params
+    let k = config.k;
+    let mut blocks = Vec::with_capacity(n_blocks);
+    for b in 0..n_blocks {
+        let bp = format!("block.{b}");
+
+        let w_q = get(&format!("{bp}.swa.w_q"));
+        let w_k = get(&format!("{bp}.swa.w_k"));
+        let w_v = get(&format!("{bp}.swa.w_v"));
+        let w_o = get(&format!("{bp}.swa.w_o"));
+        let ln_attn_gamma = { let v = get(&format!("{bp}.ln_attn.gamma")); if v.is_empty() { vec![1.0f32; d] } else { v } };
+        let ln_attn_beta = { let v = get(&format!("{bp}.ln_attn.beta")); if v.is_empty() { vec![0.0f32; d] } else { v } };
+        let ln_mem_gamma = { let v = get(&format!("{bp}.ln_mem.gamma")); if v.is_empty() { vec![1.0f32; d] } else { v } };
+        let ln_mem_beta = { let v = get(&format!("{bp}.ln_mem.beta")); if v.is_empty() { vec![0.0f32; d] } else { v } };
+        let alpha_mem = get(&format!("{bp}.alpha_mem"));
+        let alpha_refl = get(&format!("{bp}.alpha_refl"));
+
+        let mut levels = Vec::with_capacity(k);
+        for i in 0..k {
+            let p = format!("{bp}.level.{i}");
+            levels.push(decode_level_params(&get, &p));
+        }
+
+        blocks.push(BlockParams {
+            w_q, w_k, w_v, w_o,
+            ln_attn_gamma, ln_attn_beta,
+            ln_mem_gamma, ln_mem_beta,
+            levels, alpha_mem, alpha_refl,
+        });
+    }
+
+    let params = StackedMAGParams {
+        w_embed, w_unembed,
+        ln_final_gamma, ln_final_beta,
+        blocks,
+    };
+
+    Ok((params, config, n_blocks, build_state))
+}
+
+/// Check if a safetensors file is a stacked checkpoint (has shared.embed.weight key).
+pub fn is_stacked_checkpoint(path: &Path) -> io::Result<bool> {
+    let file = std::fs::File::open(path)?;
+    let mmap = unsafe { Mmap::map(&file)? };
+    let bytes: &[u8] = &mmap;
+
+    if bytes.len() < 8 {
+        return Ok(false);
+    }
+    let header_len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+    if bytes.len() < 8 + header_len {
+        return Ok(false);
+    }
+    let header_slice = std::str::from_utf8(&bytes[8..8 + header_len])
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok(header_slice.contains("shared.embed.weight"))
+}
+
+/// Encode per-level tensors into the tensor list (shared by single-block and stacked).
+fn encode_level_tensors(
+    tensors: &mut Vec<(String, Vec<u8>)>,
+    prefix: &str,
+    lp: &MemoryLevelParams,
+) -> io::Result<()> {
+    fn enc(data: &[f32]) -> Vec<u8> {
+        data.iter().flat_map(|f| f.to_le_bytes()).collect()
+    }
+
+    tensors.push((format!("{prefix}.w_k"), enc(lp.w_k_mem.master())));
+    tensors.push((format!("{prefix}.w_v"), enc(lp.w_v_mem.master())));
+    tensors.push((format!("{prefix}.w_q"), enc(lp.w_q_mem.master())));
+
+    tensors.push((format!("{prefix}.gate.alpha"),   enc(&lp.w_alpha)));
+    tensors.push((format!("{prefix}.gate.b_alpha"), enc(&lp.b_alpha)));
+    tensors.push((format!("{prefix}.gate.theta"),   enc(&lp.w_theta)));
+    tensors.push((format!("{prefix}.gate.b_theta"), enc(&lp.b_theta)));
+    tensors.push((format!("{prefix}.gate.eta"),     enc(&lp.w_eta)));
+    tensors.push((format!("{prefix}.gate.b_eta"),   enc(&lp.b_eta)));
+
+    if !lp.w_omega.is_empty() {
+        tensors.push((format!("{prefix}.w_omega"), enc(&lp.w_omega)));
+    }
+    if !lp.w_freq.is_empty() {
+        tensors.push((format!("{prefix}.w_freq"), enc(&lp.w_freq)));
+        tensors.push((format!("{prefix}.b_freq"), enc(&lp.b_freq)));
+    }
+    if !lp.w_k_conv.is_empty() {
+        tensors.push((format!("{prefix}.w_k_conv"), enc(&lp.w_k_conv)));
+        tensors.push((format!("{prefix}.b_k_conv"), enc(&lp.b_k_conv)));
+        tensors.push((format!("{prefix}.w_q_conv"), enc(&lp.w_q_conv)));
+        tensors.push((format!("{prefix}.b_q_conv"), enc(&lp.b_q_conv)));
+    }
+    if !lp.m_k_init.is_empty() {
+        tensors.push((format!("{prefix}.m_state.k"),     enc(&lp.m_k_init)));
+        tensors.push((format!("{prefix}.m_state.v"),     enc(&lp.m_v_init)));
+        tensors.push((format!("{prefix}.m_state.q"),     enc(&lp.m_q_init)));
+        tensors.push((format!("{prefix}.m_state.eta"),   enc(&lp.m_eta_init)));
+        tensors.push((format!("{prefix}.m_state.alpha"), enc(&lp.m_alpha_init)));
+        tensors.push((format!("{prefix}.m_state.mem"),   enc(&lp.m_mem_init)));
+    }
+    if !lp.gate_proj.is_empty() {
+        tensors.push((format!("{prefix}.mlp.gate_proj"), enc(&lp.gate_proj)));
+        tensors.push((format!("{prefix}.mlp.up_proj"),   enc(&lp.up_proj)));
+        tensors.push((format!("{prefix}.mlp.down_proj"), enc(&lp.down_proj)));
+    }
+    let has_w = !lp.w_rand.is_empty();
+    let has_b = !lp.b_rand.is_empty();
+    if has_w != has_b {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{prefix}.fm.w_rand and {prefix}.fm.b_rand must both be non-empty or both be empty"),
+        ));
+    }
+    if has_w {
+        tensors.push((format!("{prefix}.fm.w_rand"), enc(&lp.w_rand)));
+        tensors.push((format!("{prefix}.fm.b_rand"), enc(&lp.b_rand)));
+    }
+    Ok(())
+}
+
+/// Decode per-level params from a get-tensor closure (shared by single-block and stacked).
+fn decode_level_params(get: &dyn Fn(&str) -> Vec<f32>, prefix: &str) -> MemoryLevelParams {
+    let w_k_mem = Bf16Storage::from_f32_vec(get(&format!("{prefix}.w_k")));
+    let w_v_mem = Bf16Storage::from_f32_vec(get(&format!("{prefix}.w_v")));
+    let w_q_mem = Bf16Storage::from_f32_vec(get(&format!("{prefix}.w_q")));
+
+    MemoryLevelParams {
+        w_k_mem,
+        w_v_mem,
+        w_q_mem,
+        w_alpha:      get(&format!("{prefix}.gate.alpha")),
+        b_alpha:      get(&format!("{prefix}.gate.b_alpha")),
+        w_theta:      get(&format!("{prefix}.gate.theta")),
+        b_theta:      get(&format!("{prefix}.gate.b_theta")),
+        w_eta:        get(&format!("{prefix}.gate.eta")),
+        b_eta:        get(&format!("{prefix}.gate.b_eta")),
+        w_omega:      get(&format!("{prefix}.w_omega")),
+        w_freq:       get(&format!("{prefix}.w_freq")),
+        b_freq:       get(&format!("{prefix}.b_freq")),
+        w_k_conv:     get(&format!("{prefix}.w_k_conv")),
+        b_k_conv:     get(&format!("{prefix}.b_k_conv")),
+        w_q_conv:     get(&format!("{prefix}.w_q_conv")),
+        b_q_conv:     get(&format!("{prefix}.b_q_conv")),
+        m_k_init:     get(&format!("{prefix}.m_state.k")),
+        m_v_init:     get(&format!("{prefix}.m_state.v")),
+        m_q_init:     get(&format!("{prefix}.m_state.q")),
+        m_eta_init:   get(&format!("{prefix}.m_state.eta")),
+        m_alpha_init: get(&format!("{prefix}.m_state.alpha")),
+        m_mem_init:   get(&format!("{prefix}.m_state.mem")),
+        gate_proj:    get(&format!("{prefix}.mlp.gate_proj")),
+        up_proj:      get(&format!("{prefix}.mlp.up_proj")),
+        down_proj:    get(&format!("{prefix}.mlp.down_proj")),
+        w_rand:       get(&format!("{prefix}.fm.w_rand")),
+        b_rand:       get(&format!("{prefix}.fm.b_rand")),
+    }
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────
 
 /// Epoch-based timestamp (no chrono dependency — same convention as model.rs).
@@ -467,6 +829,119 @@ mod tests {
         // If this panics, the file format is not spec-compliant.
         let _st = safetensors::SafeTensors::deserialize(&bytes)
             .expect("safetensors crate must be able to parse our output");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_stacked_safetensors_roundtrip() {
+        let cfg = MAGConfig::test_config();
+        let n_blocks = 3;
+        let params = StackedMAGParams::init(&cfg, n_blocks, 42);
+        let dir = std::env::temp_dir().join("hecate_test_stacked_rt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stacked.safetensors");
+
+        save_stacked_safetensors(&path, &params, &cfg, n_blocks, None).unwrap();
+        let (loaded, loaded_cfg, loaded_nb, build_state) = load_stacked_safetensors(&path).unwrap();
+
+        assert_eq!(loaded_nb, n_blocks);
+        assert_eq!(loaded_cfg.k, cfg.k);
+        assert!(build_state.is_none());
+
+        // Shared params round-trip
+        assert_eq!(loaded.w_embed, params.w_embed, "embed round-trip");
+        assert_eq!(loaded.w_unembed, params.w_unembed, "unembed round-trip");
+        assert_eq!(loaded.ln_final_gamma, params.ln_final_gamma);
+        assert_eq!(loaded.ln_final_beta, params.ln_final_beta);
+
+        // Per-block round-trip
+        assert_eq!(loaded.blocks.len(), n_blocks);
+        for b in 0..n_blocks {
+            assert_eq!(loaded.blocks[b].w_q, params.blocks[b].w_q, "block {b} w_q");
+            assert_eq!(loaded.blocks[b].w_o, params.blocks[b].w_o, "block {b} w_o");
+            assert_eq!(loaded.blocks[b].alpha_mem, params.blocks[b].alpha_mem, "block {b} alpha_mem");
+            assert_eq!(loaded.blocks[b].levels.len(), cfg.k);
+            for l in 0..cfg.k {
+                assert_eq!(
+                    loaded.blocks[b].levels[l].w_k_mem.master(),
+                    params.blocks[b].levels[l].w_k_mem.master(),
+                    "block {b} level {l} w_k_mem"
+                );
+            }
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_stacked_safetensors_with_build_state() {
+        use crate::conductor::{ConductorState, ContextState};
+        use crate::context_stream::StreamCursor;
+
+        let cfg = MAGConfig::test_config();
+        let n_blocks = 2;
+        let params = StackedMAGParams::init(&cfg, n_blocks, 99);
+        let d = cfg.swa.d_model;
+
+        let build_state = BuildResumeState {
+            conductor: ConductorState { k: cfg.k, chunk_sizes: cfg.chunk_sizes.clone(), step: 500 },
+            stream_cursor: StreamCursor {
+                position: 10000, chunk_id: 20, pulse_id: 20, rng_state: None, content_hash: 0,
+            },
+            context: ContextState::new(cfg.k, d),
+            global_step: 500,
+        };
+
+        let dir = std::env::temp_dir().join("hecate_test_stacked_bs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stacked_bs.safetensors");
+
+        save_stacked_safetensors(&path, &params, &cfg, n_blocks, Some(&build_state)).unwrap();
+        let (_, _, loaded_nb, loaded_bs) = load_stacked_safetensors(&path).unwrap();
+
+        assert_eq!(loaded_nb, n_blocks);
+        let bs = loaded_bs.expect("build_state should be present");
+        assert_eq!(bs.global_step, 500);
+        assert_eq!(bs.stream_cursor.position, 10000);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_is_stacked_checkpoint() {
+        let cfg = MAGConfig::test_config();
+        let dir = std::env::temp_dir().join("hecate_test_is_stacked");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Single-block checkpoint
+        let single_path = dir.join("single.safetensors");
+        let single_params = MAGParams::init(&cfg, 42);
+        save_safetensors(&single_path, &single_params, &cfg, None).unwrap();
+        assert!(!is_stacked_checkpoint(&single_path).unwrap());
+
+        // Stacked checkpoint
+        let stacked_path = dir.join("stacked.safetensors");
+        let stacked_params = StackedMAGParams::init(&cfg, 2, 42);
+        save_stacked_safetensors(&stacked_path, &stacked_params, &cfg, 2, None).unwrap();
+        assert!(is_stacked_checkpoint(&stacked_path).unwrap());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_stacked_safetensors_python_interop() {
+        let cfg = MAGConfig::test_config();
+        let params = StackedMAGParams::init(&cfg, 2, 42);
+        let dir = std::env::temp_dir().join("hecate_test_stacked_interop");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stacked_interop.safetensors");
+
+        save_stacked_safetensors(&path, &params, &cfg, 2, None).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let _st = safetensors::SafeTensors::deserialize(&bytes)
+            .expect("safetensors crate must parse stacked checkpoint");
 
         std::fs::remove_dir_all(&dir).ok();
     }
