@@ -31,6 +31,8 @@ struct MomentBlock {
     m_ln_attn_beta: GpuBuf<f32>, v_ln_attn_beta: GpuBuf<f32>,
     m_ln_mem_gamma: GpuBuf<f32>, v_ln_mem_gamma: GpuBuf<f32>,
     m_ln_mem_beta: GpuBuf<f32>, v_ln_mem_beta: GpuBuf<f32>,
+    // Learnable level aggregation (host-side scalars)
+    m_alpha_mem: Vec<f32>, v_alpha_mem: Vec<f32>,
     levels: Vec<MomentLevelStacked>,
 }
 
@@ -109,6 +111,8 @@ impl GpuStackedAdamWState {
                 v_ln_mem_gamma: GpuBuf::zeros(bp.ln_mem_gamma.len()),
                 m_ln_mem_beta: GpuBuf::zeros(bp.ln_mem_beta.len()),
                 v_ln_mem_beta: GpuBuf::zeros(bp.ln_mem_beta.len()),
+                m_alpha_mem: vec![0.0f32; bp.alpha_mem.len()],
+                v_alpha_mem: vec![0.0f32; bp.alpha_mem.len()],
                 levels,
             }
         }).collect();
@@ -210,6 +214,14 @@ fn gpu_stacked_grad_norm(grads: &GpuStackedGrads, state: &mut GpuStackedAdamWSta
             accum(&lg.d_b_eta);
         }
     }
+    drop(accum);
+
+    // alpha_mem gradients (host-side, accumulated after closure dropped)
+    for bg in &grads.blocks {
+        for &g in &bg.d_alpha_mem {
+            total_sq += (g as f64) * (g as f64);
+        }
+    }
 
     total_sq.sqrt() as f32
 }
@@ -252,6 +264,10 @@ fn gpu_stacked_scale_grads(grads: &mut GpuStackedGrads, scale: f32) {
             scale_buf(&mut lg.d_b_theta);
             scale_buf(&mut lg.d_w_eta);
             scale_buf(&mut lg.d_b_eta);
+        }
+        // alpha_mem gradients (host-side)
+        for g in &mut bg.d_alpha_mem {
+            *g *= scale;
         }
     }
 
@@ -332,10 +348,22 @@ pub fn gpu_stacked_adamw_update(
                   &mut mb.m_ln_mem_beta, &mut mb.v_ln_mem_beta,
                   lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
 
-        // NOTE: alpha_mem/alpha_refl are declared in BlockParams but not yet wired
-        // into the forward/backward passes (levels are combined via uniform sum with
-        // 1/sqrt(k) scaling). Once learnable aggregation is implemented, add moment
-        // buffers here and update the grad norm / scale functions accordingly.
+        // alpha_mem: learnable level aggregation weights (host-side AdamW)
+        // Spec: specs/infrastructure/21_stacked_alpha_aggregation.md
+        {
+            let k = bg.d_alpha_mem.len();
+            let mut alpha_host = vec![0.0f32; k];
+            bp.alpha_mem.slice(0, k).copy_to_host(&mut alpha_host);
+            for i in 0..k {
+                let g = bg.d_alpha_mem[i];
+                mb.m_alpha_mem[i] = beta1 * mb.m_alpha_mem[i] + (1.0 - beta1) * g;
+                mb.v_alpha_mem[i] = beta2 * mb.v_alpha_mem[i] + (1.0 - beta2) * g * g;
+                let m_hat = mb.m_alpha_mem[i] * bc1_inv;
+                let v_hat = mb.v_alpha_mem[i] * bc2_inv;
+                alpha_host[i] -= lr * (m_hat / (v_hat.sqrt() + eps) + weight_decay * alpha_host[i]);
+            }
+            bp.alpha_mem.copy_from_host(&alpha_host);
+        }
 
         // Per-level CMS weights (pulse-gated)
         for (i, (lp, lg)) in bp.levels.iter_mut().zip(bg.levels.iter()).enumerate() {

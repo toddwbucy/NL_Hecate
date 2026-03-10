@@ -1380,14 +1380,14 @@ pub fn traced_stacked_forward(
             }
         }
 
-        // ── Combine level outputs ──────────────────────────────
-        let mut combined_id = y_ids[0];
+        // ── Learnable level aggregation ──────────────────────────
+        // Spec: specs/infrastructure/21_stacked_alpha_aggregation.md
+        // HOPE eq-074: y_t = Agg(...), "learnable weighted sum"
+        let alpha_weights = crate::stacked_model::host_softmax(&block.alpha_mem);
+        let mut combined_id = traced_scale(tape, y_ids[0], alpha_weights[0]);
         for i in 1..cfg.k {
-            combined_id = traced_add(tape, combined_id, y_ids[i]);
-        }
-        if cfg.k > 2 {
-            let scale = 1.0 / (cfg.k as f32).sqrt();
-            combined_id = traced_scale(tape, combined_id, scale);
+            let scaled = traced_scale(tape, y_ids[i], alpha_weights[i]);
+            combined_id = traced_add(tape, combined_id, scaled);
         }
 
         // ── MAG sigmoid gating: gate = σ(y_combined), gated_out = attn_proj * gate ──
