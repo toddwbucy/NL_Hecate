@@ -451,6 +451,11 @@ def run_build(bcfg: BuildConfig):
         bcfg.optimizer = "adamw_gpu"
     if is_stacked and bcfg.optimizer == "adamw_gpu":
         bcfg.optimizer = "adamw_gpu_stacked"
+    if is_stacked and bcfg.optimizer != "adamw_gpu_stacked":
+        raise RuntimeError(
+            f"n_blocks > 1 requires optimizer='adamw_gpu_stacked' (got '{bcfg.optimizer}'). "
+            "GpuStackedModel only supports step_adamw()."
+        )
     if bcfg.optimizer == "adamw_gpu" and not use_gpu:
         raise RuntimeError(
             "optimizer=adamw_gpu requires GPU and a CUDA-enabled build"
@@ -560,9 +565,10 @@ def run_build(bcfg: BuildConfig):
     if use_gpu:
         if is_stacked:
             n_blocks = bcfg.n_blocks
+            periodic = (bcfg.memory_reset == "periodic")
             gpu_model = nl_hecate.GpuStackedModel(
                 cfg, n_blocks, seed=bcfg.seed if hasattr(bcfg, "seed") else 42,
-                batch_size=bcfg.batch_size)
+                batch_size=bcfg.batch_size, memory_reset=periodic)
             print(f"  Stacked:  {n_blocks} blocks x k={bcfg.k} CMS levels"
                   f"  ({gpu_model.total_params():,} params)")
         else:
@@ -1091,11 +1097,22 @@ def run_build(bcfg: BuildConfig):
                 # normal (all-user-turn chunks) and should not generate warning noise.
                 try:
                     if is_stacked and hasattr(gpu_model, "gpu_stacked_tape_summary"):
-                        # Stacked model -- per-(block, level) diagnostics
+                        # Stacked model -- per-(block, level) diagnostics (GPU only)
+                        if tape_device == "cpu":
+                            print("  [tape] WARNING: tape_device='cpu' not supported for stacked models, using 'gpu'")
                         tape_sum = gpu_model.gpu_stacked_tape_summary(
                             input_ids, target_ids, pulse
                         )
+                    elif tape_device == "gpu" and hasattr(gpu_model, "gpu_tape_forward_summary"):
+                        tape_sum = gpu_model.gpu_tape_forward_summary(
+                            input_ids, target_ids, pulse
+                        )
+                    elif tape_device == "cpu" and hasattr(gpu_model, "tape_forward_summary"):
+                        tape_sum = gpu_model.tape_forward_summary(
+                            input_ids, target_ids, pulse
+                        )
                     elif hasattr(gpu_model, "gpu_tape_forward_summary"):
+                        # Fallback: prefer GPU if available
                         tape_sum = gpu_model.gpu_tape_forward_summary(
                             input_ids, target_ids, pulse
                         )
@@ -1563,8 +1580,9 @@ def run_build(bcfg: BuildConfig):
                       active_fires=level3_active_fires)
 
     # ── Final checkpoint ──────────────────────────────────────────────
+    final_path = None
     if is_stacked:
-        print(f"  [final checkpoint skipped: stacked model save not yet implemented]")
+        print("  [final checkpoint skipped: stacked model save not yet implemented]")
     else:
         if gpu_model is not None:
             params = gpu_model.to_host_params()
@@ -1597,7 +1615,10 @@ def run_build(bcfg: BuildConfig):
         avg_first = sum(losses[:10]) / min(10, len(losses))
         avg_last = sum(losses[-10:]) / min(10, len(losses))
         print(f"  Avg loss:  first10={avg_first:.4f}, last10={avg_last:.4f}")
-    print(f"  Saved:     {final_path}")
+    if final_path is not None:
+        print(f"  Saved:     {final_path}")
+    else:
+        print("  Saved:     [stacked checkpoint save not yet implemented]")
     print(f"{'=' * 60}")
 
     if jsonl:

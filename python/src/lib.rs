@@ -2414,6 +2414,9 @@ struct GpuStackedModel {
     cfg: nl_hecate_core::model::MAGConfig,
     adamw_state: Option<nl_hecate_core::gpu_stacked_optimizer::GpuStackedAdamWState>,
     n_blocks: usize,
+    /// TNT periodic reset mode. When true, context.memory[k] is zeroed after
+    /// each step where pulse.active_levels[k] is true (eq-006, 2511.07343).
+    memory_reset: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -2421,9 +2424,10 @@ struct GpuStackedModel {
 impl GpuStackedModel {
     /// Create from StackedMAGParams config.
     #[new]
-    #[pyo3(signature = (cfg, n_blocks, seed, batch_size=1))]
+    #[pyo3(signature = (cfg, n_blocks, seed, batch_size=1, memory_reset=false))]
     fn new(
         cfg: &MAGConfig, n_blocks: usize, seed: u64, batch_size: usize,
+        memory_reset: bool,
     ) -> PyResult<Self> {
         let host_params = nl_hecate_core::stacked_model::StackedMAGParams::init(
             &cfg.inner, n_blocks, seed,
@@ -2438,6 +2442,7 @@ impl GpuStackedModel {
             cfg: cfg.inner.clone(),
             adamw_state: None,
             n_blocks,
+            memory_reset,
         })
     }
 
@@ -2496,7 +2501,32 @@ impl GpuStackedModel {
             self.cfg.swa.vocab_size,
         );
 
+        // TNT periodic reset (2511.07343 eq-006): after observing this step's final M,
+        // reset context.memory[k] to zeros for each level that fired this step.
+        // CS-32 compliant: reset happens after the step's advance, before the next step's observe.
+        if self.memory_reset {
+            for (k, &active) in pulse.inner.active_levels.iter().enumerate() {
+                if active {
+                    self.context.periodic_reset_level(k);
+                }
+            }
+        }
+
         Ok((loss, grad_norm))
+    }
+
+    /// Update per-level theta_floor values on the live model config.
+    /// The new floor is applied starting from the next forward pass.
+    /// Length must equal k. Used by the gate warmup schedule in loop.py.
+    fn update_theta_floor(&mut self, floor: Vec<f32>) -> PyResult<()> {
+        if floor.len() != self.cfg.k {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "update_theta_floor: floor length {} != k {}",
+                floor.len(), self.cfg.k
+            )));
+        }
+        self.cfg.theta_floor = floor;
+        Ok(())
     }
 
     /// Total parameter count (downloads to host for counting -- use sparingly).
@@ -2564,12 +2594,13 @@ impl GpuStackedModel {
         // Per-(block, level) ||M_final @ k_last - v_last||_2
         // Source: HOPE Eq 88, spec 16_dgd_delta_norm_gpu.md
         let d = self.cfg.swa.d_model;
+        let bs = input_ids.len() / s;
         let mut delta_norms: Vec<Vec<f32>> = Vec::with_capacity(self.n_blocks);
         for block_cache in &cache.block_caches {
             let mut block_deltas = Vec::with_capacity(k);
             for level in 0..k {
                 if let Some(ref mem_cache) = block_cache.memory_caches[level] {
-                    block_deltas.push(mem_cache.dgd_delta_norm(s, d, 1));
+                    block_deltas.push(mem_cache.dgd_delta_norm(s, d, bs));
                 } else {
                     block_deltas.push(0.0);
                 }

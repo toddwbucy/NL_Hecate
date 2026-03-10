@@ -343,7 +343,7 @@ class BuildConfig:
         if self.n_blocks < 1:
             raise ValueError(f"n_blocks must be >= 1, got {self.n_blocks}")
         if self.n_blocks > 1:
-            if self.composition == "mac":
+            if self.composition.lower() == "mac":
                 raise ValueError(
                     "n_blocks > 1 does not yet support composition='mac' "
                     "(MAC persistent tokens have no stacked slot). Use 'mag'.")

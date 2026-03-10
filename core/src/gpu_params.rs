@@ -586,6 +586,14 @@ impl GpuStackedContext {
         }
     }
 
+    /// TNT periodic reset for a specific level across all blocks.
+    /// CS-32: reset happens after the step's advance, before the next step's observe.
+    pub fn periodic_reset_level(&self, level: usize) {
+        for ctx in &self.blocks {
+            ctx.periodic_reset_level(level);
+        }
+    }
+
     /// Compute per-(block, level) Frobenius norms of M matrices on GPU.
     /// Returns `Vec<Vec<f32>>` -- outer len = n_blocks, inner len = k.
     pub fn memory_norms(&self) -> Vec<Vec<f32>> {
