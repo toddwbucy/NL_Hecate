@@ -236,15 +236,16 @@ pub fn gpu_stacked_forward(
             crate::cuda_ffi::bf16_to_f32_cuda(attn_out_bf16.as_ptr(), attn_out.ptr(), total_i32);
         }
 
-        // NOTE: w_o (output projection) is not applied after attention in the
-        // initial stacked architecture. The residual stream carries raw attn_out.
-        // When w_o is wired in, add: attn_proj = attn_out @ w_o, use attn_proj below.
+        // ── Output projection: attn_proj = attn_out @ W_O^T ─────────
+        // Spec: specs/infrastructure/18_stacked_w_o_output_projection.md
+        let mut attn_proj = GpuBuf::<f32>::zeros(total);
+        crate::dispatch::cublas_matmul_transb_dd(&attn_out, &block.w_o, &mut attn_proj, n_tokens, d, d, 0.0);
 
-        // ── Residual skip 1: residual_after_attn = block_input + attn_out ──
+        // ── Residual skip 1: residual_after_attn = block_input + attn_proj ──
         let mut residual_after_attn = GpuBuf::<f32>::zeros(total);
         unsafe {
             crate::cuda_ffi::saxpy_cuda(1.0, block_input.as_ptr(), residual_after_attn.ptr(), total_i32);
-            crate::cuda_ffi::saxpy_cuda(1.0, attn_out.as_ptr(), residual_after_attn.ptr(), total_i32);
+            crate::cuda_ffi::saxpy_cuda(1.0, attn_proj.as_ptr(), residual_after_attn.ptr(), total_i32);
         }
 
         // ── LN_mem on residual_after_attn ──────────────────────────

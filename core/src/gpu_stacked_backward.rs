@@ -274,10 +274,21 @@ pub fn gpu_stacked_backward(
         }
 
         // ── Residual skip 1 backward ───────────────────────────────
-        // residual_after_attn = block_input + attn_out
-        // d_block_input = d_residual_after_attn (will become d_residual_stream for prev block)
-        // d_attn_out = d_residual_after_attn
-        let d_attn_out = &d_residual_after_attn; // alias
+        // residual_after_attn = block_input + attn_proj
+        // where attn_proj = attn_out @ W_O^T
+        // d_attn_proj = d_residual_after_attn (addition backward)
+        // d_attn_out = d_attn_proj @ W_O  (backward through output projection)
+        // d_w_o = d_attn_proj^T @ attn_out  (gradient for W_O)
+        // Spec: specs/infrastructure/18_stacked_w_o_output_projection.md
+        let mut d_attn_out = GpuBuf::zeros(bsd);
+        crate::dispatch::cublas_matmul_dd(
+            &d_residual_after_attn, &block.w_o, &mut d_attn_out,
+            n_tokens, d, d, 0.0,
+        );
+        gpu_matmul_transa_dd(
+            &d_residual_after_attn, &bc.attn_out, &mut d_w_o,
+            d, n_tokens, d,
+        );
 
         // ── SWA backward ───────────────────────────────────────────
         let mut d_q = GpuBuf::zeros(bsd);
@@ -286,7 +297,7 @@ pub fn gpu_stacked_backward(
 
         crate::dispatch::swa_backward_dd(
             &bc.q_bf16, &bc.k_bf16, &bc.v_bf16,
-            &bc.attn_weights_bf16, d_attn_out,
+            &bc.attn_weights_bf16, &d_attn_out,
             &mut d_q, &mut d_k, &mut d_v,
             s, nh, hd, ws, bs,
         );
@@ -323,10 +334,6 @@ pub fn gpu_stacked_backward(
 
         // d_block_input becomes d_residual_stream for the previous block
         d_residual_stream = d_block_input;
-
-        // Note: d_w_o not used in stacked model — output projection removed.
-        // Each block's output goes directly to residual stream.
-        // d_w_o stays zeros.
 
         block_grads[b] = Some(GpuStackedBlockGrads {
             d_w_q, d_w_k, d_w_v, d_w_o,
