@@ -51,8 +51,11 @@ pub struct GpuStackedBlockCache {
     pub memory_caches: Vec<Option<GpuMemoryCache>>,
     pub y_per_level: Vec<GpuBuf<f32>>,
     pub y_combined: GpuBuf<f32>,      // [bs*s, d]
+    // MAG gating
+    pub attn_proj: GpuBuf<f32>,       // [bs*s, d] — attn_out @ W_O^T
+    pub gate: GpuBuf<f32>,            // [bs*s, d] — sigmoid(y_combined)
     // Residual connections
-    pub residual_after_attn: GpuBuf<f32>, // [bs*s, d] = block_input + attn_out
+    pub residual_after_attn: GpuBuf<f32>, // [bs*s, d] = block_input + attn_proj
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -320,11 +323,21 @@ pub fn gpu_stacked_forward(
             }
         }
 
-        // ── Residual skip 2: residual_stream = residual_after_attn + y_combined ──
+        // ── MAG sigmoid gating: gate = σ(y_combined), gated_out = attn_proj * gate ──
+        // Spec: specs/infrastructure/20_stacked_mag_sigmoid_gating.md
+        // Titans eq-028: o = y ⊙ σ(M(x̃))
+        let mut gate = GpuBuf::<f32>::zeros(total);
+        let mut gated_out = GpuBuf::<f32>::zeros(total);
+        unsafe {
+            crate::cuda_ffi::sigmoid_cuda(y_combined.as_ptr(), gate.ptr(), total_i32);
+            crate::cuda_ffi::elemwise_mul_cuda(attn_proj.as_ptr(), gate.as_ptr(), gated_out.ptr(), total_i32);
+        }
+
+        // ── Residual: residual_out = block_input + gated_out ──
         let mut new_residual = GpuBuf::<f32>::zeros(total);
         unsafe {
-            crate::cuda_ffi::saxpy_cuda(1.0, residual_after_attn.as_ptr(), new_residual.ptr(), total_i32);
-            crate::cuda_ffi::saxpy_cuda(1.0, y_combined.as_ptr(), new_residual.ptr(), total_i32);
+            crate::cuda_ffi::saxpy_cuda(1.0, block_input.as_ptr(), new_residual.ptr(), total_i32);
+            crate::cuda_ffi::saxpy_cuda(1.0, gated_out.as_ptr(), new_residual.ptr(), total_i32);
         }
         residual_stream = new_residual;
 
@@ -339,6 +352,8 @@ pub fn gpu_stacked_forward(
             memory_caches,
             y_per_level,
             y_combined,
+            attn_proj,
+            gate,
             residual_after_attn,
         });
     }

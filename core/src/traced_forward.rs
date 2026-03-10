@@ -1390,8 +1390,14 @@ pub fn traced_stacked_forward(
             combined_id = traced_scale(tape, combined_id, scale);
         }
 
-        // ── Residual skip 2: residual_after_attn + y_combined ──
-        residual_id = traced_add(tape, residual_after_attn_id, combined_id);
+        // ── MAG sigmoid gating: gate = σ(y_combined), gated_out = attn_proj * gate ──
+        // Spec: specs/infrastructure/20_stacked_mag_sigmoid_gating.md
+        // Titans eq-028: o = y ⊙ σ(M(x̃))
+        let gate_id = traced_sigmoid(tape, combined_id);
+        let gated_out_id = traced_mul(tape, attn_proj_id, gate_id);
+
+        // ── Residual: residual_out = block_input + gated_out ──
+        residual_id = traced_add(tape, residual_id, gated_out_id);
 
         block_param_ids.push(TracedBlockParamIds {
             w_q: w_q_id,
