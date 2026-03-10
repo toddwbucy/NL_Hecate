@@ -1222,9 +1222,9 @@ pub struct TracedBlockParamIds {
     pub w_q: BufId,
     pub w_k: BufId,
     pub w_v: BufId,
-    /// `None` in stacked path: w_o is not applied as output projection
-    /// (matches gpu_stacked_forward.rs lines 239-241). Gradients are zero.
-    /// `Some(id)` in single-block path where w_o is applied.
+    /// Output projection W_O ∈ ℝ^{d×d} applied after SWA attention.
+    /// `Some(id)` in both single-block and stacked paths: attn_proj = attn_out @ W_O^T.
+    /// `None` only if W_O is intentionally omitted (not currently used).
     pub w_o: Option<BufId>,
     pub ln_attn_gamma: BufId,
     pub ln_attn_beta: BufId,

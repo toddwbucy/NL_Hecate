@@ -137,7 +137,7 @@ In the backward pass, at the point where d_attn flows back through W_O:
 cublas_matmul_dd(&d_residual_skip1, &block.w_o, &mut d_attn_out, bs * s, d, d, 0.0);
 
 // d_w_o += attn_out^T @ d_residual_skip1  (gradient for W_O)
-cublas_matmul_tn(&attn_out, &d_residual_skip1, &mut d_w_o, d, d, bs * s, 1.0);
+gpu_matmul_transa_dd(&d_residual_skip1, &attn_out, &mut d_w_o, d, bs * s, d);
 ```
 
 Note: `d_w_o` accumulates with `beta=1.0` — each block contributes its own

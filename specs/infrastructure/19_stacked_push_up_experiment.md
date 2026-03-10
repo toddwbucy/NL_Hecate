@@ -209,14 +209,14 @@ L3 peaks at 0.000128 then collapses to 0.000002).
 
 The current push-up logic (spec 07, PR #176) operates on single-block
 checkpoint keys:
-```
+```text
 level.0.w_k → level.1.w_k
 level.0.w_v → level.1.w_v
 ...
 ```
 
 For stacked checkpoints, the key remapping must operate per block:
-```
+```text
 block.0.level.0.w_k → block.0.level.1.w_k
 block.1.level.0.w_k → block.1.level.1.w_k
 block.2.level.0.w_k → block.2.level.1.w_k
