@@ -474,7 +474,7 @@ pub fn traced_cms_forward(
 
             let (y_data, mem_cache, final_m, y_id) = traced_active_level(
                 tape, cfg, level, &params.levels[level], &embedded, s, d,
-                initial_m, emb_id, lp_id,
+                initial_m, emb_id, lp_id, None,
             );
 
             context.memory[level] = final_m;
@@ -672,6 +672,7 @@ fn traced_active_level(
     initial_m: Option<Vec<f32>>,
     emb_id: BufId,
     lp_id: BufId,
+    block_index: Option<usize>,
 ) -> (Vec<f32>, MemoryCache, Vec<f32>, BufId) {
     let key = active_opaque_key(cfg.memory_rule);
 
@@ -730,7 +731,7 @@ fn traced_active_level(
                 saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
                 saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
             }
-            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level));
+            tape.record_opaque_stacked(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level), block_index);
 
             (y, MemoryCache::Delta(cache), final_m, y_id)
         }
@@ -803,7 +804,7 @@ fn traced_active_level(
                 saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
                 saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
             }
-            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level));
+            tape.record_opaque_stacked(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level), block_index);
 
             (y, MemoryCache::Titans(cache), final_m, y_id)
         }
@@ -837,7 +838,7 @@ fn traced_active_level(
                 saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
                 saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
             }
-            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level));
+            tape.record_opaque_stacked(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level), block_index);
 
             (y, MemoryCache::Hebbian(cache), final_m, y_id)
         }
@@ -891,7 +892,7 @@ fn traced_active_level(
                 saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
                 saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
             }
-            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level));
+            tape.record_opaque_stacked(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level), block_index);
 
             (y, MemoryCache::Moneta(cache), final_m, y_id)
         }
@@ -942,7 +943,7 @@ fn traced_active_level(
                 saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
                 saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
             }
-            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level));
+            tape.record_opaque_stacked(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level), block_index);
 
             (y, MemoryCache::YAAD(cache), final_m, y_id)
         }
@@ -993,7 +994,7 @@ fn traced_active_level(
                 saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
                 saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
             }
-            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level));
+            tape.record_opaque_stacked(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level), block_index);
 
             (y, MemoryCache::MEMORA(cache), final_m, y_id)
         }
@@ -1033,7 +1034,7 @@ fn traced_active_level(
                 saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
                 saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
             }
-            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level));
+            tape.record_opaque_stacked(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level), block_index);
 
             (y, MemoryCache::Lattice(cache), final_m, y_id)
         }
@@ -1089,7 +1090,7 @@ fn traced_active_level(
                 saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
                 saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
             }
-            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level));
+            tape.record_opaque_stacked(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level), block_index);
 
             (y, MemoryCache::Trellis(cache), final_m, y_id)
         }
@@ -1131,7 +1132,7 @@ fn traced_active_level(
                 saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
                 saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
             }
-            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level));
+            tape.record_opaque_stacked(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level), block_index);
 
             (y, MemoryCache::Atlas(cache), final_m, y_id)
         }
@@ -1162,7 +1163,7 @@ fn traced_active_level(
 
             let y_id = tape.alloc(y.clone(), vec![s, d]);
             let saved = vec![meta_id, lp_id, emb_saved, x_id, gate_out_id, up_out_id, fused_id, gc_id];
-            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level));
+            tape.record_opaque_stacked(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level), block_index);
 
             // No M state — return empty vec
             (y, MemoryCache::SwiGlu(cache), vec![], y_id)
@@ -1221,7 +1222,10 @@ pub struct TracedBlockParamIds {
     pub w_q: BufId,
     pub w_k: BufId,
     pub w_v: BufId,
-    pub w_o: BufId,
+    /// `None` in stacked path: w_o is not applied as output projection
+    /// (matches gpu_stacked_forward.rs lines 239-241). Gradients are zero.
+    /// `Some(id)` in single-block path where w_o is applied.
+    pub w_o: Option<BufId>,
     pub ln_attn_gamma: BufId,
     pub ln_attn_beta: BufId,
     pub ln_mem_gamma: BufId,
@@ -1326,9 +1330,9 @@ pub fn traced_stacked_forward(
                 // Active level: reuse traced_active_level with block_index tagging
                 let initial_m = Some(std::mem::take(&mut context[b][level]));
 
-                let (y_data, _mem_cache, final_m, y_id) = traced_active_level_stacked(
+                let (y_data, _mem_cache, final_m, y_id) = traced_active_level(
                     tape, cfg, level, lp, &ln_mem_data, s, d,
-                    initial_m, ln_mem_out_id, lp_id, b,
+                    initial_m, ln_mem_out_id, lp_id, Some(b),
                 );
 
                 context[b][level] = final_m;
@@ -1374,16 +1378,11 @@ pub fn traced_stacked_forward(
         // ── Residual skip 2: residual_after_attn + y_combined ──
         residual_id = traced_add(tape, residual_after_attn_id, combined_id);
 
-        // Register w_o for gradient tracking. NOT applied as output projection
-        // in stacked path — matches gpu_stacked_forward.rs lines 239-241 where
-        // w_o is explicitly skipped. The residual stream carries raw attn_out.
-        let w_o_id = tape.register_param(&block.w_o, vec![d, d]);
-
         block_param_ids.push(TracedBlockParamIds {
             w_q: w_q_id,
             w_k: w_k_id,
             w_v: w_v_id,
-            w_o: w_o_id,
+            w_o: None, // not applied in stacked path (see gpu_stacked_forward.rs:239-241)
             ln_attn_gamma: ln_attn_gamma_id,
             ln_attn_beta: ln_attn_beta_id,
             ln_mem_gamma: ln_mem_gamma_id,
@@ -1414,147 +1413,6 @@ pub fn traced_stacked_forward(
     };
 
     (loss, loss_id, param_ids)
-}
-
-/// Run an active memory rule for a stacked block, recording with block_index.
-///
-/// Same as `traced_active_level` but uses `record_opaque_stacked` to tag
-/// the opaque block with its block index for per-block diagnostic extraction.
-fn traced_active_level_stacked(
-    tape: &mut Tape,
-    cfg: &MAGConfig,
-    level: usize,
-    level_params: &MemoryLevelParams,
-    embedded: &[f32],
-    s: usize,
-    d: usize,
-    initial_m: Option<Vec<f32>>,
-    emb_id: BufId,
-    lp_id: BufId,
-    block_index: usize,
-) -> (Vec<f32>, MemoryCache, Vec<f32>, BufId) {
-    let key = active_opaque_key(cfg.memory_rule);
-
-    // For now, only TitansLMM and DeltaRule are used in stacked configs.
-    // This dispatches to the same rule logic as traced_active_level, but
-    // records with block_index via record_opaque_stacked.
-    match cfg.memory_rule {
-        MemoryRuleKind::TitansLMM => {
-            let rule = TitansLMM::from_cfg_level(cfg, level);
-            let (y, cache) = rule.step(level_params, embedded, s, d, initial_m);
-            let m_final_start = s * d * d;
-            let final_m = cache.m_states[m_final_start..m_final_start + d * d].to_vec();
-
-            let mk_f32 = match rule.momentum_kind {
-                crate::model::MomentumKind::None => 0.0f32,
-                crate::model::MomentumKind::EMA => 1.0,
-                crate::model::MomentumKind::DeltaMomentum => 2.0,
-                crate::model::MomentumKind::DeepMomentum => 3.0,
-            };
-            let fm_kind_f32 = match rule.feature_map {
-                crate::feature_map::FeatureMapKind::Identity => 0.0f32,
-                crate::feature_map::FeatureMapKind::RandomFourier { .. } => 1.0,
-                crate::feature_map::FeatureMapKind::ELU => 2.0,
-            };
-            let fm_sigma = match rule.feature_map {
-                crate::feature_map::FeatureMapKind::RandomFourier { sigma } => sigma,
-                _ => 1.0,
-            };
-            let extra_meta = [crate::moneta::bias_to_f32(rule.bias), rule.sign_sharpness, mk_f32, rule.theta_floor, rule.theta_ceil, fm_kind_f32, fm_sigma];
-            let (meta_id, lp_saved, emb_saved) =
-                alloc_common_saved(tape, level_params, embedded, s, d, &extra_meta);
-            let mut cache_ids = vec![
-                tape.alloc(cache.m_states.clone(), vec![]),
-                tape.alloc(cache.s_states.clone(), vec![]),
-                tape.alloc(cache.k_mem.clone(), vec![]),
-                tape.alloc(cache.v_mem.clone(), vec![]),
-                tape.alloc(cache.q_mem.clone(), vec![]),
-                tape.alloc(cache.concat_kv.clone(), vec![]),
-                tape.alloc(cache.alpha_pre.clone(), vec![]),
-                tape.alloc(cache.alpha.clone(), vec![]),
-                tape.alloc(cache.theta_pre.clone(), vec![]),
-                tape.alloc(cache.theta.clone(), vec![]),
-                tape.alloc(cache.eta_pre.clone(), vec![]),
-                tape.alloc(cache.eta.clone(), vec![]),
-                tape.alloc(cache.error.clone(), vec![]),
-                tape.alloc(cache.grad_outer.clone(), vec![]),
-                tape.alloc(cache.y.clone(), vec![]),
-            ];
-            if rule.momentum_kind == crate::model::MomentumKind::DeltaMomentum {
-                cache_ids.push(tape.alloc(cache.decay.clone(), vec![]));
-            }
-            if !cache.fm_z_k_mem.is_empty() {
-                cache_ids.push(tape.alloc(cache.fm_z_k_mem.clone(), vec![]));
-                cache_ids.push(tape.alloc(cache.fm_z_q_mem.clone(), vec![]));
-                cache_ids.push(tape.alloc(level_params.w_rand.clone(), vec![]));
-                cache_ids.push(tape.alloc(level_params.b_rand.clone(), vec![]));
-            }
-            let y_id = tape.alloc(y.clone(), vec![s, d]);
-            let mut saved = vec![meta_id, lp_saved, emb_saved];
-            saved.extend(cache_ids);
-            if let (Some(kc), Some(qc)) = (&cache.k_conv_cache, &cache.q_conv_cache) {
-                saved.push(tape.alloc(kc.pre_conv.clone(), vec![]));
-                saved.push(tape.alloc(kc.pre_silu.clone(), vec![]));
-                saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
-                saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
-            }
-            tape.record_opaque_stacked(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level), Some(block_index));
-
-            (y, MemoryCache::Titans(cache), final_m, y_id)
-        }
-        MemoryRuleKind::DeltaRule => {
-            let rule = DeltaRule::from_cfg_level(cfg, level);
-            let (y, cache) = rule.step(level_params, embedded, s, d, initial_m);
-            let m_final_start = s * d * d;
-            let final_m = cache.m_states[m_final_start..m_final_start + d * d].to_vec();
-
-            let fm_kind_f32 = match rule.feature_map {
-                crate::feature_map::FeatureMapKind::Identity => 0.0f32,
-                crate::feature_map::FeatureMapKind::RandomFourier { .. } => 1.0,
-                crate::feature_map::FeatureMapKind::ELU => 2.0,
-            };
-            let fm_sigma = match rule.feature_map {
-                crate::feature_map::FeatureMapKind::RandomFourier { sigma } => sigma,
-                _ => 1.0,
-            };
-            let extra_meta = [crate::moneta::bias_to_f32(rule.bias), rule.sign_sharpness, rule.theta_floor, rule.theta_ceil, fm_kind_f32, fm_sigma];
-            let (meta_id, lp_saved, emb_saved) =
-                alloc_common_saved(tape, level_params, embedded, s, d, &extra_meta);
-            let cache_ids = vec![
-                tape.alloc(cache.m_states.clone(), vec![]),
-                tape.alloc(cache.k_mem.clone(), vec![]),
-                tape.alloc(cache.v_mem.clone(), vec![]),
-                tape.alloc(cache.q_mem.clone(), vec![]),
-                tape.alloc(cache.concat_kv.clone(), vec![]),
-                tape.alloc(cache.alpha_pre.clone(), vec![]),
-                tape.alloc(cache.alpha.clone(), vec![]),
-                tape.alloc(cache.theta_pre.clone(), vec![]),
-                tape.alloc(cache.theta.clone(), vec![]),
-                tape.alloc(cache.error.clone(), vec![]),
-                tape.alloc(cache.grad_outer.clone(), vec![]),
-                tape.alloc(cache.y.clone(), vec![]),
-            ];
-            let y_id = tape.alloc(y.clone(), vec![s, d]);
-            let mut saved = vec![meta_id, lp_saved, emb_saved];
-            saved.extend(cache_ids);
-            if !cache.fm_z_k_mem.is_empty() {
-                saved.push(tape.alloc(cache.fm_z_k_mem.clone(), vec![]));
-                saved.push(tape.alloc(cache.fm_z_q_mem.clone(), vec![]));
-                saved.push(tape.alloc(level_params.w_rand.clone(), vec![]));
-                saved.push(tape.alloc(level_params.b_rand.clone(), vec![]));
-            }
-            if let (Some(kc), Some(qc)) = (&cache.k_conv_cache, &cache.q_conv_cache) {
-                saved.push(tape.alloc(kc.pre_conv.clone(), vec![]));
-                saved.push(tape.alloc(kc.pre_silu.clone(), vec![]));
-                saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
-                saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
-            }
-            tape.record_opaque_stacked(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level), Some(block_index));
-
-            (y, MemoryCache::Delta(cache), final_m, y_id)
-        }
-        _ => panic!("traced_stacked_forward: only TitansLMM and DeltaRule are supported for stacked models, got {:?}", cfg.memory_rule),
-    }
 }
 
 // ══════════════════════════════════════════════════════════════════════
