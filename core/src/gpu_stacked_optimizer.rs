@@ -359,8 +359,11 @@ pub fn gpu_stacked_adamw_update(
                       lr, beta1, beta2, eps, lbc1_inv, lbc2_inv, weight_decay);
             adamw_one(&mut lp.b_theta, &lg.d_b_theta, &mut ml.m_b_theta, &mut ml.v_b_theta,
                       lr, beta1, beta2, eps, lbc1_inv, lbc2_inv, weight_decay);
-            // TODO(CS-39): clamp b_theta after update to prevent decay divergence
-            // (mirrors single-block gpu_optimizer.rs TODO)
+            // CS-39: clamp b_theta to prevent inner-loop learning rate divergence.
+            // softplus(b_theta) = theta; clamping b_theta ∈ [-10, 2] keeps theta ∈ [~0, ~2.13].
+            unsafe {
+                crate::cuda_ffi::clamp_f32_cuda(lp.b_theta.ptr(), lp.b_theta.len() as i32, -10.0, 2.0);
+            }
             adamw_one(&mut lp.w_eta, &lg.d_w_eta, &mut ml.m_w_eta, &mut ml.v_w_eta,
                       lr, beta1, beta2, eps, lbc1_inv, lbc2_inv, weight_decay);
             adamw_one(&mut lp.b_eta, &lg.d_b_eta, &mut ml.m_b_eta, &mut ml.v_b_eta,
