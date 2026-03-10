@@ -225,14 +225,14 @@ pattern as `StackedMAGParams::init()` (stacked_model.rs:179).
 
 ### Save (`save_stacked_safetensors`)
 
-New function in `checkpoint.rs`:
+Rust-tier function in `checkpoint.rs`. Derives `n_blocks` from
+`params.blocks.len()` — caller does not supply it:
 
 ```rust
 pub fn save_stacked_safetensors(
     path: &Path,
     params: &StackedMAGParams,
     config: &MAGConfig,
-    n_blocks: usize,
     build_state: Option<&BuildResumeState>,
 ) -> io::Result<()>
 ```
@@ -241,9 +241,13 @@ Serializes with hierarchical keys. Per-level tensors follow the same structure
 as single-block but prefixed with `block.{n}.`. Shared params use `shared.`
 prefix. Metadata includes `"stacked": "true"` and `"n_blocks": "N"`.
 
+Required tensors are validated on load: missing `shared.embed.weight`,
+`shared.lm_head.weight`, or any `block.{b}.swa.w_*` produces a hard error.
+
 ### Load (`load_stacked_safetensors`)
 
-New function in `checkpoint.rs`:
+Rust-tier function in `checkpoint.rs`. Returns `n_blocks` derived from scanning
+header keys and cross-checked against metadata:
 
 ```rust
 pub fn load_stacked_safetensors(
@@ -251,26 +255,27 @@ pub fn load_stacked_safetensors(
 ) -> io::Result<(StackedMAGParams, MAGConfig, usize, Option<BuildResumeState>)>
 ```
 
-Returns n_blocks alongside the params. Detects block count by scanning header
-keys for the highest `block.{n}` prefix.
+### Format detection
 
-### Format detection in loader
-
-A top-level `load_checkpoint_auto(path)` function (or modify the existing Python
-routing) checks:
-1. If header contains `shared.embed.weight` → stacked format → `load_stacked_safetensors`
-2. Else if header contains `embed.weight` → single-block format → `load_safetensors`
+`is_stacked_checkpoint(path)` reads only the safetensors JSON header and checks
+for `shared.embed.weight`. Used in `loop.py` to auto-route stacked vs
+single-block checkpoints.
 
 ### PyO3 exposure
 
-Two new Python-visible functions:
-- `nl_hecate.save_stacked_checkpoint(params, config, path, build_state)`
-- `nl_hecate.load_stacked_checkpoint(path)` → `(params, config, n_blocks, build_state)`
-- `nl_hecate.extend_stacked_push_up(params, config, n_blocks, seed)` → new stacked params
+Three Python-visible functions:
 
-The params object for stacked models needs a Python-side representation. The
-simplest approach: pass `StackedMAGParams` as an opaque PyO3 object (like
-`MAGParams` today) with the `GpuStackedModel` constructing from it.
+- `nl_hecate.save_stacked_checkpoint(path, gpu_model, conductor=None, context=None)`
+  — reads config and block count from `GpuStackedModel` directly (no drift).
+  Requires both conductor+context or neither.
+- `nl_hecate.load_stacked_checkpoint(path)` → dict with `config` (MAGConfig),
+  `params_json` (str), `n_blocks` (int), `build_state` (dict|None)
+- `nl_hecate.extend_stacked_push_up(path, new_cfg, seed)` → dict with
+  `params_json` (str), `n_blocks` (int)
+
+`StackedMAGParams` is serialized as JSON for the Python↔Rust boundary.
+`GpuStackedModel.from_params_json(params_json, cfg, n_blocks)` deserializes
+and uploads to GPU, validating block count and k consistency.
 
 ## loop.py Changes
 

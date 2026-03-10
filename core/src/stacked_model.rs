@@ -590,19 +590,25 @@ mod tests {
     }
 
     #[test]
-    fn test_extend_push_up_distinct_l0_seeds() {
+    fn test_extend_push_up_per_block_l0_donor_diversified() {
         let cfg_k1 = tiny_config_k1();
         let cfg_k2 = tiny_config_k2();
         let old = StackedMAGParams::init(&cfg_k1, 3, 42);
         let extended = old.extend_push_up(&cfg_k2, 99);
 
-        // Fresh L0 gate biases should differ per block (distinct seeds)
-        // b_theta is level-0 default for all blocks, but w_theta (projection)
-        // comes from old L0 which was depth-specialized — blocks should differ
+        // Fresh L0 projections are donor-cloned from each block's old L0.
+        // Since old blocks were initialized with distinct seeds, each block's
+        // donor is different — so the extended L0 projections differ per block.
         assert_ne!(
-            extended.blocks[0].levels[0].w_theta,
-            extended.blocks[1].levels[0].w_theta,
-            "block 0 and 1 fresh L0 w_theta should differ (depth-specialized donors)"
+            extended.blocks[0].levels[0].w_k_mem,
+            extended.blocks[1].levels[0].w_k_mem,
+            "block 0 and 1 fresh L0 w_k_mem should differ (per-block donor diversification)"
+        );
+        // Gate biases are fixed defaults (not seed-dependent), so they match.
+        assert_eq!(
+            extended.blocks[0].levels[0].b_theta,
+            extended.blocks[1].levels[0].b_theta,
+            "gate biases are level-0 defaults, identical across blocks"
         );
     }
 }

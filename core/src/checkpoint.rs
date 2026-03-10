@@ -567,27 +567,48 @@ pub fn load_stacked_safetensors(
         vec![]
     };
 
+    // Helper: load required tensor, fail fast if missing or wrong size
+    let get_required = |name: &str, expected_len: usize| -> io::Result<Vec<f32>> {
+        let v = get(name);
+        if v.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("stacked safetensors: required tensor '{}' missing", name),
+            ));
+        }
+        if v.len() != expected_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("stacked safetensors: tensor '{}' has {} elements, expected {}",
+                        name, v.len(), expected_len),
+            ));
+        }
+        Ok(v)
+    };
+
     // Shared params
-    let w_embed = get("shared.embed.weight");
-    let w_unembed = get("shared.lm_head.weight");
     let d = config.swa.d_model;
-    let ln_final_gamma = { let v = get("shared.ln_final.gamma"); if v.is_empty() { vec![1.0f32; d] } else { v } };
-    let ln_final_beta = { let v = get("shared.ln_final.beta"); if v.is_empty() { vec![0.0f32; d] } else { v } };
+    let v = config.swa.vocab_size;
+    let w_embed = get_required("shared.embed.weight", v * d)?;
+    let w_unembed = get_required("shared.lm_head.weight", d * v)?;
+    let ln_final_gamma = { let t = get("shared.ln_final.gamma"); if t.is_empty() { vec![1.0f32; d] } else { t } };
+    let ln_final_beta = { let t = get("shared.ln_final.beta"); if t.is_empty() { vec![0.0f32; d] } else { t } };
 
     // Per-block params
     let k = config.k;
+    let dd = d * d;
     let mut blocks = Vec::with_capacity(n_blocks);
     for b in 0..n_blocks {
         let bp = format!("block.{b}");
 
-        let w_q = get(&format!("{bp}.swa.w_q"));
-        let w_k = get(&format!("{bp}.swa.w_k"));
-        let w_v = get(&format!("{bp}.swa.w_v"));
-        let w_o = get(&format!("{bp}.swa.w_o"));
-        let ln_attn_gamma = { let v = get(&format!("{bp}.ln_attn.gamma")); if v.is_empty() { vec![1.0f32; d] } else { v } };
-        let ln_attn_beta = { let v = get(&format!("{bp}.ln_attn.beta")); if v.is_empty() { vec![0.0f32; d] } else { v } };
-        let ln_mem_gamma = { let v = get(&format!("{bp}.ln_mem.gamma")); if v.is_empty() { vec![1.0f32; d] } else { v } };
-        let ln_mem_beta = { let v = get(&format!("{bp}.ln_mem.beta")); if v.is_empty() { vec![0.0f32; d] } else { v } };
+        let w_q = get_required(&format!("{bp}.swa.w_q"), dd)?;
+        let w_k = get_required(&format!("{bp}.swa.w_k"), dd)?;
+        let w_v = get_required(&format!("{bp}.swa.w_v"), dd)?;
+        let w_o = get_required(&format!("{bp}.swa.w_o"), dd)?;
+        let ln_attn_gamma = { let t = get(&format!("{bp}.ln_attn.gamma")); if t.is_empty() { vec![1.0f32; d] } else { t } };
+        let ln_attn_beta = { let t = get(&format!("{bp}.ln_attn.beta")); if t.is_empty() { vec![0.0f32; d] } else { t } };
+        let ln_mem_gamma = { let t = get(&format!("{bp}.ln_mem.gamma")); if t.is_empty() { vec![1.0f32; d] } else { t } };
+        let ln_mem_beta = { let t = get(&format!("{bp}.ln_mem.beta")); if t.is_empty() { vec![0.0f32; d] } else { t } };
         let alpha_mem = get(&format!("{bp}.alpha_mem"));
         let alpha_refl = get(&format!("{bp}.alpha_refl"));
 

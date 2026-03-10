@@ -2626,10 +2626,12 @@ impl GpuStackedModel {
                 format!("from_params_json: params JSON has {} blocks but n_blocks={}",
                         host_params.blocks.len(), n_blocks)));
         }
-        if !host_params.blocks.is_empty() && host_params.blocks[0].levels.len() != cfg.inner.k {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("from_params_json: params JSON has k={} but cfg.k={}",
-                        host_params.blocks[0].levels.len(), cfg.inner.k)));
+        for (i, block) in host_params.blocks.iter().enumerate() {
+            if block.levels.len() != cfg.inner.k {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("from_params_json: block {} has k={} but cfg.k={}",
+                            i, block.levels.len(), cfg.inner.k)));
+            }
         }
         let gpu_params = nl_hecate_core::gpu_params::GpuStackedParams::from_host(&host_params);
         let gpu_context = nl_hecate_core::gpu_params::GpuStackedContext::new(
