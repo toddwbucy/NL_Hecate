@@ -1339,7 +1339,17 @@ pub fn traced_stacked_forward(
                 y_ids.push(y_id);
                 let _ = y_data;
             } else {
-                // Frozen level: read-only path
+                // Frozen level: read-only path.
+                // Stacked models only support DeltaRule and TitansLMM — both use
+                // delta_rule_read_only.  Assert early so misconfiguration surfaces
+                // here rather than producing silently wrong gradients.
+                assert!(
+                    matches!(cfg.memory_rule,
+                        MemoryRuleKind::DeltaRule | MemoryRuleKind::TitansLMM),
+                    "traced_stacked_forward frozen path: unsupported rule {:?} \
+                     (only DeltaRule and TitansLMM are supported for stacked models)",
+                    cfg.memory_rule,
+                );
                 let frozen_ref = &context[b][level];
                 let w_q_f32 = lp.w_q_mem.as_f32();
                 let w_q_mem_id = tape.register_param(&w_q_f32, vec![d, d]);
