@@ -633,13 +633,14 @@ impl GpuStackedContext {
         let blocks = self.blocks.iter().map(|ctx| {
             let memory = ctx.memory.iter().map(|buf| {
                 let mut copy = GpuBuf::zeros(buf.len());
-                unsafe {
+                let err = unsafe {
                     crate::gpu_forward::gpu_buf_memcpy_d2d(
                         copy.ptr() as *mut std::ffi::c_void,
                         buf.as_ptr() as *const std::ffi::c_void,
                         buf.len() * std::mem::size_of::<f32>(),
-                    );
-                }
+                    )
+                };
+                assert_eq!(err, 0, "D2D memcpy failed in GpuStackedContext::deep_clone");
                 copy
             }).collect();
             // No CUDA graph scratch for stacked models, so create a minimal context

@@ -2661,8 +2661,9 @@ impl GpuStackedModel {
             ldict.set_item("level", level)?;
             ldict.set_item("opaque_key", &rule_name)?;
             let active = pulse.inner.active_levels[level];
-            let bc = if active { 1usize } else { 0usize };
-            if active { total_active += 1; }
+            // For stacked models, block_count reflects how many blocks fired this level
+            let bc = if active { self.n_blocks } else { 0usize };
+            if active { total_active += self.n_blocks; }
             ldict.set_item("block_count", bc)?;
             ldict.set_item("output_grad_norm", agg_gnorms[level])?;
             // Aggregate delta norm: max across blocks for this level

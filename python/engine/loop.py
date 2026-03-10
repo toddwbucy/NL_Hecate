@@ -472,6 +472,11 @@ def run_build(bcfg: BuildConfig):
             "extend_k is not supported with n_blocks > 1. "
             "Push-up stacking operates on single-block models only."
         )
+    if is_stacked and getattr(bcfg, "donor_weights", None) is not None:
+        raise RuntimeError(
+            "donor_weights is not supported with n_blocks > 1. "
+            "GpuStackedModel initializes fresh from seed."
+        )
     if bcfg.load and use_gpu and not use_bpe:
         raise RuntimeError(
             "GPU resume with context restore is not yet implemented for byte-level builds. "
@@ -1287,7 +1292,7 @@ def run_build(bcfg: BuildConfig):
         # Periodic checkpoint
         if bcfg.save_every > 0 and step > 0 and step % bcfg.save_every == 0:
             if is_stacked:
-                print(f"  [checkpoint skipped: stacked model save not yet implemented]")
+                print("  [checkpoint skipped: stacked model save not yet implemented]")
             else:
                 if gpu_model is not None:
                     params = gpu_model.to_host_params()
