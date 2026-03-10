@@ -159,6 +159,10 @@ impl GpuStackedAdamWState {
 fn gpu_stacked_grad_norm(grads: &GpuStackedGrads, state: &mut GpuStackedAdamWState) -> f32 {
     let mut total_sq = 0.0f64;
 
+    // NOTE: This accumulates partial sums with a host sync per tensor. For large
+    // n_blocks * k this becomes many round-trips. A single-kernel reduction across
+    // all gradient buffers would be faster but requires a flat buffer layout.
+    // Acceptable for shakedown builds; optimize when profiling shows it matters.
     let mut accum = |g: &GpuBuf<f32>| {
         let n = g.len() as i32;
         if n == 0 { return; }
@@ -364,6 +368,7 @@ pub fn gpu_stacked_adamw_update(
             unsafe {
                 crate::cuda_ffi::clamp_f32_cuda(lp.b_theta.ptr(), lp.b_theta.len() as i32, -10.0, 2.0);
             }
+            crate::dispatch::cuda_sync(); // surface any async error from clamp kernel
             adamw_one(&mut lp.w_eta, &lg.d_w_eta, &mut ml.m_w_eta, &mut ml.v_w_eta,
                       lr, beta1, beta2, eps, lbc1_inv, lbc2_inv, weight_decay);
             adamw_one(&mut lp.b_eta, &lg.d_b_eta, &mut ml.m_b_eta, &mut ml.v_b_eta,
