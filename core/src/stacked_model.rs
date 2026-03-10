@@ -197,6 +197,12 @@ impl StackedMAGParams {
     /// This means the wrapped model is NOT behavior-preserving on the first forward
     /// pass — the extra LN will slightly change logits. This is acceptable for
     /// checkpoint conversion where training continues, but not for inference parity.
+    /// Convert a single-block MAGParams into a 1-block StackedMAGParams.
+    ///
+    /// WARNING: This adds a fresh final LayerNorm (gamma=1, beta=0) that has no
+    /// counterpart in the single-block forward path. A converted checkpoint will NOT
+    /// reproduce the source model's logits exactly. Use only for structural tests,
+    /// not for inference continuity.
     pub fn from_single_block(params: &MAGParams) -> Self {
         let d = params.swa.ln_attn_gamma.len();
         let block = BlockParams {

@@ -462,10 +462,15 @@ def run_build(bcfg: BuildConfig):
         )
     # Note: GPU + residual=true is supported for training (gpu_cms_forward).
     # Serving paths (prefill/single_token) still assert !residual until adapted.
-    if bcfg.load and is_stacked:
+    if is_stacked and bcfg.load:
         raise RuntimeError(
             "Stacked model checkpoint loading is not yet implemented. "
             "n_blocks > 1 builds must start fresh (remove --load)."
+        )
+    if is_stacked and getattr(bcfg, "extend_k", None) is not None:
+        raise RuntimeError(
+            "extend_k is not supported with n_blocks > 1. "
+            "Push-up stacking operates on single-block models only."
         )
     if bcfg.load and use_gpu and not use_bpe:
         raise RuntimeError(
