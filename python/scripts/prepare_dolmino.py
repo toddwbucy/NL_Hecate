@@ -4,7 +4,7 @@ Prepare Dolmino-Mix 100B for NL-Hecate training.
 
 Streams *.jsonl.zst shards from all source subdirectories (sorted for
 reproducibility), tokenizes using the existing 32K BPE tokenizer from
-FineWeb-Edu, and writes flat numpy arrays compatible with BpeDataLoader.
+FineWeb-Edu, and writes flat numpy arrays compatible with BpeTokenStream.
 
 No quality score filter — Dolmino-Mix is already curated upstream.
 No tokenizer training — reuses data/fineweb_edu/tokenizer.json.

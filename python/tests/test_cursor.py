@@ -1,4 +1,4 @@
-"""Tests for BpeDataLoader cursor serialization (task_c99edc).
+"""Tests for BpeTokenStream cursor serialization (task_c99edc).
 
 Covers: cursor(), restore(), CursorMismatchError, CursorOutOfBounds,
         sidecar round-trip, hash validation, warm-start behaviour.
@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 from pathlib import Path
 
-from engine.data import BpeDataLoader, CursorMismatchError, CursorOutOfBounds, _fnv1a_32
+from engine.data import BpeTokenStream, CursorMismatchError, CursorOutOfBounds, _fnv1a_32
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -40,7 +40,7 @@ def _make_dataset(tmp_path: Path, n_tokens: int = 1024, vocab_size: int = 256,
 
 def test_cursor_initial_state(tmp_path):
     _make_dataset(tmp_path)
-    loader = BpeDataLoader(str(tmp_path))
+    loader = BpeTokenStream(str(tmp_path))
     c = loader.cursor()
     assert c["position"]     == 0
     assert c["total_tokens"] == 1024
@@ -50,7 +50,7 @@ def test_cursor_initial_state(tmp_path):
 
 def test_cursor_after_chunks(tmp_path):
     _make_dataset(tmp_path)
-    loader = BpeDataLoader(str(tmp_path))
+    loader = BpeTokenStream(str(tmp_path))
     seq_len = 64
     loader.next_chunk(seq_len)
     loader.next_chunk(seq_len)
@@ -65,13 +65,13 @@ def test_cursor_after_chunks(tmp_path):
 def test_restore_position_correct(tmp_path):
     """restore() seeks to saved position; next chunk starts there."""
     _make_dataset(tmp_path)
-    loader = BpeDataLoader(str(tmp_path))
+    loader = BpeTokenStream(str(tmp_path))
     seq_len = 64
 
     loader.next_chunk(seq_len)
     cursor = loader.cursor()
 
-    loader2 = BpeDataLoader(str(tmp_path))
+    loader2 = BpeTokenStream(str(tmp_path))
     loader2.restore(cursor)
 
     assert loader2.position  == seq_len
@@ -86,7 +86,7 @@ def test_restore_position_correct(tmp_path):
 def test_restore_zero_position(tmp_path):
     """restore() with position=0 (warm-start) succeeds silently."""
     _make_dataset(tmp_path)
-    loader = BpeDataLoader(str(tmp_path))
+    loader = BpeTokenStream(str(tmp_path))
     cursor = loader.cursor()          # position=0, content_hash=0, chunk_id=0
     loader.restore(cursor)            # must not raise
     assert loader.position == 0
@@ -97,12 +97,12 @@ def test_restore_zero_position(tmp_path):
 def test_restore_wrong_dataset_size(tmp_path):
     """total_tokens mismatch raises CursorMismatchError."""
     _make_dataset(tmp_path)
-    loader = BpeDataLoader(str(tmp_path))
+    loader = BpeTokenStream(str(tmp_path))
     loader.next_chunk(64)
     cursor = loader.cursor()
     cursor["total_tokens"] = 9999     # wrong size
 
-    loader2 = BpeDataLoader(str(tmp_path))
+    loader2 = BpeTokenStream(str(tmp_path))
     with pytest.raises(CursorMismatchError, match="Dataset size mismatch"):
         loader2.restore(cursor)
 
@@ -110,12 +110,12 @@ def test_restore_wrong_dataset_size(tmp_path):
 def test_restore_hash_mismatch(tmp_path):
     """Corrupted content_hash raises CursorMismatchError immediately on restore."""
     _make_dataset(tmp_path)
-    loader = BpeDataLoader(str(tmp_path))
+    loader = BpeTokenStream(str(tmp_path))
     loader.next_chunk(64)
     cursor = loader.cursor()
     cursor["content_hash"] = 0xDEADBEEF   # corrupt hash
 
-    loader2 = BpeDataLoader(str(tmp_path))
+    loader2 = BpeTokenStream(str(tmp_path))
     with pytest.raises(CursorMismatchError, match="Content hash mismatch"):
         loader2.restore(cursor)
 
@@ -125,11 +125,11 @@ def test_restore_hash_mismatch(tmp_path):
 def test_restore_out_of_bounds(tmp_path):
     """position > total_tokens raises CursorOutOfBounds."""
     _make_dataset(tmp_path)
-    loader = BpeDataLoader(str(tmp_path))
+    loader = BpeTokenStream(str(tmp_path))
     cursor = loader.cursor()
     cursor["position"] = 99999        # beyond dataset
 
-    loader2 = BpeDataLoader(str(tmp_path))
+    loader2 = BpeTokenStream(str(tmp_path))
     with pytest.raises(CursorOutOfBounds):
         loader2.restore(cursor)
 
@@ -139,7 +139,7 @@ def test_restore_out_of_bounds(tmp_path):
 def test_sidecar_written_and_read(tmp_path):
     """Sidecar JSON is written alongside checkpoint and can be round-tripped."""
     _make_dataset(tmp_path)
-    loader = BpeDataLoader(str(tmp_path))
+    loader = BpeTokenStream(str(tmp_path))
     seq_len = 64
     for _ in range(3):
         loader.next_chunk(seq_len)
@@ -151,7 +151,7 @@ def test_sidecar_written_and_read(tmp_path):
     assert sidecar.exists()
 
     saved = json.loads(sidecar.read_text())
-    loader2 = BpeDataLoader(str(tmp_path))
+    loader2 = BpeTokenStream(str(tmp_path))
     loader2.restore(saved)            # must not raise
 
     assert loader2.position  == seq_len * 3
@@ -183,7 +183,7 @@ def test_restore_after_wrap(tmp_path):
     avoids this. This test would fail with the old derivation.
     """
     _make_dataset(tmp_path, n_tokens=128)
-    loader = BpeDataLoader(str(tmp_path))
+    loader = BpeTokenStream(str(tmp_path))
     seq_len = 64
 
     loader.next_chunk(seq_len)   # pos=64,  chunk_id=1
@@ -195,7 +195,7 @@ def test_restore_after_wrap(tmp_path):
     assert cursor["chunk_id"] == 3
     assert cursor["seq_len"]  == 64   # stored, not derived
 
-    loader2 = BpeDataLoader(str(tmp_path))
+    loader2 = BpeTokenStream(str(tmp_path))
     loader2.restore(cursor)           # must not raise
 
     assert loader2.position  == 64
@@ -222,7 +222,7 @@ def test_multi_slot_cursor_roundtrip(tmp_path):
     # Build and advance slot loaders
     slots = []
     for b in range(n_slots):
-        loader_b = BpeDataLoader(str(tmp_path))
+        loader_b = BpeTokenStream(str(tmp_path))
         loader_b.position = b * slot_size
         slots.append(loader_b)
 
@@ -245,7 +245,7 @@ def test_multi_slot_cursor_roundtrip(tmp_path):
 
     restored = []
     for b in range(n_slots):
-        loader_b = BpeDataLoader(str(tmp_path))
+        loader_b = BpeTokenStream(str(tmp_path))
         loader_b.position = b * slot_size      # initial partition start
         loader_b.restore(slot_cursors[b])      # overwrite with saved position
         restored.append(loader_b)
@@ -260,7 +260,7 @@ def test_multi_slot_cursor_roundtrip(tmp_path):
 def test_single_slot_sidecar_unchanged(tmp_path):
     """batch_size=1 path writes a flat cursor dict, not a {'slots': [...]} wrapper."""
     _make_dataset(tmp_path)
-    loader = BpeDataLoader(str(tmp_path))
+    loader = BpeTokenStream(str(tmp_path))
     loader.next_chunk(64)
 
     ckpt_path = tmp_path / "model_step1.safetensors"
@@ -298,7 +298,7 @@ def test_slot_count_mismatch_resets(tmp_path):
     # Now reconstruct with only 2 slots (batch_size changed)
     bpe_loaders = []
     for b in range(n_slots):
-        loader_b = BpeDataLoader(str(tmp_path))
+        loader_b = BpeTokenStream(str(tmp_path))
         loader_b.position = b * slot_size
         bpe_loaders.append(loader_b)
 

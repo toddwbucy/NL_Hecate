@@ -20,7 +20,7 @@ from typing import Any, Optional
 import nl_hecate
 
 from engine.config import BuildConfig, cosine_lr
-from engine.data import BpeDataLoader, CursorMismatchError, CursorOutOfBounds, DEMO_TEXT, MmapTokenStream
+from engine.data import BpeTokenStream, CursorMismatchError, CursorOutOfBounds, DEMO_TEXT, MmapTokenStream
 from engine.evaluation import (
     evaluate, evaluate_numpy, print_level_metrics, print_tape_summary,
     eval_coherence_samples, generate_samples,
@@ -45,7 +45,7 @@ def _safetensors_path(path_str: str) -> str:
     return path_str
 
 
-# Data formats that use the numpy/BPE loader path (BpeDataLoader + sidecar cursor).
+# Data formats that use the numpy/BPE loader path (BpeTokenStream + sidecar cursor).
 # The byte-level path (VecStream / MmapTokenStream) uses a separate resume mechanism
 # and is unaffected by this constant.
 _NUMPY_LOADER_FORMATS = frozenset({"sharegpt", "dolmino"})
@@ -58,13 +58,13 @@ def run_build(bcfg: BuildConfig):
 
     # ── Load data ─────────────────────────────────────────────────────
     use_bpe = bcfg.data_format in _NUMPY_LOADER_FORMATS
-    active_loader: BpeDataLoader | None = None
+    active_loader: BpeTokenStream | None = None
     token_ids: list[int] | MmapTokenStream | None = None
 
-    val_loader: BpeDataLoader | None = None
+    val_stream: BpeTokenStream | None = None
 
     if use_bpe:
-        active_loader = BpeDataLoader(bcfg.data_path, split="train")
+        active_loader = BpeTokenStream(bcfg.data_path, split="train")
         print(f"Loaded {bcfg.data_format} BPE data: {len(active_loader):,} tokens, "
               f"vocab={active_loader.vocab_size}")
         if len(active_loader) < bcfg.seq_len:
@@ -74,8 +74,8 @@ def run_build(bcfg: BuildConfig):
         if bcfg.eval_every > 0:
             val_path = Path(bcfg.data_path) / "val_tokens.npy"
             if val_path.exists():
-                val_loader = BpeDataLoader(bcfg.data_path, split="val")
-                print(f"Loaded val set: {len(val_loader):,} tokens")
+                val_stream = BpeTokenStream(bcfg.data_path, split="val")
+                print(f"Loaded val set: {len(val_stream):,} tokens")
             else:
                 print("Warning: eval_every set but no val data found, disabling eval")
                 bcfg.eval_every = 0  # safe: bcfg is consumed only by this function
@@ -116,7 +116,7 @@ def run_build(bcfg: BuildConfig):
             if bcfg.val_doc_starts_path and os.path.exists(bcfg.val_doc_starts_path):
                 val_doc_starts = np.load(bcfg.val_doc_starts_path).astype(np.uint64)
                 print(f"Loaded {len(val_doc_starts):,} val document boundaries")
-            val_loader = val_bytes  # evaluate() accepts bytes for byte-level
+            val_stream = val_bytes  # evaluate() accepts bytes for byte-level
         else:
             print(f"Warning: val_path {bcfg.val_path} not found, disabling eval")
             bcfg.eval_every = 0
@@ -544,11 +544,11 @@ def run_build(bcfg: BuildConfig):
     # Slot b starts at position b * (total_tokens // batch_size) and strides by
     # batch_size * seq_len per step, giving dense sequential coverage within 1/B
     # of the corpus. batch_size=1 falls through to the scalar active_loader path.
-    bpe_loaders: list[BpeDataLoader] = []
+    bpe_loaders: list[BpeTokenStream] = []
     if use_bpe and bcfg.batch_size > 1 and active_loader is not None:
         slot_size = active_loader.total_tokens // bcfg.batch_size
         for b in range(bcfg.batch_size):
-            loader_b = BpeDataLoader(bcfg.data_path, split="train")
+            loader_b = BpeTokenStream(bcfg.data_path, split="train")
             loader_b.position = b * slot_size
             bpe_loaders.append(loader_b)
         # If a cursor sidecar exists, restore per-slot positions.
@@ -1082,7 +1082,7 @@ def run_build(bcfg: BuildConfig):
                 })
             jsonl.log(event="level_heatmap", step=step, levels=heatmap_levels)
 
-        if (bcfg.eval_every > 0 and val_loader is not None
+        if (bcfg.eval_every > 0 and val_stream is not None
                 and step > 0 and step % bcfg.eval_every == 0
                 and not is_stacked):
             saved_ctx = None
@@ -1091,7 +1091,7 @@ def run_build(bcfg: BuildConfig):
                     saved_ctx = gpu_model.to_host_context()
                     gpu_model.reset_context()
                 eval_loss, eval_ppl = evaluate(
-                    gpu_model, bcfg, val_loader, bcfg.eval_max_chunks,
+                    gpu_model, bcfg, val_stream, bcfg.eval_max_chunks,
                     val_doc_starts=val_doc_starts)
             finally:
                 if gpu_model is not None and saved_ctx is not None:

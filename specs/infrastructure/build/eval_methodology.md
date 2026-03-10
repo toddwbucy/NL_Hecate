@@ -216,7 +216,7 @@ The eval block at each `eval_every` step becomes:
 # ── Eval loss (unchanged) ────────────────────────────────────
 eval_ctx = gpu_model.to_host_context()
 gpu_model.reset_context()
-eval_loss, eval_ppl = evaluate(gpu_model, bcfg, val_loader, ...)
+eval_loss, eval_ppl = evaluate(gpu_model, bcfg, val_stream, ...)
 gpu_model.upload_context(eval_ctx)
 
 # ── Gate diagnostics (unchanged) ──────────────────────────────

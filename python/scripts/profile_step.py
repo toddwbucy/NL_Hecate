@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import nl_hecate
 from engine.config import BuildConfig
-from engine.data import BpeDataLoader
+from engine.data import BpeTokenStream
 
 
 def profile_config(config_path: str, label: str, n_steps: int = 50,
@@ -32,7 +32,7 @@ def profile_config(config_path: str, label: str, n_steps: int = 50,
     bcfg = BuildConfig.from_file(config_path)
 
     # Setup
-    loader = BpeDataLoader(bcfg.data_path, split="train")
+    loader = BpeTokenStream(bcfg.data_path, split="train")
     cfg = nl_hecate.MAGConfig(
         d_model=bcfg.d_model, num_heads=bcfg.num_heads,
         head_dim=bcfg.head_dim, seq_len=bcfg.seq_len,

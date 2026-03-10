@@ -6,7 +6,7 @@ CONTRACT
               checkpoints so that post-hoc diagnostic tools (spec 10: memory
               manifold analysis) can read M_l without access to a live model.
 
-  Expects:    - A BPE training run using BpeDataLoader (sharegpt, dolmino
+  Expects:    - A BPE training run using BpeTokenStream (sharegpt, dolmino
                 formats) with a Conductor that has no attached VecStream
               - A live ContextState containing k levels of M_l: [d×d] each
               - Sidecar .cursor.json managing data position (unchanged)
