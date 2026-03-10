@@ -299,6 +299,127 @@ impl GpuMemoryCache {
             | GpuMemoryCache::SwiGlu { .. } => 0.0,
         }
     }
+
+    /// Extract theta (inner-loop learning rate) statistics from the forward cache.
+    ///
+    /// `theta_ceil` is the configured ceiling — used to compute `frac_at_ceil`.
+    /// Returns `Some(ThetaStats)` for rules that have a learned theta (Delta, Titans, DGD),
+    /// `None` for Hebbian/SwiGlu (which have no theta).
+    /// For TNT: aggregates theta values across all shard inner caches, filtering
+    /// out zero-padded elements (softplus output is always > 0 for real tokens).
+    ///
+    /// Source: HOPE (2512.24695) — theta = softplus(w_theta · [k,v] + b_theta)
+    pub fn theta_stats(&self, theta_ceil: f32) -> Option<ThetaStats> {
+        // Helper: extract theta buffer ref from any variant that has one
+        let theta_buf: Option<&GpuBuf<f32>> = match self {
+            GpuMemoryCache::Delta { theta, .. }
+            | GpuMemoryCache::Titans { theta, .. }
+            | GpuMemoryCache::DGD { theta, .. }
+            | GpuMemoryCache::DeltaCkpt { theta, .. }
+            | GpuMemoryCache::TitansCkpt { theta, .. }
+            | GpuMemoryCache::DGDCkpt { theta, .. } => Some(theta),
+            GpuMemoryCache::Hebbian { .. }
+            | GpuMemoryCache::HebbianCkpt { .. }
+            | GpuMemoryCache::SwiGlu { .. } => None,
+            GpuMemoryCache::TNT { .. } => None, // handled separately below
+        };
+
+        if let Some(buf) = theta_buf {
+            let n = buf.len();
+            if n == 0 { return None; }
+            let mut host = vec![0.0f32; n];
+            buf.copy_to_host(&mut host);
+            return Some(ThetaStats::from_slice(&host, theta_ceil));
+        }
+
+        // TNT: gather theta values from all shard inner caches.
+        // Filter out zeros from padding — softplus(x) > 0 for all real inputs,
+        // so theta == 0.0 means the element is zero-padding from partial shards.
+        if let GpuMemoryCache::TNT { shard_inner_caches, .. } = self {
+            let mut all_theta = Vec::new();
+            for shard_cache in shard_inner_caches.iter() {
+                let inner_buf: Option<&GpuBuf<f32>> = match shard_cache {
+                    GpuMemoryCache::Delta { theta, .. }
+                    | GpuMemoryCache::Titans { theta, .. }
+                    | GpuMemoryCache::DGD { theta, .. }
+                    | GpuMemoryCache::DeltaCkpt { theta, .. }
+                    | GpuMemoryCache::TitansCkpt { theta, .. }
+                    | GpuMemoryCache::DGDCkpt { theta, .. } => Some(theta),
+                    _ => None,
+                };
+                if let Some(buf) = inner_buf {
+                    let n = buf.len();
+                    if n > 0 {
+                        let mut host = vec![0.0f32; n];
+                        buf.copy_to_host(&mut host);
+                        // Filter padding zeros (softplus output is always > 0)
+                        all_theta.extend(host.iter().copied().filter(|&v| v > 0.0));
+                    }
+                }
+            }
+            if all_theta.is_empty() { return None; }
+            return Some(ThetaStats::from_slice(&all_theta, theta_ceil));
+        }
+
+        None
+    }
+}
+
+/// Statistics about the theta (inner-loop learning rate) distribution for one (block, level).
+///
+/// Theta is per-token, per-level: theta_t = softplus(w_theta · [k_t, v_t] + b_theta).
+/// This struct summarizes the distribution across all tokens in one forward pass,
+/// revealing whether theta_ceil is constraining the learned rate.
+#[derive(Debug, Clone)]
+pub struct ThetaStats {
+    pub count: usize,
+    pub min: f32,
+    pub max: f32,
+    pub mean: f32,
+    pub median: f32,
+    pub p95: f32,
+    pub p99: f32,
+    /// Fraction of tokens where theta >= theta_ceil (hitting the configured ceiling)
+    pub frac_at_ceil: f32,
+}
+
+impl ThetaStats {
+    /// Compute stats from a sorted slice of theta values.
+    /// `theta_ceil` is the configured ceiling for computing `frac_at_ceil`.
+    pub fn from_slice(values: &[f32], theta_ceil: f32) -> Self {
+        let n = values.len();
+        assert!(n > 0);
+        let mut sorted = values.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let min = sorted[0];
+        let max = sorted[n - 1];
+        let sum: f32 = sorted.iter().sum();
+        let mean = sum / n as f32;
+
+        // Interpolated quantiles: rank = p * (n - 1), interpolate between neighbors
+        let quantile = |p: f64| -> f32 {
+            let rank = p * (n as f64 - 1.0);
+            let lo = rank.floor() as usize;
+            let hi = (lo + 1).min(n - 1);
+            let frac = rank - lo as f64;
+            (sorted[lo] as f64 * (1.0 - frac) + sorted[hi] as f64 * frac) as f32
+        };
+        let median = quantile(0.5);
+        let p95 = quantile(0.95);
+        let p99 = quantile(0.99);
+
+        // Fraction at configured ceiling (with small epsilon for float comparison)
+        let ceil_threshold = theta_ceil * (1.0 - 1e-4);
+        let at_ceil = if theta_ceil < f32::MAX {
+            sorted.iter().filter(|&&v| v >= ceil_threshold).count()
+        } else {
+            0 // no ceiling configured
+        };
+        let frac_at_ceil = at_ceil as f32 / n as f32;
+
+        ThetaStats { count: n, min, max, mean, median, p95, p99, frac_at_ceil }
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════
