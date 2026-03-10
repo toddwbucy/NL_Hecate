@@ -359,8 +359,8 @@ pub fn gpu_stacked_adamw_update(
                       lr, beta1, beta2, eps, lbc1_inv, lbc2_inv, weight_decay);
             adamw_one(&mut lp.b_theta, &lg.d_b_theta, &mut ml.m_b_theta, &mut ml.v_b_theta,
                       lr, beta1, beta2, eps, lbc1_inv, lbc2_inv, weight_decay);
-            // CS-39: clamp b_theta to prevent inner-loop learning rate divergence.
-            // softplus(b_theta) = theta; clamping b_theta ∈ [-10, 2] keeps theta ∈ [~0, ~2.13].
+            // CS-39: clamp b_theta bias component (see gpu_optimizer.rs for full rationale).
+            // w_theta · [k,v] can still push per-token theta higher; theta_ceil is the full fix.
             unsafe {
                 crate::cuda_ffi::clamp_f32_cuda(lp.b_theta.ptr(), lp.b_theta.len() as i32, -10.0, 2.0);
             }

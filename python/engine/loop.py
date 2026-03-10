@@ -477,6 +477,11 @@ def run_build(bcfg: BuildConfig):
             "donor_weights is not supported with n_blocks > 1. "
             "GpuStackedModel initializes fresh from seed."
         )
+    if is_stacked and getattr(bcfg, "auto_promote", False):
+        raise RuntimeError(
+            "auto_promote is not supported with n_blocks > 1. "
+            "Promotion rebuilds through single-block extend_params_push_up/GpuModel.from_params."
+        )
     if bcfg.load and use_gpu and not use_bpe:
         raise RuntimeError(
             "GPU resume with context restore is not yet implemented for byte-level builds. "

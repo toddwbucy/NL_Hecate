@@ -282,9 +282,11 @@ pub fn gpu_adamw_update(
                   lr, beta1, beta2, eps, lbc1_inv, lbc2_inv, weight_decay);
         adamw_one(&mut lp.b_theta, &lg.d_b_theta, &mut ml.m_b_theta, &mut ml.v_b_theta,
                   lr, beta1, beta2, eps, lbc1_inv, lbc2_inv, weight_decay);
-        // CS-39: clamp b_theta to prevent inner-loop learning rate divergence.
-        // softplus(b_theta) = theta; clamping b_theta ∈ [-10, 2] keeps theta ∈ [~0, ~2.13].
-        // Without this, theta can grow unbounded → M update explosion → NaN.
+        // CS-39: clamp b_theta to bound the bias component of inner-loop learning rate.
+        // softplus(b_theta) = theta_bias; clamping b_theta ∈ [-10, 2] keeps bias ∈ [~0, ~2.13].
+        // NOTE: w_theta · [k,v] can still push per-token theta higher. A full theta_ceil
+        // enforcement in the forward pass (via config.theta_ceil) is the proper long-term fix.
+        // This bias clamp is a first-order stabilizer — sufficient for shakedown builds.
         unsafe {
             crate::cuda_ffi::clamp_f32_cuda(lp.b_theta.ptr(), lp.b_theta.len() as i32, -10.0, 2.0);
         }
