@@ -21,7 +21,7 @@ All sources are local:
     - OpenMathInstruct:  HF cache (~3.7GB)
 
 Uses the same tokenizer as ShareGPT (data/sharegpt/tokenizer.json) for
-clean A/B comparison.  Output format matches BpeDataLoader expectations.
+clean A/B comparison.  Output format matches BpeTokenStream expectations.
 
 Usage:
     python scripts/prepare_curriculum.py \\

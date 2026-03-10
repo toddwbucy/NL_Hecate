@@ -3,7 +3,7 @@
 ```text
 CONTRACT
   Purpose:    Prepare Dolmino-Mix 100B (OLMo 3 32B annealing dataset) as a
-              flat numpy token stream compatible with BpeDataLoader for NL-Hecate
+              flat numpy token stream compatible with BpeTokenStream for NL-Hecate
               build runs. Produces train/val splits in the same uint32/int32 format
               as the FineWeb-Edu pipeline — a drop-in replacement for longer-range,
               more diverse training contexts.
@@ -26,7 +26,7 @@ CONTRACT
                 train/val document split
               - Memory-bounded: shards decompressed and released one at a time;
                 no full corpus loaded into RAM
-              - Drop-in: output directory loadable by BpeDataLoader with zero changes
+              - Drop-in: output directory loadable by BpeTokenStream with zero changes
               - meta.json schema matches FineWeb-Edu pipeline exactly
               - All tokens are valid next-token prediction targets (no masking,
                 mask_ratio=0.0)
@@ -43,12 +43,12 @@ CONTRACT
                 decompressor contention; sufficient for CPU-bound throughput.
 
   Position:   specs/infrastructure/data/01_dolmino_pipeline.md
-              Implements: BpeDataLoader-compatible output (engine/data.py)
+              Implements: BpeTokenStream-compatible output (engine/data.py)
               Peer to: specs/infrastructure/02_corpus_selection.md
 
   Source:     HOPE (2512.24695) §3 — Continuous Memory System requires a continuous
                 token stream without epoch boundaries (no DataLoader shuffle reset)
-              Internal: engine/data.py BpeDataLoader interface contract
+              Internal: engine/data.py BpeTokenStream interface contract
               Dataset: Dolmino-Mix 100B (dolmino-mix, OLMo3 dataset),
                        Wadden et al. 2024
 ```
@@ -218,7 +218,7 @@ fn stream_jsonl_zst(path: &Path) -> impl Iterator<Item = Result<JsonValue, Parse
 
 | Constraint | Mechanism |
 |-----------|-----------|
-| CS-17 (no DataLoader) | BpeDataLoader wraps flat npy arrays — no shuffle reset between chunks |
+| CS-17 (no DataLoader) | BpeTokenStream wraps flat npy arrays — no shuffle reset between chunks |
 | CS-01 (no MemoryModule class) | Pipeline is a standalone script, not a module class |
 
 ## CLI Interface

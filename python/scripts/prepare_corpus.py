@@ -4,7 +4,7 @@ Generic HuggingFace corpus preparation for NL-Hecate build runs.
 
 Streams documents from a HuggingFace dataset, tokenizes with the 32K BPE
 tokenizer, and writes the standard NL-Hecate data format consumed by
-BpeDataLoader in engine/data.py.
+BpeTokenStream in engine/data.py.
 
 Output format (matches existing prepare_fineweb_edu.py convention):
   <output_dir>/
@@ -71,7 +71,7 @@ def _prepare_targets(tokens: np.ndarray, vocab_size: int) -> np.ndarray:
     """Shift token IDs by one to produce next-token targets.
 
     The last position in each document has no next token — use vocab_size
-    as the sentinel (BpeDataLoader treats target >= vocab_size as masked).
+    as the sentinel (BpeTokenStream treats target >= vocab_size as masked).
     Since tokens are a flat stream (not chunked here), the only masked
     position is the very last token.
     """

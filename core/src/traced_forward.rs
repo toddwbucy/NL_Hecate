@@ -474,7 +474,7 @@ pub fn traced_cms_forward(
 
             let (y_data, mem_cache, final_m, y_id) = traced_active_level(
                 tape, cfg, level, &params.levels[level], &embedded, s, d,
-                initial_m, emb_id, lp_id,
+                initial_m, emb_id, lp_id, None,
             );
 
             context.memory[level] = final_m;
@@ -672,6 +672,7 @@ fn traced_active_level(
     initial_m: Option<Vec<f32>>,
     emb_id: BufId,
     lp_id: BufId,
+    block_index: Option<usize>,
 ) -> (Vec<f32>, MemoryCache, Vec<f32>, BufId) {
     let key = active_opaque_key(cfg.memory_rule);
 
@@ -730,7 +731,7 @@ fn traced_active_level(
                 saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
                 saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
             }
-            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level));
+            tape.record_opaque_stacked(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level), block_index);
 
             (y, MemoryCache::Delta(cache), final_m, y_id)
         }
@@ -803,7 +804,7 @@ fn traced_active_level(
                 saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
                 saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
             }
-            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level));
+            tape.record_opaque_stacked(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level), block_index);
 
             (y, MemoryCache::Titans(cache), final_m, y_id)
         }
@@ -837,7 +838,7 @@ fn traced_active_level(
                 saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
                 saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
             }
-            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level));
+            tape.record_opaque_stacked(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level), block_index);
 
             (y, MemoryCache::Hebbian(cache), final_m, y_id)
         }
@@ -891,7 +892,7 @@ fn traced_active_level(
                 saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
                 saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
             }
-            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level));
+            tape.record_opaque_stacked(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level), block_index);
 
             (y, MemoryCache::Moneta(cache), final_m, y_id)
         }
@@ -942,7 +943,7 @@ fn traced_active_level(
                 saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
                 saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
             }
-            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level));
+            tape.record_opaque_stacked(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level), block_index);
 
             (y, MemoryCache::YAAD(cache), final_m, y_id)
         }
@@ -993,7 +994,7 @@ fn traced_active_level(
                 saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
                 saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
             }
-            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level));
+            tape.record_opaque_stacked(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level), block_index);
 
             (y, MemoryCache::MEMORA(cache), final_m, y_id)
         }
@@ -1033,7 +1034,7 @@ fn traced_active_level(
                 saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
                 saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
             }
-            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level));
+            tape.record_opaque_stacked(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level), block_index);
 
             (y, MemoryCache::Lattice(cache), final_m, y_id)
         }
@@ -1089,7 +1090,7 @@ fn traced_active_level(
                 saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
                 saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
             }
-            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level));
+            tape.record_opaque_stacked(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level), block_index);
 
             (y, MemoryCache::Trellis(cache), final_m, y_id)
         }
@@ -1131,7 +1132,7 @@ fn traced_active_level(
                 saved.push(tape.alloc(qc.pre_conv.clone(), vec![]));
                 saved.push(tape.alloc(qc.pre_silu.clone(), vec![]));
             }
-            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level));
+            tape.record_opaque_stacked(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level), block_index);
 
             (y, MemoryCache::Atlas(cache), final_m, y_id)
         }
@@ -1162,12 +1163,266 @@ fn traced_active_level(
 
             let y_id = tape.alloc(y.clone(), vec![s, d]);
             let saved = vec![meta_id, lp_id, emb_saved, x_id, gate_out_id, up_out_id, fused_id, gc_id];
-            tape.record_opaque(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level));
+            tape.record_opaque_stacked(key, vec![emb_id, lp_id], vec![y_id], saved, Some(level), block_index);
 
             // No M state — return empty vec
             (y, MemoryCache::SwiGlu(cache), vec![], y_id)
         }
     }
+}
+
+// ── P2.9: Traced LayerNorm ────────────────────────────────────────────
+
+/// Traced LayerNorm: records on tape for backward differentiation.
+/// Returns output BufId. eps = 1e-5 (same as CUDA forward).
+pub fn traced_layernorm(
+    tape: &mut Tape,
+    input: BufId,
+    gamma: BufId,
+    beta: BufId,
+    n: usize,
+    d: usize,
+) -> BufId {
+    let x_data = tape.buf_data(input).to_vec();
+    let g_data = tape.buf_data(gamma).to_vec();
+    let b_data = tape.buf_data(beta).to_vec();
+
+    let (out_data, mean_cache, rstd_cache) = crate::mag::layer_norm(
+        &x_data, &g_data, &b_data, n, d, 1e-5,
+    );
+
+    let mean_id = tape.alloc(mean_cache, vec![n]);
+    let rstd_id = tape.alloc(rstd_cache, vec![n]);
+    tape.record_with_output(out_data, vec![n, d], |out_id| {
+        TapeOp::LayerNorm {
+            input, gamma, beta, out: out_id,
+            mean_cache: mean_id, rstd_cache: rstd_id,
+            n, d,
+        }
+    })
+}
+
+// ── P2.10: Traced Stacked Forward ────────────────────────────────────
+
+use crate::stacked_model::{StackedMAGParams, BlockParams};
+
+/// BufId map for stacked model parameters — needed to extract gradients after backward.
+#[derive(Debug, Clone)]
+pub struct TracedStackedParamIds {
+    pub w_embed: BufId,
+    pub w_unembed: BufId,
+    pub ln_final_gamma: BufId,
+    pub ln_final_beta: BufId,
+    pub blocks: Vec<TracedBlockParamIds>,
+}
+
+/// BufId map for one block's parameters.
+#[derive(Debug, Clone)]
+pub struct TracedBlockParamIds {
+    pub w_q: BufId,
+    pub w_k: BufId,
+    pub w_v: BufId,
+    /// `None` in stacked path: w_o is not applied as output projection
+    /// (matches gpu_stacked_forward.rs lines 239-241). Gradients are zero.
+    /// `Some(id)` in single-block path where w_o is applied.
+    pub w_o: Option<BufId>,
+    pub ln_attn_gamma: BufId,
+    pub ln_attn_beta: BufId,
+    pub ln_mem_gamma: BufId,
+    pub ln_mem_beta: BufId,
+    /// lp_flat BufId per level
+    pub level_params: Vec<BufId>,
+}
+
+/// Traced stacked multi-block forward pass.
+///
+/// Mirrors `gpu_stacked_forward` stage-by-stage on CPU, recording every
+/// operation on the tape for backward differentiation.
+///
+/// Flow:
+///   1. Embed tokens (shared w_embed)
+///   2. For each block b in 0..n_blocks:
+///      a. LN_attn → QKV → SWA → residual skip 1
+///      b. LN_mem → per-level memory → combine → residual skip 2
+///   3. Final LN (shared ln_final)
+///   4. Unembed (shared w_unembed) → cross-entropy loss
+///
+/// Returns (loss, loss_buf_id, TracedStackedParamIds).
+pub fn traced_stacked_forward(
+    tape: &mut Tape,
+    params: &StackedMAGParams,
+    cfg: &MAGConfig,
+    input_ids: &[usize],
+    target_ids: &[usize],
+    pulse: &Pulse,
+    context: &mut Vec<Vec<Vec<f32>>>,   // [n_blocks][k][d*d]
+) -> (f32, BufId, TracedStackedParamIds) {
+    let s = cfg.swa.seq_len;
+    let d = cfg.swa.d_model;
+    let v = cfg.swa.vocab_size;
+    let nh = cfg.swa.num_heads;
+    let hd = cfg.swa.head_dim;
+    let ws = cfg.swa.window_size;
+    let n_blocks = params.blocks.len();
+
+    assert_eq!(d, nh * hd);
+    assert!(input_ids.len() >= s);
+    assert!(target_ids.len() >= s);
+    assert_eq!(pulse.active_levels.len(), cfg.k);
+    assert_eq!(context.len(), n_blocks, "context must have one entry per block");
+    for (b, bc) in context.iter().enumerate() {
+        assert_eq!(bc.len(), cfg.k, "block {b} context must have k={} levels", cfg.k);
+    }
+
+    // ── Stage 1: Embedding lookup (shared) ─────────────────────────
+    let w_embed_id = tape.register_param(&params.w_embed, vec![v, d]);
+    let emb_id = traced_embed_lookup(tape, w_embed_id, &input_ids[..s], v, d);
+
+    // residual_id tracks the residual stream BufId through blocks
+    let mut residual_id = emb_id;
+
+    // ── Stage 2: Per-block forward ─────────────────────────────────
+    let mut block_param_ids = Vec::with_capacity(n_blocks);
+
+    for b in 0..n_blocks {
+        let block = &params.blocks[b];
+
+        // ── LN_attn on residual stream ─────────────────────────
+        let ln_attn_gamma_id = tape.register_param(&block.ln_attn_gamma, vec![d]);
+        let ln_attn_beta_id = tape.register_param(&block.ln_attn_beta, vec![d]);
+        let ln_attn_out_id = traced_layernorm(tape, residual_id, ln_attn_gamma_id, ln_attn_beta_id, s, d);
+
+        // ── QKV projections ────────────────────────────────────
+        let w_q_id = tape.register_param(&block.w_q, vec![d, d]);
+        let w_k_id = tape.register_param(&block.w_k, vec![d, d]);
+        let w_v_id = tape.register_param(&block.w_v, vec![d, d]);
+        let q_id = traced_matmul_transb(tape, ln_attn_out_id, w_q_id, s, d, d);
+        let k_id = traced_matmul_transb(tape, ln_attn_out_id, w_k_id, s, d, d);
+        let v_id = traced_matmul_transb(tape, ln_attn_out_id, w_v_id, s, d, d);
+
+        // ── SWA attention ──────────────────────────────────────
+        let (attn_out_id, _attn_weights) = traced_swa_forward(
+            tape, q_id, k_id, v_id, s, nh, hd, ws,
+        );
+
+        // ── Residual skip 1: residual + attn_out ───────────────
+        let residual_after_attn_id = traced_add(tape, residual_id, attn_out_id);
+
+        // ── LN_mem on residual_after_attn ──────────────────────
+        let ln_mem_gamma_id = tape.register_param(&block.ln_mem_gamma, vec![d]);
+        let ln_mem_beta_id = tape.register_param(&block.ln_mem_beta, vec![d]);
+        let ln_mem_out_id = traced_layernorm(tape, residual_after_attn_id, ln_mem_gamma_id, ln_mem_beta_id, s, d);
+
+        // ── Per-level memory ───────────────────────────────────
+        let ln_mem_data = tape.buf_data(ln_mem_out_id).to_vec();
+        let mut y_ids: Vec<BufId> = Vec::with_capacity(cfg.k);
+        let mut level_param_ids = Vec::with_capacity(cfg.k);
+
+        for level in 0..cfg.k {
+            let lp = &block.levels[level];
+            let lp_flat = crate::opaque_adapters::level_params_grads_to_flat(lp);
+            let lp_id = tape.register_param(&lp_flat, vec![lp_flat.len()]);
+            level_param_ids.push(lp_id);
+
+            let effective_active = pulse.active_levels[level];
+
+            if effective_active {
+                // Active level: reuse traced_active_level with block_index tagging
+                let initial_m = Some(std::mem::take(&mut context[b][level]));
+
+                let (y_data, _mem_cache, final_m, y_id) = traced_active_level(
+                    tape, cfg, level, lp, &ln_mem_data, s, d,
+                    initial_m, ln_mem_out_id, lp_id, Some(b),
+                );
+
+                context[b][level] = final_m;
+                y_ids.push(y_id);
+                let _ = y_data;
+            } else {
+                // Frozen level: read-only path.
+                // Stacked models only support DeltaRule and TitansLMM — both use
+                // delta_rule_read_only.  Assert early so misconfiguration surfaces
+                // here rather than producing silently wrong gradients.
+                assert!(
+                    matches!(cfg.memory_rule,
+                        MemoryRuleKind::DeltaRule | MemoryRuleKind::TitansLMM),
+                    "traced_stacked_forward frozen path: unsupported rule {:?} \
+                     (only DeltaRule and TitansLMM are supported for stacked models)",
+                    cfg.memory_rule,
+                );
+                let frozen_ref = &context[b][level];
+                let w_q_f32 = lp.w_q_mem.as_f32();
+                let w_q_mem_id = tape.register_param(&w_q_f32, vec![d, d]);
+                let q_mem_id = traced_matmul_transb(tape, ln_mem_out_id, w_q_mem_id, s, d, d);
+
+                let (y_data, _q_mem_data) = delta_rule_read_only(
+                    lp, &ln_mem_data, frozen_ref, s, d, &cfg.feature_map,
+                );
+
+                let fk = frozen_opaque_key(cfg.memory_rule);
+                let (fm_kind_f32, fm_sigma) = match &cfg.feature_map {
+                    crate::feature_map::FeatureMapKind::Identity => (0.0f32, 1.0f32),
+                    crate::feature_map::FeatureMapKind::RandomFourier { sigma } => (1.0f32, *sigma),
+                    crate::feature_map::FeatureMapKind::ELU => (2.0f32, 1.0f32),
+                };
+                let meta = vec![s as f32, d as f32, fm_kind_f32, fm_sigma];
+                let meta_id = tape.alloc(meta, vec![]);
+                let m_saved = tape.alloc(frozen_ref.to_vec(), vec![]);
+                let y_id = tape.alloc(y_data, vec![s, d]);
+                let tape_saved = vec![meta_id, m_saved];
+                tape.record_opaque_stacked(fk, vec![q_mem_id], vec![y_id], tape_saved, Some(level), Some(b));
+                y_ids.push(y_id);
+            }
+        }
+
+        // ── Combine level outputs ──────────────────────────────
+        let mut combined_id = y_ids[0];
+        for i in 1..cfg.k {
+            combined_id = traced_add(tape, combined_id, y_ids[i]);
+        }
+        if cfg.k > 2 {
+            let scale = 1.0 / (cfg.k as f32).sqrt();
+            combined_id = traced_scale(tape, combined_id, scale);
+        }
+
+        // ── Residual skip 2: residual_after_attn + y_combined ──
+        residual_id = traced_add(tape, residual_after_attn_id, combined_id);
+
+        block_param_ids.push(TracedBlockParamIds {
+            w_q: w_q_id,
+            w_k: w_k_id,
+            w_v: w_v_id,
+            w_o: None, // not applied in stacked path (see gpu_stacked_forward.rs:239-241)
+            ln_attn_gamma: ln_attn_gamma_id,
+            ln_attn_beta: ln_attn_beta_id,
+            ln_mem_gamma: ln_mem_gamma_id,
+            ln_mem_beta: ln_mem_beta_id,
+            level_params: level_param_ids,
+        });
+    }
+
+    // ── Stage 3: Final LayerNorm (shared) ──────────────────────────
+    let ln_final_gamma_id = tape.register_param(&params.ln_final_gamma, vec![d]);
+    let ln_final_beta_id = tape.register_param(&params.ln_final_beta, vec![d]);
+    let ln_final_out_id = traced_layernorm(tape, residual_id, ln_final_gamma_id, ln_final_beta_id, s, d);
+
+    // ── Stage 4: Unembed (shared) ──────────────────────────────────
+    let w_unembed_id = tape.register_param(&params.w_unembed, vec![d, v]);
+    let logits_id = traced_matmul(tape, ln_final_out_id, w_unembed_id, s, d, v);
+
+    // ── Stage 5: Cross-entropy loss ────────────────────────────────
+    let loss_id = traced_cross_entropy(tape, logits_id, &target_ids[..s], v);
+    let loss = tape.buf_data(loss_id)[0];
+
+    let param_ids = TracedStackedParamIds {
+        w_embed: w_embed_id,
+        w_unembed: w_unembed_id,
+        ln_final_gamma: ln_final_gamma_id,
+        ln_final_beta: ln_final_beta_id,
+        blocks: block_param_ids,
+    };
+
+    (loss, loss_id, param_ids)
 }
 
 // ══════════════════════════════════════════════════════════════════════

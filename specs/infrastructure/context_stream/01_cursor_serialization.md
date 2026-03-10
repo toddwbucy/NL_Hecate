@@ -12,7 +12,7 @@ CONTRACT
               Creating mode-specific stream subtypes (BuildStream, ChatStream)
               would be CS-10 (train/eval distinction) in disguise.
 
-  Expects:    BpeDataLoader managing a flat token array with a position cursor.
+  Expects:    BpeTokenStream managing a flat token array with a position cursor.
               Checkpoints written by engine/loop.py at configurable intervals.
               A content hash over the last chunk for dataset integrity checking.
 
@@ -76,10 +76,10 @@ corrupted file without reading the full array.
 
 ---
 
-## Interface: BpeDataLoader
+## Interface: BpeTokenStream
 
 ```python
-class BpeDataLoader:
+class BpeTokenStream:
 
     def cursor(self) -> dict:
         """Return a serializable cursor capturing current stream position.

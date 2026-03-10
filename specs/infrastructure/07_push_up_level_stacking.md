@@ -132,7 +132,7 @@ if bcfg.data_seek is not None:
     print(f"  Data cursor overridden: seeking to position {bcfg.data_seek:,}")
 ```
 
-Requires adding `BpeDataLoader.seek(position)` — set internal position
+Requires adding `BpeTokenStream.seek(position)` — set internal position
 directly, recalculate chunk_id, clear content_hash (no validation on
 manual seek).
 

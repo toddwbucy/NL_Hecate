@@ -289,7 +289,7 @@ For each evaluated corpus, insert a node into `nl_experiments`:
 
 ### D3: Selected corpus tokenized and sharded
 
-Output matches the format consumed by `BpeDataLoader` in `engine/data.py`:
+Output matches the format consumed by `BpeTokenStream` in `engine/data.py`:
 
 ```text
 python/data/<selected_corpus_name>/

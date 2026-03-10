@@ -9,7 +9,7 @@ CONTRACT
   Expects:    - batch_size is a build config parameter (>= 1)
               - GpuContextState exists and holds per-level M on GPU
               - CUDA kernels (delta_forward, titans_forward) accept m_initial[d*d]
-              - BpeDataLoader serves chunks via a single position cursor
+              - BpeTokenStream serves chunks via a single position cursor
 
   Guarantees: - With batch_size=B and seq_len=S, every token in the corpus flows
                 through SOME batch slot's M update (no token is skipped)
@@ -23,7 +23,7 @@ CONTRACT
   Cost:       - GpuContextState VRAM: B * k * d*d * 4 bytes (e.g., B=8, k=4, d=512 = 32 MB)
               - Forward kernel: no extra FLOPs; m_initial offset read is O(1)
               - copy_final_m: B D2D memcpy calls per level (each d*d floats, ~1 MB)
-              - loop.py: B separate BpeDataLoader instances (same corpus mmap'd once)
+              - loop.py: B separate BpeTokenStream instances (same corpus mmap'd once)
               - No change to backward kernels (d_m_initial is a state gradient,
                 not a weight gradient, and is not consumed by AdamW)
 
@@ -45,7 +45,7 @@ CONTRACT
               core/src/gpu_forward.rs (broadcast_m_initial, copy_final_m)
               core/kernels/delta_forward.cu, titans_forward.cu
               python/engine/loop.py (batch chunk collection)
-              python/engine/data.py (BpeDataLoader)
+              python/engine/data.py (BpeTokenStream)
 ```
 
 ## Problem Statement
@@ -150,7 +150,7 @@ fn copy_final_m_batch(m_states: &GpuBuf<f32>, context_m: &mut GpuBuf<f32>,
 
 Recommended: keep `batch_size` in `BuildConfig` (build time, not model arch), and pass it to `GpuModel::new` explicitly.
 
-#### `python/engine/loop.py` — Per-slot BpeDataLoader
+#### `python/engine/loop.py` — Per-slot BpeTokenStream
 
 **Before** (batch_size > 1):
 ```python
@@ -167,7 +167,7 @@ This yields B consecutive chunks from ONE cursor (positions t*B*S .. (t+1)*B*S).
 bpe_loaders = []
 slot_size = bpe_loader.total_tokens // bcfg.batch_size
 for b in range(bcfg.batch_size):
-    loader_b = BpeDataLoader(bcfg.data_path, split="train")
+    loader_b = BpeTokenStream(bcfg.data_path, split="train")
     loader_b.position = b * slot_size  # start of sub-corpus b
     bpe_loaders.append(loader_b)
 

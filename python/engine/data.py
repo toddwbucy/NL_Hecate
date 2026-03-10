@@ -1,4 +1,4 @@
-"""Data loading: mmap byte stream, BPE ShareGPT loader, demo text."""
+"""Data loading: mmap byte stream, BPE token stream, demo text."""
 
 import json
 import mmap
@@ -65,7 +65,7 @@ class MmapTokenStream:
         self._f.close()
 
 
-class BpeDataLoader:
+class BpeTokenStream:
     """Load pre-tokenized ShareGPT data (numpy arrays) and serve chunks.
 
     Manages a position cursor into the flat token/target arrays.

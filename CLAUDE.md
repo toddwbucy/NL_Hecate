@@ -93,9 +93,9 @@ Every spec file has a `CONTRACT` header block with: Purpose, Expects, Guarantees
 
 ## HADES: Paper Traceability via Semantic Graph RAG
 
-Every spec traces to paper equations. Use the `/hades` skill (or `hades` CLI) with the `NL` database to look up source material.
+Every spec traces to paper equations. Use the `/hades` skill (or `hades` CLI) with the `NestedLearning` database to look up source material.
 
-**Database**: `NL` — 73 collections, 1,699 documents across 7 decomposed papers + cross-cutting NL collections.
+**Database**: `NestedLearning` — 109 collections, 1,699+ documents across 7 decomposed papers + cross-cutting NL collections.
 
 ### Per-Paper Collections
 
@@ -124,19 +124,19 @@ Each core paper is decomposed into `{prefix}_equations`, `{prefix}_definitions`,
 
 ```bash
 # Semantic search across ingested NL papers
-hades --database NL db query "momentum accumulator in inner loop"
+hades --database NestedLearning db query "momentum accumulator in inner loop"
 
 # Search within a specific paper
-hades --database NL db query "chunkwise approximation error" --paper 2511.07343
+hades --database NestedLearning db query "chunkwise approximation error" --paper 2511.07343
 
 # Look up a specific equation collection
-hades --database NL db export titans_equations | head -20
+hades --database NestedLearning db export titans_equations | head -20
 
 # Trace a code smell back to its source
-hades --database NL db aql "FOR doc IN nl_code_smells FILTER doc.id == 'CS-32' RETURN doc"
+hades --database NestedLearning db aql "FOR doc IN nl_code_smells FILTER doc.id == 'CS-32' RETURN doc"
 
 # Graph traversal — find what a paper connects to
-hades --database NL db graph neighbors --start "arxiv_metadata/2504.13173" --graph paper_graph
+hades --database NestedLearning db graph neighbors --start "arxiv_metadata/2504.13173" --graph paper_graph
 ```
 
 ## Graph Maintenance (HADES Spec Ingestion)
@@ -187,7 +187,7 @@ When writing or modifying a spec file in `specs/`, the corresponding HADES graph
 
 **Verification** (should return only infra-only specs like `edge_deployment`, `wengert_tape`):
 ```bash
-hades --database NL db aql "
+hades --database NestedLearning db aql "
   FOR s IN hecate_specs
     LET edges = (
       FOR e IN nl_hecate_trace_edges
@@ -205,15 +205,15 @@ The HADES MCP server (`hades_*` tools) drives every step. Use them directly — 
 
 ### Session start — always first
 ```
-hades_task_usage(database="NL")   # briefing: open tasks, last session context
+hades_task_usage(database="NestedLearning")   # briefing: open tasks, last session context
 ```
 
 ---
 
 ### Step 1 — Task
 ```python
-hades_task_create(database="NL", title="...", type="task", priority="high|medium|low")
-hades_task_start(database="NL", key="task_xxx")   # open → in_progress
+hades_task_create(database="NestedLearning", title="...", type="task", priority="high|medium|low")
+hades_task_start(database="NestedLearning", key="task_xxx")   # open → in_progress
 ```
 
 ---
@@ -221,10 +221,10 @@ hades_task_start(database="NL", key="task_xxx")   # open → in_progress
 ### Step 2 — Spec (write before touching code)
 Research the constraints first:
 ```python
-hades_query(text="<concept>", database="NL")                     # find relevant equations/smells/axioms
-hades_arxiv_abstract(query="<concept>", database="NL")           # search 2.8M paper abstracts
+hades_query(text="<concept>", database="NestedLearning")                     # find relevant equations/smells/axioms
+hades_arxiv_abstract(query="<concept>", database="NestedLearning")           # search 2.8M paper abstracts
 hades_arxiv_info(arxiv_id="2512.24695")                          # paper metadata
-hades_db_aql(query="FOR doc IN nl_code_smells FILTER ...", database="NL")  # query specific smells
+hades_db_aql(query="FOR doc IN nl_code_smells FILTER ...", database="NestedLearning")  # query specific smells
 ```
 
 Write `specs/<category>/<NN>_<name>.md` with a full CONTRACT block.
@@ -232,11 +232,11 @@ Write `specs/<category>/<NN>_<name>.md` with a full CONTRACT block.
 Register the spec in the graph immediately after writing:
 ```python
 # Ingest the spec file itself (embeds text, enables semantic search over specs)
-hades_ingest(target="specs/<category>/<NN>_<name>.md", database="NL",
+hades_ingest(target="specs/<category>/<NN>_<name>.md", database="NestedLearning",
              id="<name>-spec", force=True)
 
 # Insert spec metadata node
-hades_db_insert(collection="hecate_specs", database="NL", data='''{
+hades_db_insert(collection="hecate_specs", database="NestedLearning", data='''{
   "_key": "<name>", "title": "...", "category": "...", "version": "0.4.0",
   "path": "<relative/path.md>", "purpose": "...",
   "paper_source": ["2512.24695"], "traced_to_equations": ["hope_equations/eq-NNN-..."],
@@ -244,7 +244,7 @@ hades_db_insert(collection="hecate_specs", database="NL", data='''{
 }''')
 
 # Insert trace edges (one per referenced equation)
-hades_db_insert(collection="nl_hecate_trace_edges", database="NL", data='''{
+hades_db_insert(collection="nl_hecate_trace_edges", database="NestedLearning", data='''{
   "_from": "hecate_specs/<name>", "_to": "hope_equations/eq-NNN-...", "rel": "implements"
 }''')
 ```
@@ -259,7 +259,7 @@ Implement against the spec file only. No features beyond spec scope.
 ### Step 4 — PR
 Submit pull request. Then transition the task:
 ```python
-hades_task_review(database="NL", key="task_xxx")   # in_progress → in_review
+hades_task_review(database="NestedLearning", key="task_xxx")   # in_progress → in_review
 ```
 
 ---
@@ -274,7 +274,7 @@ e. Repeat until CodeRabbit posts NO new actionable comments
 ```
 Use across sessions if needed:
 ```python
-hades_task_handoff(database="NL", key="task_xxx", done="...", remaining="...")
+hades_task_handoff(database="NestedLearning", key="task_xxx", done="...", remaining="...")
 ```
 
 ---
@@ -282,13 +282,13 @@ hades_task_handoff(database="NL", key="task_xxx", done="...", remaining="...")
 ### Step 6 — Graph gate (the acceptance test — must pass before merge)
 Ingest all new/modified source files. The `--claims` flag creates compliance edges atomically:
 ```python
-hades_ingest(target="core/src/foo.rs", database="NL", id="foo-rs",
+hades_ingest(target="core/src/foo.rs", database="NestedLearning", id="foo-rs",
              force=True, claims="CS-32:behavioral,CS-40:architectural")
 ```
 
 Verify compliance — every required smell must have an edge:
 ```python
-hades_db_aql(database="NL", query="""
+hades_db_aql(database="NestedLearning", query="""
   FOR e IN nl_smell_compliance_edges
     FILTER e._from == "arxiv_metadata/foo-rs"
     RETURN {smell: e._to, enforcement: e.enforcement}
@@ -297,13 +297,13 @@ hades_db_aql(database="NL", query="""
 
 Check chunk/embedding health:
 ```python
-hades_db_health(database="NL")
+hades_db_health(database="NestedLearning")
 ```
 
 Add richer edges if needed (after ingest):
 ```python
 hades_link(source_id="foo-rs", smell="CS-44", enforcement="architectural",
-           database="NL", summary="...", methods=["fn_name"])
+           database="NestedLearning", summary="...", methods=["fn_name"])
 ```
 
 **If any required smell is missing or violated → DO NOT MERGE. Fix and restart from Step 5.**
@@ -313,7 +313,7 @@ hades_link(source_id="foo-rs", smell="CS-44", enforcement="architectural",
 ### Step 7 — Merge
 Only after graph gate passes clean. Squash merge to main. Close the task:
 ```python
-hades_task_close(database="NL", key="task_xxx")
+hades_task_close(database="NestedLearning", key="task_xxx")
 ```
 
 ---
@@ -321,7 +321,7 @@ hades_task_close(database="NL", key="task_xxx")
 ### Binaries and artifacts
 When a compiled binary or artifact is produced (`.so`, `.whl`, CUDA fat binary):
 ```python
-hades_db_insert(collection="hecate_artifacts", database="NL", data='''{
+hades_db_insert(collection="hecate_artifacts", database="NestedLearning", data='''{
   "_key": "<name>", "artifact_type": "wheel|so|fatbin",
   "path": "relative/path", "produced_by_task": "persephone_tasks/task_xxx",
   "build_hash": "<git-sha>", "created_at": "epoch:NNN",

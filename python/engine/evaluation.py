@@ -3,7 +3,7 @@
 import math
 
 import nl_hecate
-from engine.data import BpeDataLoader
+from engine.data import BpeTokenStream
 
 
 # Fixed prompts for sampling at checkpoints (tests different capabilities)
@@ -196,7 +196,7 @@ def probe_context_value(gpu_model, cfg, prompt_ids, snapshot,
     }
 
 
-def evaluate(gpu_model, bcfg, val_loader,
+def evaluate(gpu_model, bcfg, val_stream,
              max_chunks: int, val_doc_starts=None) -> tuple[float, float]:
     """Run forward-only on val set. Returns (avg_loss, perplexity).
 
@@ -210,10 +210,10 @@ def evaluate(gpu_model, bcfg, val_loader,
     total_loss = 0.0
     n_chunks = 0
 
-    if isinstance(val_loader, BpeDataLoader):
-        val_loader.position = 0
+    if isinstance(val_stream, BpeTokenStream):
+        val_stream.position = 0
         for _ in range(max_chunks):
-            chunk = val_loader.next_chunk(bcfg.seq_len)
+            chunk = val_stream.next_chunk(bcfg.seq_len)
             if chunk is None:
                 break
             input_ids, target_ids = chunk
@@ -230,7 +230,7 @@ def evaluate(gpu_model, bcfg, val_loader,
             conductor.advance()
     else:
         # Byte-level eval: VecStream over val corpus
-        val_stream = nl_hecate.VecStream.from_bytes(val_loader)
+        val_stream = nl_hecate.VecStream.from_bytes(val_stream)
         val_conductor = nl_hecate.Conductor(bcfg.k, bcfg.chunk_sizes)
         val_conductor.attach_stream(val_stream)
 
