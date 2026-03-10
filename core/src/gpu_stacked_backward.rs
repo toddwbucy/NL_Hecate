@@ -130,14 +130,18 @@ pub fn gpu_stacked_backward(
 
     // ── Final LN backward ──────────────────────────────────────────────
     // The last block's output (residual_stream) went through ln_final.
-    // We need the residual_stream value, which is block_caches[last].residual_after_attn + y_combined.
-    // Actually, the final residual_stream was consumed by LN — we reconstruct it from the last block.
+    // Reconstruct: residual_out = block_input + gated_out
+    //   where gated_out = attn_proj * gate (MAG sigmoid gating)
     let last_block_cache = &cache.block_caches[n_blocks - 1];
-    // residual_stream_final = residual_after_attn + y_combined (from last block)
     let mut residual_stream_final = GpuBuf::zeros(bsd);
+    let mut gated_out_last = GpuBuf::zeros(bsd);
     unsafe {
-        crate::cuda_ffi::saxpy_cuda(1.0, last_block_cache.residual_after_attn.as_ptr(), residual_stream_final.ptr(), bsd_i32);
-        crate::cuda_ffi::saxpy_cuda(1.0, last_block_cache.y_combined.as_ptr(), residual_stream_final.ptr(), bsd_i32);
+        crate::cuda_ffi::elemwise_mul_cuda(
+            last_block_cache.attn_proj.as_ptr(), last_block_cache.gate.as_ptr(),
+            gated_out_last.ptr(), bsd_i32,
+        );
+        crate::cuda_ffi::saxpy_cuda(1.0, last_block_cache.block_input.as_ptr(), residual_stream_final.ptr(), bsd_i32);
+        crate::cuda_ffi::saxpy_cuda(1.0, gated_out_last.as_ptr(), residual_stream_final.ptr(), bsd_i32);
     }
 
     let mut d_residual_stream = GpuBuf::zeros(bsd);
@@ -179,17 +183,29 @@ pub fn gpu_stacked_backward(
             .map(|_| GpuLevelGrads::zeros_mlp(d, inter))
             .collect();
 
-        // ── Residual skip 2 backward ───────────────────────────────
-        // residual_out = residual_after_attn + y_combined
-        // d_residual_after_attn = d_residual_stream (addition backward)
-        // d_y_combined = d_residual_stream (addition backward)
+        // ── MAG gating backward ──────────────────────────────────────
+        // Forward: residual_out = block_input + gated_out
+        //          gated_out = attn_proj * gate
+        //          gate = sigmoid(y_combined)
+        // Spec: specs/infrastructure/20_stacked_mag_sigmoid_gating.md
+
+        // d_gated_out = d_residual_stream (from output residual skip)
+        // Gating backward: gated_out = attn_proj * gate
+        let mut d_attn_proj = GpuBuf::zeros(bsd);
+        let mut d_gate = GpuBuf::zeros(bsd);
+        unsafe {
+            crate::cuda_ffi::gating_backward_cuda(
+                d_residual_stream.as_ptr(), bc.attn_proj.as_ptr(), bc.gate.as_ptr(),
+                d_attn_proj.ptr(), d_gate.ptr(), bsd_i32,
+            );
+        }
+
+        // Sigmoid backward: gate = sigmoid(y_combined)
         let d_y_combined = GpuBuf::zeros(bsd);
         unsafe {
-            crate::cuda_ffi::saxpy_cuda(1.0, d_residual_stream.as_ptr(), d_y_combined.ptr(), bsd_i32);
-        }
-        let mut d_residual_after_attn = GpuBuf::zeros(bsd);
-        unsafe {
-            crate::cuda_ffi::saxpy_cuda(1.0, d_residual_stream.as_ptr(), d_residual_after_attn.ptr(), bsd_i32);
+            crate::cuda_ffi::sigmoid_backward_cuda(
+                d_gate.as_ptr(), bc.gate.as_ptr(), d_y_combined.ptr(), bsd_i32,
+            );
         }
 
         // Scale for 1/sqrt(k) normalization (k>2)
@@ -254,7 +270,7 @@ pub fn gpu_stacked_backward(
         }
 
         // ── LN_mem backward ────────────────────────────────────────
-        let mut d_residual_from_mem = GpuBuf::zeros(bsd);
+        let mut d_residual_after_attn = GpuBuf::zeros(bsd);
         unsafe {
             crate::cuda_ffi::layer_norm_backward_cuda(
                 d_mem_input.as_ptr(),
@@ -262,31 +278,33 @@ pub fn gpu_stacked_backward(
                 block.ln_mem_gamma.as_ptr(),
                 bc.ln_mem_mean.as_ptr(),
                 bc.ln_mem_rstd.as_ptr(),
-                d_residual_from_mem.ptr(),
+                d_residual_after_attn.ptr(),
                 d_ln_mem_gamma.ptr(),
                 d_ln_mem_beta.ptr(),
                 n_tokens as i32, d as i32,
             );
         }
-        // Add LN_mem backward to d_residual_after_attn
-        unsafe {
-            crate::cuda_ffi::saxpy_cuda(1.0, d_residual_from_mem.as_ptr(), d_residual_after_attn.ptr(), bsd_i32);
-        }
 
         // ── Residual skip 1 backward ───────────────────────────────
         // residual_after_attn = block_input + attn_proj
-        // where attn_proj = attn_out @ W_O^T
-        // d_attn_proj = d_residual_after_attn (addition backward)
-        // d_attn_out = d_attn_proj @ W_O  (backward through output projection)
-        // d_w_o = d_attn_proj^T @ attn_out  (gradient for W_O)
+        // d_attn_proj accumulates from two paths:
+        //   1. d_attn_proj (from gating backward above)
+        //   2. d_residual_after_attn (from skip 1: block_input + attn_proj)
+        unsafe {
+            crate::cuda_ffi::saxpy_cuda(1.0, d_residual_after_attn.as_ptr(), d_attn_proj.ptr(), bsd_i32);
+        }
+
+        // W_O backward: attn_proj = attn_out @ W_O^T
+        // d_attn_out = d_attn_proj @ W_O
+        // d_w_o = d_attn_proj^T @ attn_out
         // Spec: specs/infrastructure/18_stacked_w_o_output_projection.md
         let mut d_attn_out = GpuBuf::zeros(bsd);
         crate::dispatch::cublas_matmul_dd(
-            &d_residual_after_attn, &block.w_o, &mut d_attn_out,
+            &d_attn_proj, &block.w_o, &mut d_attn_out,
             n_tokens, d, d, 0.0,
         );
         gpu_matmul_transa_dd(
-            &d_residual_after_attn, &bc.attn_out, &mut d_w_o,
+            &d_attn_proj, &bc.attn_out, &mut d_w_o,
             d, n_tokens, d,
         );
 
@@ -327,8 +345,11 @@ pub fn gpu_stacked_backward(
                 n_tokens as i32, d as i32,
             );
         }
-        // Add d_residual_after_attn to d_block_input (residual skip 1 addition backward)
+        // block_input is used in two places:
+        //   1. residual_out = block_input + gated_out  → d_block_input += d_residual_stream
+        //   2. residual_after_attn = block_input + attn_proj → d_block_input += d_residual_after_attn
         unsafe {
+            crate::cuda_ffi::saxpy_cuda(1.0, d_residual_stream.as_ptr(), d_block_input.ptr(), bsd_i32);
             crate::cuda_ffi::saxpy_cuda(1.0, d_residual_after_attn.as_ptr(), d_block_input.ptr(), bsd_i32);
         }
 
