@@ -339,6 +339,14 @@ class BuildConfig:
             if not (0.0 <= self.promotion_rewind_pct <= 1.0):
                 raise ValueError(
                     f"promotion_rewind_pct must be in [0.0, 1.0], got {self.promotion_rewind_pct}")
+        # Multi-block stacking guards
+        if self.n_blocks < 1:
+            raise ValueError(f"n_blocks must be >= 1, got {self.n_blocks}")
+        if self.n_blocks > 1:
+            if self.composition == "mac":
+                raise ValueError(
+                    "n_blocks > 1 does not yet support composition='mac' "
+                    "(MAC persistent tokens have no stacked slot). Use 'mag'.")
         # Tape device validation
         if self.tape_device not in ("off", "gpu", "cpu"):
             raise ValueError(

@@ -439,6 +439,11 @@ def run_build(bcfg: BuildConfig):
           (f" ({bcfg.data_format} BPE)" if use_bpe else ""))
     use_gpu = bcfg.gpu and hasattr(nl_hecate, "GpuModel")
     is_stacked = getattr(bcfg, "n_blocks", 1) > 1
+    if is_stacked and not use_gpu:
+        raise RuntimeError(
+            "n_blocks > 1 requires GPU mode (gpu=true). "
+            "Stacked multi-block builds are GPU-only."
+        )
     if is_stacked and not hasattr(nl_hecate, "GpuStackedModel"):
         raise RuntimeError("n_blocks > 1 requires a CUDA-enabled build with GpuStackedModel")
     # Auto-promote adamw → adamw_gpu when on GPU (no reason to round-trip to CPU)
@@ -452,6 +457,11 @@ def run_build(bcfg: BuildConfig):
         )
     # Note: GPU + residual=true is supported for training (gpu_cms_forward).
     # Serving paths (prefill/single_token) still assert !residual until adapted.
+    if bcfg.load and is_stacked:
+        raise RuntimeError(
+            "Stacked model checkpoint loading is not yet implemented. "
+            "n_blocks > 1 builds must start fresh (remove --load)."
+        )
     if bcfg.load and use_gpu and not use_bpe:
         raise RuntimeError(
             "GPU resume with context restore is not yet implemented for byte-level builds. "
@@ -1553,24 +1563,27 @@ def run_build(bcfg: BuildConfig):
                       active_fires=level3_active_fires)
 
     # ── Final checkpoint ──────────────────────────────────────────────
-    if gpu_model is not None:
-        params = gpu_model.to_host_params()
-        context = gpu_model.to_host_context()
-    final_path = _safetensors_path(bcfg.save_path)
-    os.makedirs(os.path.dirname(final_path) or ".", exist_ok=True)
-    if use_bpe:
-        nl_hecate.save_checkpoint_with_context(final_path, params, cfg, conductor, context)
+    if is_stacked:
+        print(f"  [final checkpoint skipped: stacked model save not yet implemented]")
     else:
-        nl_hecate.save_build_checkpoint(final_path, params, cfg, conductor, context)
-    sidecar = Path(str(final_path) + ".cursor.json")
-    if bpe_loaders:
-        sidecar.write_text(json.dumps(
-            {"slots": [loader.cursor() for loader in bpe_loaders],
-             "level_start_cursor": _level_start_cursor}, indent=2))
-    elif active_loader is not None:
-        final_cursor = active_loader.cursor()
-        final_cursor["level_start_cursor"] = _level_start_cursor
-        sidecar.write_text(json.dumps(final_cursor, indent=2))
+        if gpu_model is not None:
+            params = gpu_model.to_host_params()
+            context = gpu_model.to_host_context()
+        final_path = _safetensors_path(bcfg.save_path)
+        os.makedirs(os.path.dirname(final_path) or ".", exist_ok=True)
+        if use_bpe:
+            nl_hecate.save_checkpoint_with_context(final_path, params, cfg, conductor, context)
+        else:
+            nl_hecate.save_build_checkpoint(final_path, params, cfg, conductor, context)
+        sidecar = Path(str(final_path) + ".cursor.json")
+        if bpe_loaders:
+            sidecar.write_text(json.dumps(
+                {"slots": [loader.cursor() for loader in bpe_loaders],
+                 "level_start_cursor": _level_start_cursor}, indent=2))
+        elif active_loader is not None:
+            final_cursor = active_loader.cursor()
+            final_cursor["level_start_cursor"] = _level_start_cursor
+            sidecar.write_text(json.dumps(final_cursor, indent=2))
 
     # ── Summary ───────────────────────────────────────────────────────
     print(f"\n{'=' * 60}")

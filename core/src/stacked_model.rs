@@ -39,6 +39,11 @@ pub struct BlockParams {
 
 impl BlockParams {
     /// Initialize one block with Xavier-scaled projections and level-specific gates.
+    ///
+    /// NOTE: This covers the Titans MAG path used by shakedown configs. Features
+    /// not yet wired: AtlasOmega atlas_init, learned frequency gates (omega/freq
+    /// params in MemoryLevelParams), Conv1D buffers, MAC persistent tokens.
+    /// These will be added when their respective compositions are stacked.
     pub fn init(cfg: &MAGConfig, seed: u64) -> Self {
         let d = cfg.swa.d_model;
         let mut rng = SimpleRng::new(seed);
@@ -186,6 +191,12 @@ impl StackedMAGParams {
 
     /// Convert from existing single-block MAGParams (backward compat).
     /// Wraps the single block's SWA + levels into block 0.
+    ///
+    /// LIMITATION: The final LayerNorm (ln_final_gamma/beta) is initialized to
+    /// identity (gamma=1, beta=0) because single-block MAGParams has no equivalent.
+    /// This means the wrapped model is NOT behavior-preserving on the first forward
+    /// pass — the extra LN will slightly change logits. This is acceptable for
+    /// checkpoint conversion where training continues, but not for inference parity.
     pub fn from_single_block(params: &MAGParams) -> Self {
         let d = params.swa.ln_attn_gamma.len();
         let block = BlockParams {

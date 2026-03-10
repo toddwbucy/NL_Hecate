@@ -328,6 +328,11 @@ pub fn gpu_stacked_adamw_update(
                   &mut mb.m_ln_mem_beta, &mut mb.v_ln_mem_beta,
                   lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
 
+        // NOTE: alpha_mem/alpha_refl are declared in BlockParams but not yet wired
+        // into the forward/backward passes (levels are combined via uniform sum with
+        // 1/sqrt(k) scaling). Once learnable aggregation is implemented, add moment
+        // buffers here and update the grad norm / scale functions accordingly.
+
         // Per-level CMS weights (pulse-gated)
         for (i, (lp, lg)) in bp.levels.iter_mut().zip(bg.levels.iter()).enumerate() {
             if i >= pulse.active_levels.len() || !pulse.active_levels[i] {
@@ -354,6 +359,8 @@ pub fn gpu_stacked_adamw_update(
                       lr, beta1, beta2, eps, lbc1_inv, lbc2_inv, weight_decay);
             adamw_one(&mut lp.b_theta, &lg.d_b_theta, &mut ml.m_b_theta, &mut ml.v_b_theta,
                       lr, beta1, beta2, eps, lbc1_inv, lbc2_inv, weight_decay);
+            // TODO(CS-39): clamp b_theta after update to prevent decay divergence
+            // (mirrors single-block gpu_optimizer.rs TODO)
             adamw_one(&mut lp.w_eta, &lg.d_w_eta, &mut ml.m_w_eta, &mut ml.v_w_eta,
                       lr, beta1, beta2, eps, lbc1_inv, lbc2_inv, weight_decay);
             adamw_one(&mut lp.b_eta, &lg.d_b_eta, &mut ml.m_b_eta, &mut ml.v_b_eta,
@@ -362,4 +369,19 @@ pub fn gpu_stacked_adamw_update(
     }
 
     grad_norm
+}
+
+/// Weight tying for stacked model: copy w_unembed^T → w_embed on GPU.
+/// Mirrors gpu_backward::gpu_sync_embed_weights for single-block models.
+#[cfg(feature = "cuda")]
+pub fn gpu_stacked_sync_embed_weights(params: &mut GpuStackedParams, d: usize, vocab: usize) {
+    unsafe {
+        crate::cuda_ffi::transpose_copy_cuda(
+            params.w_unembed.as_ptr(),  // src: [d, vocab]
+            params.w_embed.ptr(),        // dst: [vocab, d]
+            d as i32,
+            vocab as i32,
+        );
+    }
+    crate::dispatch::cuda_sync();
 }

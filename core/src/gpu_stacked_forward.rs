@@ -236,6 +236,10 @@ pub fn gpu_stacked_forward(
             crate::cuda_ffi::bf16_to_f32_cuda(attn_out_bf16.as_ptr(), attn_out.ptr(), total_i32);
         }
 
+        // NOTE: w_o (output projection) is not applied after attention in the
+        // initial stacked architecture. The residual stream carries raw attn_out.
+        // When w_o is wired in, add: attn_proj = attn_out @ w_o, use attn_proj below.
+
         // ── Residual skip 1: residual_after_attn = block_input + attn_out ──
         let mut residual_after_attn = GpuBuf::<f32>::zeros(total);
         unsafe {
@@ -298,7 +302,10 @@ pub fn gpu_stacked_forward(
             }
         }
 
-        // ── Combine levels: sum with 1/sqrt(k) for k>2 ────────────
+        // ── Combine levels: uniform sum with 1/sqrt(k) for k>2 ────
+        // NOTE: alpha_mem/alpha_refl are not yet used here. Level outputs are
+        // combined via uniform sum. When learnable aggregation is added, replace
+        // the uniform sum with softmax(alpha) weighted combination.
         let mut y_combined = GpuBuf::<f32>::zeros(total);
         for y_level in &y_per_level {
             unsafe {

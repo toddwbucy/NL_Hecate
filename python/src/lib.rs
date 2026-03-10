@@ -2488,6 +2488,14 @@ impl GpuStackedModel {
             lr, beta1, beta2, eps, weight_decay, max_grad_norm,
         );
 
+        // Weight tying: sync w_unembed^T → w_embed (same as single-block path).
+        // Without this, shared input/output embeddings diverge during training.
+        nl_hecate_core::gpu_stacked_optimizer::gpu_stacked_sync_embed_weights(
+            &mut self.params,
+            self.cfg.swa.d_model,
+            self.cfg.swa.vocab_size,
+        );
+
         Ok((loss, grad_norm))
     }
 
@@ -2531,6 +2539,12 @@ impl GpuStackedModel {
         if input_ids.is_empty() || input_ids.len() % s != 0 || target_ids.len() != input_ids.len() {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 format!("input/target length must be batch_size * seq_len {} (got {})", s, input_ids.len())));
+        }
+        if let Some(&max_id) = input_ids.iter().max() {
+            if max_id >= v {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("input_ids contains {} >= vocab_size {}", max_id, v)));
+            }
         }
 
         // Capture M state norms from current context (before diagnostic forward)
