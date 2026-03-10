@@ -2340,7 +2340,8 @@ impl GpuModel {
             ldict.set_item("dgd_delta_norm", delta_norm)?;
             // Theta (inner-loop learning rate) distribution
             if let Some(ref mc) = cache.memory_caches[level] {
-                if let Some(ts) = mc.theta_stats() {
+                let tc = self.cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
+                if let Some(ts) = mc.theta_stats(tc) {
                     let tdict = PyDict::new(py);
                     tdict.set_item("count", ts.count)?;
                     tdict.set_item("min", ts.min)?;
@@ -2349,7 +2350,7 @@ impl GpuModel {
                     tdict.set_item("median", ts.median)?;
                     tdict.set_item("p95", ts.p95)?;
                     tdict.set_item("p99", ts.p99)?;
-                    tdict.set_item("frac_at_max", ts.frac_at_max)?;
+                    tdict.set_item("frac_at_ceil", ts.frac_at_ceil)?;
                     ldict.set_item("theta", tdict)?;
                 }
             }
@@ -2637,7 +2638,8 @@ impl GpuStackedModel {
             for level in 0..k {
                 if let Some(ref mem_cache) = block_cache.memory_caches[level] {
                     block_deltas.push(mem_cache.dgd_delta_norm(s, d, bs));
-                    block_theta.push(mem_cache.theta_stats());
+                    let tc = self.cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
+                    block_theta.push(mem_cache.theta_stats(tc));
                 } else {
                     block_deltas.push(0.0);
                     block_theta.push(None);
@@ -2691,7 +2693,7 @@ impl GpuStackedModel {
                     tdict.set_item("median", ts.median)?;
                     tdict.set_item("p95", ts.p95)?;
                     tdict.set_item("p99", ts.p99)?;
-                    tdict.set_item("frac_at_max", ts.frac_at_max)?;
+                    tdict.set_item("frac_at_ceil", ts.frac_at_ceil)?;
                     ldict.set_item("theta", tdict)?;
                 }
                 levels_list.append(ldict)?;
@@ -2737,7 +2739,7 @@ impl GpuStackedModel {
                     if ts.max > agg_max { agg_max = ts.max; }
                     agg_sum += ts.mean * ts.count as f32;
                     if ts.p99 > agg_p99 { agg_p99 = ts.p99; }
-                    agg_frac_sum += ts.frac_at_max * ts.count as f32;
+                    agg_frac_sum += ts.frac_at_ceil * ts.count as f32;
                 }
             }
             if has_theta {
@@ -2746,8 +2748,8 @@ impl GpuStackedModel {
                 tdict.set_item("min", agg_min)?;
                 tdict.set_item("max", agg_max)?;
                 tdict.set_item("mean", agg_sum / agg_count as f32)?;
-                tdict.set_item("p99", agg_p99)?;
-                tdict.set_item("frac_at_max", agg_frac_sum / agg_count as f32)?;
+                tdict.set_item("p99_max", agg_p99)?;  // max(per-block p99), not true combined p99
+                tdict.set_item("frac_at_ceil", agg_frac_sum / agg_count as f32)?;
                 ldict.set_item("theta", tdict)?;
             }
             agg_levels_list.append(ldict)?;

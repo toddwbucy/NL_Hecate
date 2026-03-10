@@ -353,10 +353,12 @@ def print_tape_summary(tape_summary: dict, step: int) -> None:
         print(line)
         if "theta" in lvl and lvl["theta"] is not None:
             t = lvl["theta"]
-            ceil_pct = t.get("frac_at_max", 0.0) * 100
+            ceil_pct = t.get("frac_at_ceil", 0.0) * 100
+            # Aggregated stacked view uses p99_max; single-block uses p99
+            p99_val = t.get("p99", t.get("p99_max", 0.0))
             print(
                 f"           θ  mean={t['mean']:.4f}  "
-                f"p99={t['p99']:.4f}  "
+                f"p99={p99_val:.4f}  "
                 f"max={t['max']:.4f}  "
                 f"@ceil={ceil_pct:.1f}%"
             )

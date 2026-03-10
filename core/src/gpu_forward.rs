@@ -302,12 +302,14 @@ impl GpuMemoryCache {
 
     /// Extract theta (inner-loop learning rate) statistics from the forward cache.
     ///
+    /// `theta_ceil` is the configured ceiling — used to compute `frac_at_ceil`.
     /// Returns `Some(ThetaStats)` for rules that have a learned theta (Delta, Titans, DGD),
     /// `None` for Hebbian/SwiGlu (which have no theta).
-    /// For TNT: aggregates theta values across all shard inner caches.
+    /// For TNT: aggregates theta values across all shard inner caches, filtering
+    /// out zero-padded elements (softplus output is always > 0 for real tokens).
     ///
     /// Source: HOPE (2512.24695) — theta = softplus(w_theta · [k,v] + b_theta)
-    pub fn theta_stats(&self) -> Option<ThetaStats> {
+    pub fn theta_stats(&self, theta_ceil: f32) -> Option<ThetaStats> {
         // Helper: extract theta buffer ref from any variant that has one
         let theta_buf: Option<&GpuBuf<f32>> = match self {
             GpuMemoryCache::Delta { theta, .. }
@@ -327,10 +329,12 @@ impl GpuMemoryCache {
             if n == 0 { return None; }
             let mut host = vec![0.0f32; n];
             buf.copy_to_host(&mut host);
-            return Some(ThetaStats::from_slice(&host));
+            return Some(ThetaStats::from_slice(&host, theta_ceil));
         }
 
-        // TNT: gather theta values from all shard inner caches
+        // TNT: gather theta values from all shard inner caches.
+        // Filter out zeros from padding — softplus(x) > 0 for all real inputs,
+        // so theta == 0.0 means the element is zero-padding from partial shards.
         if let GpuMemoryCache::TNT { shard_inner_caches, .. } = self {
             let mut all_theta = Vec::new();
             for shard_cache in shard_inner_caches.iter() {
@@ -348,12 +352,13 @@ impl GpuMemoryCache {
                     if n > 0 {
                         let mut host = vec![0.0f32; n];
                         buf.copy_to_host(&mut host);
-                        all_theta.extend_from_slice(&host);
+                        // Filter padding zeros (softplus output is always > 0)
+                        all_theta.extend(host.iter().copied().filter(|&v| v > 0.0));
                     }
                 }
             }
             if all_theta.is_empty() { return None; }
-            return Some(ThetaStats::from_slice(&all_theta));
+            return Some(ThetaStats::from_slice(&all_theta, theta_ceil));
         }
 
         None
@@ -374,12 +379,14 @@ pub struct ThetaStats {
     pub median: f32,
     pub p95: f32,
     pub p99: f32,
-    /// Fraction of tokens where theta == max (i.e., hitting the ceiling)
-    pub frac_at_max: f32,
+    /// Fraction of tokens where theta >= theta_ceil (hitting the configured ceiling)
+    pub frac_at_ceil: f32,
 }
 
 impl ThetaStats {
-    pub fn from_slice(values: &[f32]) -> Self {
+    /// Compute stats from a sorted slice of theta values.
+    /// `theta_ceil` is the configured ceiling for computing `frac_at_ceil`.
+    pub fn from_slice(values: &[f32], theta_ceil: f32) -> Self {
         let n = values.len();
         assert!(n > 0);
         let mut sorted = values.to_vec();
@@ -389,16 +396,29 @@ impl ThetaStats {
         let max = sorted[n - 1];
         let sum: f32 = sorted.iter().sum();
         let mean = sum / n as f32;
-        let median = sorted[n / 2];
-        let p95 = sorted[((n as f64 * 0.95).ceil() as usize).min(n - 1)];
-        let p99 = sorted[((n as f64 * 0.99).ceil() as usize).min(n - 1)];
 
-        // Fraction at ceiling: count values within 0.1% of max
-        let threshold = max * 0.999;
-        let at_max = sorted.iter().filter(|&&v| v >= threshold).count();
-        let frac_at_max = at_max as f32 / n as f32;
+        // Interpolated quantiles: rank = p * (n - 1), interpolate between neighbors
+        let quantile = |p: f64| -> f32 {
+            let rank = p * (n as f64 - 1.0);
+            let lo = rank.floor() as usize;
+            let hi = (lo + 1).min(n - 1);
+            let frac = rank - lo as f64;
+            (sorted[lo] as f64 * (1.0 - frac) + sorted[hi] as f64 * frac) as f32
+        };
+        let median = quantile(0.5);
+        let p95 = quantile(0.95);
+        let p99 = quantile(0.99);
 
-        ThetaStats { count: n, min, max, mean, median, p95, p99, frac_at_max }
+        // Fraction at configured ceiling (with small epsilon for float comparison)
+        let ceil_threshold = theta_ceil * (1.0 - 1e-4);
+        let at_ceil = if theta_ceil < f32::MAX {
+            sorted.iter().filter(|&&v| v >= ceil_threshold).count()
+        } else {
+            0 // no ceiling configured
+        };
+        let frac_at_ceil = at_ceil as f32 / n as f32;
+
+        ThetaStats { count: n, min, max, mean, median, p95, p99, frac_at_ceil }
     }
 }
 
