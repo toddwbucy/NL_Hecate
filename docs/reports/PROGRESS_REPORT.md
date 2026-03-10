@@ -233,11 +233,11 @@ The codebase provides a complete set of Python-tier primitives for experimentati
 
 ---
 
-## HADES Knowledge Graph (NL Database)
+## HADES Knowledge Graph (NestedLearning Database)
 
 | Collection Type | Count |
 |----------------|-------|
-| Databases | 1 (NL) |
+| Databases | 1 (NestedLearning) |
 | Collections | 73 |
 | Documents | ~1,699 |
 | Per-paper equation collections | 7 papers decomposed |

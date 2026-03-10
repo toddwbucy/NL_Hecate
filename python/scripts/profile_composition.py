@@ -92,8 +92,6 @@ def profile_run(config_path: str, label: str,
     loader = BpeTokenStream(bcfg.data_path, split="train")
 
     total_steps = warmup + n_steps
-    use_bwd = True  # alternate: even=step_adamw, odd=backward_only
-
     for i in range(total_steps):
         chunk = loader.next_chunk(bcfg.seq_len)
         if chunk is None:
@@ -108,7 +106,7 @@ def profile_run(config_path: str, label: str,
         # -- step_adamw timing --
         cuda_sync()
         t0 = time.perf_counter()
-        loss, g_norm = gpu_model.step_adamw(
+        _loss, _g_norm = gpu_model.step_adamw(
             input_ids, target_ids, pulse, 0.0006,
             beta1=0.9, beta2=0.999, eps=1e-8,
             weight_decay=0.1, max_grad_norm=1.0,
@@ -145,7 +143,7 @@ def profile_run(config_path: str, label: str,
 
         cuda_sync()
         t0 = time.perf_counter()
-        loss, grads = gpu_model2.backward_only(input_ids, target_ids, pulse)
+        _loss, _grads = gpu_model2.backward_only(input_ids, target_ids, pulse)
         cuda_sync()
         t1 = time.perf_counter()
 
@@ -235,9 +233,9 @@ def main():
 
     print(f"{'=' * 70}")
     print(f"\n  Window size: MAC={mac['window_size']}, MAG={mag['window_size']}")
-    print(f"  If MAC/MAG ratio ≈ 1.0 on fwd+bwd → attention is NOT the bottleneck")
-    print(f"  If optimizer cost is high → AdamW state updates dominate")
-    print(f"  If L3/L0 ratio > 1.5 → slow-level memory updates are expensive")
+    print("  If MAC/MAG ratio ≈ 1.0 on fwd+bwd → attention is NOT the bottleneck")
+    print("  If optimizer cost is high → AdamW state updates dominate")
+    print("  If L3/L0 ratio > 1.5 → slow-level memory updates are expensive")
 
 
 if __name__ == "__main__":
