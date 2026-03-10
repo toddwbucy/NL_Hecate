@@ -1,3 +1,4 @@
+#define WARP_SZ 32
 // Elementwise CUDA Kernels — GPU-Resident Model
 //
 // Operations that don't need their own kernel file but must run on device
@@ -180,21 +181,21 @@ __global__ void gate_compute_kernel(
     }
 
     // Warp reduction
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+    for (int offset = WARP_SZ / 2; offset > 0; offset >>= 1) {
         sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
     }
 
     // Cross-warp reduction via shared memory
     __shared__ float warp_sums[32];
-    int warp_id = threadIdx.x / warpSize;
-    int lane = threadIdx.x % warpSize;
+    int warp_id = threadIdx.x / WARP_SZ;
+    int lane = threadIdx.x % WARP_SZ;
 
     if (lane == 0) warp_sums[warp_id] = sum;
     __syncthreads();
 
     if (threadIdx.x == 0) {
         float total = 0.0f;
-        int num_warps = (blockDim.x + warpSize - 1) / warpSize;
+        int num_warps = (blockDim.x + WARP_SZ - 1) / WARP_SZ;
         for (int w = 0; w < num_warps; w++) {
             total += warp_sums[w];
         }
@@ -322,20 +323,20 @@ __global__ void dgd_delta_norm_kernel(
     }
 
     // Step 3: Warp reduction
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+    for (int offset = WARP_SZ / 2; offset > 0; offset >>= 1) {
         local_sq += __shfl_down_sync(0xFFFFFFFF, local_sq, offset);
     }
 
     // Step 4: Inter-warp reduction via shared memory
-    int warp_id = tid / warpSize;
-    int lane = tid % warpSize;
+    int warp_id = tid / WARP_SZ;
+    int lane = tid % WARP_SZ;
     if (lane == 0) prediction[warp_id] = local_sq;  // reuse prediction as scratch
     __syncthreads();
 
     if (warp_id == 0) {
-        int n_warps = (blockDim.x + warpSize - 1) / warpSize;
+        int n_warps = (blockDim.x + WARP_SZ - 1) / WARP_SZ;
         float val = (lane < n_warps) ? prediction[lane] : 0.0f;
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        for (int offset = WARP_SZ / 2; offset > 0; offset >>= 1) {
             val += __shfl_down_sync(0xFFFFFFFF, val, offset);
         }
         if (lane == 0) {
@@ -351,7 +352,7 @@ extern "C" void dgd_delta_norm_cuda(
     int dd = d * d;
     int block_size = (dd < 1024) ? dd : 1024;
     // Round up to warp boundary — __shfl_down_sync requires full warps
-    block_size = ((block_size + warpSize - 1) / warpSize) * warpSize;
+    block_size = ((block_size + WARP_SZ - 1) / WARP_SZ) * WARP_SZ;
     if (block_size > 1024) block_size = 1024;
     // Need at least d floats of smem for prediction + warp scratch
     int smem_bytes = d * sizeof(float);

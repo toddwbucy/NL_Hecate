@@ -420,3 +420,235 @@ impl GpuContextState {
         }
     }
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// GpuBlockParams — per-block SWA + LN + CMS levels on GPU
+// ══════════════════════════════════════════════════════════════════════
+
+/// One block's learnable parameters resident on GPU.
+/// Contains SWA projections (no embed/unembed), LayerNorms, and CMS levels.
+#[cfg(feature = "cuda")]
+pub struct GpuBlockParams {
+    // SWA attention projections
+    pub w_q: GpuBuf<f32>,       // [d, d]
+    pub w_k: GpuBuf<f32>,       // [d, d]
+    pub w_v: GpuBuf<f32>,       // [d, d]
+    pub w_o: GpuBuf<f32>,       // [d, d]
+    // Pre-norm LayerNorm for attention branch
+    pub ln_attn_gamma: GpuBuf<f32>,  // [d]
+    pub ln_attn_beta: GpuBuf<f32>,   // [d]
+    // Pre-norm LayerNorm for memory branch
+    pub ln_mem_gamma: GpuBuf<f32>,   // [d]
+    pub ln_mem_beta: GpuBuf<f32>,    // [d]
+    // CMS memory levels (length k)
+    pub levels: Vec<GpuMemoryLevelParams>,
+    // CMS aggregation logits (kept on GPU for future learnable aggregation)
+    pub alpha_mem: GpuBuf<f32>,  // [k]
+    pub alpha_refl: GpuBuf<f32>, // [k]
+}
+
+#[cfg(feature = "cuda")]
+impl GpuBlockParams {
+    /// Upload one block's parameters from host BlockParams.
+    pub fn from_host(host: &crate::stacked_model::BlockParams) -> Self {
+        GpuBlockParams {
+            w_q: GpuBuf::from_host(&host.w_q),
+            w_k: GpuBuf::from_host(&host.w_k),
+            w_v: GpuBuf::from_host(&host.w_v),
+            w_o: GpuBuf::from_host(&host.w_o),
+            ln_attn_gamma: GpuBuf::from_host(&host.ln_attn_gamma),
+            ln_attn_beta: GpuBuf::from_host(&host.ln_attn_beta),
+            ln_mem_gamma: GpuBuf::from_host(&host.ln_mem_gamma),
+            ln_mem_beta: GpuBuf::from_host(&host.ln_mem_beta),
+            levels: host.levels.iter().map(GpuMemoryLevelParams::from_host).collect(),
+            alpha_mem: GpuBuf::from_host(&host.alpha_mem),
+            alpha_refl: GpuBuf::from_host(&host.alpha_refl),
+        }
+    }
+
+    /// Download block parameters from GPU to host.
+    pub fn to_host(&self, d: usize, k: usize) -> crate::stacked_model::BlockParams {
+        let mut w_q = vec![0.0f32; d * d];
+        let mut w_k = vec![0.0f32; d * d];
+        let mut w_v = vec![0.0f32; d * d];
+        let mut w_o = vec![0.0f32; d * d];
+        let mut ln_attn_gamma = vec![0.0f32; d];
+        let mut ln_attn_beta = vec![0.0f32; d];
+        let mut ln_mem_gamma = vec![0.0f32; d];
+        let mut ln_mem_beta = vec![0.0f32; d];
+        let mut alpha_mem = vec![0.0f32; k];
+        let mut alpha_refl = vec![0.0f32; k];
+
+        self.w_q.copy_to_host(&mut w_q);
+        self.w_k.copy_to_host(&mut w_k);
+        self.w_v.copy_to_host(&mut w_v);
+        self.w_o.copy_to_host(&mut w_o);
+        self.ln_attn_gamma.copy_to_host(&mut ln_attn_gamma);
+        self.ln_attn_beta.copy_to_host(&mut ln_attn_beta);
+        self.ln_mem_gamma.copy_to_host(&mut ln_mem_gamma);
+        self.ln_mem_beta.copy_to_host(&mut ln_mem_beta);
+        self.alpha_mem.copy_to_host(&mut alpha_mem);
+        self.alpha_refl.copy_to_host(&mut alpha_refl);
+
+        crate::stacked_model::BlockParams {
+            w_q, w_k, w_v, w_o,
+            ln_attn_gamma, ln_attn_beta,
+            ln_mem_gamma, ln_mem_beta,
+            levels: self.levels.iter().map(|l| l.to_host(d)).collect(),
+            alpha_mem, alpha_refl,
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// GpuStackedParams — shared embed/unembed + N blocks on GPU
+// ══════════════════════════════════════════════════════════════════════
+
+/// Full stacked model parameters on GPU.
+/// Shared embedding/unembedding + final LayerNorm, plus N independent blocks.
+#[cfg(feature = "cuda")]
+pub struct GpuStackedParams {
+    pub w_embed: GpuBuf<f32>,        // [vocab, d]
+    pub w_unembed: GpuBuf<f32>,      // [d, vocab]
+    pub ln_final_gamma: GpuBuf<f32>, // [d]
+    pub ln_final_beta: GpuBuf<f32>,  // [d]
+    pub blocks: Vec<GpuBlockParams>,
+}
+
+#[cfg(feature = "cuda")]
+impl GpuStackedParams {
+    /// Upload all stacked parameters from host to GPU.
+    pub fn from_host(host: &crate::stacked_model::StackedMAGParams) -> Self {
+        GpuStackedParams {
+            w_embed: GpuBuf::from_host(&host.w_embed),
+            w_unembed: GpuBuf::from_host(&host.w_unembed),
+            ln_final_gamma: GpuBuf::from_host(&host.ln_final_gamma),
+            ln_final_beta: GpuBuf::from_host(&host.ln_final_beta),
+            blocks: host.blocks.iter().map(GpuBlockParams::from_host).collect(),
+        }
+    }
+
+    /// Download all parameters from GPU to host.
+    pub fn to_host(&self, d: usize, vocab: usize, k: usize) -> crate::stacked_model::StackedMAGParams {
+        let mut w_embed = vec![0.0f32; vocab * d];
+        let mut w_unembed = vec![0.0f32; d * vocab];
+        let mut ln_final_gamma = vec![0.0f32; d];
+        let mut ln_final_beta = vec![0.0f32; d];
+
+        self.w_embed.copy_to_host(&mut w_embed);
+        self.w_unembed.copy_to_host(&mut w_unembed);
+        self.ln_final_gamma.copy_to_host(&mut ln_final_gamma);
+        self.ln_final_beta.copy_to_host(&mut ln_final_beta);
+
+        crate::stacked_model::StackedMAGParams {
+            w_embed, w_unembed,
+            ln_final_gamma, ln_final_beta,
+            blocks: self.blocks.iter().map(|b| b.to_host(d, k)).collect(),
+        }
+    }
+
+    /// Number of blocks.
+    pub fn n_blocks(&self) -> usize {
+        self.blocks.len()
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// GpuStackedContext — per-block per-level M matrices on GPU
+// ══════════════════════════════════════════════════════════════════════
+
+/// Memory state for a stacked model: [n_blocks][k] M matrices on GPU.
+/// Each block maintains its own set of k memory matrices.
+#[cfg(feature = "cuda")]
+pub struct GpuStackedContext {
+    /// Per-block context states. Each has k memory buffers.
+    pub blocks: Vec<GpuContextState>,
+    pub d: usize,
+    pub batch_size: usize,
+    pub n_blocks: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl GpuStackedContext {
+    /// Initialize zero M matrices for all blocks x levels.
+    /// No CUDA graph support for stacked forward (standard dispatch only).
+    pub fn new(n_blocks: usize, k: usize, d: usize, batch_size: usize) -> Self {
+        let blocks = (0..n_blocks)
+            .map(|_| GpuContextState::new(k, d, batch_size, None, 0))
+            .collect();
+        GpuStackedContext { blocks, d, batch_size, n_blocks }
+    }
+
+    /// Zero all memory across all blocks.
+    pub fn reset(&mut self) {
+        for ctx in &mut self.blocks {
+            ctx.reset();
+        }
+    }
+
+    /// Compute per-(block, level) Frobenius norms of M matrices on GPU.
+    /// Returns `Vec<Vec<f32>>` -- outer len = n_blocks, inner len = k.
+    pub fn memory_norms(&self) -> Vec<Vec<f32>> {
+        let mut result = Vec::with_capacity(self.n_blocks);
+        for ctx in &self.blocks {
+            let mut block_norms = Vec::with_capacity(ctx.memory.len());
+            for buf in &ctx.memory {
+                let buf_len = buf.len();
+                if buf_len == 0 {
+                    block_norms.push(0.0);
+                    continue;
+                }
+                let mut num_blocks_out: i32 = 0;
+                let max_norm_blocks = (buf_len + 255) / 256;
+                let mut scratch = GpuBuf::zeros(max_norm_blocks);
+                let err = unsafe {
+                    crate::cuda_ffi::grad_norm_sq_cuda(
+                        buf.as_ptr(), scratch.ptr(), buf_len as i32, &mut num_blocks_out,
+                    )
+                };
+                assert_eq!(err, 0, "grad_norm_sq_cuda for M state norm failed");
+                crate::dispatch::cuda_sync();
+                let nb = num_blocks_out as usize;
+                let mut host = vec![0.0f32; nb];
+                scratch.slice(0, nb).copy_to_host(&mut host);
+                let sq_sum: f64 = host.iter().map(|x| *x as f64).sum();
+                block_norms.push(sq_sum.sqrt() as f32);
+            }
+            result.push(block_norms);
+        }
+        result
+    }
+
+    /// Deep clone all GPU memory buffers (D2D copy). Used by tape diagnostics
+    /// to save/restore context around a non-destructive forward+backward.
+    pub fn deep_clone(&self) -> Self {
+        let blocks = self.blocks.iter().map(|ctx| {
+            let memory = ctx.memory.iter().map(|buf| {
+                let mut copy = GpuBuf::zeros(buf.len());
+                unsafe {
+                    crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        copy.ptr() as *mut std::ffi::c_void,
+                        buf.as_ptr() as *const std::ffi::c_void,
+                        buf.len() * std::mem::size_of::<f32>(),
+                    );
+                }
+                copy
+            }).collect();
+            // No CUDA graph scratch for stacked models, so create a minimal context
+            GpuContextState {
+                memory,
+                d: ctx.d,
+                batch_size: ctx.batch_size,
+                forward_scratch: None,
+                level_scratch: Vec::new(),
+                cuda_graph: crate::cuda_graph::CudaGraphStore::new(0),
+            }
+        }).collect();
+        GpuStackedContext {
+            blocks,
+            d: self.d,
+            batch_size: self.batch_size,
+            n_blocks: self.n_blocks,
+        }
+    }
+}

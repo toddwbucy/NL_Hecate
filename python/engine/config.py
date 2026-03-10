@@ -152,6 +152,14 @@ class BuildConfig:
     # Residual stream + pre-LayerNorm (specs/infrastructure/13_residual_stream.md)
     residual: bool = False  # True = additive residual, no sigmoid gating
 
+    # Multi-block stacking (specs/infrastructure/14_multi_block_stacking.md)
+    n_blocks: int = 1  # Number of stacked SWA+CMS blocks (1 = single-block legacy)
+
+    # Stacked tape diagnostics (specs/infrastructure/15_stacked_tape_diagnostics.md)
+    # "off" = no tape overhead (default), "gpu" = GPU-resident per-(block,level) gnorms,
+    # "cpu" = full Wengert tape on CPU (DGD delta, M state readout — slow)
+    tape_device: str = "off"
+
     # Runtime
     gpu: bool = True  # GPU by default; --cpu to override
     load: str | None = None
@@ -179,9 +187,9 @@ class BuildConfig:
             raise ValueError("window_size must be positive")
         if self.k < 1:
             raise ValueError("k must be >= 1")
-        if self.optimizer not in ("sgd", "adamw", "adamw_gpu"):
+        if self.optimizer not in ("sgd", "adamw", "adamw_gpu", "adamw_gpu_stacked"):
             raise ValueError(
-                f"optimizer must be 'sgd', 'adamw', or 'adamw_gpu', got '{self.optimizer}'")
+                f"optimizer must be 'sgd', 'adamw', 'adamw_gpu', or 'adamw_gpu_stacked', got '{self.optimizer}'")
         if self.lr <= 0:
             raise ValueError("lr must be positive")
         if self.max_grad_norm < 0:
@@ -331,6 +339,10 @@ class BuildConfig:
             if not (0.0 <= self.promotion_rewind_pct <= 1.0):
                 raise ValueError(
                     f"promotion_rewind_pct must be in [0.0, 1.0], got {self.promotion_rewind_pct}")
+        # Tape device validation
+        if self.tape_device not in ("off", "gpu", "cpu"):
+            raise ValueError(
+                f"tape_device must be 'off', 'gpu', or 'cpu', got '{self.tape_device}'")
 
     @property
     def head_dim(self) -> int:

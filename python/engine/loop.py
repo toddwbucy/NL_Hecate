@@ -438,9 +438,14 @@ def run_build(bcfg: BuildConfig):
     print(f"  Data:     {data_len:,} tokens" +
           (f" ({bcfg.data_format} BPE)" if use_bpe else ""))
     use_gpu = bcfg.gpu and hasattr(nl_hecate, "GpuModel")
+    is_stacked = getattr(bcfg, "n_blocks", 1) > 1
+    if is_stacked and not hasattr(nl_hecate, "GpuStackedModel"):
+        raise RuntimeError("n_blocks > 1 requires a CUDA-enabled build with GpuStackedModel")
     # Auto-promote adamw → adamw_gpu when on GPU (no reason to round-trip to CPU)
     if use_gpu and bcfg.optimizer == "adamw":
         bcfg.optimizer = "adamw_gpu"
+    if is_stacked and bcfg.optimizer == "adamw_gpu":
+        bcfg.optimizer = "adamw_gpu_stacked"
     if bcfg.optimizer == "adamw_gpu" and not use_gpu:
         raise RuntimeError(
             "optimizer=adamw_gpu requires GPU and a CUDA-enabled build"
@@ -455,7 +460,7 @@ def run_build(bcfg: BuildConfig):
     print(f"  Build:    {bcfg.steps} steps (from step {resume_step}), lr={bcfg.lr}")
     print(f"  Optimizer: {bcfg.optimizer}" +
           (f" (b1={bcfg.beta1}, b2={bcfg.beta2}, wd={bcfg.weight_decay}, warmup={bcfg.warmup_steps})"
-           if bcfg.optimizer in ("adamw", "adamw_gpu") else ""))
+           if bcfg.optimizer in ("adamw", "adamw_gpu", "adamw_gpu_stacked") else ""))
     if bcfg.max_grad_norm > 0:
         print(f"  Grad clip: max_norm={bcfg.max_grad_norm}")
     print(f"  Device:   {'GPU' if use_gpu else 'CPU'}")
@@ -543,9 +548,17 @@ def run_build(bcfg: BuildConfig):
 
     gpu_model = None
     if use_gpu:
-        periodic = (bcfg.memory_reset == "periodic")
-        gpu_model = nl_hecate.GpuModel.from_params(
-            params, cfg, batch_size=bcfg.batch_size, memory_reset=periodic)
+        if is_stacked:
+            n_blocks = bcfg.n_blocks
+            gpu_model = nl_hecate.GpuStackedModel(
+                cfg, n_blocks, seed=bcfg.seed if hasattr(bcfg, "seed") else 42,
+                batch_size=bcfg.batch_size)
+            print(f"  Stacked:  {n_blocks} blocks x k={bcfg.k} CMS levels"
+                  f"  ({gpu_model.total_params():,} params)")
+        else:
+            periodic = (bcfg.memory_reset == "periodic")
+            gpu_model = nl_hecate.GpuModel.from_params(
+                params, cfg, batch_size=bcfg.batch_size, memory_reset=periodic)
 
     error_buffers = nl_hecate.ErrorBufferList(bcfg.k, bcfg.d_model)
 
@@ -555,7 +568,7 @@ def run_build(bcfg: BuildConfig):
         next_doc_idx = int(np.searchsorted(doc_starts, byte_pos, side="right"))
 
     adamw_opt = None
-    use_adamw_gpu = (bcfg.optimizer == "adamw_gpu")
+    use_adamw_gpu = (bcfg.optimizer in ("adamw_gpu", "adamw_gpu_stacked"))
     if bcfg.optimizer == "adamw":
         adamw_opt = nl_hecate.FrequencyAwareAdamW(
             params, beta1=bcfg.beta1, beta2=bcfg.beta2,
@@ -570,6 +583,7 @@ def run_build(bcfg: BuildConfig):
             "seq_len": bcfg.seq_len, "k": bcfg.k, "memory_rule": bcfg.memory_rule,
             "composition": bcfg.composition, "optimizer": bcfg.optimizer,
             "lr": bcfg.lr, "steps": bcfg.steps, "params": params.num_params(),
+            "n_blocks": getattr(bcfg, "n_blocks", 1),
         })
 
     # ── S4-M7 validation state ────────────────────────────────────────
@@ -765,13 +779,21 @@ def run_build(bcfg: BuildConfig):
         need_gnorms = log_this or slow_level_fires
 
         if gpu_model is not None and use_adamw_gpu:
-            loss, g_norm = gpu_model.step_adamw(
-                input_ids, target_ids, pulse, current_lr,
-                beta1=bcfg.beta1, beta2=bcfg.beta2, eps=1e-8,
-                weight_decay=bcfg.weight_decay,
-                max_grad_norm=bcfg.max_grad_norm,
-                collect_level_gnorms=need_gnorms,
-            )
+            if is_stacked:
+                loss, g_norm = gpu_model.step_adamw(
+                    input_ids, target_ids, pulse, current_lr,
+                    beta1=bcfg.beta1, beta2=bcfg.beta2, eps=1e-8,
+                    weight_decay=bcfg.weight_decay,
+                    max_grad_norm=bcfg.max_grad_norm,
+                )
+            else:
+                loss, g_norm = gpu_model.step_adamw(
+                    input_ids, target_ids, pulse, current_lr,
+                    beta1=bcfg.beta1, beta2=bcfg.beta2, eps=1e-8,
+                    weight_decay=bcfg.weight_decay,
+                    max_grad_norm=bcfg.max_grad_norm,
+                    collect_level_gnorms=need_gnorms,
+                )
             # Component 1+2: collect per-level gnorms for monitoring (active steps only)
             if need_gnorms and hasattr(gpu_model, "level_grad_norms"):
                 level_gnorms = gpu_model.level_grad_norms()
@@ -1030,7 +1052,8 @@ def run_build(bcfg: BuildConfig):
             jsonl.log(event="level_heatmap", step=step, levels=heatmap_levels)
 
         if (bcfg.eval_every > 0 and val_loader is not None
-                and step > 0 and step % bcfg.eval_every == 0):
+                and step > 0 and step % bcfg.eval_every == 0
+                and not is_stacked):
             saved_ctx = None
             try:
                 if gpu_model is not None:
@@ -1045,30 +1068,40 @@ def run_build(bcfg: BuildConfig):
             print(f"  [eval] step {step:5d}  loss={eval_loss:.4f}  ppl={eval_ppl:.1f}")
             if gpu_model is not None and hasattr(gpu_model, "gate_biases"):
                 print_level_metrics(gpu_model, bcfg.k)
+            tape_device = getattr(bcfg, "tape_device", "off")
+            tape_enabled = tape_device != "off"
             tape_eff = bcfg.tape_every if bcfg.tape_every > 0 else bcfg.eval_every
             if (tape_eff > 0 and step % tape_eff == 0
                     and gpu_model is not None
-                    and hasattr(gpu_model, "tape_forward_summary")
+                    and tape_enabled
                     and input_ids is not None and target_ids is not None
                     and max(target_ids) < bcfg.vocab_size):
                 # Skip silently when batch contains masked targets (vocab_size sentinel).
                 # The Rust binding rejects target_ids >= vocab_size; masked batches are
                 # normal (all-user-turn chunks) and should not generate warning noise.
                 try:
-                    if hasattr(gpu_model, "gpu_tape_forward_summary"):
+                    if is_stacked and hasattr(gpu_model, "gpu_stacked_tape_summary"):
+                        # Stacked model -- per-(block, level) diagnostics
+                        tape_sum = gpu_model.gpu_stacked_tape_summary(
+                            input_ids, target_ids, pulse
+                        )
+                    elif hasattr(gpu_model, "gpu_tape_forward_summary"):
                         tape_sum = gpu_model.gpu_tape_forward_summary(
                             input_ids, target_ids, pulse
                         )
-                    else:
+                    elif hasattr(gpu_model, "tape_forward_summary"):
                         tape_sum = gpu_model.tape_forward_summary(
                             input_ids, target_ids, pulse
                         )
+                    else:
+                        tape_sum = None
                 except (ValueError, KeyError, TypeError, OSError) as exc:
-                    print(f"  [tape] WARNING: tape_forward_summary failed at step {step}: {exc}")
+                    print(f"  [tape] WARNING: tape summary failed at step {step}: {exc}")
                 else:
-                    print_tape_summary(tape_sum, step)
-                    if jsonl:
-                        jsonl.log(event="tape_summary", step=step, **tape_sum)
+                    if tape_sum is not None:
+                        print_tape_summary(tape_sum, step)
+                        if jsonl:
+                            jsonl.log(event="tape_summary", step=step, **tape_sum)
             if bcfg.k > 1:
                 fires_str = "  ".join(f"L{i}:{level_fire_counts[i]}" for i in range(bcfg.k))
                 print(f"    [fires] {fires_str}")
@@ -1154,7 +1187,7 @@ def run_build(bcfg: BuildConfig):
 
         # ── S4-M7: Phase boundary curriculum probe ────────────────────
         if (step in phase_boundaries and gpu_model is not None
-                and use_bpe and bcfg.data_path):
+                and use_bpe and bcfg.data_path and not is_stacked):
             if not phase_val_data:
                 data_dir = Path(bcfg.data_path)
                 for pname in ("stories", "conversation", "reasoning"):
@@ -1196,134 +1229,160 @@ def run_build(bcfg: BuildConfig):
                         log_entry[f"{pname}_loss"] = pl
                     jsonl.log(**log_entry)
 
+        # ── Stacked tape diagnostics (independent of eval block) ──────
+        if is_stacked and gpu_model is not None:
+            tape_eff_stacked = bcfg.tape_every if bcfg.tape_every > 0 else bcfg.eval_every
+            tape_device_stacked = getattr(bcfg, "tape_device", "off")
+            if (tape_device_stacked != "off" and tape_eff_stacked > 0
+                    and step > 0 and step % tape_eff_stacked == 0
+                    and input_ids is not None and target_ids is not None
+                    and max(target_ids) < bcfg.vocab_size):
+                try:
+                    if hasattr(gpu_model, "gpu_stacked_tape_summary"):
+                        tape_sum = gpu_model.gpu_stacked_tape_summary(
+                            input_ids, target_ids, pulse
+                        )
+                    else:
+                        tape_sum = None
+                except (ValueError, KeyError, TypeError, OSError) as exc:
+                    print(f"  [tape] WARNING: stacked tape summary failed at step {step}: {exc}")
+                else:
+                    if tape_sum is not None:
+                        print_tape_summary(tape_sum, step)
+                        if jsonl:
+                            jsonl.log(event="tape_summary", step=step, **tape_sum)
+
         # Periodic checkpoint
         if bcfg.save_every > 0 and step > 0 and step % bcfg.save_every == 0:
-            if gpu_model is not None:
-                params = gpu_model.to_host_params()
-                context = gpu_model.to_host_context()
-            p = Path(_safetensors_path(bcfg.save_path))
-            ckpt_path = str(p.with_stem(f"{p.stem}_step{step}"))
-            os.makedirs(os.path.dirname(ckpt_path) or ".", exist_ok=True)
-            if use_bpe:
-                nl_hecate.save_checkpoint_with_context(ckpt_path, params, cfg, conductor, context)
+            if is_stacked:
+                print(f"  [checkpoint skipped: stacked model save not yet implemented]")
             else:
-                nl_hecate.save_build_checkpoint(ckpt_path, params, cfg, conductor, context)
-            sidecar = Path(str(ckpt_path) + ".cursor.json")
-            if bpe_loaders:
-                sidecar.write_text(json.dumps(
-                    {"slots": [loader.cursor() for loader in bpe_loaders],
-                     "level_start_cursor": _level_start_cursor}, indent=2))
-            elif active_loader is not None:
-                cursor_data = active_loader.cursor()
-                cursor_data["level_start_cursor"] = _level_start_cursor
-                sidecar.write_text(json.dumps(cursor_data, indent=2))
-            print(f"  [checkpoint saved: {ckpt_path}]")
+                if gpu_model is not None:
+                    params = gpu_model.to_host_params()
+                    context = gpu_model.to_host_context()
+                p = Path(_safetensors_path(bcfg.save_path))
+                ckpt_path = str(p.with_stem(f"{p.stem}_step{step}"))
+                os.makedirs(os.path.dirname(ckpt_path) or ".", exist_ok=True)
+                if use_bpe:
+                    nl_hecate.save_checkpoint_with_context(ckpt_path, params, cfg, conductor, context)
+                else:
+                    nl_hecate.save_build_checkpoint(ckpt_path, params, cfg, conductor, context)
+                sidecar = Path(str(ckpt_path) + ".cursor.json")
+                if bpe_loaders:
+                    sidecar.write_text(json.dumps(
+                        {"slots": [loader.cursor() for loader in bpe_loaders],
+                         "level_start_cursor": _level_start_cursor}, indent=2))
+                elif active_loader is not None:
+                    cursor_data = active_loader.cursor()
+                    cursor_data["level_start_cursor"] = _level_start_cursor
+                    sidecar.write_text(json.dumps(cursor_data, indent=2))
+                print(f"  [checkpoint saved: {ckpt_path}]")
 
-            # Component 3: per-level parameter drift (||M_t||_F vs ||M_0||_F)
-            # Uses memory_norms as proxy for parameter magnitude per level.
-            # ||M_t - M_0|| is approximated by tracking norm evolution over time
-            # since storing full initial M tensors would require d*d*k floats.
-            if jsonl and gpu_model is not None and hasattr(gpu_model, "memory_norms"):
-                cur_norms = list(gpu_model.memory_norms())
-                drift_info = []
-                for i, cur_n in enumerate(cur_norms):
-                    init_n = level_param_norms_init[i] if i < len(level_param_norms_init) else 0.0
-                    drift_info.append({
-                        "level": i,
-                        "norm_init": round(init_n, 6),
-                        "norm_now": round(cur_n, 6),
-                        "norm_ratio": round(cur_n / init_n, 4) if init_n > 1e-8 else None,
-                    })
-                jsonl.log(event="level_param_drift", step=step, levels=drift_info)
+                # Component 3: per-level parameter drift (||M_t||_F vs ||M_0||_F)
+                # Uses memory_norms as proxy for parameter magnitude per level.
+                # ||M_t - M_0|| is approximated by tracking norm evolution over time
+                # since storing full initial M tensors would require d*d*k floats.
+                if jsonl and gpu_model is not None and hasattr(gpu_model, "memory_norms"):
+                    cur_norms = list(gpu_model.memory_norms())
+                    drift_info = []
+                    for i, cur_n in enumerate(cur_norms):
+                        init_n = level_param_norms_init[i] if i < len(level_param_norms_init) else 0.0
+                        drift_info.append({
+                            "level": i,
+                            "norm_init": round(init_n, 6),
+                            "norm_now": round(cur_n, 6),
+                            "norm_ratio": round(cur_n / init_n, 4) if init_n > 1e-8 else None,
+                        })
+                    jsonl.log(event="level_param_drift", step=step, levels=drift_info)
 
-            # S4-M7: Checkpoint roundtrip verification
-            if use_gpu:
-                v_model = None
-                try:
-                    if use_bpe:
-                        v_params, v_cfg = nl_hecate.load_checkpoint(ckpt_path)
-                    else:
-                        v_params, v_cfg, _ = nl_hecate.load_build_checkpoint(ckpt_path)
-                    v_model = nl_hecate.GpuModel.from_params(v_params, v_cfg, batch_size=bcfg.batch_size)
-                    # Save context before verification forward passes
-                    # Slice to single seq_len chunk — forward() expects exactly
-                    # seq_len tokens regardless of batch_size used in step_adamw
-                    rt_input = list(input_ids[:bcfg.seq_len])
-                    rt_target = list(target_ids[:bcfg.seq_len])
-                    rt_ctx = gpu_model.to_host_context()
+                # S4-M7: Checkpoint roundtrip verification
+                if use_gpu:
+                    v_model = None
                     try:
-                        v_model.upload_context(rt_ctx)
-                        train_fwd, _ = gpu_model.forward(rt_input, rt_target, pulse)
-                        verify_fwd, _ = v_model.forward(rt_input, rt_target, pulse)
+                        if use_bpe:
+                            v_params, v_cfg = nl_hecate.load_checkpoint(ckpt_path)
+                        else:
+                            v_params, v_cfg, _ = nl_hecate.load_build_checkpoint(ckpt_path)
+                        v_model = nl_hecate.GpuModel.from_params(v_params, v_cfg, batch_size=bcfg.batch_size)
+                        # Save context before verification forward passes
+                        # Slice to single seq_len chunk -- forward() expects exactly
+                        # seq_len tokens regardless of batch_size used in step_adamw
+                        rt_input = list(input_ids[:bcfg.seq_len])
+                        rt_target = list(target_ids[:bcfg.seq_len])
+                        rt_ctx = gpu_model.to_host_context()
+                        try:
+                            v_model.upload_context(rt_ctx)
+                            train_fwd, _ = gpu_model.forward(rt_input, rt_target, pulse)
+                            verify_fwd, _ = v_model.forward(rt_input, rt_target, pulse)
+                        finally:
+                            # Restore context after verification (forward modifies M)
+                            gpu_model.upload_context(rt_ctx)
+                        delta = abs(verify_fwd - train_fwd)
+                        if jsonl:
+                            jsonl.log(event="checkpoint_roundtrip", step=step,
+                                      delta=delta, loss=train_fwd,
+                                      verify_loss=verify_fwd)
+                        if delta > 1e-6:
+                            print(f"  [WARNING] checkpoint roundtrip "
+                                  f"delta={delta:.2e}")
+                        else:
+                            print(f"  [checkpoint roundtrip OK, "
+                                  f"delta={delta:.2e}]")
+                    except (OSError, RuntimeError, ValueError) as e:
+                        print(f"  [checkpoint roundtrip failed: {e}]")
                     finally:
-                        # Restore context after verification (forward modifies M)
-                        gpu_model.upload_context(rt_ctx)
-                    delta = abs(verify_fwd - train_fwd)
-                    if jsonl:
-                        jsonl.log(event="checkpoint_roundtrip", step=step,
-                                  delta=delta, loss=train_fwd,
-                                  verify_loss=verify_fwd)
-                    if delta > 1e-6:
-                        print(f"  [WARNING] checkpoint roundtrip "
-                              f"delta={delta:.2e}")
-                    else:
-                        print(f"  [checkpoint roundtrip OK, "
-                              f"delta={delta:.2e}]")
-                except (OSError, RuntimeError, ValueError) as e:
-                    print(f"  [checkpoint roundtrip failed: {e}]")
-                finally:
-                    del v_model
+                        del v_model
 
-            # ── Checkpoint learning samples + Probe 3 ─────────────────
-            if tokenizer is not None and gpu_model is not None:
-                ckpt_snapshot = full_snapshot(gpu_model)
-                try:
-                    # Learning samples (generate_learning, not frozen)
-                    # Restore between samples: each 128-step generate_learning
-                    # heavily modifies params toward one prompt's pattern.
-                    from engine.generation import generate_learning
-                    for prompt_text in SAMPLE_PROMPTS:
+                # ── Checkpoint learning samples + Probe 3 ─────────────────
+                if tokenizer is not None and gpu_model is not None:
+                    ckpt_snapshot = full_snapshot(gpu_model)
+                    try:
+                        # Learning samples (generate_learning, not frozen)
+                        # Restore between samples: each 128-step generate_learning
+                        # heavily modifies params toward one prompt's pattern.
+                        from engine.generation import generate_learning
+                        for prompt_text in SAMPLE_PROMPTS:
+                            full_restore(gpu_model, ckpt_snapshot)
+                            gpu_model.reset_optimizer()
+                            gpu_model.reset_context()
+                            prompt_ids = tokenizer.encode(prompt_text)
+                            tokens, losses, _ = generate_learning(
+                                gpu_model, cfg, prompt_ids,
+                                max_tokens=128, temperature=0.7, lr=bcfg.lr)
+                            gen_text = tokenizer.decode(tokens[len(prompt_ids):])
+                            preview = gen_text[:80].replace("\n", " ")
+                            valid = [v for v in losses if not math.isnan(v)]
+                            avg_loss = sum(valid) / len(valid) if valid else float('nan')
+                            n_gen = len(tokens) - len(prompt_ids)
+                            print(f"  [sample] {prompt_text[:40]}... → {preview}...")
+                            print(f"    avg_loss={avg_loss:.4f} over {n_gen} tokens"
+                                  f" ({len(valid)}/{len(losses)} valid)")
+                        if jsonl:
+                            jsonl.log(event="sample", step=step,
+                                      mode="learning", n_prompts=len(SAMPLE_PROMPTS))
+
+                        # Probe 3: accumulated context vs cold start (first prompt)
                         full_restore(gpu_model, ckpt_snapshot)
-                        gpu_model.reset_optimizer()
-                        gpu_model.reset_context()
+                        gpu_model.reset_optimizer()  # prior probes/samples corrupt AdamW moments
+                        prompt_text = EVAL_PROMPTS[0]
                         prompt_ids = tokenizer.encode(prompt_text)
-                        tokens, losses, _ = generate_learning(
-                            gpu_model, cfg, prompt_ids,
-                            max_tokens=128, temperature=0.7, lr=bcfg.lr)
-                        gen_text = tokenizer.decode(tokens[len(prompt_ids):])
-                        preview = gen_text[:80].replace("\n", " ")
-                        valid = [v for v in losses if not math.isnan(v)]
-                        avg_loss = sum(valid) / len(valid) if valid else float('nan')
-                        n_gen = len(tokens) - len(prompt_ids)
-                        print(f"  [sample] {prompt_text[:40]}... → {preview}...")
-                        print(f"    avg_loss={avg_loss:.4f} over {n_gen} tokens"
-                              f" ({len(valid)}/{len(losses)} valid)")
-                    if jsonl:
-                        jsonl.log(event="sample", step=step,
-                                  mode="learning", n_prompts=len(SAMPLE_PROMPTS))
-
-                    # Probe 3: accumulated context vs cold start (first prompt)
-                    full_restore(gpu_model, ckpt_snapshot)
-                    gpu_model.reset_optimizer()  # prior probes/samples corrupt AdamW moments
-                    prompt_text = EVAL_PROMPTS[0]
-                    prompt_ids = tokenizer.encode(prompt_text)
-                    cresult = probe_context_value(
-                        gpu_model, cfg, prompt_ids, ckpt_snapshot,
-                        max_tokens=30, temperature=0.7, lr=bcfg.lr)
-                    print(f"  [probe3] cold={cresult['cold_avg_loss']:.4f} "
-                          f"warm={cresult['warm_avg_loss']:.4f} "
-                          f"benefit={cresult['context_benefit']:.4f}")
-                    if jsonl:
-                        jsonl.log(event="learning_probe",
-                                  probe="context_value", step=step,
-                                  cold_loss=cresult["cold_avg_loss"],
-                                  warm_loss=cresult["warm_avg_loss"],
-                                  context_benefit=cresult["context_benefit"])
-                except Exception as e:
-                    print(f"  [checkpoint samples/probe3 failed: {e}]")
-                finally:
-                    full_restore(gpu_model, ckpt_snapshot)
-                    gpu_model.reset_optimizer()  # probes corrupt AdamW moments
+                        cresult = probe_context_value(
+                            gpu_model, cfg, prompt_ids, ckpt_snapshot,
+                            max_tokens=30, temperature=0.7, lr=bcfg.lr)
+                        print(f"  [probe3] cold={cresult['cold_avg_loss']:.4f} "
+                              f"warm={cresult['warm_avg_loss']:.4f} "
+                              f"benefit={cresult['context_benefit']:.4f}")
+                        if jsonl:
+                            jsonl.log(event="learning_probe",
+                                      probe="context_value", step=step,
+                                      cold_loss=cresult["cold_avg_loss"],
+                                      warm_loss=cresult["warm_avg_loss"],
+                                      context_benefit=cresult["context_benefit"])
+                    except Exception as e:
+                        print(f"  [checkpoint samples/probe3 failed: {e}]")
+                    finally:
+                        full_restore(gpu_model, ckpt_snapshot)
+                        gpu_model.reset_optimizer()  # probes corrupt AdamW moments
 
         # ── Auto-promotion: L0 saturated → push up to k+1 ──────────
         if (bcfg.auto_promote and _sat_announced[0]

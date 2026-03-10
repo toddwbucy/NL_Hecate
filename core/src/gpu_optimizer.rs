@@ -172,7 +172,7 @@ impl GpuAdamWState {
 /// Helper: call the fused AdamW kernel for one (w, g, m, v) pair.
 #[cfg(feature = "cuda")]
 #[inline]
-fn adamw_one(
+pub(crate) fn adamw_one(
     w: &mut GpuBuf<f32>, g: &GpuBuf<f32>,
     m: &mut GpuBuf<f32>, v: &mut GpuBuf<f32>,
     lr: f32, beta1: f32, beta2: f32, eps: f32,

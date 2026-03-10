@@ -111,7 +111,7 @@ impl GpuLevelGrads {
     /// Allocate zero-initialized gradient buffers for one CMS level.
     /// For SwiGLU levels, pass inter = cfg.intermediate_size.
     /// For matrix rules (Delta/Titans/Hebbian/DGD), pass inter = 0.
-    fn zeros_mlp(d: usize, inter: usize) -> Self {
+    pub(crate) fn zeros_mlp(d: usize, inter: usize) -> Self {
         GpuLevelGrads {
             d_w_k_mem: GpuBuf::zeros(d * d),
             d_w_v_mem: GpuBuf::zeros(d * d),
@@ -454,7 +454,7 @@ pub fn gpu_cms_backward(
 /// Returns d_embedded contribution from memory projections.
 /// `batch_size` is the number of sequences processed in parallel this step.
 #[cfg(feature = "cuda")]
-fn gpu_memory_backward(
+pub(crate) fn gpu_memory_backward(
     level_params: &GpuMemoryLevelParams,
     cfg: &MAGConfig,
     mem_cache: &GpuMemoryCache,
@@ -1321,7 +1321,7 @@ fn accumulate_projection_grads(
 
 /// Frozen level read-only backward (simplified).
 #[cfg(feature = "cuda")]
-fn gpu_memory_read_only_backward(
+pub(crate) fn gpu_memory_read_only_backward(
     level_params: &GpuMemoryLevelParams,
     _y_level: &GpuBuf<f32>,
     _d_y: &GpuBuf<f32>,
@@ -1407,7 +1407,7 @@ pub fn gpu_sync_embed_weights(params: &mut GpuMAGParams, d: usize, vocab: usize)
 ///
 /// Row-major trick: sgemm(N, T, n, m, k, alpha, B, n, A, m, beta, C, n)
 #[cfg(feature = "cuda")]
-fn gpu_matmul_transa_dd(
+pub(crate) fn gpu_matmul_transa_dd(
     a: &GpuBuf<f32>,   // [k, m] stored row-major
     b: &GpuBuf<f32>,   // [k, n] stored row-major
     c: &mut GpuBuf<f32>, // [m, n] output
