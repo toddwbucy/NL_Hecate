@@ -1012,6 +1012,18 @@ pub fn dgd_backward_dispatch(
 /// which is the standard practice for gradient clipping (same as CS-39/CS-44).
 /// No-op when m_norm_max is 0.0 or f32::MAX (disabled).
 #[inline]
+/// Clip error vector in-place: if ‖error‖₂ > clip, rescale to clip.
+/// Matches CUDA error_clip_inplace. No-op when clip <= 0.
+fn clip_error_l2(error: &mut [f32], clip: f32) {
+    if clip <= 0.0 { return; }
+    let norm_sq: f32 = error.iter().map(|x| x * x).sum();
+    let norm = norm_sq.sqrt();
+    if norm > clip {
+        let scale = clip / norm;
+        for x in error.iter_mut() { *x *= scale; }
+    }
+}
+
 fn clamp_m_norm(slice: &mut [f32], m_norm_max: f32) {
     if m_norm_max > 0.0 && m_norm_max < f32::MAX {
         let norm = slice.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -1027,7 +1039,7 @@ fn rust_delta_forward(
     k_mem: &[f32], v_mem: &[f32], q_mem: &[f32],
     alpha: &[f32], theta: &[f32], m_initial: &[f32],
     m_states: &mut [f32], y: &mut [f32],
-    seq_len: usize, d: usize, m_norm_max: f32, _error_clip: f32,
+    seq_len: usize, d: usize, m_norm_max: f32, error_clip: f32,
 ) {
     let dd = d * d;
     m_states[..dd].copy_from_slice(m_initial);
@@ -1048,13 +1060,17 @@ fn rust_delta_forward(
             prediction[i] = sum;
         }
 
-        // error = prediction - v; M update
+        // error = prediction - v
+        let mut error = vec![0.0f32; d];
+        for i in 0..d { error[i] = prediction[i] - v_t[i]; }
+        clip_error_l2(&mut error, error_clip);
+
+        // M update
         let retention = 1.0 - alpha_t;
         for i in 0..d {
-            let err_i = prediction[i] - v_t[i];
             for j in 0..d {
                 m_states[m_next + i * d + j] =
-                    retention * m_states[m_t + i * d + j] - theta_t * err_i * k_t[j];
+                    retention * m_states[m_t + i * d + j] - theta_t * error[i] * k_t[j];
             }
         }
 
@@ -1075,7 +1091,7 @@ fn rust_delta_backward(
     alpha: &[f32], theta: &[f32], m_states: &[f32], d_y: &[f32],
     d_k_mem: &mut [f32], d_v_mem: &mut [f32], d_q_mem: &mut [f32],
     d_alpha: &mut [f32], d_theta: &mut [f32], d_m_initial: &mut [f32],
-    seq_len: usize, d: usize, _error_clip: f32,
+    seq_len: usize, d: usize, error_clip: f32,
 ) {
     let dd = d * d;
     let mut d_m = vec![0.0f32; dd];
@@ -1102,7 +1118,7 @@ fn rust_delta_backward(
             d_q_mem[t * d + j] = sum;
         }
 
-        // Recompute prediction and error
+        // Recompute prediction and error (with same clip as forward)
         let mut prediction = vec![0.0f32; d];
         for i in 0..d {
             let mut sum = 0.0f32;
@@ -1111,6 +1127,7 @@ fn rust_delta_backward(
         }
         let mut error = vec![0.0f32; d];
         for i in 0..d { error[i] = prediction[i] - v_t[i]; }
+        clip_error_l2(&mut error, error_clip);
 
         // d_alpha, d_theta (reductions)
         let mut d_alpha_sum = 0.0f32;
@@ -1168,7 +1185,7 @@ fn rust_titans_forward(
     alpha: &[f32], theta: &[f32], eta: &[f32],
     m_initial: &[f32], s_initial: &[f32],
     m_states: &mut [f32], s_states: &mut [f32], y: &mut [f32],
-    seq_len: usize, d: usize, m_norm_max: f32, _error_clip: f32,
+    seq_len: usize, d: usize, m_norm_max: f32, error_clip: f32,
 ) {
     let dd = d * d;
     m_states[..dd].copy_from_slice(m_initial);
@@ -1194,12 +1211,15 @@ fn rust_titans_forward(
             prediction[i] = sum;
         }
 
+        let mut error = vec![0.0f32; d];
+        for i in 0..d { error[i] = prediction[i] - v_t[i]; }
+        clip_error_l2(&mut error, error_clip);
+
         // S_{t+1} = eta_t * S_t - theta_t * outer(error, k)
         for i in 0..d {
-            let err_i = prediction[i] - v_t[i];
             for j in 0..d {
                 s_states[s_next + i * d + j] =
-                    eta_t * s_states[s_t + i * d + j] - theta_t * err_i * k_t[j];
+                    eta_t * s_states[s_t + i * d + j] - theta_t * error[i] * k_t[j];
             }
         }
 
@@ -1229,7 +1249,7 @@ fn rust_titans_backward(
     d_k_mem: &mut [f32], d_v_mem: &mut [f32], d_q_mem: &mut [f32],
     d_alpha: &mut [f32], d_theta: &mut [f32], d_eta: &mut [f32],
     d_m_initial: &mut [f32], d_s_initial: &mut [f32],
-    seq_len: usize, d: usize, _error_clip: f32,
+    seq_len: usize, d: usize, error_clip: f32,
 ) {
     let dd = d * d;
     let mut d_m = vec![0.0f32; dd];
@@ -1275,7 +1295,7 @@ fn rust_titans_backward(
         for i in 0..dd { d_eta_sum += s_states[s_t_off + i] * d_s[i]; }
         d_eta[t] = d_eta_sum;
 
-        // Recompute prediction/error
+        // Recompute prediction/error (with same clip as forward)
         let mut prediction = vec![0.0f32; d];
         for i in 0..d {
             let mut sum = 0.0f32;
@@ -1284,6 +1304,7 @@ fn rust_titans_backward(
         }
         let mut error = vec![0.0f32; d];
         for i in 0..d { error[i] = prediction[i] - v_t[i]; }
+        clip_error_l2(&mut error, error_clip);
 
         let mut d_theta_sum = 0.0f32;
         for i in 0..d {

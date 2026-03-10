@@ -205,12 +205,16 @@ def run_build(bcfg: BuildConfig):
             else:
                 # Push-up: use canonical template (levels shift frequencies)
                 new_chunks = chunk_template[:target_k]
-            # Extend m_norm_max to target_k if needed
-            ext_m_norm = bcfg.m_norm_max
+            # Extend m_norm_max to target_k if needed (prefer checkpoint values over config)
+            ext_m_norm = bcfg.m_norm_max if bcfg.m_norm_max is not None else (
+                list(cfg.m_norm_max) if hasattr(cfg, 'm_norm_max') and cfg.m_norm_max else None
+            )
             if ext_m_norm is not None and len(ext_m_norm) < target_k:
                 ext_m_norm = list(ext_m_norm) + [ext_m_norm[-1]] * (target_k - len(ext_m_norm))
-            # Extend error_clip to target_k if needed
-            ext_error_clip = bcfg.error_clip
+            # Extend error_clip to target_k if needed (prefer checkpoint values over config)
+            ext_error_clip = bcfg.error_clip if bcfg.error_clip is not None else (
+                list(cfg.error_clip) if hasattr(cfg, 'error_clip') and cfg.error_clip else None
+            )
             if ext_error_clip is not None and len(ext_error_clip) < target_k:
                 ext_error_clip = list(ext_error_clip) + [ext_error_clip[-1]] * (target_k - len(ext_error_clip))
             # Rebuild MAGConfig with the new k (carry all other fields from loaded cfg)
@@ -1363,12 +1367,15 @@ def run_build(bcfg: BuildConfig):
             # Build new MAGConfig(k+1)
             chunk_template = [1, 8, 64, 512]
             new_chunks = chunk_template[:new_k]
-            new_m_norm = None
-            if bcfg.m_norm_max is not None:
-                new_m_norm = list(bcfg.m_norm_max) + [bcfg.m_norm_max[-1]]
-            new_error_clip = None
-            if bcfg.error_clip is not None:
-                new_error_clip = [*bcfg.error_clip, bcfg.error_clip[-1]]
+            # Prefer bcfg values, fall back to live cfg (checkpoint may have set them)
+            src_m_norm = bcfg.m_norm_max if bcfg.m_norm_max is not None else (
+                list(cfg.m_norm_max) if hasattr(cfg, 'm_norm_max') and cfg.m_norm_max else None
+            )
+            new_m_norm = [*src_m_norm, src_m_norm[-1]] if src_m_norm else None
+            src_error_clip = bcfg.error_clip if bcfg.error_clip is not None else (
+                list(cfg.error_clip) if hasattr(cfg, 'error_clip') and cfg.error_clip else None
+            )
+            new_error_clip = [*src_error_clip, src_error_clip[-1]] if src_error_clip else None
             new_cfg = nl_hecate.MAGConfig(
                 d_model=cfg.d_model, num_heads=cfg.num_heads,
                 head_dim=cfg.head_dim, seq_len=cfg.seq_len,
