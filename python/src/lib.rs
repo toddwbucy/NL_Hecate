@@ -33,6 +33,11 @@ use nl_hecate_core::model::{
     load_checkpoint as rust_load_checkpoint,
     BuildResumeState as RustBuildResumeState,
 };
+use nl_hecate_core::checkpoint::{
+    save_stacked_safetensors as rust_save_stacked,
+    load_stacked_safetensors as rust_load_stacked,
+    is_stacked_checkpoint as rust_is_stacked_checkpoint,
+};
 
 // ── SWAConfig ────────────────────────────────────────────────────────
 
@@ -1661,6 +1666,136 @@ fn load_build_checkpoint(py: Python<'_>, path: &str) -> PyResult<(MAGParams, MAG
     Ok((MAGParams { inner: params }, MAGConfig { inner: config }, bs_obj))
 }
 
+// ── Stacked checkpoint + extend_k ─────────────────────────────────────
+// Spec: specs/infrastructure/22_stacked_extend_k_per_block.md
+
+/// Check if a safetensors file is a stacked checkpoint.
+#[pyfunction]
+fn is_stacked_checkpoint(path: &str) -> PyResult<bool> {
+    rust_is_stacked_checkpoint(std::path::Path::new(path))
+        .map_err(|e| PyValueError::new_err(format!("is_stacked_checkpoint failed: {e}")))
+}
+
+/// Save stacked model checkpoint (n_blocks > 1).
+/// Uses hierarchical keys: shared.embed.weight, block.{n}.level.{m}.*, etc.
+#[cfg(feature = "cuda")]
+#[pyfunction]
+#[pyo3(signature = (path, gpu_model, conductor=None, context=None))]
+fn save_stacked_checkpoint(
+    path: &str,
+    gpu_model: &GpuStackedModel,
+    conductor: Option<&mut Conductor>,
+    context: Option<&ContextState>,
+) -> PyResult<()> {
+    let d = gpu_model.cfg.swa.d_model;
+    let v = gpu_model.cfg.swa.vocab_size;
+    let k = gpu_model.cfg.k;
+    let host_params = gpu_model.params.to_host(d, v, k);
+
+    let build_state = match (conductor, context) {
+        (Some(cond), Some(ctx)) => {
+            let ckpt = if cond.inner.has_stream() {
+                cond.inner.checkpoint()
+            } else {
+                RustCheckpoint {
+                    conductor: RustConductorState {
+                        k: cond.inner.k,
+                        chunk_sizes: cond.inner.chunk_sizes.clone(),
+                        step: cond.inner.step(),
+                    },
+                    stream: StreamCursor {
+                        position: 0, chunk_id: 0, pulse_id: 0, rng_state: None, content_hash: 0,
+                    },
+                }
+            };
+            Some(RustBuildResumeState {
+                conductor: ckpt.conductor,
+                stream_cursor: ckpt.stream,
+                context: ctx.inner.clone(),
+                global_step: cond.inner.step(),
+            })
+        }
+        (None, None) => None,
+        _ => {
+            return Err(PyValueError::new_err(
+                "save_stacked_checkpoint requires both conductor and context, or neither",
+            ));
+        }
+    };
+
+    rust_save_stacked(
+        std::path::Path::new(path), &host_params, &gpu_model.cfg, build_state.as_ref(),
+    ).map_err(|e| PyValueError::new_err(format!("save_stacked_checkpoint failed: {e}")))
+}
+
+/// Load stacked model checkpoint.
+/// Returns dict with: "config" (MAGConfig), "n_blocks", "params_json", "build_state" (dict|None).
+/// The params_json is used to construct GpuStackedModel via from_params_json.
+#[pyfunction]
+fn load_stacked_checkpoint(py: Python<'_>, path: &str) -> PyResult<PyObject> {
+    let (params, config, n_blocks, build_state) = rust_load_stacked(std::path::Path::new(path))
+        .map_err(|e| PyValueError::new_err(format!("load_stacked_checkpoint failed: {e}")))?;
+
+    let dict = PyDict::new(py);
+    dict.set_item("n_blocks", n_blocks)?;
+
+    // Return MAGConfig as a proper PyO3 object
+    let py_cfg = MAGConfig { inner: config };
+    dict.set_item("config", Py::new(py, py_cfg)?)?;
+
+    // Serialize host params as JSON for GpuStackedModel.from_params_json
+    let params_json = serde_json::to_string(&params)
+        .map_err(|e| PyValueError::new_err(format!("params serialization failed: {e}")))?;
+    dict.set_item("params_json", params_json)?;
+
+    match build_state {
+        Some(bs) => {
+            let bs_dict = PyDict::new(py);
+            bs_dict.set_item("global_step", bs.global_step)?;
+            bs_dict.set_item("conductor_step", bs.conductor.step)?;
+            bs_dict.set_item("conductor_k", bs.conductor.k)?;
+            bs_dict.set_item("conductor_chunk_sizes", bs.conductor.chunk_sizes)?;
+            bs_dict.set_item("stream_position", bs.stream_cursor.position)?;
+            bs_dict.set_item("stream_chunk_id", bs.stream_cursor.chunk_id)?;
+            bs_dict.set_item("stream_pulse_id", bs.stream_cursor.pulse_id)?;
+            bs_dict.set_item("stream_content_hash", bs.stream_cursor.content_hash)?;
+            bs_dict.set_item("stream_rng_state", bs.stream_cursor.rng_state)?;
+            bs_dict.set_item("context_d", bs.context.d)?;
+            bs_dict.set_item("context_memory", bs.context.memory)?;
+            dict.set_item("build_state", bs_dict)?;
+        }
+        None => {
+            dict.set_item("build_state", py.None())?;
+        }
+    }
+
+    Ok(dict.into_any().unbind())
+}
+
+/// Push-up level stacking for stacked multi-block models.
+/// Each block independently shifts level[i] → level[i+1], fresh L0 per block.
+#[pyfunction]
+fn extend_stacked_push_up(
+    py: Python<'_>,
+    path: &str,
+    new_cfg: &MAGConfig,
+    seed: u64,
+) -> PyResult<PyObject> {
+    let (params, _config, n_blocks, _build_state) = rust_load_stacked(std::path::Path::new(path))
+        .map_err(|e| PyValueError::new_err(format!("extend_stacked_push_up: load failed: {e}")))?;
+
+    let extended = params.extend_push_up(&new_cfg.inner, seed);
+
+    // Serialize the extended params for GpuStackedModel construction
+    let params_json = serde_json::to_string(&extended)
+        .map_err(|e| PyValueError::new_err(format!("params serialization failed: {e}")))?;
+
+    let dict = PyDict::new(py);
+    dict.set_item("params_json", params_json)?;
+    dict.set_item("n_blocks", n_blocks)?;
+    Ok(dict.into_any().unbind())
+}
+
 // ── GPU-Resident Model ───────────────────────────────────────────────
 
 /// GPU-resident model: all parameters live on GPU.
@@ -2468,6 +2603,50 @@ impl GpuStackedModel {
         })
     }
 
+    /// Create from serialized StackedMAGParams JSON (loaded from checkpoint).
+    /// Used by load_stacked_checkpoint + extend_stacked_push_up.
+    #[staticmethod]
+    #[pyo3(signature = (params_json, cfg, n_blocks, batch_size=1, memory_reset=false))]
+    fn from_params_json(
+        params_json: &str, cfg: &MAGConfig, n_blocks: usize,
+        batch_size: usize, memory_reset: bool,
+    ) -> PyResult<Self> {
+        if batch_size == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err("batch_size must be >= 1"));
+        }
+        if n_blocks == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err("n_blocks must be >= 1"));
+        }
+        let host_params: nl_hecate_core::stacked_model::StackedMAGParams =
+            serde_json::from_str(params_json)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(
+                    format!("from_params_json: failed to deserialize: {e}")))?;
+        if host_params.blocks.len() != n_blocks {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("from_params_json: params JSON has {} blocks but n_blocks={}",
+                        host_params.blocks.len(), n_blocks)));
+        }
+        for (i, block) in host_params.blocks.iter().enumerate() {
+            if block.levels.len() != cfg.inner.k {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("from_params_json: block {} has k={} but cfg.k={}",
+                            i, block.levels.len(), cfg.inner.k)));
+            }
+        }
+        let gpu_params = nl_hecate_core::gpu_params::GpuStackedParams::from_host(&host_params);
+        let gpu_context = nl_hecate_core::gpu_params::GpuStackedContext::new(
+            n_blocks, cfg.inner.k, cfg.inner.swa.d_model, batch_size,
+        );
+        Ok(GpuStackedModel {
+            params: gpu_params,
+            context: gpu_context,
+            cfg: cfg.inner.clone(),
+            adamw_state: None,
+            n_blocks,
+            memory_reset,
+        })
+    }
+
     /// Full GPU build step with AdamW optimizer. Returns (loss, grad_norm).
     #[pyo3(signature = (input_ids, target_ids, pulse, lr, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.1, max_grad_norm=1.0))]
     fn step_adamw(&mut self, input_ids: Vec<usize>, target_ids: Vec<usize>,
@@ -2804,6 +2983,12 @@ fn nl_hecate(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(save_checkpoint_with_context, m)?)?;
     m.add_function(wrap_pyfunction!(load_checkpoint, m)?)?;
     m.add_function(wrap_pyfunction!(load_build_checkpoint, m)?)?;
+    // Stacked checkpoint + extend_k
+    m.add_function(wrap_pyfunction!(is_stacked_checkpoint, m)?)?;
+    #[cfg(feature = "cuda")]
+    m.add_function(wrap_pyfunction!(save_stacked_checkpoint, m)?)?;
+    m.add_function(wrap_pyfunction!(load_stacked_checkpoint, m)?)?;
+    m.add_function(wrap_pyfunction!(extend_stacked_push_up, m)?)?;
     // CPU frequency-aware AdamW optimizer
     m.add_class::<FrequencyAwareAdamW>()?;
     // GPU-resident model

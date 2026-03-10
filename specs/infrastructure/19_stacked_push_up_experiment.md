@@ -76,14 +76,18 @@ Stacked push-up gives both:
 
 | Prereq | Status | Why needed |
 |--------|--------|-----------|
-| BUG-01 (W_O projection) | task_2a31af, in_progress | Stacked model NaNs without W_O |
-| BUG-02 (MAG sigmoid gating) | task_a83090, open | Unbounded memory → residual divergence |
-| BUG-03 (alpha_mem aggregation) | task_604923, open | Needed at k≥2 only; can defer to phase 2 |
-| Push-up checkpoint extension | PR #176, merged | Level remapping logic |
+| BUG-01 (W_O projection) | PR #188, merged | Stacked model NaNs without W_O |
+| BUG-02 (MAG sigmoid gating) | PR #189, merged | Unbounded memory → residual divergence |
+| BUG-03 (alpha_mem aggregation) | PR #190, merged | Learnable level weighting at k≥2 |
+| Push-up checkpoint extension | PR #176, merged | Single-block level remapping logic |
+| Per-block extend_k remapping | task_3ea8c3, open | Stacked push-up requires per-block level shift (hard blocker for phases 2-4) |
 
-BUG-01 and BUG-02 are hard blockers for phase 1. BUG-03 is soft — at k=1 there
-is only one level per block, so alpha_mem aggregation is a no-op. BUG-03 must
-be resolved before phase 2 (k=2).
+BUG-01, BUG-02, and BUG-03 are all resolved. The remaining hard blocker is
+per-block extend_k remapping: the current push-up logic (`extend_params_push_up`
+in `model.rs`) operates on flat `level.{i}` keys and is explicitly blocked for
+`n_blocks > 1` in `loop.py:470-483`. Phases 2-4 require `block.{n}.level.{m}`
+hierarchical remapping where each block independently shifts its levels up and
+gets a fresh L0 with independent Xavier init.
 
 ## Experiment Protocol
 

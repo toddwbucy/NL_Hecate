@@ -249,6 +249,95 @@ impl StackedMAGParams {
             blocks: vec![block],
         }
     }
+
+    /// Push-up level extension for stacked models: per-block level shift.
+    ///
+    /// Each block independently shifts level[i] → level[i+1] and gets a fresh L0
+    /// with distinct Xavier init (different seed per block). Shared params
+    /// (embed, unembed, ln_final) are preserved exactly.
+    ///
+    /// Mirrors `MAGParams::extend_push_up` (model.rs) but operates per-block.
+    /// Spec: specs/infrastructure/22_stacked_extend_k_per_block.md
+    pub fn extend_push_up(&self, new_cfg: &MAGConfig, seed: u64) -> StackedMAGParams {
+        let n_blocks = self.blocks.len();
+        assert!(n_blocks > 0, "extend_push_up: stacked model must have at least 1 block");
+
+        // Validate structural compatibility with new_cfg
+        let old_d = self.w_embed.len() / new_cfg.swa.vocab_size;
+        assert_eq!(
+            old_d, new_cfg.swa.d_model,
+            "extend_push_up: d_model mismatch (checkpoint has {old_d}, new_cfg has {})",
+            new_cfg.swa.d_model,
+        );
+        assert_eq!(
+            self.w_embed.len(), new_cfg.swa.vocab_size * new_cfg.swa.d_model,
+            "extend_push_up: vocab_size mismatch",
+        );
+
+        let old_k = self.blocks[0].levels.len();
+        assert_eq!(
+            new_cfg.k, old_k + 1,
+            "extend_push_up requires new_cfg.k ({}) == old_k + 1 ({})",
+            new_cfg.k, old_k + 1,
+        );
+        // Validate all blocks have the same k
+        for (b, block) in self.blocks.iter().enumerate() {
+            assert_eq!(
+                block.levels.len(), old_k,
+                "extend_push_up: block {} has {} levels, expected {}",
+                b, block.levels.len(), old_k,
+            );
+        }
+
+        // Per-block level shift with distinct seeds
+        let new_blocks: Vec<BlockParams> = self.blocks.iter().enumerate().map(|(b, old_block)| {
+            let block_seed = seed.wrapping_add(b as u64 * 10_000);
+            let mut new_block = BlockParams::init(new_cfg, block_seed);
+
+            // Preserve SWA projections and LayerNorms for this block
+            new_block.w_q = old_block.w_q.clone();
+            new_block.w_k = old_block.w_k.clone();
+            new_block.w_v = old_block.w_v.clone();
+            new_block.w_o = old_block.w_o.clone();
+            new_block.ln_attn_gamma = old_block.ln_attn_gamma.clone();
+            new_block.ln_attn_beta = old_block.ln_attn_beta.clone();
+            new_block.ln_mem_gamma = old_block.ln_mem_gamma.clone();
+            new_block.ln_mem_beta = old_block.ln_mem_beta.clone();
+
+            // Shift levels: old level[i] → new level[i+1]
+            for i in 0..old_k {
+                new_block.levels[i + 1] = old_block.levels[i].clone();
+            }
+
+            // Clone old L0 projections into fresh L0 for scale-matched init.
+            // Gate biases kept at level-0 defaults from BlockParams::init.
+            let donor = &old_block.levels[0];
+            new_block.levels[0].w_k_mem = donor.w_k_mem.clone();
+            new_block.levels[0].w_v_mem = donor.w_v_mem.clone();
+            new_block.levels[0].w_q_mem = donor.w_q_mem.clone();
+            new_block.levels[0].w_alpha = donor.w_alpha.clone();
+            new_block.levels[0].w_theta = donor.w_theta.clone();
+            new_block.levels[0].w_eta = donor.w_eta.clone();
+            new_block.levels[0].w_omega = donor.w_omega.clone();
+
+            // Shift alpha logits per block
+            for i in 0..old_k {
+                new_block.alpha_mem[i + 1] = old_block.alpha_mem[i];
+                new_block.alpha_refl[i + 1] = old_block.alpha_refl[i];
+            }
+            // new alpha[0] = 0.0 from init (uniform initial weight for new L0)
+
+            new_block
+        }).collect();
+
+        StackedMAGParams {
+            w_embed: self.w_embed.clone(),
+            w_unembed: self.w_unembed.clone(),
+            ln_final_gamma: self.ln_final_gamma.clone(),
+            ln_final_beta: self.ln_final_beta.clone(),
+            blocks: new_blocks,
+        }
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -362,5 +451,164 @@ mod tests {
         assert_eq!(stacked.w_unembed, single.swa.w_unembed);
         assert_eq!(stacked.blocks[0].w_q, single.swa.w_q);
         assert_eq!(stacked.blocks[0].levels.len(), single.levels.len());
+    }
+
+    fn tiny_config_k1() -> MAGConfig {
+        let mut cfg = tiny_config();
+        cfg.k = 1;
+        cfg.chunk_sizes = vec![1];
+        cfg
+    }
+
+    fn tiny_config_k2() -> MAGConfig {
+        let mut cfg = tiny_config();
+        cfg.k = 2;
+        cfg.chunk_sizes = vec![1, 8];
+        cfg
+    }
+
+    #[test]
+    fn test_extend_push_up_basic() {
+        let cfg_k1 = tiny_config_k1();
+        let cfg_k2 = tiny_config_k2();
+        let n_blocks = 3;
+        let old = StackedMAGParams::init(&cfg_k1, n_blocks, 42);
+        let extended = old.extend_push_up(&cfg_k2, 99);
+
+        // Structure
+        assert_eq!(extended.n_blocks(), n_blocks);
+        for block in &extended.blocks {
+            assert_eq!(block.levels.len(), 2);
+            assert_eq!(block.alpha_mem.len(), 2);
+            assert_eq!(block.alpha_refl.len(), 2);
+        }
+    }
+
+    #[test]
+    fn test_extend_push_up_shared_preserved() {
+        let cfg_k1 = tiny_config_k1();
+        let cfg_k2 = tiny_config_k2();
+        let old = StackedMAGParams::init(&cfg_k1, 4, 42);
+        let extended = old.extend_push_up(&cfg_k2, 99);
+
+        // Shared params preserved exactly
+        assert_eq!(extended.w_embed, old.w_embed);
+        assert_eq!(extended.w_unembed, old.w_unembed);
+        assert_eq!(extended.ln_final_gamma, old.ln_final_gamma);
+        assert_eq!(extended.ln_final_beta, old.ln_final_beta);
+    }
+
+    #[test]
+    fn test_extend_push_up_swa_preserved() {
+        let cfg_k1 = tiny_config_k1();
+        let cfg_k2 = tiny_config_k2();
+        let old = StackedMAGParams::init(&cfg_k1, 4, 42);
+        let extended = old.extend_push_up(&cfg_k2, 99);
+
+        // Per-block SWA preserved
+        for b in 0..4 {
+            assert_eq!(extended.blocks[b].w_q, old.blocks[b].w_q);
+            assert_eq!(extended.blocks[b].w_k, old.blocks[b].w_k);
+            assert_eq!(extended.blocks[b].w_v, old.blocks[b].w_v);
+            assert_eq!(extended.blocks[b].w_o, old.blocks[b].w_o);
+            assert_eq!(extended.blocks[b].ln_attn_gamma, old.blocks[b].ln_attn_gamma);
+            assert_eq!(extended.blocks[b].ln_mem_gamma, old.blocks[b].ln_mem_gamma);
+        }
+    }
+
+    #[test]
+    fn test_extend_push_up_levels_shifted() {
+        let cfg_k1 = tiny_config_k1();
+        let cfg_k2 = tiny_config_k2();
+        let old = StackedMAGParams::init(&cfg_k1, 3, 42);
+        let extended = old.extend_push_up(&cfg_k2, 99);
+
+        // Old level 0 → new level 1 (shifted up)
+        for b in 0..3 {
+            assert_eq!(
+                extended.blocks[b].levels[1].w_k_mem.master(),
+                old.blocks[b].levels[0].w_k_mem.master(),
+                "block {b}: old L0.w_k_mem should be at new L1"
+            );
+            assert_eq!(
+                extended.blocks[b].levels[1].w_v_mem.master(),
+                old.blocks[b].levels[0].w_v_mem.master(),
+            );
+        }
+    }
+
+    #[test]
+    fn test_extend_push_up_fresh_l0_scale_matched() {
+        let cfg_k1 = tiny_config_k1();
+        let cfg_k2 = tiny_config_k2();
+        let old = StackedMAGParams::init(&cfg_k1, 3, 42);
+        let extended = old.extend_push_up(&cfg_k2, 99);
+
+        // Fresh L0 has old L0's projection weights (scale-matched)
+        for b in 0..3 {
+            assert_eq!(
+                extended.blocks[b].levels[0].w_k_mem.master(),
+                old.blocks[b].levels[0].w_k_mem.master(),
+                "block {b}: fresh L0 should clone old L0 projections"
+            );
+        }
+    }
+
+    #[test]
+    fn test_extend_push_up_fresh_l0_gate_biases_default() {
+        let cfg_k1 = tiny_config_k1();
+        let cfg_k2 = tiny_config_k2();
+        let old = StackedMAGParams::init(&cfg_k1, 2, 42);
+        let extended = old.extend_push_up(&cfg_k2, 99);
+
+        // Fresh L0 gate biases should be level-0 defaults, not cloned from old L0
+        for b in 0..2 {
+            // Level-0 default b_alpha is default_b_alpha(0)
+            let expected_b_alpha = vec![default_b_alpha(0)];
+            assert_eq!(
+                extended.blocks[b].levels[0].b_alpha, expected_b_alpha,
+                "block {b}: fresh L0 b_alpha should be level-0 default"
+            );
+        }
+    }
+
+    #[test]
+    fn test_extend_push_up_alpha_shifted() {
+        let cfg_k1 = tiny_config_k1();
+        let cfg_k2 = tiny_config_k2();
+        let mut old = StackedMAGParams::init(&cfg_k1, 2, 42);
+        // Set non-zero alpha to verify shift
+        old.blocks[0].alpha_mem[0] = 1.5;
+        old.blocks[1].alpha_mem[0] = -0.7;
+        let extended = old.extend_push_up(&cfg_k2, 99);
+
+        // Alpha[0] should be 0.0 (fresh), alpha[1] should be old alpha[0]
+        assert_eq!(extended.blocks[0].alpha_mem[0], 0.0);
+        assert_eq!(extended.blocks[0].alpha_mem[1], 1.5);
+        assert_eq!(extended.blocks[1].alpha_mem[0], 0.0);
+        assert_eq!(extended.blocks[1].alpha_mem[1], -0.7);
+    }
+
+    #[test]
+    fn test_extend_push_up_per_block_l0_donor_diversified() {
+        let cfg_k1 = tiny_config_k1();
+        let cfg_k2 = tiny_config_k2();
+        let old = StackedMAGParams::init(&cfg_k1, 3, 42);
+        let extended = old.extend_push_up(&cfg_k2, 99);
+
+        // Fresh L0 projections are donor-cloned from each block's old L0.
+        // Since old blocks were initialized with distinct seeds, each block's
+        // donor is different — so the extended L0 projections differ per block.
+        assert_ne!(
+            extended.blocks[0].levels[0].w_k_mem,
+            extended.blocks[1].levels[0].w_k_mem,
+            "block 0 and 1 fresh L0 w_k_mem should differ (per-block donor diversification)"
+        );
+        // Gate biases are fixed defaults (not seed-dependent), so they match.
+        assert_eq!(
+            extended.blocks[0].levels[0].b_theta,
+            extended.blocks[1].levels[0].b_theta,
+            "gate biases are level-0 defaults, identical across blocks"
+        );
     }
 }

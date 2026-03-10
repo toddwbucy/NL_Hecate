@@ -136,9 +136,45 @@ def run_build(bcfg: BuildConfig):
     resume_step = 0
     build_state = None
     _restored_level_start_cursor: int | None = None
+    _stacked_params_json: str | None = None  # set by stacked checkpoint load
     if bcfg.load:
         print(f"Loading checkpoint: {bcfg.load}")
-        if use_bpe:
+        # Detect stacked vs single-block checkpoint
+        _is_stacked_ckpt = (
+            hasattr(nl_hecate, "is_stacked_checkpoint")
+            and nl_hecate.is_stacked_checkpoint(bcfg.load)
+        )
+        if _is_stacked_ckpt:
+            # Stacked checkpoint load (spec 22)
+            result = nl_hecate.load_stacked_checkpoint(bcfg.load)
+            _stacked_params_json = result["params_json"]
+            cfg = result["config"]
+            bcfg.n_blocks = result["n_blocks"]
+            build_state = result["build_state"]
+            # Create a dummy single-block params for num_params display
+            # (the actual GPU model uses _stacked_params_json)
+            params = nl_hecate.MAGParams(cfg, seed=bcfg.seed if hasattr(bcfg, "seed") else 42)
+            if build_state is not None:
+                resume_step = build_state["global_step"]
+                print(f"  Stacked checkpoint: n_blocks={result['n_blocks']}, k={cfg.k}")
+                print(f"  Resuming from step {resume_step}")
+            else:
+                print(f"  Stacked checkpoint: n_blocks={result['n_blocks']}, k={cfg.k} (no build state)")
+            # Cursor sidecar for data position
+            sidecar = Path(str(bcfg.load) + ".cursor.json")
+            if sidecar.exists() and active_loader is not None:
+                cursor = json.loads(sidecar.read_text())
+                is_multi_slot = isinstance(cursor, dict) and isinstance(cursor.get("slots"), list)
+                if not is_multi_slot:
+                    try:
+                        active_loader.restore(cursor)
+                        print(f"  Stream position: {cursor['position']:,} / {cursor['total_tokens']:,} tokens")
+                    except (CursorMismatchError, CursorOutOfBounds) as e:
+                        print(f"  ERROR: cursor mismatch — {e}")
+                        return
+                if isinstance(cursor, dict) and "level_start_cursor" in cursor:
+                    _restored_level_start_cursor = cursor["level_start_cursor"]
+        elif use_bpe:
             # BPE path: try build checkpoint first, fall back to serving checkpoint.
             # If a cursor sidecar exists, this is a true resume (same data, same run).
             # If no sidecar, this is a warm-start (different run / donor weights).
@@ -255,7 +291,17 @@ def run_build(bcfg: BuildConfig):
                 tnt_local_chunk_size=bcfg.tnt_local_chunk_size,
                 residual=bcfg.residual,
             )
-            if bcfg.push_up:
+            if _stacked_params_json is not None:
+                # Stacked extend_k (spec 22): per-block level shift
+                if not bcfg.push_up:
+                    print("  ERROR: stacked extend_k only supports push_up (not stack_up)")
+                    return
+                result = nl_hecate.extend_stacked_push_up(
+                    bcfg.load, new_cfg, bcfg.seed)
+                _stacked_params_json = result["params_json"]
+                print(f"  Stacked push-up: k={loaded_k} → k={target_k}, "
+                      f"n_blocks={result['n_blocks']}, chunks={new_chunks}")
+            elif bcfg.push_up:
                 params = nl_hecate.extend_params_push_up(params, new_cfg, bcfg.seed)
                 print(f"  Push-up: k={loaded_k} → k={target_k}, "
                       f"chunks={new_chunks}")
@@ -462,16 +508,8 @@ def run_build(bcfg: BuildConfig):
         )
     # Note: GPU + residual=true is supported for training (gpu_cms_forward).
     # Serving paths (prefill/single_token) still assert !residual until adapted.
-    if is_stacked and bcfg.load:
-        raise RuntimeError(
-            "Stacked model checkpoint loading is not yet implemented. "
-            "n_blocks > 1 builds must start fresh (remove --load)."
-        )
-    if is_stacked and getattr(bcfg, "extend_k", None) is not None:
-        raise RuntimeError(
-            "extend_k is not supported with n_blocks > 1. "
-            "Push-up stacking operates on single-block models only."
-        )
+    # Stacked checkpoint loading and extend_k are supported (spec 22).
+    # Guards removed: stacked models can now load and push-up extend.
     if is_stacked and getattr(bcfg, "donor_weights", None) is not None:
         raise RuntimeError(
             "donor_weights is not supported with n_blocks > 1. "
@@ -581,9 +619,16 @@ def run_build(bcfg: BuildConfig):
         if is_stacked:
             n_blocks = bcfg.n_blocks
             periodic = (bcfg.memory_reset == "periodic")
-            gpu_model = nl_hecate.GpuStackedModel(
-                cfg, n_blocks, seed=bcfg.seed if hasattr(bcfg, "seed") else 42,
-                batch_size=bcfg.batch_size, memory_reset=periodic)
+            if _stacked_params_json is not None:
+                # Loaded from stacked checkpoint (or extended via push-up)
+                gpu_model = nl_hecate.GpuStackedModel.from_params_json(
+                    _stacked_params_json, cfg, n_blocks,
+                    batch_size=bcfg.batch_size, memory_reset=periodic)
+            else:
+                # Fresh init
+                gpu_model = nl_hecate.GpuStackedModel(
+                    cfg, n_blocks, seed=bcfg.seed if hasattr(bcfg, "seed") else 42,
+                    batch_size=bcfg.batch_size, memory_reset=periodic)
             print(f"  Stacked:  {n_blocks} blocks x k={bcfg.k} CMS levels"
                   f"  ({gpu_model.total_params():,} params)")
         else:
@@ -1313,9 +1358,24 @@ def run_build(bcfg: BuildConfig):
 
         # Periodic checkpoint
         if bcfg.save_every > 0 and step > 0 and step % bcfg.save_every == 0:
-            if is_stacked:
-                print("  [checkpoint skipped: stacked model save not yet implemented]")
-            else:
+            if is_stacked and gpu_model is not None:
+                p = Path(_safetensors_path(bcfg.save_path))
+                ckpt_path = str(p.with_stem(f"{p.stem}_step{step}"))
+                os.makedirs(os.path.dirname(ckpt_path) or ".", exist_ok=True)
+                nl_hecate.save_stacked_checkpoint(
+                    ckpt_path, gpu_model,
+                    conductor=conductor, context=context)
+                sidecar = Path(str(ckpt_path) + ".cursor.json")
+                if bpe_loaders:
+                    sidecar.write_text(json.dumps(
+                        {"slots": [loader.cursor() for loader in bpe_loaders],
+                         "level_start_cursor": _level_start_cursor}, indent=2))
+                elif active_loader is not None:
+                    cursor_data = active_loader.cursor()
+                    cursor_data["level_start_cursor"] = _level_start_cursor
+                    sidecar.write_text(json.dumps(cursor_data, indent=2))
+                print(f"  [checkpoint saved: {ckpt_path}]")
+            elif not is_stacked:
                 if gpu_model is not None:
                     params = gpu_model.to_host_params()
                     context = gpu_model.to_host_context()
@@ -1612,28 +1672,29 @@ def run_build(bcfg: BuildConfig):
                       active_fires=level3_active_fires)
 
     # ── Final checkpoint ──────────────────────────────────────────────
-    final_path = None
-    if is_stacked:
-        print("  [final checkpoint skipped: stacked model save not yet implemented]")
+    final_path = _safetensors_path(bcfg.save_path)
+    os.makedirs(os.path.dirname(final_path) or ".", exist_ok=True)
+    if is_stacked and gpu_model is not None:
+        nl_hecate.save_stacked_checkpoint(
+            final_path, gpu_model,
+            conductor=conductor, context=context)
     else:
         if gpu_model is not None:
             params = gpu_model.to_host_params()
             context = gpu_model.to_host_context()
-        final_path = _safetensors_path(bcfg.save_path)
-        os.makedirs(os.path.dirname(final_path) or ".", exist_ok=True)
         if use_bpe:
             nl_hecate.save_checkpoint_with_context(final_path, params, cfg, conductor, context)
         else:
             nl_hecate.save_build_checkpoint(final_path, params, cfg, conductor, context)
-        sidecar = Path(str(final_path) + ".cursor.json")
-        if bpe_loaders:
-            sidecar.write_text(json.dumps(
-                {"slots": [loader.cursor() for loader in bpe_loaders],
-                 "level_start_cursor": _level_start_cursor}, indent=2))
-        elif active_loader is not None:
-            final_cursor = active_loader.cursor()
-            final_cursor["level_start_cursor"] = _level_start_cursor
-            sidecar.write_text(json.dumps(final_cursor, indent=2))
+    sidecar = Path(str(final_path) + ".cursor.json")
+    if bpe_loaders:
+        sidecar.write_text(json.dumps(
+            {"slots": [loader.cursor() for loader in bpe_loaders],
+             "level_start_cursor": _level_start_cursor}, indent=2))
+    elif active_loader is not None:
+        final_cursor = active_loader.cursor()
+        final_cursor["level_start_cursor"] = _level_start_cursor
+        sidecar.write_text(json.dumps(final_cursor, indent=2))
 
     # ── Summary ───────────────────────────────────────────────────────
     print(f"\n{'=' * 60}")
@@ -1647,10 +1708,7 @@ def run_build(bcfg: BuildConfig):
         avg_first = sum(losses[:10]) / min(10, len(losses))
         avg_last = sum(losses[-10:]) / min(10, len(losses))
         print(f"  Avg loss:  first10={avg_first:.4f}, last10={avg_last:.4f}")
-    if final_path is not None:
-        print(f"  Saved:     {final_path}")
-    else:
-        print("  Saved:     [stacked checkpoint save not yet implemented]")
+    print(f"  Saved:     {final_path}")
     print(f"{'=' * 60}")
 
     if jsonl:
