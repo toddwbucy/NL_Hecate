@@ -1222,9 +1222,9 @@ pub struct TracedBlockParamIds {
     pub w_q: BufId,
     pub w_k: BufId,
     pub w_v: BufId,
-    /// `None` in stacked path: w_o is not applied as output projection
-    /// (matches gpu_stacked_forward.rs lines 239-241). Gradients are zero.
-    /// `Some(id)` in single-block path where w_o is applied.
+    /// Output projection W_O ∈ ℝ^{d×d} applied after SWA attention.
+    /// `Some(id)` in both single-block and stacked paths: attn_proj = attn_out @ W_O^T.
+    /// `None` only if W_O is intentionally omitted (not currently used).
     pub w_o: Option<BufId>,
     pub ln_attn_gamma: BufId,
     pub ln_attn_beta: BufId,
@@ -1305,8 +1305,13 @@ pub fn traced_stacked_forward(
             tape, q_id, k_id, v_id, s, nh, hd, ws,
         );
 
-        // ── Residual skip 1: residual + attn_out ───────────────
-        let residual_after_attn_id = traced_add(tape, residual_id, attn_out_id);
+        // ── Output projection: attn_proj = attn_out @ W_O^T ──
+        // Spec: specs/infrastructure/18_stacked_w_o_output_projection.md
+        let w_o_id = tape.register_param(&block.w_o, vec![d, d]);
+        let attn_proj_id = traced_matmul_transb(tape, attn_out_id, w_o_id, s, d, d);
+
+        // ── Residual skip 1: residual + attn_proj ──────────────
+        let residual_after_attn_id = traced_add(tape, residual_id, attn_proj_id);
 
         // ── LN_mem on residual_after_attn ──────────────────────
         let ln_mem_gamma_id = tape.register_param(&block.ln_mem_gamma, vec![d]);
@@ -1392,7 +1397,7 @@ pub fn traced_stacked_forward(
             w_q: w_q_id,
             w_k: w_k_id,
             w_v: w_v_id,
-            w_o: None, // not applied in stacked path (see gpu_stacked_forward.rs:239-241)
+            w_o: Some(w_o_id),
             ln_attn_gamma: ln_attn_gamma_id,
             ln_attn_beta: ln_attn_beta_id,
             ln_mem_gamma: ln_mem_gamma_id,
