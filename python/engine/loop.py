@@ -205,10 +205,18 @@ def run_build(bcfg: BuildConfig):
             else:
                 # Push-up: use canonical template (levels shift frequencies)
                 new_chunks = chunk_template[:target_k]
-            # Extend m_norm_max to target_k if needed
-            ext_m_norm = bcfg.m_norm_max
+            # Extend m_norm_max to target_k if needed (prefer checkpoint, normalize [] → None)
+            ext_m_norm = (bcfg.m_norm_max or None) if bcfg.m_norm_max is not None else (
+                list(cfg.m_norm_max) if hasattr(cfg, 'm_norm_max') and cfg.m_norm_max else None
+            )
             if ext_m_norm is not None and len(ext_m_norm) < target_k:
                 ext_m_norm = list(ext_m_norm) + [ext_m_norm[-1]] * (target_k - len(ext_m_norm))
+            # Extend error_clip to target_k if needed (prefer checkpoint, normalize [] → None)
+            ext_error_clip = (bcfg.error_clip or None) if bcfg.error_clip is not None else (
+                list(cfg.error_clip) if hasattr(cfg, 'error_clip') and cfg.error_clip else None
+            )
+            if ext_error_clip is not None and len(ext_error_clip) < target_k:
+                ext_error_clip = list(ext_error_clip) + [ext_error_clip[-1]] * (target_k - len(ext_error_clip))
             # Rebuild MAGConfig with the new k (carry all other fields from loaded cfg)
             new_cfg = nl_hecate.MAGConfig(
                 d_model=cfg.d_model, num_heads=cfg.num_heads,
@@ -237,6 +245,7 @@ def run_build(bcfg: BuildConfig):
                 theta_floor=bcfg.theta_floor,
                 theta_ceil=bcfg.theta_ceil,
                 m_norm_max=ext_m_norm,
+                error_clip=ext_error_clip,
                 parallel_strategy=(
                     bcfg.parallel_strategy
                     if bcfg.parallel_strategy is not None
@@ -263,6 +272,8 @@ def run_build(bcfg: BuildConfig):
             bcfg.chunk_sizes = new_chunks
             if ext_m_norm is not None:
                 bcfg.m_norm_max = ext_m_norm
+            if ext_error_clip is not None:
+                bcfg.error_clip = ext_error_clip
             resume_step = 0
             build_state = None
             # New phase — persisted level_start_cursor from prior phase is stale.
@@ -303,13 +314,14 @@ def run_build(bcfg: BuildConfig):
         # Apply theta clamps from BuildConfig onto loaded cfg (allows
         # adding clamps to an existing checkpoint that didn't have them).
         # MAGConfig is frozen, so rebuild if clamps changed.
-        if bcfg.theta_floor is not None or bcfg.theta_ceil is not None or bcfg.m_norm_max is not None:
+        if bcfg.theta_floor is not None or bcfg.theta_ceil is not None or bcfg.m_norm_max is not None or bcfg.error_clip is not None:
             # Use bcfg value when explicitly set; fall back to loaded cfg so we
             # never silently wipe clamp values that were already baked into the
             # checkpoint (e.g. resuming without --m_norm_max still preserves it).
             theta_floor = bcfg.theta_floor if bcfg.theta_floor is not None else list(cfg.theta_floor)
             theta_ceil  = bcfg.theta_ceil  if bcfg.theta_ceil  is not None else list(cfg.theta_ceil)
             m_norm_max  = bcfg.m_norm_max  if bcfg.m_norm_max  is not None else list(cfg.m_norm_max)
+            error_clip  = bcfg.error_clip  if bcfg.error_clip  is not None else list(cfg.error_clip)
             cfg = nl_hecate.MAGConfig(
                 d_model=cfg.d_model, num_heads=cfg.num_heads,
                 head_dim=cfg.head_dim, seq_len=cfg.seq_len,
@@ -337,6 +349,7 @@ def run_build(bcfg: BuildConfig):
                 theta_floor=theta_floor,
                 theta_ceil=theta_ceil,
                 m_norm_max=m_norm_max,
+                error_clip=error_clip,
                 parallel_strategy=(
                     bcfg.parallel_strategy
                     if bcfg.parallel_strategy is not None
@@ -379,6 +392,7 @@ def run_build(bcfg: BuildConfig):
             theta_ceil=bcfg.theta_ceil,
             intermediate_size=bcfg.intermediate_size,
             m_norm_max=bcfg.m_norm_max,
+            error_clip=bcfg.error_clip,
             parallel_strategy=bcfg.parallel_strategy,
             tnt_global_chunk_size=bcfg.tnt_global_chunk_size,
             tnt_local_chunk_size=bcfg.tnt_local_chunk_size,
@@ -417,6 +431,8 @@ def run_build(bcfg: BuildConfig):
               f"falsification_step={bcfg.gate_warmup_falsification_step}")
     if len(cfg.m_norm_max) > 0:
         print(f"  M-norm:   max={list(cfg.m_norm_max)}")
+    if len(cfg.error_clip) > 0:
+        print(f"  ErrClip:  max={list(cfg.error_clip)}")
     print(f"  Params:   {params.num_params():,}")
     data_len = len(active_loader) if use_bpe else len(token_ids)
     print(f"  Data:     {data_len:,} tokens" +
@@ -691,6 +707,7 @@ def run_build(bcfg: BuildConfig):
                     theta_floor=warmup_floor,
                     theta_ceil=list(cfg.theta_ceil) if list(cfg.theta_ceil) else None,
                     m_norm_max=list(cfg.m_norm_max) if list(cfg.m_norm_max) else None,
+                    error_clip=list(cfg.error_clip) if list(cfg.error_clip) else None,
                     parallel_strategy=bcfg.parallel_strategy,
                     tnt_global_chunk_size=bcfg.tnt_global_chunk_size,
                     tnt_local_chunk_size=bcfg.tnt_local_chunk_size,
@@ -722,6 +739,7 @@ def run_build(bcfg: BuildConfig):
                     theta_floor=final_floor,
                     theta_ceil=list(cfg.theta_ceil) if list(cfg.theta_ceil) else None,
                     m_norm_max=list(cfg.m_norm_max) if list(cfg.m_norm_max) else None,
+                    error_clip=list(cfg.error_clip) if list(cfg.error_clip) else None,
                     parallel_strategy=bcfg.parallel_strategy,
                     tnt_global_chunk_size=bcfg.tnt_global_chunk_size,
                     tnt_local_chunk_size=bcfg.tnt_local_chunk_size,
@@ -1349,9 +1367,15 @@ def run_build(bcfg: BuildConfig):
             # Build new MAGConfig(k+1)
             chunk_template = [1, 8, 64, 512]
             new_chunks = chunk_template[:new_k]
-            new_m_norm = None
-            if bcfg.m_norm_max is not None:
-                new_m_norm = list(bcfg.m_norm_max) + [bcfg.m_norm_max[-1]]
+            # Prefer bcfg values, fall back to live cfg (normalize [] → None)
+            src_m_norm = (bcfg.m_norm_max or None) if bcfg.m_norm_max is not None else (
+                list(cfg.m_norm_max) if hasattr(cfg, 'm_norm_max') and cfg.m_norm_max else None
+            )
+            new_m_norm = [*src_m_norm, src_m_norm[-1]] if src_m_norm else None
+            src_error_clip = (bcfg.error_clip or None) if bcfg.error_clip is not None else (
+                list(cfg.error_clip) if hasattr(cfg, 'error_clip') and cfg.error_clip else None
+            )
+            new_error_clip = [*src_error_clip, src_error_clip[-1]] if src_error_clip else None
             new_cfg = nl_hecate.MAGConfig(
                 d_model=cfg.d_model, num_heads=cfg.num_heads,
                 head_dim=cfg.head_dim, seq_len=cfg.seq_len,
@@ -1370,6 +1394,7 @@ def run_build(bcfg: BuildConfig):
                 intermediate_size=bcfg.intermediate_size,
                 theta_floor=None, theta_ceil=None,
                 m_norm_max=new_m_norm,
+                error_clip=new_error_clip,
                 parallel_strategy=getattr(cfg, "parallel_strategy", None),
                 tnt_global_chunk_size=bcfg.tnt_global_chunk_size,
                 tnt_local_chunk_size=bcfg.tnt_local_chunk_size,
@@ -1398,6 +1423,8 @@ def run_build(bcfg: BuildConfig):
             bcfg.chunk_sizes = new_chunks
             if new_m_norm is not None:
                 bcfg.m_norm_max = new_m_norm
+            if new_error_clip is not None:
+                bcfg.error_clip = new_error_clip
 
             # Reset all per-level tracking for new k
             _sat_ema = [0.0] * new_k

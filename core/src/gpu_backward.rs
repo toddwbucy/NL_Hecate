@@ -485,6 +485,7 @@ fn gpu_memory_backward(
                 &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
                 &mut d_alpha, &mut d_theta, &mut d_m_initial,
                 s, d, batch_size,
+                cfg.error_clip_for_level(level),
             );
 
             // CS-39 straight-through: zero d_theta where theta was clamped.
@@ -524,6 +525,7 @@ fn gpu_memory_backward(
                 &mut d_alpha, &mut d_theta, &mut d_eta,
                 &mut d_m_initial, &mut d_s_initial,
                 s, d, batch_size,
+                cfg.error_clip_for_level(level),
             );
 
             // CS-39 straight-through: zero d_theta where theta was clamped.
@@ -577,7 +579,7 @@ fn gpu_memory_backward(
         GpuMemoryCache::DeltaCkpt { k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, checkpoint_interval, k_norms, q_norms } => {
             let c = *checkpoint_interval;
             let (d_k_mem, d_v_mem, d_q_mem, d_alpha, mut d_theta) =
-                delta_backward_checkpointed(k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, d_y, s, d, c);
+                delta_backward_checkpointed(k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, d_y, s, d, c, cfg.error_clip_for_level(level));
             // CS-39 straight-through: zero d_theta where theta was clamped.
             let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
             let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
@@ -600,7 +602,7 @@ fn gpu_memory_backward(
         GpuMemoryCache::TitansCkpt { k_mem, v_mem, q_mem, alpha, theta, eta, m_checkpoints, s_checkpoints, checkpoint_interval, k_norms, q_norms } => {
             let c = *checkpoint_interval;
             let (d_k_mem, d_v_mem, d_q_mem, d_alpha, mut d_theta, d_eta) =
-                titans_backward_checkpointed(k_mem, v_mem, q_mem, alpha, theta, eta, m_checkpoints, s_checkpoints, d_y, s, d, c);
+                titans_backward_checkpointed(k_mem, v_mem, q_mem, alpha, theta, eta, m_checkpoints, s_checkpoints, d_y, s, d, c, cfg.error_clip_for_level(level));
             // CS-39 straight-through: zero d_theta where theta was clamped.
             let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
             let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
@@ -648,6 +650,7 @@ fn gpu_memory_backward(
                 &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
                 &mut d_alpha, &mut d_theta, &mut d_m_initial,
                 s, d, batch_size,
+                cfg.error_clip_for_level(level),
             );
 
             // CS-39 straight-through: zero d_theta where theta was clamped.
@@ -673,7 +676,7 @@ fn gpu_memory_backward(
         GpuMemoryCache::DGDCkpt { k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, checkpoint_interval, k_norms, q_norms } => {
             let c = *checkpoint_interval;
             let (d_k_mem, d_v_mem, d_q_mem, d_alpha, mut d_theta) =
-                delta_backward_checkpointed(k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, d_y, s, d, c);
+                delta_backward_checkpointed(k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, d_y, s, d, c, cfg.error_clip_for_level(level));
             // CS-39 straight-through: zero d_theta where theta was clamped.
             let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
             let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
@@ -807,6 +810,7 @@ fn gpu_memory_backward(
                             &mut d_alpha_shard, &mut d_theta_shard, &mut d_eta_shard,
                             &mut d_m_initial, &mut d_s_initial,
                             cl, d, n_batch,
+                            cfg.error_clip_for_level(level),
                         );
 
                         // Reduce per-local d_m_initial → shared global M gradient.
@@ -829,6 +833,7 @@ fn gpu_memory_backward(
                             &mut d_k_shard, &mut d_v_shard, &mut d_q_shard,
                             &mut d_alpha_shard, &mut d_theta_shard, &mut d_m_initial,
                             cl, d, n_batch,
+                            cfg.error_clip_for_level(level),
                         );
 
                         // Reduce per-local d_m_initial → shared global M gradient.
@@ -1019,7 +1024,7 @@ fn delta_backward_checkpointed(
     k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
     alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>,
     m_checkpoints: &GpuBuf<f32>, d_y: &GpuBuf<f32>,
-    s: usize, d: usize, c: usize,
+    s: usize, d: usize, c: usize, error_clip: f32,
 ) -> (GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>) {
     let dd = d * d;
     let sd = s * d;
@@ -1063,6 +1068,7 @@ fn delta_backward_checkpointed(
                 local_m_states.ptr(),
                 local_y.ptr(),
                 seg_len as i32, d as i32, 1, // batch_size=1 (checkpointed paths are always bs=1)
+                error_clip,
             );
         }
         crate::dispatch::cuda_sync();
@@ -1075,7 +1081,7 @@ fn delta_backward_checkpointed(
             &d_m_seed,
             &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
             &mut d_alpha, &mut d_theta, &mut seg_d_m_out,
-            t_start, t_end, d,
+            t_start, t_end, d, error_clip,
         );
         crate::dispatch::cuda_sync();
 
@@ -1094,7 +1100,7 @@ fn titans_backward_checkpointed(
     alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>, eta: &GpuBuf<f32>,
     m_checkpoints: &GpuBuf<f32>, s_checkpoints: &GpuBuf<f32>,
     d_y: &GpuBuf<f32>,
-    s: usize, d: usize, c: usize,
+    s: usize, d: usize, c: usize, error_clip: f32,
 ) -> (GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>) {
     let dd = d * d;
     let sd = s * d;
@@ -1141,6 +1147,7 @@ fn titans_backward_checkpointed(
                 local_s_states.ptr(),
                 local_y.ptr(),
                 seg_len as i32, d as i32, 1, // batch_size=1 (checkpointed paths are always bs=1)
+                error_clip,
             );
         }
         crate::dispatch::cuda_sync();
@@ -1155,7 +1162,7 @@ fn titans_backward_checkpointed(
             &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
             &mut d_alpha, &mut d_theta, &mut d_eta,
             &mut seg_d_m_out, &mut seg_d_s_out,
-            t_start, t_end, d,
+            t_start, t_end, d, error_clip,
         );
         crate::dispatch::cuda_sync();
 

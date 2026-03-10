@@ -57,6 +57,8 @@ class BuildConfig:
 
     # Per-level M Frobenius norm ceiling (empty = disabled)
     m_norm_max: list[float] | None = None   # straight-through clamp after M update
+    # Per-level per-token error clip ceiling (empty = disabled, spec 17)
+    error_clip: list[float] | None = None   # clip ‖e_t‖₂ to this value in CUDA kernels
 
     # SwiGluMlp / Llama level stacking (HOPE §7.3)
     intermediate_size: int = 0             # 0 for matrix rules; 8192 for Llama-3.2-1B
@@ -254,6 +256,9 @@ class BuildConfig:
         if self.m_norm_max is not None and len(self.m_norm_max) != self.k:
             raise ValueError(
                 f"m_norm_max length {len(self.m_norm_max)} must match k={self.k}")
+        if self.error_clip is not None and len(self.error_clip) != self.k:
+            raise ValueError(
+                f"error_clip length {len(self.error_clip)} must match k={self.k}")
         if self.checkpoint_interval is not None and self.checkpoint_interval < 1:
             raise ValueError(
                 f"checkpoint_interval must be >= 1 or None, got {self.checkpoint_interval}")

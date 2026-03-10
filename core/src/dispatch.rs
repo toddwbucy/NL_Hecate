@@ -735,6 +735,7 @@ pub fn delta_forward_dispatch(
     seq_len: usize,
     d: usize,
     m_norm_max: f32,
+    error_clip: f32,
 ) {
     #[cfg(feature = "cuda")]
     {
@@ -745,12 +746,12 @@ pub fn delta_forward_dispatch(
         let clamp_enabled = m_norm_max > 0.0 && m_norm_max < f32::MAX;
         if !is_rust_forced() && !clamp_enabled {
             cuda_delta_forward(k_mem, v_mem, q_mem, alpha, theta, m_initial,
-                               m_states, y, seq_len, d);
+                               m_states, y, seq_len, d, error_clip);
             return;
         }
     }
     rust_delta_forward(k_mem, v_mem, q_mem, alpha, theta, m_initial,
-                       m_states, y, seq_len, d, m_norm_max);
+                       m_states, y, seq_len, d, m_norm_max, error_clip);
 }
 
 /// Delta Rule backward inner loop dispatch.
@@ -772,19 +773,20 @@ pub fn delta_backward_dispatch(
     d_m_initial: &mut [f32],
     seq_len: usize,
     d: usize,
+    error_clip: f32,
 ) {
     #[cfg(feature = "cuda")]
     {
         if !is_rust_forced() {
             cuda_delta_backward(k_mem, v_mem, q_mem, alpha, theta, m_states, d_y,
                                 d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta, d_m_initial,
-                                seq_len, d);
+                                seq_len, d, error_clip);
             return;
         }
     }
     rust_delta_backward(k_mem, v_mem, q_mem, alpha, theta, m_states, d_y,
                         d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta, d_m_initial,
-                        seq_len, d);
+                        seq_len, d, error_clip);
 }
 
 // ── Titans LMM dispatch ─────────────────────────────────────────────
@@ -805,6 +807,7 @@ pub fn titans_forward_dispatch(
     seq_len: usize,
     d: usize,
     m_norm_max: f32,
+    error_clip: f32,
 ) {
     #[cfg(feature = "cuda")]
     {
@@ -813,13 +816,13 @@ pub fn titans_forward_dispatch(
         if !is_rust_forced() && !clamp_enabled {
             cuda_titans_forward(k_mem, v_mem, q_mem, alpha, theta, eta,
                                 m_initial, s_initial, m_states, s_states, y,
-                                seq_len, d);
+                                seq_len, d, error_clip);
             return;
         }
     }
     rust_titans_forward(k_mem, v_mem, q_mem, alpha, theta, eta,
                         m_initial, s_initial, m_states, s_states, y,
-                        seq_len, d, m_norm_max);
+                        seq_len, d, m_norm_max, error_clip);
 }
 
 /// Titans LMM backward inner loop dispatch.
@@ -843,6 +846,7 @@ pub fn titans_backward_dispatch(
     d_s_initial: &mut [f32],
     seq_len: usize,
     d: usize,
+    error_clip: f32,
 ) {
     #[cfg(feature = "cuda")]
     {
@@ -852,7 +856,7 @@ pub fn titans_backward_dispatch(
                                  d_k_mem, d_v_mem, d_q_mem,
                                  d_alpha, d_theta, d_eta,
                                  d_m_initial, d_s_initial,
-                                 seq_len, d);
+                                 seq_len, d, error_clip);
             return;
         }
     }
@@ -861,7 +865,7 @@ pub fn titans_backward_dispatch(
                          d_k_mem, d_v_mem, d_q_mem,
                          d_alpha, d_theta, d_eta,
                          d_m_initial, d_s_initial,
-                         seq_len, d);
+                         seq_len, d, error_clip);
 }
 
 // ── Hebbian Rule dispatch ───────────────────────────────────────────
@@ -948,18 +952,19 @@ pub fn dgd_forward_dispatch(
     y: &mut [f32],
     seq_len: usize,
     d: usize,
+    error_clip: f32,
 ) {
     #[cfg(feature = "cuda")]
     {
         if !is_rust_forced() {
             cuda_dgd_forward(k_mem, v_mem, q_mem, alpha, theta, m_initial,
-                             m_states, y, seq_len, d);
+                             m_states, y, seq_len, d, error_clip);
             return;
         }
     }
     // DGD math is identical to Delta Rule at L2 bias
     rust_delta_forward(k_mem, v_mem, q_mem, alpha, theta, m_initial,
-                       m_states, y, seq_len, d, f32::MAX);
+                       m_states, y, seq_len, d, f32::MAX, error_clip);
 }
 
 /// DGD backward inner loop dispatch.
@@ -981,20 +986,21 @@ pub fn dgd_backward_dispatch(
     d_m_initial: &mut [f32],
     seq_len: usize,
     d: usize,
+    error_clip: f32,
 ) {
     #[cfg(feature = "cuda")]
     {
         if !is_rust_forced() {
             cuda_dgd_backward(k_mem, v_mem, q_mem, alpha, theta, m_states, d_y,
                               d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta, d_m_initial,
-                              seq_len, d);
+                              seq_len, d, error_clip);
             return;
         }
     }
     // DGD math is identical to Delta Rule at L2 bias
     rust_delta_backward(k_mem, v_mem, q_mem, alpha, theta, m_states, d_y,
                         d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta, d_m_initial,
-                        seq_len, d);
+                        seq_len, d, error_clip);
 }
 
 // ── Rust reference inner loops ──────────────────────────────────────
@@ -1006,6 +1012,18 @@ pub fn dgd_backward_dispatch(
 /// which is the standard practice for gradient clipping (same as CS-39/CS-44).
 /// No-op when m_norm_max is 0.0 or f32::MAX (disabled).
 #[inline]
+/// Clip error vector in-place: if ‖error‖₂ > clip, rescale to clip.
+/// Matches CUDA error_clip_inplace. No-op when clip <= 0.
+fn clip_error_l2(error: &mut [f32], clip: f32) {
+    if clip <= 0.0 { return; }
+    let norm_sq: f32 = error.iter().map(|x| x * x).sum();
+    let norm = norm_sq.sqrt();
+    if norm > clip {
+        let scale = clip / norm;
+        for x in error.iter_mut() { *x *= scale; }
+    }
+}
+
 fn clamp_m_norm(slice: &mut [f32], m_norm_max: f32) {
     if m_norm_max > 0.0 && m_norm_max < f32::MAX {
         let norm = slice.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -1021,7 +1039,7 @@ fn rust_delta_forward(
     k_mem: &[f32], v_mem: &[f32], q_mem: &[f32],
     alpha: &[f32], theta: &[f32], m_initial: &[f32],
     m_states: &mut [f32], y: &mut [f32],
-    seq_len: usize, d: usize, m_norm_max: f32,
+    seq_len: usize, d: usize, m_norm_max: f32, error_clip: f32,
 ) {
     let dd = d * d;
     m_states[..dd].copy_from_slice(m_initial);
@@ -1042,13 +1060,17 @@ fn rust_delta_forward(
             prediction[i] = sum;
         }
 
-        // error = prediction - v; M update
+        // error = prediction - v
+        let mut error = vec![0.0f32; d];
+        for i in 0..d { error[i] = prediction[i] - v_t[i]; }
+        clip_error_l2(&mut error, error_clip);
+
+        // M update
         let retention = 1.0 - alpha_t;
         for i in 0..d {
-            let err_i = prediction[i] - v_t[i];
             for j in 0..d {
                 m_states[m_next + i * d + j] =
-                    retention * m_states[m_t + i * d + j] - theta_t * err_i * k_t[j];
+                    retention * m_states[m_t + i * d + j] - theta_t * error[i] * k_t[j];
             }
         }
 
@@ -1069,7 +1091,7 @@ fn rust_delta_backward(
     alpha: &[f32], theta: &[f32], m_states: &[f32], d_y: &[f32],
     d_k_mem: &mut [f32], d_v_mem: &mut [f32], d_q_mem: &mut [f32],
     d_alpha: &mut [f32], d_theta: &mut [f32], d_m_initial: &mut [f32],
-    seq_len: usize, d: usize,
+    seq_len: usize, d: usize, error_clip: f32,
 ) {
     let dd = d * d;
     let mut d_m = vec![0.0f32; dd];
@@ -1096,7 +1118,7 @@ fn rust_delta_backward(
             d_q_mem[t * d + j] = sum;
         }
 
-        // Recompute prediction and error
+        // Recompute prediction and error (with same clip as forward)
         let mut prediction = vec![0.0f32; d];
         for i in 0..d {
             let mut sum = 0.0f32;
@@ -1105,6 +1127,7 @@ fn rust_delta_backward(
         }
         let mut error = vec![0.0f32; d];
         for i in 0..d { error[i] = prediction[i] - v_t[i]; }
+        clip_error_l2(&mut error, error_clip);
 
         // d_alpha, d_theta (reductions)
         let mut d_alpha_sum = 0.0f32;
@@ -1162,7 +1185,7 @@ fn rust_titans_forward(
     alpha: &[f32], theta: &[f32], eta: &[f32],
     m_initial: &[f32], s_initial: &[f32],
     m_states: &mut [f32], s_states: &mut [f32], y: &mut [f32],
-    seq_len: usize, d: usize, m_norm_max: f32,
+    seq_len: usize, d: usize, m_norm_max: f32, error_clip: f32,
 ) {
     let dd = d * d;
     m_states[..dd].copy_from_slice(m_initial);
@@ -1188,12 +1211,15 @@ fn rust_titans_forward(
             prediction[i] = sum;
         }
 
+        let mut error = vec![0.0f32; d];
+        for i in 0..d { error[i] = prediction[i] - v_t[i]; }
+        clip_error_l2(&mut error, error_clip);
+
         // S_{t+1} = eta_t * S_t - theta_t * outer(error, k)
         for i in 0..d {
-            let err_i = prediction[i] - v_t[i];
             for j in 0..d {
                 s_states[s_next + i * d + j] =
-                    eta_t * s_states[s_t + i * d + j] - theta_t * err_i * k_t[j];
+                    eta_t * s_states[s_t + i * d + j] - theta_t * error[i] * k_t[j];
             }
         }
 
@@ -1223,7 +1249,7 @@ fn rust_titans_backward(
     d_k_mem: &mut [f32], d_v_mem: &mut [f32], d_q_mem: &mut [f32],
     d_alpha: &mut [f32], d_theta: &mut [f32], d_eta: &mut [f32],
     d_m_initial: &mut [f32], d_s_initial: &mut [f32],
-    seq_len: usize, d: usize,
+    seq_len: usize, d: usize, error_clip: f32,
 ) {
     let dd = d * d;
     let mut d_m = vec![0.0f32; dd];
@@ -1269,7 +1295,7 @@ fn rust_titans_backward(
         for i in 0..dd { d_eta_sum += s_states[s_t_off + i] * d_s[i]; }
         d_eta[t] = d_eta_sum;
 
-        // Recompute prediction/error
+        // Recompute prediction/error (with same clip as forward)
         let mut prediction = vec![0.0f32; d];
         for i in 0..d {
             let mut sum = 0.0f32;
@@ -1278,6 +1304,7 @@ fn rust_titans_backward(
         }
         let mut error = vec![0.0f32; d];
         for i in 0..d { error[i] = prediction[i] - v_t[i]; }
+        clip_error_l2(&mut error, error_clip);
 
         let mut d_theta_sum = 0.0f32;
         for i in 0..d {
@@ -1430,7 +1457,7 @@ fn cuda_delta_forward(
     k_mem: &[f32], v_mem: &[f32], q_mem: &[f32],
     alpha: &[f32], theta: &[f32], m_initial: &[f32],
     m_states: &mut [f32], y: &mut [f32],
-    seq_len: usize, d: usize,
+    seq_len: usize, d: usize, error_clip: f32,
 ) {
     let dd = d * d;
     let dev_km = DevBuf::new(seq_len * d);
@@ -1456,7 +1483,7 @@ fn cuda_delta_forward(
             dev_km.ptr, dev_vm.ptr, dev_qm.ptr,
             dev_alpha.ptr, dev_theta.ptr, dev_minit.ptr,
             dev_mstates.ptr, dev_y.ptr,
-            seq_len as i32, d as i32, 1,
+            seq_len as i32, d as i32, 1, error_clip,
         );
         let rc = cudaDeviceSynchronize();
         assert_eq!(rc, 0, "cudaDeviceSynchronize failed after delta forward (error {rc})");
@@ -1472,7 +1499,7 @@ fn cuda_delta_backward(
     alpha: &[f32], theta: &[f32], m_states: &[f32], d_y: &[f32],
     d_k_mem: &mut [f32], d_v_mem: &mut [f32], d_q_mem: &mut [f32],
     d_alpha: &mut [f32], d_theta: &mut [f32], d_m_initial: &mut [f32],
-    seq_len: usize, d: usize,
+    seq_len: usize, d: usize, error_clip: f32,
 ) {
     let dd = d * d;
     let dev_km = DevBuf::new(seq_len * d);
@@ -1510,7 +1537,7 @@ fn cuda_delta_backward(
             dev_dy.ptr as *const f32,
             dev_dkm.ptr, dev_dvm.ptr, dev_dqm.ptr,
             dev_dalpha.ptr, dev_dtheta.ptr, dev_dm_init.ptr,
-            seq_len as i32, d as i32, 1,
+            seq_len as i32, d as i32, 1, error_clip,
         );
         let rc = cudaDeviceSynchronize();
         assert_eq!(rc, 0, "cudaDeviceSynchronize failed after delta backward (error {rc})");
@@ -1530,7 +1557,7 @@ fn cuda_titans_forward(
     alpha: &[f32], theta: &[f32], eta: &[f32],
     m_initial: &[f32], s_initial: &[f32],
     m_states: &mut [f32], s_states: &mut [f32], y: &mut [f32],
-    seq_len: usize, d: usize,
+    seq_len: usize, d: usize, error_clip: f32,
 ) {
     let dd = d * d;
     let dev_km = DevBuf::new(seq_len * d);
@@ -1563,7 +1590,7 @@ fn cuda_titans_forward(
             dev_alpha.ptr, dev_theta.ptr, dev_eta.ptr,
             dev_minit.ptr, dev_sinit.ptr,
             dev_mstates.ptr, dev_sstates.ptr, dev_y.ptr,
-            seq_len as i32, d as i32, 1,
+            seq_len as i32, d as i32, 1, error_clip,
         );
         let rc = cudaDeviceSynchronize();
         assert_eq!(rc, 0, "cudaDeviceSynchronize failed after titans forward (error {rc})");
@@ -1583,7 +1610,7 @@ fn cuda_titans_backward(
     d_k_mem: &mut [f32], d_v_mem: &mut [f32], d_q_mem: &mut [f32],
     d_alpha: &mut [f32], d_theta: &mut [f32], d_eta: &mut [f32],
     d_m_initial: &mut [f32], d_s_initial: &mut [f32],
-    seq_len: usize, d: usize,
+    seq_len: usize, d: usize, error_clip: f32,
 ) {
     let dd = d * d;
     let dev_km = DevBuf::new(seq_len * d);
@@ -1631,7 +1658,7 @@ fn cuda_titans_backward(
             dev_dkm.ptr, dev_dvm.ptr, dev_dqm.ptr,
             dev_dalpha.ptr, dev_dtheta.ptr, dev_deta.ptr,
             dev_dm_init.ptr, dev_ds_init.ptr,
-            seq_len as i32, d as i32, 1,
+            seq_len as i32, d as i32, 1, error_clip,
         );
         let rc = cudaDeviceSynchronize();
         assert_eq!(rc, 0, "cudaDeviceSynchronize failed after titans backward (error {rc})");
@@ -1744,7 +1771,7 @@ fn cuda_dgd_forward(
     k_mem: &[f32], v_mem: &[f32], q_mem: &[f32],
     alpha: &[f32], theta: &[f32], m_initial: &[f32],
     m_states: &mut [f32], y: &mut [f32],
-    seq_len: usize, d: usize,
+    seq_len: usize, d: usize, error_clip: f32,
 ) {
     let dd = d * d;
     let dev_km = DevBuf::new(seq_len * d);
@@ -1770,7 +1797,7 @@ fn cuda_dgd_forward(
             dev_km.ptr, dev_vm.ptr, dev_qm.ptr,
             dev_alpha.ptr, dev_theta.ptr, dev_minit.ptr,
             dev_mstates.ptr, dev_y.ptr,
-            seq_len as i32, d as i32,
+            seq_len as i32, d as i32, error_clip,
         );
         let rc = cudaDeviceSynchronize();
         assert_eq!(rc, 0, "cudaDeviceSynchronize failed after dgd forward (error {rc})");
@@ -1786,7 +1813,7 @@ fn cuda_dgd_backward(
     alpha: &[f32], theta: &[f32], m_states: &[f32], d_y: &[f32],
     d_k_mem: &mut [f32], d_v_mem: &mut [f32], d_q_mem: &mut [f32],
     d_alpha: &mut [f32], d_theta: &mut [f32], d_m_initial: &mut [f32],
-    seq_len: usize, d: usize,
+    seq_len: usize, d: usize, error_clip: f32,
 ) {
     let dd = d * d;
     let dev_km = DevBuf::new(seq_len * d);
@@ -1824,7 +1851,7 @@ fn cuda_dgd_backward(
             dev_dy.ptr as *const f32,
             dev_dkm.ptr, dev_dvm.ptr, dev_dqm.ptr,
             dev_dalpha.ptr, dev_dtheta.ptr, dev_dm_init.ptr,
-            seq_len as i32, d as i32,
+            seq_len as i32, d as i32, error_clip,
         );
         let rc = cudaDeviceSynchronize();
         assert_eq!(rc, 0, "cudaDeviceSynchronize failed after dgd backward (error {rc})");
@@ -1967,7 +1994,7 @@ pub fn delta_forward_dd(
     alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>,
     m_initial: &GpuSlice<f32>,
     m_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
-    seq_len: usize, d: usize, batch_size: usize,
+    seq_len: usize, d: usize, batch_size: usize, error_clip: f32,
 ) {
     unsafe {
         crate::cuda_ffi::delta_forward_f32_cuda(
@@ -1975,7 +2002,7 @@ pub fn delta_forward_dd(
             alpha.as_ptr(), theta.as_ptr(),
             m_initial.as_ptr(),
             m_states.ptr(), y.ptr(),
-            seq_len as i32, d as i32, batch_size as i32,
+            seq_len as i32, d as i32, batch_size as i32, error_clip,
         );
     }
 }
@@ -1988,7 +2015,7 @@ pub fn delta_backward_dd(
     m_states: &GpuBuf<f32>, d_y: &GpuBuf<f32>,
     d_k_mem: &mut GpuBuf<f32>, d_v_mem: &mut GpuBuf<f32>, d_q_mem: &mut GpuBuf<f32>,
     d_alpha: &mut GpuBuf<f32>, d_theta: &mut GpuBuf<f32>, d_m_initial: &mut GpuBuf<f32>,
-    seq_len: usize, d: usize, batch_size: usize,
+    seq_len: usize, d: usize, batch_size: usize, error_clip: f32,
 ) {
     unsafe {
         crate::cuda_ffi::delta_backward_f32_cuda(
@@ -1997,7 +2024,7 @@ pub fn delta_backward_dd(
             d_y.as_ptr(),
             d_k_mem.ptr(), d_v_mem.ptr(), d_q_mem.ptr(),
             d_alpha.ptr(), d_theta.ptr(), d_m_initial.ptr(),
-            seq_len as i32, d as i32, batch_size as i32,
+            seq_len as i32, d as i32, batch_size as i32, error_clip,
         );
     }
 }
@@ -2009,7 +2036,7 @@ pub fn titans_forward_dd(
     alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>, eta: &GpuBuf<f32>,
     m_initial: &GpuSlice<f32>, s_initial: &GpuSlice<f32>,
     m_states: &mut GpuBuf<f32>, s_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
-    seq_len: usize, d: usize, batch_size: usize,
+    seq_len: usize, d: usize, batch_size: usize, error_clip: f32,
 ) {
     unsafe {
         crate::cuda_ffi::titans_forward_f32_cuda(
@@ -2017,7 +2044,7 @@ pub fn titans_forward_dd(
             alpha.as_ptr(), theta.as_ptr(), eta.as_ptr(),
             m_initial.as_ptr(), s_initial.as_ptr(),
             m_states.ptr(), s_states.ptr(), y.ptr(),
-            seq_len as i32, d as i32, batch_size as i32,
+            seq_len as i32, d as i32, batch_size as i32, error_clip,
         );
     }
 }
@@ -2032,7 +2059,7 @@ pub fn titans_backward_dd(
     d_k_mem: &mut GpuBuf<f32>, d_v_mem: &mut GpuBuf<f32>, d_q_mem: &mut GpuBuf<f32>,
     d_alpha: &mut GpuBuf<f32>, d_theta: &mut GpuBuf<f32>, d_eta: &mut GpuBuf<f32>,
     d_m_initial: &mut GpuBuf<f32>, d_s_initial: &mut GpuBuf<f32>,
-    seq_len: usize, d: usize, batch_size: usize,
+    seq_len: usize, d: usize, batch_size: usize, error_clip: f32,
 ) {
     unsafe {
         crate::cuda_ffi::titans_backward_f32_cuda(
@@ -2043,7 +2070,7 @@ pub fn titans_backward_dd(
             d_k_mem.ptr(), d_v_mem.ptr(), d_q_mem.ptr(),
             d_alpha.ptr(), d_theta.ptr(), d_eta.ptr(),
             d_m_initial.ptr(), d_s_initial.ptr(),
-            seq_len as i32, d as i32, batch_size as i32,
+            seq_len as i32, d as i32, batch_size as i32, error_clip,
         );
     }
 }
@@ -2095,7 +2122,7 @@ pub fn dgd_forward_dd(
     alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>,
     m_initial: &GpuSlice<f32>,
     m_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
-    seq_len: usize, d: usize,
+    seq_len: usize, d: usize, error_clip: f32,
 ) {
     unsafe {
         crate::cuda_ffi::dgd_forward_f32_cuda(
@@ -2103,7 +2130,7 @@ pub fn dgd_forward_dd(
             alpha.as_ptr(), theta.as_ptr(),
             m_initial.as_ptr(),
             m_states.ptr(), y.ptr(),
-            seq_len as i32, d as i32,
+            seq_len as i32, d as i32, error_clip,
         );
     }
 }
@@ -2116,7 +2143,7 @@ pub fn dgd_backward_dd(
     m_states: &GpuBuf<f32>, d_y: &GpuBuf<f32>,
     d_k_mem: &mut GpuBuf<f32>, d_v_mem: &mut GpuBuf<f32>, d_q_mem: &mut GpuBuf<f32>,
     d_alpha: &mut GpuBuf<f32>, d_theta: &mut GpuBuf<f32>, d_m_initial: &mut GpuBuf<f32>,
-    seq_len: usize, d: usize,
+    seq_len: usize, d: usize, error_clip: f32,
 ) {
     unsafe {
         crate::cuda_ffi::dgd_backward_f32_cuda(
@@ -2125,7 +2152,7 @@ pub fn dgd_backward_dd(
             d_y.as_ptr(),
             d_k_mem.ptr(), d_v_mem.ptr(), d_q_mem.ptr(),
             d_alpha.ptr(), d_theta.ptr(), d_m_initial.ptr(),
-            seq_len as i32, d as i32,
+            seq_len as i32, d as i32, error_clip,
         );
     }
 }
@@ -2141,7 +2168,7 @@ pub fn delta_forward_dd_ckpt(
     alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>,
     m_initial: &GpuSlice<f32>,
     m_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
-    seq_len: usize, d: usize, checkpoint_interval: usize,
+    seq_len: usize, d: usize, checkpoint_interval: usize, error_clip: f32,
 ) {
     unsafe {
         crate::cuda_ffi::delta_forward_ckpt_f32_cuda(
@@ -2149,7 +2176,7 @@ pub fn delta_forward_dd_ckpt(
             alpha.as_ptr(), theta.as_ptr(),
             m_initial.as_ptr(),
             m_states.ptr(), y.ptr(),
-            seq_len as i32, d as i32, checkpoint_interval as i32,
+            seq_len as i32, d as i32, checkpoint_interval as i32, error_clip,
         );
     }
 }
@@ -2161,7 +2188,7 @@ pub fn titans_forward_dd_ckpt(
     alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>, eta: &GpuBuf<f32>,
     m_initial: &GpuSlice<f32>, s_initial: &GpuSlice<f32>,
     m_states: &mut GpuBuf<f32>, s_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
-    seq_len: usize, d: usize, checkpoint_interval: usize,
+    seq_len: usize, d: usize, checkpoint_interval: usize, error_clip: f32,
 ) {
     unsafe {
         crate::cuda_ffi::titans_forward_ckpt_f32_cuda(
@@ -2169,7 +2196,7 @@ pub fn titans_forward_dd_ckpt(
             alpha.as_ptr(), theta.as_ptr(), eta.as_ptr(),
             m_initial.as_ptr(), s_initial.as_ptr(),
             m_states.ptr(), s_states.ptr(), y.ptr(),
-            seq_len as i32, d as i32, checkpoint_interval as i32,
+            seq_len as i32, d as i32, checkpoint_interval as i32, error_clip,
         );
     }
 }
@@ -2200,7 +2227,7 @@ pub fn dgd_forward_dd_ckpt(
     alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>,
     m_initial: &GpuSlice<f32>,
     m_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
-    seq_len: usize, d: usize, checkpoint_interval: usize,
+    seq_len: usize, d: usize, checkpoint_interval: usize, error_clip: f32,
 ) {
     unsafe {
         crate::cuda_ffi::dgd_forward_ckpt_f32_cuda(
@@ -2208,7 +2235,7 @@ pub fn dgd_forward_dd_ckpt(
             alpha.as_ptr(), theta.as_ptr(),
             m_initial.as_ptr(),
             m_states.ptr(), y.ptr(),
-            seq_len as i32, d as i32, checkpoint_interval as i32,
+            seq_len as i32, d as i32, checkpoint_interval as i32, error_clip,
         );
     }
 }
@@ -2223,7 +2250,7 @@ pub fn delta_backward_dd_segment(
     d_m_seed: &GpuBuf<f32>,
     d_k_mem: &mut GpuBuf<f32>, d_v_mem: &mut GpuBuf<f32>, d_q_mem: &mut GpuBuf<f32>,
     d_alpha: &mut GpuBuf<f32>, d_theta: &mut GpuBuf<f32>, d_m_out: &mut GpuBuf<f32>,
-    t_start: usize, t_end: usize, d: usize,
+    t_start: usize, t_end: usize, d: usize, error_clip: f32,
 ) {
     debug_assert!(t_start < t_end, "segment t_start={t_start} must be < t_end={t_end}");
     debug_assert!(d > 0, "d must be > 0");
@@ -2236,7 +2263,7 @@ pub fn delta_backward_dd_segment(
             d_m_seed.as_ptr(),
             d_k_mem.ptr(), d_v_mem.ptr(), d_q_mem.ptr(),
             d_alpha.ptr(), d_theta.ptr(), d_m_out.ptr(),
-            t_start as i32, t_end as i32, d as i32,
+            t_start as i32, t_end as i32, d as i32, error_clip,
         );
     }
 }
@@ -2252,7 +2279,7 @@ pub fn titans_backward_dd_segment(
     d_k_mem: &mut GpuBuf<f32>, d_v_mem: &mut GpuBuf<f32>, d_q_mem: &mut GpuBuf<f32>,
     d_alpha: &mut GpuBuf<f32>, d_theta: &mut GpuBuf<f32>, d_eta: &mut GpuBuf<f32>,
     d_m_out: &mut GpuBuf<f32>, d_s_out: &mut GpuBuf<f32>,
-    t_start: usize, t_end: usize, d: usize,
+    t_start: usize, t_end: usize, d: usize, error_clip: f32,
 ) {
     debug_assert!(t_start < t_end, "segment t_start={t_start} must be < t_end={t_end}");
     debug_assert!(d > 0, "d must be > 0");
@@ -2266,7 +2293,7 @@ pub fn titans_backward_dd_segment(
             d_k_mem.ptr(), d_v_mem.ptr(), d_q_mem.ptr(),
             d_alpha.ptr(), d_theta.ptr(), d_eta.ptr(),
             d_m_out.ptr(), d_s_out.ptr(),
-            t_start as i32, t_end as i32, d as i32,
+            t_start as i32, t_end as i32, d as i32, error_clip,
         );
     }
 }
@@ -2306,7 +2333,7 @@ pub fn dgd_backward_dd_segment(
     d_m_seed: &GpuBuf<f32>,
     d_k_mem: &mut GpuBuf<f32>, d_v_mem: &mut GpuBuf<f32>, d_q_mem: &mut GpuBuf<f32>,
     d_alpha: &mut GpuBuf<f32>, d_theta: &mut GpuBuf<f32>, d_m_out: &mut GpuBuf<f32>,
-    t_start: usize, t_end: usize, d: usize,
+    t_start: usize, t_end: usize, d: usize, error_clip: f32,
 ) {
     debug_assert!(t_start < t_end, "segment t_start={t_start} must be < t_end={t_end}");
     debug_assert!(d > 0, "d must be > 0");
@@ -2319,7 +2346,7 @@ pub fn dgd_backward_dd_segment(
             d_m_seed.as_ptr(),
             d_k_mem.ptr(), d_v_mem.ptr(), d_q_mem.ptr(),
             d_alpha.ptr(), d_theta.ptr(), d_m_out.ptr(),
-            t_start as i32, t_end as i32, d as i32,
+            t_start as i32, t_end as i32, d as i32, error_clip,
         );
     }
 }

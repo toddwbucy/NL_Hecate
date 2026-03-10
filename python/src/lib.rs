@@ -278,6 +278,7 @@ impl MAGConfig {
         theta_floor=None, theta_ceil=None,
         intermediate_size=0,
         m_norm_max=None,
+        error_clip=None,
         feature_map="identity",
         feature_map_sigma=1.0,
         parallel_strategy=None,
@@ -323,6 +324,7 @@ impl MAGConfig {
         theta_ceil: Option<Vec<f32>>,
         intermediate_size: usize,
         m_norm_max: Option<Vec<f32>>,
+        error_clip: Option<Vec<f32>>,
         feature_map: &str,
         feature_map_sigma: f32,
         parallel_strategy: Option<&str>,
@@ -351,6 +353,20 @@ impl MAGConfig {
             if cs < 1 {
                 return Err(PyValueError::new_err(format!(
                     "chunk_sizes[{i}] must be >= 1, got {cs}"
+                )));
+            }
+        }
+        if let Some(ref v) = m_norm_max {
+            if !v.is_empty() && v.len() != k {
+                return Err(PyValueError::new_err(format!(
+                    "m_norm_max length ({}) must equal k ({k})", v.len()
+                )));
+            }
+        }
+        if let Some(ref v) = error_clip {
+            if !v.is_empty() && v.len() != k {
+                return Err(PyValueError::new_err(format!(
+                    "error_clip length ({}) must equal k ({k})", v.len()
                 )));
             }
         }
@@ -547,6 +563,7 @@ impl MAGConfig {
                 theta_ceil: theta_ceil.unwrap_or_default(),
                 intermediate_size,
                 m_norm_max: m_norm_max.unwrap_or_default(),
+                error_clip: error_clip.unwrap_or_default(),
                 feature_map: fm_kind,
                 residual,
             },
@@ -624,6 +641,8 @@ impl MAGConfig {
     fn theta_ceil(&self) -> Vec<f32> { self.inner.theta_ceil.clone() }
     #[getter]
     fn m_norm_max(&self) -> Vec<f32> { self.inner.m_norm_max.clone() }
+    #[getter]
+    fn error_clip(&self) -> Vec<f32> { self.inner.error_clip.clone() }
     #[getter]
     fn feature_map(&self) -> (String, Option<f64>) {
         match self.inner.feature_map {
@@ -857,6 +876,7 @@ impl MAGForwardCache {
     theta_floor=None, theta_ceil=None,
     intermediate_size=0,
     m_norm_max=None,
+    error_clip=None,
     feature_map="identity",
     feature_map_sigma=1.0,
     parallel_strategy=None,
@@ -902,6 +922,7 @@ fn mag_create_config(
     theta_ceil: Option<Vec<f32>>,
     intermediate_size: usize,
     m_norm_max: Option<Vec<f32>>,
+    error_clip: Option<Vec<f32>>,
     feature_map: &str,
     feature_map_sigma: f32,
     parallel_strategy: Option<&str>,
@@ -915,7 +936,7 @@ fn mag_create_config(
         d_hidden, lp_p, sign_sharpness, lq_q, lambda_local, lambda_2, delta, m_slots, d_compress, lambda_k, lambda_v,
         retention, m3, frequency_schedule, checkpoint_interval, attentional_bias, kernel_size, self_ref_chunk_size,
         projection_kind, self_generated_values, momentum_kind, momentum_d_hidden,
-        theta_floor, theta_ceil, intermediate_size, m_norm_max,
+        theta_floor, theta_ceil, intermediate_size, m_norm_max, error_clip,
         feature_map, feature_map_sigma,
         parallel_strategy, tnt_global_chunk_size, tnt_local_chunk_size,
         residual,

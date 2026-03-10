@@ -33,6 +33,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "error_clip.cuh"
 
 // ══════════════════════════════════════════════════════════════════════
 // Ampere+ cp.async helpers (sm_80+)
@@ -86,7 +87,7 @@ __global__ void delta_forward_kernel(
     const float* __restrict__ m_initial,  // [batch_size, d*d]
     float* __restrict__ m_states,         // [batch_size, (seq_len+1)*d*d]
     float* __restrict__ y,                // [batch_size, seq_len, d]
-    int seq_len, int d)
+    int seq_len, int d, float error_clip)
 {
     int b = blockIdx.x;   // batch index
     int tid = threadIdx.x;
@@ -181,6 +182,7 @@ __global__ void delta_forward_kernel(
             error_buf[row] = prediction[row] - v_t[row];
         }
         __syncthreads();
+        error_clip_inplace(error_buf, prediction, d, tid, error_clip);
 
         // ── M_{t+1}[i,j] = (1-alpha_t) * M_t[i,j] - theta_t * error[i] * k_t[j] ──
         // Read from m_states[t*dd], write to m_states[(t+1)*dd] — non-overlapping
@@ -233,6 +235,7 @@ __global__ void delta_forward_kernel(
             error_buf[row] = prediction[row] - v_t[row];
         }
         __syncthreads();
+        error_clip_inplace(error_buf, prediction, d, tid, error_clip);
 
         // ── M_{t+1}[i,j] = (1-alpha_t) * M_t[i,j] - theta_t * error[i] * k_t[j] ──
         // Read from m_states[t*dd], write to m_states[(t+1)*dd] — non-overlapping
@@ -274,7 +277,7 @@ __global__ void delta_forward_ckpt_kernel(
     float* __restrict__ m_states,         // [num_ckpt * d*d]
     float* __restrict__ y,
     float* __restrict__ m_work,           // [d*d] — working M in global memory
-    int seq_len, int d, int checkpoint_interval)
+    int seq_len, int d, int checkpoint_interval, float error_clip)
 {
     int tid = threadIdx.x;
     int dd = d * d;
@@ -318,6 +321,7 @@ __global__ void delta_forward_ckpt_kernel(
             error_buf[row] = prediction[row] - v_t[row];
         }
         __syncthreads();
+        error_clip_inplace(error_buf, prediction, d, tid, error_clip);
 
         float retention = 1.0f - alpha_t;
         for (int idx = tid; idx < dd; idx += blockDim.x) {
@@ -352,7 +356,7 @@ extern "C" void delta_forward_ckpt_f32_cuda(
     const float* k_mem, const float* v_mem, const float* q_mem,
     const float* alpha, const float* theta, const float* m_initial,
     float* m_states, float* y,
-    int seq_len, int d, int checkpoint_interval)
+    int seq_len, int d, int checkpoint_interval, float error_clip)
 {
     if (d <= 0 || 2 * d * (int)sizeof(float) > 163840) {
         fprintf(stderr, "delta_forward_ckpt_f32_cuda: d=%d out of range.\n", d);
@@ -394,7 +398,7 @@ extern "C" void delta_forward_ckpt_f32_cuda(
 
     delta_forward_ckpt_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_initial,
-        m_states, y, m_work, seq_len, d, checkpoint_interval);
+        m_states, y, m_work, seq_len, d, checkpoint_interval, error_clip);
     check_cuda_launch("delta_forward_ckpt_kernel", d, smem_bytes);
 
     check_cuda_alloc("delta_forward_ckpt: cudaDeviceSynchronize",
@@ -406,7 +410,7 @@ extern "C" void delta_forward_f32_cuda(
     const float* k_mem, const float* v_mem, const float* q_mem,
     const float* alpha, const float* theta, const float* m_initial,
     float* m_states, float* y,
-    int seq_len, int d, int batch_size)
+    int seq_len, int d, int batch_size, float error_clip)
 {
     if (d <= 0 || 8 * d * (int)sizeof(float) > 163840) {
         fprintf(stderr, "delta_forward_f32_cuda: d=%d out of range (must be 1..=5120).\n", d);
@@ -441,6 +445,6 @@ extern "C" void delta_forward_f32_cuda(
 
     delta_forward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_initial,
-        m_states, y, seq_len, d);
+        m_states, y, seq_len, d, error_clip);
     check_cuda_launch("delta_forward_kernel", d, smem_bytes);
 }

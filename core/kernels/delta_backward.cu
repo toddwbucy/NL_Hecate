@@ -38,6 +38,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "error_clip.cuh"
 
 // ══════════════════════════════════════════════════════════════════════
 // Ampere+ cp.async helpers (sm_80+)
@@ -98,7 +99,7 @@ __global__ void delta_backward_kernel(
     float* __restrict__ d_theta,          // [batch_size, seq_len]
     float* __restrict__ d_m_initial,      // [d*d] — summed across batch (atomicAdd)
     float* __restrict__ d_M,              // [batch_size, d*d] — per-batch gradient accumulator
-    int seq_len, int d)
+    int seq_len, int d, float error_clip)
 {
     int b = blockIdx.x;   // batch index
     int tid = threadIdx.x;
@@ -235,6 +236,7 @@ __global__ void delta_backward_kernel(
             error_buf[row] = prediction[row] - v_t[row];
         }
         __syncthreads();
+        error_clip_inplace(error_buf, prediction, d, tid, error_clip);
 
         // ── d_alpha_t = -sum_{i,j} M_t[i,j] * d_M[i,j] (parallel reduction) ──
         {
@@ -361,7 +363,7 @@ __global__ void delta_backward_segment_kernel(
     float* __restrict__ d_theta,
     float* __restrict__ d_m_out,          // [d*d] — d_M to propagate to earlier segment
     float* __restrict__ d_M,              // [d*d] — gradient accumulator in global memory
-    int t_start, int t_end, int d)
+    int t_start, int t_end, int d, float error_clip)
 {
     int tid = threadIdx.x;
     int dd = d * d;
@@ -419,6 +421,7 @@ __global__ void delta_backward_segment_kernel(
             error_buf[row] = prediction[row] - v_t[row];
         }
         __syncthreads();
+        error_clip_inplace(error_buf, prediction, d, tid, error_clip);
 
         // d_alpha
         {
@@ -510,7 +513,7 @@ extern "C" void delta_backward_segment_f32_cuda(
     const float* d_m_seed,
     float* d_k_mem, float* d_v_mem, float* d_q_mem,
     float* d_alpha, float* d_theta, float* d_m_out,
-    int t_start, int t_end, int d)
+    int t_start, int t_end, int d, float error_clip)
 {
     if (d <= 0) {
         fprintf(stderr, "delta_backward_segment_f32_cuda: d=%d must be > 0.\n", d);
@@ -542,6 +545,10 @@ extern "C" void delta_backward_segment_f32_cuda(
         exit(1);
     }
 
+    check_cuda_alloc("delta_backward_segment: cudaFuncSetAttribute",
+                     cudaFuncSetAttribute(delta_backward_segment_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+
     // Allocate d_M workspace in global memory
     float* d_M_work = nullptr;
     check_cuda_alloc("delta_backward_segment: cudaMalloc d_M_work",
@@ -551,7 +558,7 @@ extern "C" void delta_backward_segment_f32_cuda(
         k_mem, v_mem, q_mem, alpha, theta, m_states, d_y,
         d_m_seed,
         d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta, d_m_out,
-        d_M_work, t_start, t_end, d);
+        d_M_work, t_start, t_end, d, error_clip);
     check_cuda_launch("delta_backward_segment_kernel", d, smem_bytes);
 
     check_cuda_alloc("delta_backward_segment: cudaDeviceSynchronize",
@@ -565,7 +572,7 @@ extern "C" void delta_backward_f32_cuda(
     const float* d_y,
     float* d_k_mem, float* d_v_mem, float* d_q_mem,
     float* d_alpha, float* d_theta, float* d_m_initial,
-    int seq_len, int d, int batch_size)
+    int seq_len, int d, int batch_size, float error_clip)
 {
     if (d <= 0) {
         fprintf(stderr, "delta_backward_f32_cuda: d=%d must be > 0.\n", d);
@@ -613,7 +620,7 @@ extern "C" void delta_backward_f32_cuda(
     delta_backward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_states, d_y,
         d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta, d_m_initial,
-        d_M_work, seq_len, d);
+        d_M_work, seq_len, d, error_clip);
     check_cuda_launch("delta_backward_kernel", d, smem_bytes);
 
     check_cuda_alloc("delta_backward: cudaDeviceSynchronize",

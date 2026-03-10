@@ -29,6 +29,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "error_clip.cuh"
 
 // ══════════════════════════════════════════════════════════════════════
 // Ampere+ cp.async helpers (sm_80+)
@@ -90,7 +91,7 @@ __global__ void titans_forward_kernel(
     float* __restrict__ m_states,         // [batch_size, (seq_len+1)*d*d]
     float* __restrict__ s_states,         // [batch_size, (seq_len+1)*d*d]
     float* __restrict__ y,                // [batch_size, seq_len, d]
-    int seq_len, int d)
+    int seq_len, int d, float error_clip)
 {
     int b = blockIdx.x;   // batch index
     int tid = threadIdx.x;
@@ -192,6 +193,7 @@ __global__ void titans_forward_kernel(
             error_buf[row] = prediction[row] - v_t[row];
         }
         __syncthreads();
+        error_clip_inplace(error_buf, prediction, d, tid, error_clip);
 
         // S_{t+1} = eta * S_t - theta * outer(error, k)
         // M_{t+1} = (1-alpha) * M_t + S_{t+1}
@@ -247,6 +249,7 @@ __global__ void titans_forward_kernel(
             error_buf[row] = prediction[row] - v_t[row];
         }
         __syncthreads();
+        error_clip_inplace(error_buf, prediction, d, tid, error_clip);
 
         // S_{t+1} = eta * S_t - theta * outer(error, k)
         // M_{t+1} = (1-alpha) * M_t + S_{t+1}
@@ -293,7 +296,7 @@ __global__ void titans_forward_ckpt_kernel(
     float* __restrict__ y,
     float* __restrict__ m_work,           // [d*d] — working M
     float* __restrict__ s_work,           // [d*d] — working S
-    int seq_len, int d, int checkpoint_interval)
+    int seq_len, int d, int checkpoint_interval, float error_clip)
 {
     int tid = threadIdx.x;
     int dd = d * d;
@@ -340,6 +343,7 @@ __global__ void titans_forward_ckpt_kernel(
             error_buf[row] = prediction[row] - v_t[row];
         }
         __syncthreads();
+        error_clip_inplace(error_buf, prediction, d, tid, error_clip);
 
         float retention = 1.0f - alpha_t;
         for (int idx = tid; idx < dd; idx += blockDim.x) {
@@ -378,7 +382,7 @@ extern "C" void titans_forward_ckpt_f32_cuda(
     const float* alpha, const float* theta, const float* eta,
     const float* m_initial, const float* s_initial,
     float* m_states, float* s_states, float* y,
-    int seq_len, int d, int checkpoint_interval)
+    int seq_len, int d, int checkpoint_interval, float error_clip)
 {
     if (d <= 0 || 2 * d * (int)sizeof(float) > 163840) {
         fprintf(stderr, "titans_forward_ckpt_f32_cuda: d=%d out of range.\n", d);
@@ -408,7 +412,7 @@ extern "C" void titans_forward_ckpt_f32_cuda(
     titans_forward_ckpt_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, eta,
         m_initial, s_initial, m_states, s_states, y,
-        m_work, s_work, seq_len, d, checkpoint_interval);
+        m_work, s_work, seq_len, d, checkpoint_interval, error_clip);
     check_cuda_launch("titans_forward_ckpt_kernel", d, smem_bytes);
 
     check_cuda_alloc("titans_forward_ckpt: cudaDeviceSynchronize",
@@ -422,7 +426,7 @@ extern "C" void titans_forward_f32_cuda(
     const float* alpha, const float* theta, const float* eta,
     const float* m_initial, const float* s_initial,
     float* m_states, float* s_states, float* y,
-    int seq_len, int d, int batch_size)
+    int seq_len, int d, int batch_size, float error_clip)
 {
     if (d <= 0 || 8 * d * (int)sizeof(float) > 163840) {
         fprintf(stderr, "titans_forward_f32_cuda: d=%d out of range (must be 1..=5120).\n", d);
@@ -450,6 +454,6 @@ extern "C" void titans_forward_f32_cuda(
     titans_forward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, eta,
         m_initial, s_initial, m_states, s_states, y,
-        seq_len, d);
+        seq_len, d, error_clip);
     check_cuda_launch("titans_forward_kernel", d, smem_bytes);
 }

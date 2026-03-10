@@ -91,5 +91,6 @@ fn main() {
         println!("cargo:rerun-if-changed=kernels/gate_backward.cu");
         println!("cargo:rerun-if-changed=kernels/tnt_forward.cu");
         println!("cargo:rerun-if-changed=kernels/tnt_backward.cu");
+        println!("cargo:rerun-if-changed=kernels/error_clip.cuh");
     }
 }

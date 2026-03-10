@@ -1545,6 +1545,8 @@ pub fn dgd_opaque_backward(
     let meta = saved[0];
     let seq_len = meta[0] as usize;
     let d = meta[1] as usize;
+    // error_clip stored at meta[2] when forward saves it; 0.0 for old recordings
+    let error_clip = if meta.len() > 2 { meta[2] } else { 0.0 };
 
     let k_mem = saved[1];
     let v_mem = saved[2];
@@ -1565,7 +1567,7 @@ pub fn dgd_opaque_backward(
         k_mem, v_mem, q_mem, alpha, theta, m_states, d_y,
         &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
         &mut d_alpha, &mut d_theta, &mut d_m_initial,
-        seq_len, d,
+        seq_len, d, error_clip,
     );
 
     d_inputs[0] = d_k_mem;

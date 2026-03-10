@@ -737,6 +737,7 @@ fn gpu_memory_forward(
             crate::dispatch::delta_forward_dd(
                 &k_mem, &v_mem, &q_mem, &alpha, &theta,
                 &m_initial_slice, &mut m_states, &mut y, s, d, bs,
+                cfg.error_clip_for_level(level),
             );
             crate::dispatch::cuda_sync();
             // Copy all bs slots' final M back: element b's final M at m_states offset b*(s+1)*dd + s*dd.
@@ -764,6 +765,7 @@ fn gpu_memory_forward(
                 &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
                 &m_initial_slice, &s_initial_slice,
                 &mut m_states, &mut s_states, &mut y, s, d, bs,
+                cfg.error_clip_for_level(level),
             );
             crate::dispatch::cuda_sync();
             copy_final_m_batch(&m_states, context_m, s, dd, bs);
@@ -803,6 +805,7 @@ fn gpu_memory_forward(
             crate::dispatch::delta_forward_dd_ckpt(
                 &k_mem, &v_mem, &q_mem, &alpha, &theta,
                 &m_initial, &mut m_checkpoints, &mut y, s, d, c,
+                cfg.error_clip_for_level(level),
             );
             crate::dispatch::cuda_sync();
             copy_final_m(&m_checkpoints, context_m, (num_ckpt - 1) * dd, dd);
@@ -822,6 +825,7 @@ fn gpu_memory_forward(
                 &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
                 &m_initial, &s_initial_buf.slice(0, dd),
                 &mut m_checkpoints, &mut s_checkpoints, &mut y, s, d, c,
+                cfg.error_clip_for_level(level),
             );
             crate::dispatch::cuda_sync();
             copy_final_m(&m_checkpoints, context_m, (num_ckpt - 1) * dd, dd);
@@ -1062,6 +1066,7 @@ fn gpu_tnt_forward(
                     &alpha_b, &theta_b, &eta_b,
                     &m_initial_slice, &s_initial_slice,
                     &mut m_states, &mut s_states, &mut y_local, cl, d, n_batch,
+                    cfg.error_clip_for_level(level),
                 );
                 GpuMemoryCache::Titans {
                     k_mem: k_mem_b, v_mem: v_mem_b, q_mem: q_mem_b,
@@ -1076,6 +1081,7 @@ fn gpu_tnt_forward(
                     &k_mem_b, &v_mem_b, &q_mem_b,
                     &alpha_b, &theta_b,
                     &m_initial_slice, &mut m_states, &mut y_local, cl, d, n_batch,
+                    cfg.error_clip_for_level(level),
                 );
                 GpuMemoryCache::Delta {
                     k_mem: k_mem_b, v_mem: v_mem_b, q_mem: q_mem_b,
@@ -1214,6 +1220,7 @@ fn gpu_memory_forward_into_scratch(
                 &scratch.k_mem, &scratch.v_mem, &scratch.q_mem,
                 &scratch.alpha, &scratch.theta,
                 &m_initial_slice, &mut scratch.m_states, &mut scratch.y, s, d, bs,
+                cfg.error_clip_for_level(level),
             );
             // NOTE: copy_final_m_batch is NOT called here — caller does it outside the graph.
             true
@@ -1239,6 +1246,7 @@ fn gpu_memory_forward_into_scratch(
                     &scratch.alpha, &scratch.theta, &scratch.eta,
                     &m_initial_slice, &s_initial_slice,
                     &mut scratch.m_states, &mut scratch.s_states, &mut scratch.y, s, d, bs,
+                    cfg.error_clip_for_level(level),
                 );
                 // NOTE: copy_final_m_batch NOT called here — caller does it outside the graph.
             }
