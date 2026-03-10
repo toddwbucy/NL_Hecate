@@ -54,6 +54,8 @@ pub struct GpuStackedBlockCache {
     // MAG gating
     pub attn_proj: GpuBuf<f32>,       // [bs*s, d] — attn_out @ W_O^T
     pub gate: GpuBuf<f32>,            // [bs*s, d] — sigmoid(y_combined)
+    // Learnable level aggregation
+    pub alpha_weights: Vec<f32>,      // [k] — softmax(alpha_mem), for backward
     // Residual connections
     pub residual_after_attn: GpuBuf<f32>, // [bs*s, d] = block_input + attn_proj
 }
@@ -306,20 +308,16 @@ pub fn gpu_stacked_forward(
             }
         }
 
-        // ── Combine levels: uniform sum with 1/sqrt(k) for k>2 ────
-        // NOTE: alpha_mem/alpha_refl are not yet used here. Level outputs are
-        // combined via uniform sum. When learnable aggregation is added, replace
-        // the uniform sum with softmax(alpha) weighted combination.
+        // ── Learnable level aggregation: weights = softmax(alpha_mem) ────
+        // Spec: specs/infrastructure/21_stacked_alpha_aggregation.md
+        // HOPE eq-074: y_t = Agg(...), "learnable weighted sum"
+        let mut alpha_host = vec![0.0f32; cfg.k];
+        block.alpha_mem.slice(0, cfg.k).copy_to_host(&mut alpha_host);
+        let alpha_weights = crate::stacked_model::host_softmax(&alpha_host);
         let mut y_combined = GpuBuf::<f32>::zeros(total);
-        for y_level in &y_per_level {
+        for (l, y_level) in y_per_level.iter().enumerate() {
             unsafe {
-                crate::cuda_ffi::saxpy_cuda(1.0, y_level.as_ptr(), y_combined.ptr(), total_i32);
-            }
-        }
-        if cfg.k > 2 {
-            let scale = 1.0 / (cfg.k as f32).sqrt();
-            unsafe {
-                crate::cuda_ffi::saxpy_cuda(scale - 1.0, y_combined.as_ptr(), y_combined.ptr(), total_i32);
+                crate::cuda_ffi::saxpy_cuda(alpha_weights[l], y_level.as_ptr(), y_combined.ptr(), total_i32);
             }
         }
 
@@ -354,6 +352,7 @@ pub fn gpu_stacked_forward(
             y_combined,
             attn_proj,
             gate,
+            alpha_weights,
             residual_after_attn,
         });
     }

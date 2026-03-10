@@ -13,6 +13,28 @@ use crate::model::{
 };
 use crate::tensor::SimpleRng;
 
+// ── Host-side softmax for alpha_mem ──────────────────────────────────
+
+/// Numerically stable softmax over a small host-side vector (k elements).
+/// Used for learnable level aggregation weights (HOPE eq-074).
+pub fn host_softmax(logits: &[f32]) -> Vec<f32> {
+    if logits.is_empty() {
+        return vec![];
+    }
+    let max_val = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut out = vec![0.0f32; logits.len()];
+    let mut sum_exp = 0.0f32;
+    for (i, &a) in logits.iter().enumerate() {
+        let e = (a - max_val).exp();
+        out[i] = e;
+        sum_exp += e;
+    }
+    for w in &mut out {
+        *w /= sum_exp;
+    }
+    out
+}
+
 // ── Per-block parameters ─────────────────────────────────────────────
 
 /// Parameters for one block in the stacked architecture.

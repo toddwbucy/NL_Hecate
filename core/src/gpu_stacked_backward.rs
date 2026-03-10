@@ -35,6 +35,8 @@ pub struct GpuStackedBlockGrads {
     pub d_ln_mem_gamma: GpuBuf<f32>,
     pub d_ln_mem_beta: GpuBuf<f32>,
     pub levels: Vec<GpuLevelGrads>,
+    /// Gradient for learnable level aggregation weights. Length k.
+    pub d_alpha_mem: Vec<f32>,
     /// Per-level L2 norm of d_y_combined (output gradient entering each level's
     /// backward). Length k. 0.0 for inactive levels. Used by tape diagnostics.
     pub level_output_gnorms: Vec<f32>,
@@ -208,13 +210,27 @@ pub fn gpu_stacked_backward(
             );
         }
 
-        // Scale for 1/sqrt(k) normalization (k>2)
-        if cfg.k > 2 {
-            let scale = 1.0 / (cfg.k as f32).sqrt();
-            unsafe {
-                crate::cuda_ffi::saxpy_cuda(scale - 1.0, d_y_combined.as_ptr(), d_y_combined.ptr(), bsd_i32);
-            }
+        // ── Learnable aggregation backward ──────────────────────────
+        // Forward: y_combined = Σ_l w[l] * y_level[l], w = softmax(alpha_mem)
+        // Spec: specs/infrastructure/21_stacked_alpha_aggregation.md
+
+        // Compute d_alpha_mem via softmax Jacobian (reference: mac.rs:904-915).
+        // dot_l = <d_y_combined, y_level[l]> — inner products on host.
+        let w = &bc.alpha_weights;
+        let mut d_y_host = vec![0.0f32; bsd];
+        crate::dispatch::cuda_sync();
+        d_y_combined.slice(0, bsd).copy_to_host(&mut d_y_host);
+        let mut dots = vec![0.0f64; cfg.k];
+        for l in 0..cfg.k {
+            let mut y_l_host = vec![0.0f32; bsd];
+            bc.y_per_level[l].slice(0, bsd).copy_to_host(&mut y_l_host);
+            dots[l] = d_y_host.iter().zip(y_l_host.iter())
+                .map(|(&dy, &y)| dy as f64 * y as f64).sum();
         }
+        let weighted_dot_sum: f64 = (0..cfg.k).map(|j| w[j] as f64 * dots[j]).sum();
+        let d_alpha_mem: Vec<f32> = (0..cfg.k)
+            .map(|l| (w[l] as f64 * (dots[l] - weighted_dot_sum)) as f32)
+            .collect();
 
         // ── Per-level output gradient norms (tape diagnostics) ─────
         let mut block_level_gnorms = vec![0.0f32; cfg.k];
@@ -241,14 +257,21 @@ pub fn gpu_stacked_backward(
             }
         }
 
-        // ── Memory backward per level ──────────────────────────────
+        // ── Memory backward per level (weighted by alpha) ──────────
+        // Each level receives d_y_level[l] = w[l] * d_y_combined
         let mut d_mem_input = GpuBuf::zeros(bsd);
         for level in 0..cfg.k {
+            // Scale d_y_combined by alpha weight for this level
+            let mut d_y_level = GpuBuf::zeros(bsd);
+            unsafe {
+                crate::cuda_ffi::saxpy_cuda(w[level], d_y_combined.as_ptr(), d_y_level.ptr(), bsd_i32);
+            }
+
             if cache.pulse.active_levels[level] {
                 if let Some(ref mem_cache) = bc.memory_caches[level] {
                     let d_emb_level = gpu_memory_backward(
                         &block.levels[level], cfg, mem_cache,
-                        &d_y_combined, &bc.ln_mem_out,
+                        &d_y_level, &bc.ln_mem_out,
                         &mut level_grads[level],
                         s, d, level, bs,
                     );
@@ -259,7 +282,7 @@ pub fn gpu_stacked_backward(
             } else {
                 let d_emb_level = gpu_memory_read_only_backward(
                     &block.levels[level], &bc.y_per_level[level],
-                    &d_y_combined, &bc.ln_mem_out,
+                    &d_y_level, &bc.ln_mem_out,
                     &mut level_grads[level],
                     s, d, bs,
                 );
@@ -361,6 +384,7 @@ pub fn gpu_stacked_backward(
             d_ln_attn_gamma, d_ln_attn_beta,
             d_ln_mem_gamma, d_ln_mem_beta,
             levels: level_grads,
+            d_alpha_mem,
             level_output_gnorms: block_level_gnorms,
         });
     }
