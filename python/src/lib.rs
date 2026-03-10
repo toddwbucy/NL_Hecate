@@ -2429,6 +2429,9 @@ impl GpuStackedModel {
         cfg: &MAGConfig, n_blocks: usize, seed: u64, batch_size: usize,
         memory_reset: bool,
     ) -> PyResult<Self> {
+        if batch_size == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err("batch_size must be >= 1"));
+        }
         let host_params = nl_hecate_core::stacked_model::StackedMAGParams::init(
             &cfg.inner, n_blocks, seed,
         );
