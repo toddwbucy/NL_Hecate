@@ -78,7 +78,7 @@ pub fn extract_tape_summary(
         for lev in 0..cfg.k {
             // Collect all blocks at this level in forward order.
             let level_blocks: Vec<(usize, String)> = all_blocks.iter()
-                .filter_map(|&(idx, key, lvl)| {
+                .filter_map(|&(idx, key, lvl, _block_idx)| {
                     if lvl == Some(lev) {
                         Some((idx, format!("{:?}", key)))
                     } else {
@@ -111,6 +111,105 @@ pub fn extract_tape_summary(
         }
 
         TapeSummary { loss, total_blocks, levels }
+    })
+}
+
+// ── Stacked Tape Summary ──────────────────────────────────────────────
+
+use crate::stacked_model::StackedMAGParams;
+use crate::traced_forward::{traced_stacked_forward, TracedStackedParamIds};
+
+/// Per-(block, level) entry in a `StackedTapeSummary`.
+#[derive(Debug, Clone)]
+pub struct BlockLevelSummary {
+    pub block: usize,
+    pub level: usize,
+    pub opaque_key: String,
+    pub block_count: usize,
+    pub output_grad_norm: f32,
+    pub dgd_delta_norm: f32,
+}
+
+/// Per-block summary aggregated across levels.
+#[derive(Debug, Clone)]
+pub struct BlockTapeSummary {
+    pub block: usize,
+    pub levels: Vec<BlockLevelSummary>,
+}
+
+/// Lightweight diagnostic from one traced forward+backward on stacked model.
+#[derive(Debug, Clone)]
+pub struct StackedTapeSummary {
+    pub loss: f32,
+    pub total_blocks: usize,
+    pub n_blocks: usize,
+    pub blocks: Vec<BlockTapeSummary>,
+}
+
+/// Run one traced forward+backward on stacked `params`/`context` and return
+/// a `StackedTapeSummary` with per-(block, level) opaque block diagnostics.
+///
+/// Does NOT update weights or optimizer state.
+pub fn extract_stacked_tape_summary(
+    params:     &StackedMAGParams,
+    cfg:        &MAGConfig,
+    input_ids:  &[usize],
+    target_ids: &[usize],
+    pulse:      &Pulse,
+    context:    &mut Vec<Vec<Vec<f32>>>,
+) -> StackedTapeSummary {
+    let registry = register_opaque_vjps();
+    let n_blocks = params.blocks.len();
+
+    with_tape(registry, |tape| {
+        let (loss, loss_id, _param_ids) =
+            traced_stacked_forward(tape, params, cfg, input_ids, target_ids, pulse, context);
+
+        tape.backward(loss_id);
+
+        let all_ops = tape.enumerate_opaque_blocks();
+        let total_blocks = all_ops.len();
+
+        let mut blocks = Vec::with_capacity(n_blocks);
+        for b in 0..n_blocks {
+            let mut levels = Vec::with_capacity(cfg.k);
+            for lev in 0..cfg.k {
+                let level_blocks: Vec<(usize, String)> = all_ops.iter()
+                    .filter_map(|&(idx, key, lvl, blk)| {
+                        if lvl == Some(lev) && blk == Some(b) {
+                            Some((idx, format!("{:?}", key)))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                let block_count = level_blocks.len();
+                let (opaque_key_str, output_grad_norm, dgd_delta_norm) =
+                    if let Some((last_idx, last_key)) = level_blocks.last() {
+                        let gnorm = tape.opaque_output_grad_norm(*last_idx).unwrap_or(0.0);
+                        let dgd_norm = tape
+                            .get_saved_by_role(*last_idx, obs::DGD_DELTA)
+                            .map(|buf| buf.iter().map(|x| x * x).sum::<f32>().sqrt())
+                            .unwrap_or(0.0);
+                        (last_key.clone(), gnorm, dgd_norm)
+                    } else {
+                        (String::from("None"), 0.0, 0.0)
+                    };
+
+                levels.push(BlockLevelSummary {
+                    block: b,
+                    level: lev,
+                    opaque_key: opaque_key_str,
+                    block_count,
+                    output_grad_norm,
+                    dgd_delta_norm,
+                });
+            }
+            blocks.push(BlockTapeSummary { block: b, levels });
+        }
+
+        StackedTapeSummary { loss, total_blocks, n_blocks, blocks }
     })
 }
 

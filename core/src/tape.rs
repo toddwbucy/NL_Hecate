@@ -33,15 +33,18 @@ pub struct TapeBuf {
     /// CMS level index (0..k-1) this buffer belongs to.
     /// None for buffers that are not level-specific.
     pub level: Option<usize>,
+    /// Block index within stacked model (0..n_blocks-1).
+    /// None for shared params (embed, unembed, ln_final) and single-block models.
+    pub block_index: Option<usize>,
 }
 
 impl TapeBuf {
     pub fn new(data: Vec<f32>, shape: Vec<usize>) -> Self {
-        TapeBuf { data, shape, is_param: false, role: None, level: None }
+        TapeBuf { data, shape, is_param: false, role: None, level: None, block_index: None }
     }
 
     pub fn param(data: Vec<f32>, shape: Vec<usize>) -> Self {
-        TapeBuf { data, shape, is_param: true, role: None, level: None }
+        TapeBuf { data, shape, is_param: true, role: None, level: None, block_index: None }
     }
 
     pub fn numel(&self) -> usize {
@@ -244,6 +247,16 @@ pub enum TapeOp {
         saved: Vec<BufId>,
         /// CMS level index for this block (0..k-1), or None for non-CMS blocks (SWA, DGD).
         level: Option<usize>,
+        /// Block index within stacked model (0..n_blocks-1), or None for single-block.
+        block_index: Option<usize>,
+    },
+    // ── LayerNorm ────────────────────────────────────────────────
+    /// out = LayerNorm(x, gamma, beta). Saves x, gamma, mean, rstd for backward.
+    LayerNorm {
+        input: BufId, gamma: BufId, beta: BufId, out: BufId,
+        /// Saved for backward
+        mean_cache: BufId, rstd_cache: BufId,
+        n: usize, d: usize,
     },
 }
 
@@ -305,7 +318,7 @@ impl Tape {
         level: Option<usize>,
     ) -> BufId {
         let id = self.bufs.len();
-        self.bufs.push(TapeBuf { data, shape, is_param: false, role: Some(role), level });
+        self.bufs.push(TapeBuf { data, shape, is_param: false, role: Some(role), level, block_index: None });
         self.grad_accum.push(None);
         id
     }
@@ -387,7 +400,16 @@ impl Tape {
                           level: Option<usize>) {
         assert!(self.opaque_registry.contains_key(&key),
                 "No opaque backward registered for {:?}", key);
-        self.record(TapeOp::Opaque { key, inputs, outputs, saved, level });
+        self.record(TapeOp::Opaque { key, inputs, outputs, saved, level, block_index: None });
+    }
+
+    /// Record an opaque block with block_index for stacked models.
+    pub fn record_opaque_stacked(&mut self, key: OpaqueKey, inputs: Vec<BufId>,
+                                  outputs: Vec<BufId>, saved: Vec<BufId>,
+                                  level: Option<usize>, block_index: Option<usize>) {
+        assert!(self.opaque_registry.contains_key(&key),
+                "No opaque backward registered for {:?}", key);
+        self.record(TapeOp::Opaque { key, inputs, outputs, saved, level, block_index });
     }
 
     // ── Gradient seeding and access ──────────────────────────────
@@ -781,8 +803,26 @@ impl Tape {
                 }
             }
 
+            // ── LayerNorm: out = LN(x, gamma, beta) ──────────────
+            TapeOp::LayerNorm { input, gamma, beta, out, mean_cache, rstd_cache, n, d } => {
+                if let Some(d_out) = self.grad_accum[*out].clone() {
+                    let x_data = self.bufs[*input].data.clone();
+                    let gamma_data = self.bufs[*gamma].data.clone();
+                    let mean_data = self.bufs[*mean_cache].data.clone();
+                    let rstd_data = self.bufs[*rstd_cache].data.clone();
+                    let (d_x, d_gamma, d_beta) = crate::mag::layer_norm_backward(
+                        &d_out, &x_data, &gamma_data,
+                        &mean_data, &rstd_data,
+                        *n, *d,
+                    );
+                    self.accumulate_grad(*input, &d_x);
+                    self.accumulate_grad(*gamma, &d_gamma);
+                    self.accumulate_grad(*beta, &d_beta);
+                }
+            }
+
             // ── Opaque: registered VJP block ─────────────────────
-            TapeOp::Opaque { key, inputs, outputs, saved, level: _ } => {
+            TapeOp::Opaque { key, inputs, outputs, saved, level: _, block_index: _ } => {
                 // Collect upstream gradients for all outputs.
                 let d_outputs: Vec<Vec<f32>> = outputs.iter().map(|&oid| {
                     self.grad_accum[oid].clone().unwrap_or_else(|| vec![0.0; self.bufs[oid].numel()])
@@ -861,10 +901,11 @@ impl Tape {
     }
 
     /// Enumerate all opaque blocks in forward order: `(op_idx, key, level)`.
-    pub fn enumerate_opaque_blocks(&self) -> Vec<(usize, OpaqueKey, Option<usize>)> {
+    /// Enumerate opaque blocks. Returns (op_idx, key, level, block_index).
+    pub fn enumerate_opaque_blocks(&self) -> Vec<(usize, OpaqueKey, Option<usize>, Option<usize>)> {
         self.ops.iter().enumerate()
             .filter_map(|(i, op)| match op {
-                TapeOp::Opaque { key, level, .. } => Some((i, *key, *level)),
+                TapeOp::Opaque { key, level, block_index, .. } => Some((i, *key, *level, *block_index)),
                 _ => None,
             })
             .collect()
@@ -2383,7 +2424,7 @@ mod tests {
 
         let blocks = tape.enumerate_opaque_blocks();
         assert_eq!(blocks.len(), 4, "expected 4 opaque blocks");
-        for (expected_level, &(_, key, level)) in blocks.iter().enumerate() {
+        for (expected_level, &(_, key, level, _block_idx)) in blocks.iter().enumerate() {
             assert_eq!(key, OpaqueKey::DeltaRule);
             assert_eq!(level, Some(expected_level),
                 "block {expected_level}: got level {level:?}");

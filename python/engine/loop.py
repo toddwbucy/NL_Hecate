@@ -1111,10 +1111,13 @@ def run_build(bcfg: BuildConfig):
                 # The Rust binding rejects target_ids >= vocab_size; masked batches are
                 # normal (all-user-turn chunks) and should not generate warning noise.
                 try:
-                    if is_stacked and hasattr(gpu_model, "gpu_stacked_tape_summary"):
-                        # Stacked model -- per-(block, level) diagnostics (GPU only)
-                        if tape_device == "cpu":
-                            print("  [tape] WARNING: tape_device='cpu' not supported for stacked models, using 'gpu'")
+                    if is_stacked and tape_device == "cpu" and hasattr(gpu_model, "cpu_stacked_tape_summary"):
+                        # Stacked model -- CPU Wengert tape for full gradient observability
+                        tape_sum = gpu_model.cpu_stacked_tape_summary(
+                            input_ids, target_ids, pulse
+                        )
+                    elif is_stacked and hasattr(gpu_model, "gpu_stacked_tape_summary"):
+                        # Stacked model -- per-(block, level) diagnostics (GPU fast path)
                         tape_sum = gpu_model.gpu_stacked_tape_summary(
                             input_ids, target_ids, pulse
                         )
@@ -1280,7 +1283,11 @@ def run_build(bcfg: BuildConfig):
                     and input_ids is not None and target_ids is not None
                     and max(target_ids) < bcfg.vocab_size):
                 try:
-                    if hasattr(gpu_model, "gpu_stacked_tape_summary"):
+                    if tape_device_stacked == "cpu" and hasattr(gpu_model, "cpu_stacked_tape_summary"):
+                        tape_sum = gpu_model.cpu_stacked_tape_summary(
+                            input_ids, target_ids, pulse
+                        )
+                    elif hasattr(gpu_model, "gpu_stacked_tape_summary"):
                         tape_sum = gpu_model.gpu_stacked_tape_summary(
                             input_ids, target_ids, pulse
                         )
