@@ -149,7 +149,11 @@ def run_build(bcfg: BuildConfig):
             result = nl_hecate.load_stacked_checkpoint(bcfg.load)
             _stacked_params_json = result["params_json"]
             cfg = result["config"]
+            bcfg.n_blocks = result["n_blocks"]
             build_state = result["build_state"]
+            # Create a dummy single-block params for num_params display
+            # (the actual GPU model uses _stacked_params_json)
+            params = nl_hecate.MAGParams(cfg, seed=bcfg.seed if hasattr(bcfg, "seed") else 42)
             if build_state is not None:
                 resume_step = build_state["global_step"]
                 print(f"  Stacked checkpoint: n_blocks={result['n_blocks']}, k={cfg.k}")
@@ -1359,7 +1363,7 @@ def run_build(bcfg: BuildConfig):
                 ckpt_path = str(p.with_stem(f"{p.stem}_step{step}"))
                 os.makedirs(os.path.dirname(ckpt_path) or ".", exist_ok=True)
                 nl_hecate.save_stacked_checkpoint(
-                    ckpt_path, cfg, bcfg.n_blocks, gpu_model,
+                    ckpt_path, gpu_model,
                     conductor=conductor, context=context)
                 sidecar = Path(str(ckpt_path) + ".cursor.json")
                 if bpe_loaders:
@@ -1672,7 +1676,7 @@ def run_build(bcfg: BuildConfig):
     os.makedirs(os.path.dirname(final_path) or ".", exist_ok=True)
     if is_stacked and gpu_model is not None:
         nl_hecate.save_stacked_checkpoint(
-            final_path, cfg, bcfg.n_blocks, gpu_model,
+            final_path, gpu_model,
             conductor=conductor, context=context)
     else:
         if gpu_model is not None:

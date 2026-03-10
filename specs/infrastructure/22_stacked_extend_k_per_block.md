@@ -132,61 +132,72 @@ metadata for explicit format identification.
 
 ### Algorithm
 
-```text
+```rust
 fn extend_stacked_push_up(
     old: &StackedMAGParams,
     new_cfg: &MAGConfig,
-    n_blocks: usize,
     seed: u64,
-) -> StackedMAGParams:
-    assert new_cfg.k == old.blocks[0].levels.len() + 1
+) -> StackedMAGParams {
+    let n_blocks: usize = old.blocks.len();
+    assert!(n_blocks > 0);
+    let old_k: usize = old.blocks[0].levels.len();
+    assert_eq!(new_cfg.k, old_k + 1);
+    assert_eq!(old.w_embed.len(), new_cfg.swa.vocab_size * new_cfg.swa.d_model);
 
-    # 1. Preserve shared params exactly (bitwise)
-    new.w_embed = old.w_embed.clone()
-    new.w_unembed = old.w_unembed.clone()
-    new.ln_final_gamma = old.ln_final_gamma.clone()
-    new.ln_final_beta = old.ln_final_beta.clone()
+    // 1. Preserve shared params exactly (bitwise)
+    let mut new = StackedMAGParams {
+        w_embed: old.w_embed.clone(),
+        w_unembed: old.w_unembed.clone(),
+        ln_final_gamma: old.ln_final_gamma.clone(),
+        ln_final_beta: old.ln_final_beta.clone(),
+        blocks: Vec::with_capacity(n_blocks),
+    };
 
-    # 2. Per-block level shift (independent per block)
-    for b in 0..n_blocks:
-        old_block = old.blocks[b]
-        new_block = BlockParams::init(new_cfg, seed + b * 10_000)
+    // 2. Per-block level shift (independent per block)
+    for b in 0..n_blocks {
+        let old_block: &BlockParams = &old.blocks[b];
+        let block_seed: u64 = seed.wrapping_add(b as u64 * 10_000);
+        let mut new_block: BlockParams = BlockParams::init(new_cfg, block_seed);
 
-        # Preserve SWA projections and LayerNorms for this block
-        new_block.w_q = old_block.w_q.clone()
-        new_block.w_k = old_block.w_k.clone()
-        new_block.w_v = old_block.w_v.clone()
-        new_block.w_o = old_block.w_o.clone()
-        new_block.ln_attn_gamma = old_block.ln_attn_gamma.clone()
-        new_block.ln_attn_beta = old_block.ln_attn_beta.clone()
-        new_block.ln_mem_gamma = old_block.ln_mem_gamma.clone()
-        new_block.ln_mem_beta = old_block.ln_mem_beta.clone()
+        // Preserve SWA projections and LayerNorms for this block
+        new_block.w_q = old_block.w_q.clone();
+        new_block.w_k = old_block.w_k.clone();
+        new_block.w_v = old_block.w_v.clone();
+        new_block.w_o = old_block.w_o.clone();
+        new_block.ln_attn_gamma = old_block.ln_attn_gamma.clone();
+        new_block.ln_attn_beta = old_block.ln_attn_beta.clone();
+        new_block.ln_mem_gamma = old_block.ln_mem_gamma.clone();
+        new_block.ln_mem_beta = old_block.ln_mem_beta.clone();
 
-        # Shift levels: old level[i] → new level[i+1]
-        for i in 0..old_k:
-            new_block.levels[i+1] = old_block.levels[i].clone()
+        // Shift levels: old level[i] → new level[i+1]
+        for i in 0..old_k {
+            new_block.levels[i + 1] = old_block.levels[i].clone();
+        }
 
-        # Fresh L0: clone old L0 projections for scale-matched init
-        # (same logic as single-block: prevents signal swamping)
-        donor = old_block.levels[0]
-        new_block.levels[0].w_k_mem = donor.w_k_mem.clone()
-        new_block.levels[0].w_v_mem = donor.w_v_mem.clone()
-        new_block.levels[0].w_q_mem = donor.w_q_mem.clone()
-        new_block.levels[0].w_alpha = donor.w_alpha.clone()
-        new_block.levels[0].w_theta = donor.w_theta.clone()
-        new_block.levels[0].w_eta = donor.w_eta.clone()
-        new_block.levels[0].w_omega = donor.w_omega.clone()
-        # Gate biases kept at level-0 defaults from init
+        // Fresh L0: clone old L0 projections for scale-matched init
+        // (same logic as single-block: prevents signal swamping)
+        let donor: &MemoryLevelParams = &old_block.levels[0];
+        new_block.levels[0].w_k_mem = donor.w_k_mem.clone();
+        new_block.levels[0].w_v_mem = donor.w_v_mem.clone();
+        new_block.levels[0].w_q_mem = donor.w_q_mem.clone();
+        new_block.levels[0].w_alpha = donor.w_alpha.clone();
+        new_block.levels[0].w_theta = donor.w_theta.clone();
+        new_block.levels[0].w_eta = donor.w_eta.clone();
+        new_block.levels[0].w_omega = donor.w_omega.clone();
+        // Gate biases kept at level-0 defaults from init
 
-        # Shift alpha logits per block
-        for i in 0..old_k:
-            new_block.alpha_mem[i+1] = old_block.alpha_mem[i]
-            new_block.alpha_refl[i+1] = old_block.alpha_refl[i]
-        # new alpha[0] = 0.0 (from init) — uniform initial weight
+        // Shift alpha logits per block
+        for i in 0..old_k {
+            new_block.alpha_mem[i + 1] = old_block.alpha_mem[i];
+            new_block.alpha_refl[i + 1] = old_block.alpha_refl[i];
+        }
+        // new alpha[0] = 0.0 (from init) — uniform initial weight
 
-        new.blocks[b] = new_block
+        new.blocks.push(new_block);
+    }
 
-    return new
+    new
+}
 ```
 
 ### Key differences from single-block push-up

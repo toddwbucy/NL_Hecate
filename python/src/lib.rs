@@ -1680,18 +1680,16 @@ fn is_stacked_checkpoint(path: &str) -> PyResult<bool> {
 /// Uses hierarchical keys: shared.embed.weight, block.{n}.level.{m}.*, etc.
 #[cfg(feature = "cuda")]
 #[pyfunction]
-#[pyo3(signature = (path, cfg, n_blocks, gpu_model, conductor=None, context=None))]
+#[pyo3(signature = (path, gpu_model, conductor=None, context=None))]
 fn save_stacked_checkpoint(
     path: &str,
-    cfg: &MAGConfig,
-    n_blocks: usize,
     gpu_model: &GpuStackedModel,
     conductor: Option<&mut Conductor>,
     context: Option<&ContextState>,
 ) -> PyResult<()> {
-    let d = cfg.inner.swa.d_model;
-    let v = cfg.inner.swa.vocab_size;
-    let k = cfg.inner.k;
+    let d = gpu_model.cfg.swa.d_model;
+    let v = gpu_model.cfg.swa.vocab_size;
+    let k = gpu_model.cfg.k;
     let host_params = gpu_model.params.to_host(d, v, k);
 
     let build_state = match (conductor, context) {
@@ -1717,11 +1715,16 @@ fn save_stacked_checkpoint(
                 global_step: cond.inner.step(),
             })
         }
-        _ => None,
+        (None, None) => None,
+        _ => {
+            return Err(PyValueError::new_err(
+                "save_stacked_checkpoint requires both conductor and context, or neither",
+            ));
+        }
     };
 
     rust_save_stacked(
-        std::path::Path::new(path), &host_params, &cfg.inner, n_blocks, build_state.as_ref(),
+        std::path::Path::new(path), &host_params, &gpu_model.cfg, build_state.as_ref(),
     ).map_err(|e| PyValueError::new_err(format!("save_stacked_checkpoint failed: {e}")))
 }
 
@@ -2611,10 +2614,23 @@ impl GpuStackedModel {
         if batch_size == 0 {
             return Err(pyo3::exceptions::PyValueError::new_err("batch_size must be >= 1"));
         }
+        if n_blocks == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err("n_blocks must be >= 1"));
+        }
         let host_params: nl_hecate_core::stacked_model::StackedMAGParams =
             serde_json::from_str(params_json)
                 .map_err(|e| pyo3::exceptions::PyValueError::new_err(
                     format!("from_params_json: failed to deserialize: {e}")))?;
+        if host_params.blocks.len() != n_blocks {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("from_params_json: params JSON has {} blocks but n_blocks={}",
+                        host_params.blocks.len(), n_blocks)));
+        }
+        if !host_params.blocks.is_empty() && host_params.blocks[0].levels.len() != cfg.inner.k {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("from_params_json: params JSON has k={} but cfg.k={}",
+                        host_params.blocks[0].levels.len(), cfg.inner.k)));
+        }
         let gpu_params = nl_hecate_core::gpu_params::GpuStackedParams::from_host(&host_params);
         let gpu_context = nl_hecate_core::gpu_params::GpuStackedContext::new(
             n_blocks, cfg.inner.k, cfg.inner.swa.d_model, batch_size,

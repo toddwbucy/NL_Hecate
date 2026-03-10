@@ -372,9 +372,9 @@ pub fn save_stacked_safetensors(
     path: &Path,
     params: &StackedMAGParams,
     config: &MAGConfig,
-    n_blocks: usize,
     build_state: Option<&BuildResumeState>,
 ) -> io::Result<()> {
+    let n_blocks = params.blocks.len();
     let mut tensors: Vec<(String, Vec<u8>)> = Vec::new();
 
     fn enc(data: &[f32]) -> Vec<u8> {
@@ -509,26 +509,36 @@ pub fn load_stacked_safetensors(
         ),
     };
 
-    // Detect n_blocks from header keys
-    let n_blocks = meta.get("n_blocks")
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or_else(|| {
-            // Fallback: scan keys for highest block.{n}
-            let mut max_b = 0usize;
-            if let Some(obj) = header.as_object() {
-                for key in obj.keys() {
-                    if let Some(rest) = key.strip_prefix("block.") {
-                        if let Some(dot) = rest.find('.') {
-                            if let Ok(b) = rest[..dot].parse::<usize>() {
-                                max_b = max_b.max(b + 1);
-                            }
+    // Scan keys for actual block count (authoritative)
+    let scanned_n_blocks = {
+        let mut max_b = 0usize;
+        if let Some(obj) = header.as_object() {
+            for key in obj.keys() {
+                if let Some(rest) = key.strip_prefix("block.") {
+                    if let Some(dot) = rest.find('.') {
+                        if let Ok(b) = rest[..dot].parse::<usize>() {
+                            max_b = max_b.max(b + 1);
                         }
                     }
                 }
             }
-            max_b
-        });
+        }
+        max_b
+    };
+
+    // Use metadata n_blocks if present, but validate against scanned keys
+    let n_blocks = match meta.get("n_blocks").and_then(|v| v.as_str()).and_then(|s| s.parse::<usize>().ok()) {
+        Some(meta_n) => {
+            if scanned_n_blocks > 0 && meta_n != scanned_n_blocks {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("stacked safetensors: metadata n_blocks={meta_n} but found {scanned_n_blocks} blocks in keys"),
+                ));
+            }
+            meta_n
+        }
+        None => scanned_n_blocks,
+    };
 
     if n_blocks == 0 {
         return Err(io::Error::new(
@@ -842,7 +852,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("stacked.safetensors");
 
-        save_stacked_safetensors(&path, &params, &cfg, n_blocks, None).unwrap();
+        save_stacked_safetensors(&path, &params, &cfg, None).unwrap();
         let (loaded, loaded_cfg, loaded_nb, build_state) = load_stacked_safetensors(&path).unwrap();
 
         assert_eq!(loaded_nb, n_blocks);
@@ -897,7 +907,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("stacked_bs.safetensors");
 
-        save_stacked_safetensors(&path, &params, &cfg, n_blocks, Some(&build_state)).unwrap();
+        save_stacked_safetensors(&path, &params, &cfg, Some(&build_state)).unwrap();
         let (_, _, loaded_nb, loaded_bs) = load_stacked_safetensors(&path).unwrap();
 
         assert_eq!(loaded_nb, n_blocks);
@@ -923,7 +933,7 @@ mod tests {
         // Stacked checkpoint
         let stacked_path = dir.join("stacked.safetensors");
         let stacked_params = StackedMAGParams::init(&cfg, 2, 42);
-        save_stacked_safetensors(&stacked_path, &stacked_params, &cfg, 2, None).unwrap();
+        save_stacked_safetensors(&stacked_path, &stacked_params, &cfg, None).unwrap();
         assert!(is_stacked_checkpoint(&stacked_path).unwrap());
 
         std::fs::remove_dir_all(&dir).ok();
@@ -937,7 +947,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("stacked_interop.safetensors");
 
-        save_stacked_safetensors(&path, &params, &cfg, 2, None).unwrap();
+        save_stacked_safetensors(&path, &params, &cfg, None).unwrap();
 
         let bytes = std::fs::read(&path).unwrap();
         let _st = safetensors::SafeTensors::deserialize(&bytes)

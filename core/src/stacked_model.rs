@@ -259,14 +259,27 @@ impl StackedMAGParams {
     /// Mirrors `MAGParams::extend_push_up` (model.rs) but operates per-block.
     /// Spec: specs/infrastructure/22_stacked_extend_k_per_block.md
     pub fn extend_push_up(&self, new_cfg: &MAGConfig, seed: u64) -> StackedMAGParams {
-        let old_k = self.blocks[0].levels.len();
         let n_blocks = self.blocks.len();
+        assert!(n_blocks > 0, "extend_push_up: stacked model must have at least 1 block");
+
+        // Validate structural compatibility with new_cfg
+        let old_d = self.w_embed.len() / new_cfg.swa.vocab_size;
+        assert_eq!(
+            old_d, new_cfg.swa.d_model,
+            "extend_push_up: d_model mismatch (checkpoint has {old_d}, new_cfg has {})",
+            new_cfg.swa.d_model,
+        );
+        assert_eq!(
+            self.w_embed.len(), new_cfg.swa.vocab_size * new_cfg.swa.d_model,
+            "extend_push_up: vocab_size mismatch",
+        );
+
+        let old_k = self.blocks[0].levels.len();
         assert_eq!(
             new_cfg.k, old_k + 1,
             "extend_push_up requires new_cfg.k ({}) == old_k + 1 ({})",
             new_cfg.k, old_k + 1,
         );
-        assert!(n_blocks > 0, "extend_push_up: stacked model must have at least 1 block");
         // Validate all blocks have the same k
         for (b, block) in self.blocks.iter().enumerate() {
             assert_eq!(
