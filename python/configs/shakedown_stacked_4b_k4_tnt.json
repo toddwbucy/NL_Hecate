@@ -12,6 +12,7 @@
         "chunk_sizes": [1, 8, 64, 512],
         "m_norm_max": [100.0, 100.0, 100.0, 100.0],
         "error_clip": [50.0, 50.0, 50.0, 50.0],
+        "theta_ceil": [2.0, 2.0, 2.0, 2.0],
         "residual": true,
         "n_blocks": 4,
         "parallel_strategy": "tnt_hierarchical",
