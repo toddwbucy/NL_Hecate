@@ -299,6 +299,107 @@ impl GpuMemoryCache {
             | GpuMemoryCache::SwiGlu { .. } => 0.0,
         }
     }
+
+    /// Extract theta (inner-loop learning rate) statistics from the forward cache.
+    ///
+    /// Returns `Some(ThetaStats)` for rules that have a learned theta (Delta, Titans, DGD),
+    /// `None` for Hebbian/SwiGlu (which have no theta).
+    /// For TNT: aggregates theta values across all shard inner caches.
+    ///
+    /// Source: HOPE (2512.24695) — theta = softplus(w_theta · [k,v] + b_theta)
+    pub fn theta_stats(&self) -> Option<ThetaStats> {
+        // Helper: extract theta buffer ref from any variant that has one
+        let theta_buf: Option<&GpuBuf<f32>> = match self {
+            GpuMemoryCache::Delta { theta, .. }
+            | GpuMemoryCache::Titans { theta, .. }
+            | GpuMemoryCache::DGD { theta, .. }
+            | GpuMemoryCache::DeltaCkpt { theta, .. }
+            | GpuMemoryCache::TitansCkpt { theta, .. }
+            | GpuMemoryCache::DGDCkpt { theta, .. } => Some(theta),
+            GpuMemoryCache::Hebbian { .. }
+            | GpuMemoryCache::HebbianCkpt { .. }
+            | GpuMemoryCache::SwiGlu { .. } => None,
+            GpuMemoryCache::TNT { .. } => None, // handled separately below
+        };
+
+        if let Some(buf) = theta_buf {
+            let n = buf.len();
+            if n == 0 { return None; }
+            let mut host = vec![0.0f32; n];
+            buf.copy_to_host(&mut host);
+            return Some(ThetaStats::from_slice(&host));
+        }
+
+        // TNT: gather theta values from all shard inner caches
+        if let GpuMemoryCache::TNT { shard_inner_caches, .. } = self {
+            let mut all_theta = Vec::new();
+            for shard_cache in shard_inner_caches.iter() {
+                let inner_buf: Option<&GpuBuf<f32>> = match shard_cache {
+                    GpuMemoryCache::Delta { theta, .. }
+                    | GpuMemoryCache::Titans { theta, .. }
+                    | GpuMemoryCache::DGD { theta, .. }
+                    | GpuMemoryCache::DeltaCkpt { theta, .. }
+                    | GpuMemoryCache::TitansCkpt { theta, .. }
+                    | GpuMemoryCache::DGDCkpt { theta, .. } => Some(theta),
+                    _ => None,
+                };
+                if let Some(buf) = inner_buf {
+                    let n = buf.len();
+                    if n > 0 {
+                        let mut host = vec![0.0f32; n];
+                        buf.copy_to_host(&mut host);
+                        all_theta.extend_from_slice(&host);
+                    }
+                }
+            }
+            if all_theta.is_empty() { return None; }
+            return Some(ThetaStats::from_slice(&all_theta));
+        }
+
+        None
+    }
+}
+
+/// Statistics about the theta (inner-loop learning rate) distribution for one (block, level).
+///
+/// Theta is per-token, per-level: theta_t = softplus(w_theta · [k_t, v_t] + b_theta).
+/// This struct summarizes the distribution across all tokens in one forward pass,
+/// revealing whether theta_ceil is constraining the learned rate.
+#[derive(Debug, Clone)]
+pub struct ThetaStats {
+    pub count: usize,
+    pub min: f32,
+    pub max: f32,
+    pub mean: f32,
+    pub median: f32,
+    pub p95: f32,
+    pub p99: f32,
+    /// Fraction of tokens where theta == max (i.e., hitting the ceiling)
+    pub frac_at_max: f32,
+}
+
+impl ThetaStats {
+    pub fn from_slice(values: &[f32]) -> Self {
+        let n = values.len();
+        assert!(n > 0);
+        let mut sorted = values.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let min = sorted[0];
+        let max = sorted[n - 1];
+        let sum: f32 = sorted.iter().sum();
+        let mean = sum / n as f32;
+        let median = sorted[n / 2];
+        let p95 = sorted[((n as f64 * 0.95).ceil() as usize).min(n - 1)];
+        let p99 = sorted[((n as f64 * 0.99).ceil() as usize).min(n - 1)];
+
+        // Fraction at ceiling: count values within 0.1% of max
+        let threshold = max * 0.999;
+        let at_max = sorted.iter().filter(|&&v| v >= threshold).count();
+        let frac_at_max = at_max as f32 / n as f32;
+
+        ThetaStats { count: n, min, max, mean, median, p95, p99, frac_at_max }
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════

@@ -344,12 +344,22 @@ def print_tape_summary(tape_summary: dict, step: int) -> None:
     print(f"  [tape] step={step}  loss={tape_summary['loss']:.4f}"
           f"  total_blocks={tape_summary['total_blocks']}")
     for lvl in tape_summary["levels"]:
-        print(
+        line = (
             f"    L{lvl['level']} [{lvl['opaque_key']}]"
             f"  blocks={lvl['block_count']}"
             f"  out_gnorm={lvl['output_grad_norm']:.4e}"
             f"  dgd_delta={lvl['dgd_delta_norm']:.4e}"
         )
+        print(line)
+        if "theta" in lvl and lvl["theta"] is not None:
+            t = lvl["theta"]
+            ceil_pct = t.get("frac_at_max", 0.0) * 100
+            print(
+                f"           θ  mean={t['mean']:.4f}  "
+                f"p99={t['p99']:.4f}  "
+                f"max={t['max']:.4f}  "
+                f"@ceil={ceil_pct:.1f}%"
+            )
 
 
 def eval_coherence_samples(gpu_model, cfg, max_tokens: int = 30,
