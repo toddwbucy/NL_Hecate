@@ -132,7 +132,7 @@ fn test_cuda_delta_forward_matches_rust() {
     let mut y_cuda = vec![0.0f32; seq_len * d];
     delta_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_initial,
-        &mut m_states_cuda, &mut y_cuda, seq_len, d, f32::MAX);
+        &mut m_states_cuda, &mut y_cuda, seq_len, d, f32::MAX, 0.0);
 
     check_close("delta_fwd_y", &y_rust, &y_cuda, 1e-5);
     check_close("delta_fwd_m_states", &m_states_rust, &m_states_cuda, 1e-5);
@@ -162,7 +162,7 @@ fn test_cuda_delta_forward_full_pipeline() {
     let mut y_cuda = vec![0.0f32; s * d];
     delta_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_initial,
-        &mut m_states_cuda, &mut y_cuda, s, d, f32::MAX);
+        &mut m_states_cuda, &mut y_cuda, s, d, f32::MAX, 0.0);
 
     check_close("pipeline_y", &y_rust, &y_cuda, 1e-5);
     check_close("pipeline_m_states", &cache_rust.m_states, &m_states_cuda, 1e-5);
@@ -188,7 +188,7 @@ fn test_cuda_delta_backward_matches_rust() {
     let mut y = vec![0.0f32; seq_len * d];
     delta_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_initial,
-        &mut m_states, &mut y, seq_len, d, f32::MAX);
+        &mut m_states, &mut y, seq_len, d, f32::MAX, 0.0);
 
     // Upstream gradient
     let d_y = rand_buf(seq_len * d, 700);
@@ -287,7 +287,7 @@ fn test_cuda_delta_backward_matches_rust() {
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_states, &d_y,
         &mut dk_cuda, &mut dv_cuda, &mut dq_cuda,
         &mut dalpha_cuda, &mut dtheta_cuda, &mut dm_init_cuda,
-        seq_len, d);
+        seq_len, d, 0.0);
 
     check_close("delta_bwd_dk", &dk_rust, &dk_cuda, 1e-4);
     check_close("delta_bwd_dv", &dv_rust, &dv_cuda, 1e-4);
@@ -319,7 +319,7 @@ fn test_cuda_delta_forward_seq_len_1() {
     let mut y_cuda = vec![0.0f32; d];
     delta_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_initial,
-        &mut m_states_cuda, &mut y_cuda, seq_len, d, f32::MAX);
+        &mut m_states_cuda, &mut y_cuda, seq_len, d, f32::MAX, 0.0);
 
     check_close("seq1_y", &y_rust, &y_cuda, 1e-5);
     check_close("seq1_m", &m_states_rust, &m_states_cuda, 1e-5);
@@ -347,7 +347,7 @@ fn test_cuda_delta_forward_nonzero_initial() {
     let mut y_cuda = vec![0.0f32; seq_len * d];
     delta_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_initial,
-        &mut m_states_cuda, &mut y_cuda, seq_len, d, f32::MAX);
+        &mut m_states_cuda, &mut y_cuda, seq_len, d, f32::MAX, 0.0);
 
     check_close("nonzero_init_y", &y_rust, &y_cuda, 1e-5);
     check_close("nonzero_init_m", &m_states_rust, &m_states_cuda, 1e-5);
@@ -379,7 +379,7 @@ fn test_cuda_delta_backward_full_pipeline() {
     let mut y = vec![0.0f32; s * d];
     delta_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_initial,
-        &mut m_states, &mut y, s, d, f32::MAX);
+        &mut m_states, &mut y, s, d, f32::MAX, 0.0);
 
     let mut dk_cuda = vec![0.0f32; s * d];
     let mut dv_cuda = vec![0.0f32; s * d];
@@ -392,7 +392,7 @@ fn test_cuda_delta_backward_full_pipeline() {
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_states, &d_y,
         &mut dk_cuda, &mut dv_cuda, &mut dq_cuda,
         &mut dalpha_cuda, &mut dtheta_cuda, &mut dm_init_cuda,
-        s, d);
+        s, d, 0.0);
 
     // The inner loop gradients should match the cache-based ones
     // dk_cuda, dv_cuda, dq_cuda from the inner loop won't directly match
@@ -421,7 +421,7 @@ fn test_cuda_delta_backward_seq_len_1() {
     let mut y = vec![0.0f32; d];
     delta_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_initial,
-        &mut m_states, &mut y, seq_len, d, f32::MAX);
+        &mut m_states, &mut y, seq_len, d, f32::MAX, 0.0);
 
     let d_y = rand_buf(d, 1900);
 
@@ -504,7 +504,7 @@ fn test_cuda_delta_backward_seq_len_1() {
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_states, &d_y,
         &mut dk_cuda, &mut dv_cuda, &mut dq_cuda,
         &mut dalpha_cuda, &mut dtheta_cuda, &mut dm_init_cuda,
-        seq_len, d);
+        seq_len, d, 0.0);
 
     check_close("seq1_bwd_dk", &dk_rust, &dk_cuda, 1e-4);
     check_close("seq1_bwd_dv", &dv_rust, &dv_cuda, 1e-4);
@@ -533,7 +533,7 @@ fn test_cuda_delta_forward_output_nonzero() {
     let mut y = vec![0.0f32; seq_len * d];
     delta_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_initial,
-        &mut m_states, &mut y, seq_len, d, f32::MAX);
+        &mut m_states, &mut y, seq_len, d, f32::MAX, 0.0);
 
     let y_max = y.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
     assert!(y_max > 1e-10, "y should be nonzero, max_abs={y_max}");
@@ -563,7 +563,7 @@ fn test_cuda_delta_backward_nonzero() {
     let mut y = vec![0.0f32; seq_len * d];
     delta_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_initial,
-        &mut m_states, &mut y, seq_len, d, f32::MAX);
+        &mut m_states, &mut y, seq_len, d, f32::MAX, 0.0);
 
     let d_y = vec![1.0f32; seq_len * d];
     let mut dk = vec![0.0f32; seq_len * d];
@@ -576,7 +576,7 @@ fn test_cuda_delta_backward_nonzero() {
     delta_backward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_states, &d_y,
         &mut dk, &mut dv, &mut dq, &mut da, &mut dt, &mut dm,
-        seq_len, d);
+        seq_len, d, 0.0);
 
     let dk_max = dk.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
     let dv_max = dv.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
@@ -605,13 +605,13 @@ fn test_cuda_delta_forward_deterministic() {
     let mut m1 = vec![0.0f32; (seq_len + 1) * dd];
     delta_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_initial,
-        &mut m1, &mut y1, seq_len, d, f32::MAX);
+        &mut m1, &mut y1, seq_len, d, f32::MAX, 0.0);
 
     let mut y2 = vec![0.0f32; seq_len * d];
     let mut m2 = vec![0.0f32; (seq_len + 1) * dd];
     delta_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_initial,
-        &mut m2, &mut y2, seq_len, d, f32::MAX);
+        &mut m2, &mut y2, seq_len, d, f32::MAX, 0.0);
 
     assert_eq!(y1, y2, "CUDA delta forward should be deterministic");
 }
@@ -638,7 +638,7 @@ fn test_cuda_delta_forward_d16() {
     let mut y_cuda = vec![0.0f32; seq_len * d];
     delta_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_initial,
-        &mut m_states_cuda, &mut y_cuda, seq_len, d, f32::MAX);
+        &mut m_states_cuda, &mut y_cuda, seq_len, d, f32::MAX, 0.0);
 
     check_close("d16_y", &y_rust, &y_cuda, 1e-4);
     check_close("d16_m", &m_states_rust, &m_states_cuda, 1e-4);
@@ -667,7 +667,7 @@ fn test_cuda_delta_forward_large_d() {
     let mut y_cuda = vec![0.0f32; seq_len * d];
     delta_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_initial,
-        &mut m_states_cuda, &mut y_cuda, seq_len, d, f32::MAX);
+        &mut m_states_cuda, &mut y_cuda, seq_len, d, f32::MAX, 0.0);
 
     check_close("large_d_y", &y_rust, &y_cuda, 1e-4);
     check_close("large_d_m", &m_states_rust, &m_states_cuda, 1e-4);

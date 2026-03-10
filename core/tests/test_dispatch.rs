@@ -165,7 +165,7 @@ mod cuda_tests {
         let mut y_cuda = vec![0.0f32; seq_len * d];
         delta_forward_dispatch(
             &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_initial,
-            &mut m_states_cuda, &mut y_cuda, seq_len, d, f32::MAX,
+            &mut m_states_cuda, &mut y_cuda, seq_len, d, f32::MAX, 0.0,
         );
 
         // Force Rust path
@@ -174,7 +174,7 @@ mod cuda_tests {
         let mut y_rust = vec![0.0f32; seq_len * d];
         delta_forward_dispatch(
             &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_initial,
-            &mut m_states_rust, &mut y_rust, seq_len, d, f32::MAX,
+            &mut m_states_rust, &mut y_rust, seq_len, d, f32::MAX, 0.0,
         );
 
         // Reset

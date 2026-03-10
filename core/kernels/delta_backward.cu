@@ -545,6 +545,10 @@ extern "C" void delta_backward_segment_f32_cuda(
         exit(1);
     }
 
+    check_cuda_alloc("delta_backward_segment: cudaFuncSetAttribute",
+                     cudaFuncSetAttribute(delta_backward_segment_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+
     // Allocate d_M workspace in global memory
     float* d_M_work = nullptr;
     check_cuda_alloc("delta_backward_segment: cudaMalloc d_M_work",

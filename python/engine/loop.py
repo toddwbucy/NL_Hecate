@@ -1368,7 +1368,7 @@ def run_build(bcfg: BuildConfig):
                 new_m_norm = list(bcfg.m_norm_max) + [bcfg.m_norm_max[-1]]
             new_error_clip = None
             if bcfg.error_clip is not None:
-                new_error_clip = list(bcfg.error_clip) + [bcfg.error_clip[-1]]
+                new_error_clip = [*bcfg.error_clip, bcfg.error_clip[-1]]
             new_cfg = nl_hecate.MAGConfig(
                 d_model=cfg.d_model, num_heads=cfg.num_heads,
                 head_dim=cfg.head_dim, seq_len=cfg.seq_len,

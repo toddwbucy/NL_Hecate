@@ -284,7 +284,7 @@ fn test_cuda_delta_forward_d2048() {
     let mut y_cuda = vec![0.0f32; seq_len * d];
     delta_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_initial,
-        &mut m_states_cuda, &mut y_cuda, seq_len, d, f32::MAX);
+        &mut m_states_cuda, &mut y_cuda, seq_len, d, f32::MAX, 0.0);
 
     check_close("delta_d2048_y", &y_rust, &y_cuda, 1e-4);
     check_close("delta_d2048_m", &m_states_rust, &m_states_cuda, 1e-4);
@@ -314,7 +314,7 @@ fn test_cuda_delta_backward_d2048() {
     let mut y = vec![0.0f32; seq_len * d];
     delta_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_initial,
-        &mut m_states, &mut y, seq_len, d, f32::MAX);
+        &mut m_states, &mut y, seq_len, d, f32::MAX, 0.0);
 
     let d_y = rand_buf(seq_len * d, 20004);
 
@@ -334,7 +334,7 @@ fn test_cuda_delta_backward_d2048() {
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_states, &d_y,
         &mut dk_cuda, &mut dv_cuda, &mut dq_cuda,
         &mut dalpha_cuda, &mut dtheta_cuda, &mut dm_cuda,
-        seq_len, d);
+        seq_len, d, 0.0);
 
     check_close("delta_bwd_d2048_dk", &dk_rust, &dk_cuda, 1e-3);
     check_close("delta_bwd_d2048_dv", &dv_rust, &dv_cuda, 1e-3);
@@ -450,7 +450,7 @@ fn test_cuda_titans_forward_d2048() {
     titans_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
         &m_initial, &s_initial,
-        &mut m_cuda, &mut s_cuda, &mut y_cuda, seq_len, d, f32::MAX);
+        &mut m_cuda, &mut s_cuda, &mut y_cuda, seq_len, d, f32::MAX, 0.0);
 
     check_close("titans_d2048_y", &y_rust, &y_cuda, 1e-4);
     check_close("titans_d2048_m", &m_rust, &m_cuda, 1e-4);
@@ -484,7 +484,7 @@ fn test_cuda_titans_backward_d2048() {
     titans_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
         &m_initial, &s_initial,
-        &mut m_states, &mut s_states, &mut y, seq_len, d, f32::MAX);
+        &mut m_states, &mut s_states, &mut y, seq_len, d, f32::MAX, 0.0);
 
     let d_y = rand_buf(seq_len * d, 41004);
 
@@ -504,7 +504,7 @@ fn test_cuda_titans_backward_d2048() {
         &mut dk, &mut dv, &mut dq,
         &mut dalpha, &mut dtheta, &mut deta,
         &mut dm, &mut ds,
-        seq_len, d);
+        seq_len, d, 0.0);
 
     // Sanity: gradients are non-zero
     let dk_norm: f32 = dk.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -539,7 +539,7 @@ fn test_cuda_dgd_forward_d2048() {
     let mut y_cuda = vec![0.0f32; seq_len * d];
     dgd_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_initial,
-        &mut m_states_cuda, &mut y_cuda, seq_len, d);
+        &mut m_states_cuda, &mut y_cuda, seq_len, d, 0.0);
 
     check_close("dgd_d2048_y", &y_rust, &y_cuda, 1e-4);
     check_close("dgd_d2048_m", &m_states_rust, &m_states_cuda, 1e-4);
@@ -564,7 +564,7 @@ fn test_cuda_dgd_backward_d2048() {
     let mut y = vec![0.0f32; seq_len * d];
     dgd_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_initial,
-        &mut m_states, &mut y, seq_len, d);
+        &mut m_states, &mut y, seq_len, d, 0.0);
 
     let d_y = rand_buf(seq_len * d, 51004);
 
@@ -580,7 +580,7 @@ fn test_cuda_dgd_backward_d2048() {
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_states, &d_y,
         &mut dk, &mut dv, &mut dq,
         &mut dalpha, &mut dtheta, &mut dm,
-        seq_len, d);
+        seq_len, d, 0.0);
 
     // Sanity: gradients are non-zero
     let dk_norm: f32 = dk.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -698,7 +698,7 @@ fn test_cuda_delta_forward_d1536() {
     let mut y_cuda = vec![0.0f32; seq_len * d];
     delta_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_initial,
-        &mut m_states_cuda, &mut y_cuda, seq_len, d, f32::MAX);
+        &mut m_states_cuda, &mut y_cuda, seq_len, d, f32::MAX, 0.0);
 
     check_close("delta_d1536_y", &y_rust, &y_cuda, 1e-4);
     check_close("delta_d1536_m", &m_states_rust, &m_states_cuda, 1e-4);

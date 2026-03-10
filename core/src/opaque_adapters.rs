@@ -1565,7 +1565,7 @@ pub fn dgd_opaque_backward(
         k_mem, v_mem, q_mem, alpha, theta, m_states, d_y,
         &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
         &mut d_alpha, &mut d_theta, &mut d_m_initial,
-        seq_len, d,
+        seq_len, d, 0.0,
     );
 
     d_inputs[0] = d_k_mem;

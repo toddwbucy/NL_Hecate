@@ -356,6 +356,20 @@ impl MAGConfig {
                 )));
             }
         }
+        if let Some(ref v) = m_norm_max {
+            if !v.is_empty() && v.len() != k {
+                return Err(PyValueError::new_err(format!(
+                    "m_norm_max length ({}) must equal k ({k})", v.len()
+                )));
+            }
+        }
+        if let Some(ref v) = error_clip {
+            if !v.is_empty() && v.len() != k {
+                return Err(PyValueError::new_err(format!(
+                    "error_clip length ({}) must equal k ({k})", v.len()
+                )));
+            }
+        }
         let comp = match composition.to_lowercase().as_str() {
             "mag" => CompositionKind::MAG,
             "mal" => CompositionKind::MAL,

@@ -90,7 +90,7 @@ fn test_cuda_titans_forward_matches_rust() {
     titans_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
         &m_initial, &s_initial, &mut m_cuda, &mut s_cuda, &mut y_cuda,
-        seq_len, d, f32::MAX);
+        seq_len, d, f32::MAX, 0.0);
 
     check_close("titans_fwd_y", &y_rust, &y_cuda, 1e-5);
     check_close("titans_fwd_m", &m_rust, &m_cuda, 1e-5);
@@ -121,7 +121,7 @@ fn test_cuda_titans_forward_seq_len_1() {
     titans_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
         &m_initial, &s_initial, &mut m_cuda, &mut s_cuda, &mut y_cuda,
-        1, d, f32::MAX);
+        1, d, f32::MAX, 0.0);
 
     check_close("titans_seq1_y", &y_rust, &y_cuda, 1e-5);
 }
@@ -147,7 +147,7 @@ fn test_cuda_titans_forward_momentum_nonzero() {
     titans_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
         &m_initial, &s_initial, &mut m_states, &mut s_states, &mut y,
-        seq_len, d, f32::MAX);
+        seq_len, d, f32::MAX, 0.0);
 
     let s_final = &s_states[seq_len * dd..];
     let s_max = s_final.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
@@ -283,7 +283,7 @@ fn test_cuda_titans_backward_matches_rust() {
         &mut dk_cuda, &mut dv_cuda, &mut dq_cuda,
         &mut dalpha_cuda, &mut dtheta_cuda, &mut deta_cuda,
         &mut dm_init_cuda, &mut ds_init_cuda,
-        seq_len, d);
+        seq_len, d, 0.0);
 
     check_close("titans_bwd_dk", &dk_rust, &dk_cuda, 1e-4);
     check_close("titans_bwd_dv", &dv_rust, &dv_cuda, 1e-4);
@@ -316,7 +316,7 @@ fn test_cuda_titans_backward_nonzero() {
     titans_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
         &m_initial, &s_initial, &mut m_states, &mut s_states, &mut y,
-        seq_len, d, f32::MAX);
+        seq_len, d, f32::MAX, 0.0);
 
     let d_y = vec![1.0f32; seq_len * d];
     let mut dk = vec![0.0f32; seq_len * d];
@@ -332,7 +332,7 @@ fn test_cuda_titans_backward_nonzero() {
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
         &m_states, &s_states, &d_y,
         &mut dk, &mut dv, &mut dq, &mut da, &mut dt, &mut de,
-        &mut dm, &mut ds, seq_len, d);
+        &mut dm, &mut ds, seq_len, d, 0.0);
 
     let dk_max = dk.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
     let dv_max = dv.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
@@ -363,7 +363,7 @@ fn test_cuda_titans_forward_deterministic() {
     titans_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
         &m_initial, &s_initial, &mut m1, &mut s1, &mut y1,
-        seq_len, d, f32::MAX);
+        seq_len, d, f32::MAX, 0.0);
 
     let mut y2 = vec![0.0f32; seq_len * d];
     let mut m2 = vec![0.0f32; (seq_len + 1) * dd];
@@ -371,7 +371,7 @@ fn test_cuda_titans_forward_deterministic() {
     titans_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
         &m_initial, &s_initial, &mut m2, &mut s2, &mut y2,
-        seq_len, d, f32::MAX);
+        seq_len, d, f32::MAX, 0.0);
 
     assert_eq!(y1, y2, "CUDA titans forward should be deterministic");
 }
@@ -404,7 +404,7 @@ fn test_cuda_titans_forward_large_d() {
     titans_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
         &m_initial, &s_initial, &mut m_cuda, &mut s_cuda, &mut y_cuda,
-        seq_len, d, f32::MAX);
+        seq_len, d, f32::MAX, 0.0);
 
     check_close("titans_large_d_y", &y_rust, &y_cuda, 1e-4);
     check_close("titans_large_d_m", &m_rust, &m_cuda, 1e-4);

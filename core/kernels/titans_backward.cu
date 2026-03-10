@@ -575,6 +575,10 @@ extern "C" void titans_backward_segment_f32_cuda(
         exit(1);
     }
 
+    check_cuda_alloc("titans_backward_segment: cudaFuncSetAttribute",
+                     cudaFuncSetAttribute(titans_backward_segment_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+
     // Allocate d_M and d_S workspaces
     float* d_M_work = nullptr;
     float* d_S_work = nullptr;
