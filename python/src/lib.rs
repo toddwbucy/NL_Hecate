@@ -2460,6 +2460,12 @@ impl GpuStackedModel {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 format!("input/target length must be batch_size * seq_len {} (got {})", s, input_ids.len())));
         }
+        let bs = input_ids.len() / s;
+        if bs != self.context.batch_size {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("batch mismatch: input has {} samples but context allocated for batch_size={}",
+                        bs, self.context.batch_size)));
+        }
         if let Some(&max_id) = input_ids.iter().max() {
             if max_id >= v {
                 return Err(pyo3::exceptions::PyValueError::new_err(
@@ -2569,6 +2575,12 @@ impl GpuStackedModel {
         if input_ids.is_empty() || input_ids.len() % s != 0 || target_ids.len() != input_ids.len() {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 format!("input/target length must be batch_size * seq_len {} (got {})", s, input_ids.len())));
+        }
+        let bs = input_ids.len() / s;
+        if bs != self.context.batch_size {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("batch mismatch: input has {} samples but context allocated for batch_size={}",
+                        bs, self.context.batch_size)));
         }
         if let Some(&max_id) = input_ids.iter().max() {
             if max_id >= v {

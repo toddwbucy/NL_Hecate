@@ -598,20 +598,22 @@ impl GpuStackedContext {
     /// Returns `Vec<Vec<f32>>` -- outer len = n_blocks, inner len = k.
     pub fn memory_norms(&self) -> Vec<Vec<f32>> {
         let mut result = Vec::with_capacity(self.n_blocks);
+        let slot_size = self.d * self.d; // one M matrix = d*d f32s
         for ctx in &self.blocks {
             let mut block_norms = Vec::with_capacity(ctx.memory.len());
             for buf in &ctx.memory {
-                let buf_len = buf.len();
-                if buf_len == 0 {
+                if buf.len() == 0 || slot_size == 0 {
                     block_norms.push(0.0);
                     continue;
                 }
+                // Norm slot 0 only (matches single-block metric, independent of batch_size)
+                let n = slot_size.min(buf.len()) as i32;
                 let mut num_blocks_out: i32 = 0;
-                let max_norm_blocks = (buf_len + 255) / 256;
+                let max_norm_blocks = (n as usize + 255) / 256;
                 let mut scratch = GpuBuf::zeros(max_norm_blocks);
                 let err = unsafe {
                     crate::cuda_ffi::grad_norm_sq_cuda(
-                        buf.as_ptr(), scratch.ptr(), buf_len as i32, &mut num_blocks_out,
+                        buf.as_ptr(), scratch.ptr(), n, &mut num_blocks_out,
                     )
                 };
                 assert_eq!(err, 0, "grad_norm_sq_cuda for M state norm failed");
