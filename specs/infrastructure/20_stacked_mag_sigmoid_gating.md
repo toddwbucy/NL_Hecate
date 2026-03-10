@@ -1,6 +1,6 @@
 # BUG-02: Wire MAG Sigmoid Gating in Stacked Multi-Block Forward/Backward
 
-```
+```text
 CONTRACT
   Purpose:    Add the missing MAG sigmoid gating to the stacked multi-block
               GPU forward and backward paths, replacing the broken two-additive-
@@ -42,7 +42,7 @@ memory output. Without the sigmoid bound, memory magnitudes are unbounded.
 ## Paper Source
 
 Titans (2501.00663) Section 3.3, equation collection `titans_equations/eq-028`:
-```
+```text
 o = y ⊙ σ(M(x̃))
 ```
 Where:

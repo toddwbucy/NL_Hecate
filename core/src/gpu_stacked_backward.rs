@@ -201,7 +201,7 @@ pub fn gpu_stacked_backward(
         }
 
         // Sigmoid backward: gate = sigmoid(y_combined)
-        let d_y_combined = GpuBuf::zeros(bsd);
+        let mut d_y_combined = GpuBuf::zeros(bsd);
         unsafe {
             crate::cuda_ffi::sigmoid_backward_cuda(
                 d_gate.as_ptr(), bc.gate.as_ptr(), d_y_combined.ptr(), bsd_i32,
