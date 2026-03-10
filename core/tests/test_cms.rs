@@ -225,6 +225,7 @@ fn test_k2_beats_k1() {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
 
         residual: false,
@@ -256,6 +257,7 @@ fn test_k2_beats_k1() {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
 
         residual: false,
@@ -451,6 +453,7 @@ fn test_k4_vs_k2_multiscale() {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
 
         residual: false,
@@ -481,6 +484,7 @@ fn test_k4_vs_k2_multiscale() {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
 
         residual: false,
@@ -588,6 +592,7 @@ fn test_k4_diagnostics() {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
 
         residual: false,
@@ -873,6 +878,7 @@ fn test_cms_stability_boundary() {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
 
         residual: false,
@@ -903,6 +909,7 @@ fn test_cms_stability_boundary() {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
 
         residual: false,
@@ -1107,6 +1114,7 @@ fn test_k4_normalization_magnitude() {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
 
         residual: false,
@@ -1190,6 +1198,7 @@ fn test_k4_uniform_init_stable() {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
 
         residual: false,
@@ -1259,6 +1268,7 @@ fn test_k4_normalized_stable() {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
 
         residual: false,

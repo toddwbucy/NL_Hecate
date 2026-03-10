@@ -226,6 +226,7 @@ fn test_titans_vs_delta() {
             theta_ceil: vec![],
         intermediate_size: 0,
         m_norm_max: vec![],
+        error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
                 residual: false,
 };
@@ -254,6 +255,7 @@ fn test_titans_vs_delta() {
             theta_ceil: vec![],
         intermediate_size: 0,
         m_norm_max: vec![],
+        error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
                 residual: false,
 };
@@ -372,6 +374,7 @@ fn test_titans_m_norm_clamp_cpu() {
         theta_ceil: vec![],
         intermediate_size: 0,
         m_norm_max: vec![m_norm_max_val],
+        error_clip: vec![],
         feature_map: FeatureMapKind::Identity,
             residual: false,
 };
@@ -408,6 +411,7 @@ fn test_titans_m_norm_clamp_cpu() {
     // above the cap, proving the earlier assertion tested a live constraint.
     let cfg_no_clamp = MAGConfig {
         m_norm_max: vec![],  // disabled
+        error_clip: vec![],  // disabled
         ..cfg.clone()
     };
     let params_nc = MAGParams::init(&cfg_no_clamp, 42);

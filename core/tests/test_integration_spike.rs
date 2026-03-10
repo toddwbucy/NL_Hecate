@@ -77,6 +77,7 @@ fn spike_config_a() -> MAGConfig {
             theta_ceil: vec![],
         intermediate_size: 0,
         m_norm_max: vec![],
+        error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
                 residual: false,
 }
@@ -120,6 +121,7 @@ fn spike_config_b() -> MAGConfig {
             theta_ceil: vec![],
         intermediate_size: 0,
         m_norm_max: vec![],
+        error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
                 residual: false,
 }
@@ -163,6 +165,7 @@ fn spike_config_c() -> MAGConfig {
             theta_ceil: vec![],
         intermediate_size: 0,
         m_norm_max: vec![],
+        error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
                 residual: false,
 }
@@ -776,6 +779,7 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
         // SwiGluMlp requires intermediate_size > 0; other rules don't use it.
         intermediate_size: if rule == MemoryRuleKind::SwiGluMlp { 4 * d_model } else { 0 },
         m_norm_max: vec![],
+        error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
                 residual: false,
 }

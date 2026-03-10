@@ -65,6 +65,7 @@ fn tiny_config(rule: MemoryRuleKind, retention: RetentionKind) -> MAGConfig {
             theta_ceil: vec![],
         intermediate_size: 0,
         m_norm_max: vec![],
+        error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
                 residual: false,
 }

@@ -86,6 +86,7 @@ extern "C" {
         seq_len: i32,
         d: i32,
         batch_size: i32,
+        error_clip: f32,
     );
 
     /// CUDA DeltaRule backward inner loop (all f32).
@@ -110,6 +111,7 @@ extern "C" {
         seq_len: i32,
         d: i32,
         batch_size: i32,
+        error_clip: f32,
     );
 
     // ── Titans LMM memory kernels (all f32) ─────────────────────────
@@ -132,6 +134,7 @@ extern "C" {
         seq_len: i32,
         d: i32,
         batch_size: i32,
+        error_clip: f32,
     );
 
     /// CUDA TitansLMM backward inner loop (all f32).
@@ -156,6 +159,7 @@ extern "C" {
         seq_len: i32,
         d: i32,
         batch_size: i32,
+        error_clip: f32,
     );
 
     // ── Hebbian Rule memory kernels (all f32) ───────────────────────
@@ -200,7 +204,7 @@ extern "C" {
         k_mem: *const f32, v_mem: *const f32, q_mem: *const f32,
         alpha: *const f32, theta: *const f32, m_initial: *const f32,
         m_states: *mut f32, y: *mut f32,
-        seq_len: i32, d: i32, checkpoint_interval: i32,
+        seq_len: i32, d: i32, checkpoint_interval: i32, error_clip: f32,
     );
 
     /// TitansLMM forward with checkpoint_interval — stores M/S every C steps.
@@ -209,7 +213,7 @@ extern "C" {
         alpha: *const f32, theta: *const f32, eta: *const f32,
         m_initial: *const f32, s_initial: *const f32,
         m_states: *mut f32, s_states: *mut f32, y: *mut f32,
-        seq_len: i32, d: i32, checkpoint_interval: i32,
+        seq_len: i32, d: i32, checkpoint_interval: i32, error_clip: f32,
     );
 
     /// HebbianRule forward with checkpoint_interval — stores M every C steps.
@@ -230,7 +234,7 @@ extern "C" {
         d_m_seed: *const f32,
         d_k_mem: *mut f32, d_v_mem: *mut f32, d_q_mem: *mut f32,
         d_alpha: *mut f32, d_theta: *mut f32, d_m_out: *mut f32,
-        t_start: i32, t_end: i32, d: i32,
+        t_start: i32, t_end: i32, d: i32, error_clip: f32,
     );
 
     /// TitansLMM segment backward — operates on [t_start, t_end) with d_m_seed/d_s_seed.
@@ -242,7 +246,7 @@ extern "C" {
         d_k_mem: *mut f32, d_v_mem: *mut f32, d_q_mem: *mut f32,
         d_alpha: *mut f32, d_theta: *mut f32, d_eta: *mut f32,
         d_m_out: *mut f32, d_s_out: *mut f32,
-        t_start: i32, t_end: i32, d: i32,
+        t_start: i32, t_end: i32, d: i32, error_clip: f32,
     );
 
     /// HebbianRule segment backward — operates on [t_start, t_end) with d_m_seed.
@@ -273,6 +277,7 @@ extern "C" {
         y: *mut f32,
         seq_len: i32,
         d: i32,
+        error_clip: f32,
     );
 
     /// CUDA DGD backward inner loop (all f32).
@@ -292,6 +297,7 @@ extern "C" {
         d_m_initial: *mut f32,
         seq_len: i32,
         d: i32,
+        error_clip: f32,
     );
 
     /// DGD forward with checkpoint_interval — stores M every C steps.
@@ -299,7 +305,7 @@ extern "C" {
         k_mem: *const f32, v_mem: *const f32, q_mem: *const f32,
         alpha: *const f32, theta: *const f32, m_initial: *const f32,
         m_states: *mut f32, y: *mut f32,
-        seq_len: i32, d: i32, checkpoint_interval: i32,
+        seq_len: i32, d: i32, checkpoint_interval: i32, error_clip: f32,
     );
 
     /// DGD segment backward — operates on [t_start, t_end) with d_m_seed.
@@ -310,7 +316,7 @@ extern "C" {
         d_m_seed: *const f32,
         d_k_mem: *mut f32, d_v_mem: *mut f32, d_q_mem: *mut f32,
         d_alpha: *mut f32, d_theta: *mut f32, d_m_out: *mut f32,
-        t_start: i32, t_end: i32, d: i32,
+        t_start: i32, t_end: i32, d: i32, error_clip: f32,
     );
 
     // ── M-norm clamp ──────────────────────────────────────────────────

@@ -437,6 +437,7 @@ fn test_k1_learned_is_noop() {
             theta_ceil: vec![],
         intermediate_size: 0,
         m_norm_max: vec![],
+        error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
                 residual: false,
 };
@@ -573,6 +574,7 @@ fn test_anneal_uses_fixed_schedule() {
             theta_ceil: vec![],
         intermediate_size: 0,
         m_norm_max: vec![],
+        error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
                 residual: false,
 };

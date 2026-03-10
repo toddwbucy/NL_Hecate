@@ -775,6 +775,11 @@ pub struct MAGConfig {
     /// Empty = disabled (legacy behavior). Recommended: 100.0 for d=512 titans.
     #[serde(default)]
     pub m_norm_max: Vec<f32>,
+    /// Per-level per-token error clip ceiling (spec 17, straight-through in backward).
+    /// When ‖e_t‖₂ > error_clip, rescale e_t so ‖e_t‖₂ = error_clip.
+    /// Empty = disabled (zero overhead: branch never entered). Recommended: 50.0.
+    #[serde(default)]
+    pub error_clip: Vec<f32>,
     /// SwiGluMlp intermediate (hidden) dimension. 0 for all matrix-memory rules.
     /// Typically 4*d_model (e.g., 8192 for d=2048 — Llama-3.2-1B MLP size).
     #[serde(default)]
@@ -815,6 +820,13 @@ impl MAGConfig {
     pub fn max_m_norm(&self, level: usize) -> f32 {
         let v = self.m_norm_max.get(level).copied().unwrap_or(0.0);
         if v > 0.0 { v } else { f32::MAX }
+    }
+
+    /// Returns the per-token error clip threshold for `level`, or 0.0 if unset.
+    /// When 0.0, the CUDA kernel skips the clip entirely (zero overhead).
+    #[inline]
+    pub fn error_clip_for_level(&self, level: usize) -> f32 {
+        self.error_clip.get(level).copied().unwrap_or(0.0)
     }
 }
 
@@ -899,6 +911,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
         }
@@ -940,6 +953,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
         }
@@ -981,6 +995,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
         }
@@ -1023,6 +1038,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
         }
@@ -1065,6 +1081,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
         }
@@ -1107,6 +1124,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
         }
@@ -1148,6 +1166,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
         }
@@ -1189,6 +1208,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
         }
@@ -1230,6 +1250,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
         }
@@ -1271,6 +1292,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
         }
@@ -1322,6 +1344,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
         }
@@ -1373,6 +1396,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
         }
@@ -1424,6 +1448,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
         }
@@ -1475,6 +1500,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
         }
@@ -1526,6 +1552,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
         }
@@ -1577,6 +1604,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
         }
@@ -1619,6 +1647,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
         }
@@ -1661,6 +1690,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
         }
@@ -1706,6 +1736,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
         }
@@ -1751,6 +1782,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
         }
@@ -1792,6 +1824,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
         }
@@ -1833,6 +1866,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
         }
@@ -1874,6 +1908,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
         }
@@ -1915,6 +1950,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
         }
@@ -1957,6 +1993,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
         }
@@ -1998,6 +2035,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
         }
@@ -2040,6 +2078,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
         }
@@ -2082,6 +2121,7 @@ impl MAGConfig {
             theta_ceil: vec![],
             intermediate_size: 0,
             m_norm_max: vec![],
+            error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
         }

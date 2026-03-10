@@ -69,6 +69,7 @@ fn delta_k1_config(fm: FeatureMapKind) -> MAGConfig {
         theta_ceil: vec![],
         intermediate_size: 0,
         m_norm_max: vec![],
+        error_clip: vec![],
         feature_map: fm,
             residual: false,
 }
