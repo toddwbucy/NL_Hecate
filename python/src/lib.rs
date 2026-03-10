@@ -2338,6 +2338,21 @@ impl GpuModel {
                 .map(|mc| mc.dgd_delta_norm(s, d, bs))
                 .unwrap_or(0.0);
             ldict.set_item("dgd_delta_norm", delta_norm)?;
+            // Theta (inner-loop learning rate) distribution
+            if let Some(ref mc) = cache.memory_caches[level] {
+                if let Some(ts) = mc.theta_stats() {
+                    let tdict = PyDict::new(py);
+                    tdict.set_item("count", ts.count)?;
+                    tdict.set_item("min", ts.min)?;
+                    tdict.set_item("max", ts.max)?;
+                    tdict.set_item("mean", ts.mean)?;
+                    tdict.set_item("median", ts.median)?;
+                    tdict.set_item("p95", ts.p95)?;
+                    tdict.set_item("p99", ts.p99)?;
+                    tdict.set_item("frac_at_max", ts.frac_at_max)?;
+                    ldict.set_item("theta", tdict)?;
+                }
+            }
             levels_list.append(ldict)?;
         }
         dict.set_item("levels", levels_list)?;
@@ -2614,16 +2629,22 @@ impl GpuStackedModel {
         let d = self.cfg.swa.d_model;
         let bs = input_ids.len() / s;
         let mut delta_norms: Vec<Vec<f32>> = Vec::with_capacity(self.n_blocks);
+        let mut theta_stats_grid: Vec<Vec<Option<nl_hecate_core::gpu_forward::ThetaStats>>> =
+            Vec::with_capacity(self.n_blocks);
         for block_cache in &cache.block_caches {
             let mut block_deltas = Vec::with_capacity(k);
+            let mut block_theta = Vec::with_capacity(k);
             for level in 0..k {
                 if let Some(ref mem_cache) = block_cache.memory_caches[level] {
                     block_deltas.push(mem_cache.dgd_delta_norm(s, d, bs));
+                    block_theta.push(mem_cache.theta_stats());
                 } else {
                     block_deltas.push(0.0);
+                    block_theta.push(None);
                 }
             }
             delta_norms.push(block_deltas);
+            theta_stats_grid.push(block_theta);
         }
 
         // Backward (collect level_output_gnorms)
@@ -2660,6 +2681,19 @@ impl GpuStackedModel {
                 ldict.set_item("output_grad_norm", gnorm)?;
                 ldict.set_item("dgd_delta_norm", delta_norms[bi][level])?;
                 ldict.set_item("m_norm", m_norms[bi][level])?;
+                // Theta (inner-loop learning rate) distribution
+                if let Some(ref ts) = theta_stats_grid[bi][level] {
+                    let tdict = pyo3::types::PyDict::new(py);
+                    tdict.set_item("count", ts.count)?;
+                    tdict.set_item("min", ts.min)?;
+                    tdict.set_item("max", ts.max)?;
+                    tdict.set_item("mean", ts.mean)?;
+                    tdict.set_item("median", ts.median)?;
+                    tdict.set_item("p95", ts.p95)?;
+                    tdict.set_item("p99", ts.p99)?;
+                    tdict.set_item("frac_at_max", ts.frac_at_max)?;
+                    ldict.set_item("theta", tdict)?;
+                }
                 levels_list.append(ldict)?;
 
                 if gnorm > agg_gnorms[level] {
@@ -2687,6 +2721,35 @@ impl GpuStackedModel {
             // Aggregate delta norm: max across blocks for this level
             let max_delta = delta_norms.iter().map(|bd| bd[level]).fold(0.0f32, f32::max);
             ldict.set_item("dgd_delta_norm", max_delta)?;
+            // Aggregate theta stats across blocks: weighted mean, min of mins, max of maxes
+            let mut agg_count = 0usize;
+            let mut agg_min = f32::MAX;
+            let mut agg_max = f32::MIN;
+            let mut agg_sum = 0.0f32;
+            let mut agg_p99 = 0.0f32;
+            let mut agg_frac_sum = 0.0f32;
+            let mut has_theta = false;
+            for bi in 0..self.n_blocks {
+                if let Some(ref ts) = theta_stats_grid[bi][level] {
+                    has_theta = true;
+                    agg_count += ts.count;
+                    if ts.min < agg_min { agg_min = ts.min; }
+                    if ts.max > agg_max { agg_max = ts.max; }
+                    agg_sum += ts.mean * ts.count as f32;
+                    if ts.p99 > agg_p99 { agg_p99 = ts.p99; }
+                    agg_frac_sum += ts.frac_at_max * ts.count as f32;
+                }
+            }
+            if has_theta {
+                let tdict = pyo3::types::PyDict::new(py);
+                tdict.set_item("count", agg_count)?;
+                tdict.set_item("min", agg_min)?;
+                tdict.set_item("max", agg_max)?;
+                tdict.set_item("mean", agg_sum / agg_count as f32)?;
+                tdict.set_item("p99", agg_p99)?;
+                tdict.set_item("frac_at_max", agg_frac_sum / agg_count as f32)?;
+                ldict.set_item("theta", tdict)?;
+            }
             agg_levels_list.append(ldict)?;
         }
         dict.set_item("levels", agg_levels_list)?;
