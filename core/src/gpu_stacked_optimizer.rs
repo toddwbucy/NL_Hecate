@@ -226,6 +226,96 @@ fn gpu_stacked_grad_norm(grads: &GpuStackedGrads, state: &mut GpuStackedAdamWSta
     total_sq.sqrt() as f32
 }
 
+/// Per-block gradient norm results.
+#[cfg(feature = "cuda")]
+pub struct PerBlockGradNorms {
+    /// Aggregate L2 norm per block (SWA + all levels + alpha_mem).
+    /// Length = n_blocks. Used for depth specialization CV metric.
+    pub block_norms: Vec<f32>,
+    /// L0-only L2 norm per block (only level[0] memory params).
+    /// Length = n_blocks. Used for the "L0 gnorm per block > 0.01" floor
+    /// check in spec 19 promotion criteria.
+    pub l0_block_norms: Vec<f32>,
+}
+
+/// Compute per-block L2 gradient norms. Returns both aggregate (SWA + all
+/// levels) and L0-only norms per block. Called before global clipping so
+/// values reflect the true per-block learning signal. Shared params (embed,
+/// unembed, ln_final) are excluded because they contribute equally to every
+/// block's gradient and would mask depth specialization.
+#[cfg(feature = "cuda")]
+pub fn gpu_stacked_per_block_grad_norms(
+    grads: &GpuStackedGrads,
+    state: &mut GpuStackedAdamWState,
+) -> PerBlockGradNorms {
+    let n = grads.blocks.len();
+    let mut block_norms = Vec::with_capacity(n);
+    let mut l0_block_norms = Vec::with_capacity(n);
+
+    for bg in &grads.blocks {
+        let mut block_sq = 0.0f64;
+        let mut l0_sq = 0.0f64;
+
+        let mut accum_to = |g: &GpuBuf<f32>, target: &mut f64| {
+            let n = g.len() as i32;
+            if n == 0 { return; }
+            let mut num_blocks: i32 = 0;
+            let err = unsafe {
+                crate::cuda_ffi::grad_norm_sq_cuda(
+                    g.as_ptr(), state.norm_scratch.ptr(),
+                    n, &mut num_blocks,
+                )
+            };
+            assert_eq!(err, 0, "grad_norm_sq_cuda failed with cudaError_t={}", err);
+            crate::dispatch::cuda_sync();
+            let nb = num_blocks as usize;
+            state.norm_scratch.slice(0, nb).copy_to_host(&mut state.norm_host[..nb]);
+            for i in 0..nb {
+                *target += state.norm_host[i] as f64;
+            }
+        };
+
+        // SWA projections for this block (aggregate only)
+        accum_to(&bg.d_w_q, &mut block_sq);
+        accum_to(&bg.d_w_k, &mut block_sq);
+        accum_to(&bg.d_w_v, &mut block_sq);
+        accum_to(&bg.d_w_o, &mut block_sq);
+        accum_to(&bg.d_ln_attn_gamma, &mut block_sq);
+        accum_to(&bg.d_ln_attn_beta, &mut block_sq);
+        accum_to(&bg.d_ln_mem_gamma, &mut block_sq);
+        accum_to(&bg.d_ln_mem_beta, &mut block_sq);
+
+        // All levels within this block. For L0, accumulate into both
+        // block_sq and l0_sq without redundant kernel launches.
+        for (li, lg) in bg.levels.iter().enumerate() {
+            let target = if li == 0 { &mut l0_sq } else { &mut block_sq };
+            accum_to(&lg.d_w_k_mem, target);
+            accum_to(&lg.d_w_v_mem, target);
+            accum_to(&lg.d_w_q_mem, target);
+            accum_to(&lg.d_w_alpha, target);
+            accum_to(&lg.d_b_alpha, target);
+            accum_to(&lg.d_w_theta, target);
+            accum_to(&lg.d_b_theta, target);
+            accum_to(&lg.d_w_eta, target);
+            accum_to(&lg.d_b_eta, target);
+        }
+        drop(accum_to);
+
+        // L0 energy is part of the aggregate
+        block_sq += l0_sq;
+
+        // alpha_mem gradients (host-side)
+        for &g in &bg.d_alpha_mem {
+            block_sq += (g as f64) * (g as f64);
+        }
+
+        block_norms.push(block_sq.sqrt() as f32);
+        l0_block_norms.push(l0_sq.sqrt() as f32);
+    }
+
+    PerBlockGradNorms { block_norms, l0_block_norms }
+}
+
 /// Scale all stacked gradient buffers by a constant factor (for clipping).
 #[cfg(feature = "cuda")]
 fn gpu_stacked_scale_grads(grads: &mut GpuStackedGrads, scale: f32) {

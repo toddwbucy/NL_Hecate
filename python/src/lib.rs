@@ -2568,6 +2568,10 @@ struct GpuStackedModel {
     /// TNT periodic reset mode. When true, context.memory[k] is zeroed after
     /// each step where pulse.active_levels[k] is true (eq-006, 2511.07343).
     memory_reset: bool,
+    /// Per-block aggregate gradient norms from the most recent step_adamw call (spec 23).
+    last_block_gnorms: Vec<f32>,
+    /// Per-block L0-only gradient norms from the most recent step_adamw call (spec 23).
+    last_l0_block_gnorms: Vec<f32>,
 }
 
 #[cfg(feature = "cuda")]
@@ -2600,6 +2604,8 @@ impl GpuStackedModel {
             adamw_state: None,
             n_blocks,
             memory_reset,
+            last_block_gnorms: Vec::new(),
+            last_l0_block_gnorms: Vec::new(),
         })
     }
 
@@ -2644,14 +2650,17 @@ impl GpuStackedModel {
             adamw_state: None,
             n_blocks,
             memory_reset,
+            last_block_gnorms: Vec::new(),
+            last_l0_block_gnorms: Vec::new(),
         })
     }
 
     /// Full GPU build step with AdamW optimizer. Returns (loss, grad_norm).
-    #[pyo3(signature = (input_ids, target_ids, pulse, lr, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.1, max_grad_norm=1.0))]
+    #[pyo3(signature = (input_ids, target_ids, pulse, lr, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.1, max_grad_norm=1.0, collect_block_gnorms=false))]
     fn step_adamw(&mut self, input_ids: Vec<usize>, target_ids: Vec<usize>,
                   pulse: &Pulse, lr: f32, beta1: f32, beta2: f32,
-                  eps: f32, weight_decay: f32, max_grad_norm: f32) -> PyResult<(f32, f32)> {
+                  eps: f32, weight_decay: f32, max_grad_norm: f32,
+                  collect_block_gnorms: bool) -> PyResult<(f32, f32)> {
         let s = self.cfg.swa.seq_len;
         let v = self.cfg.swa.vocab_size;
         if s == 0 {
@@ -2692,6 +2701,16 @@ impl GpuStackedModel {
             );
         }
         let state = self.adamw_state.as_mut().unwrap();
+
+        // Per-block gradient norms (spec 23) — computed before clipping
+        if collect_block_gnorms {
+            let per_block = nl_hecate_core::gpu_stacked_optimizer::gpu_stacked_per_block_grad_norms(&grads, state);
+            self.last_block_gnorms = per_block.block_norms;
+            self.last_l0_block_gnorms = per_block.l0_block_norms;
+        } else {
+            self.last_block_gnorms.clear();
+            self.last_l0_block_gnorms.clear();
+        }
 
         // AdamW update (grads passed as &mut for in-place clipping)
         let grad_norm = nl_hecate_core::gpu_stacked_optimizer::gpu_stacked_adamw_update(
@@ -2754,6 +2773,20 @@ impl GpuStackedModel {
     #[getter]
     fn n_blocks(&self) -> usize {
         self.n_blocks
+    }
+
+    /// Per-block aggregate gradient norms from the most recent step_adamw call
+    /// (spec 23). Includes SWA + all levels per block. Computed before global
+    /// gradient clipping. Returns empty Vec if collect_block_gnorms was false.
+    fn block_grad_norms(&self) -> Vec<f32> {
+        self.last_block_gnorms.clone()
+    }
+
+    /// Per-block L0-only gradient norms from the most recent step_adamw call
+    /// (spec 23). Only level[0] memory params per block — used for the
+    /// "L0 gnorm per block > 0.01" floor check (spec 19 promotion criteria).
+    fn l0_block_grad_norms(&self) -> Vec<f32> {
+        self.last_l0_block_gnorms.clone()
     }
 
     /// GPU-resident stacked tape summary -- per-(block, level) gradient diagnostics.
