@@ -1,6 +1,6 @@
 # Per-Block Gradient Norms and Depth Specialization Metric
 
-```
+```text
 CONTRACT
   Purpose:    Expose per-block L2 gradient norms from the stacked optimizer so that
               block-level convergence and depth specialization can be observed during
