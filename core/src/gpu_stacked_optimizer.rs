@@ -226,6 +226,76 @@ fn gpu_stacked_grad_norm(grads: &GpuStackedGrads, state: &mut GpuStackedAdamWSta
     total_sq.sqrt() as f32
 }
 
+/// Compute per-block L2 gradient norms. Returns Vec<f32> of length n_blocks.
+/// Called before global clipping so values reflect the true per-block learning
+/// signal. Includes SWA projections, LayerNorms, and all memory levels for
+/// each block. Shared params (embed, unembed, ln_final) are excluded because
+/// they contribute equally to every block's gradient and would mask depth
+/// specialization.
+#[cfg(feature = "cuda")]
+pub fn gpu_stacked_per_block_grad_norms(
+    grads: &GpuStackedGrads,
+    state: &mut GpuStackedAdamWState,
+) -> Vec<f32> {
+    let mut block_norms = Vec::with_capacity(grads.blocks.len());
+
+    for bg in &grads.blocks {
+        let mut block_sq = 0.0f64;
+
+        let mut accum = |g: &GpuBuf<f32>| {
+            let n = g.len() as i32;
+            if n == 0 { return; }
+            let mut num_blocks: i32 = 0;
+            let err = unsafe {
+                crate::cuda_ffi::grad_norm_sq_cuda(
+                    g.as_ptr(), state.norm_scratch.ptr(),
+                    n, &mut num_blocks,
+                )
+            };
+            assert_eq!(err, 0, "grad_norm_sq_cuda failed with cudaError_t={}", err);
+            crate::dispatch::cuda_sync();
+            let nb = num_blocks as usize;
+            state.norm_scratch.slice(0, nb).copy_to_host(&mut state.norm_host[..nb]);
+            for i in 0..nb {
+                block_sq += state.norm_host[i] as f64;
+            }
+        };
+
+        // SWA projections for this block
+        accum(&bg.d_w_q);
+        accum(&bg.d_w_k);
+        accum(&bg.d_w_v);
+        accum(&bg.d_w_o);
+        accum(&bg.d_ln_attn_gamma);
+        accum(&bg.d_ln_attn_beta);
+        accum(&bg.d_ln_mem_gamma);
+        accum(&bg.d_ln_mem_beta);
+
+        // All levels within this block
+        for lg in &bg.levels {
+            accum(&lg.d_w_k_mem);
+            accum(&lg.d_w_v_mem);
+            accum(&lg.d_w_q_mem);
+            accum(&lg.d_w_alpha);
+            accum(&lg.d_b_alpha);
+            accum(&lg.d_w_theta);
+            accum(&lg.d_b_theta);
+            accum(&lg.d_w_eta);
+            accum(&lg.d_b_eta);
+        }
+        drop(accum);
+
+        // alpha_mem gradients (host-side)
+        for &g in &bg.d_alpha_mem {
+            block_sq += (g as f64) * (g as f64);
+        }
+
+        block_norms.push(block_sq.sqrt() as f32);
+    }
+
+    block_norms
+}
+
 /// Scale all stacked gradient buffers by a constant factor (for clipping).
 #[cfg(feature = "cuda")]
 fn gpu_stacked_scale_grads(grads: &mut GpuStackedGrads, scale: f32) {
