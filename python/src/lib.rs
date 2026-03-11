@@ -2568,8 +2568,10 @@ struct GpuStackedModel {
     /// TNT periodic reset mode. When true, context.memory[k] is zeroed after
     /// each step where pulse.active_levels[k] is true (eq-006, 2511.07343).
     memory_reset: bool,
-    /// Per-block gradient norms from the most recent step_adamw call (spec 23).
+    /// Per-block aggregate gradient norms from the most recent step_adamw call (spec 23).
     last_block_gnorms: Vec<f32>,
+    /// Per-block L0-only gradient norms from the most recent step_adamw call (spec 23).
+    last_l0_block_gnorms: Vec<f32>,
 }
 
 #[cfg(feature = "cuda")]
@@ -2603,6 +2605,7 @@ impl GpuStackedModel {
             n_blocks,
             memory_reset,
             last_block_gnorms: Vec::new(),
+            last_l0_block_gnorms: Vec::new(),
         })
     }
 
@@ -2648,6 +2651,7 @@ impl GpuStackedModel {
             n_blocks,
             memory_reset,
             last_block_gnorms: Vec::new(),
+            last_l0_block_gnorms: Vec::new(),
         })
     }
 
@@ -2700,10 +2704,12 @@ impl GpuStackedModel {
 
         // Per-block gradient norms (spec 23) — computed before clipping
         if collect_block_gnorms {
-            self.last_block_gnorms =
-                nl_hecate_core::gpu_stacked_optimizer::gpu_stacked_per_block_grad_norms(&grads, state);
+            let per_block = nl_hecate_core::gpu_stacked_optimizer::gpu_stacked_per_block_grad_norms(&grads, state);
+            self.last_block_gnorms = per_block.block_norms;
+            self.last_l0_block_gnorms = per_block.l0_block_norms;
         } else {
             self.last_block_gnorms.clear();
+            self.last_l0_block_gnorms.clear();
         }
 
         // AdamW update (grads passed as &mut for in-place clipping)
@@ -2769,11 +2775,18 @@ impl GpuStackedModel {
         self.n_blocks
     }
 
-    /// Per-block gradient norms from the most recent step_adamw call (spec 23).
-    /// Computed before global gradient clipping. Returns empty Vec if step_adamw
-    /// has not been called yet or collect_block_gnorms was false.
+    /// Per-block aggregate gradient norms from the most recent step_adamw call
+    /// (spec 23). Includes SWA + all levels per block. Computed before global
+    /// gradient clipping. Returns empty Vec if collect_block_gnorms was false.
     fn block_grad_norms(&self) -> Vec<f32> {
         self.last_block_gnorms.clone()
+    }
+
+    /// Per-block L0-only gradient norms from the most recent step_adamw call
+    /// (spec 23). Only level[0] memory params per block — used for the
+    /// "L0 gnorm per block > 0.01" floor check (spec 19 promotion criteria).
+    fn l0_block_grad_norms(&self) -> Vec<f32> {
+        self.last_l0_block_gnorms.clone()
     }
 
     /// GPU-resident stacked tape summary -- per-(block, level) gradient diagnostics.

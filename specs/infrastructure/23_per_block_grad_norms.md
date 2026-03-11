@@ -26,9 +26,10 @@ CONTRACT
                  paths — this is purely observational.
 
   Cost:       Per logging step: n_blocks host syncs per block (same pattern as existing
-              gpu_stacked_grad_norm, just partitioned). At n_blocks=4 with ~15 tensors
-              per block, this is ~60 kernel launches + syncs. Negligible compared to
-              the forward/backward pass (~2ms total for d=512).
+              gpu_stacked_grad_norm, just partitioned). Each block has 8 + 9*k tensors
+              (8 SWA/LN + 9 per level). At n_blocks=4, k=1: 68 kernel launches; at
+              k=4: 176 launches. Negligible compared to the forward/backward pass
+              (~2ms total for d=512).
 
   Trade-off:  Adding a per-block gnorm vector to the log increases JSONL line size by
               ~40 bytes per logged step. The CV computation is trivial (4 floats).
@@ -106,16 +107,19 @@ cv   = std / mean    (if mean > 0, else 0)
 
 Promotion readiness requires BOTH:
 1. **CV has stabilized** — rolling window CV change < threshold (block specialization saturated)
-2. **All block gnorms above minimum** — no block has collapsed (>0.01 for L0, spec 19)
+2. **All L0 block gnorms above minimum** — no block's L0 has collapsed (>0.01, spec 19).
+   This uses `l0_block_grad_norms`, NOT the aggregate `block_grad_norms`, because at k≥2
+   the aggregate includes higher levels that may mask a dead L0.
 
 The CV stability check prevents premature promotion: if blocks are still differentiating,
 pushing up would interrupt depth specialization before it completes.
 
 ### Phase 2+ usage
 
-At k>=2, per-block gnorms include all levels within each block. The CV measures whether
-blocks have diverged in their TOTAL learning dynamics (all levels combined per block).
-This is complementary to per-level gnorms (spec 12), which measure whether individual
+At k>=2, aggregate per-block gnorms include all levels within each block. The CV measures
+whether blocks have diverged in their TOTAL learning dynamics (all levels combined per
+block). The separate L0-only gnorms isolate the fresh level's health from promoted levels.
+Both are complementary to per-level gnorms (spec 12), which measure whether individual
 levels within a block have saturated.
 
 Full promotion readiness at k>=2:

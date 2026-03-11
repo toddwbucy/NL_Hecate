@@ -861,7 +861,7 @@ def run_build(bcfg: BuildConfig):
                     beta1=bcfg.beta1, beta2=bcfg.beta2, eps=1e-8,
                     weight_decay=bcfg.weight_decay,
                     max_grad_norm=bcfg.max_grad_norm,
-                    collect_block_gnorms=need_gnorms,
+                    collect_block_gnorms=(log_this and jsonl is not None),
                 )
             else:
                 loss, g_norm = gpu_model.step_adamw(
@@ -1078,6 +1078,12 @@ def run_build(bcfg: BuildConfig):
                             var_bg ** 0.5 / mean_bg, 6)
                     else:
                         log_fields["block_gnorm_cv"] = 0.0
+                # L0-only per-block gnorms for promotion floor check (spec 19)
+                if hasattr(gpu_model, "l0_block_grad_norms"):
+                    l0_bg = gpu_model.l0_block_grad_norms()
+                    if l0_bg:
+                        log_fields["l0_block_grad_norms"] = [
+                            round(g, 6) for g in l0_bg]
             jsonl.log(**log_fields)
 
         # Gate warmup falsification checkpoint (09_gate_warmup.md §5)
