@@ -14,15 +14,20 @@ CONTRACT
               - GpuStackedModel PyO3 wrapper (python/src/lib.rs)
               - JSONL logging infrastructure (loop.py)
 
-  Guarantees: 1. gpu_stacked_per_block_grad_norms returns Vec<f32> of length n_blocks,
+  Guarantees: 1. gpu_stacked_per_block_grad_norms returns PerBlockGradNorms with two
+                 Vec<f32> fields (block_norms, l0_block_norms), each length n_blocks,
                  computed BEFORE global gradient clipping (same as per-level gnorms
                  in single-block path).
-              2. Per-block gnorms are opt-in via collect_block_gnorms flag on step_adamw
+              2. block_norms includes SWA + all levels + alpha_mem per block (aggregate).
+                 l0_block_norms includes only level[0] memory params per block (for
+                 spec 19 "L0 gnorm per block > 0.01" floor check at k>=2).
+              3. Per-block gnorms are opt-in via collect_block_gnorms flag on step_adamw
                  to avoid overhead on non-logging steps.
-              3. block_gnorm_cv (coefficient of variation = std/mean) is computed in
-                 Python and logged to JSONL on logging steps.
-              4. No new CUDA kernels required — reuses existing grad_norm_sq_cuda.
-              5. No change to gradient clipping, optimizer update, or forward/backward
+              4. block_gnorm_cv (coefficient of variation = std/mean, a derived
+                 diagnostic formula with no paper source) is computed in Python
+                 and logged to JSONL on logging steps.
+              5. No new CUDA kernels required — reuses existing grad_norm_sq_cuda.
+              6. No change to gradient clipping, optimizer update, or forward/backward
                  paths — this is purely observational.
 
   Cost:       Per logging step: n_blocks host syncs per block (same pattern as existing
@@ -133,100 +138,56 @@ Full promotion readiness at k>=2:
 
 ### 3a. Rust: `gpu_stacked_per_block_grad_norms`
 
-New function in `gpu_stacked_optimizer.rs`:
+New function and return struct in `gpu_stacked_optimizer.rs`:
 
 ```rust
-/// Compute per-block L2 gradient norms. Returns Vec<f32> of length n_blocks.
-/// Called before global clipping so values reflect the true per-block learning
-/// signal. Includes SWA projections, LayerNorms, and all memory levels for
-/// each block. Shared params (embed, unembed, ln_final) are NOT included
-/// because they are shared across all blocks and would add the same energy
-/// to every block's norm.
+/// Per-block gradient norm results.
+pub struct PerBlockGradNorms {
+    /// Aggregate L2 norm per block (SWA + all levels + alpha_mem).
+    /// Length = n_blocks. Used for depth specialization CV metric.
+    pub block_norms: Vec<f32>,
+    /// L0-only L2 norm per block (only level[0] memory params).
+    /// Length = n_blocks. Used for "L0 gnorm per block > 0.01" floor
+    /// check in spec 19 promotion criteria.
+    pub l0_block_norms: Vec<f32>,
+}
+
+/// Compute per-block L2 gradient norms. Returns both aggregate and L0-only
+/// norms. Called before global clipping. Shared params excluded.
+/// L0 tensors accumulate into a separate l0_sq accumulator in a single pass
+/// (no redundant kernel launches — level[0] results feed both block_sq and
+/// l0_sq via block_sq += l0_sq after the level loop).
 #[cfg(feature = "cuda")]
 pub fn gpu_stacked_per_block_grad_norms(
     grads: &GpuStackedGrads,
     state: &mut GpuStackedAdamWState,
-) -> Vec<f32> {
-    let mut block_norms = Vec::with_capacity(grads.blocks.len());
-
-    for bg in &grads.blocks {
-        let mut block_sq = 0.0f64;
-
-        // Closure: accumulate squared norm for one GPU buffer
-        let mut accum = |g: &GpuBuf<f32>| {
-            let n = g.len() as i32;
-            if n == 0 { return; }
-            let mut num_blocks: i32 = 0;
-            let err = unsafe {
-                crate::cuda_ffi::grad_norm_sq_cuda(
-                    g.as_ptr(), state.norm_scratch.ptr(),
-                    n, &mut num_blocks,
-                )
-            };
-            assert_eq!(err, 0);
-            crate::dispatch::cuda_sync();
-            let nb = num_blocks as usize;
-            state.norm_scratch.slice(0, nb)
-                .copy_to_host(&mut state.norm_host[..nb]);
-            for i in 0..nb {
-                block_sq += state.norm_host[i] as f64;
-            }
-        };
-
-        // SWA projections for this block
-        accum(&bg.d_w_q);
-        accum(&bg.d_w_k);
-        accum(&bg.d_w_v);
-        accum(&bg.d_w_o);
-        accum(&bg.d_ln_attn_gamma);
-        accum(&bg.d_ln_attn_beta);
-        accum(&bg.d_ln_mem_gamma);
-        accum(&bg.d_ln_mem_beta);
-
-        // All levels within this block
-        for lg in &bg.levels {
-            accum(&lg.d_w_k_mem);
-            accum(&lg.d_w_v_mem);
-            accum(&lg.d_w_q_mem);
-            accum(&lg.d_w_alpha);
-            accum(&lg.d_b_alpha);
-            accum(&lg.d_w_theta);
-            accum(&lg.d_b_theta);
-            accum(&lg.d_w_eta);
-            accum(&lg.d_b_eta);
-        }
-
-        // alpha_mem gradients (host-side)
-        for &g in &bg.d_alpha_mem {
-            block_sq += (g as f64) * (g as f64);
-        }
-
-        block_norms.push(block_sq.sqrt() as f32);
-    }
-
-    block_norms
-}
+) -> PerBlockGradNorms
 ```
 
 ### 3b. PyO3: expose on GpuStackedModel
 
-Add `collect_block_gnorms` flag to `step_adamw` and `block_grad_norms()` accessor:
+Add `collect_block_gnorms` flag to `step_adamw` and two accessors:
 
 ```rust
 // In GpuStackedModel:
 last_block_gnorms: Vec<f32>,
+last_l0_block_gnorms: Vec<f32>,
 
 // In step_adamw, after backward, before clipping:
 if collect_block_gnorms {
-    self.last_block_gnorms =
-        gpu_stacked_per_block_grad_norms(&grads, state);
+    let per_block = gpu_stacked_per_block_grad_norms(&grads, state);
+    self.last_block_gnorms = per_block.block_norms;
+    self.last_l0_block_gnorms = per_block.l0_block_norms;
 } else {
     self.last_block_gnorms.clear();
+    self.last_l0_block_gnorms.clear();
 }
 
-fn block_grad_norms(&self) -> Vec<f32> {
-    self.last_block_gnorms.clone()
-}
+/// Aggregate per-block gnorms (SWA + all levels).
+fn block_grad_norms(&self) -> Vec<f32>
+
+/// L0-only per-block gnorms (spec 19 floor check).
+fn l0_block_grad_norms(&self) -> Vec<f32>
 ```
 
 ### 3c. Python: CV computation and logging
@@ -257,6 +218,7 @@ if is_stacked and hasattr(gpu_model, "block_grad_norms"):
   "loss": 4.21,
   "grad_norm": 2.65,
   "block_grad_norms": [1.82, 1.41, 1.15, 0.93],
+  "l0_block_grad_norms": [0.42, 0.38, 0.31, 0.22],
   "block_gnorm_cv": 0.216,
   ...
 }
@@ -323,14 +285,15 @@ This diagnostic is uninformative if:
 
 ## 8. Acceptance Criteria
 
-1. `gpu_stacked_per_block_grad_norms` returns `Vec<f32>` of length `n_blocks`
-2. Each entry is the L2 norm of all gradients belonging to that block (SWA + all levels)
-3. Shared params (embed, unembed, ln_final) excluded from per-block norms
-4. Computed before gradient clipping (pre-clip values)
-5. Opt-in: zero overhead when `collect_block_gnorms=false`
-6. `block_gnorm_cv` logged to JSONL on logging steps
-7. No change to forward/backward/optimizer paths — purely observational
-8. Single-block path unaffected (no regressions)
+1. `gpu_stacked_per_block_grad_norms` returns `PerBlockGradNorms` with `block_norms` and `l0_block_norms`, each of length `n_blocks`
+2. `block_norms`: L2 norm of all gradients belonging to that block (SWA + all levels + alpha_mem)
+3. `l0_block_norms`: L2 norm of only level[0] memory params per block
+4. Shared params (embed, unembed, ln_final) excluded from both vectors
+5. Computed before gradient clipping (pre-clip values)
+6. Opt-in: zero overhead when `collect_block_gnorms=false`
+7. `block_gnorm_cv` (derived: std/mean) and `l0_block_grad_norms` logged to JSONL on logging steps
+8. No change to forward/backward/optimizer paths — purely observational
+9. Single-block path unaffected (no regressions)
 
 ---
 
@@ -340,6 +303,7 @@ This diagnostic is uninformative if:
 |----------|-----------|--------|-------------|
 | eq-097-hope-cms-chain | hope_equations | HOPE S5.1 | informs (CMS block structure) |
 | eq-070-arch-variant1 | hope_equations | HOPE CMS chain | informs (stacked variant) |
+| block_gnorm_cv | derived | Standard CV = std/mean | derived diagnostic (no paper source) |
 
 ## Code Smells
 
