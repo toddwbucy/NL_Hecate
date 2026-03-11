@@ -281,9 +281,9 @@ This diagnostic is uninformative if:
 
 | File | Change |
 |------|--------|
-| `core/src/gpu_stacked_optimizer.rs` | Add `gpu_stacked_per_block_grad_norms()` |
-| `python/src/lib.rs` | Add `collect_block_gnorms` to stacked `step_adamw`, add `block_grad_norms()` accessor |
-| `python/engine/loop.py` | Compute CV, log `block_grad_norms` and `block_gnorm_cv` to JSONL |
+| `core/src/gpu_stacked_optimizer.rs` | Add `PerBlockGradNorms` struct and `gpu_stacked_per_block_grad_norms()` returning aggregate + L0-only norms |
+| `python/src/lib.rs` | Add `collect_block_gnorms` to stacked `step_adamw`, add `block_grad_norms()` and `l0_block_grad_norms()` accessors |
+| `python/engine/loop.py` | Compute CV, log `block_grad_norms`, `l0_block_grad_norms`, and `block_gnorm_cv` to JSONL |
 
 ---
 
