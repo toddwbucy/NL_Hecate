@@ -199,14 +199,18 @@ In `loop.py`, on logging steps:
 if is_stacked and hasattr(gpu_model, "block_grad_norms"):
     block_gnorms = gpu_model.block_grad_norms()
     if block_gnorms:
+        log_fields["block_grad_norms"] = [round(g, 6) for g in block_gnorms]
         mean_bg = sum(block_gnorms) / len(block_gnorms)
         if mean_bg > 0:
             var_bg = sum((g - mean_bg) ** 2 for g in block_gnorms) / len(block_gnorms)
-            block_gnorm_cv = (var_bg ** 0.5) / mean_bg
+            log_fields["block_gnorm_cv"] = round(var_bg ** 0.5 / mean_bg, 6)
         else:
-            block_gnorm_cv = 0.0
-        log_fields["block_grad_norms"] = [round(g, 6) for g in block_gnorms]
-        log_fields["block_gnorm_cv"] = round(block_gnorm_cv, 6)
+            log_fields["block_gnorm_cv"] = 0.0
+    # L0-only per-block gnorms for promotion floor check (spec 19)
+    if hasattr(gpu_model, "l0_block_grad_norms"):
+        l0_bg = gpu_model.l0_block_grad_norms()
+        if l0_bg:
+            log_fields["l0_block_grad_norms"] = [round(g, 6) for g in l0_bg]
 ```
 
 ### 3d. JSONL output format
