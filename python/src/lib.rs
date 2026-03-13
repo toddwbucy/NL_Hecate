@@ -280,6 +280,7 @@ impl MAGConfig {
         attentional_bias=None, kernel_size=0, self_ref_chunk_size=1,
         projection_kind="static", self_generated_values=false,
         momentum_kind="none", momentum_d_hidden=0,
+        alpha_floor=None, alpha_ceil=None,
         theta_floor=None, theta_ceil=None,
         intermediate_size=0,
         m_norm_max=None,
@@ -325,6 +326,8 @@ impl MAGConfig {
         self_generated_values: bool,
         momentum_kind: &str,
         momentum_d_hidden: usize,
+        alpha_floor: Option<Vec<f32>>,
+        alpha_ceil: Option<Vec<f32>>,
         theta_floor: Option<Vec<f32>>,
         theta_ceil: Option<Vec<f32>>,
         intermediate_size: usize,
@@ -564,6 +567,8 @@ impl MAGConfig {
                 },
                 self_generated_values,
                 self_ref_chunk_size,
+                alpha_floor: alpha_floor.unwrap_or_default(),
+                alpha_ceil: alpha_ceil.unwrap_or_default(),
                 theta_floor: theta_floor.unwrap_or_default(),
                 theta_ceil: theta_ceil.unwrap_or_default(),
                 intermediate_size,
@@ -640,6 +645,10 @@ impl MAGConfig {
     fn self_ref_chunk_size(&self) -> usize { self.inner.self_ref_chunk_size }
     #[getter]
     fn momentum_d_hidden(&self) -> usize { self.inner.momentum_d_hidden }
+    #[getter]
+    fn alpha_floor(&self) -> Vec<f32> { self.inner.alpha_floor.clone() }
+    #[getter]
+    fn alpha_ceil(&self) -> Vec<f32> { self.inner.alpha_ceil.clone() }
     #[getter]
     fn theta_floor(&self) -> Vec<f32> { self.inner.theta_floor.clone() }
     #[getter]
@@ -878,6 +887,7 @@ impl MAGForwardCache {
     attentional_bias=None, kernel_size=0, self_ref_chunk_size=1,
     projection_kind="static", self_generated_values=false,
     momentum_kind="none", momentum_d_hidden=0,
+    alpha_floor=None, alpha_ceil=None,
     theta_floor=None, theta_ceil=None,
     intermediate_size=0,
     m_norm_max=None,
@@ -923,6 +933,8 @@ fn mag_create_config(
     self_generated_values: bool,
     momentum_kind: &str,
     momentum_d_hidden: usize,
+    alpha_floor: Option<Vec<f32>>,
+    alpha_ceil: Option<Vec<f32>>,
     theta_floor: Option<Vec<f32>>,
     theta_ceil: Option<Vec<f32>>,
     intermediate_size: usize,
@@ -941,6 +953,7 @@ fn mag_create_config(
         d_hidden, lp_p, sign_sharpness, lq_q, lambda_local, lambda_2, delta, m_slots, d_compress, lambda_k, lambda_v,
         retention, m3, frequency_schedule, checkpoint_interval, attentional_bias, kernel_size, self_ref_chunk_size,
         projection_kind, self_generated_values, momentum_kind, momentum_d_hidden,
+        alpha_floor, alpha_ceil,
         theta_floor, theta_ceil, intermediate_size, m_norm_max, error_clip,
         feature_map, feature_map_sigma,
         parallel_strategy, tnt_global_chunk_size, tnt_local_chunk_size,
@@ -2787,6 +2800,111 @@ impl GpuStackedModel {
     /// "L0 gnorm per block > 0.01" floor check (spec 19 promotion criteria).
     fn l0_block_grad_norms(&self) -> Vec<f32> {
         self.last_l0_block_gnorms.clone()
+    }
+
+    /// CPU Wengert tape summary for stacked models — full gradient observability.
+    ///
+    /// Downloads params + context to host, runs traced forward+backward on CPU,
+    /// returns per-(block, level) diagnostics. Slower than GPU path but gives
+    /// full tape visibility for debugging. Context is not modified.
+    fn cpu_stacked_tape_summary(
+        &mut self,
+        input_ids: Vec<usize>,
+        target_ids: Vec<usize>,
+        pulse: &Pulse,
+        py: Python<'_>,
+    ) -> PyResult<PyObject> {
+        let s = self.cfg.swa.seq_len;
+        let v = self.cfg.swa.vocab_size;
+        let d = self.cfg.swa.d_model;
+        let k = self.cfg.k;
+        if s == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err("seq_len must be > 0"));
+        }
+        if input_ids.is_empty() || input_ids.len() % s != 0 || target_ids.len() != input_ids.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("input/target length must be batch_size * seq_len {} (got {})", s, input_ids.len())));
+        }
+        if let Some(&max_id) = input_ids.iter().max() {
+            if max_id >= v {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("input_ids contains {} >= vocab_size {}", max_id, v)));
+            }
+        }
+        if let Some(&max_id) = target_ids.iter().max() {
+            if max_id >= v {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("target_ids contains {} >= vocab_size {}", max_id, v)));
+            }
+        }
+
+        // Download params and context to host for CPU traced forward.
+        let host_params = self.params.to_host(d, v, k);
+        let mut host_ctx: Vec<Vec<Vec<f32>>> = self.context.blocks.iter()
+            .map(|gpu_ctx| {
+                let ctx_state = gpu_ctx.to_host(k);
+                ctx_state.memory
+            })
+            .collect();
+
+        let summary = nl_hecate_core::tape_summary::extract_stacked_tape_summary(
+            &host_params, &self.cfg, &input_ids, &target_ids, &pulse.inner, &mut host_ctx,
+        );
+
+        // Build Python dict — same schema as gpu_stacked_tape_summary.
+        let dict = pyo3::types::PyDict::new(py);
+        dict.set_item("loss", summary.loss)?;
+        dict.set_item("n_blocks", summary.n_blocks)?;
+
+        // Per-block breakdown
+        let blocks_list = pyo3::types::PyList::empty(py);
+        let mut agg_gnorms = vec![0.0f32; k];
+        let mut agg_deltas = vec![0.0f32; k];
+
+        for block_sum in &summary.blocks {
+            let bdict = pyo3::types::PyDict::new(py);
+            bdict.set_item("block_index", block_sum.block)?;
+            let levels_list = pyo3::types::PyList::empty(py);
+            for lvl in &block_sum.levels {
+                let ldict = pyo3::types::PyDict::new(py);
+                ldict.set_item("level", lvl.level)?;
+                ldict.set_item("opaque_key", &lvl.opaque_key)?;
+                ldict.set_item("block_count", lvl.block_count)?;
+                ldict.set_item("output_grad_norm", lvl.output_grad_norm)?;
+                ldict.set_item("dgd_delta_norm", lvl.dgd_delta_norm)?;
+                levels_list.append(ldict)?;
+                if lvl.output_grad_norm > agg_gnorms[lvl.level] {
+                    agg_gnorms[lvl.level] = lvl.output_grad_norm;
+                }
+                if lvl.dgd_delta_norm > agg_deltas[lvl.level] {
+                    agg_deltas[lvl.level] = lvl.dgd_delta_norm;
+                }
+            }
+            bdict.set_item("levels", levels_list)?;
+            blocks_list.append(bdict)?;
+        }
+        dict.set_item("blocks", blocks_list)?;
+
+        // Aggregated levels (backward compat with print_tape_summary)
+        let mut total_active = 0usize;
+        let agg_levels_list = pyo3::types::PyList::empty(py);
+        for level in 0..k {
+            let ldict = pyo3::types::PyDict::new(py);
+            ldict.set_item("level", level)?;
+            let rule_name = format!("{:?}", self.cfg.memory_rule);
+            ldict.set_item("opaque_key", &rule_name)?;
+            let active = pulse.inner.active_levels[level];
+            let bc = if active { self.n_blocks } else { 0usize };
+            if active { total_active += self.n_blocks; }
+            ldict.set_item("block_count", bc)?;
+            ldict.set_item("output_grad_norm", agg_gnorms[level])?;
+            ldict.set_item("dgd_delta_norm", agg_deltas[level])?;
+            agg_levels_list.append(ldict)?;
+        }
+        dict.set_item("levels", agg_levels_list)?;
+        dict.set_item("total_blocks", total_active)?;
+
+        Ok(dict.into())
     }
 
     /// GPU-resident stacked tape summary -- per-(block, level) gradient diagnostics.

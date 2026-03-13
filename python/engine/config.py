@@ -51,6 +51,10 @@ class BuildConfig:
     # Memory enable flag (False = SWA-only baseline, no CMS memory modules)
     memory_enabled: bool = True
 
+    # Per-level alpha retention gate clamps (empty = unclamped, CS-39 style)
+    alpha_floor: list[float] | None = None  # per-level sigmoid lower bound (prevents catastrophic forgetting)
+    alpha_ceil: list[float] | None = None   # per-level sigmoid upper bound (prevents memory stasis)
+
     # Per-level theta gate clamps (empty = unclamped, CS-39 style)
     theta_floor: list[float] | None = None  # per-level softplus lower bound
     theta_ceil: list[float] | None = None   # per-level softplus upper bound
@@ -255,6 +259,12 @@ class BuildConfig:
         if self.data_format not in ("byte", "sharegpt", "dolmino"):
             raise ValueError(
                 f"data_format must be 'byte', 'sharegpt', or 'dolmino', got '{self.data_format}'")
+        if self.alpha_floor is not None and len(self.alpha_floor) != self.k:
+            raise ValueError(
+                f"alpha_floor length {len(self.alpha_floor)} must match k={self.k}")
+        if self.alpha_ceil is not None and len(self.alpha_ceil) != self.k:
+            raise ValueError(
+                f"alpha_ceil length {len(self.alpha_ceil)} must match k={self.k}")
         if self.theta_floor is not None and len(self.theta_floor) != self.k:
             raise ValueError(
                 f"theta_floor length {len(self.theta_floor)} must match k={self.k}")

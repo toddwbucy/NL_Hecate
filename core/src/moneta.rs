@@ -64,6 +64,9 @@ pub struct Moneta {
     /// At q=4 (MONETA design target): W = A / ||A||_4^2, bounding peak magnitudes.
     /// Source: MIRAS §5.3 Eqs 24-25, specs/algorithms/retention_mechanisms/07_lq_norm.md.
     pub lq_q: f32,
+    /// Per-level alpha floor/ceil (CS-39 retention gate clamp). 0.0/1.0 = no clamp.
+    pub alpha_floor: f32,
+    pub alpha_ceil: f32,
     /// Per-level theta floor/ceil (CS-39 training wheels). 0.0/MAX = no clamp.
     pub theta_floor: f32,
     pub theta_ceil: f32,
@@ -78,6 +81,8 @@ impl Moneta {
             lambda_2: cfg.lambda_2,
             sign_sharpness: cfg.sign_sharpness,
             lq_q: cfg.lq_q,
+            alpha_floor: cfg.alpha_floor.get(level).copied().unwrap_or(0.0),
+            alpha_ceil: cfg.alpha_ceil.get(level).copied().unwrap_or(1.0),
             theta_floor: cfg.theta_floor.get(level).copied().unwrap_or(0.0),
             theta_ceil: cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX),
         }
@@ -306,7 +311,7 @@ impl MemoryRule for Moneta {
                 alpha_pre_t += concat_t[i] * level_params.w_alpha[i];
             }
             alpha_pre[t] = alpha_pre_t;
-            alpha[t] = sigmoid_f32(alpha_pre_t);
+            alpha[t] = sigmoid_f32(alpha_pre_t).clamp(self.alpha_floor, self.alpha_ceil);
 
             // theta_t = softplus(concat @ w_theta + b_theta)
             let mut theta_pre_t = level_params.b_theta[0];
@@ -758,7 +763,9 @@ impl MemoryRule for Moneta {
 
                 // Gate backward
                 let sig_deriv = alpha_t * (1.0 - alpha_t);
-                let d_alpha_pre = d_alpha_scalar * sig_deriv;
+                let alpha_raw = cache.alpha[t];
+                let alpha_clamp_mask = if alpha_raw <= self.alpha_floor || alpha_raw >= self.alpha_ceil { 0.0 } else { 1.0 };
+                let d_alpha_pre = d_alpha_scalar * sig_deriv * alpha_clamp_mask;
                 // straight-through clamp mask (CS-39)
                 let theta_raw = cache.theta[t];
                 let clamp_mask = if theta_raw <= self.theta_floor || theta_raw >= self.theta_ceil { 0.0 } else { 1.0 };
@@ -996,7 +1003,9 @@ impl MemoryRule for Moneta {
 
             // ── Gate backward: alpha_t = sigmoid(alpha_pre_t) ──
             let sig_deriv = alpha_t * (1.0 - alpha_t);
-            let d_alpha_pre = d_alpha_scalar * sig_deriv;
+            let alpha_raw = cache.alpha[t];
+            let alpha_clamp_mask = if alpha_raw <= self.alpha_floor || alpha_raw >= self.alpha_ceil { 0.0 } else { 1.0 };
+            let d_alpha_pre = d_alpha_scalar * sig_deriv * alpha_clamp_mask;
 
             // ── Gate backward: theta_t = softplus(theta_pre_t), straight-through clamp (CS-39) ──
             let theta_raw = cache.theta[t];
@@ -1544,7 +1553,7 @@ mod tests {
 
     #[test]
     fn test_moneta_init() {
-        let rule = Moneta { d_hidden: 4, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0, lq_q: 2.0, theta_floor: 0.0, theta_ceil: f32::MAX };
+        let rule = Moneta { d_hidden: 4, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0, lq_q: 2.0, alpha_floor: 0.0, alpha_ceil: 1.0, theta_floor: 0.0, theta_ceil: f32::MAX };
         let state = rule.init(8);
         assert_eq!(state.w1.len(), 4 * 8); // [d_hidden, d]
         assert_eq!(state.w2.len(), 8 * 4); // [d, d_hidden]
@@ -1556,7 +1565,7 @@ mod tests {
 
     #[test]
     fn test_moneta_level_and_parallelization() {
-        let rule = Moneta { d_hidden: 4, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0, lq_q: 2.0, theta_floor: 0.0, theta_ceil: f32::MAX };
+        let rule = Moneta { d_hidden: 4, lp_p: 2.0, lambda_2: 0.01, sign_sharpness: 10.0, lq_q: 2.0, alpha_floor: 0.0, alpha_ceil: 1.0, theta_floor: 0.0, theta_ceil: f32::MAX };
         assert_eq!(rule.level(), 0);
         let strategies = rule.supported_parallelization();
         assert!(strategies.contains(&"sequential"));

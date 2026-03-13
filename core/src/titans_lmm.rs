@@ -41,6 +41,9 @@ pub struct TitansLMM {
     pub sign_sharpness: f32,
     pub momentum_kind: crate::model::MomentumKind,
     pub momentum_d_hidden: usize,
+    /// Per-level alpha floor/ceil (CS-39 retention gate clamp). 0.0/1.0 = no clamp.
+    pub alpha_floor: f32,
+    pub alpha_ceil: f32,
     /// Per-level theta floor/ceil (CS-39 training wheels). 0.0/MAX = no clamp.
     pub theta_floor: f32,
     pub theta_ceil: f32,
@@ -58,6 +61,8 @@ impl TitansLMM {
             sign_sharpness: 10.0,
             momentum_kind: crate::model::MomentumKind::EMA,
             momentum_d_hidden: 0,
+            alpha_floor: 0.0,
+            alpha_ceil: 1.0,
             theta_floor: 0.0,
             theta_ceil: f32::MAX,
             m_norm_max: f32::MAX,
@@ -72,6 +77,8 @@ impl TitansLMM {
             sign_sharpness: cfg.sign_sharpness,
             momentum_kind: mk,
             momentum_d_hidden: cfg.momentum_d_hidden,
+            alpha_floor: cfg.alpha_floor.get(level).copied().unwrap_or(0.0),
+            alpha_ceil: cfg.alpha_ceil.get(level).copied().unwrap_or(1.0),
             theta_floor: cfg.theta_floor.get(level).copied().unwrap_or(0.0),
             theta_ceil: cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX),
             m_norm_max: cfg.max_m_norm(level),
@@ -300,7 +307,7 @@ impl MemoryRule for TitansLMM {
                 alpha_pre_t += concat_t[i] * level_params.w_alpha[i];
             }
             alpha_pre[t] = alpha_pre_t;
-            alpha[t] = sigmoid_f32(alpha_pre_t);
+            alpha[t] = sigmoid_f32(alpha_pre_t).clamp(self.alpha_floor, self.alpha_ceil);
 
             // theta_t = softplus(concat @ w_theta + b_theta)
             let mut theta_pre_t = level_params.b_theta[0];
@@ -916,7 +923,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = TitansLMM { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0, theta_floor: 0.0, theta_ceil: f32::MAX, m_norm_max: f32::MAX, feature_map: FeatureMapKind::Identity };
+        let rule = TitansLMM { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0, alpha_floor: 0.0, alpha_ceil: 1.0, theta_floor: 0.0, theta_ceil: f32::MAX, m_norm_max: f32::MAX, feature_map: FeatureMapKind::Identity };
         let (y, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for (i, &v) in y.iter().enumerate() {
             assert!(v.is_finite(), "L1 y[{i}] not finite: {v}");
@@ -928,7 +935,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = TitansLMM { bias: crate::model::AttentionalBias::Lp(3.0), sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0, theta_floor: 0.0, theta_ceil: f32::MAX, m_norm_max: f32::MAX, feature_map: FeatureMapKind::Identity };
+        let rule = TitansLMM { bias: crate::model::AttentionalBias::Lp(3.0), sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0, alpha_floor: 0.0, alpha_ceil: 1.0, theta_floor: 0.0, theta_ceil: f32::MAX, m_norm_max: f32::MAX, feature_map: FeatureMapKind::Identity };
         let (y, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for (i, &v) in y.iter().enumerate() {
             assert!(v.is_finite(), "Lp(3) y[{i}] not finite: {v}");
@@ -940,7 +947,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = TitansLMM { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0, theta_floor: 0.0, theta_ceil: f32::MAX, m_norm_max: f32::MAX, feature_map: FeatureMapKind::Identity };
+        let rule = TitansLMM { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0, alpha_floor: 0.0, alpha_ceil: 1.0, theta_floor: 0.0, theta_ceil: f32::MAX, m_norm_max: f32::MAX, feature_map: FeatureMapKind::Identity };
         let (y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let d_y = vec![1.0f32; y.len()];
         let (grads, d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
@@ -992,6 +999,8 @@ mod tests {
             sign_sharpness: 10.0,
             momentum_kind: crate::model::MomentumKind::DeltaMomentum,
             momentum_d_hidden: 0,
+            alpha_floor: 0.0,
+            alpha_ceil: 1.0,
             theta_floor: 0.0,
             theta_ceil: f32::MAX,
             m_norm_max: f32::MAX,
@@ -1028,6 +1037,8 @@ mod tests {
             sign_sharpness: 10.0,
             momentum_kind: crate::model::MomentumKind::DeepMomentum,
             momentum_d_hidden: 4 * d,
+            alpha_floor: 0.0,
+            alpha_ceil: 1.0,
             theta_floor: 0.0,
             theta_ceil: f32::MAX,
             m_norm_max: f32::MAX,

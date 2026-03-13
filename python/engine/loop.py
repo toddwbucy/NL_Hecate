@@ -278,6 +278,8 @@ def run_build(bcfg: BuildConfig):
                     else getattr(cfg, "retention", None)
                 ),
                 intermediate_size=bcfg.intermediate_size,
+                alpha_floor=bcfg.alpha_floor,
+                alpha_ceil=bcfg.alpha_ceil,
                 theta_floor=bcfg.theta_floor,
                 theta_ceil=bcfg.theta_ceil,
                 m_norm_max=ext_m_norm,
@@ -360,10 +362,12 @@ def run_build(bcfg: BuildConfig):
         # Apply theta clamps from BuildConfig onto loaded cfg (allows
         # adding clamps to an existing checkpoint that didn't have them).
         # MAGConfig is frozen, so rebuild if clamps changed.
-        if bcfg.theta_floor is not None or bcfg.theta_ceil is not None or bcfg.m_norm_max is not None or bcfg.error_clip is not None:
+        if bcfg.alpha_floor is not None or bcfg.alpha_ceil is not None or bcfg.theta_floor is not None or bcfg.theta_ceil is not None or bcfg.m_norm_max is not None or bcfg.error_clip is not None:
             # Use bcfg value when explicitly set; fall back to loaded cfg so we
             # never silently wipe clamp values that were already baked into the
             # checkpoint (e.g. resuming without --m_norm_max still preserves it).
+            alpha_floor = bcfg.alpha_floor if bcfg.alpha_floor is not None else list(cfg.alpha_floor)
+            alpha_ceil  = bcfg.alpha_ceil  if bcfg.alpha_ceil  is not None else list(cfg.alpha_ceil)
             theta_floor = bcfg.theta_floor if bcfg.theta_floor is not None else list(cfg.theta_floor)
             theta_ceil  = bcfg.theta_ceil  if bcfg.theta_ceil  is not None else list(cfg.theta_ceil)
             m_norm_max  = bcfg.m_norm_max  if bcfg.m_norm_max  is not None else list(cfg.m_norm_max)
@@ -392,6 +396,8 @@ def run_build(bcfg: BuildConfig):
                     else getattr(cfg, "retention", None)
                 ),
                 intermediate_size=bcfg.intermediate_size,
+                alpha_floor=alpha_floor,
+                alpha_ceil=alpha_ceil,
                 theta_floor=theta_floor,
                 theta_ceil=theta_ceil,
                 m_norm_max=m_norm_max,
@@ -434,6 +440,8 @@ def run_build(bcfg: BuildConfig):
             momentum_d_hidden=bcfg.momentum_d_hidden,
             attentional_bias=bcfg.attentional_bias,
             retention=bcfg.retention,
+            alpha_floor=bcfg.alpha_floor,
+            alpha_ceil=bcfg.alpha_ceil,
             theta_floor=bcfg.theta_floor,
             theta_ceil=bcfg.theta_ceil,
             intermediate_size=bcfg.intermediate_size,
@@ -469,6 +477,8 @@ def run_build(bcfg: BuildConfig):
         print(f"  SwiGLU:   intermediate_size={bcfg.intermediate_size}")
     if bcfg.donor_weights:
         print(f"  Donor:    {bcfg.donor_weights}")
+    if bcfg.alpha_floor is not None or bcfg.alpha_ceil is not None:
+        print(f"  α clamps: floor={bcfg.alpha_floor}, ceil={bcfg.alpha_ceil}")
     if bcfg.theta_floor is not None or bcfg.theta_ceil is not None:
         print(f"  θ clamps: floor={bcfg.theta_floor}, ceil={bcfg.theta_ceil}")
     if bcfg.gate_warmup_theta_floor_init is not None:
@@ -794,6 +804,8 @@ def run_build(bcfg: BuildConfig):
                     attentional_bias=getattr(cfg, "attentional_bias", None),
                     retention=getattr(cfg, "retention", None),
                     intermediate_size=bcfg.intermediate_size,
+                    alpha_floor=list(cfg.alpha_floor) if list(cfg.alpha_floor) else None,
+                    alpha_ceil=list(cfg.alpha_ceil) if list(cfg.alpha_ceil) else None,
                     theta_floor=warmup_floor,
                     theta_ceil=list(cfg.theta_ceil) if list(cfg.theta_ceil) else None,
                     m_norm_max=list(cfg.m_norm_max) if list(cfg.m_norm_max) else None,
@@ -826,6 +838,8 @@ def run_build(bcfg: BuildConfig):
                     attentional_bias=getattr(cfg, "attentional_bias", None),
                     retention=getattr(cfg, "retention", None),
                     intermediate_size=bcfg.intermediate_size,
+                    alpha_floor=list(cfg.alpha_floor) if list(cfg.alpha_floor) else None,
+                    alpha_ceil=list(cfg.alpha_ceil) if list(cfg.alpha_ceil) else None,
                     theta_floor=final_floor,
                     theta_ceil=list(cfg.theta_ceil) if list(cfg.theta_ceil) else None,
                     m_norm_max=list(cfg.m_norm_max) if list(cfg.m_norm_max) else None,
@@ -1592,6 +1606,7 @@ def run_build(bcfg: BuildConfig):
                 attentional_bias=getattr(cfg, "attentional_bias", None),
                 retention=getattr(cfg, "retention", None),
                 intermediate_size=bcfg.intermediate_size,
+                alpha_floor=None, alpha_ceil=None,
                 theta_floor=None, theta_ceil=None,
                 m_norm_max=new_m_norm,
                 error_clip=new_error_clip,

@@ -761,6 +761,15 @@ pub struct MAGConfig {
     /// Only meaningful when projection_kind == Adaptive.
     #[serde(default = "default_one")]
     pub self_ref_chunk_size: usize,
+    /// Per-level alpha (retention gate) floor after sigmoid activation (CS-39).
+    /// Prevents catastrophic memory forgetting: alpha^N retention after N steps.
+    /// Length must match `k`. Default: empty (no floor, sigmoid [0,1] bounds only).
+    #[serde(default)]
+    pub alpha_floor: Vec<f32>,
+    /// Per-level alpha (retention gate) ceiling after sigmoid activation (CS-39).
+    /// Length must match `k`. Default: empty (no ceiling, sigmoid [0,1] bounds only).
+    #[serde(default)]
+    pub alpha_ceil: Vec<f32>,
     /// Per-level theta (inner-loop lr) floor after softplus activation (CS-39).
     /// Prevents higher CMS levels from collapsing to near-zero learning rate.
     /// Length must match `k`. Default: all zeros (no floor).
@@ -805,6 +814,16 @@ fn default_false() -> bool { false }
 fn default_sign_sharpness() -> f32 { 10.0 }
 
 impl MAGConfig {
+    /// Clamp a post-sigmoid alpha value using per-level floor/ceil (CS-39).
+    /// Prevents catastrophic forgetting (alpha too low) or memory stasis (alpha too high).
+    /// Returns alpha unchanged if no floor/ceil is configured for this level.
+    #[inline]
+    pub fn clamp_alpha(&self, level: usize, alpha: f32) -> f32 {
+        let floor = self.alpha_floor.get(level).copied().unwrap_or(0.0);
+        let ceil = self.alpha_ceil.get(level).copied().unwrap_or(1.0);
+        alpha.clamp(floor, ceil)
+    }
+
     /// Clamp a post-softplus theta value using per-level floor/ceil (CS-39).
     /// Returns theta unchanged if no floor/ceil is configured for this level.
     #[inline]
@@ -907,6 +926,8 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            alpha_floor: vec![],
+            alpha_ceil: vec![],
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
@@ -949,6 +970,8 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            alpha_floor: vec![],
+            alpha_ceil: vec![],
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
@@ -991,6 +1014,8 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            alpha_floor: vec![],
+            alpha_ceil: vec![],
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
@@ -1034,6 +1059,8 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            alpha_floor: vec![],
+            alpha_ceil: vec![],
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
@@ -1077,6 +1104,8 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            alpha_floor: vec![],
+            alpha_ceil: vec![],
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
@@ -1120,6 +1149,8 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            alpha_floor: vec![],
+            alpha_ceil: vec![],
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
@@ -1162,6 +1193,8 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            alpha_floor: vec![],
+            alpha_ceil: vec![],
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
@@ -1204,6 +1237,8 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            alpha_floor: vec![],
+            alpha_ceil: vec![],
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
@@ -1246,6 +1281,8 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            alpha_floor: vec![],
+            alpha_ceil: vec![],
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
@@ -1288,6 +1325,8 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            alpha_floor: vec![],
+            alpha_ceil: vec![],
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
@@ -1340,6 +1379,8 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            alpha_floor: vec![],
+            alpha_ceil: vec![],
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
@@ -1392,6 +1433,8 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            alpha_floor: vec![],
+            alpha_ceil: vec![],
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
@@ -1444,6 +1487,8 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            alpha_floor: vec![],
+            alpha_ceil: vec![],
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
@@ -1496,6 +1541,8 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            alpha_floor: vec![],
+            alpha_ceil: vec![],
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
@@ -1548,6 +1595,8 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            alpha_floor: vec![],
+            alpha_ceil: vec![],
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
@@ -1600,6 +1649,8 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            alpha_floor: vec![],
+            alpha_ceil: vec![],
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
@@ -1643,6 +1694,8 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            alpha_floor: vec![],
+            alpha_ceil: vec![],
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
@@ -1686,6 +1739,8 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            alpha_floor: vec![],
+            alpha_ceil: vec![],
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
@@ -1732,6 +1787,8 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            alpha_floor: vec![],
+            alpha_ceil: vec![],
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
@@ -1778,6 +1835,8 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            alpha_floor: vec![],
+            alpha_ceil: vec![],
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
@@ -1820,6 +1879,8 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            alpha_floor: vec![],
+            alpha_ceil: vec![],
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
@@ -1862,6 +1923,8 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            alpha_floor: vec![],
+            alpha_ceil: vec![],
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
@@ -1904,6 +1967,8 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            alpha_floor: vec![],
+            alpha_ceil: vec![],
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
@@ -1946,6 +2011,8 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            alpha_floor: vec![],
+            alpha_ceil: vec![],
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
@@ -1989,6 +2056,8 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            alpha_floor: vec![],
+            alpha_ceil: vec![],
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
@@ -2031,6 +2100,8 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            alpha_floor: vec![],
+            alpha_ceil: vec![],
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
@@ -2074,6 +2145,8 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            alpha_floor: vec![],
+            alpha_ceil: vec![],
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
@@ -2117,6 +2190,8 @@ impl MAGConfig {
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
+            alpha_floor: vec![],
+            alpha_ceil: vec![],
             theta_floor: vec![],
             theta_ceil: vec![],
             intermediate_size: 0,
