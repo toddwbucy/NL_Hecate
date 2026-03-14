@@ -51,6 +51,7 @@ fn make_tnt_config(rule: MemoryRuleKind) -> MAGConfig {
         m3: None,
         frequency_schedule: nl_hecate_core::dynamic_freq::FrequencySchedule::Fixed,
         checkpoint_interval: None,
+        tape_multiplier: None,
         hope_variant: HopeVariant::FreqGated,
         lattice_variant: LatticeVariant::Decode,
         n_persistent: 0,

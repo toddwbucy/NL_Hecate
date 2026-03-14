@@ -483,9 +483,13 @@ pub fn gpu_cms_forward(
         let is_tnt_mode = cfg.parallel.as_ref()
             .map(|p| p.strategy == ParallelStrategy::TNTHierarchical)
             .unwrap_or(false);
+        // Spec 25: tape_multiplier routes levels to Ckpt path, which is incompatible
+        // with CUDA graph capture. Disable capture if any level would use Ckpt.
+        let has_ckpt = cfg.checkpoint_interval.is_some()
+            || cfg.tape_multiplier.map_or(false, |m| m > 0);
         let can_capture = !cfg.residual
             && matches!(cfg.memory_rule, MemoryRuleKind::DeltaRule | MemoryRuleKind::TitansLMM)
-            && cfg.checkpoint_interval.is_none()
+            && !has_ckpt
             && !is_tnt_mode;
 
         if can_capture {
@@ -856,7 +860,12 @@ pub(crate) fn gpu_memory_forward(
     let m_initial_slice = context_m.slice(0, bs * dd);
     let m_norm_max = cfg.max_m_norm(level);
 
-    match (cfg.checkpoint_interval, cfg.memory_rule) {
+    // Spec 25: boundary-scoped Wengert tape. Use effective_checkpoint_interval
+    // which accounts for tape_multiplier — derives per-level intervals from chunk_sizes.
+    // When tape_multiplier is None/0, falls back to cfg.checkpoint_interval (legacy).
+    let eff_ckpt = cfg.effective_checkpoint_interval(level);
+
+    match (eff_ckpt, cfg.memory_rule) {
         // ── Full-trajectory paths (checkpoint_interval=None, current behavior) ──
         (None, MemoryRuleKind::DeltaRule) => {
             let mut m_states = GpuBuf::zeros(bs * (s + 1) * dd);

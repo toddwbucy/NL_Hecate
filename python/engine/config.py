@@ -117,6 +117,10 @@ class BuildConfig:
 
     # Gradient checkpointing (VRAM optimization for memory rules)
     checkpoint_interval: int | None = None  # None = full trajectory; C = store M every C steps
+    # Tape multiplier (spec 25): controls intra-chunk checkpoint density.
+    # 1 = boundary-only (min memory), N = N checkpoints per chunk.
+    # None/0 = full trajectory (current behavior, backward compatible).
+    tape_multiplier: int | None = None
 
     # Batching
     batch_size: int = 1  # number of sequences per step (GPU batching)

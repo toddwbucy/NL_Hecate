@@ -36,6 +36,7 @@ fn make_config(rule: MemoryRuleKind, checkpoint_interval: Option<usize>) -> MAGC
         m3: None,
         frequency_schedule: nl_hecate_core::dynamic_freq::FrequencySchedule::Fixed,
         checkpoint_interval,
+        tape_multiplier: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,

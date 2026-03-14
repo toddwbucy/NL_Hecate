@@ -151,9 +151,9 @@ def run_build(bcfg: BuildConfig):
             cfg = result["config"]
             bcfg.n_blocks = result["n_blocks"]
             build_state = result["build_state"]
-            # Create a dummy single-block params for num_params display
-            # (the actual GPU model uses _stacked_params_json)
-            params = nl_hecate.MAGParams(cfg, seed=bcfg.seed if hasattr(bcfg, "seed") else 42)
+            # Stacked models use _stacked_params_json for GPU construction.
+            # param count is read from the GpuStackedModel after construction.
+            params = None
             if build_state is not None:
                 resume_step = build_state["global_step"]
                 print(f"  Stacked checkpoint: n_blocks={result['n_blocks']}, k={cfg.k}")
@@ -262,6 +262,7 @@ def run_build(bcfg: BuildConfig):
                 chunk_sizes=new_chunks,
                 memory_rule=cfg.memory_rule, composition=cfg.composition,
                 checkpoint_interval=bcfg.checkpoint_interval,
+                tape_multiplier=bcfg.tape_multiplier,
                 projection_kind=cfg.projection_kind,
                 self_generated_values=cfg.self_generated_values,
                 self_ref_chunk_size=cfg.self_ref_chunk_size,
@@ -380,6 +381,7 @@ def run_build(bcfg: BuildConfig):
                 chunk_sizes=list(cfg.chunk_sizes),
                 memory_rule=cfg.memory_rule, composition=cfg.composition,
                 checkpoint_interval=bcfg.checkpoint_interval,
+                tape_multiplier=bcfg.tape_multiplier,
                 projection_kind=cfg.projection_kind,
                 self_generated_values=cfg.self_generated_values,
                 self_ref_chunk_size=cfg.self_ref_chunk_size,
@@ -433,6 +435,7 @@ def run_build(bcfg: BuildConfig):
             memory_rule=bcfg.memory_rule,
             composition=bcfg.composition,
             checkpoint_interval=bcfg.checkpoint_interval,
+            tape_multiplier=bcfg.tape_multiplier,
             projection_kind=bcfg.projection_kind,
             self_generated_values=bcfg.self_generated_values,
             self_ref_chunk_size=bcfg.self_ref_chunk_size,
@@ -489,7 +492,10 @@ def run_build(bcfg: BuildConfig):
         print(f"  M-norm:   max={list(cfg.m_norm_max)}")
     if len(cfg.error_clip) > 0:
         print(f"  ErrClip:  max={list(cfg.error_clip)}")
-    print(f"  Params:   {params.num_params():,}")
+    if params is not None:
+        print(f"  Params:   {params.num_params():,}")
+    else:
+        print(f"  Params:   (stacked — reported after GPU upload)")
     data_len = len(active_loader) if use_bpe else len(token_ids)
     print(f"  Data:     {data_len:,} tokens" +
           (f" ({bcfg.data_format} BPE)" if use_bpe else ""))
@@ -668,7 +674,7 @@ def run_build(bcfg: BuildConfig):
             "d_model": bcfg.d_model, "num_heads": bcfg.num_heads,
             "seq_len": bcfg.seq_len, "k": bcfg.k, "memory_rule": bcfg.memory_rule,
             "composition": bcfg.composition, "optimizer": bcfg.optimizer,
-            "lr": bcfg.lr, "steps": bcfg.steps, "params": params.num_params(),
+            "lr": bcfg.lr, "steps": bcfg.steps, "params": params.num_params() if params is not None else 0,
             "n_blocks": getattr(bcfg, "n_blocks", 1),
         })
 
@@ -796,6 +802,7 @@ def run_build(bcfg: BuildConfig):
                     chunk_sizes=list(cfg.chunk_sizes),
                     memory_rule=cfg.memory_rule, composition=cfg.composition,
                     checkpoint_interval=bcfg.checkpoint_interval,
+                    tape_multiplier=bcfg.tape_multiplier,
                     projection_kind=cfg.projection_kind,
                     self_generated_values=cfg.self_generated_values,
                     self_ref_chunk_size=cfg.self_ref_chunk_size,
@@ -830,6 +837,7 @@ def run_build(bcfg: BuildConfig):
                     chunk_sizes=list(cfg.chunk_sizes),
                     memory_rule=cfg.memory_rule, composition=cfg.composition,
                     checkpoint_interval=bcfg.checkpoint_interval,
+                    tape_multiplier=bcfg.tape_multiplier,
                     projection_kind=cfg.projection_kind,
                     self_generated_values=cfg.self_generated_values,
                     self_ref_chunk_size=cfg.self_ref_chunk_size,
@@ -1598,6 +1606,7 @@ def run_build(bcfg: BuildConfig):
                 chunk_sizes=new_chunks,
                 memory_rule=cfg.memory_rule, composition=cfg.composition,
                 checkpoint_interval=bcfg.checkpoint_interval,
+                tape_multiplier=bcfg.tape_multiplier,
                 projection_kind=cfg.projection_kind,
                 self_generated_values=cfg.self_generated_values,
                 self_ref_chunk_size=cfg.self_ref_chunk_size,

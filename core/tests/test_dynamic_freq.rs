@@ -423,6 +423,7 @@ fn test_k1_learned_is_noop() {
         m3: None,
         frequency_schedule: FrequencySchedule::Learned(LearnedFreqConfig::default()),
         checkpoint_interval: None,
+        tape_multiplier: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
@@ -562,6 +563,7 @@ fn test_anneal_uses_fixed_schedule() {
             anneal_steps: 1000, // Long annealing — step 0 should use fixed
         }),
         checkpoint_interval: None,
+        tape_multiplier: None,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
