@@ -3154,7 +3154,7 @@ impl GpuStackedModel {
                     agg_frac_sum += ts.frac_at_ceil * ts.count as f32;
                 }
             }
-            if has_theta {
+            if has_theta && agg_count > 0 {
                 let tdict = pyo3::types::PyDict::new(py);
                 tdict.set_item("count", agg_count)?;
                 tdict.set_item("min", agg_min)?;
@@ -3184,7 +3184,7 @@ impl GpuStackedModel {
                         a_frac_sum += as_.frac_at_bound * as_.count as f32;
                     }
                 }
-                if has_alpha {
+                if has_alpha && a_count > 0 {
                     let adict = pyo3::types::PyDict::new(py);
                     adict.set_item("count", a_count)?;
                     adict.set_item("min", a_min)?;
@@ -3213,7 +3213,7 @@ impl GpuStackedModel {
                         if es.p99 > e_p99 { e_p99 = es.p99; }
                     }
                 }
-                if has_eta {
+                if has_eta && e_count > 0 {
                     let edict = pyo3::types::PyDict::new(py);
                     edict.set_item("count", e_count)?;
                     edict.set_item("min", e_min)?;
