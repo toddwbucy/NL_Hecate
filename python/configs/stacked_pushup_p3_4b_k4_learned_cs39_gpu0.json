@@ -1,5 +1,5 @@
 {
-    "description": "Push-up k=3→k=4 from 5K checkpoint. CS-39 clamps. 100K step limit. Cursor cleared. Dolmino. GPU 0.",
+    "description": "Push-up k=3→k=4 from 5K checkpoint. CS-39 clamps. 100K step limit. Cursor cleared. Dolmino. GPU 0. NOTE: alpha_floor requires feat/cs39-full-gate-clamping branch (not on main).",
     "model": {
         "d_model": 512,
         "num_heads": 8,

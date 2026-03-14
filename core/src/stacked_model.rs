@@ -359,6 +359,10 @@ impl StackedMAGParams {
             "extend_clone: d_model mismatch (checkpoint has {old_d}, new_cfg has {})",
             new_cfg.swa.d_model,
         );
+        assert_eq!(
+            self.w_embed.len(), new_cfg.swa.vocab_size * new_cfg.swa.d_model,
+            "extend_clone: vocab_size mismatch",
+        );
 
         let old_k = self.blocks[0].levels.len();
         let new_k = new_cfg.k;
@@ -389,17 +393,21 @@ impl StackedMAGParams {
             new_block.ln_mem_gamma = old_block.ln_mem_gamma.clone();
             new_block.ln_mem_beta = old_block.ln_mem_beta.clone();
 
-            // Clone levels round-robin: new level[i] gets old level[i % old_k] projections.
-            // Gate biases stay at new config defaults (from init) for frequency-appropriate init.
+            // Clone levels round-robin: new level[i] gets ALL fields from old level[i % old_k].
+            // Gate biases (b_alpha, b_theta, b_eta) are then restored to new config defaults
+            // so each cloned level gets frequency-appropriate gate initialization.
             for i in 0..new_k {
+                let init_b_alpha = new_block.levels[i].b_alpha.clone();
+                let init_b_theta = new_block.levels[i].b_theta.clone();
+                let init_b_eta = new_block.levels[i].b_eta.clone();
+
                 let donor = &old_block.levels[i % old_k];
-                new_block.levels[i].w_k_mem = donor.w_k_mem.clone();
-                new_block.levels[i].w_v_mem = donor.w_v_mem.clone();
-                new_block.levels[i].w_q_mem = donor.w_q_mem.clone();
-                new_block.levels[i].w_alpha = donor.w_alpha.clone();
-                new_block.levels[i].w_theta = donor.w_theta.clone();
-                new_block.levels[i].w_eta = donor.w_eta.clone();
-                new_block.levels[i].w_omega = donor.w_omega.clone();
+                new_block.levels[i] = donor.clone();
+
+                // Restore frequency-appropriate gate biases from init
+                new_block.levels[i].b_alpha = init_b_alpha;
+                new_block.levels[i].b_theta = init_b_theta;
+                new_block.levels[i].b_eta = init_b_eta;
             }
 
             // Clone alpha_mem/alpha_refl round-robin

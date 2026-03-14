@@ -352,6 +352,12 @@ class BuildConfig:
         if self.tape_device not in ("off", "gpu", "cpu"):
             raise ValueError(
                 f"tape_device must be 'off', 'gpu', or 'cpu', got '{self.tape_device}'")
+        # Clone expansion validation
+        if self.clone_to is not None:
+            if not self.load:
+                raise ValueError("clone_to requires load (a checkpoint path to clone from)")
+            if self.extend_k is not None:
+                raise ValueError("clone_to and extend_k are mutually exclusive")
 
     @property
     def head_dim(self) -> int:
