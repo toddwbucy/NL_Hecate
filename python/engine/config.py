@@ -179,6 +179,16 @@ class BuildConfig:
     # "cpu" = full Wengert tape on CPU (DGD delta, M state readout — slow)
     tape_device: str = "off"
 
+    # Run directory (unified output location)
+    # When set, all outputs go under this directory:
+    #   {run_dir}/config.json       — frozen config copy
+    #   {run_dir}/metrics.jsonl     — training log
+    #   {run_dir}/checkpoints/      — model checkpoints + cursor sidecars
+    #   Console output: redirect nohup to {run_dir}/output.log
+    # Overrides save_path and log_file. Backward compat: leave None to use
+    # save_path/log_file directly (old behavior).
+    run_dir: str | None = None
+
     # Runtime
     gpu: bool = True  # GPU by default; --cpu to override
     load: str | None = None

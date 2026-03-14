@@ -96,6 +96,26 @@ def run_build(bcfg: BuildConfig):
 
     import numpy as np
 
+    # ── Run directory setup ────────────────────────────────────────────
+    if bcfg.run_dir is not None:
+        run_dir = Path(bcfg.run_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_dir = run_dir / "checkpoints"
+        ckpt_dir.mkdir(exist_ok=True)
+        # Auto-derive save_path and log_file from run_dir
+        bcfg.save_path = str(ckpt_dir / "model.safetensors")
+        bcfg.log_file = str(run_dir / "metrics.jsonl")
+        # Freeze a copy of the config into the run directory
+        config_snapshot = run_dir / "config.json"
+        if not config_snapshot.exists():
+            import json as _json
+            snapshot = {k: v for k, v in bcfg.__dict__.items()
+                        if not k.startswith("_")}
+            config_snapshot.write_text(_json.dumps(snapshot, indent=2, default=str))
+        print(f"Run directory: {run_dir}")
+        print(f"  Checkpoints: {ckpt_dir}")
+        print(f"  Metrics:     {bcfg.log_file}")
+
     # ── Load data ─────────────────────────────────────────────────────
     use_bpe = bcfg.data_format in _NUMPY_LOADER_FORMATS
     active_loader: BpeTokenStream | None = None
