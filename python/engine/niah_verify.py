@@ -30,6 +30,7 @@ if str(_pkg_root) not in sys.path:
 
 import nl_hecate
 from engine.data import BpeTokenStream
+from engine.generation import generate_cached
 from engine.tokenizer import load_tokenizer
 
 
@@ -63,6 +64,38 @@ NEEDLES = [
         "9054",
     ),
 ]
+
+# ── Coherence probes ───────────────────────────────────────────────
+# Simple text-completion prompts for qualitative generation assessment.
+# At 60M params we expect limited fluency but recognizably English output
+# with local coherence. These run alongside NIAH to sanity-check that
+# the model hasn't collapsed while showing positive retrieval signal.
+
+COHERENCE_PROMPTS = [
+    "The cat sat on the",
+    "Once upon a time there was a",
+    "Scientists recently discovered that",
+]
+
+
+def _run_coherence(gpu_model, cfg, tokenizer, max_tokens: int = 50) -> list[dict]:
+    """Generate text from each coherence prompt for qualitative review."""
+    results = []
+    for prompt_text in COHERENCE_PROMPTS:
+        gpu_model.reset_context()
+        prompt_tokens = tokenizer.encode(prompt_text)
+
+        generated = generate_cached(
+            gpu_model, cfg, prompt_tokens,
+            max_tokens=max_tokens, temperature=0.8, top_k=40)
+
+        output_text = tokenizer.decode(generated)
+        results.append({
+            "prompt": prompt_text,
+            "generation": output_text,
+            "num_tokens": len(generated) - len(prompt_tokens),
+        })
+    return results
 
 
 def _logprob_at_position(logits_flat: list[float], position: int,
@@ -229,7 +262,8 @@ def run_niah_verify(checkpoint_path: str, data_path: str,
                     distances: list[int], num_trials: int = 5,
                     haystack_size: int = 8192, min_prefix: int = 512,
                     min_suffix: int = 256, seed: int = 42,
-                    gpu_device: int = 0) -> dict:
+                    gpu_device: int = 0,
+                    coherence: bool = True) -> dict:
     """Run full NIAH verification against a checkpoint.
 
     Returns results dict with per-distance pass rates and trial details.
@@ -359,6 +393,16 @@ def run_niah_verify(checkpoint_path: str, data_path: str,
         print(f"    {d}: {dr['pass_rate']:.0%} pass, "
               f"mean_lift={dr['mean_lift']:.3f}")
 
+    # Coherence generation
+    coherence_results = []
+    if coherence:
+        print("\n  Coherence probes:")
+        coherence_results = _run_coherence(gpu_model, cfg, tokenizer)
+        for cr in coherence_results:
+            print(f"    prompt: \"{cr['prompt']}\"")
+            print(f"    output: \"{cr['generation']}\"")
+            print()
+
     return {
         "checkpoint": checkpoint_path,
         "model": {
@@ -376,6 +420,7 @@ def run_niah_verify(checkpoint_path: str, data_path: str,
             "num_trials": num_trials,
         },
         "distances": all_results,
+        "coherence": coherence_results,
     }
 
 
@@ -402,6 +447,8 @@ def main():
                         help="JSON output file path (default: stdout)")
     parser.add_argument("--gpu", type=int, default=0,
                         help="CUDA device index (default: 0)")
+    parser.add_argument("--no-coherence", action="store_true",
+                        help="Skip coherence generation probes")
 
     args = parser.parse_args()
 
@@ -419,6 +466,7 @@ def main():
         min_suffix=args.min_suffix,
         seed=args.seed,
         gpu_device=args.gpu,
+        coherence=not args.no_coherence,
     )
 
     elapsed = time.perf_counter() - t_start

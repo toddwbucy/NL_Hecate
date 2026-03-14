@@ -26,9 +26,14 @@ sys.modules["engine.data"] = _stub_data
 _stub_tok = type(sys)("engine.tokenizer")
 _stub_tok.load_tokenizer = None
 sys.modules["engine.tokenizer"] = _stub_tok
+
+_stub_gen = type(sys)("engine.generation")
+_stub_gen.generate_cached = None  # not used in pure-logic tests
+sys.modules["engine.generation"] = _stub_gen
 _spec.loader.exec_module(_mod)
 
 NEEDLES = _mod.NEEDLES
+COHERENCE_PROMPTS = _mod.COHERENCE_PROMPTS
 _logprob_at_position = _mod._logprob_at_position
 _build_trial_sequence = _mod._build_trial_sequence
 
@@ -296,3 +301,20 @@ class TestNeedles:
     def test_answers_unique(self):
         answers = [a for _, _, a in NEEDLES]
         assert len(set(answers)) == len(answers)
+
+
+# ── COHERENCE_PROMPTS validation ──────────────────────────────────
+
+class TestCoherencePrompts:
+    """Validate coherence probe definitions."""
+
+    def test_three_prompts(self):
+        assert len(COHERENCE_PROMPTS) == 3
+
+    def test_prompts_are_strings(self):
+        for prompt in COHERENCE_PROMPTS:
+            assert isinstance(prompt, str)
+            assert len(prompt) > 5  # non-trivial
+
+    def test_prompts_are_distinct(self):
+        assert len(set(COHERENCE_PROMPTS)) == len(COHERENCE_PROMPTS)
