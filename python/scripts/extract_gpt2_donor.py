@@ -93,6 +93,8 @@ def _build_mag_config(d: int, n_heads: int, vocab_size: int, k: int) -> dict:
 
 
 def extract_gpt2_weights(output_path: str, d_model: int = 768, k: int = 4):
+    if k < 1 or k > 4:
+        sys.exit(f"k must be 1-4, got {k} (gate defaults and chunk_sizes only cover k<=4)")
     try:
         from transformers import GPT2LMHeadModel
     except ImportError:

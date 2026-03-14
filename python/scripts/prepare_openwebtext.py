@@ -153,7 +153,7 @@ def main():
     tokens_arr = np.array(all_tokens, dtype=np.uint32)
 
     # Split train/val
-    val_size = max(int(total * VAL_FRAC), 1024)
+    val_size = min(max(int(total * VAL_FRAC), 1024), total - 1)
     train_tokens = tokens_arr[:-val_size]
     val_tokens = tokens_arr[-val_size:]
 

@@ -81,7 +81,7 @@ def latest_run_evals(evals: list[dict]) -> list[dict]:
         current.append(e)
     if current:
         runs.append(current)
-    return max(runs, key=len)
+    return runs[-1] if runs else current
 
 def load_step_events(name: str) -> list[dict]:
     path = RUNS_DIR / f"{name}.jsonl"

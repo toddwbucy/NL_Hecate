@@ -490,10 +490,10 @@ At tape_every steps, append a `tape_summary` event:
     "loss": 6.5729,
     "n_blocks": 4,
     "blocks": [
-        {"block_index": 0, "levels": [{"level": 0, "gnorm": 0.0312}, ...]},
-        {"block_index": 1, "levels": [{"level": 0, "gnorm": 0.4821}, ...]},
-        {"block_index": 2, "levels": [{"level": 0, "gnorm": 15.234}, ...]},
-        {"block_index": 3, "levels": [{"level": 0, "gnorm": 18673.9}, ...]}
+        {"block_index": 0, "levels": [{"level": 0, "output_grad_norm": 0.0312}, ...]},
+        {"block_index": 1, "levels": [{"level": 0, "output_grad_norm": 0.4821}, ...]},
+        {"block_index": 2, "levels": [{"level": 0, "output_grad_norm": 15.234}, ...]},
+        {"block_index": 3, "levels": [{"level": 0, "output_grad_norm": 18673.9}, ...]}
     ]
 }
 ```
