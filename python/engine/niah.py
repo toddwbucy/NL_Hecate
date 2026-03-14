@@ -236,10 +236,18 @@ def _run_single_trial(gpu_model, cfg, tokenizer,
 
 def _logprob_of_tokens(logits: list[float], token_ids: list[int],
                         vocab: int) -> float:
-    """Compute log-probability of the first token in token_ids from logits.
+    """Compute average log-probability of token_ids from logits.
 
-    Uses log-softmax over the vocabulary. Only scores the first token
-    since that's what the last-position logits predict.
+    Uses log-softmax over the vocabulary. When token_ids has multiple
+    tokens (e.g. "7492" → [74, 92] under BPE), we score the first token
+    from the provided logits. Multi-token answers get the same treatment
+    as single-token ones since we only have logits for one position.
+
+    For a fairer multi-token comparison, callers should ensure needle
+    answers tokenize to a single token, or extend the forward pass to
+    produce logits at each answer position. For now, first-token scoring
+    is a reasonable proxy: if the model assigns high probability to the
+    first digit of "7492" but not to random numbers, retrieval is working.
     """
     if not token_ids:
         return 0.0

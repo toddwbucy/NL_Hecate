@@ -52,43 +52,26 @@ def _safetensors_path(path_str: str) -> str:
 _NUMPY_LOADER_FORMATS = frozenset({"sharegpt", "dolmino"})
 
 
-def _carve_window_val(loader: BpeTokenStream, val_tokens: int):
-    """Carve a validation slice from the END of the current training window.
+def _carve_window_val(loader: BpeTokenStream, val_tokens: int,
+                      cursor_pos: int = 0):
+    """Carve a validation slice from the END of the remaining training window.
 
-    Returns (val_tokens_np, val_targets_np) sliced from the loader's numpy
-    arrays. The training loop should stop before reaching these tokens.
+    Returns (val_tokens_np, val_targets_np, val_boundary) where val_boundary
+    is the token position where training must stop (BpeTokenStream wraps at
+    corpus end, so the caller must enforce this).
 
     Spec 12 §5: each phase gets its own val slice from its own data window.
     No level ever re-encounters val data from a prior lifetime.
     """
     total = loader.total_tokens
-    val_size = min(val_tokens, total // 5)  # Never more than 20% of corpus
-    val_start = total - val_size
-    return loader.tokens[val_start:total], loader.targets[val_start:total]
-
-
-def _update_window_val(loader: BpeTokenStream, cursor_pos: int,
-                       val_tokens: int):
-    """Re-carve window-local val after a promotion advances the data cursor.
-
-    Takes tokens AHEAD of the current cursor position (the next unseen data).
-    This ensures val data is always novel — never overlaps with training data
-    the model has already processed.
-    """
-    total = loader.total_tokens
-    val_size = min(val_tokens, (total - cursor_pos) // 5)
+    remaining = total - cursor_pos
+    val_size = min(val_tokens, remaining // 5)  # Never more than 20% of remaining
     if val_size < 100:
-        return None, None  # Not enough data left for meaningful val
-    # Take from the end of the remaining data window
-    val_end = total
-    val_start = val_end - val_size
-    # Ensure val_start is ahead of cursor (novel data)
-    if val_start < cursor_pos:
-        val_start = cursor_pos
-        val_size = val_end - val_start
-    if val_size < 100:
-        return None, None
-    return loader.tokens[val_start:val_end], loader.targets[val_start:val_end]
+        return None, None, total  # Not enough data for meaningful val
+    val_boundary = total - val_size
+    return (loader.tokens[val_boundary:total],
+            loader.targets[val_boundary:total],
+            val_boundary)
 
 
 def run_build(bcfg: BuildConfig):
@@ -136,11 +119,10 @@ def run_build(bcfg: BuildConfig):
             return
         if bcfg.eval_every > 0:
             if bcfg.window_local_val:
-                # Carve val from training data window (no fixed val set)
-                _window_val_tokens, _window_val_targets = _carve_window_val(
-                    active_loader, bcfg.window_val_tokens)
-                print(f"Window-local val: {len(_window_val_tokens):,} tokens "
-                      f"from training window end")
+                # Window-local val carve is deferred until after cursor restore
+                # (see below). This ensures the val slice comes from the END of
+                # the remaining training window, not from already-consumed data.
+                pass
             else:
                 val_path = Path(bcfg.data_path) / "val_tokens.npy"
                 if val_path.exists():
@@ -873,6 +855,20 @@ def run_build(bcfg: BuildConfig):
     if gpu_model is not None and hasattr(gpu_model, "memory_norms"):
         level_param_norms_init = list(gpu_model.memory_norms())
 
+    # ── Deferred window-local val carve ─────────────────────────────
+    # Must happen AFTER cursor restore so val comes from the END of the
+    # remaining training window, not from already-consumed data.
+    _window_val_boundary = None  # token position where training must stop
+    if bcfg.window_local_val and active_loader is not None and bcfg.eval_every > 0:
+        cursor_pos = active_loader.cursor()["position"]
+        _window_val_tokens, _window_val_targets, _window_val_boundary = _carve_window_val(
+            active_loader, bcfg.window_val_tokens, cursor_pos)
+        if _window_val_tokens is not None:
+            print(f"Window-local val: {len(_window_val_tokens):,} tokens "
+                  f"from training window end (boundary={_window_val_boundary:,})")
+        else:
+            print("Window-local val: not enough data remaining, eval disabled")
+
     losses = []
     t_start = time.perf_counter()
     t_window_start = t_start
@@ -1478,39 +1474,38 @@ def run_build(bcfg: BuildConfig):
                         jsonl.log(event="memory_vocab_probe", **vprobe)
                 except Exception as e:
                     print(f"    [vocab probe failed: {e}]")
-            # ── NIAH eval (spec 12 §6) ────────────────────────────────
-            niah_eff = bcfg.niah_every if bcfg.niah_every > 0 else 0
-            if (bcfg.niah_enabled and gpu_model is not None
-                    and tokenizer is not None
-                    and niah_eff > 0 and step % niah_eff == 0
-                    and active_loader is not None):
-                try:
-                    # Use training data as haystack source
-                    haystack_need = bcfg.niah_haystack_tokens * (bcfg.niah_num_trials + 1)
-                    hay_start = max(0, active_loader.position - haystack_need)
-                    haystack = active_loader.tokens[hay_start:hay_start + haystack_need].tolist()
-                    niah_result = run_niah(
-                        gpu_model, cfg, haystack, tokenizer,
-                        num_trials=bcfg.niah_num_trials,
-                        haystack_len=bcfg.niah_haystack_tokens,
-                    )
-                    print_niah_results(niah_result, step)
-                    if jsonl:
-                        jsonl.log(event="niah", step=step, **{
-                            k: v for k, v in niah_result.items()
-                            if k != "trials"
-                        })
-                        for t in niah_result.get("trials", []):
-                            jsonl.log(event="niah_trial", step=step, **{
-                                k: v for k, v in t.items()
-                                if k != "answer_tokens"
-                            })
-                except Exception as e:
-                    print(f"    [niah failed: {e}]")
-
             if jsonl:
                 jsonl.log(event="eval", step=step, eval_loss=eval_loss,
                           eval_ppl=eval_ppl, eval_chunks=bcfg.eval_max_chunks)
+
+        # ── NIAH eval (spec 12 §6, independent of eval gate) ────────
+        niah_eff = bcfg.niah_every if bcfg.niah_every > 0 else 0
+        if (bcfg.niah_enabled and gpu_model is not None
+                and tokenizer is not None
+                and niah_eff > 0 and step > 0 and step % niah_eff == 0
+                and active_loader is not None):
+            try:
+                haystack_need = bcfg.niah_haystack_tokens * (bcfg.niah_num_trials + 1)
+                hay_start = max(0, active_loader.position - haystack_need)
+                haystack = active_loader.tokens[hay_start:hay_start + haystack_need].tolist()
+                niah_result = run_niah(
+                    gpu_model, cfg, haystack, tokenizer,
+                    num_trials=bcfg.niah_num_trials,
+                    haystack_len=bcfg.niah_haystack_tokens,
+                )
+                print_niah_results(niah_result, step)
+                if jsonl:
+                    jsonl.log(event="niah", step=step, **{
+                        k: v for k, v in niah_result.items()
+                        if k != "trials"
+                    })
+                    for t in niah_result.get("trials", []):
+                        jsonl.log(event="niah_trial", step=step, **{
+                            k: v for k, v in t.items()
+                            if k != "answer_tokens"
+                        })
+            except Exception as e:
+                print(f"    [niah failed: {e}]")
 
         # ── S4-M7: Phase boundary curriculum probe ────────────────────
         if (step in phase_boundaries and gpu_model is not None
@@ -1924,11 +1919,11 @@ def run_build(bcfg: BuildConfig):
             # Re-carve window-local val for the new data window
             if bcfg.window_local_val and active_loader is not None:
                 cursor_pos = active_loader.cursor()["position"]
-                _window_val_tokens, _window_val_targets = _update_window_val(
-                    active_loader, cursor_pos, bcfg.window_val_tokens)
+                _window_val_tokens, _window_val_targets, _window_val_boundary = _carve_window_val(
+                    active_loader, bcfg.window_val_tokens, cursor_pos)
                 if _window_val_tokens is not None:
                     print(f"  Window-local val: re-carved {len(_window_val_tokens):,} "
-                          f"tokens from new window")
+                          f"tokens from new window (boundary={_window_val_boundary:,})")
                 else:
                     print(f"  Window-local val: not enough data remaining, eval disabled")
 
