@@ -2829,6 +2829,20 @@ impl GpuStackedModel {
         self.last_l0_block_gnorms.clone()
     }
 
+    /// Get the current tape_multiplier value.
+    #[getter]
+    fn tape_multiplier(&self) -> Option<usize> {
+        self.cfg.tape_multiplier
+    }
+
+    /// Set tape_multiplier at runtime — takes effect on the next forward call.
+    /// Controls intra-chunk gradient checkpoint density (spec 25).
+    /// None or 0 = full trajectory, 1 = boundary-only, N = N checkpoints per chunk.
+    #[setter]
+    fn set_tape_multiplier(&mut self, value: Option<usize>) {
+        self.cfg.tape_multiplier = value;
+    }
+
     /// CPU Wengert tape summary for stacked models — full gradient observability.
     ///
     /// Downloads params + context to host, runs traced forward+backward on CPU,
