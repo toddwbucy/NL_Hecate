@@ -125,8 +125,8 @@ cf_runs  = {"A": evA, "B": evB, "C": evC, "D": evD}
 tnt_runs = {"B": evBt, "C": evCt, "D": evDt}
 
 # Final ppl
-final_cf  = {k: v[-1]["eval_ppl"] for k, v in cf_runs.items()}
-final_tnt = {k: v[-1]["eval_ppl"] for k, v in tnt_runs.items()}
+final_cf  = {k: v[-1]["eval_ppl"] for k, v in cf_runs.items() if v}
+final_tnt = {k: v[-1]["eval_ppl"] for k, v in tnt_runs.items() if v}
 
 # Gate bias trajectories (level b_theta over time)
 step_B  = load_step_events("ablation_B")
@@ -553,15 +553,17 @@ KEY COMPARISONS
              label="B  L0 b_θ", alpha=0.85)
     ax1.plot(xs_Bt, ys_Bt, color=PALETTE_TNT["B"], linestyle="-",  linewidth=2.0,
              label="B-TNT  L0 b_θ")
-    ax1.axhline(ys_B[0], color="#aaaaaa", linestyle=":", linewidth=1.0,
-                label=f"init ({ys_B[0]:.2f})")
+    if ys_B:
+        ax1.axhline(ys_B[0], color="#aaaaaa", linestyle=":", linewidth=1.0,
+                    label=f"init ({ys_B[0]:.2f})")
     styled_ax(ax1, xlabel="Build step", ylabel="b_θ (L0)",
               title="Run B vs B-TNT — L0 learning rate gate")
     ax1.legend(fontsize=7.5)
-    ax1.text(0.02, 0.06,
-             f"B final: {ys_B[-1]:.2f}\nB-TNT final: {ys_Bt[-1]:.2f}",
-             transform=ax1.transAxes, fontsize=7.5, va="bottom",
-             fontfamily="monospace")
+    if ys_B and ys_Bt:
+        ax1.text(0.02, 0.06,
+                 f"B final: {ys_B[-1]:.2f}\nB-TNT final: {ys_Bt[-1]:.2f}",
+                 transform=ax1.transAxes, fontsize=7.5, va="bottom",
+                 fontfamily="monospace")
 
     # Panel 2: Run D vs D-TNT  (k=4, per-level)
     ax2 = fig.add_subplot(gs[0, 1])
