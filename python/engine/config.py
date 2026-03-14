@@ -134,9 +134,10 @@ class BuildConfig:
     gate_warmup_l3_threshold: float = 0.001
 
     # Level stacking (specs/infrastructure/07_push_up_level_stacking.md)
-    extend_k: int | None = None       # Target k (must be loaded_k + 1)
+    extend_k: int | None = None       # Target k (must be loaded_k + 1 for push_up/stack_up)
     push_up: bool = False             # Shift existing levels to slower frequencies
     stack_up: bool = False            # Keep existing levels, add fresh level at top
+    clone_to: int | None = None       # Clone expansion: duplicate levels to fill target k (any k > loaded_k)
     data_seek: int | None = None      # Override data cursor to this token position
 
     # Auto-promotion (specs/infrastructure/12_metric_driven_promotion.md)
@@ -343,6 +344,8 @@ class BuildConfig:
         if self.n_blocks < 1:
             raise ValueError(f"n_blocks must be >= 1, got {self.n_blocks}")
         if self.n_blocks > 1:
+            if not self.residual:
+                raise ValueError("n_blocks > 1 requires residual=true (pre-LN residual stream)")
             if self.composition.lower() == "mac":
                 raise ValueError(
                     "n_blocks > 1 does not yet support composition='mac' "
@@ -351,6 +354,12 @@ class BuildConfig:
         if self.tape_device not in ("off", "gpu", "cpu"):
             raise ValueError(
                 f"tape_device must be 'off', 'gpu', or 'cpu', got '{self.tape_device}'")
+        # Clone expansion validation
+        if self.clone_to is not None:
+            if not self.load:
+                raise ValueError("clone_to requires load (a checkpoint path to clone from)")
+            if self.extend_k is not None:
+                raise ValueError("clone_to and extend_k are mutually exclusive")
 
     @property
     def head_dim(self) -> int:
