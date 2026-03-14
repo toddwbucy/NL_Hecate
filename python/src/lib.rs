@@ -2917,6 +2917,17 @@ impl GpuStackedModel {
                 ldict.set_item("block_count", lvl.block_count)?;
                 ldict.set_item("output_grad_norm", lvl.output_grad_norm)?;
                 ldict.set_item("dgd_delta_norm", lvl.dgd_delta_norm)?;
+                // m_norm from host context (Frobenius norm of M)
+                let m_norm = if lvl.level < host_ctx[block_sum.block].len() {
+                    let m = &host_ctx[block_sum.block][lvl.level];
+                    m.iter().map(|x| x * x).sum::<f32>().sqrt()
+                } else {
+                    0.0
+                };
+                ldict.set_item("m_norm", m_norm)?;
+                // alpha/theta/eta: CPU path does not extract gate buffers
+                // from the tape yet. Keys omitted — print_tape_summary
+                // handles missing keys with conditional checks.
                 levels_list.append(ldict)?;
                 if lvl.output_grad_norm > agg_gnorms[lvl.level] {
                     agg_gnorms[lvl.level] = lvl.output_grad_norm;
@@ -2944,6 +2955,15 @@ impl GpuStackedModel {
             ldict.set_item("block_count", bc)?;
             ldict.set_item("output_grad_norm", agg_gnorms[level])?;
             ldict.set_item("dgd_delta_norm", agg_deltas[level])?;
+            // Aggregate m_norm: max across blocks for this level
+            let max_mnorm = host_ctx.iter().map(|block_ctx| {
+                if level < block_ctx.len() {
+                    block_ctx[level].iter().map(|x| x * x).sum::<f32>().sqrt()
+                } else {
+                    0.0
+                }
+            }).fold(0.0f32, f32::max);
+            ldict.set_item("m_norm", max_mnorm)?;
             agg_levels_list.append(ldict)?;
         }
         dict.set_item("levels", agg_levels_list)?;
