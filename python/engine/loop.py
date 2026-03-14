@@ -87,13 +87,8 @@ def run_build(bcfg: BuildConfig):
         # Auto-derive save_path and log_file from run_dir
         bcfg.save_path = str(ckpt_dir / "model.safetensors")
         bcfg.log_file = str(run_dir / "metrics.jsonl")
-        # Freeze a copy of the config into the run directory
-        config_snapshot = run_dir / "config.json"
-        if not config_snapshot.exists():
-            import json as _json
-            snapshot = {k: v for k, v in bcfg.__dict__.items()
-                        if not k.startswith("_")}
-            config_snapshot.write_text(_json.dumps(snapshot, indent=2, default=str))
+        # Config snapshot is deferred until after checkpoint restore so it
+        # captures the effective runtime config (merged with checkpoint values).
         print(f"Run directory: {run_dir}")
         print(f"  Checkpoints: {ckpt_dir}")
         print(f"  Metrics:     {bcfg.log_file}")
@@ -178,7 +173,7 @@ def run_build(bcfg: BuildConfig):
 
     # ── Load tokenizer for sample generation ──────────────────────────
     tokenizer = None
-    if use_bpe and (bcfg.save_every > 0 or bcfg.eval_every > 0):
+    if use_bpe and (bcfg.save_every > 0 or bcfg.eval_every > 0 or bcfg.auto_promote):
         tokenizer = load_tokenizer(data_dir=bcfg.data_path)
         tok_type = "BPE" if isinstance(tokenizer, BpeTokenizer) else "byte-level"
         print(f"Tokenizer for samples: {tok_type}")
@@ -630,6 +625,16 @@ def run_build(bcfg: BuildConfig):
     data_len = len(active_loader) if use_bpe else len(token_ids)
     print(f"  Data:     {data_len:,} tokens" +
           (f" ({bcfg.data_format} BPE)" if use_bpe else ""))
+    # Deferred config snapshot: written after checkpoint restore so it captures
+    # the effective runtime config (d_model, k, chunk_sizes merged from checkpoint).
+    if bcfg.run_dir is not None:
+        config_snapshot = Path(bcfg.run_dir) / "config.json"
+        if not config_snapshot.exists():
+            import json as _json
+            snapshot = {k: v for k, v in bcfg.__dict__.items()
+                        if not k.startswith("_")}
+            config_snapshot.write_text(_json.dumps(snapshot, indent=2, default=str))
+
     use_gpu = bcfg.gpu and hasattr(nl_hecate, "GpuModel")
     is_stacked = getattr(bcfg, "n_blocks", 1) > 1
     if is_stacked and not use_gpu:
@@ -877,10 +882,14 @@ def run_build(bcfg: BuildConfig):
     for step in range(resume_step, end_step):
         if use_bpe:
             # Enforce window-local val boundary: stop before training into val data
-            if _window_val_boundary is not None and active_loader is not None:
-                if active_loader.position + bcfg.seq_len > _window_val_boundary:
+            if _window_val_boundary is not None:
+                _loaders_to_check = bpe_loaders if bpe_loaders else (
+                    [active_loader] if active_loader is not None else [])
+                if any(ld.position + bcfg.seq_len > _window_val_boundary
+                       for ld in _loaders_to_check):
+                    max_pos = max(ld.position for ld in _loaders_to_check)
                     print(f"  [window-val] Reached val boundary at position "
-                          f"{active_loader.position:,}/{_window_val_boundary:,}, "
+                          f"{max_pos:,}/{_window_val_boundary:,}, "
                           f"stopping at step {step}")
                     break
             if bcfg.batch_size > 1:
@@ -1871,7 +1880,7 @@ def run_build(bcfg: BuildConfig):
                 _level_start_cursor = (active_loader.cursor()["position"]
                                        if active_loader is not None else 0)
             # Re-carve window-local val for the new data window
-            if bcfg.window_local_val and active_loader is not None:
+            if bcfg.window_local_val and bcfg.eval_every > 0 and active_loader is not None:
                 cursor_pos = active_loader.cursor()["position"]
                 _window_val_tokens, _window_val_targets, _window_val_boundary = _carve_window_val(
                     active_loader, bcfg.window_val_tokens, cursor_pos)
