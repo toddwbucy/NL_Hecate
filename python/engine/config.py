@@ -344,6 +344,8 @@ class BuildConfig:
         if self.n_blocks < 1:
             raise ValueError(f"n_blocks must be >= 1, got {self.n_blocks}")
         if self.n_blocks > 1:
+            if not self.residual:
+                raise ValueError("n_blocks > 1 requires residual=true (pre-LN residual stream)")
             if self.composition.lower() == "mac":
                 raise ValueError(
                     "n_blocks > 1 does not yet support composition='mac' "
