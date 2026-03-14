@@ -700,4 +700,120 @@ mod tests {
             "gate biases are level-0 defaults, identical across blocks"
         );
     }
+
+    fn tiny_config_k4() -> MAGConfig {
+        let mut cfg = tiny_config();
+        cfg.k = 4;
+        cfg.chunk_sizes = vec![1, 8, 64, 512];
+        cfg
+    }
+
+    #[test]
+    fn test_extend_clone_k1_to_k4_structure() {
+        let cfg_k1 = tiny_config_k1();
+        let cfg_k4 = tiny_config_k4();
+        let n_blocks = 3;
+        let old = StackedMAGParams::init(&cfg_k1, n_blocks, 42);
+        let cloned = old.extend_clone(&cfg_k4, 99);
+
+        assert_eq!(cloned.n_blocks(), n_blocks);
+        for block in &cloned.blocks {
+            assert_eq!(block.levels.len(), 4);
+            assert_eq!(block.alpha_mem.len(), 4);
+            assert_eq!(block.alpha_refl.len(), 4);
+        }
+    }
+
+    #[test]
+    fn test_extend_clone_shared_preserved() {
+        let cfg_k1 = tiny_config_k1();
+        let cfg_k4 = tiny_config_k4();
+        let old = StackedMAGParams::init(&cfg_k1, 4, 42);
+        let cloned = old.extend_clone(&cfg_k4, 99);
+
+        assert_eq!(cloned.w_embed, old.w_embed);
+        assert_eq!(cloned.w_unembed, old.w_unembed);
+        assert_eq!(cloned.ln_final_gamma, old.ln_final_gamma);
+        assert_eq!(cloned.ln_final_beta, old.ln_final_beta);
+    }
+
+    #[test]
+    fn test_extend_clone_round_robin_donor() {
+        let cfg_k2 = tiny_config_k2();
+        let cfg_k4 = tiny_config_k4();
+        let old = StackedMAGParams::init(&cfg_k2, 2, 42);
+        let cloned = old.extend_clone(&cfg_k4, 99);
+
+        // k=2→k=4: level[0] from donor[0], level[1] from donor[1],
+        //          level[2] from donor[0], level[3] from donor[1]
+        for b in 0..2 {
+            assert_eq!(
+                cloned.blocks[b].levels[0].w_k_mem.master(),
+                old.blocks[b].levels[0].w_k_mem.master(),
+                "block {b}: cloned L0 should come from donor L0"
+            );
+            assert_eq!(
+                cloned.blocks[b].levels[1].w_k_mem.master(),
+                old.blocks[b].levels[1].w_k_mem.master(),
+                "block {b}: cloned L1 should come from donor L1"
+            );
+            assert_eq!(
+                cloned.blocks[b].levels[2].w_k_mem.master(),
+                old.blocks[b].levels[0].w_k_mem.master(),
+                "block {b}: cloned L2 should come from donor L0 (round-robin)"
+            );
+            assert_eq!(
+                cloned.blocks[b].levels[3].w_k_mem.master(),
+                old.blocks[b].levels[1].w_k_mem.master(),
+                "block {b}: cloned L3 should come from donor L1 (round-robin)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_extend_clone_gate_biases_from_init() {
+        let cfg_k1 = tiny_config_k1();
+        let cfg_k4 = tiny_config_k4();
+        let old = StackedMAGParams::init(&cfg_k1, 2, 42);
+        let cloned = old.extend_clone(&cfg_k4, 99);
+
+        // Gate biases should come from init (frequency-appropriate), not from donor
+        let fresh = StackedMAGParams::init(&cfg_k4, 2, 99);
+        for b in 0..2 {
+            for lev in 0..4 {
+                assert_eq!(
+                    cloned.blocks[b].levels[lev].b_alpha,
+                    fresh.blocks[b].levels[lev].b_alpha,
+                    "block {b} level {lev}: b_alpha should match init defaults"
+                );
+                assert_eq!(
+                    cloned.blocks[b].levels[lev].b_theta,
+                    fresh.blocks[b].levels[lev].b_theta,
+                    "block {b} level {lev}: b_theta should match init defaults"
+                );
+                assert_eq!(
+                    cloned.blocks[b].levels[lev].b_eta,
+                    fresh.blocks[b].levels[lev].b_eta,
+                    "block {b} level {lev}: b_eta should match init defaults"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_extend_clone_alpha_mem_round_robin() {
+        let cfg_k2 = tiny_config_k2();
+        let cfg_k4 = tiny_config_k4();
+        let old = StackedMAGParams::init(&cfg_k2, 2, 42);
+        let cloned = old.extend_clone(&cfg_k4, 99);
+
+        for b in 0..2 {
+            assert_eq!(cloned.blocks[b].alpha_mem[0], old.blocks[b].alpha_mem[0]);
+            assert_eq!(cloned.blocks[b].alpha_mem[1], old.blocks[b].alpha_mem[1]);
+            assert_eq!(cloned.blocks[b].alpha_mem[2], old.blocks[b].alpha_mem[0],
+                "alpha_mem[2] should round-robin from alpha_mem[0]");
+            assert_eq!(cloned.blocks[b].alpha_mem[3], old.blocks[b].alpha_mem[1],
+                "alpha_mem[3] should round-robin from alpha_mem[1]");
+        }
+    }
 }

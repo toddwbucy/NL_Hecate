@@ -1,5 +1,5 @@
 {
-    "description": "Push-up k=3→k=4 from 5K checkpoint. CS-39 clamps. 100K step limit. Cursor cleared. Dolmino. GPU 0. NOTE: alpha_floor requires feat/cs39-full-gate-clamping branch (not on main).",
+    "description": "Push-up k=3→k=4 from 5K checkpoint. 100K step limit. Cursor cleared. Dolmino. GPU 0.",
     "model": {
         "d_model": 512,
         "num_heads": 8,
@@ -28,7 +28,6 @@
         "beta1": 0.9,
         "beta2": 0.999,
         "max_grad_norm": 1.0,
-        "alpha_floor": [0.8, 0.8, 0.8, 0.8],
         "theta_ceil": [1.0, 1.0, 1.0, 1.0],
         "batch_size": 1,
         "log_every": 8,
@@ -37,7 +36,7 @@
         "save_path": "checkpoints/stacked_pushup_p3_4b_k4_learned_cs39_gpu0.safetensors",
         "log_file": "runs/stacked_pushup_p3_4b_k4_learned_cs39_gpu0.jsonl",
         "tape_every": 1024,
-        "tape_device": "cpu",
+        "tape_device": "gpu",
         "gpu": true,
         "seed": 42,
         "load": "checkpoints/stacked_pushup_p2_4b_k3_learned_cs39_gpu0_step5120.safetensors",
