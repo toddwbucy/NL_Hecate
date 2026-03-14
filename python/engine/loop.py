@@ -30,7 +30,6 @@ from engine.evaluation import (
     EVAL_PROMPTS, SAMPLE_PROMPTS,
 )
 from engine.logging_utils import JSONLLogger, rss_mb
-from engine.niah import run_niah, print_niah_results
 from engine.tokenizer import ByteTokenizer, BpeTokenizer, load_tokenizer
 
 
@@ -1478,35 +1477,6 @@ def run_build(bcfg: BuildConfig):
                 jsonl.log(event="eval", step=step, eval_loss=eval_loss,
                           eval_ppl=eval_ppl, eval_chunks=bcfg.eval_max_chunks)
 
-        # ── NIAH eval (spec 12 §6, independent of eval gate) ────────
-        niah_eff = bcfg.niah_every if bcfg.niah_every > 0 else 0
-        if (bcfg.niah_enabled and gpu_model is not None
-                and tokenizer is not None
-                and niah_eff > 0 and step > 0 and step % niah_eff == 0
-                and active_loader is not None):
-            try:
-                haystack_need = bcfg.niah_haystack_tokens * (bcfg.niah_num_trials + 1)
-                hay_start = max(0, active_loader.position - haystack_need)
-                haystack = active_loader.tokens[hay_start:hay_start + haystack_need].tolist()
-                niah_result = run_niah(
-                    gpu_model, cfg, haystack, tokenizer,
-                    num_trials=bcfg.niah_num_trials,
-                    haystack_len=bcfg.niah_haystack_tokens,
-                )
-                print_niah_results(niah_result, step)
-                if jsonl:
-                    jsonl.log(event="niah", step=step, **{
-                        k: v for k, v in niah_result.items()
-                        if k != "trials"
-                    })
-                    for t in niah_result.get("trials", []):
-                        jsonl.log(event="niah_trial", step=step, **{
-                            k: v for k, v in t.items()
-                            if k != "answer_tokens"
-                        })
-            except Exception as e:
-                print(f"    [niah failed: {e}]")
-
         # ── S4-M7: Phase boundary curriculum probe ────────────────────
         if (step in phase_boundaries and gpu_model is not None
                 and use_bpe and bcfg.data_path and not is_stacked):
@@ -1759,29 +1729,6 @@ def run_build(bcfg: BuildConfig):
                 promo_cursor["level_start_cursor"] = _level_start_cursor
                 promo_sidecar.write_text(json.dumps(promo_cursor, indent=2))
             print(f"  Checkpoint: {promo_ckpt}")
-
-            # NIAH at promotion boundary (pre-promotion snapshot)
-            if (bcfg.niah_enabled and gpu_model is not None
-                    and tokenizer is not None
-                    and active_loader is not None):
-                try:
-                    haystack_need = bcfg.niah_haystack_tokens * (bcfg.niah_num_trials + 1)
-                    hay_start = max(0, active_loader.position - haystack_need)
-                    haystack = active_loader.tokens[hay_start:hay_start + haystack_need].tolist()
-                    niah_result = run_niah(
-                        gpu_model, cfg, haystack, tokenizer,
-                        num_trials=bcfg.niah_num_trials,
-                        haystack_len=bcfg.niah_haystack_tokens,
-                    )
-                    print(f"  [niah] pre-promotion k={old_k}→k={new_k}:")
-                    print_niah_results(niah_result, step)
-                    if jsonl:
-                        jsonl.log(event="niah_promotion", step=step,
-                                  phase="pre", old_k=old_k, new_k=new_k,
-                                  pass_rate=niah_result.get("pass_rate", 0),
-                                  mean_lift=niah_result.get("mean_lift", 0))
-                except Exception as e:
-                    print(f"  [niah pre-promotion failed: {e}]")
 
             # Coherence samples at promotion boundary
             if (gpu_model is not None and tokenizer is not None):

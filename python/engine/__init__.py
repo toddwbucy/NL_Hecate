@@ -20,7 +20,6 @@ from engine.evaluation import (
     SAMPLE_PROMPTS, EVAL_PROMPTS,
 )
 from engine.logging_utils import JSONLLogger, rss_mb
-from engine.niah import run_niah, print_niah_results, NEEDLES
 from engine.loop import run_build
 from engine.chat import run_chat
 
@@ -43,8 +42,6 @@ __all__ = [
     "SAMPLE_PROMPTS", "EVAL_PROMPTS",
     # logging
     "JSONLLogger", "rss_mb",
-    # niah
-    "run_niah", "print_niah_results", "NEEDLES",
     # loops
     "run_build", "run_chat",
 ]
