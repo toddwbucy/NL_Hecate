@@ -876,6 +876,13 @@ def run_build(bcfg: BuildConfig):
 
     for step in range(resume_step, end_step):
         if use_bpe:
+            # Enforce window-local val boundary: stop before training into val data
+            if _window_val_boundary is not None and active_loader is not None:
+                if active_loader.position + bcfg.seq_len > _window_val_boundary:
+                    print(f"  [window-val] Reached val boundary at position "
+                          f"{active_loader.position:,}/{_window_val_boundary:,}, "
+                          f"stopping at step {step}")
+                    break
             if bcfg.batch_size > 1:
                 if gpu_model is None or not use_adamw_gpu:
                     raise RuntimeError(
