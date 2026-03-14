@@ -485,6 +485,7 @@ class BuildConfig:
             "retention": "retention",
             "extend_k": "extend_k",
             "data_seek": "data_seek",
+            "run_dir": "run_dir",
         }
         for cli_name, cfg_name in mapping.items():
             val = getattr(args, cli_name, None)

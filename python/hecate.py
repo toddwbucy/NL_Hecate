@@ -7,18 +7,18 @@ tokens come from: data pipeline (--build) or keyboard (--chat/--prompt).
 
 Usage:
     # Build (stream data from files — GPU by default)
-    python hecate.py --build --config configs/hope_60m.json
-    python hecate.py --build --config configs/hope_60m.json --load checkpoints/model_step5000.json
+    python hecate.py --build --config configs/hope_60m.json --run-dir results/my_run
+    python hecate.py --build --config configs/hope_60m.json --load results/prior/checkpoints/model.safetensors
 
     # Chat (interactive, with optional learning)
-    python hecate.py --chat --checkpoint checkpoints/model.json
-    python hecate.py --chat --checkpoint checkpoints/model.json --learn --lr 0.0006
+    python hecate.py --chat --checkpoint results/my_run/checkpoints/model.safetensors
+    python hecate.py --chat --checkpoint results/my_run/checkpoints/model.safetensors --learn --lr 0.0006
 
     # One-shot generation
-    python hecate.py --prompt "Once upon a time" --checkpoint checkpoints/model.json
+    python hecate.py --prompt "Once upon a time" --checkpoint results/my_run/checkpoints/model.safetensors
 
     # Raw REPL
-    python hecate.py --interactive --checkpoint checkpoints/model.json
+    python hecate.py --interactive --checkpoint results/my_run/checkpoints/model.safetensors
 
     # Force CPU (when GPU is available but you want CPU anyway)
     python hecate.py --build --config configs/hope_60m.json --cpu
@@ -89,6 +89,8 @@ modes:
                        help="Memory decay: l2_weight_decay, kl_divergence, elastic_net, sphere_normalization")
     build.add_argument("--checkpoint_interval", type=int, default=None,
                        help="Gradient checkpointing interval")
+    build.add_argument("--run-dir", type=str, default=None,
+                       help="Run directory (checkpoints/, metrics.jsonl, config.json)")
     build.add_argument("--save_path", type=str, default=None)
     build.add_argument("--save_every", type=int, default=None,
                        help="Save checkpoint every N steps (0 = only at end)")
