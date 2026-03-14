@@ -48,3 +48,35 @@ python/*.log
 
 # artifacts/.build-meta.json is machine-local (see artifacts/.gitignore)
 artifacts/.build-meta.json
+
+# Nohup logs (all directories)
+nohup_*.out
+**/nohup_*.out
+
+# Training data directories (all under python/data/)
+python/data/
+
+# Checkpoints (top-level and nested)
+checkpoints/
+
+# Results directories
+results/
+python/results/
+
+# Compiled shared library
+python/nl_hecate.so
+
+# Python lockfile (PyO3 binary crate, not a library)
+python/Cargo.lock
+
+# PDF reports (generated, binary)
+docs/reports/*.pdf
+
+# Claude Code / sidecar / todo workspace state
+.claude/
+.sidecar/
+.todos/
+.mcp.json
+
+# Archived run logs
+docs/archived_runs/

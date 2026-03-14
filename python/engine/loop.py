@@ -479,7 +479,10 @@ def run_build(bcfg: BuildConfig):
         print(f"  M-norm:   max={list(cfg.m_norm_max)}")
     if len(cfg.error_clip) > 0:
         print(f"  ErrClip:  max={list(cfg.error_clip)}")
-    print(f"  Params:   {params.num_params():,}")
+    if params is not None:
+        print(f"  Params:   {params.num_params():,}")
+    else:
+        print(f"  Params:   (stacked — reported after GPU upload)")
     data_len = len(active_loader) if use_bpe else len(token_ids)
     print(f"  Data:     {data_len:,} tokens" +
           (f" ({bcfg.data_format} BPE)" if use_bpe else ""))
@@ -658,7 +661,8 @@ def run_build(bcfg: BuildConfig):
             "d_model": bcfg.d_model, "num_heads": bcfg.num_heads,
             "seq_len": bcfg.seq_len, "k": bcfg.k, "memory_rule": bcfg.memory_rule,
             "composition": bcfg.composition, "optimizer": bcfg.optimizer,
-            "lr": bcfg.lr, "steps": bcfg.steps, "params": params.num_params(),
+            "lr": bcfg.lr, "steps": bcfg.steps,
+            "params": params.num_params() if params is not None else 0,
             "n_blocks": getattr(bcfg, "n_blocks", 1),
         })
 
