@@ -1925,7 +1925,7 @@ def run_build(bcfg: BuildConfig):
                     print(f"  Window-local val: re-carved {len(_window_val_tokens):,} "
                           f"tokens from new window (boundary={_window_val_boundary:,})")
                 else:
-                    print(f"  Window-local val: not enough data remaining, eval disabled")
+                    print("  Window-local val: not enough data remaining, eval disabled")
 
             print(f"  Promotion complete, continuing at step {step + 1}\n")
 
