@@ -338,6 +338,87 @@ impl StackedMAGParams {
             blocks: new_blocks,
         }
     }
+
+    /// Clone expansion: duplicate existing levels to fill a larger k.
+    ///
+    /// Unlike push-up (which shifts levels to slower frequencies and adds a fresh L0),
+    /// clone copies existing level weights directly into the new slots.
+    /// k=1→k=4: level[0] is cloned into levels[0..4].
+    /// k=2→k=4: levels[0,1] are cloned into levels[0..4] (round-robin).
+    ///
+    /// SWA projections, LayerNorms, and embeddings are preserved.
+    /// Gate biases for cloned levels use the new config's defaults (from BlockParams::init)
+    /// to match the target frequency's expected retention/learning-rate regime.
+    pub fn extend_clone(&self, new_cfg: &MAGConfig, seed: u64) -> StackedMAGParams {
+        let n_blocks = self.blocks.len();
+        assert!(n_blocks > 0, "extend_clone: stacked model must have at least 1 block");
+
+        let old_d = self.w_embed.len() / new_cfg.swa.vocab_size;
+        assert_eq!(
+            old_d, new_cfg.swa.d_model,
+            "extend_clone: d_model mismatch (checkpoint has {old_d}, new_cfg has {})",
+            new_cfg.swa.d_model,
+        );
+
+        let old_k = self.blocks[0].levels.len();
+        let new_k = new_cfg.k;
+        assert!(
+            new_k > old_k,
+            "extend_clone requires new_cfg.k ({}) > old_k ({})",
+            new_k, old_k,
+        );
+        for (b, block) in self.blocks.iter().enumerate() {
+            assert_eq!(
+                block.levels.len(), old_k,
+                "extend_clone: block {} has {} levels, expected {}",
+                b, block.levels.len(), old_k,
+            );
+        }
+
+        let new_blocks: Vec<BlockParams> = self.blocks.iter().enumerate().map(|(b, old_block)| {
+            let block_seed = seed.wrapping_add(b as u64 * 10_000);
+            let mut new_block = BlockParams::init(new_cfg, block_seed);
+
+            // Preserve SWA projections and LayerNorms
+            new_block.w_q = old_block.w_q.clone();
+            new_block.w_k = old_block.w_k.clone();
+            new_block.w_v = old_block.w_v.clone();
+            new_block.w_o = old_block.w_o.clone();
+            new_block.ln_attn_gamma = old_block.ln_attn_gamma.clone();
+            new_block.ln_attn_beta = old_block.ln_attn_beta.clone();
+            new_block.ln_mem_gamma = old_block.ln_mem_gamma.clone();
+            new_block.ln_mem_beta = old_block.ln_mem_beta.clone();
+
+            // Clone levels round-robin: new level[i] gets old level[i % old_k] projections.
+            // Gate biases stay at new config defaults (from init) for frequency-appropriate init.
+            for i in 0..new_k {
+                let donor = &old_block.levels[i % old_k];
+                new_block.levels[i].w_k_mem = donor.w_k_mem.clone();
+                new_block.levels[i].w_v_mem = donor.w_v_mem.clone();
+                new_block.levels[i].w_q_mem = donor.w_q_mem.clone();
+                new_block.levels[i].w_alpha = donor.w_alpha.clone();
+                new_block.levels[i].w_theta = donor.w_theta.clone();
+                new_block.levels[i].w_eta = donor.w_eta.clone();
+                new_block.levels[i].w_omega = donor.w_omega.clone();
+            }
+
+            // Clone alpha_mem/alpha_refl round-robin
+            for i in 0..new_k {
+                new_block.alpha_mem[i] = old_block.alpha_mem[i % old_k];
+                new_block.alpha_refl[i] = old_block.alpha_refl[i % old_k];
+            }
+
+            new_block
+        }).collect();
+
+        StackedMAGParams {
+            w_embed: self.w_embed.clone(),
+            w_unembed: self.w_unembed.clone(),
+            ln_final_gamma: self.ln_final_gamma.clone(),
+            ln_final_beta: self.ln_final_beta.clone(),
+            blocks: new_blocks,
+        }
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────

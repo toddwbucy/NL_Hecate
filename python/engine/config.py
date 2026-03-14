@@ -134,9 +134,10 @@ class BuildConfig:
     gate_warmup_l3_threshold: float = 0.001
 
     # Level stacking (specs/infrastructure/07_push_up_level_stacking.md)
-    extend_k: int | None = None       # Target k (must be loaded_k + 1)
+    extend_k: int | None = None       # Target k (must be loaded_k + 1 for push_up/stack_up)
     push_up: bool = False             # Shift existing levels to slower frequencies
     stack_up: bool = False            # Keep existing levels, add fresh level at top
+    clone_to: int | None = None       # Clone expansion: duplicate levels to fill target k (any k > loaded_k)
     data_seek: int | None = None      # Override data cursor to this token position
 
     # Auto-promotion (specs/infrastructure/12_metric_driven_promotion.md)

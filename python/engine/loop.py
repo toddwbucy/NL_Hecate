@@ -151,9 +151,9 @@ def run_build(bcfg: BuildConfig):
             cfg = result["config"]
             bcfg.n_blocks = result["n_blocks"]
             build_state = result["build_state"]
-            # Create a dummy single-block params for num_params display
-            # (the actual GPU model uses _stacked_params_json)
-            params = nl_hecate.MAGParams(cfg, seed=bcfg.seed if hasattr(bcfg, "seed") else 42)
+            # Stacked models use _stacked_params_json for GPU construction.
+            # param count is read from the GpuStackedModel after construction.
+            params = None
             if build_state is not None:
                 resume_step = build_state["global_step"]
                 print(f"  Stacked checkpoint: n_blocks={result['n_blocks']}, k={cfg.k}")
@@ -323,6 +323,86 @@ def run_build(bcfg: BuildConfig):
             resume_step = 0
             build_state = None
             # New phase — persisted level_start_cursor from prior phase is stale.
+            _restored_level_start_cursor = None
+
+        # ── Clone expansion (k=1→k=4 etc.) ──────────────────────────
+        if bcfg.clone_to is not None:
+            loaded_k = cfg.k
+            target_k = bcfg.clone_to
+            if target_k <= loaded_k:
+                print(f"  ERROR: clone_to={target_k} must be > loaded_k={loaded_k}")
+                return
+            chunk_template = [1, 8, 64, 512, 4096, 32768, 262144, 2097152]
+            if target_k > len(chunk_template):
+                print(f"  ERROR: clone_to={target_k} exceeds max supported k={len(chunk_template)}")
+                return
+            new_chunks = chunk_template[:target_k]
+            # Extend per-level arrays
+            ext_m_norm = (bcfg.m_norm_max or None) if bcfg.m_norm_max is not None else (
+                list(cfg.m_norm_max) if hasattr(cfg, 'm_norm_max') and cfg.m_norm_max else None
+            )
+            if ext_m_norm is not None and len(ext_m_norm) < target_k:
+                ext_m_norm = list(ext_m_norm) + [ext_m_norm[-1]] * (target_k - len(ext_m_norm))
+            ext_error_clip = (bcfg.error_clip or None) if bcfg.error_clip is not None else (
+                list(cfg.error_clip) if hasattr(cfg, 'error_clip') and cfg.error_clip else None
+            )
+            if ext_error_clip is not None and len(ext_error_clip) < target_k:
+                ext_error_clip = list(ext_error_clip) + [ext_error_clip[-1]] * (target_k - len(ext_error_clip))
+            new_cfg = nl_hecate.MAGConfig(
+                d_model=cfg.d_model, num_heads=cfg.num_heads,
+                head_dim=cfg.head_dim, seq_len=cfg.seq_len,
+                window_size=cfg.window_size, vocab_size=cfg.vocab_size,
+                memory_enabled=cfg.memory_enabled, k=target_k,
+                chunk_sizes=new_chunks,
+                memory_rule=cfg.memory_rule, composition=cfg.composition,
+                checkpoint_interval=bcfg.checkpoint_interval,
+                projection_kind=cfg.projection_kind,
+                self_generated_values=cfg.self_generated_values,
+                self_ref_chunk_size=cfg.self_ref_chunk_size,
+                momentum_kind=cfg.momentum_kind,
+                momentum_d_hidden=cfg.momentum_d_hidden,
+                attentional_bias=(
+                    bcfg.attentional_bias
+                    if bcfg.attentional_bias is not None
+                    else getattr(cfg, "attentional_bias", None)
+                ),
+                retention=(
+                    bcfg.retention
+                    if bcfg.retention is not None
+                    else getattr(cfg, "retention", None)
+                ),
+                intermediate_size=bcfg.intermediate_size,
+                theta_floor=bcfg.theta_floor,
+                theta_ceil=bcfg.theta_ceil,
+                m_norm_max=ext_m_norm,
+                error_clip=ext_error_clip,
+                parallel_strategy=(
+                    bcfg.parallel_strategy
+                    if bcfg.parallel_strategy is not None
+                    else getattr(cfg, "parallel_strategy", None)
+                ),
+                tnt_global_chunk_size=bcfg.tnt_global_chunk_size,
+                tnt_local_chunk_size=bcfg.tnt_local_chunk_size,
+                residual=bcfg.residual,
+            )
+            if _stacked_params_json is not None:
+                result = nl_hecate.extend_stacked_clone(
+                    bcfg.load, new_cfg, bcfg.seed)
+                _stacked_params_json = result["params_json"]
+                print(f"  Clone: k={loaded_k} → k={target_k}, "
+                      f"n_blocks={result['n_blocks']}, chunks={new_chunks}")
+            else:
+                print("  ERROR: clone_to only supported for stacked models")
+                return
+            cfg = new_cfg
+            bcfg.k = target_k
+            bcfg.chunk_sizes = new_chunks
+            if ext_m_norm is not None:
+                bcfg.m_norm_max = ext_m_norm
+            if ext_error_clip is not None:
+                bcfg.error_clip = ext_error_clip
+            resume_step = 0
+            build_state = None
             _restored_level_start_cursor = None
 
         # ── Data cursor override (for push-up or manual reposition) ──

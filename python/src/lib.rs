@@ -1796,6 +1796,30 @@ fn extend_stacked_push_up(
     Ok(dict.into_any().unbind())
 }
 
+/// Clone expansion: duplicate existing levels to fill a larger k.
+/// k=1→k=4: level[0] weights cloned into all 4 slots.
+/// Gate biases use new config defaults for frequency-appropriate init.
+#[pyfunction]
+fn extend_stacked_clone(
+    py: Python<'_>,
+    path: &str,
+    new_cfg: &MAGConfig,
+    seed: u64,
+) -> PyResult<PyObject> {
+    let (params, _config, n_blocks, _build_state) = rust_load_stacked(std::path::Path::new(path))
+        .map_err(|e| PyValueError::new_err(format!("extend_stacked_clone: load failed: {e}")))?;
+
+    let extended = params.extend_clone(&new_cfg.inner, seed);
+
+    let params_json = serde_json::to_string(&extended)
+        .map_err(|e| PyValueError::new_err(format!("params serialization failed: {e}")))?;
+
+    let dict = PyDict::new(py);
+    dict.set_item("params_json", params_json)?;
+    dict.set_item("n_blocks", n_blocks)?;
+    Ok(dict.into_any().unbind())
+}
+
 // ── GPU-Resident Model ───────────────────────────────────────────────
 
 /// GPU-resident model: all parameters live on GPU.
@@ -3022,6 +3046,7 @@ fn nl_hecate(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(save_stacked_checkpoint, m)?)?;
     m.add_function(wrap_pyfunction!(load_stacked_checkpoint, m)?)?;
     m.add_function(wrap_pyfunction!(extend_stacked_push_up, m)?)?;
+    m.add_function(wrap_pyfunction!(extend_stacked_clone, m)?)?;
     // CPU frequency-aware AdamW optimizer
     m.add_class::<FrequencyAwareAdamW>()?;
     // GPU-resident model
