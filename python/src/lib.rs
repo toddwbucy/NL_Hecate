@@ -2829,10 +2829,13 @@ impl GpuStackedModel {
         self.last_l0_block_gnorms.clone()
     }
 
-    /// Get the current tape_multiplier value.
+    /// Get the current tape_multiplier value (canonicalized: Some(0) → None).
     #[getter]
     fn tape_multiplier(&self) -> Option<usize> {
-        self.cfg.tape_multiplier
+        match self.cfg.tape_multiplier {
+            Some(0) => None,
+            other => other,
+        }
     }
 
     /// Set tape_multiplier at runtime — takes effect on the next forward call.
