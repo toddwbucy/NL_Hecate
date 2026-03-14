@@ -488,6 +488,17 @@ pub(crate) fn gpu_memory_backward(
                 cfg.error_clip_for_level(level),
             );
 
+            // CS-39 straight-through: zero d_alpha where alpha was clamped.
+            let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
+            let alpha_ceil  = cfg.alpha_ceil.get(level).copied().unwrap_or(1.0);
+            if alpha_floor > 0.0 || alpha_ceil < 1.0 {
+                unsafe {
+                    crate::cuda_ffi::theta_clamp_mask_cuda(
+                        alpha.as_ptr(), d_alpha.ptr(), bs_s as i32, alpha_floor, alpha_ceil,
+                    );
+                }
+            }
+
             // CS-39 straight-through: zero d_theta where theta was clamped.
             let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
             let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
@@ -527,6 +538,17 @@ pub(crate) fn gpu_memory_backward(
                 s, d, batch_size,
                 cfg.error_clip_for_level(level),
             );
+
+            // CS-39 straight-through: zero d_alpha where alpha was clamped.
+            let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
+            let alpha_ceil  = cfg.alpha_ceil.get(level).copied().unwrap_or(1.0);
+            if alpha_floor > 0.0 || alpha_ceil < 1.0 {
+                unsafe {
+                    crate::cuda_ffi::theta_clamp_mask_cuda(
+                        alpha.as_ptr(), d_alpha.ptr(), bs_s as i32, alpha_floor, alpha_ceil,
+                    );
+                }
+            }
 
             // CS-39 straight-through: zero d_theta where theta was clamped.
             let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
@@ -578,8 +600,18 @@ pub(crate) fn gpu_memory_backward(
         // ── Checkpointed variants: segment-based backward ──────────
         GpuMemoryCache::DeltaCkpt { k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, checkpoint_interval, k_norms, q_norms } => {
             let c = *checkpoint_interval;
-            let (d_k_mem, d_v_mem, d_q_mem, d_alpha, mut d_theta) =
+            let (d_k_mem, d_v_mem, d_q_mem, mut d_alpha, mut d_theta) =
                 delta_backward_checkpointed(k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, d_y, s, d, c, cfg.error_clip_for_level(level));
+            // CS-39 straight-through: zero d_alpha where alpha was clamped.
+            let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
+            let alpha_ceil  = cfg.alpha_ceil.get(level).copied().unwrap_or(1.0);
+            if alpha_floor > 0.0 || alpha_ceil < 1.0 {
+                unsafe {
+                    crate::cuda_ffi::theta_clamp_mask_cuda(
+                        alpha.as_ptr(), d_alpha.ptr(), s as i32, alpha_floor, alpha_ceil,
+                    );
+                }
+            }
             // CS-39 straight-through: zero d_theta where theta was clamped.
             let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
             let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
@@ -601,8 +633,18 @@ pub(crate) fn gpu_memory_backward(
         }
         GpuMemoryCache::TitansCkpt { k_mem, v_mem, q_mem, alpha, theta, eta, m_checkpoints, s_checkpoints, checkpoint_interval, k_norms, q_norms } => {
             let c = *checkpoint_interval;
-            let (d_k_mem, d_v_mem, d_q_mem, d_alpha, mut d_theta, d_eta) =
+            let (d_k_mem, d_v_mem, d_q_mem, mut d_alpha, mut d_theta, d_eta) =
                 titans_backward_checkpointed(k_mem, v_mem, q_mem, alpha, theta, eta, m_checkpoints, s_checkpoints, d_y, s, d, c, cfg.error_clip_for_level(level));
+            // CS-39 straight-through: zero d_alpha where alpha was clamped.
+            let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
+            let alpha_ceil  = cfg.alpha_ceil.get(level).copied().unwrap_or(1.0);
+            if alpha_floor > 0.0 || alpha_ceil < 1.0 {
+                unsafe {
+                    crate::cuda_ffi::theta_clamp_mask_cuda(
+                        alpha.as_ptr(), d_alpha.ptr(), s as i32, alpha_floor, alpha_ceil,
+                    );
+                }
+            }
             // CS-39 straight-through: zero d_theta where theta was clamped.
             let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
             let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
@@ -653,6 +695,17 @@ pub(crate) fn gpu_memory_backward(
                 cfg.error_clip_for_level(level),
             );
 
+            // CS-39 straight-through: zero d_alpha where alpha was clamped.
+            let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
+            let alpha_ceil  = cfg.alpha_ceil.get(level).copied().unwrap_or(1.0);
+            if alpha_floor > 0.0 || alpha_ceil < 1.0 {
+                unsafe {
+                    crate::cuda_ffi::theta_clamp_mask_cuda(
+                        alpha.as_ptr(), d_alpha.ptr(), bs_s as i32, alpha_floor, alpha_ceil,
+                    );
+                }
+            }
+
             // CS-39 straight-through: zero d_theta where theta was clamped.
             let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
             let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
@@ -675,8 +728,18 @@ pub(crate) fn gpu_memory_backward(
         }
         GpuMemoryCache::DGDCkpt { k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, checkpoint_interval, k_norms, q_norms } => {
             let c = *checkpoint_interval;
-            let (d_k_mem, d_v_mem, d_q_mem, d_alpha, mut d_theta) =
+            let (d_k_mem, d_v_mem, d_q_mem, mut d_alpha, mut d_theta) =
                 delta_backward_checkpointed(k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, d_y, s, d, c, cfg.error_clip_for_level(level));
+            // CS-39 straight-through: zero d_alpha where alpha was clamped.
+            let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
+            let alpha_ceil  = cfg.alpha_ceil.get(level).copied().unwrap_or(1.0);
+            if alpha_floor > 0.0 || alpha_ceil < 1.0 {
+                unsafe {
+                    crate::cuda_ffi::theta_clamp_mask_cuda(
+                        alpha.as_ptr(), d_alpha.ptr(), s as i32, alpha_floor, alpha_ceil,
+                    );
+                }
+            }
             // CS-39 straight-through: zero d_theta where theta was clamped.
             let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
             let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
@@ -846,6 +909,19 @@ pub(crate) fn gpu_memory_backward(
                         }
                     }
                     _ => unreachable!("TNT inner cache must be Titans or Delta"),
+                }
+
+                // CS-39 straight-through: zero d_alpha where alpha was clamped.
+                let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
+                let alpha_ceil  = cfg.alpha_ceil.get(level).copied().unwrap_or(1.0);
+                if alpha_floor > 0.0 || alpha_ceil < 1.0 {
+                    if let GpuMemoryCache::Titans { alpha, .. } | GpuMemoryCache::Delta { alpha, .. } = inner_cache {
+                        unsafe {
+                            crate::cuda_ffi::theta_clamp_mask_cuda(
+                                alpha.as_ptr(), d_alpha_shard.ptr(), shard_tokens as i32, alpha_floor, alpha_ceil,
+                            );
+                        }
+                    }
                 }
 
                 // CS-39 straight-through: zero d_theta where theta was clamped

@@ -483,9 +483,13 @@ pub fn gpu_cms_forward(
         let is_tnt_mode = cfg.parallel.as_ref()
             .map(|p| p.strategy == ParallelStrategy::TNTHierarchical)
             .unwrap_or(false);
+        // Spec 25: tape_multiplier routes levels to Ckpt path, which is incompatible
+        // with CUDA graph capture. Disable capture if any level would use Ckpt.
+        let has_ckpt = cfg.checkpoint_interval.is_some()
+            || cfg.tape_multiplier.map_or(false, |m| m > 0);
         let can_capture = !cfg.residual
             && matches!(cfg.memory_rule, MemoryRuleKind::DeltaRule | MemoryRuleKind::TitansLMM)
-            && cfg.checkpoint_interval.is_none()
+            && !has_ckpt
             && !is_tnt_mode;
 
         if can_capture {
@@ -837,6 +841,12 @@ pub(crate) fn gpu_memory_forward(
             level_params.b_theta.as_ptr(), theta.ptr(),
             tokens_i32, d_i32, 1, // 1=softplus
         );
+        // CS-39: clamp post-sigmoid alpha to [floor, ceil] per level.
+        let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
+        let alpha_ceil  = cfg.alpha_ceil.get(level).copied().unwrap_or(1.0);
+        if alpha_floor > 0.0 || alpha_ceil < 1.0 {
+            crate::cuda_ffi::clamp_f32_cuda(alpha.ptr(), tokens_i32, alpha_floor, alpha_ceil);
+        }
         // CS-39: clamp post-softplus theta to [floor, ceil] per level.
         let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
         let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
@@ -850,7 +860,12 @@ pub(crate) fn gpu_memory_forward(
     let m_initial_slice = context_m.slice(0, bs * dd);
     let m_norm_max = cfg.max_m_norm(level);
 
-    match (cfg.checkpoint_interval, cfg.memory_rule) {
+    // Spec 25: boundary-scoped Wengert tape. Use effective_checkpoint_interval
+    // which accounts for tape_multiplier — derives per-level intervals from chunk_sizes.
+    // When tape_multiplier is None/0, falls back to cfg.checkpoint_interval (legacy).
+    let eff_ckpt = cfg.effective_checkpoint_interval(level);
+
+    match (eff_ckpt, cfg.memory_rule) {
         // ── Full-trajectory paths (checkpoint_interval=None, current behavior) ──
         (None, MemoryRuleKind::DeltaRule) => {
             let mut m_states = GpuBuf::zeros(bs * (s + 1) * dd);
@@ -1116,6 +1131,11 @@ pub(crate) fn gpu_tnt_forward(
                 level_params.b_theta.as_ptr(), theta.ptr(),
                 shard_tokens_i32, d_i32, 1,
             );
+            let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
+            let alpha_ceil  = cfg.alpha_ceil.get(level).copied().unwrap_or(1.0);
+            if alpha_floor > 0.0 || alpha_ceil < 1.0 {
+                crate::cuda_ffi::clamp_f32_cuda(alpha.ptr(), shard_tokens_i32, alpha_floor, alpha_ceil);
+            }
             let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
             let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
             if theta_floor > 0.0 || theta_ceil < f32::MAX {
@@ -1324,6 +1344,11 @@ fn gpu_memory_forward_into_scratch(
             level_params.b_theta.as_ptr(), scratch.theta.ptr(),
             tokens_i32, d_i32, 1, // 1=softplus
         );
+        let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
+        let alpha_ceil  = cfg.alpha_ceil.get(level).copied().unwrap_or(1.0);
+        if alpha_floor > 0.0 || alpha_ceil < 1.0 {
+            crate::cuda_ffi::clamp_f32_cuda(scratch.alpha.ptr(), tokens_i32, alpha_floor, alpha_ceil);
+        }
         let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
         let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
         if theta_floor > 0.0 || theta_ceil < f32::MAX {

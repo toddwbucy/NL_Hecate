@@ -145,6 +145,9 @@ pub trait MemoryRule: OpaqueVjp {
 pub struct DeltaRule {
     pub bias: crate::model::AttentionalBias,
     pub sign_sharpness: f32,
+    /// Per-level alpha floor/ceil (CS-39 retention gate clamp). 0.0/1.0 = no clamp.
+    pub alpha_floor: f32,
+    pub alpha_ceil: f32,
     /// Per-level theta floor/ceil (CS-39 training wheels). 0.0/MAX = no clamp.
     pub theta_floor: f32,
     pub theta_ceil: f32,
@@ -155,13 +158,15 @@ pub struct DeltaRule {
 impl DeltaRule {
     /// L2 bias (backward compatible default).
     pub fn l2() -> Self {
-        DeltaRule { bias: crate::model::AttentionalBias::L2, sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: f32::MAX, feature_map: FeatureMapKind::Identity }
+        DeltaRule { bias: crate::model::AttentionalBias::L2, sign_sharpness: 10.0, alpha_floor: 0.0, alpha_ceil: 1.0, theta_floor: 0.0, theta_ceil: f32::MAX, feature_map: FeatureMapKind::Identity }
     }
     /// Construct from MAGConfig fields for a specific CMS level (CS-39 clamp per level).
     pub fn from_cfg_level(cfg: &crate::model::MAGConfig, level: usize) -> Self {
         DeltaRule {
             bias: cfg.attentional_bias,
             sign_sharpness: cfg.sign_sharpness,
+            alpha_floor: cfg.alpha_floor.get(level).copied().unwrap_or(0.0),
+            alpha_ceil: cfg.alpha_ceil.get(level).copied().unwrap_or(1.0),
             theta_floor: cfg.theta_floor.get(level).copied().unwrap_or(0.0),
             theta_ceil: cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX),
             feature_map: cfg.feature_map.clone(),
@@ -357,7 +362,7 @@ impl MemoryRule for DeltaRule {
                 alpha_pre_t += concat_t[i] * level_params.w_alpha[i];
             }
             alpha_pre[t] = alpha_pre_t;
-            alpha[t] = sigmoid_f32(alpha_pre_t);
+            alpha[t] = sigmoid_f32(alpha_pre_t).clamp(self.alpha_floor, self.alpha_ceil);
 
             // theta_t = softplus(concat @ w_theta + b_theta)
             let mut theta_pre_t = level_params.b_theta[0];
@@ -978,7 +983,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = DeltaRule { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: f32::MAX , feature_map: FeatureMapKind::Identity};
+        let rule = DeltaRule { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, alpha_floor: 0.0, alpha_ceil: 1.0, theta_floor: 0.0, theta_ceil: f32::MAX , feature_map: FeatureMapKind::Identity};
         let (y, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for (i, &v) in y.iter().enumerate() {
             assert!(v.is_finite(), "L1 y[{i}] not finite: {v}");
@@ -990,7 +995,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = DeltaRule { bias: crate::model::AttentionalBias::Lp(3.0), sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: f32::MAX , feature_map: FeatureMapKind::Identity};
+        let rule = DeltaRule { bias: crate::model::AttentionalBias::Lp(3.0), sign_sharpness: 10.0, alpha_floor: 0.0, alpha_ceil: 1.0, theta_floor: 0.0, theta_ceil: f32::MAX , feature_map: FeatureMapKind::Identity};
         let (y, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for (i, &v) in y.iter().enumerate() {
             assert!(v.is_finite(), "Lp(3) y[{i}] not finite: {v}");
@@ -1002,7 +1007,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = DeltaRule { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: f32::MAX , feature_map: FeatureMapKind::Identity};
+        let rule = DeltaRule { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, alpha_floor: 0.0, alpha_ceil: 1.0, theta_floor: 0.0, theta_ceil: f32::MAX , feature_map: FeatureMapKind::Identity};
         let (y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let d_y = vec![1.0f32; y.len()];
         let (grads, d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
@@ -1022,7 +1027,7 @@ mod tests {
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
         let (y_l2, _) = DeltaRule::l2().step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
-        let rule_lp2 = DeltaRule { bias: crate::model::AttentionalBias::Lp(2.0), sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: f32::MAX , feature_map: FeatureMapKind::Identity};
+        let rule_lp2 = DeltaRule { bias: crate::model::AttentionalBias::Lp(2.0), sign_sharpness: 10.0, alpha_floor: 0.0, alpha_ceil: 1.0, theta_floor: 0.0, theta_ceil: f32::MAX , feature_map: FeatureMapKind::Identity};
         let (y_lp2, _) = rule_lp2.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         // Forward outputs should differ (biased grad → different M updates)
         let max_diff: f32 = y_l2.iter().zip(y_lp2.iter())
@@ -1042,7 +1047,7 @@ mod tests {
         let mut embedded = vec![0.0f32; seq_len * d];
         SimpleRng::new(99).fill_uniform(&mut embedded, 0.5);
 
-        let rule = DeltaRule { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: f32::MAX , feature_map: FeatureMapKind::Identity};
+        let rule = DeltaRule { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, alpha_floor: 0.0, alpha_ceil: 1.0, theta_floor: 0.0, theta_ceil: f32::MAX , feature_map: FeatureMapKind::Identity};
         let (_, cache) = rule.step(&params, &embedded, seq_len, d, None);
         let d_y = vec![1.0f32; seq_len * d];
         let (pg_direct, de_direct) = rule.step_backward(&params, &cache, &d_y, &embedded);
@@ -1072,7 +1077,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = DeltaRule { bias: crate::model::AttentionalBias::L2, sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: 0.01 , feature_map: FeatureMapKind::Identity};
+        let rule = DeltaRule { bias: crate::model::AttentionalBias::L2, sign_sharpness: 10.0, alpha_floor: 0.0, alpha_ceil: 1.0, theta_floor: 0.0, theta_ceil: 0.01 , feature_map: FeatureMapKind::Identity};
         let (_, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for (t, &th) in cache.theta.iter().enumerate() {
             assert!(th <= 0.01 + 1e-6, "theta[{t}]={th} exceeds ceil=0.01");
@@ -1088,7 +1093,7 @@ mod tests {
         // Ceiling of 0.0 forces all theta to 0.0, ensuring clamping for any positive softplus output.
         // Use floor=MAX to force clamping at floor (theta = 0.0 floor, which is at boundary):
         // Instead, set ceil extremely small so every token hits the ceil.
-        let rule = DeltaRule { bias: crate::model::AttentionalBias::L2, sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: 1e-10 , feature_map: FeatureMapKind::Identity};
+        let rule = DeltaRule { bias: crate::model::AttentionalBias::L2, sign_sharpness: 10.0, alpha_floor: 0.0, alpha_ceil: 1.0, theta_floor: 0.0, theta_ceil: 1e-10 , feature_map: FeatureMapKind::Identity};
         let (_, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let d_y = vec![1.0f32; cfg.swa.seq_len * cfg.swa.d_model];
         let (grads, _) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
@@ -1106,7 +1111,7 @@ mod tests {
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
         let rule_no_clamp = DeltaRule::l2();
-        let rule_with_noop = DeltaRule { bias: crate::model::AttentionalBias::L2, sign_sharpness: 10.0, theta_floor: 0.0, theta_ceil: f32::MAX , feature_map: FeatureMapKind::Identity};
+        let rule_with_noop = DeltaRule { bias: crate::model::AttentionalBias::L2, sign_sharpness: 10.0, alpha_floor: 0.0, alpha_ceil: 1.0, theta_floor: 0.0, theta_ceil: f32::MAX , feature_map: FeatureMapKind::Identity};
         let (y1, _) = rule_no_clamp.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let (y2, _) = rule_with_noop.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for (i, (&a, &b)) in y1.iter().zip(y2.iter()).enumerate() {
