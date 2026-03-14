@@ -2840,7 +2840,11 @@ impl GpuStackedModel {
     /// None or 0 = full trajectory, 1 = boundary-only, N = N checkpoints per chunk.
     #[setter]
     fn set_tape_multiplier(&mut self, value: Option<usize>) {
-        self.cfg.tape_multiplier = value;
+        // Canonicalize: Some(0) and None both mean "full trajectory"
+        self.cfg.tape_multiplier = match value {
+            Some(0) => None,
+            other => other,
+        };
     }
 
     /// CPU Wengert tape summary for stacked models — full gradient observability.
