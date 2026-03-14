@@ -300,6 +300,124 @@ impl GpuMemoryCache {
         }
     }
 
+    /// Extract alpha (retention/forgetting gate) statistics from the forward cache.
+    ///
+    /// `alpha_floor` is the CS-39 configured floor — used to compute `frac_at_floor`.
+    /// Returns `Some(GateStats)` for rules that have a learned alpha (Delta, Titans,
+    /// Hebbian, DGD + Ckpt variants). Returns `None` for SwiGlu.
+    /// For TNT: aggregates alpha values across all shard inner caches, filtering
+    /// out zero-padded elements (sigmoid output is always > 0 for real tokens).
+    ///
+    /// Source: Titans (2501.00663) eq-013 — α_t = σ(w_α · [k,v] + b_α)
+    pub fn alpha_stats(&self, alpha_floor: f32) -> Option<GateStats> {
+        let alpha_buf: Option<&GpuBuf<f32>> = match self {
+            GpuMemoryCache::Delta { alpha, .. }
+            | GpuMemoryCache::Titans { alpha, .. }
+            | GpuMemoryCache::Hebbian { alpha, .. }
+            | GpuMemoryCache::DGD { alpha, .. }
+            | GpuMemoryCache::DeltaCkpt { alpha, .. }
+            | GpuMemoryCache::TitansCkpt { alpha, .. }
+            | GpuMemoryCache::HebbianCkpt { alpha, .. }
+            | GpuMemoryCache::DGDCkpt { alpha, .. } => Some(alpha),
+            GpuMemoryCache::SwiGlu { .. } => None,
+            GpuMemoryCache::TNT { .. } => None, // handled separately below
+        };
+
+        if let Some(buf) = alpha_buf {
+            let n = buf.len();
+            if n == 0 { return None; }
+            let mut host = vec![0.0f32; n];
+            buf.copy_to_host(&mut host);
+            return Some(GateStats::from_slice(&host, alpha_floor, true));
+        }
+
+        // TNT: gather alpha values from all shard inner caches.
+        if let GpuMemoryCache::TNT { shard_inner_caches, .. } = self {
+            let mut all_alpha = Vec::new();
+            for shard_cache in shard_inner_caches.iter() {
+                let inner_buf: Option<&GpuBuf<f32>> = match shard_cache {
+                    GpuMemoryCache::Delta { alpha, .. }
+                    | GpuMemoryCache::Titans { alpha, .. }
+                    | GpuMemoryCache::Hebbian { alpha, .. }
+                    | GpuMemoryCache::DGD { alpha, .. }
+                    | GpuMemoryCache::DeltaCkpt { alpha, .. }
+                    | GpuMemoryCache::TitansCkpt { alpha, .. }
+                    | GpuMemoryCache::HebbianCkpt { alpha, .. }
+                    | GpuMemoryCache::DGDCkpt { alpha, .. } => Some(alpha),
+                    _ => None,
+                };
+                if let Some(buf) = inner_buf {
+                    let n = buf.len();
+                    if n > 0 {
+                        let mut host = vec![0.0f32; n];
+                        buf.copy_to_host(&mut host);
+                        // Filter padding zeros (sigmoid output is always > 0)
+                        all_alpha.extend(host.iter().copied().filter(|&v| v > 0.0));
+                    }
+                }
+            }
+            if all_alpha.is_empty() { return None; }
+            return Some(GateStats::from_slice(&all_alpha, alpha_floor, true));
+        }
+
+        None
+    }
+
+    /// Extract eta (momentum gate) statistics from the forward cache.
+    ///
+    /// Returns `Some(GateStats)` for Titans and TitansCkpt only (the only rules
+    /// with a momentum accumulator S). Returns `None` for all other rules.
+    /// For TNT: aggregates eta values across shard inner caches if they are Titans.
+    ///
+    /// Source: Titans (2501.00663) eq-014 — η_t = σ(w_η · [k,v] + b_η)
+    pub fn eta_stats(&self) -> Option<GateStats> {
+        let eta_buf: Option<&GpuBuf<f32>> = match self {
+            GpuMemoryCache::Titans { eta, .. }
+            | GpuMemoryCache::TitansCkpt { eta, .. } => Some(eta),
+            GpuMemoryCache::Delta { .. }
+            | GpuMemoryCache::Hebbian { .. }
+            | GpuMemoryCache::DGD { .. }
+            | GpuMemoryCache::DeltaCkpt { .. }
+            | GpuMemoryCache::HebbianCkpt { .. }
+            | GpuMemoryCache::DGDCkpt { .. }
+            | GpuMemoryCache::SwiGlu { .. } => None,
+            GpuMemoryCache::TNT { .. } => None, // handled separately below
+        };
+
+        if let Some(buf) = eta_buf {
+            let n = buf.len();
+            if n == 0 { return None; }
+            let mut host = vec![0.0f32; n];
+            buf.copy_to_host(&mut host);
+            // No configured bound for eta — pass 0.0 as floor (will yield frac_at_bound=0)
+            return Some(GateStats::from_slice(&host, 0.0, true));
+        }
+
+        // TNT: gather eta values from Titans shard inner caches only.
+        if let GpuMemoryCache::TNT { shard_inner_caches, .. } = self {
+            let mut all_eta = Vec::new();
+            for shard_cache in shard_inner_caches.iter() {
+                let inner_buf: Option<&GpuBuf<f32>> = match shard_cache {
+                    GpuMemoryCache::Titans { eta, .. }
+                    | GpuMemoryCache::TitansCkpt { eta, .. } => Some(eta),
+                    _ => None,
+                };
+                if let Some(buf) = inner_buf {
+                    let n = buf.len();
+                    if n > 0 {
+                        let mut host = vec![0.0f32; n];
+                        buf.copy_to_host(&mut host);
+                        all_eta.extend(host.iter().copied().filter(|&v| v > 0.0));
+                    }
+                }
+            }
+            if all_eta.is_empty() { return None; }
+            return Some(GateStats::from_slice(&all_eta, 0.0, true));
+        }
+
+        None
+    }
+
     /// Extract theta (inner-loop learning rate) statistics from the forward cache.
     ///
     /// `theta_ceil` is the configured ceiling — used to compute `frac_at_ceil`.
@@ -419,6 +537,74 @@ impl ThetaStats {
         let frac_at_ceil = at_ceil as f32 / n as f32;
 
         ThetaStats { count: n, min, max, mean, median, p95, p99, frac_at_ceil }
+    }
+}
+
+/// Generic gate statistics for alpha (retention) and eta (momentum) gates.
+///
+/// Same interpolated-quantile approach as ThetaStats, but with directional
+/// bound checking: floor for alpha (CS-39 alpha_floor), ceiling for theta.
+/// Eta has no configured bound.
+///
+/// Source: Titans (2501.00663) eq-013 (alpha), eq-014 (eta)
+///         Spec 26: specs/infrastructure/26_gate_diagnostics.md
+#[derive(Debug, Clone)]
+pub struct GateStats {
+    pub count: usize,
+    pub min: f32,
+    pub max: f32,
+    pub mean: f32,
+    pub median: f32,
+    pub p95: f32,
+    pub p99: f32,
+    /// Fraction of tokens at the configured bound (floor or ceil).
+    pub frac_at_bound: f32,
+}
+
+impl GateStats {
+    /// Compute stats from a slice of gate values.
+    ///
+    /// `bound` is the configured floor or ceiling value.
+    /// `bound_is_floor` controls direction:
+    ///   - true (alpha): counts values ≤ bound × (1 + ε)
+    ///   - false (theta-style): counts values ≥ bound × (1 - ε)
+    /// Pass `bound=0.0` with `bound_is_floor=true` to get frac_at_bound=0 (no bound).
+    pub fn from_slice(values: &[f32], bound: f32, bound_is_floor: bool) -> Self {
+        let n = values.len();
+        assert!(n > 0);
+        let mut sorted = values.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let min = sorted[0];
+        let max = sorted[n - 1];
+        let sum: f32 = sorted.iter().sum();
+        let mean = sum / n as f32;
+
+        let quantile = |p: f64| -> f32 {
+            let rank = p * (n as f64 - 1.0);
+            let lo = rank.floor() as usize;
+            let hi = (lo + 1).min(n - 1);
+            let frac = rank - lo as f64;
+            (sorted[lo] as f64 * (1.0 - frac) + sorted[hi] as f64 * frac) as f32
+        };
+        let median = quantile(0.5);
+        let p95 = quantile(0.95);
+        let p99 = quantile(0.99);
+
+        let at_bound = if bound_is_floor && bound > 0.0 {
+            // Floor: count values ≤ bound × (1 + ε)
+            let threshold = bound * (1.0 + 1e-4);
+            sorted.iter().filter(|&&v| v <= threshold).count()
+        } else if !bound_is_floor && bound < f32::MAX {
+            // Ceiling: count values ≥ bound × (1 - ε)
+            let threshold = bound * (1.0 - 1e-4);
+            sorted.iter().filter(|&&v| v >= threshold).count()
+        } else {
+            0
+        };
+        let frac_at_bound = at_bound as f32 / n as f32;
+
+        GateStats { count: n, min, max, mean, median, p95, p99, frac_at_bound }
     }
 }
 

@@ -350,17 +350,41 @@ def print_tape_summary(tape_summary: dict, step: int) -> None:
             f"  out_gnorm={lvl['output_grad_norm']:.4e}"
             f"  dgd_delta={lvl['dgd_delta_norm']:.4e}"
         )
+        # Append m_norm to level line if present
+        if "m_norm" in lvl:
+            line += f"  m_norm={lvl['m_norm']:.1f}"
         print(line)
+        # Alpha (retention/forgetting gate) — before theta
+        if "alpha" in lvl and lvl["alpha"] is not None:
+            a = lvl["alpha"]
+            floor_pct = a.get("frac_at_floor", 0.0) * 100
+            p99_val = a.get("p99", a.get("p99_max", 0.0))
+            print(
+                f"           \u03b1  mean={a['mean']:.4f}  "
+                f"p99={p99_val:.4f}  "
+                f"max={a['max']:.4f}  "
+                f"@floor={floor_pct:.1f}%"
+            )
+        # Theta (inner-loop learning rate)
         if "theta" in lvl and lvl["theta"] is not None:
             t = lvl["theta"]
             ceil_pct = t.get("frac_at_ceil", 0.0) * 100
             # Aggregated stacked view uses p99_max; single-block uses p99
             p99_val = t.get("p99", t.get("p99_max", 0.0))
             print(
-                f"           θ  mean={t['mean']:.4f}  "
+                f"           \u03b8  mean={t['mean']:.4f}  "
                 f"p99={p99_val:.4f}  "
                 f"max={t['max']:.4f}  "
                 f"@ceil={ceil_pct:.1f}%"
+            )
+        # Eta (momentum gate) — Titans only, no bound indicator
+        if "eta" in lvl and lvl["eta"] is not None:
+            e = lvl["eta"]
+            p99_val = e.get("p99", e.get("p99_max", 0.0))
+            print(
+                f"           \u03b7  mean={e['mean']:.4f}  "
+                f"p99={p99_val:.4f}  "
+                f"max={e['max']:.4f}"
             )
 
 
