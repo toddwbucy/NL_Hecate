@@ -158,6 +158,16 @@ class BuildConfig:
     promotion_rewind_pct: float = 0.0  # Fraction of THIS level's steps to rewind data cursor on push-up
     #                                  # 0.0 = no rewind (cursor continues), 0.25 = 25% rewind, 1.0 = full rewind
 
+    # Window-local validation (specs/infrastructure/12_metric_driven_promotion.md §5)
+    window_local_val: bool = False   # Carve val from current training window (not fixed val set)
+    window_val_tokens: int = 50000   # Tokens reserved for window-local validation
+
+    # NIAH evaluation (specs/infrastructure/12_metric_driven_promotion.md §6)
+    niah_enabled: bool = False       # Run needle-in-a-haystack at promotion boundaries
+    niah_haystack_tokens: int = 4096 # Haystack length in tokens
+    niah_num_trials: int = 5         # Number of needle trials per eval
+    niah_every: int = 0              # 0 = only at promotion boundaries; N = every N steps
+
     # Residual stream + pre-LayerNorm (specs/infrastructure/13_residual_stream.md)
     residual: bool = False  # True = additive residual, no sigmoid gating
 
@@ -423,9 +433,20 @@ class BuildConfig:
                        "promotion_stability_threshold", "promotion_rewind_pct"):
                 if pk in pm:
                     flat[pk] = pm[pk]
+        # niah section (12_metric_driven_promotion.md §6)
+        if "niah" in raw:
+            nh = raw["niah"]
+            for nk in ("niah_enabled", "niah_haystack_tokens",
+                        "niah_num_trials", "niah_every"):
+                # Strip niah_ prefix if present in the section
+                short = nk.replace("niah_", "")
+                if short in nh:
+                    flat[nk] = nh[short]
+                elif nk in nh:
+                    flat[nk] = nh[nk]
         for key in list(raw.keys()):
             if key not in ("model", "build", "data", "gate_warmup", "promotion",
-                           "notes", "description"):
+                           "niah", "notes", "description"):
                 flat[key] = raw[key]
         # Rename head_dim if present (derived, not stored)
         flat.pop("head_dim", None)

@@ -30,6 +30,7 @@ from engine.evaluation import (
     EVAL_PROMPTS, SAMPLE_PROMPTS,
 )
 from engine.logging_utils import JSONLLogger, rss_mb
+from engine.niah import run_niah, print_niah_results
 from engine.tokenizer import ByteTokenizer, BpeTokenizer, load_tokenizer
 
 
@@ -51,6 +52,45 @@ def _safetensors_path(path_str: str) -> str:
 _NUMPY_LOADER_FORMATS = frozenset({"sharegpt", "dolmino"})
 
 
+def _carve_window_val(loader: BpeTokenStream, val_tokens: int):
+    """Carve a validation slice from the END of the current training window.
+
+    Returns (val_tokens_np, val_targets_np) sliced from the loader's numpy
+    arrays. The training loop should stop before reaching these tokens.
+
+    Spec 12 §5: each phase gets its own val slice from its own data window.
+    No level ever re-encounters val data from a prior lifetime.
+    """
+    total = loader.total_tokens
+    val_size = min(val_tokens, total // 5)  # Never more than 20% of corpus
+    val_start = total - val_size
+    return loader.tokens[val_start:total], loader.targets[val_start:total]
+
+
+def _update_window_val(loader: BpeTokenStream, cursor_pos: int,
+                       val_tokens: int):
+    """Re-carve window-local val after a promotion advances the data cursor.
+
+    Takes tokens AHEAD of the current cursor position (the next unseen data).
+    This ensures val data is always novel — never overlaps with training data
+    the model has already processed.
+    """
+    total = loader.total_tokens
+    val_size = min(val_tokens, (total - cursor_pos) // 5)
+    if val_size < 100:
+        return None, None  # Not enough data left for meaningful val
+    # Take from the end of the remaining data window
+    val_end = total
+    val_start = val_end - val_size
+    # Ensure val_start is ahead of cursor (novel data)
+    if val_start < cursor_pos:
+        val_start = cursor_pos
+        val_size = val_end - val_start
+    if val_size < 100:
+        return None, None
+    return loader.tokens[val_start:val_end], loader.targets[val_start:val_end]
+
+
 def run_build(bcfg: BuildConfig):
     """Execute the full build loop. All state managed internally."""
 
@@ -62,6 +102,9 @@ def run_build(bcfg: BuildConfig):
     token_ids: list[int] | MmapTokenStream | None = None
 
     val_stream: BpeTokenStream | None = None
+    # Window-local val: numpy slices from current training window (spec 12 §5)
+    _window_val_tokens = None  # np.ndarray or None
+    _window_val_targets = None
 
     if use_bpe:
         active_loader = BpeTokenStream(bcfg.data_path, split="train")
@@ -72,13 +115,20 @@ def run_build(bcfg: BuildConfig):
                   f"format={bcfg.data_format})")
             return
         if bcfg.eval_every > 0:
-            val_path = Path(bcfg.data_path) / "val_tokens.npy"
-            if val_path.exists():
-                val_stream = BpeTokenStream(bcfg.data_path, split="val")
-                print(f"Loaded val set: {len(val_stream):,} tokens")
+            if bcfg.window_local_val:
+                # Carve val from training data window (no fixed val set)
+                _window_val_tokens, _window_val_targets = _carve_window_val(
+                    active_loader, bcfg.window_val_tokens)
+                print(f"Window-local val: {len(_window_val_tokens):,} tokens "
+                      f"from training window end")
             else:
-                print("Warning: eval_every set but no val data found, disabling eval")
-                bcfg.eval_every = 0  # safe: bcfg is consumed only by this function
+                val_path = Path(bcfg.data_path) / "val_tokens.npy"
+                if val_path.exists():
+                    val_stream = BpeTokenStream(bcfg.data_path, split="val")
+                    print(f"Loaded val set: {len(val_stream):,} tokens")
+                else:
+                    print("Warning: eval_every set but no val data found, disabling eval")
+                    bcfg.eval_every = 0  # safe: bcfg is consumed only by this function
     elif bcfg.data_path:
         if bcfg.data_path.endswith(".bin"):
             fsize = os.path.getsize(bcfg.data_path)
@@ -1252,7 +1302,8 @@ def run_build(bcfg: BuildConfig):
                 })
             jsonl.log(event="level_heatmap", step=step, levels=heatmap_levels)
 
-        if (bcfg.eval_every > 0 and val_stream is not None
+        _has_val = (val_stream is not None or _window_val_tokens is not None)
+        if (bcfg.eval_every > 0 and _has_val
                 and step > 0 and step % bcfg.eval_every == 0
                 and not is_stacked):
             saved_ctx = None
@@ -1260,9 +1311,15 @@ def run_build(bcfg: BuildConfig):
                 if gpu_model is not None:
                     saved_ctx = gpu_model.to_host_context()
                     gpu_model.reset_context()
-                eval_loss, eval_ppl = evaluate(
-                    gpu_model, bcfg, val_stream, bcfg.eval_max_chunks,
-                    val_doc_starts=val_doc_starts)
+                if _window_val_tokens is not None:
+                    # Window-local val: eval on data the model hasn't trained on
+                    eval_loss, eval_ppl = evaluate_numpy(
+                        gpu_model, bcfg, _window_val_tokens,
+                        _window_val_targets, max_chunks=bcfg.eval_max_chunks)
+                else:
+                    eval_loss, eval_ppl = evaluate(
+                        gpu_model, bcfg, val_stream, bcfg.eval_max_chunks,
+                        val_doc_starts=val_doc_starts)
             finally:
                 if gpu_model is not None and saved_ctx is not None:
                     gpu_model.upload_context(saved_ctx)
@@ -1401,6 +1458,36 @@ def run_build(bcfg: BuildConfig):
                         jsonl.log(event="memory_vocab_probe", **vprobe)
                 except Exception as e:
                     print(f"    [vocab probe failed: {e}]")
+            # ── NIAH eval (spec 12 §6) ────────────────────────────────
+            niah_eff = bcfg.niah_every if bcfg.niah_every > 0 else 0
+            if (bcfg.niah_enabled and gpu_model is not None
+                    and tokenizer is not None
+                    and niah_eff > 0 and step % niah_eff == 0
+                    and active_loader is not None):
+                try:
+                    # Use training data as haystack source
+                    haystack_need = bcfg.niah_haystack_tokens * (bcfg.niah_num_trials + 1)
+                    hay_start = max(0, active_loader.position - haystack_need)
+                    haystack = active_loader.tokens[hay_start:hay_start + haystack_need].tolist()
+                    niah_result = run_niah(
+                        gpu_model, cfg, haystack, tokenizer,
+                        num_trials=bcfg.niah_num_trials,
+                        haystack_len=bcfg.niah_haystack_tokens,
+                    )
+                    print_niah_results(niah_result, step)
+                    if jsonl:
+                        jsonl.log(event="niah", step=step, **{
+                            k: v for k, v in niah_result.items()
+                            if k != "trials"
+                        })
+                        for t in niah_result.get("trials", []):
+                            jsonl.log(event="niah_trial", step=step, **{
+                                k: v for k, v in t.items()
+                                if k != "answer_tokens"
+                            })
+                except Exception as e:
+                    print(f"    [niah failed: {e}]")
+
             if jsonl:
                 jsonl.log(event="eval", step=step, eval_loss=eval_loss,
                           eval_ppl=eval_ppl, eval_chunks=bcfg.eval_max_chunks)
@@ -1658,6 +1745,41 @@ def run_build(bcfg: BuildConfig):
                 promo_sidecar.write_text(json.dumps(promo_cursor, indent=2))
             print(f"  Checkpoint: {promo_ckpt}")
 
+            # NIAH at promotion boundary (pre-promotion snapshot)
+            if (bcfg.niah_enabled and gpu_model is not None
+                    and tokenizer is not None
+                    and active_loader is not None):
+                try:
+                    haystack_need = bcfg.niah_haystack_tokens * (bcfg.niah_num_trials + 1)
+                    hay_start = max(0, active_loader.position - haystack_need)
+                    haystack = active_loader.tokens[hay_start:hay_start + haystack_need].tolist()
+                    niah_result = run_niah(
+                        gpu_model, cfg, haystack, tokenizer,
+                        num_trials=bcfg.niah_num_trials,
+                        haystack_len=bcfg.niah_haystack_tokens,
+                    )
+                    print(f"  [niah] pre-promotion k={old_k}→k={new_k}:")
+                    print_niah_results(niah_result, step)
+                    if jsonl:
+                        jsonl.log(event="niah_promotion", step=step,
+                                  phase="pre", old_k=old_k, new_k=new_k,
+                                  pass_rate=niah_result.get("pass_rate", 0),
+                                  mean_lift=niah_result.get("mean_lift", 0))
+                except Exception as e:
+                    print(f"  [niah pre-promotion failed: {e}]")
+
+            # Coherence samples at promotion boundary
+            if (gpu_model is not None and tokenizer is not None):
+                try:
+                    samples = eval_coherence_samples(gpu_model, cfg, max_tokens=30,
+                                                     tokenizer=tokenizer)
+                    print(f"  [coherence] pre-promotion k={old_k}:")
+                    for prompt, gen in samples:
+                        preview = gen[:80].replace("\n", "\\n")
+                        print(f"    \"{prompt}\" → \"{preview}\"")
+                except Exception as e:
+                    print(f"  [coherence pre-promotion failed: {e}]")
+
             if jsonl:
                 cursor_pos = (active_loader.cursor()["position"]
                               if active_loader is not None else 0)
@@ -1779,6 +1901,17 @@ def run_build(bcfg: BuildConfig):
                     print(f"  Data cursor: {cur_pos:,} (continues naturally)")
                 _level_start_cursor = (active_loader.cursor()["position"]
                                        if active_loader is not None else 0)
+            # Re-carve window-local val for the new data window
+            if bcfg.window_local_val and active_loader is not None:
+                cursor_pos = active_loader.cursor()["position"]
+                _window_val_tokens, _window_val_targets = _update_window_val(
+                    active_loader, cursor_pos, bcfg.window_val_tokens)
+                if _window_val_tokens is not None:
+                    print(f"  Window-local val: re-carved {len(_window_val_tokens):,} "
+                          f"tokens from new window")
+                else:
+                    print(f"  Window-local val: not enough data remaining, eval disabled")
+
             print(f"  Promotion complete, continuing at step {step + 1}\n")
 
     t_end = time.perf_counter()
