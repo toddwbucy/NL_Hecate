@@ -9,28 +9,56 @@ import pytest
 
 import importlib.util
 
-# Import niah_verify directly (bypasses engine/__init__.py which needs nl_hecate)
-_niah_path = os.path.join(os.path.dirname(__file__), "..", "engine", "niah_verify.py")
+# Import niah_verify directly (bypasses engine/__init__.py which needs nl_hecate).
+# Stubs are scoped to the import window and restored immediately after.
+_niah_path = os.path.join(os.path.dirname(__file__), "..", "tools", "niah_verify.py")
 _spec = importlib.util.spec_from_file_location("niah_verify", _niah_path,
                                                 submodule_search_locations=[])
 _mod = importlib.util.module_from_spec(_spec)
-# Stub out nl_hecate and engine.* so the module loads without CUDA
-_stub_nl = type(sys)("nl_hecate")
-sys.modules["nl_hecate"] = _stub_nl
 
-_stub_data = type(sys)("engine.data")
-_stub_data.BpeTokenStream = None  # not used in pure-logic tests
-sys.modules["engine"] = type(sys)("engine")
-sys.modules["engine.data"] = _stub_data
+# Pure-Python fallback for logprob_at_position (mirrors Rust binding logic)
+import math as _math
+def _stub_logprob(logits_flat, position, token_id, vocab):
+    if token_id >= vocab:
+        return float("-inf")
+    row_start = position * vocab
+    row = logits_flat[row_start:row_start + vocab]
+    max_logit = max(row)
+    if _math.isnan(max_logit) or _math.isinf(max_logit):
+        return float("nan")
+    exp_sum = sum(_math.exp(x - max_logit) for x in row)
+    if exp_sum <= 0:
+        return float("nan")
+    return (row[token_id] - max_logit) - _math.log(exp_sum)
 
-_stub_tok = type(sys)("engine.tokenizer")
-_stub_tok.load_tokenizer = None
-sys.modules["engine.tokenizer"] = _stub_tok
+# Save originals, insert stubs, load module, restore originals
+_STUB_KEYS = ["nl_hecate", "engine", "engine.data", "engine.tokenizer", "engine.generation"]
+_saved = {k: sys.modules.pop(k, None) for k in _STUB_KEYS}
+try:
+    _stub_nl = type(sys)("nl_hecate")
+    _stub_nl.logprob_at_position = _stub_logprob
+    sys.modules["nl_hecate"] = _stub_nl
 
-_stub_gen = type(sys)("engine.generation")
-_stub_gen.generate_cached = None  # not used in pure-logic tests
-sys.modules["engine.generation"] = _stub_gen
-_spec.loader.exec_module(_mod)
+    _stub_data = type(sys)("engine.data")
+    _stub_data.BpeTokenStream = None
+    sys.modules["engine"] = type(sys)("engine")
+    sys.modules["engine.data"] = _stub_data
+
+    _stub_tok = type(sys)("engine.tokenizer")
+    _stub_tok.load_tokenizer = None
+    sys.modules["engine.tokenizer"] = _stub_tok
+
+    _stub_gen = type(sys)("engine.generation")
+    _stub_gen.generate_cached = None
+    sys.modules["engine.generation"] = _stub_gen
+
+    _spec.loader.exec_module(_mod)
+finally:
+    for k, orig in _saved.items():
+        if orig is not None:
+            sys.modules[k] = orig
+        else:
+            sys.modules.pop(k, None)
 
 NEEDLES = _mod.NEEDLES
 COHERENCE_PROMPTS = _mod.COHERENCE_PROMPTS

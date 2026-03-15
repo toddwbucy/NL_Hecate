@@ -2,10 +2,12 @@
 
 Loads a checkpoint, plants synthetic factoids at random positions within
 real-corpus haystacks, and measures whether the model retrieves them at
-configurable distances. Designed to run between push-up phases.
+configurable distances. Designed to run offline between push-up phases.
+
+This is NOT part of the training loop — it is an offline evaluation tool.
 
 Usage:
-    python -m engine.niah_verify \
+    python -m tools.niah_verify \
         --checkpoint model.safetensors \
         --data data/fineweb_edu \
         --distances 1024,2048,4096 \
@@ -102,24 +104,12 @@ def _logprob_at_position(logits_flat: list[float], position: int,
                          token_id: int, vocab: int) -> float:
     """Extract log-probability of token_id at a specific position.
 
-    logits_flat is [seq_len * vocab] row-major from model.forward().
+    Delegates to Rust binding (nl_hecate.logprob_at_position) for
+    numerically-stable log-sum-exp. Python only validates inputs.
     """
-    if token_id >= vocab or token_id < 0:
+    if token_id < 0:
         return float("-inf")
-
-    row_start = position * vocab
-    row = logits_flat[row_start:row_start + vocab]
-
-    max_logit = max(row)
-    if math.isnan(max_logit) or math.isinf(max_logit):
-        return float("nan")
-
-    exp_sum = sum(math.exp(row[j] - max_logit) for j in range(vocab))
-    if exp_sum <= 0:
-        return float("nan")
-
-    log_sum_exp = max_logit + math.log(exp_sum)
-    return row[token_id] - log_sum_exp
+    return nl_hecate.logprob_at_position(logits_flat, position, token_id, vocab)
 
 
 def _build_trial_sequence(corpus_tokens: list[int],
