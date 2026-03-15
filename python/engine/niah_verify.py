@@ -187,9 +187,10 @@ def _run_trial(gpu_model, cfg, sequence: list[int],
     conductor = nl_hecate.Conductor(
         cfg.k, list(cfg.chunk_sizes) if hasattr(cfg, 'chunk_sizes') else [1] * cfg.k)
 
-    # Forward through the full sequence in seq_len chunks
-    last_logits_flat = None
-    last_chunk_start = 0
+    # Forward through the full sequence in seq_len chunks.
+    # Capture logits from the chunk containing query_answer_pos (not just the last chunk).
+    answer_logits_flat = None
+    answer_chunk_start = 0
     pos = 0
 
     while pos < len(sequence):
@@ -216,23 +217,28 @@ def _run_trial(gpu_model, cfg, sequence: list[int],
         _loss, logits_flat = gpu_model.forward(chunk_input, chunk_target, pulse)
         conductor.advance()
 
-        last_logits_flat = logits_flat
-        last_chunk_start = pos
+        # Capture logits from the chunk that actually contains the answer position
+        if pos <= query_answer_pos < chunk_end:
+            answer_logits_flat = logits_flat
+            answer_chunk_start = pos
+
         pos = chunk_end
 
-    if last_logits_flat is None:
-        return {"pass": False, "lift": 0.0, "error": "no logits produced"}
+    if answer_logits_flat is None:
+        return {"pass": False, "lift": 0.0,
+                "error": f"answer_pos {query_answer_pos} not found in any chunk "
+                         f"(sequence length {len(sequence)})"}
 
-    # Find the answer position within the last chunk's logits
-    pos_in_chunk = query_answer_pos - last_chunk_start
+    # Find the answer position within the captured chunk's logits
+    pos_in_chunk = query_answer_pos - answer_chunk_start
     if pos_in_chunk < 0 or pos_in_chunk >= seq_len:
         return {"pass": False, "lift": 0.0,
-                "error": f"answer_pos {query_answer_pos} not in last chunk "
-                         f"[{last_chunk_start}, {last_chunk_start + seq_len})"}
+                "error": f"answer_pos {query_answer_pos} out of range in chunk "
+                         f"[{answer_chunk_start}, {answer_chunk_start + seq_len})"}
 
     # Score the correct answer
     answer_logprob = _logprob_at_position(
-        last_logits_flat, pos_in_chunk, answer_token_id, vocab)
+        answer_logits_flat, pos_in_chunk, answer_token_id, vocab)
 
     # Score 10 random baselines
     baseline_logprobs = []
@@ -241,7 +247,7 @@ def _run_trial(gpu_model, cfg, sequence: list[int],
         random_tokens = tokenizer.encode(random_num)
         if random_tokens:
             bp = _logprob_at_position(
-                last_logits_flat, pos_in_chunk, random_tokens[0], vocab)
+                answer_logits_flat, pos_in_chunk, random_tokens[0], vocab)
             baseline_logprobs.append(bp)
 
     if not baseline_logprobs:
@@ -452,7 +458,12 @@ def main():
 
     args = parser.parse_args()
 
-    distances = [int(d.strip()) for d in args.distances.split(",")]
+    try:
+        distances = [int(d.strip()) for d in args.distances.split(",") if d.strip()]
+    except ValueError as e:
+        parser.error(f"--distances must be comma-separated integers: {e}")
+    if not distances:
+        parser.error("--distances must contain at least one value")
 
     t_start = time.perf_counter()
 

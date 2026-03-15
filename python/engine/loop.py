@@ -227,7 +227,7 @@ def run_build(bcfg: BuildConfig):
             try:
                 params, cfg, build_state = nl_hecate.load_build_checkpoint(bcfg.load)
                 resume_step = build_state["global_step"] if build_state else 0
-            except Exception:
+            except (RuntimeError, OSError):
                 params, cfg = nl_hecate.load_checkpoint(bcfg.load)
                 resume_step = 0
             sidecar = Path(str(bcfg.load) + ".cursor.json")
@@ -1811,7 +1811,7 @@ def run_build(bcfg: BuildConfig):
                     for prompt, gen in samples:
                         preview = gen[:80].replace("\n", "\\n")
                         print(f"    \"{prompt}\" → \"{preview}\"")
-                except Exception as e:
+                except (RuntimeError, ValueError, TypeError) as e:
                     print(f"  [coherence pre-promotion failed: {e}]")
 
             if jsonl:
