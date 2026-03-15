@@ -2724,6 +2724,55 @@ impl GpuStackedModel {
         })
     }
 
+    /// Forward-only pass for stacked model. Returns (loss, logits_flat).
+    /// logits_flat is [seq_len * vocab_size] in row-major order.
+    /// Does NOT run backward or update weights — safe for inference/eval.
+    fn forward(&mut self, input_ids: Vec<usize>, target_ids: Vec<usize>,
+               pulse: &Pulse) -> PyResult<(f32, Vec<f32>)> {
+        let s = self.cfg.swa.seq_len;
+        let v = self.cfg.swa.vocab_size;
+        if s == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err("seq_len must be > 0"));
+        }
+        if input_ids.is_empty() || input_ids.len() % s != 0 || target_ids.len() != input_ids.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("input/target length must be batch_size * seq_len {} (got {})", s, input_ids.len())));
+        }
+        let bs = input_ids.len() / s;
+        if bs != self.context.batch_size {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("batch mismatch: input has {} samples but context allocated for batch_size={}",
+                        bs, self.context.batch_size)));
+        }
+        if let Some(&max_id) = input_ids.iter().max() {
+            if max_id >= v {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("input_ids contains {} >= vocab_size {}", max_id, v)));
+            }
+        }
+
+        let (loss, cache) = nl_hecate_core::gpu_stacked_forward::gpu_stacked_forward(
+            &self.params, &self.cfg, &input_ids, &target_ids,
+            &pulse.inner, &mut self.context,
+        );
+
+        // Copy logits from GPU to host
+        let n_logits = bs * s * v;
+        let mut logits_host = vec![0.0f32; n_logits];
+        cache.logits.copy_to_host(&mut logits_host);
+
+        // TNT periodic reset (same policy as step_adamw)
+        if self.memory_reset {
+            for (k, &active) in pulse.inner.active_levels.iter().enumerate() {
+                if active {
+                    self.context.periodic_reset_level(k);
+                }
+            }
+        }
+
+        Ok((loss, logits_host))
+    }
+
     /// Full GPU build step with AdamW optimizer. Returns (loss, grad_norm).
     #[pyo3(signature = (input_ids, target_ids, pulse, lr, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.1, max_grad_norm=1.0, collect_block_gnorms=false))]
     fn step_adamw(&mut self, input_ids: Vec<usize>, target_ids: Vec<usize>,

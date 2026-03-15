@@ -111,9 +111,14 @@ def _logprob_at_position(logits_flat: list[float], position: int,
     row = logits_flat[row_start:row_start + vocab]
 
     max_logit = max(row)
-    log_sum_exp = max_logit + math.log(
-        sum(math.exp(row[j] - max_logit) for j in range(vocab))
-    )
+    if math.isnan(max_logit) or math.isinf(max_logit):
+        return float("nan")
+
+    exp_sum = sum(math.exp(row[j] - max_logit) for j in range(vocab))
+    if exp_sum <= 0:
+        return float("nan")
+
+    log_sum_exp = max_logit + math.log(exp_sum)
     return row[token_id] - log_sum_exp
 
 
@@ -188,9 +193,9 @@ def _run_trial(gpu_model, cfg, sequence: list[int],
         cfg.k, list(cfg.chunk_sizes) if hasattr(cfg, 'chunk_sizes') else [1] * cfg.k)
 
     # Forward through the full sequence in seq_len chunks.
-    # Capture logits from the chunk containing query_answer_pos (not just the last chunk).
+    # Keep logits for the chunk containing query_answer_pos.
     answer_logits_flat = None
-    answer_chunk_start = 0
+    answer_chunk_start = None
     pos = 0
 
     while pos < len(sequence):
@@ -214,11 +219,11 @@ def _run_trial(gpu_model, cfg, sequence: list[int],
                 chunk_target = sequence[pos + 1:chunk_end] + [vocab]
 
         pulse = conductor.pulse()
-        _loss, logits_flat = gpu_model.forward(chunk_input, chunk_target, pulse)
+        loss, logits_flat = gpu_model.forward(chunk_input, chunk_target, pulse)
         conductor.advance()
 
-        # Capture logits from the chunk that actually contains the answer position
-        if pos <= query_answer_pos < chunk_end:
+        # Keep logits if this chunk contains the answer position
+        if pos <= query_answer_pos < pos + seq_len:
             answer_logits_flat = logits_flat
             answer_chunk_start = pos
 
@@ -226,19 +231,19 @@ def _run_trial(gpu_model, cfg, sequence: list[int],
 
     if answer_logits_flat is None:
         return {"pass": False, "lift": 0.0,
-                "error": f"answer_pos {query_answer_pos} not found in any chunk "
-                         f"(sequence length {len(sequence)})"}
+                "error": f"answer_pos {query_answer_pos} not covered by any chunk "
+                         f"(sequence len {len(sequence)}, seq_len {seq_len})"}
 
-    # Find the answer position within the captured chunk's logits
+    # Find the answer position within the answer chunk's logits
     pos_in_chunk = query_answer_pos - answer_chunk_start
-    if pos_in_chunk < 0 or pos_in_chunk >= seq_len:
-        return {"pass": False, "lift": 0.0,
-                "error": f"answer_pos {query_answer_pos} out of range in chunk "
-                         f"[{answer_chunk_start}, {answer_chunk_start + seq_len})"}
 
     # Score the correct answer
     answer_logprob = _logprob_at_position(
         answer_logits_flat, pos_in_chunk, answer_token_id, vocab)
+
+    if math.isnan(answer_logprob):
+        return {"pass": False, "lift": 0.0,
+                "error": "answer logprob is NaN (bad logits at this position)"}
 
     # Score 10 random baselines
     baseline_logprobs = []
@@ -248,10 +253,11 @@ def _run_trial(gpu_model, cfg, sequence: list[int],
         if random_tokens:
             bp = _logprob_at_position(
                 answer_logits_flat, pos_in_chunk, random_tokens[0], vocab)
-            baseline_logprobs.append(bp)
+            if not math.isnan(bp):
+                baseline_logprobs.append(bp)
 
     if not baseline_logprobs:
-        return {"pass": False, "lift": 0.0, "error": "no baselines scored"}
+        return {"pass": False, "lift": 0.0, "error": "no valid baselines scored"}
 
     baseline_logprob = sum(baseline_logprobs) / len(baseline_logprobs)
     lift = answer_logprob - baseline_logprob
@@ -274,16 +280,27 @@ def run_niah_verify(checkpoint_path: str, data_path: str,
 
     Returns results dict with per-distance pass rates and trial details.
     """
-    # Load checkpoint
-    try:
-        params, cfg, _build_state = nl_hecate.load_build_checkpoint(checkpoint_path)
-    except (RuntimeError, OSError):
-        params, cfg = nl_hecate.load_checkpoint(checkpoint_path)
+    # Load checkpoint — detect stacked vs single-block
+    is_stacked = nl_hecate.is_stacked_checkpoint(checkpoint_path)
+
+    if is_stacked:
+        result = nl_hecate.load_stacked_checkpoint(checkpoint_path)
+        cfg = result["config"]
+        n_blocks = result["n_blocks"]
+        params_json = result["params_json"]
+    else:
+        try:
+            params, cfg, build_state = nl_hecate.load_build_checkpoint(checkpoint_path)
+        except Exception:
+            params, cfg = nl_hecate.load_checkpoint(checkpoint_path)
 
     print(f"NIAH Verification: {checkpoint_path}")
     print(f"  Model: d={cfg.d_model}, k={cfg.k}, "
           f"chunks={list(cfg.chunk_sizes)}")
-    print(f"  Params: {params.num_params():,}")
+    if is_stacked:
+        print(f"  Stacked: {n_blocks} blocks")
+    else:
+        print(f"  Params: {params.num_params():,}")
 
     # Load corpus
     loader = BpeTokenStream(data_path, split="train")
@@ -296,8 +313,13 @@ def run_niah_verify(checkpoint_path: str, data_path: str,
     # Upload to GPU
     if hasattr(nl_hecate, "set_cuda_device"):
         nl_hecate.set_cuda_device(gpu_device)
-    gpu_model = nl_hecate.GpuModel.from_params(params, cfg)
-    print(f"  GPU:   device {gpu_device}")
+    if is_stacked:
+        gpu_model = nl_hecate.GpuStackedModel.from_params_json(
+            params_json, cfg, n_blocks)
+        print(f"  GPU:   device {gpu_device} ({gpu_model.total_params():,} params)")
+    else:
+        gpu_model = nl_hecate.GpuModel.from_params(params, cfg)
+        print(f"  GPU:   device {gpu_device}")
 
     print(f"  Distances: {distances}")
     print(f"  Trials: {num_trials} per distance\n")
@@ -309,6 +331,10 @@ def run_niah_verify(checkpoint_path: str, data_path: str,
 
     for distance in distances:
         distance_results = []
+
+        # Auto-scale haystack: need at least distance + min_prefix + overhead + min_suffix
+        # Use max(user haystack, distance * 2) so there's room for needle placement
+        effective_haystack = max(haystack_size, distance + min_prefix + min_suffix + 512)
 
         for trial_idx in range(num_trials):
             needle_idx = trial_idx % len(NEEDLES)
@@ -327,7 +353,7 @@ def run_niah_verify(checkpoint_path: str, data_path: str,
                 continue
 
             # Pick a random corpus offset for this trial
-            max_offset = len(corpus_tokens) - haystack_size - 1000
+            max_offset = len(corpus_tokens) - effective_haystack - 1000
             if max_offset < 0:
                 distance_results.append({
                     "needle_idx": needle_idx,
@@ -339,7 +365,7 @@ def run_niah_verify(checkpoint_path: str, data_path: str,
 
             trial_seq = _build_trial_sequence(
                 corpus_tokens, needle_tokens, query_tokens,
-                distance, haystack_size, min_prefix, min_suffix,
+                distance, effective_haystack, min_prefix, min_suffix,
                 rng, corpus_offset)
 
             if trial_seq is None:
@@ -362,9 +388,10 @@ def run_niah_verify(checkpoint_path: str, data_path: str,
             result["answer"] = needle_answer
             distance_results.append(result)
 
-        # Aggregate
+        # Aggregate (skip NaN lifts)
         passing = [r for r in distance_results if r.get("pass", False)]
-        lifts = [r["lift"] for r in distance_results if "lift" in r]
+        lifts = [r["lift"] for r in distance_results
+                 if "lift" in r and not math.isnan(r["lift"])]
         pass_rate = len(passing) / len(distance_results) if distance_results else 0.0
         mean_lift = sum(lifts) / len(lifts) if lifts else 0.0
 
@@ -399,15 +426,17 @@ def run_niah_verify(checkpoint_path: str, data_path: str,
         print(f"    {d}: {dr['pass_rate']:.0%} pass, "
               f"mean_lift={dr['mean_lift']:.3f}")
 
-    # Coherence generation
+    # Coherence generation (skip for stacked models — no prefill/reset_cache yet)
     coherence_results = []
-    if coherence:
+    if coherence and hasattr(gpu_model, 'prefill'):
         print("\n  Coherence probes:")
         coherence_results = _run_coherence(gpu_model, cfg, tokenizer)
         for cr in coherence_results:
             print(f"    prompt: \"{cr['prompt']}\"")
             print(f"    output: \"{cr['generation']}\"")
             print()
+    elif coherence:
+        print("\n  Coherence probes: skipped (stacked model — no prefill support yet)")
 
     return {
         "checkpoint": checkpoint_path,
