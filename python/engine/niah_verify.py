@@ -213,7 +213,7 @@ def _run_trial(gpu_model, cfg, sequence: list[int],
                 chunk_target = sequence[pos + 1:chunk_end] + [vocab]
 
         pulse = conductor.pulse()
-        loss, logits_flat = gpu_model.forward(chunk_input, chunk_target, pulse)
+        _loss, logits_flat = gpu_model.forward(chunk_input, chunk_target, pulse)
         conductor.advance()
 
         last_logits_flat = logits_flat
@@ -270,8 +270,8 @@ def run_niah_verify(checkpoint_path: str, data_path: str,
     """
     # Load checkpoint
     try:
-        params, cfg, build_state = nl_hecate.load_build_checkpoint(checkpoint_path)
-    except Exception:
+        params, cfg, _build_state = nl_hecate.load_build_checkpoint(checkpoint_path)
+    except (RuntimeError, OSError):
         params, cfg = nl_hecate.load_checkpoint(checkpoint_path)
 
     print(f"NIAH Verification: {checkpoint_path}")

@@ -896,14 +896,18 @@ def run_build(bcfg: BuildConfig):
     # remaining training window, not from already-consumed data.
     _window_val_boundary = None  # token position where training must stop
     if bcfg.window_local_val and active_loader is not None and bcfg.eval_every > 0:
-        cursor_pos = active_loader.cursor()["position"]
-        _window_val_tokens, _window_val_targets, _window_val_boundary = _carve_window_val(
-            active_loader, bcfg.window_val_tokens, cursor_pos)
-        if _window_val_tokens is not None:
-            print(f"Window-local val: {len(_window_val_tokens):,} tokens "
-                  f"from training window end (boundary={_window_val_boundary:,})")
+        if bcfg.batch_size > 1:
+            print("Warning: window_local_val disabled for batch_size > 1 "
+                  "(per-slot loaders have independent cursors)")
         else:
-            print("Window-local val: not enough data remaining, eval disabled")
+            cursor_pos = active_loader.cursor()["position"]
+            _window_val_tokens, _window_val_targets, _window_val_boundary = _carve_window_val(
+                active_loader, bcfg.window_val_tokens, cursor_pos)
+            if _window_val_tokens is not None:
+                print(f"Window-local val: {len(_window_val_tokens):,} tokens "
+                      f"from training window end (boundary={_window_val_boundary:,})")
+            else:
+                print("Window-local val: not enough data remaining, eval disabled")
 
     losses = []
     t_start = time.perf_counter()
@@ -917,7 +921,7 @@ def run_build(bcfg: BuildConfig):
             if _window_val_boundary is not None:
                 _loaders_to_check = bpe_loaders if bpe_loaders else (
                     [active_loader] if active_loader is not None else [])
-                if any(ld.position + bcfg.seq_len > _window_val_boundary
+                if any(ld.position + bcfg.seq_len >= _window_val_boundary
                        for ld in _loaders_to_check):
                     max_pos = max(ld.position for ld in _loaders_to_check)
                     print(f"  [window-val] Reached val boundary at position "
@@ -1943,14 +1947,17 @@ def run_build(bcfg: BuildConfig):
                                        if active_loader is not None else 0)
             # Re-carve window-local val for the new data window
             if bcfg.window_local_val and bcfg.eval_every > 0 and active_loader is not None:
-                cursor_pos = active_loader.cursor()["position"]
-                _window_val_tokens, _window_val_targets, _window_val_boundary = _carve_window_val(
-                    active_loader, bcfg.window_val_tokens, cursor_pos)
-                if _window_val_tokens is not None:
-                    print(f"  Window-local val: re-carved {len(_window_val_tokens):,} "
-                          f"tokens from new window (boundary={_window_val_boundary:,})")
+                if bcfg.batch_size > 1:
+                    print("  Window-local val: skipped (batch_size > 1)")
                 else:
-                    print("  Window-local val: not enough data remaining, eval disabled")
+                    cursor_pos = active_loader.cursor()["position"]
+                    _window_val_tokens, _window_val_targets, _window_val_boundary = _carve_window_val(
+                        active_loader, bcfg.window_val_tokens, cursor_pos)
+                    if _window_val_tokens is not None:
+                        print(f"  Window-local val: re-carved {len(_window_val_tokens):,} "
+                              f"tokens from new window (boundary={_window_val_boundary:,})")
+                    else:
+                        print("  Window-local val: not enough data remaining, eval disabled")
 
             print(f"  Promotion complete, continuing at step {step + 1}\n")
 
