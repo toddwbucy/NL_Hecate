@@ -825,4 +825,77 @@ mod tests {
                 "alpha_mem[3] should round-robin from alpha_mem[1]");
         }
     }
+
+    #[test]
+    fn test_b_alpha_init_override() {
+        // Default config: b_alpha should be default_b_alpha(level) = 3.0, 4.0
+        let cfg_default = tiny_config();
+        let params_default = StackedMAGParams::init(&cfg_default, 1, 42);
+        let l0_default = params_default.blocks[0].levels[0].b_alpha[0];
+        let l1_default = params_default.blocks[0].levels[1].b_alpha[0];
+        assert!((l0_default - 3.0).abs() < 1e-6,
+            "L0 default b_alpha should be 3.0, got {l0_default}");
+        assert!((l1_default - 4.0).abs() < 1e-6,
+            "L1 default b_alpha should be 4.0, got {l1_default}");
+
+        // Custom config: b_alpha_init=[0.0, 0.0] → neutral retention
+        let mut cfg_custom = tiny_config();
+        cfg_custom.b_alpha_init = vec![0.0, 0.0];
+        let params_custom = StackedMAGParams::init(&cfg_custom, 1, 42);
+        let l0_custom = params_custom.blocks[0].levels[0].b_alpha[0];
+        let l1_custom = params_custom.blocks[0].levels[1].b_alpha[0];
+        assert!(l0_custom.abs() < 1e-6,
+            "L0 custom b_alpha should be 0.0, got {l0_custom}");
+        assert!(l1_custom.abs() < 1e-6,
+            "L1 custom b_alpha should be 0.0, got {l1_custom}");
+
+        // Partial override: only L0 overridden, L1 uses default
+        let mut cfg_partial = tiny_config();
+        cfg_partial.b_alpha_init = vec![1.5];  // only L0
+        let params_partial = StackedMAGParams::init(&cfg_partial, 1, 42);
+        let l0_partial = params_partial.blocks[0].levels[0].b_alpha[0];
+        let l1_partial = params_partial.blocks[0].levels[1].b_alpha[0];
+        assert!((l0_partial - 1.5).abs() < 1e-6,
+            "L0 partial b_alpha should be 1.5, got {l0_partial}");
+        assert!((l1_partial - 4.0).abs() < 1e-6,
+            "L1 partial b_alpha should fall back to default 4.0, got {l1_partial}");
+    }
+
+    #[test]
+    fn test_b_theta_init_override() {
+        let cfg_default = tiny_config();
+        let params_default = StackedMAGParams::init(&cfg_default, 1, 42);
+        let l0_default = params_default.blocks[0].levels[0].b_theta[0];
+        let l1_default = params_default.blocks[0].levels[1].b_theta[0];
+        assert!((l0_default - (-4.6)).abs() < 1e-6,
+            "L0 default b_theta should be -4.6, got {l0_default}");
+        assert!((l1_default - (-5.6)).abs() < 1e-6,
+            "L1 default b_theta should be -5.6, got {l1_default}");
+
+        let mut cfg_custom = tiny_config();
+        cfg_custom.b_theta_init = vec![-2.0, -3.0];
+        let params_custom = StackedMAGParams::init(&cfg_custom, 1, 42);
+        let l0_custom = params_custom.blocks[0].levels[0].b_theta[0];
+        let l1_custom = params_custom.blocks[0].levels[1].b_theta[0];
+        assert!((l0_custom - (-2.0)).abs() < 1e-6,
+            "L0 custom b_theta should be -2.0, got {l0_custom}");
+        assert!((l1_custom - (-3.0)).abs() < 1e-6,
+            "L1 custom b_theta should be -3.0, got {l1_custom}");
+    }
+
+    #[test]
+    fn test_b_alpha_init_multi_block() {
+        // Verify override applies to ALL blocks, not just block 0
+        let mut cfg = tiny_config();
+        cfg.b_alpha_init = vec![0.0, 0.0];
+        let params = StackedMAGParams::init(&cfg, 4, 42);
+        for b in 0..4 {
+            let l0 = params.blocks[b].levels[0].b_alpha[0];
+            let l1 = params.blocks[b].levels[1].b_alpha[0];
+            assert!(l0.abs() < 1e-6,
+                "Block {b} L0 b_alpha should be 0.0, got {l0}");
+            assert!(l1.abs() < 1e-6,
+                "Block {b} L1 b_alpha should be 0.0, got {l1}");
+        }
+    }
 }
