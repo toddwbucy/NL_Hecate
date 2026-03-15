@@ -3359,12 +3359,21 @@ fn logprob_at_position(
     if token_id >= vocab {
         return Ok(f64::NEG_INFINITY);
     }
-    let row_start = position * vocab;
-    let row_end = row_start + vocab;
+    let row_start = position.checked_mul(vocab).ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "position {position} * vocab {vocab} overflows usize"
+        ))
+    })?;
+    let row_end = row_start.checked_add(vocab).ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "position {position} out of range (logits has {} positions, vocab={vocab})",
+            logits_flat.len() / vocab.max(1)
+        ))
+    })?;
     if row_end > logits_flat.len() {
         return Err(PyValueError::new_err(format!(
             "position {position} out of range (logits has {} positions, vocab={vocab})",
-            logits_flat.len() / vocab
+            logits_flat.len() / vocab.max(1)
         )));
     }
     let row = &logits_flat[row_start..row_end];
