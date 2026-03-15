@@ -487,7 +487,12 @@ def main():
 
     args = parser.parse_args()
 
-    distances = [int(d.strip()) for d in args.distances.split(",")]
+    try:
+        distances = [int(d.strip()) for d in args.distances.split(",") if d.strip()]
+    except ValueError as e:
+        parser.error(f"--distances must be comma-separated integers: {e}")
+    if not distances:
+        parser.error("--distances must contain at least one value")
 
     t_start = time.perf_counter()
 

@@ -291,6 +291,8 @@ impl MAGConfig {
         tnt_global_chunk_size=64,
         tnt_local_chunk_size=8,
         residual=false,
+        b_alpha_init=None,
+        b_theta_init=None,
     ))]
     fn new(
         d_model: usize,
@@ -340,6 +342,8 @@ impl MAGConfig {
         tnt_global_chunk_size: usize,
         tnt_local_chunk_size: usize,
         residual: bool,
+        b_alpha_init: Option<Vec<f32>>,
+        b_theta_init: Option<Vec<f32>>,
     ) -> PyResult<Self> {
         if d_model != num_heads * head_dim {
             return Err(PyValueError::new_err(format!(
@@ -376,6 +380,20 @@ impl MAGConfig {
             if !v.is_empty() && v.len() != k {
                 return Err(PyValueError::new_err(format!(
                     "error_clip length ({}) must equal k ({k})", v.len()
+                )));
+            }
+        }
+        if let Some(ref v) = b_alpha_init {
+            if !v.is_empty() && v.len() != k {
+                return Err(PyValueError::new_err(format!(
+                    "b_alpha_init length ({}) must equal k ({k})", v.len()
+                )));
+            }
+        }
+        if let Some(ref v) = b_theta_init {
+            if !v.is_empty() && v.len() != k {
+                return Err(PyValueError::new_err(format!(
+                    "b_theta_init length ({}) must equal k ({k})", v.len()
                 )));
             }
         }
@@ -578,6 +596,8 @@ impl MAGConfig {
                 error_clip: error_clip.unwrap_or_default(),
                 feature_map: fm_kind,
                 residual,
+                b_alpha_init: b_alpha_init.unwrap_or_default(),
+                b_theta_init: b_theta_init.unwrap_or_default(),
             },
         })
     }
@@ -670,6 +690,10 @@ impl MAGConfig {
 
     #[getter]
     fn residual(&self) -> bool { self.inner.residual }
+    #[getter]
+    fn b_alpha_init(&self) -> Vec<f32> { self.inner.b_alpha_init.clone() }
+    #[getter]
+    fn b_theta_init(&self) -> Vec<f32> { self.inner.b_theta_init.clone() }
 }
 
 // ── MAGParams ──────────────────────────────────────────────────────
@@ -900,6 +924,8 @@ impl MAGForwardCache {
     tnt_global_chunk_size=64,
     tnt_local_chunk_size=8,
     residual=false,
+    b_alpha_init=None,
+    b_theta_init=None,
 ))]
 fn mag_create_config(
     d_model: usize,
@@ -949,6 +975,8 @@ fn mag_create_config(
     tnt_global_chunk_size: usize,
     tnt_local_chunk_size: usize,
     residual: bool,
+    b_alpha_init: Option<Vec<f32>>,
+    b_theta_init: Option<Vec<f32>>,
 ) -> PyResult<MAGConfig> {
     MAGConfig::new(
         d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled,
@@ -961,6 +989,7 @@ fn mag_create_config(
         feature_map, feature_map_sigma,
         parallel_strategy, tnt_global_chunk_size, tnt_local_chunk_size,
         residual,
+        b_alpha_init, b_theta_init,
     )
 }
 

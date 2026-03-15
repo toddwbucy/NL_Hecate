@@ -51,10 +51,47 @@ def _safetensors_path(path_str: str) -> str:
 _NUMPY_LOADER_FORMATS = frozenset({"sharegpt", "dolmino"})
 
 
+def _carve_window_val(loader: BpeTokenStream, val_tokens: int,
+                      cursor_pos: int = 0):
+    """Carve a validation slice from the END of the remaining training window.
+
+    Returns (val_tokens_np, val_targets_np, val_boundary) where val_boundary
+    is the token position where training must stop (BpeTokenStream wraps at
+    corpus end, so the caller must enforce this).
+
+    Spec 12 §5: each phase gets its own val slice from its own data window.
+    No level ever re-encounters val data from a prior lifetime.
+    """
+    total = loader.total_tokens
+    remaining = total - cursor_pos
+    val_size = min(val_tokens, remaining // 5)  # Never more than 20% of remaining
+    if val_size < 100:
+        return None, None, total  # Not enough data for meaningful val
+    val_boundary = total - val_size
+    return (loader.tokens[val_boundary:total],
+            loader.targets[val_boundary:total],
+            val_boundary)
+
+
 def run_build(bcfg: BuildConfig):
     """Execute the full build loop. All state managed internally."""
 
     import numpy as np
+
+    # ── Run directory setup ────────────────────────────────────────────
+    if bcfg.run_dir is not None:
+        run_dir = Path(bcfg.run_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_dir = run_dir / "checkpoints"
+        ckpt_dir.mkdir(exist_ok=True)
+        # Auto-derive save_path and log_file from run_dir
+        bcfg.save_path = str(ckpt_dir / "model.safetensors")
+        bcfg.log_file = str(run_dir / "metrics.jsonl")
+        # Config snapshot is deferred until after checkpoint restore so it
+        # captures the effective runtime config (merged with checkpoint values).
+        print(f"Run directory: {run_dir}")
+        print(f"  Checkpoints: {ckpt_dir}")
+        print(f"  Metrics:     {bcfg.log_file}")
 
     # ── Load data ─────────────────────────────────────────────────────
     use_bpe = bcfg.data_format in _NUMPY_LOADER_FORMATS
@@ -62,6 +99,9 @@ def run_build(bcfg: BuildConfig):
     token_ids: list[int] | MmapTokenStream | None = None
 
     val_stream: BpeTokenStream | None = None
+    # Window-local val: numpy slices from current training window (spec 12 §5)
+    _window_val_tokens = None  # np.ndarray or None
+    _window_val_targets = None
 
     if use_bpe:
         active_loader = BpeTokenStream(bcfg.data_path, split="train")
@@ -72,13 +112,19 @@ def run_build(bcfg: BuildConfig):
                   f"format={bcfg.data_format})")
             return
         if bcfg.eval_every > 0:
-            val_path = Path(bcfg.data_path) / "val_tokens.npy"
-            if val_path.exists():
-                val_stream = BpeTokenStream(bcfg.data_path, split="val")
-                print(f"Loaded val set: {len(val_stream):,} tokens")
+            if bcfg.window_local_val:
+                # Window-local val carve is deferred until after cursor restore
+                # (see below). This ensures the val slice comes from the END of
+                # the remaining training window, not from already-consumed data.
+                pass
             else:
-                print("Warning: eval_every set but no val data found, disabling eval")
-                bcfg.eval_every = 0  # safe: bcfg is consumed only by this function
+                val_path = Path(bcfg.data_path) / "val_tokens.npy"
+                if val_path.exists():
+                    val_stream = BpeTokenStream(bcfg.data_path, split="val")
+                    print(f"Loaded val set: {len(val_stream):,} tokens")
+                else:
+                    print("Warning: eval_every set but no val data found, disabling eval")
+                    bcfg.eval_every = 0  # safe: bcfg is consumed only by this function
     elif bcfg.data_path:
         if bcfg.data_path.endswith(".bin"):
             fsize = os.path.getsize(bcfg.data_path)
@@ -127,7 +173,7 @@ def run_build(bcfg: BuildConfig):
 
     # ── Load tokenizer for sample generation ──────────────────────────
     tokenizer = None
-    if use_bpe and (bcfg.save_every > 0 or bcfg.eval_every > 0):
+    if use_bpe and (bcfg.save_every > 0 or bcfg.eval_every > 0 or bcfg.auto_promote):
         tokenizer = load_tokenizer(data_dir=bcfg.data_path)
         tok_type = "BPE" if isinstance(tokenizer, BpeTokenizer) else "byte-level"
         print(f"Tokenizer for samples: {tok_type}")
@@ -181,7 +227,7 @@ def run_build(bcfg: BuildConfig):
             try:
                 params, cfg, build_state = nl_hecate.load_build_checkpoint(bcfg.load)
                 resume_step = build_state["global_step"] if build_state else 0
-            except Exception:
+            except (RuntimeError, OSError):
                 params, cfg = nl_hecate.load_checkpoint(bcfg.load)
                 resume_step = 0
             sidecar = Path(str(bcfg.load) + ".cursor.json")
@@ -293,6 +339,16 @@ def run_build(bcfg: BuildConfig):
                 tnt_global_chunk_size=bcfg.tnt_global_chunk_size,
                 tnt_local_chunk_size=bcfg.tnt_local_chunk_size,
                 residual=bcfg.residual,
+                b_alpha_init=(
+                    bcfg.b_alpha_init
+                    if bcfg.b_alpha_init is not None
+                    else getattr(cfg, "b_alpha_init", None)
+                ),
+                b_theta_init=(
+                    bcfg.b_theta_init
+                    if bcfg.b_theta_init is not None
+                    else getattr(cfg, "b_theta_init", None)
+                ),
             )
             if _stacked_params_json is not None:
                 # Stacked extend_k (spec 22): per-block level shift
@@ -387,6 +443,16 @@ def run_build(bcfg: BuildConfig):
                 tnt_global_chunk_size=bcfg.tnt_global_chunk_size,
                 tnt_local_chunk_size=bcfg.tnt_local_chunk_size,
                 residual=bcfg.residual,
+                b_alpha_init=(
+                    bcfg.b_alpha_init
+                    if bcfg.b_alpha_init is not None
+                    else getattr(cfg, "b_alpha_init", None)
+                ),
+                b_theta_init=(
+                    bcfg.b_theta_init
+                    if bcfg.b_theta_init is not None
+                    else getattr(cfg, "b_theta_init", None)
+                ),
             )
             if _stacked_params_json is not None:
                 result = nl_hecate.extend_stacked_clone(
@@ -500,6 +566,16 @@ def run_build(bcfg: BuildConfig):
                     else getattr(cfg, "tnt_local_chunk_size", None)
                 ),
                 residual=bcfg.residual,
+                b_alpha_init=(
+                    bcfg.b_alpha_init
+                    if bcfg.b_alpha_init is not None
+                    else getattr(cfg, "b_alpha_init", None)
+                ),
+                b_theta_init=(
+                    bcfg.b_theta_init
+                    if bcfg.b_theta_init is not None
+                    else getattr(cfg, "b_theta_init", None)
+                ),
             )
     else:
         cfg = nl_hecate.MAGConfig(
@@ -534,6 +610,8 @@ def run_build(bcfg: BuildConfig):
             tnt_global_chunk_size=bcfg.tnt_global_chunk_size,
             tnt_local_chunk_size=bcfg.tnt_local_chunk_size,
             residual=bcfg.residual,
+            b_alpha_init=bcfg.b_alpha_init,
+            b_theta_init=bcfg.b_theta_init,
         )
         params = nl_hecate.mag_init_params(cfg, bcfg.seed)
         if bcfg.donor_weights is not None:
@@ -579,6 +657,16 @@ def run_build(bcfg: BuildConfig):
     data_len = len(active_loader) if use_bpe else len(token_ids)
     print(f"  Data:     {data_len:,} tokens" +
           (f" ({bcfg.data_format} BPE)" if use_bpe else ""))
+    # Deferred config snapshot: written after checkpoint restore so it captures
+    # the effective runtime config (d_model, k, chunk_sizes merged from checkpoint).
+    if bcfg.run_dir is not None:
+        config_snapshot = Path(bcfg.run_dir) / "config.json"
+        if not config_snapshot.exists():
+            import json as _json
+            snapshot = {k: v for k, v in bcfg.__dict__.items()
+                        if not k.startswith("_")}
+            config_snapshot.write_text(_json.dumps(snapshot, indent=2, default=str))
+
     use_gpu = bcfg.gpu and hasattr(nl_hecate, "GpuModel")
     is_stacked = getattr(bcfg, "n_blocks", 1) > 1
     if is_stacked and not use_gpu:
@@ -803,6 +891,24 @@ def run_build(bcfg: BuildConfig):
     if gpu_model is not None and hasattr(gpu_model, "memory_norms"):
         level_param_norms_init = list(gpu_model.memory_norms())
 
+    # ── Deferred window-local val carve ─────────────────────────────
+    # Must happen AFTER cursor restore so val comes from the END of the
+    # remaining training window, not from already-consumed data.
+    _window_val_boundary = None  # token position where training must stop
+    if bcfg.window_local_val and active_loader is not None and bcfg.eval_every > 0:
+        if bcfg.batch_size > 1:
+            print("Warning: window_local_val disabled for batch_size > 1 "
+                  "(per-slot loaders have independent cursors)")
+        else:
+            cursor_pos = active_loader.cursor()["position"]
+            _window_val_tokens, _window_val_targets, _window_val_boundary = _carve_window_val(
+                active_loader, bcfg.window_val_tokens, cursor_pos)
+            if _window_val_tokens is not None:
+                print(f"Window-local val: {len(_window_val_tokens):,} tokens "
+                      f"from training window end (boundary={_window_val_boundary:,})")
+            else:
+                print("Window-local val: not enough data remaining, eval disabled")
+
     losses = []
     t_start = time.perf_counter()
     t_window_start = t_start
@@ -811,6 +917,17 @@ def run_build(bcfg: BuildConfig):
 
     for step in range(resume_step, end_step):
         if use_bpe:
+            # Enforce window-local val boundary: stop before training into val data
+            if _window_val_boundary is not None:
+                _loaders_to_check = bpe_loaders if bpe_loaders else (
+                    [active_loader] if active_loader is not None else [])
+                if any(ld.position + bcfg.seq_len >= _window_val_boundary
+                       for ld in _loaders_to_check):
+                    max_pos = max(ld.position for ld in _loaders_to_check)
+                    print(f"  [window-val] Reached val boundary at position "
+                          f"{max_pos:,}/{_window_val_boundary:,}, "
+                          f"stopping at step {step}")
+                    break
             if bcfg.batch_size > 1:
                 if gpu_model is None or not use_adamw_gpu:
                     raise RuntimeError(
@@ -902,6 +1019,16 @@ def run_build(bcfg: BuildConfig):
                     tnt_global_chunk_size=bcfg.tnt_global_chunk_size,
                     tnt_local_chunk_size=bcfg.tnt_local_chunk_size,
                     residual=bcfg.residual,
+                    b_alpha_init=(
+                        bcfg.b_alpha_init
+                        if bcfg.b_alpha_init is not None
+                        else getattr(cfg, "b_alpha_init", None)
+                    ),
+                    b_theta_init=(
+                        bcfg.b_theta_init
+                        if bcfg.b_theta_init is not None
+                        else getattr(cfg, "b_theta_init", None)
+                    ),
                 )
         elif (bcfg.gate_warmup_theta_floor_init is not None
               and step == bcfg.gate_warmup_decay_steps):
@@ -937,6 +1064,16 @@ def run_build(bcfg: BuildConfig):
                     tnt_global_chunk_size=bcfg.tnt_global_chunk_size,
                     tnt_local_chunk_size=bcfg.tnt_local_chunk_size,
                     residual=bcfg.residual,
+                    b_alpha_init=(
+                        bcfg.b_alpha_init
+                        if bcfg.b_alpha_init is not None
+                        else getattr(cfg, "b_alpha_init", None)
+                    ),
+                    b_theta_init=(
+                        bcfg.b_theta_init
+                        if bcfg.b_theta_init is not None
+                        else getattr(cfg, "b_theta_init", None)
+                    ),
                 )
 
         use_cosine = (adamw_opt is not None or use_adamw_gpu)
@@ -1252,7 +1389,8 @@ def run_build(bcfg: BuildConfig):
                 })
             jsonl.log(event="level_heatmap", step=step, levels=heatmap_levels)
 
-        if (bcfg.eval_every > 0 and val_stream is not None
+        _has_val = (val_stream is not None or _window_val_tokens is not None)
+        if (bcfg.eval_every > 0 and _has_val
                 and step > 0 and step % bcfg.eval_every == 0
                 and not is_stacked):
             saved_ctx = None
@@ -1260,9 +1398,15 @@ def run_build(bcfg: BuildConfig):
                 if gpu_model is not None:
                     saved_ctx = gpu_model.to_host_context()
                     gpu_model.reset_context()
-                eval_loss, eval_ppl = evaluate(
-                    gpu_model, bcfg, val_stream, bcfg.eval_max_chunks,
-                    val_doc_starts=val_doc_starts)
+                if _window_val_tokens is not None:
+                    # Window-local val: eval on data the model hasn't trained on
+                    eval_loss, eval_ppl = evaluate_numpy(
+                        gpu_model, bcfg, _window_val_tokens,
+                        _window_val_targets, max_chunks=bcfg.eval_max_chunks)
+                else:
+                    eval_loss, eval_ppl = evaluate(
+                        gpu_model, bcfg, val_stream, bcfg.eval_max_chunks,
+                        val_doc_starts=val_doc_starts)
             finally:
                 if gpu_model is not None and saved_ctx is not None:
                     gpu_model.upload_context(saved_ctx)
@@ -1658,6 +1802,18 @@ def run_build(bcfg: BuildConfig):
                 promo_sidecar.write_text(json.dumps(promo_cursor, indent=2))
             print(f"  Checkpoint: {promo_ckpt}")
 
+            # Coherence samples at promotion boundary
+            if (gpu_model is not None and tokenizer is not None):
+                try:
+                    samples = eval_coherence_samples(gpu_model, cfg, max_tokens=30,
+                                                     tokenizer=tokenizer)
+                    print(f"  [coherence] pre-promotion k={old_k}:")
+                    for prompt, gen in samples:
+                        preview = gen[:80].replace("\n", "\\n")
+                        print(f"    \"{prompt}\" → \"{preview}\"")
+                except (RuntimeError, ValueError, TypeError) as e:
+                    print(f"  [coherence pre-promotion failed: {e}]")
+
             if jsonl:
                 cursor_pos = (active_loader.cursor()["position"]
                               if active_loader is not None else 0)
@@ -1704,6 +1860,16 @@ def run_build(bcfg: BuildConfig):
                 tnt_global_chunk_size=bcfg.tnt_global_chunk_size,
                 tnt_local_chunk_size=bcfg.tnt_local_chunk_size,
                 residual=bcfg.residual,
+                b_alpha_init=(
+                    bcfg.b_alpha_init
+                    if bcfg.b_alpha_init is not None
+                    else getattr(cfg, "b_alpha_init", None)
+                ),
+                b_theta_init=(
+                    bcfg.b_theta_init
+                    if bcfg.b_theta_init is not None
+                    else getattr(cfg, "b_theta_init", None)
+                ),
             )
 
             # Push-up: shift trained levels to slower frequencies, fresh L0
@@ -1779,6 +1945,20 @@ def run_build(bcfg: BuildConfig):
                     print(f"  Data cursor: {cur_pos:,} (continues naturally)")
                 _level_start_cursor = (active_loader.cursor()["position"]
                                        if active_loader is not None else 0)
+            # Re-carve window-local val for the new data window
+            if bcfg.window_local_val and bcfg.eval_every > 0 and active_loader is not None:
+                if bcfg.batch_size > 1:
+                    print("  Window-local val: skipped (batch_size > 1)")
+                else:
+                    cursor_pos = active_loader.cursor()["position"]
+                    _window_val_tokens, _window_val_targets, _window_val_boundary = _carve_window_val(
+                        active_loader, bcfg.window_val_tokens, cursor_pos)
+                    if _window_val_tokens is not None:
+                        print(f"  Window-local val: re-carved {len(_window_val_tokens):,} "
+                              f"tokens from new window (boundary={_window_val_boundary:,})")
+                    else:
+                        print("  Window-local val: not enough data remaining, eval disabled")
+
             print(f"  Promotion complete, continuing at step {step + 1}\n")
 
     t_end = time.perf_counter()

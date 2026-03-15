@@ -64,6 +64,10 @@ class BuildConfig:
     # Per-level per-token error clip ceiling (empty = disabled, spec 17)
     error_clip: list[float] | None = None   # clip ‖e_t‖₂ to this value in CUDA kernels
 
+    # Per-level gate bias initialization overrides
+    b_alpha_init: list[float] | None = None  # override default b_alpha (3.0,4.0,...) per level
+    b_theta_init: list[float] | None = None  # override default b_theta (-4.6,-5.6,...) per level
+
     # SwiGluMlp / Llama level stacking (HOPE §7.3)
     intermediate_size: int = 0             # 0 for matrix rules; 8192 for Llama-3.2-1B
     donor_layers: list[int] | None = None  # which Llama layers to transplant (e.g. [0,5,10,15])
@@ -158,6 +162,10 @@ class BuildConfig:
     promotion_rewind_pct: float = 0.0  # Fraction of THIS level's steps to rewind data cursor on push-up
     #                                  # 0.0 = no rewind (cursor continues), 0.25 = 25% rewind, 1.0 = full rewind
 
+    # Window-local validation (specs/infrastructure/12_metric_driven_promotion.md §5)
+    window_local_val: bool = False   # Carve val from current training window (not fixed val set)
+    window_val_tokens: int = 50000   # Tokens reserved for window-local validation
+
     # Residual stream + pre-LayerNorm (specs/infrastructure/13_residual_stream.md)
     residual: bool = False  # True = additive residual, no sigmoid gating
 
@@ -168,6 +176,16 @@ class BuildConfig:
     # "off" = no tape overhead (default), "gpu" = GPU-resident per-(block,level) gnorms,
     # "cpu" = full Wengert tape on CPU (DGD delta, M state readout — slow)
     tape_device: str = "off"
+
+    # Run directory (unified output location)
+    # When set, all outputs go under this directory:
+    #   {run_dir}/config.json       — frozen config copy
+    #   {run_dir}/metrics.jsonl     — training log
+    #   {run_dir}/checkpoints/      — model checkpoints + cursor sidecars
+    #   Console output: redirect nohup to {run_dir}/output.log
+    # Overrides save_path and log_file. Backward compat: leave None to use
+    # save_path/log_file directly (old behavior).
+    run_dir: str | None = None
 
     # Runtime
     gpu: bool = True  # GPU by default; --cpu to override
@@ -282,6 +300,12 @@ class BuildConfig:
         if self.error_clip is not None and len(self.error_clip) != self.k:
             raise ValueError(
                 f"error_clip length {len(self.error_clip)} must match k={self.k}")
+        if self.b_alpha_init is not None and self.b_alpha_init and len(self.b_alpha_init) != self.k:
+            raise ValueError(
+                f"b_alpha_init length {len(self.b_alpha_init)} must match k={self.k}")
+        if self.b_theta_init is not None and self.b_theta_init and len(self.b_theta_init) != self.k:
+            raise ValueError(
+                f"b_theta_init length {len(self.b_theta_init)} must match k={self.k}")
         if self.checkpoint_interval is not None and self.checkpoint_interval < 1:
             raise ValueError(
                 f"checkpoint_interval must be >= 1 or None, got {self.checkpoint_interval}")
@@ -368,6 +392,11 @@ class BuildConfig:
         if self.tape_device not in ("off", "gpu", "cpu"):
             raise ValueError(
                 f"tape_device must be 'off', 'gpu', or 'cpu', got '{self.tape_device}'")
+        # Window-local val validation
+        if self.window_local_val and self.window_val_tokens < 1:
+            raise ValueError(
+                f"window_val_tokens must be >= 1 when window_local_val is enabled, "
+                f"got {self.window_val_tokens}")
         # Clone expansion validation
         if self.clone_to is not None:
             if not self.load:
@@ -466,6 +495,7 @@ class BuildConfig:
             "retention": "retention",
             "extend_k": "extend_k",
             "data_seek": "data_seek",
+            "run_dir": "run_dir",
         }
         for cli_name, cfg_name in mapping.items():
             val = getattr(args, cli_name, None)
