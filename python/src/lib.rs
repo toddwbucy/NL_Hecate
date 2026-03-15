@@ -3338,6 +3338,51 @@ impl GpuStackedModel {
 
 }
 
+// ── NIAH utilities ───────────────────────────────────────────────────
+
+/// Compute log-probability of a specific token at a position in logits.
+///
+/// logits_flat: [seq_len * vocab] row-major from model.forward()
+/// position: which token position to score
+/// token_id: which vocab token to get the log-prob for
+/// vocab: vocabulary size
+///
+/// Returns log p(token_id | logits[position]) using numerically-stable
+/// log-sum-exp. Returns -inf for out-of-range token_id, NaN for bad logits.
+#[pyfunction]
+fn logprob_at_position(
+    logits_flat: Vec<f32>,
+    position: usize,
+    token_id: usize,
+    vocab: usize,
+) -> PyResult<f64> {
+    if token_id >= vocab {
+        return Ok(f64::NEG_INFINITY);
+    }
+    let row_start = position * vocab;
+    let row_end = row_start + vocab;
+    if row_end > logits_flat.len() {
+        return Err(PyValueError::new_err(format!(
+            "position {position} out of range (logits has {} positions, vocab={vocab})",
+            logits_flat.len() / vocab
+        )));
+    }
+    let row = &logits_flat[row_start..row_end];
+
+    let max_logit = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if max_logit.is_nan() || max_logit.is_infinite() {
+        return Ok(f64::NAN);
+    }
+
+    let exp_sum: f64 = row.iter().map(|&x| ((x - max_logit) as f64).exp()).sum();
+    if exp_sum <= 0.0 {
+        return Ok(f64::NAN);
+    }
+
+    let log_sum_exp = (max_logit as f64) + exp_sum.ln();
+    Ok((row[token_id] as f64) - log_sum_exp)
+}
+
 // ── Module ───────────────────────────────────────────────────────────
 
 #[pymodule]
@@ -3394,5 +3439,7 @@ fn nl_hecate(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<GpuModel>()?;
     #[cfg(feature = "cuda")]
     m.add_class::<GpuStackedModel>()?;
+    // NIAH utilities
+    m.add_function(wrap_pyfunction!(logprob_at_position, m)?)?;
     Ok(())
 }

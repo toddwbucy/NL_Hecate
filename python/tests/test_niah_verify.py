@@ -10,12 +10,29 @@ import pytest
 import importlib.util
 
 # Import niah_verify directly (bypasses engine/__init__.py which needs nl_hecate)
-_niah_path = os.path.join(os.path.dirname(__file__), "..", "engine", "niah_verify.py")
+_niah_path = os.path.join(os.path.dirname(__file__), "..", "tools", "niah_verify.py")
 _spec = importlib.util.spec_from_file_location("niah_verify", _niah_path,
                                                 submodule_search_locations=[])
 _mod = importlib.util.module_from_spec(_spec)
 # Stub out nl_hecate and engine.* so the module loads without CUDA
 _stub_nl = type(sys)("nl_hecate")
+
+# Pure-Python fallback for logprob_at_position (mirrors Rust binding logic)
+import math as _math
+def _stub_logprob(logits_flat, position, token_id, vocab):
+    if token_id >= vocab:
+        return float("-inf")
+    row_start = position * vocab
+    row = logits_flat[row_start:row_start + vocab]
+    max_logit = max(row)
+    if _math.isnan(max_logit) or _math.isinf(max_logit):
+        return float("nan")
+    exp_sum = sum(_math.exp(x - max_logit) for x in row)
+    if exp_sum <= 0:
+        return float("nan")
+    return (row[token_id] - max_logit) - _math.log(exp_sum)
+
+_stub_nl.logprob_at_position = _stub_logprob
 sys.modules["nl_hecate"] = _stub_nl
 
 _stub_data = type(sys)("engine.data")

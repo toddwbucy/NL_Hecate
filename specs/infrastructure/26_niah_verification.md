@@ -207,7 +207,7 @@ pass = lift > 0
 ## 5. CLI Interface
 
 ```bash
-python -m engine.niah_verify \
+python -m tools.niah_verify \
     --checkpoint runs/k2_phase1/checkpoints/model.safetensors \
     --data data/fineweb_edu \
     --distances 1024,2048,4096 \
@@ -324,7 +324,7 @@ passes at 4096 only after k=4 is available, the level hierarchy is working.
 
 | File | Purpose |
 |------|---------|
-| `python/engine/niah_verify.py` | Standalone CLI tool + core logic |
+| `python/tools/niah_verify.py` | Standalone offline CLI tool + core logic |
 
 ### Files unchanged
 
