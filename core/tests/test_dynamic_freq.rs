@@ -443,6 +443,8 @@ fn test_k1_learned_is_noop() {
         error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
                 residual: false,
+                b_alpha_init: vec![],
+                b_theta_init: vec![],
 };
     let params = MAGParams::init(&cfg, 42);
     let d = cfg.swa.d_model;
@@ -583,6 +585,8 @@ fn test_anneal_uses_fixed_schedule() {
         error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
                 residual: false,
+                b_alpha_init: vec![],
+                b_theta_init: vec![],
 };
 
     let params = MAGParams::init(&cfg, 42);

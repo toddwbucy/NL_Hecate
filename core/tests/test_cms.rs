@@ -232,6 +232,8 @@ fn test_k2_beats_k1() {
             feature_map: FeatureMapKind::Identity,
 
         residual: false,
+        b_alpha_init: vec![],
+        b_theta_init: vec![],
 };
     // k=2 config
     let cfg_k2 = MAGConfig {
@@ -267,6 +269,8 @@ fn test_k2_beats_k1() {
             feature_map: FeatureMapKind::Identity,
 
         residual: false,
+        b_alpha_init: vec![],
+        b_theta_init: vec![],
 };
 
     let input_ids: Vec<usize> = (0..swa.seq_len).map(|t| t % swa.vocab_size).collect();
@@ -466,6 +470,8 @@ fn test_k4_vs_k2_multiscale() {
             feature_map: FeatureMapKind::Identity,
 
         residual: false,
+        b_alpha_init: vec![],
+        b_theta_init: vec![],
 };
     let cfg_k4 = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
@@ -500,6 +506,8 @@ fn test_k4_vs_k2_multiscale() {
             feature_map: FeatureMapKind::Identity,
 
         residual: false,
+        b_alpha_init: vec![],
+        b_theta_init: vec![],
 };
 
     let slow_period = 8;
@@ -611,6 +619,8 @@ fn test_k4_diagnostics() {
             feature_map: FeatureMapKind::Identity,
 
         residual: false,
+        b_alpha_init: vec![],
+        b_theta_init: vec![],
 };
 
     let (input_ids, target_ids) = make_multiscale_data(
@@ -900,6 +910,8 @@ fn test_cms_stability_boundary() {
             feature_map: FeatureMapKind::Identity,
 
         residual: false,
+        b_alpha_init: vec![],
+        b_theta_init: vec![],
 };
     let cfg_k2 = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
@@ -934,6 +946,8 @@ fn test_cms_stability_boundary() {
             feature_map: FeatureMapKind::Identity,
 
         residual: false,
+        b_alpha_init: vec![],
+        b_theta_init: vec![],
 };
 
     let slow_period = 8;
@@ -1142,6 +1156,8 @@ fn test_k4_normalization_magnitude() {
             feature_map: FeatureMapKind::Identity,
 
         residual: false,
+        b_alpha_init: vec![],
+        b_theta_init: vec![],
 };
     let params_k4 = MAGParams::init(&cfg_k4, 42);
     let mut context = ContextState::new(cfg_k4.k, cfg_k4.swa.d_model);
@@ -1229,6 +1245,8 @@ fn test_k4_uniform_init_stable() {
             feature_map: FeatureMapKind::Identity,
 
         residual: false,
+        b_alpha_init: vec![],
+        b_theta_init: vec![],
 };
 
     let (input_ids, target_ids) = make_multiscale_data(
@@ -1302,6 +1320,8 @@ fn test_k4_normalized_stable() {
             feature_map: FeatureMapKind::Identity,
 
         residual: false,
+        b_alpha_init: vec![],
+        b_theta_init: vec![],
 };
 
     let (input_ids, target_ids) = make_multiscale_data(

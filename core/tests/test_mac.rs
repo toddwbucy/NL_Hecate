@@ -334,6 +334,8 @@ fn test_mac_vs_mag() {
         error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
                 residual: false,
+                b_alpha_init: vec![],
+                b_theta_init: vec![],
 };
     let cfg_mac = MAGConfig {
         swa: swa_mac, memory_enabled: true,
@@ -366,6 +368,8 @@ fn test_mac_vs_mag() {
         error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
                 residual: false,
+                b_alpha_init: vec![],
+                b_theta_init: vec![],
 };
 
     let seq_len = 8;

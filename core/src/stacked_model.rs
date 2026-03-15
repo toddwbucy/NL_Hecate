@@ -88,10 +88,14 @@ impl BlockParams {
         let mut levels = Vec::with_capacity(cfg.k);
         for level in 0..cfg.k {
             let mut level_rng = SimpleRng::new(seed.wrapping_add(1000 + level as u64 * 500));
+            let b_alpha = cfg.b_alpha_init.get(level).copied()
+                .unwrap_or_else(|| default_b_alpha(level));
+            let b_theta = cfg.b_theta_init.get(level).copied()
+                .unwrap_or_else(|| default_b_theta(level));
             let level_params = MemoryLevelParams::init(
                 d, &mut level_rng,
-                default_b_alpha(level),
-                default_b_theta(level),
+                b_alpha,
+                b_theta,
                 default_b_eta(level),
             );
             levels.push(level_params);
@@ -483,6 +487,8 @@ mod tests {
             error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: true,
+            b_alpha_init: vec![],
+            b_theta_init: vec![],
         }
     }
 

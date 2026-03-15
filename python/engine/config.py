@@ -64,6 +64,10 @@ class BuildConfig:
     # Per-level per-token error clip ceiling (empty = disabled, spec 17)
     error_clip: list[float] | None = None   # clip ‖e_t‖₂ to this value in CUDA kernels
 
+    # Per-level gate bias initialization overrides
+    b_alpha_init: list[float] | None = None  # override default b_alpha (3.0,4.0,...) per level
+    b_theta_init: list[float] | None = None  # override default b_theta (-4.6,-5.6,...) per level
+
     # SwiGluMlp / Llama level stacking (HOPE §7.3)
     intermediate_size: int = 0             # 0 for matrix rules; 8192 for Llama-3.2-1B
     donor_layers: list[int] | None = None  # which Llama layers to transplant (e.g. [0,5,10,15])
@@ -296,6 +300,12 @@ class BuildConfig:
         if self.error_clip is not None and len(self.error_clip) != self.k:
             raise ValueError(
                 f"error_clip length {len(self.error_clip)} must match k={self.k}")
+        if self.b_alpha_init is not None and len(self.b_alpha_init) != self.k:
+            raise ValueError(
+                f"b_alpha_init length {len(self.b_alpha_init)} must match k={self.k}")
+        if self.b_theta_init is not None and len(self.b_theta_init) != self.k:
+            raise ValueError(
+                f"b_theta_init length {len(self.b_theta_init)} must match k={self.k}")
         if self.checkpoint_interval is not None and self.checkpoint_interval < 1:
             raise ValueError(
                 f"checkpoint_interval must be >= 1 or None, got {self.checkpoint_interval}")

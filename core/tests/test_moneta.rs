@@ -226,6 +226,8 @@ fn test_moneta_vs_delta() {
         error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
                 residual: false,
+                b_alpha_init: vec![],
+                b_theta_init: vec![],
 };
     let cfg_moneta = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
@@ -258,6 +260,8 @@ fn test_moneta_vs_delta() {
         error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
                 residual: false,
+                b_alpha_init: vec![],
+                b_theta_init: vec![],
 };
 
     let input_ids: Vec<usize> = (0..swa.seq_len).map(|t| t % swa.vocab_size).collect();

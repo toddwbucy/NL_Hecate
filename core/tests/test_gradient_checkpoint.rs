@@ -56,6 +56,8 @@ fn make_config(rule: MemoryRuleKind, checkpoint_interval: Option<usize>) -> MAGC
         error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
                 residual: false,
+                b_alpha_init: vec![],
+                b_theta_init: vec![],
 }
 }
 

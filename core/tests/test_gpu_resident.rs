@@ -56,6 +56,8 @@ fn make_test_config(rule: MemoryRuleKind) -> MAGConfig {
         error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
                 residual: false,
+                b_alpha_init: vec![],
+                b_theta_init: vec![],
 }
 }
 

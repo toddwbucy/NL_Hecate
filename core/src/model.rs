@@ -810,6 +810,17 @@ pub struct MAGConfig {
     /// When false: original MAG gated path (backward compatible).
     #[serde(default = "default_false")]
     pub residual: bool,
+    /// Per-level b_alpha initial bias override for gate initialization.
+    /// When non-empty, replaces default_b_alpha(level) during model init.
+    /// Empty = use defaults (3.0, 4.0, 4.5, 5.0, ... per level).
+    /// Set to [0.0, 0.0] for neutral init (sigmoid(0.0) = 0.50 retention).
+    #[serde(default)]
+    pub b_alpha_init: Vec<f32>,
+    /// Per-level b_theta initial bias override for gate initialization.
+    /// When non-empty, replaces default_b_theta(level) during model init.
+    /// Empty = use defaults (-4.6, -5.6, -6.6, ... per level).
+    #[serde(default)]
+    pub b_theta_init: Vec<f32>,
 }
 
 fn default_one() -> usize { 1 }
@@ -959,6 +970,8 @@ impl MAGConfig {
             error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
+            b_alpha_init: vec![],
+            b_theta_init: vec![],
         }
     }
 
@@ -1004,6 +1017,8 @@ impl MAGConfig {
             error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
+            b_alpha_init: vec![],
+            b_theta_init: vec![],
         }
     }
 
@@ -1049,6 +1064,8 @@ impl MAGConfig {
             error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
+            b_alpha_init: vec![],
+            b_theta_init: vec![],
         }
     }
 
@@ -1095,6 +1112,8 @@ impl MAGConfig {
             error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
+            b_alpha_init: vec![],
+            b_theta_init: vec![],
         }
     }
 
@@ -1141,6 +1160,8 @@ impl MAGConfig {
             error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
+            b_alpha_init: vec![],
+            b_theta_init: vec![],
         }
     }
 
@@ -1187,6 +1208,8 @@ impl MAGConfig {
             error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
+            b_alpha_init: vec![],
+            b_theta_init: vec![],
         }
     }
 
@@ -1232,6 +1255,8 @@ impl MAGConfig {
             error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
+            b_alpha_init: vec![],
+            b_theta_init: vec![],
         }
     }
 
@@ -1277,6 +1302,8 @@ impl MAGConfig {
             error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
+            b_alpha_init: vec![],
+            b_theta_init: vec![],
         }
     }
 
@@ -1322,6 +1349,8 @@ impl MAGConfig {
             error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
+            b_alpha_init: vec![],
+            b_theta_init: vec![],
         }
     }
 
@@ -1367,6 +1396,8 @@ impl MAGConfig {
             error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
+            b_alpha_init: vec![],
+            b_theta_init: vec![],
         }
     }
 
@@ -1422,6 +1453,8 @@ impl MAGConfig {
             error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
+            b_alpha_init: vec![],
+            b_theta_init: vec![],
         }
     }
 
@@ -1477,6 +1510,8 @@ impl MAGConfig {
             error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
+            b_alpha_init: vec![],
+            b_theta_init: vec![],
         }
     }
 
@@ -1532,6 +1567,8 @@ impl MAGConfig {
             error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
+            b_alpha_init: vec![],
+            b_theta_init: vec![],
         }
     }
 
@@ -1587,6 +1624,8 @@ impl MAGConfig {
             error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
+            b_alpha_init: vec![],
+            b_theta_init: vec![],
         }
     }
 
@@ -1642,6 +1681,8 @@ impl MAGConfig {
             error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
+            b_alpha_init: vec![],
+            b_theta_init: vec![],
         }
     }
 
@@ -1697,6 +1738,8 @@ impl MAGConfig {
             error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
+            b_alpha_init: vec![],
+            b_theta_init: vec![],
         }
     }
 
@@ -1743,6 +1786,8 @@ impl MAGConfig {
             error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
+            b_alpha_init: vec![],
+            b_theta_init: vec![],
         }
     }
 
@@ -1789,6 +1834,8 @@ impl MAGConfig {
             error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
+            b_alpha_init: vec![],
+            b_theta_init: vec![],
         }
     }
 
@@ -1838,6 +1885,8 @@ impl MAGConfig {
             error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
+            b_alpha_init: vec![],
+            b_theta_init: vec![],
         }
     }
 
@@ -1887,6 +1936,8 @@ impl MAGConfig {
             error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
+            b_alpha_init: vec![],
+            b_theta_init: vec![],
         }
     }
 
@@ -1932,6 +1983,8 @@ impl MAGConfig {
             error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
+            b_alpha_init: vec![],
+            b_theta_init: vec![],
         }
     }
 
@@ -1977,6 +2030,8 @@ impl MAGConfig {
             error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
+            b_alpha_init: vec![],
+            b_theta_init: vec![],
         }
     }
 
@@ -2022,6 +2077,8 @@ impl MAGConfig {
             error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
+            b_alpha_init: vec![],
+            b_theta_init: vec![],
         }
     }
 
@@ -2067,6 +2124,8 @@ impl MAGConfig {
             error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
+            b_alpha_init: vec![],
+            b_theta_init: vec![],
         }
     }
 
@@ -2113,6 +2172,8 @@ impl MAGConfig {
             error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
+            b_alpha_init: vec![],
+            b_theta_init: vec![],
         }
     }
 
@@ -2158,6 +2219,8 @@ impl MAGConfig {
             error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
+            b_alpha_init: vec![],
+            b_theta_init: vec![],
         }
     }
 
@@ -2204,6 +2267,8 @@ impl MAGConfig {
             error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
+            b_alpha_init: vec![],
+            b_theta_init: vec![],
         }
     }
 
@@ -2250,6 +2315,8 @@ impl MAGConfig {
             error_clip: vec![],
             feature_map: FeatureMapKind::Identity,
             residual: false,
+            b_alpha_init: vec![],
+            b_theta_init: vec![],
         }
     }
 }
