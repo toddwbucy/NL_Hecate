@@ -339,8 +339,16 @@ def run_build(bcfg: BuildConfig):
                 tnt_global_chunk_size=bcfg.tnt_global_chunk_size,
                 tnt_local_chunk_size=bcfg.tnt_local_chunk_size,
                 residual=bcfg.residual,
-                b_alpha_init=bcfg.b_alpha_init,
-                b_theta_init=bcfg.b_theta_init,
+                b_alpha_init=(
+                    bcfg.b_alpha_init
+                    if bcfg.b_alpha_init is not None
+                    else getattr(cfg, "b_alpha_init", None)
+                ),
+                b_theta_init=(
+                    bcfg.b_theta_init
+                    if bcfg.b_theta_init is not None
+                    else getattr(cfg, "b_theta_init", None)
+                ),
             )
             if _stacked_params_json is not None:
                 # Stacked extend_k (spec 22): per-block level shift
@@ -435,8 +443,16 @@ def run_build(bcfg: BuildConfig):
                 tnt_global_chunk_size=bcfg.tnt_global_chunk_size,
                 tnt_local_chunk_size=bcfg.tnt_local_chunk_size,
                 residual=bcfg.residual,
-                b_alpha_init=bcfg.b_alpha_init,
-                b_theta_init=bcfg.b_theta_init,
+                b_alpha_init=(
+                    bcfg.b_alpha_init
+                    if bcfg.b_alpha_init is not None
+                    else getattr(cfg, "b_alpha_init", None)
+                ),
+                b_theta_init=(
+                    bcfg.b_theta_init
+                    if bcfg.b_theta_init is not None
+                    else getattr(cfg, "b_theta_init", None)
+                ),
             )
             if _stacked_params_json is not None:
                 result = nl_hecate.extend_stacked_clone(
@@ -550,8 +566,16 @@ def run_build(bcfg: BuildConfig):
                     else getattr(cfg, "tnt_local_chunk_size", None)
                 ),
                 residual=bcfg.residual,
-                b_alpha_init=bcfg.b_alpha_init,
-                b_theta_init=bcfg.b_theta_init,
+                b_alpha_init=(
+                    bcfg.b_alpha_init
+                    if bcfg.b_alpha_init is not None
+                    else getattr(cfg, "b_alpha_init", None)
+                ),
+                b_theta_init=(
+                    bcfg.b_theta_init
+                    if bcfg.b_theta_init is not None
+                    else getattr(cfg, "b_theta_init", None)
+                ),
             )
     else:
         cfg = nl_hecate.MAGConfig(
@@ -991,8 +1015,16 @@ def run_build(bcfg: BuildConfig):
                     tnt_global_chunk_size=bcfg.tnt_global_chunk_size,
                     tnt_local_chunk_size=bcfg.tnt_local_chunk_size,
                     residual=bcfg.residual,
-                    b_alpha_init=bcfg.b_alpha_init,
-                    b_theta_init=bcfg.b_theta_init,
+                    b_alpha_init=(
+                        bcfg.b_alpha_init
+                        if bcfg.b_alpha_init is not None
+                        else getattr(cfg, "b_alpha_init", None)
+                    ),
+                    b_theta_init=(
+                        bcfg.b_theta_init
+                        if bcfg.b_theta_init is not None
+                        else getattr(cfg, "b_theta_init", None)
+                    ),
                 )
         elif (bcfg.gate_warmup_theta_floor_init is not None
               and step == bcfg.gate_warmup_decay_steps):
@@ -1028,8 +1060,16 @@ def run_build(bcfg: BuildConfig):
                     tnt_global_chunk_size=bcfg.tnt_global_chunk_size,
                     tnt_local_chunk_size=bcfg.tnt_local_chunk_size,
                     residual=bcfg.residual,
-                    b_alpha_init=bcfg.b_alpha_init,
-                    b_theta_init=bcfg.b_theta_init,
+                    b_alpha_init=(
+                        bcfg.b_alpha_init
+                        if bcfg.b_alpha_init is not None
+                        else getattr(cfg, "b_alpha_init", None)
+                    ),
+                    b_theta_init=(
+                        bcfg.b_theta_init
+                        if bcfg.b_theta_init is not None
+                        else getattr(cfg, "b_theta_init", None)
+                    ),
                 )
 
         use_cosine = (adamw_opt is not None or use_adamw_gpu)
@@ -1816,8 +1856,16 @@ def run_build(bcfg: BuildConfig):
                 tnt_global_chunk_size=bcfg.tnt_global_chunk_size,
                 tnt_local_chunk_size=bcfg.tnt_local_chunk_size,
                 residual=bcfg.residual,
-                b_alpha_init=bcfg.b_alpha_init,
-                b_theta_init=bcfg.b_theta_init,
+                b_alpha_init=(
+                    bcfg.b_alpha_init
+                    if bcfg.b_alpha_init is not None
+                    else getattr(cfg, "b_alpha_init", None)
+                ),
+                b_theta_init=(
+                    bcfg.b_theta_init
+                    if bcfg.b_theta_init is not None
+                    else getattr(cfg, "b_theta_init", None)
+                ),
             )
 
             # Push-up: shift trained levels to slower frequencies, fresh L0

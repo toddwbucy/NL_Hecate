@@ -300,10 +300,10 @@ class BuildConfig:
         if self.error_clip is not None and len(self.error_clip) != self.k:
             raise ValueError(
                 f"error_clip length {len(self.error_clip)} must match k={self.k}")
-        if self.b_alpha_init is not None and len(self.b_alpha_init) != self.k:
+        if self.b_alpha_init is not None and self.b_alpha_init and len(self.b_alpha_init) != self.k:
             raise ValueError(
                 f"b_alpha_init length {len(self.b_alpha_init)} must match k={self.k}")
-        if self.b_theta_init is not None and len(self.b_theta_init) != self.k:
+        if self.b_theta_init is not None and self.b_theta_init and len(self.b_theta_init) != self.k:
             raise ValueError(
                 f"b_theta_init length {len(self.b_theta_init)} must match k={self.k}")
         if self.checkpoint_interval is not None and self.checkpoint_interval < 1:

@@ -290,7 +290,7 @@ def run_niah_verify(checkpoint_path: str, data_path: str,
     # Upload to GPU
     if hasattr(nl_hecate, "set_cuda_device"):
         nl_hecate.set_cuda_device(gpu_device)
-    gpu_model = nl_hecate.GpuModel(params, cfg)
+    gpu_model = nl_hecate.GpuModel.from_params(params, cfg)
     print(f"  GPU:   device {gpu_device}")
 
     print(f"  Distances: {distances}")

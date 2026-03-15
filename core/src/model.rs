@@ -2354,18 +2354,22 @@ impl MAGParams {
         for level in 0..cfg.k {
             // Different seed offset per level to avoid correlation
             let mut rng = SimpleRng::new(seed.wrapping_add(1000 + level as u64 * 500));
+            let b_alpha = cfg.b_alpha_init.get(level).copied()
+                .unwrap_or_else(|| default_b_alpha(level));
+            let b_theta = cfg.b_theta_init.get(level).copied()
+                .unwrap_or_else(|| default_b_theta(level));
             let mut level_params = if cfg.memory_rule == MemoryRuleKind::AtlasOmega {
                 MemoryLevelParams::atlas_init(
                     d, &mut rng,
-                    default_b_alpha(level),
-                    default_b_theta(level),
+                    b_alpha,
+                    b_theta,
                     default_b_eta(level),
                 )
             } else {
                 MemoryLevelParams::init(
                     d, &mut rng,
-                    default_b_alpha(level),
-                    default_b_theta(level),
+                    b_alpha,
+                    b_theta,
                     default_b_eta(level),
                 )
             };

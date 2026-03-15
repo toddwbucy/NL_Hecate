@@ -383,6 +383,20 @@ impl MAGConfig {
                 )));
             }
         }
+        if let Some(ref v) = b_alpha_init {
+            if !v.is_empty() && v.len() != k {
+                return Err(PyValueError::new_err(format!(
+                    "b_alpha_init length ({}) must equal k ({k})", v.len()
+                )));
+            }
+        }
+        if let Some(ref v) = b_theta_init {
+            if !v.is_empty() && v.len() != k {
+                return Err(PyValueError::new_err(format!(
+                    "b_theta_init length ({}) must equal k ({k})", v.len()
+                )));
+            }
+        }
         let comp = match composition.to_lowercase().as_str() {
             "mag" => CompositionKind::MAG,
             "mal" => CompositionKind::MAL,
