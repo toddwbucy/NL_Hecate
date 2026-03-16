@@ -901,7 +901,7 @@ impl MAGConfig {
         let cl = self.cycle_length();
         let d = self.swa.d_model; // M states and projections are d_model-sized
         let dd = d * d;
-        let per_cycle = 2 * dd * 4                // M + S boundary states (d_model²)
+        let per_cycle = cl * 2 * dd * 4            // M + S full trajectories (d_model² per step)
                       + cl * d * 3 * 4            // projections (k, v, q) — d_model per token
                       + cl * 3 * 4                // gates (alpha, theta, eta)
                       + cl * 2 * 4;               // k_norms, q_norms

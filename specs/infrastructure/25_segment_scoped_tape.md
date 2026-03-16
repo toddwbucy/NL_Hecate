@@ -143,7 +143,7 @@ As levels are added via push-up, the cycle length grows exponentially:
 | 2 | [1,8] | 8 | 64 |
 | 3 | [1,8,64] | 64 | 8 |
 | 4 | [1,8,64,512] | 512 | 1 |
-| 5 | [1,8,64,512,4096] | 4096 | 0 (cycle > seq) |
+| 5 | [1,8,64,512,4096] | 4096 | 1 (partial cycle) |
 
 **Critical consequence at k=4**: cycle_length = seq_len = 512. There is exactly
 one cycle per sequence. tape_multiplier=1 means "keep everything" — the multiplier
@@ -151,7 +151,9 @@ provides no memory reduction. This is inherent to the CMS architecture: when the
 slowest level fires once per sequence, the entire sequence IS one cycle.
 
 **At k=5+**: cycle_length exceeds seq_len. The cycle never completes within a
-single forward pass. Cache management must handle partial cycles — the drop
+single forward pass, but partial cycles count as one retained cycle
+(ceil(512/4096) = 1, and `retained_cycles = min(tape_multiplier, max(1, cycles_in_seq))`
+ensures at least 1). Cache management must handle partial cycles — the drop
 never fires because the cycle boundary is never reached. Effectively equivalent
 to full trajectory, but the code must not break.
 
@@ -294,21 +296,21 @@ For k=2 [1,8] at d=1024 (cycle_len=8):
 
 ### Memory Budget
 
-For d=512, 4 blocks, k=2 [1,8], seq_len=512 (64 cycles):
+For d=512, 4 blocks, k=2 [1,8], seq_len=512 (64 cycles, ~16 MB/cycle/level):
 
 | Multiplier | Retained | Cache total | Notes |
 |------------|----------|-------------|-------|
-| 1 (default)| 1 cycle  | 4 × 2 × 4 MB = 32 MB | Minimum viable |
-| 4          | 4 cycles | 4 × 2 × 16 MB = 128 MB | Development |
-| 64 (full)  | 64 cycles| 4 × 2 × 256 MB = 2 GB | Full trajectory |
+| 1 (default)| 1 cycle  | 4 × 2 × 16 MB = 128 MB | Minimum viable |
+| 4          | 4 cycles | 4 × 2 × 4 × 16 MB = 512 MB | Development |
+| 64 (full)  | 64 cycles| 4 × 2 × 64 × 16 MB = 8 GB | Full trajectory |
 
-For d=1024, 8 blocks, k=2 [1,8], seq_len=512 (64 cycles):
+For d=1024, 8 blocks, k=2 [1,8], seq_len=512 (64 cycles, ~64 MB/cycle/level):
 
 | Multiplier | Retained | Cache total | Notes |
 |------------|----------|-------------|-------|
-| 1 (default)| 1 cycle  | 8 × 2 × 16 MB = 256 MB | Fits easily |
-| 4          | 4 cycles | 8 × 2 × 64 MB = 1 GB | Comfortable |
-| 64 (full)  | 64 cycles| 8 × 2 × 1 GB = 16 GB | Tight on A6000 |
+| 1 (default)| 1 cycle  | 8 × 2 × 64 MB = 1 GB | Fits on A6000 (48 GB) |
+| 4          | 4 cycles | 8 × 2 × 4 × 64 MB = 4 GB | Comfortable on A6000 |
+| 64 (full)  | 64 cycles| 8 × 2 × 64 × 64 MB = 64 GB | Exceeds A6000; requires tape_multiplier < 48 |
 
 ### Tape Size Formula
 
