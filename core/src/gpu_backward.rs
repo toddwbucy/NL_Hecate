@@ -485,7 +485,9 @@ pub(crate) fn gpu_memory_backward(
                 unsafe {
                     crate::cuda_ffi::broadcast_fill_f32_cuda(
                         m_bcast.ptr(), m_states.as_ptr(),
-                        dd as i32, (s + 1) as i32, batch_size as i32,
+                        i32::try_from(dd).expect("dd overflows i32"),
+                        i32::try_from(s + 1).expect("s+1 overflows i32"),
+                        i32::try_from(batch_size).expect("batch_size overflows i32"),
                     );
                 }
                 m_bcast
@@ -548,13 +550,16 @@ pub(crate) fn gpu_memory_backward(
                 let mut m_bcast = GpuBuf::zeros(batch_size * (s + 1) * dd);
                 let mut s_bcast = GpuBuf::zeros(batch_size * (s + 1) * dd);
                 unsafe {
+                    let dd_i32 = i32::try_from(dd).expect("dd overflows i32");
+                    let slots_i32 = i32::try_from(s + 1).expect("s+1 overflows i32");
+                    let bs_i32 = i32::try_from(batch_size).expect("batch_size overflows i32");
                     crate::cuda_ffi::broadcast_fill_f32_cuda(
                         m_bcast.ptr(), m_states.as_ptr(),
-                        dd as i32, (s + 1) as i32, batch_size as i32,
+                        dd_i32, slots_i32, bs_i32,
                     );
                     crate::cuda_ffi::broadcast_fill_f32_cuda(
                         s_bcast.ptr(), s_states.as_ptr(),
-                        dd as i32, (s + 1) as i32, batch_size as i32,
+                        dd_i32, slots_i32, bs_i32,
                     );
                 }
                 (m_bcast, s_bcast)
@@ -927,13 +932,16 @@ pub(crate) fn gpu_memory_backward(
                             let mut m_bcast = GpuBuf::zeros(n_batch * (cl + 1) * dd);
                             let mut s_bcast = GpuBuf::zeros(n_batch * (cl + 1) * dd);
                             unsafe {
+                                let dd_i32 = i32::try_from(dd).expect("dd overflows i32");
+                                let slots_i32 = i32::try_from(cl + 1).expect("cl+1 overflows i32");
+                                let nb_i32 = i32::try_from(n_batch).expect("n_batch overflows i32");
                                 crate::cuda_ffi::broadcast_fill_f32_cuda(
                                     m_bcast.ptr(), m_states.as_ptr(),
-                                    dd as i32, (cl + 1) as i32, n_batch as i32,
+                                    dd_i32, slots_i32, nb_i32,
                                 );
                                 crate::cuda_ffi::broadcast_fill_f32_cuda(
                                     s_bcast.ptr(), s_states.as_ptr(),
-                                    dd as i32, (cl + 1) as i32, n_batch as i32,
+                                    dd_i32, slots_i32, nb_i32,
                                 );
                             }
                             (m_bcast, s_bcast)
@@ -971,7 +979,9 @@ pub(crate) fn gpu_memory_backward(
                             unsafe {
                                 crate::cuda_ffi::broadcast_fill_f32_cuda(
                                     m_bcast.ptr(), m_states.as_ptr(),
-                                    dd as i32, (cl + 1) as i32, n_batch as i32,
+                                    i32::try_from(dd).expect("dd overflows i32"),
+                                    i32::try_from(cl + 1).expect("cl+1 overflows i32"),
+                                    i32::try_from(n_batch).expect("n_batch overflows i32"),
                                 );
                             }
                             m_bcast
