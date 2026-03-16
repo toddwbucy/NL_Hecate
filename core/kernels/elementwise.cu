@@ -367,7 +367,7 @@ __global__ void broadcast_fill_f32_kernel(
     }
 }
 
-extern "C" void broadcast_fill_f32_cuda(
+extern "C" int broadcast_fill_f32_cuda(
     float* dst, const float* src,
     int dd, int n_slots, int n_batch)
 {
@@ -376,11 +376,12 @@ extern "C" void broadcast_fill_f32_cuda(
     if (dd64 > INT_MAX || (long long)n_batch * dd64 > INT_MAX) {
         fprintf(stderr, "broadcast_fill_f32_cuda: overflow (n_batch=%d, n_slots=%d, dd=%d)\n",
                 n_batch, n_slots, dd);
-        return;
+        return 1;
     }
     int block = (dd < 256) ? dd : 256;
     dim3 grid(n_slots, n_batch);
     broadcast_fill_f32_kernel<<<grid, block>>>(dst, src, dd, n_slots);
+    return 0;
 }
 
 extern "C" void dgd_delta_norm_cuda(

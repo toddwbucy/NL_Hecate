@@ -14,7 +14,7 @@ use crate::gpu_params::{GpuMAGParams, GpuMemoryLevelParams};
 #[cfg(feature = "cuda")]
 use crate::gpu_forward::{GpuCMSCache, GpuMemoryCache, gpu_buf_memcpy_d2d};
 #[cfg(feature = "cuda")]
-use crate::model::{MAGConfig, LevelTapeStrategy, MemoryRuleKind};
+use crate::model::{MAGConfig, MemoryRuleKind};
 
 // ══════════════════════════════════════════════════════════════════════
 // GpuMAGGrads — gradient buffers on GPU
@@ -483,12 +483,13 @@ pub(crate) fn gpu_memory_backward(
             let m_for_bw = if *proxy {
                 let mut m_bcast = GpuBuf::zeros(batch_size * (s + 1) * dd);
                 unsafe {
-                    crate::cuda_ffi::broadcast_fill_f32_cuda(
+                    let rc = crate::cuda_ffi::broadcast_fill_f32_cuda(
                         m_bcast.ptr(), m_states.as_ptr(),
                         i32::try_from(dd).expect("dd overflows i32"),
                         i32::try_from(s + 1).expect("s+1 overflows i32"),
                         i32::try_from(batch_size).expect("batch_size overflows i32"),
                     );
+                    assert_eq!(rc, 0, "broadcast_fill_f32_cuda failed (rc={rc})");
                 }
                 m_bcast
             } else {
@@ -553,14 +554,16 @@ pub(crate) fn gpu_memory_backward(
                     let dd_i32 = i32::try_from(dd).expect("dd overflows i32");
                     let slots_i32 = i32::try_from(s + 1).expect("s+1 overflows i32");
                     let bs_i32 = i32::try_from(batch_size).expect("batch_size overflows i32");
-                    crate::cuda_ffi::broadcast_fill_f32_cuda(
+                    let rc = crate::cuda_ffi::broadcast_fill_f32_cuda(
                         m_bcast.ptr(), m_states.as_ptr(),
                         dd_i32, slots_i32, bs_i32,
                     );
-                    crate::cuda_ffi::broadcast_fill_f32_cuda(
+                    assert_eq!(rc, 0, "broadcast_fill M failed (rc={rc})");
+                    let rc = crate::cuda_ffi::broadcast_fill_f32_cuda(
                         s_bcast.ptr(), s_states.as_ptr(),
                         dd_i32, slots_i32, bs_i32,
                     );
+                    assert_eq!(rc, 0, "broadcast_fill S failed (rc={rc})");
                 }
                 (m_bcast, s_bcast)
             } else {
@@ -935,14 +938,16 @@ pub(crate) fn gpu_memory_backward(
                                 let dd_i32 = i32::try_from(dd).expect("dd overflows i32");
                                 let slots_i32 = i32::try_from(cl + 1).expect("cl+1 overflows i32");
                                 let nb_i32 = i32::try_from(n_batch).expect("n_batch overflows i32");
-                                crate::cuda_ffi::broadcast_fill_f32_cuda(
+                                let rc = crate::cuda_ffi::broadcast_fill_f32_cuda(
                                     m_bcast.ptr(), m_states.as_ptr(),
                                     dd_i32, slots_i32, nb_i32,
                                 );
-                                crate::cuda_ffi::broadcast_fill_f32_cuda(
+                                assert_eq!(rc, 0, "broadcast_fill M failed (rc={rc})");
+                                let rc = crate::cuda_ffi::broadcast_fill_f32_cuda(
                                     s_bcast.ptr(), s_states.as_ptr(),
                                     dd_i32, slots_i32, nb_i32,
                                 );
+                                assert_eq!(rc, 0, "broadcast_fill S failed (rc={rc})");
                             }
                             (m_bcast, s_bcast)
                         } else {
@@ -977,12 +982,13 @@ pub(crate) fn gpu_memory_backward(
                         let m_for_bw = if is_proxy {
                             let mut m_bcast = GpuBuf::zeros(n_batch * (cl + 1) * dd);
                             unsafe {
-                                crate::cuda_ffi::broadcast_fill_f32_cuda(
+                                let rc = crate::cuda_ffi::broadcast_fill_f32_cuda(
                                     m_bcast.ptr(), m_states.as_ptr(),
                                     i32::try_from(dd).expect("dd overflows i32"),
                                     i32::try_from(cl + 1).expect("cl+1 overflows i32"),
                                     i32::try_from(n_batch).expect("n_batch overflows i32"),
                                 );
+                                assert_eq!(rc, 0, "broadcast_fill M failed (rc={rc})");
                             }
                             m_bcast
                         } else {

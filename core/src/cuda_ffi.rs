@@ -326,7 +326,7 @@ extern "C" {
     pub(crate) fn broadcast_fill_f32_cuda(
         dst: *mut f32, src: *const f32,
         dd: i32, n_slots: i32, n_batch: i32,
-    );
+    ) -> i32;
 
     // ── M-norm clamp ──────────────────────────────────────────────────
 
