@@ -276,7 +276,7 @@ impl MAGConfig {
         k=1, chunk_sizes=None, memory_rule="delta", composition="mag",
         d_hidden=None, lp_p=None, sign_sharpness=None, lq_q=None, lambda_local=None, lambda_2=None,
         delta=None, m_slots=None, d_compress=None, lambda_k=None, lambda_v=None,
-        retention=None, m3=None, frequency_schedule=None, checkpoint_interval=None, tape_multiplier=None,
+        retention=None, m3=None, frequency_schedule=None, checkpoint_interval=None, tape_multiplier=1,
         attentional_bias=None, kernel_size=0, self_ref_chunk_size=1,
         projection_kind="static", self_generated_values=false,
         momentum_kind="none", momentum_d_hidden=0,
@@ -321,7 +321,7 @@ impl MAGConfig {
         m3: Option<&Bound<'_, PyDict>>,
         frequency_schedule: Option<&Bound<'_, PyAny>>,
         checkpoint_interval: Option<usize>,
-        tape_multiplier: Option<usize>,
+        tape_multiplier: usize,
         attentional_bias: Option<&str>,
         kernel_size: usize,
         self_ref_chunk_size: usize,
@@ -562,7 +562,7 @@ impl MAGConfig {
                 m3: m3_cfg,
                 frequency_schedule: freq_sched,
                 checkpoint_interval,
-                tape_multiplier,
+                tape_multiplier: tape_multiplier.max(1),
                 hope_variant: nl_hecate_core::model::HopeVariant::FreqGated,
                 lattice_variant: nl_hecate_core::model::LatticeVariant::Decode,
                 n_persistent: 0,
@@ -909,7 +909,7 @@ impl MAGForwardCache {
     k=1, chunk_sizes=None, memory_rule="delta", composition="mag",
     d_hidden=None, lp_p=None, sign_sharpness=None, lq_q=None, lambda_local=None, lambda_2=None,
     delta=None, m_slots=None, d_compress=None, lambda_k=None, lambda_v=None,
-    retention=None, m3=None, frequency_schedule=None, checkpoint_interval=None, tape_multiplier=None,
+    retention=None, m3=None, frequency_schedule=None, checkpoint_interval=None, tape_multiplier=1,
     attentional_bias=None, kernel_size=0, self_ref_chunk_size=1,
     projection_kind="static", self_generated_values=false,
     momentum_kind="none", momentum_d_hidden=0,
@@ -954,7 +954,7 @@ fn mag_create_config(
     m3: Option<&Bound<'_, PyDict>>,
     frequency_schedule: Option<&Bound<'_, PyAny>>,
     checkpoint_interval: Option<usize>,
-    tape_multiplier: Option<usize>,
+    tape_multiplier: usize,
     attentional_bias: Option<&str>,
     kernel_size: usize,
     self_ref_chunk_size: usize,
@@ -2907,25 +2907,18 @@ impl GpuStackedModel {
         self.last_l0_block_gnorms.clone()
     }
 
-    /// Get the current tape_multiplier value (canonicalized: Some(0) → None).
+    /// Get the current tape_multiplier value (spec 25: CMS cycles of cache to retain).
     #[getter]
-    fn tape_multiplier(&self) -> Option<usize> {
-        match self.cfg.tape_multiplier {
-            Some(0) => None,
-            other => other,
-        }
+    fn tape_multiplier(&self) -> usize {
+        self.cfg.tape_multiplier
     }
 
     /// Set tape_multiplier at runtime — takes effect on the next forward call.
-    /// Controls intra-chunk gradient checkpoint density (spec 25).
-    /// None or 0 = full trajectory, 1 = boundary-only, N = N checkpoints per chunk.
+    /// Controls how many CMS cycles of cache to retain (spec 25).
+    /// 1 = one cycle (default, minimum for backward). N = N cycles.
     #[setter]
-    fn set_tape_multiplier(&mut self, value: Option<usize>) {
-        // Canonicalize: Some(0) and None both mean "full trajectory"
-        self.cfg.tape_multiplier = match value {
-            Some(0) => None,
-            other => other,
-        };
+    fn set_tape_multiplier(&mut self, value: usize) {
+        self.cfg.tape_multiplier = value.max(1);
     }
 
     /// CPU Wengert tape summary for stacked models — full gradient observability.
