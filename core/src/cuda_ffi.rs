@@ -319,6 +319,15 @@ extern "C" {
         t_start: i32, t_end: i32, d: i32, error_clip: f32,
     );
 
+    // ── Broadcast fill (spec 27) ───────────────────────────────────────
+
+    /// Fill dst[b*n_slots*dd + t*dd + i] = src[b*dd + i] for all (b,t,i).
+    /// Used to broadcast M_final/S_final into full trajectory for proxy backward.
+    pub(crate) fn broadcast_fill_f32_cuda(
+        dst: *mut f32, src: *const f32,
+        dd: i32, n_slots: i32, n_batch: i32,
+    );
+
     // ── M-norm clamp ──────────────────────────────────────────────────
 
     /// Frobenius-norm clamp for M state (called once per training step).

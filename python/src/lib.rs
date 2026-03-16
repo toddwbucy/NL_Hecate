@@ -12,6 +12,7 @@ use nl_hecate_core::model::{MAGConfig as RustMAGConfig, MAGParams as RustMAGPara
 use nl_hecate_core::retention::{RetentionKind, default_retention};
 use nl_hecate_core::m3::M3Config as RustM3Config;
 use nl_hecate_core::dynamic_freq::{FrequencySchedule, LearnedFreqConfig};
+use nl_hecate_core::model::LevelTapeStrategy;
 use nl_hecate_core::cms_variants::{
     DeploymentVariant as RustDeploymentVariant,
     BlockConfig as RustBlockConfig,
@@ -38,6 +39,25 @@ use nl_hecate_core::checkpoint::{
     load_stacked_safetensors as rust_load_stacked,
     is_stacked_checkpoint as rust_is_stacked_checkpoint,
 };
+
+// ── Tape strategy helpers ─────────────────────────────────────────────
+
+fn parse_tape_strategy(s: &str) -> PyResult<LevelTapeStrategy> {
+    match s.to_lowercase().as_str() {
+        "exact" => Ok(LevelTapeStrategy::Exact),
+        "proxy" => Ok(LevelTapeStrategy::Proxy),
+        _ => Err(PyValueError::new_err(format!(
+            "Unknown tape_strategy '{s}'. Expected: exact, proxy"
+        ))),
+    }
+}
+
+fn format_tape_strategy(ts: &LevelTapeStrategy) -> &'static str {
+    match ts {
+        LevelTapeStrategy::Exact => "exact",
+        LevelTapeStrategy::Proxy => "proxy",
+    }
+}
 
 // ── SWAConfig ────────────────────────────────────────────────────────
 
@@ -602,17 +622,13 @@ impl MAGConfig {
                 b_theta_init: b_theta_init.unwrap_or_default(),
                 tape_strategies: match tape_strategies {
                     Some(strs) => {
-                        let mut v = Vec::with_capacity(strs.len());
-                        for s in &strs {
-                            v.push(match s.to_lowercase().as_str() {
-                                "exact" => nl_hecate_core::model::LevelTapeStrategy::Exact,
-                                "proxy" => nl_hecate_core::model::LevelTapeStrategy::Proxy,
-                                _ => return Err(PyValueError::new_err(format!(
-                                    "Unknown tape_strategy '{s}'. Expected: exact, proxy"
-                                ))),
-                            });
+                        if !strs.is_empty() && strs.len() != k {
+                            return Err(PyValueError::new_err(format!(
+                                "tape_strategies length ({}) must equal k ({k}) when non-empty",
+                                strs.len(),
+                            )));
                         }
-                        v
+                        strs.iter().map(|s| parse_tape_strategy(s)).collect::<PyResult<Vec<_>>>()?
                     }
                     None => Vec::new(),
                 },
@@ -714,10 +730,7 @@ impl MAGConfig {
     fn b_theta_init(&self) -> Vec<f32> { self.inner.b_theta_init.clone() }
     #[getter]
     fn tape_strategies(&self) -> Vec<String> {
-        self.inner.tape_strategies.iter().map(|s| match s {
-            nl_hecate_core::model::LevelTapeStrategy::Exact => "exact".to_string(),
-            nl_hecate_core::model::LevelTapeStrategy::Proxy => "proxy".to_string(),
-        }).collect()
+        self.inner.tape_strategies.iter().map(|s| format_tape_strategy(s).to_string()).collect()
     }
 }
 

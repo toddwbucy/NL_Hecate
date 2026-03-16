@@ -345,6 +345,34 @@ __global__ void dgd_delta_norm_kernel(
     }
 }
 
+// ── Broadcast fill (spec 27) ────────────────────────────────────────
+// Fill a [n_batch * n_slots * dd] buffer by broadcasting [n_batch * dd]
+// source into every slot.  Layout: dst[b * n_slots * dd + t * dd + i] = src[b * dd + i].
+// Used in proxy backward to construct full trajectory from M_final.
+
+__global__ void broadcast_fill_f32_kernel(
+    float* __restrict__ dst,
+    const float* __restrict__ src,
+    int dd, int n_slots)
+{
+    int b = blockIdx.y;          // batch element
+    int t = blockIdx.x;          // time slot
+    int src_off = b * dd;
+    int dst_off = (b * n_slots + t) * dd;
+    for (int i = threadIdx.x; i < dd; i += blockDim.x) {
+        dst[dst_off + i] = src[src_off + i];
+    }
+}
+
+extern "C" void broadcast_fill_f32_cuda(
+    float* dst, const float* src,
+    int dd, int n_slots, int n_batch)
+{
+    int block = (dd < 256) ? dd : 256;
+    dim3 grid(n_slots, n_batch);
+    broadcast_fill_f32_kernel<<<grid, block>>>(dst, src, dd, n_slots);
+}
+
 extern "C" void dgd_delta_norm_cuda(
     const float* M, const float* k, const float* v,
     float* norm_out, int d)

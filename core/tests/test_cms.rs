@@ -1,6 +1,6 @@
 //! CMS integration tests: multi-step training, error buffer health, falsification.
 
-use nl_hecate_core::model::{MAGConfig, MAGParams, FeatureMapKind, MemoryRuleKind, CompositionKind, HopeVariant, LatticeVariant, MomentumKind, ProjectionKind};
+use nl_hecate_core::model::{MAGConfig, MAGParams, FeatureMapKind, MemoryRuleKind, CompositionKind, HopeVariant, LatticeVariant, MomentumKind, ProjectionKind, LevelTapeStrategy};
 use nl_hecate_core::dynamic_freq::FrequencySchedule;
 use nl_hecate_core::retention::RetentionKind;
 use nl_hecate_core::mag::{cms_forward, cms_backward};
@@ -272,7 +272,8 @@ fn test_k2_beats_k1() {
         residual: false,
         b_alpha_init: vec![],
         b_theta_init: vec![],
-        tape_strategies: Vec::new(),
+        // Spec 27: exercise explicit per-level strategy assignment
+        tape_strategies: vec![LevelTapeStrategy::Exact, LevelTapeStrategy::Proxy],
 };
 
     let input_ids: Vec<usize> = (0..swa.seq_len).map(|t| t % swa.vocab_size).collect();
@@ -511,7 +512,13 @@ fn test_k4_vs_k2_multiscale() {
         residual: false,
         b_alpha_init: vec![],
         b_theta_init: vec![],
-        tape_strategies: Vec::new(),
+        // Spec 27: explicit per-level strategy for k=4
+        tape_strategies: vec![
+            LevelTapeStrategy::Exact,
+            LevelTapeStrategy::Proxy,
+            LevelTapeStrategy::Proxy,
+            LevelTapeStrategy::Proxy,
+        ],
 };
 
     let slow_period = 8;

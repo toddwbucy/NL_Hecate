@@ -948,15 +948,18 @@ impl MAGConfig {
 
     /// Spec 27: tape strategy for a given CMS level.
     /// If tape_strategies is empty, uses default: L0=Exact, L1+=Proxy.
-    /// If tape_strategies is set, uses the per-level assignment.
+    /// If tape_strategies is set, its length must equal k (validated here).
     #[inline]
     pub fn tape_strategy_for_level(&self, level: usize) -> LevelTapeStrategy {
-        if let Some(&strat) = self.tape_strategies.get(level) {
-            strat
-        } else if level == 0 {
-            LevelTapeStrategy::Exact
+        if self.tape_strategies.is_empty() {
+            if level == 0 { LevelTapeStrategy::Exact } else { LevelTapeStrategy::Proxy }
         } else {
-            LevelTapeStrategy::Proxy
+            assert_eq!(
+                self.tape_strategies.len(), self.k,
+                "tape_strategies length ({}) must equal k ({}) when non-empty",
+                self.tape_strategies.len(), self.k,
+            );
+            self.tape_strategies[level]
         }
     }
 

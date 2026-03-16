@@ -95,9 +95,10 @@ pub enum GpuMemoryCache {
         q_mem: GpuBuf<f32>,     // [s, d]
         alpha: GpuBuf<f32>,     // [s]
         theta: GpuBuf<f32>,     // [s]
-        m_states: GpuBuf<f32>,  // [(s+1)*d*d]
+        m_states: GpuBuf<f32>,  // [(s+1)*d*d] exact, [d*d] proxy
         k_norms: GpuBuf<f32>,  // [s] — L2 norms before normalization
         q_norms: GpuBuf<f32>,  // [s]
+        proxy: bool,            // spec 27: true = m_states is M_final only
     },
     Titans {
         k_mem: GpuBuf<f32>,
@@ -106,10 +107,11 @@ pub enum GpuMemoryCache {
         alpha: GpuBuf<f32>,
         theta: GpuBuf<f32>,
         eta: GpuBuf<f32>,
-        m_states: GpuBuf<f32>,  // [(s+1)*d*d]
-        s_states: GpuBuf<f32>,  // [(s+1)*d*d]
+        m_states: GpuBuf<f32>,  // [(s+1)*d*d] exact, [d*d] proxy
+        s_states: GpuBuf<f32>,  // [(s+1)*d*d] exact, [d*d] proxy
         k_norms: GpuBuf<f32>,
         q_norms: GpuBuf<f32>,
+        proxy: bool,            // spec 27: true = m_states/s_states are finals only
     },
     Hebbian {
         k_mem: GpuBuf<f32>,
@@ -250,6 +252,11 @@ impl GpuMemoryCache {
         };
 
         match self {
+            GpuMemoryCache::Delta { proxy: true, .. }
+            | GpuMemoryCache::Titans { proxy: true, .. } => {
+                // Proxy caches don't have full trajectory — no M_{s-1} to measure.
+                return 0.0;
+            }
             GpuMemoryCache::Delta { k_mem, v_mem, m_states, .. }
             | GpuMemoryCache::DGD { k_mem, v_mem, m_states, .. }
             | GpuMemoryCache::Titans { k_mem, v_mem, m_states, .. } => {
@@ -1053,6 +1060,7 @@ pub(crate) fn gpu_memory_forward(
     // otherwise None (full trajectory within each shard). Cycle-scoped eviction is handled
     // at the shard level in gpu_tnt_forward, not within gpu_memory_forward.
     let eff_ckpt = cfg.effective_checkpoint_interval(level);
+    let is_proxy = cfg.tape_strategy_for_level(level) == LevelTapeStrategy::Proxy;
 
     match (eff_ckpt, cfg.memory_rule) {
         // ── Full-trajectory paths (checkpoint_interval=None, current behavior) ──
@@ -1065,7 +1073,6 @@ pub(crate) fn gpu_memory_forward(
                 cfg.error_clip_for_level(level),
             );
             crate::dispatch::cuda_sync();
-            // Copy all bs slots' final M back: element b's final M at m_states offset b*(s+1)*dd + s*dd.
             copy_final_m_batch(&m_states, context_m, s, dd, bs);
             for b in 0..bs {
                 unsafe {
@@ -1075,7 +1082,24 @@ pub(crate) fn gpu_memory_forward(
                     );
                 }
             }
-            (y, GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states, k_norms, q_norms })
+            // Spec 27: proxy levels extract M_final, discard full trajectory
+            let (cache_m, cache_proxy) = if is_proxy {
+                let mut m_final = GpuBuf::zeros(bs * dd);
+                for b in 0..bs {
+                    unsafe {
+                        let rc = gpu_buf_memcpy_d2d(
+                            (m_final.ptr() as *mut u8).add(b * dd * 4) as *mut _,
+                            (m_states.as_ptr() as *const u8).add((b * (s + 1) + s) * dd * 4) as *const _,
+                            dd * 4,
+                        );
+                        assert_eq!(rc, 0, "proxy M_final copy failed");
+                    }
+                }
+                (m_final, true)
+            } else {
+                (m_states, false)
+            };
+            (y, GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states: cache_m, k_norms, q_norms, proxy: cache_proxy })
         }
         (None, MemoryRuleKind::TitansLMM) => {
             // Compute eta gate for all bs*s tokens (Titans uses 3 gates: alpha, theta, eta)
@@ -1102,7 +1126,31 @@ pub(crate) fn gpu_memory_forward(
                     );
                 }
             }
-            (y, GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states, s_states, k_norms, q_norms })
+            // Spec 27: proxy levels extract M_final/S_final, discard full trajectory
+            let (cache_m, cache_s, cache_proxy) = if is_proxy {
+                let mut m_final = GpuBuf::zeros(bs * dd);
+                let mut s_final = GpuBuf::zeros(bs * dd);
+                for b in 0..bs {
+                    unsafe {
+                        let rc = gpu_buf_memcpy_d2d(
+                            (m_final.ptr() as *mut u8).add(b * dd * 4) as *mut _,
+                            (m_states.as_ptr() as *const u8).add((b * (s + 1) + s) * dd * 4) as *const _,
+                            dd * 4,
+                        );
+                        assert_eq!(rc, 0, "proxy M_final copy failed");
+                        let rc = gpu_buf_memcpy_d2d(
+                            (s_final.ptr() as *mut u8).add(b * dd * 4) as *mut _,
+                            (s_states.as_ptr() as *const u8).add((b * (s + 1) + s) * dd * 4) as *const _,
+                            dd * 4,
+                        );
+                        assert_eq!(rc, 0, "proxy S_final copy failed");
+                    }
+                }
+                (m_final, s_final, true)
+            } else {
+                (m_states, s_states, false)
+            };
+            (y, GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states: cache_m, s_states: cache_s, k_norms, q_norms, proxy: cache_proxy })
         }
         (None, MemoryRuleKind::HebbianRule) => {
             assert_eq!(bs, 1, "Hebbian GPU forward with batch_size > 1 is not supported");
@@ -1419,6 +1467,7 @@ pub(crate) fn gpu_tnt_forward(
                         alpha: alpha_b, theta: theta_b, eta: eta_b,
                         m_states: m_final, s_states: s_final,
                         k_norms: shard_k_norms.dup(), q_norms: shard_q_norms.dup(),
+                        proxy: true,
                     }
                 } else {
                     GpuMemoryCache::Titans {
@@ -1426,6 +1475,7 @@ pub(crate) fn gpu_tnt_forward(
                         alpha: alpha_b, theta: theta_b, eta: eta_b,
                         m_states, s_states,
                         k_norms: shard_k_norms.dup(), q_norms: shard_q_norms.dup(),
+                        proxy: false,
                     }
                 }
             }
@@ -1455,12 +1505,14 @@ pub(crate) fn gpu_tnt_forward(
                         k_mem: k_mem_b, v_mem: v_mem_b, q_mem: q_mem_b,
                         alpha: alpha_b, theta: theta_b, m_states: m_final,
                         k_norms: shard_k_norms.dup(), q_norms: shard_q_norms.dup(),
+                        proxy: true,
                     }
                 } else {
                     GpuMemoryCache::Delta {
                         k_mem: k_mem_b, v_mem: v_mem_b, q_mem: q_mem_b,
                         alpha: alpha_b, theta: theta_b, m_states,
                         k_norms: shard_k_norms.dup(), q_norms: shard_q_norms.dup(),
+                        proxy: false,
                     }
                 }
             }
@@ -1654,6 +1706,10 @@ fn gpu_memory_forward_into_scratch(
 /// The returned cache holds `from_raw_non_owning` GpuBuf views into the scratch.
 /// These are valid until the next call to gpu_cms_forward (which overwrites scratch).
 /// Safety invariant: backward is called before the next forward — no aliasing hazard.
+///
+/// NOTE: Scratch buffers always hold full trajectory (proxy: false) because they
+/// are pre-allocated at graph creation time. Proxy VRAM savings only apply to
+/// the per-step allocation path (gpu_memory_forward), not the CUDA-graph path.
 #[cfg(feature = "cuda")]
 unsafe fn memory_cache_from_scratch(
     scratch: &crate::cuda_graph::GpuLevelScratch,
@@ -1673,6 +1729,7 @@ unsafe fn memory_cache_from_scratch(
             m_states: GpuBuf::from_raw_non_owning(scratch.m_states.ptr(), bs * (s + 1) * dd),
             k_norms:  GpuBuf::from_raw_non_owning(scratch.k_norms.ptr(), bs * s),
             q_norms:  GpuBuf::from_raw_non_owning(scratch.q_norms.ptr(), bs * s),
+            proxy: false,
         }),
         (None, MemoryRuleKind::TitansLMM) => Some(GpuMemoryCache::Titans {
             k_mem:    GpuBuf::from_raw_non_owning(scratch.k_mem.ptr(), bs * s * d),
@@ -1685,6 +1742,7 @@ unsafe fn memory_cache_from_scratch(
             s_states: GpuBuf::from_raw_non_owning(scratch.s_states.ptr(), bs * (s + 1) * dd),
             k_norms:  GpuBuf::from_raw_non_owning(scratch.k_norms.ptr(), bs * s),
             q_norms:  GpuBuf::from_raw_non_owning(scratch.q_norms.ptr(), bs * s),
+            proxy: false,
         }),
         _ => None,  // Unsupported rule — caller (gpu_cms_replay) returns None → standard dispatch
     }

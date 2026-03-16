@@ -471,7 +471,7 @@ pub(crate) fn gpu_memory_backward(
     let bs_s = batch_size * s;
 
     match mem_cache {
-        GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states, k_norms, q_norms } => {
+        GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states, k_norms, q_norms, proxy, .. } => {
             let mut d_k_mem = GpuBuf::zeros(bsd);
             let mut d_v_mem = GpuBuf::zeros(bsd);
             let mut d_q_mem = GpuBuf::zeros(bsd);
@@ -479,9 +479,23 @@ pub(crate) fn gpu_memory_backward(
             let mut d_theta = GpuBuf::zeros(bs_s);
             let mut d_m_initial = GpuBuf::zeros(dd);
 
+            // Spec 27: proxy caches store only M_final — broadcast for backward kernel
+            let m_for_bw = if *proxy {
+                let mut m_bcast = GpuBuf::zeros(batch_size * (s + 1) * dd);
+                unsafe {
+                    crate::cuda_ffi::broadcast_fill_f32_cuda(
+                        m_bcast.ptr(), m_states.as_ptr(),
+                        dd as i32, (s + 1) as i32, batch_size as i32,
+                    );
+                }
+                m_bcast
+            } else {
+                m_states.dup()
+            };
+
             crate::dispatch::delta_backward_dd(
                 k_mem, v_mem, q_mem, alpha, theta,
-                m_states, d_y,
+                &m_for_bw, d_y,
                 &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
                 &mut d_alpha, &mut d_theta, &mut d_m_initial,
                 s, d, batch_size,
@@ -519,7 +533,7 @@ pub(crate) fn gpu_memory_backward(
                 level_grads, s, d, batch_size,
             )
         }
-        GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states, s_states, k_norms, q_norms } => {
+        GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states, s_states, k_norms, q_norms, proxy, .. } => {
             let mut d_k_mem = GpuBuf::zeros(bsd);
             let mut d_v_mem = GpuBuf::zeros(bsd);
             let mut d_q_mem = GpuBuf::zeros(bsd);
@@ -529,9 +543,28 @@ pub(crate) fn gpu_memory_backward(
             let mut d_m_initial = GpuBuf::zeros(dd);
             let mut d_s_initial = GpuBuf::zeros(dd);
 
+            // Spec 27: proxy caches store only M_final/S_final — broadcast for backward kernel
+            let (m_for_bw, s_for_bw) = if *proxy {
+                let mut m_bcast = GpuBuf::zeros(batch_size * (s + 1) * dd);
+                let mut s_bcast = GpuBuf::zeros(batch_size * (s + 1) * dd);
+                unsafe {
+                    crate::cuda_ffi::broadcast_fill_f32_cuda(
+                        m_bcast.ptr(), m_states.as_ptr(),
+                        dd as i32, (s + 1) as i32, batch_size as i32,
+                    );
+                    crate::cuda_ffi::broadcast_fill_f32_cuda(
+                        s_bcast.ptr(), s_states.as_ptr(),
+                        dd as i32, (s + 1) as i32, batch_size as i32,
+                    );
+                }
+                (m_bcast, s_bcast)
+            } else {
+                (m_states.dup(), s_states.dup())
+            };
+
             crate::dispatch::titans_backward_dd(
                 k_mem, v_mem, q_mem, alpha, theta, eta,
-                m_states, s_states, d_y,
+                &m_for_bw, &s_for_bw, d_y,
                 &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
                 &mut d_alpha, &mut d_theta, &mut d_eta,
                 &mut d_m_initial, &mut d_s_initial,
@@ -889,25 +922,18 @@ pub(crate) fn gpu_memory_backward(
 
                         let (m_for_bw, s_for_bw) = if is_proxy {
                             // Broadcast M_final/S_final into [(cl+1)*dd] per batch element
+                            // using a single CUDA kernel launch instead of nested host-driven copies.
                             let mut m_bcast = GpuBuf::zeros(n_batch * (cl + 1) * dd);
                             let mut s_bcast = GpuBuf::zeros(n_batch * (cl + 1) * dd);
-                            for b in 0..n_batch {
-                                for t in 0..=cl {
-                                    unsafe {
-                                        let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
-                                            (m_bcast.ptr() as *mut u8).add((b * (cl + 1) + t) * dd * 4) as *mut _,
-                                            (m_states.as_ptr() as *const u8).add(b * dd * 4) as *const _,
-                                            dd * 4,
-                                        );
-                                        assert_eq!(rc, 0, "proxy M broadcast failed");
-                                        let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
-                                            (s_bcast.ptr() as *mut u8).add((b * (cl + 1) + t) * dd * 4) as *mut _,
-                                            (s_states.as_ptr() as *const u8).add(b * dd * 4) as *const _,
-                                            dd * 4,
-                                        );
-                                        assert_eq!(rc, 0, "proxy S broadcast failed");
-                                    }
-                                }
+                            unsafe {
+                                crate::cuda_ffi::broadcast_fill_f32_cuda(
+                                    m_bcast.ptr(), m_states.as_ptr(),
+                                    dd as i32, (cl + 1) as i32, n_batch as i32,
+                                );
+                                crate::cuda_ffi::broadcast_fill_f32_cuda(
+                                    s_bcast.ptr(), s_states.as_ptr(),
+                                    dd as i32, (cl + 1) as i32, n_batch as i32,
+                                );
                             }
                             (m_bcast, s_bcast)
                         } else {
@@ -941,17 +967,11 @@ pub(crate) fn gpu_memory_backward(
 
                         let m_for_bw = if is_proxy {
                             let mut m_bcast = GpuBuf::zeros(n_batch * (cl + 1) * dd);
-                            for b in 0..n_batch {
-                                for t in 0..=cl {
-                                    unsafe {
-                                        let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
-                                            (m_bcast.ptr() as *mut u8).add((b * (cl + 1) + t) * dd * 4) as *mut _,
-                                            (m_states.as_ptr() as *const u8).add(b * dd * 4) as *const _,
-                                            dd * 4,
-                                        );
-                                        assert_eq!(rc, 0, "proxy M broadcast failed");
-                                    }
-                                }
+                            unsafe {
+                                crate::cuda_ffi::broadcast_fill_f32_cuda(
+                                    m_bcast.ptr(), m_states.as_ptr(),
+                                    dd as i32, (cl + 1) as i32, n_batch as i32,
+                                );
                             }
                             m_bcast
                         } else {
