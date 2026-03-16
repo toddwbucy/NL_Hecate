@@ -157,13 +157,13 @@ ensures at least 1). Cache management must handle partial cycles — the drop
 never fires because the cycle boundary is never reached. Effectively equivalent
 to full trajectory, but the code must not break.
 
-Per-cycle cache cost at d=1024, 8 blocks, tape_multiplier=1:
+Per-cycle cache cost at d=1024, 8 blocks, tape_multiplier=1 (per level per cycle):
 
-| k | cycle_len | M/S per cycle | Projs per cycle | Total/cycle | × 8 blocks × k |
-|---|-----------|--------------|-----------------|-------------|-----------------|
-| 2 | 8 | 16 MB | ~96 KB | ~16 MB | 256 MB |
-| 3 | 64 | 24 MB | ~768 KB | ~25 MB | 600 MB |
-| 4 | 512 | 32 MB | ~6 MB | ~38 MB | 1.2 GB |
+| k | cycle_len | M/S per cycle (per level) | Projs per cycle | Total/cycle (per level) | × 8 blocks × k levels |
+|---|-----------|--------------------------|-----------------|------------------------|----------------------|
+| 2 | 8 | 64 MB | ~96 KB | ~64 MB | 1 GB |
+| 3 | 64 | 512 MB | ~768 KB | ~512 MB | 12 GB |
+| 4 | 512 | 4 GB | ~6 MB | ~4 GB | 128 GB |
 
 This is a scaling cost the architecture pays as k increases. The code must:
 1. Derive cycle_length from `max(chunk_sizes)` dynamically — never hardcode
@@ -414,7 +414,7 @@ To recover the old full-trajectory behavior, set `tape_multiplier` to
 3. Cache drops happen at cycle boundaries, synchronized to the CMS clock
 4. Gradient correctness: FD gradient check passes within the retained window
 5. d=512 4-block k=2 at tape_multiplier=1: no throughput regression vs naive full-trajectory (~580 tok/s)
-6. d=1024 8-block k=2 at tape_multiplier=1: fits on A6000 (~256 MB tape)
+6. d=1024 8-block k=2 at tape_multiplier=1: fits on A6000 (~1 GB tape)
 7. Higher tape_multiplier values proportionally increase cache and gradient depth
 8. Tape size is deterministic from model config — can be computed before forward pass
 9. Same model behavior at all multiplier values (only gradient truncation depth changes)
