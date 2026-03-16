@@ -878,6 +878,9 @@ impl MAGConfig {
     /// retained_shards = ceil(tape_multiplier * cycle_length / shard_size), min 1.
     /// When cycle_length >= shard_size (e.g. k=4), retained_shards >= tape_multiplier.
     pub fn retained_shards(&self, shard_size: usize) -> usize {
+        if shard_size == 0 {
+            return 1;
+        }
         let window_tokens = self.tape_multiplier * self.cycle_length();
         ((window_tokens + shard_size - 1) / shard_size).max(1)
     }
@@ -893,16 +896,17 @@ impl MAGConfig {
                       + cl * 3 * 4                // gates (alpha, theta, eta)
                       + cl * 2 * 4;               // k_norms, q_norms
         let seq_len = self.swa.seq_len;
-        let cycles_in_seq = if cl > 0 { seq_len / cl } else { seq_len };
+        let cycles_in_seq = if cl > 0 { (seq_len + cl - 1) / cl } else { seq_len };
         let retained = self.tape_multiplier.min(cycles_in_seq.max(1));
         n_blocks * self.k * retained * per_cycle
     }
 
     /// Returns the checkpoint interval for memory rules within a shard/segment.
-    /// None = store full M trajectory (every token), Some(C) = store every C steps.
-    /// Uses checkpoint_interval if explicitly set, otherwise None (full trajectory).
+    /// Always returns None — cycle-scoped tape (spec 25) manages VRAM at the shard
+    /// level, making within-shard gradient checkpointing unnecessary. Full M trajectory
+    /// is stored within each retained shard (CS-42: no unbounded recomputation).
     pub fn effective_checkpoint_interval(&self, _level: usize) -> Option<usize> {
-        self.checkpoint_interval
+        None
     }
 }
 

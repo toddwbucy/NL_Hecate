@@ -562,7 +562,7 @@ impl MAGConfig {
                 m3: m3_cfg,
                 frequency_schedule: freq_sched,
                 checkpoint_interval,
-                tape_multiplier,
+                tape_multiplier: tape_multiplier.max(1),
                 hope_variant: nl_hecate_core::model::HopeVariant::FreqGated,
                 lattice_variant: nl_hecate_core::model::LatticeVariant::Decode,
                 n_persistent: 0,

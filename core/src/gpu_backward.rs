@@ -761,8 +761,8 @@ pub(crate) fn gpu_memory_backward(
         }
         // ── TNT: reverse shard loop with batched inner backward ──────
         GpuMemoryCache::TNT {
-            shard_inner_caches, shard_y_bufs, k_summaries, v_summaries,
-            global_m_before, global_chunk_size, local_chunk_size,
+            shard_inner_caches, k_summaries, v_summaries,
+            global_chunk_size, local_chunk_size,
             total_shards, first_retained_shard,
         } => {
             assert_eq!(batch_size, 1, "TNT backward currently supports batch_size=1 only");

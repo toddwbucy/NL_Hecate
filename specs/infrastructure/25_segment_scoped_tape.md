@@ -104,7 +104,7 @@ naive implementation simply failed to enforce that scoping.
 The CMS operates like a Swiss watch. Multiple levels fire at different rates, but
 they are synchronized: when the slowest level fires, all levels fire together.
 
-```
+```text
 k=2, chunk_sizes=[1, 8]:
   L0: ████████ ████████ ████████ ████████  (every token)
   L1: █───────█───────█───────█───────█    (every 8 tokens)
@@ -214,7 +214,7 @@ summary data in reverse. It does not need the shard inner caches.
 
 For each level, within each block:
 
-```
+```text
 Forward step t:
   1. Compute projections (k_mem, v_mem, q_mem), gates (alpha, theta, eta)
   2. Run inner memory kernel → update M, produce y_t
@@ -279,10 +279,10 @@ For d=1024, 8 blocks, k=2 [1,8], seq_len=512 (64 cycles):
 
 Deterministic from model config:
 
-```
+```text
 cycle_length = max(chunk_sizes[0..k])   # period of slowest level
-cycles_in_seq = seq_len / cycle_length
-retained_cycles = min(tape_multiplier, cycles_in_seq)
+cycles_in_seq = ceil(seq_len / cycle_length)  # partial cycles count
+retained_cycles = min(tape_multiplier, max(1, cycles_in_seq))
 
 per_cycle_cache = 2 × d² × sizeof(f32)  # M + S boundary states
                 + cycle_length × d × 3 × sizeof(f32)  # projections
@@ -332,19 +332,20 @@ behavior, which is now expressed as `tape_multiplier = seq_len / cycle_length`.
 
 ### What Changes
 
-**Cache management layer**: New cycle-aware cache manager that tracks which cycles
-are retained and frees the oldest when the window is exceeded. This sits between
-the forward path (which produces caches) and the backward path (which consumes
-them). It does NOT change the forward or backward kernels — only WHEN caches
-are freed.
+**Cache management layer**: Rolling eviction of shard inner caches based on the
+cycle-scoped retention window. This does NOT change the forward or backward
+kernels — only WHEN caches are freed.
 
-**Sequential path** (`gpu_memory_forward`): Cache entries are tagged with their
-cycle index. After each cycle boundary, the manager checks if retained_cycles
-exceeds tape_multiplier and frees the oldest if so.
+**Sequential path** (`gpu_memory_forward`): Unchanged. Full M trajectory is
+stored within each call. Cycle-scoped eviction is a future extension for the
+sequential path. Currently, all production configs use TNT.
 
-**TNT path** (`gpu_tnt_forward`): Each shard contains multiple cycles
-(shard_size / cycle_length). The same rolling drop applies within each shard.
-After a shard completes, all its remaining caches are freed (shard independence).
+**TNT path** (`gpu_tnt_forward`): Rolling eviction at the shard level. After each
+shard's forward completes, if the accumulated shard count exceeds
+`retained_shards(shard_size)`, the oldest shard's inner cache is freed. The
+backward only computes inner gradients for retained shards; evicted shards
+contribute global M gradients only (gradient truncation). Summaries (O(d) each)
+are retained for ALL shards to preserve the global M backward chain rule.
 
 **Default change**: `tape_multiplier` defaults to 1, not None. All existing
 configs without `tape_multiplier` get the cycle-scoped behavior automatically.

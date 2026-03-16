@@ -236,6 +236,9 @@ class BuildConfig:
         if self.self_ref_chunk_size < 1:
             raise ValueError(
                 f"self_ref_chunk_size must be >= 1, got {self.self_ref_chunk_size}")
+        if not isinstance(self.tape_multiplier, int) or self.tape_multiplier < 1:
+            raise ValueError(
+                f"tape_multiplier must be an int >= 1, got {self.tape_multiplier!r}")
         if self.momentum_d_hidden < 0:
             raise ValueError(
                 f"momentum_d_hidden must be >= 0, got {self.momentum_d_hidden}")
