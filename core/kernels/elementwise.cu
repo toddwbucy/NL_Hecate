@@ -381,6 +381,12 @@ extern "C" int broadcast_fill_f32_cuda(
     int block = (dd < 256) ? dd : 256;
     dim3 grid(n_slots, n_batch);
     broadcast_fill_f32_kernel<<<grid, block>>>(dst, src, dd, n_slots);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "broadcast_fill_f32_cuda: launch failed: %s\n",
+                cudaGetErrorString(err));
+        return 2;
+    }
     return 0;
 }
 
