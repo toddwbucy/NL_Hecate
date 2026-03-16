@@ -124,6 +124,7 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
                 residual: false,
                 b_alpha_init: vec![],
                 b_theta_init: vec![],
+                tape_strategies: Vec::new(),
 }
 }
 

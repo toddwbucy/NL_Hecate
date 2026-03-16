@@ -293,6 +293,7 @@ impl MAGConfig {
         residual=false,
         b_alpha_init=None,
         b_theta_init=None,
+        tape_strategies=None,
     ))]
     fn new(
         d_model: usize,
@@ -344,6 +345,7 @@ impl MAGConfig {
         residual: bool,
         b_alpha_init: Option<Vec<f32>>,
         b_theta_init: Option<Vec<f32>>,
+        tape_strategies: Option<Vec<String>>,
     ) -> PyResult<Self> {
         if d_model != num_heads * head_dim {
             return Err(PyValueError::new_err(format!(
@@ -598,6 +600,22 @@ impl MAGConfig {
                 residual,
                 b_alpha_init: b_alpha_init.unwrap_or_default(),
                 b_theta_init: b_theta_init.unwrap_or_default(),
+                tape_strategies: match tape_strategies {
+                    Some(strs) => {
+                        let mut v = Vec::with_capacity(strs.len());
+                        for s in &strs {
+                            v.push(match s.to_lowercase().as_str() {
+                                "exact" => nl_hecate_core::model::LevelTapeStrategy::Exact,
+                                "proxy" => nl_hecate_core::model::LevelTapeStrategy::Proxy,
+                                _ => return Err(PyValueError::new_err(format!(
+                                    "Unknown tape_strategy '{s}'. Expected: exact, proxy"
+                                ))),
+                            });
+                        }
+                        v
+                    }
+                    None => Vec::new(),
+                },
             },
         })
     }
@@ -694,6 +712,13 @@ impl MAGConfig {
     fn b_alpha_init(&self) -> Vec<f32> { self.inner.b_alpha_init.clone() }
     #[getter]
     fn b_theta_init(&self) -> Vec<f32> { self.inner.b_theta_init.clone() }
+    #[getter]
+    fn tape_strategies(&self) -> Vec<String> {
+        self.inner.tape_strategies.iter().map(|s| match s {
+            nl_hecate_core::model::LevelTapeStrategy::Exact => "exact".to_string(),
+            nl_hecate_core::model::LevelTapeStrategy::Proxy => "proxy".to_string(),
+        }).collect()
+    }
 }
 
 // ── MAGParams ──────────────────────────────────────────────────────
@@ -926,6 +951,7 @@ impl MAGForwardCache {
     residual=false,
     b_alpha_init=None,
     b_theta_init=None,
+    tape_strategies=None,
 ))]
 fn mag_create_config(
     d_model: usize,
@@ -977,6 +1003,7 @@ fn mag_create_config(
     residual: bool,
     b_alpha_init: Option<Vec<f32>>,
     b_theta_init: Option<Vec<f32>>,
+    tape_strategies: Option<Vec<String>>,
 ) -> PyResult<MAGConfig> {
     MAGConfig::new(
         d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled,
@@ -990,6 +1017,7 @@ fn mag_create_config(
         parallel_strategy, tnt_global_chunk_size, tnt_local_chunk_size,
         residual,
         b_alpha_init, b_theta_init,
+        tape_strategies,
     )
 }
 

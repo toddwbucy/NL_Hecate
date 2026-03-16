@@ -77,6 +77,7 @@ fn delta_k1_config(fm: FeatureMapKind) -> MAGConfig {
             residual: false,
             b_alpha_init: vec![],
             b_theta_init: vec![],
+            tape_strategies: Vec::new(),
 }
 }
 

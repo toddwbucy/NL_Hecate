@@ -445,6 +445,7 @@ fn test_k1_learned_is_noop() {
                 residual: false,
                 b_alpha_init: vec![],
                 b_theta_init: vec![],
+                tape_strategies: Vec::new(),
 };
     let params = MAGParams::init(&cfg, 42);
     let d = cfg.swa.d_model;
@@ -587,6 +588,7 @@ fn test_anneal_uses_fixed_schedule() {
                 residual: false,
                 b_alpha_init: vec![],
                 b_theta_init: vec![],
+                tape_strategies: Vec::new(),
 };
 
     let params = MAGParams::init(&cfg, 42);

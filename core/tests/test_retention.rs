@@ -73,6 +73,7 @@ fn tiny_config(rule: MemoryRuleKind, retention: RetentionKind) -> MAGConfig {
                 residual: false,
                 b_alpha_init: vec![],
                 b_theta_init: vec![],
+                tape_strategies: Vec::new(),
 }
 }
 

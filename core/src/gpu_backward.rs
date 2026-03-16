@@ -14,7 +14,7 @@ use crate::gpu_params::{GpuMAGParams, GpuMemoryLevelParams};
 #[cfg(feature = "cuda")]
 use crate::gpu_forward::{GpuCMSCache, GpuMemoryCache, gpu_buf_memcpy_d2d};
 #[cfg(feature = "cuda")]
-use crate::model::{MAGConfig, MemoryRuleKind};
+use crate::model::{MAGConfig, LevelTapeStrategy, MemoryRuleKind};
 
 // ══════════════════════════════════════════════════════════════════════
 // GpuMAGGrads — gradient buffers on GPU
@@ -876,14 +876,48 @@ pub(crate) fn gpu_memory_backward(
                     _ => unreachable!("TNT inner cache must be Titans or Delta"),
                 };
 
+                // Spec 27: proxy levels have m_states/s_states containing only M_final/S_final
+                // (n_batch * dd). Broadcast into full trajectory for backward kernel compatibility.
+                // The VRAM savings come from cache storage between forward and backward, not from
+                // the transient backward buffer (freed after this shard completes).
+                let is_proxy = cfg.tape_strategy_for_level(level) == LevelTapeStrategy::Proxy;
+
                 match inner_cache {
                     GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states, s_states, .. } => {
                         let mut d_m_initial = GpuBuf::zeros(n_batch * dd);
                         let mut d_s_initial = GpuBuf::zeros(n_batch * dd);
 
+                        let (m_for_bw, s_for_bw) = if is_proxy {
+                            // Broadcast M_final/S_final into [(cl+1)*dd] per batch element
+                            let mut m_bcast = GpuBuf::zeros(n_batch * (cl + 1) * dd);
+                            let mut s_bcast = GpuBuf::zeros(n_batch * (cl + 1) * dd);
+                            for b in 0..n_batch {
+                                for t in 0..=cl {
+                                    unsafe {
+                                        let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                                            (m_bcast.ptr() as *mut u8).add((b * (cl + 1) + t) * dd * 4) as *mut _,
+                                            (m_states.as_ptr() as *const u8).add(b * dd * 4) as *const _,
+                                            dd * 4,
+                                        );
+                                        assert_eq!(rc, 0, "proxy M broadcast failed");
+                                        let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                                            (s_bcast.ptr() as *mut u8).add((b * (cl + 1) + t) * dd * 4) as *mut _,
+                                            (s_states.as_ptr() as *const u8).add(b * dd * 4) as *const _,
+                                            dd * 4,
+                                        );
+                                        assert_eq!(rc, 0, "proxy S broadcast failed");
+                                    }
+                                }
+                            }
+                            (m_bcast, s_bcast)
+                        } else {
+                            // Exact: use stored trajectory directly (zero-copy reference via dup)
+                            (m_states.dup(), s_states.dup())
+                        };
+
                         crate::dispatch::titans_backward_dd(
                             k_mem, v_mem, q_mem, alpha, theta, eta,
-                            m_states, s_states, &d_y_padded,
+                            &m_for_bw, &s_for_bw, &d_y_padded,
                             &mut d_k_shard, &mut d_v_shard, &mut d_q_shard,
                             &mut d_alpha_shard, &mut d_theta_shard, &mut d_eta_shard,
                             &mut d_m_initial, &mut d_s_initial,
@@ -891,31 +925,55 @@ pub(crate) fn gpu_memory_backward(
                             cfg.error_clip_for_level(level),
                         );
 
-                        for b in 0..n_batch {
-                            unsafe {
-                                crate::cuda_ffi::saxpy_cuda(
-                                    1.0, d_m_initial.as_ptr().add(b * dd), d_m_old.ptr(), dd as i32,
-                                );
+                        if !is_proxy {
+                            // Only propagate d_m_initial for exact levels — proxy has no M chain
+                            for b in 0..n_batch {
+                                unsafe {
+                                    crate::cuda_ffi::saxpy_cuda(
+                                        1.0, d_m_initial.as_ptr().add(b * dd), d_m_old.ptr(), dd as i32,
+                                    );
+                                }
                             }
                         }
                     }
                     GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states, .. } => {
                         let mut d_m_initial = GpuBuf::zeros(n_batch * dd);
 
+                        let m_for_bw = if is_proxy {
+                            let mut m_bcast = GpuBuf::zeros(n_batch * (cl + 1) * dd);
+                            for b in 0..n_batch {
+                                for t in 0..=cl {
+                                    unsafe {
+                                        let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                                            (m_bcast.ptr() as *mut u8).add((b * (cl + 1) + t) * dd * 4) as *mut _,
+                                            (m_states.as_ptr() as *const u8).add(b * dd * 4) as *const _,
+                                            dd * 4,
+                                        );
+                                        assert_eq!(rc, 0, "proxy M broadcast failed");
+                                    }
+                                }
+                            }
+                            m_bcast
+                        } else {
+                            m_states.dup()
+                        };
+
                         crate::dispatch::delta_backward_dd(
                             k_mem, v_mem, q_mem, alpha, theta,
-                            m_states, &d_y_padded,
+                            &m_for_bw, &d_y_padded,
                             &mut d_k_shard, &mut d_v_shard, &mut d_q_shard,
                             &mut d_alpha_shard, &mut d_theta_shard, &mut d_m_initial,
                             cl, d, n_batch,
                             cfg.error_clip_for_level(level),
                         );
 
-                        for b in 0..n_batch {
-                            unsafe {
-                                crate::cuda_ffi::saxpy_cuda(
-                                    1.0, d_m_initial.as_ptr().add(b * dd), d_m_old.ptr(), dd as i32,
-                                );
+                        if !is_proxy {
+                            for b in 0..n_batch {
+                                unsafe {
+                                    crate::cuda_ffi::saxpy_cuda(
+                                        1.0, d_m_initial.as_ptr().add(b * dd), d_m_old.ptr(), dd as i32,
+                                    );
+                                }
                             }
                         }
                     }

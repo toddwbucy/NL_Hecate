@@ -83,6 +83,7 @@ impl EdgeConfig {
             self_generated_values: false,
             self_ref_chunk_size: 1,
                     residual: false,
+            tape_strategies: Vec::new(),
 }
     }
 

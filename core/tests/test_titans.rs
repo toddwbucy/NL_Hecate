@@ -234,6 +234,7 @@ fn test_titans_vs_delta() {
                 residual: false,
                 b_alpha_init: vec![],
                 b_theta_init: vec![],
+                tape_strategies: Vec::new(),
 };
     let cfg_titans = MAGConfig {
         swa: swa.clone(), memory_enabled: true,
@@ -268,6 +269,7 @@ fn test_titans_vs_delta() {
                 residual: false,
                 b_alpha_init: vec![],
                 b_theta_init: vec![],
+                tape_strategies: Vec::new(),
 };
 
     let input_ids: Vec<usize> = (0..swa.seq_len).map(|t| t % swa.vocab_size).collect();
@@ -392,6 +394,7 @@ fn test_titans_m_norm_clamp_cpu() {
             residual: false,
             b_alpha_init: vec![],
             b_theta_init: vec![],
+            tape_strategies: Vec::new(),
 };
 
     let params = MAGParams::init(&cfg, 42);

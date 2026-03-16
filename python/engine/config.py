@@ -126,6 +126,11 @@ class BuildConfig:
     # N = N cycles (deeper gradient flow, more memory).
     tape_multiplier: int = 1
 
+    # Per-level tape strategy (spec 27): controls M/S trajectory in backward.
+    # Empty = auto (L0=exact, L1+=proxy). If set, length must equal k.
+    # "exact" = full M trajectory. "proxy" = M_final only (truncated BPTT).
+    tape_strategies: list = field(default_factory=list)
+
     # Batching
     batch_size: int = 1  # number of sequences per step (GPU batching)
 

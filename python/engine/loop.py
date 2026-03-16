@@ -349,6 +349,7 @@ def run_build(bcfg: BuildConfig):
                     if bcfg.b_theta_init is not None
                     else getattr(cfg, "b_theta_init", None)
                 ),
+                tape_strategies=(bcfg.tape_strategies or list(getattr(cfg, "tape_strategies", []))),
             )
             if _stacked_params_json is not None:
                 # Stacked extend_k (spec 22): per-block level shift
@@ -453,6 +454,7 @@ def run_build(bcfg: BuildConfig):
                     if bcfg.b_theta_init is not None
                     else getattr(cfg, "b_theta_init", None)
                 ),
+                tape_strategies=(bcfg.tape_strategies or list(getattr(cfg, "tape_strategies", []))),
             )
             if _stacked_params_json is not None:
                 result = nl_hecate.extend_stacked_clone(
@@ -576,6 +578,7 @@ def run_build(bcfg: BuildConfig):
                     if bcfg.b_theta_init is not None
                     else getattr(cfg, "b_theta_init", None)
                 ),
+                tape_strategies=(bcfg.tape_strategies or list(getattr(cfg, "tape_strategies", []))),
             )
     else:
         cfg = nl_hecate.MAGConfig(
@@ -612,6 +615,7 @@ def run_build(bcfg: BuildConfig):
             residual=bcfg.residual,
             b_alpha_init=bcfg.b_alpha_init,
             b_theta_init=bcfg.b_theta_init,
+            tape_strategies=bcfg.tape_strategies,
         )
         params = nl_hecate.mag_init_params(cfg, bcfg.seed)
         if bcfg.donor_weights is not None:
@@ -1029,6 +1033,7 @@ def run_build(bcfg: BuildConfig):
                         if bcfg.b_theta_init is not None
                         else getattr(cfg, "b_theta_init", None)
                     ),
+                    tape_strategies=(bcfg.tape_strategies or list(getattr(cfg, "tape_strategies", []))),
                 )
         elif (bcfg.gate_warmup_theta_floor_init is not None
               and step == bcfg.gate_warmup_decay_steps):
@@ -1074,6 +1079,7 @@ def run_build(bcfg: BuildConfig):
                         if bcfg.b_theta_init is not None
                         else getattr(cfg, "b_theta_init", None)
                     ),
+                    tape_strategies=(bcfg.tape_strategies or list(getattr(cfg, "tape_strategies", []))),
                 )
 
         use_cosine = (adamw_opt is not None or use_adamw_gpu)
@@ -1870,6 +1876,7 @@ def run_build(bcfg: BuildConfig):
                     if bcfg.b_theta_init is not None
                     else getattr(cfg, "b_theta_init", None)
                 ),
+                tape_strategies=(bcfg.tape_strategies or list(getattr(cfg, "tape_strategies", []))),
             )
 
             # Push-up: shift trained levels to slower frequencies, fresh L0

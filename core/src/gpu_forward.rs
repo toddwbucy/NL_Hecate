@@ -14,7 +14,7 @@ use crate::gpu_buf::GpuBuf;
 #[cfg(feature = "cuda")]
 use crate::gpu_params::{GpuMAGParams, GpuContextState};
 #[cfg(feature = "cuda")]
-use crate::model::{MAGConfig, MemoryRuleKind};
+use crate::model::{MAGConfig, MemoryRuleKind, LevelTapeStrategy};
 #[cfg(feature = "cuda")]
 use crate::conductor::Pulse;
 #[cfg(feature = "cuda")]
@@ -1354,6 +1354,8 @@ pub(crate) fn gpu_tnt_forward(
         let m_initial_slice = m_broadcast.slice(0, n_batch * dd);
         let mut y_local = GpuBuf::zeros(padded_len * d);
 
+        let is_proxy = cfg.tape_strategy_for_level(level) == LevelTapeStrategy::Proxy;
+
         let inner_cache = match cfg.memory_rule {
             MemoryRuleKind::TitansLMM => {
                 // Compute eta gate for shard tokens (unpadded first, then pad)
@@ -1378,6 +1380,7 @@ pub(crate) fn gpu_tnt_forward(
 
                 let s_initial_buf = GpuBuf::zeros(n_batch * dd);
                 let s_initial_slice = s_initial_buf.slice(0, n_batch * dd);
+                // Spec 27: full trajectory for exact levels, full for forward then extract final for proxy
                 let mut m_states = GpuBuf::zeros(n_batch * (cl + 1) * dd);
                 let mut s_states = GpuBuf::zeros(n_batch * (cl + 1) * dd);
                 crate::dispatch::titans_forward_dd(
@@ -1387,11 +1390,43 @@ pub(crate) fn gpu_tnt_forward(
                     &mut m_states, &mut s_states, &mut y_local, cl, d, n_batch,
                     cfg.error_clip_for_level(level),
                 );
-                GpuMemoryCache::Titans {
-                    k_mem: k_mem_b, v_mem: v_mem_b, q_mem: q_mem_b,
-                    alpha: alpha_b, theta: theta_b, eta: eta_b,
-                    m_states, s_states,
-                    k_norms: shard_k_norms.dup(), q_norms: shard_q_norms.dup(),
+
+                if is_proxy {
+                    // Spec 27 proxy: extract M_final and S_final, discard full trajectory.
+                    // M_final is at offset cl*dd per batch element (last timestep of trajectory).
+                    let mut m_final = GpuBuf::zeros(n_batch * dd);
+                    let mut s_final = GpuBuf::zeros(n_batch * dd);
+                    for b in 0..n_batch {
+                        unsafe {
+                            let rc = gpu_buf_memcpy_d2d(
+                                (m_final.ptr() as *mut u8).add(b * dd * 4) as *mut _,
+                                (m_states.as_ptr() as *const u8).add((b * (cl + 1) + cl) * dd * 4) as *const _,
+                                dd * 4,
+                            );
+                            assert_eq!(rc, 0, "TNT proxy M_final copy failed");
+                            let rc = gpu_buf_memcpy_d2d(
+                                (s_final.ptr() as *mut u8).add(b * dd * 4) as *mut _,
+                                (s_states.as_ptr() as *const u8).add((b * (cl + 1) + cl) * dd * 4) as *const _,
+                                dd * 4,
+                            );
+                            assert_eq!(rc, 0, "TNT proxy S_final copy failed");
+                        }
+                    }
+                    // Return Titans cache with m_states/s_states containing only finals.
+                    // Backward will detect proxy via cfg.tape_strategy_for_level().
+                    GpuMemoryCache::Titans {
+                        k_mem: k_mem_b, v_mem: v_mem_b, q_mem: q_mem_b,
+                        alpha: alpha_b, theta: theta_b, eta: eta_b,
+                        m_states: m_final, s_states: s_final,
+                        k_norms: shard_k_norms.dup(), q_norms: shard_q_norms.dup(),
+                    }
+                } else {
+                    GpuMemoryCache::Titans {
+                        k_mem: k_mem_b, v_mem: v_mem_b, q_mem: q_mem_b,
+                        alpha: alpha_b, theta: theta_b, eta: eta_b,
+                        m_states, s_states,
+                        k_norms: shard_k_norms.dup(), q_norms: shard_q_norms.dup(),
+                    }
                 }
             }
             MemoryRuleKind::DeltaRule => {
@@ -1402,10 +1437,31 @@ pub(crate) fn gpu_tnt_forward(
                     &m_initial_slice, &mut m_states, &mut y_local, cl, d, n_batch,
                     cfg.error_clip_for_level(level),
                 );
-                GpuMemoryCache::Delta {
-                    k_mem: k_mem_b, v_mem: v_mem_b, q_mem: q_mem_b,
-                    alpha: alpha_b, theta: theta_b, m_states,
-                    k_norms: shard_k_norms.dup(), q_norms: shard_q_norms.dup(),
+
+                if is_proxy {
+                    // Spec 27 proxy: extract M_final only, discard full trajectory.
+                    let mut m_final = GpuBuf::zeros(n_batch * dd);
+                    for b in 0..n_batch {
+                        unsafe {
+                            let rc = gpu_buf_memcpy_d2d(
+                                (m_final.ptr() as *mut u8).add(b * dd * 4) as *mut _,
+                                (m_states.as_ptr() as *const u8).add((b * (cl + 1) + cl) * dd * 4) as *const _,
+                                dd * 4,
+                            );
+                            assert_eq!(rc, 0, "TNT proxy M_final copy failed");
+                        }
+                    }
+                    GpuMemoryCache::Delta {
+                        k_mem: k_mem_b, v_mem: v_mem_b, q_mem: q_mem_b,
+                        alpha: alpha_b, theta: theta_b, m_states: m_final,
+                        k_norms: shard_k_norms.dup(), q_norms: shard_q_norms.dup(),
+                    }
+                } else {
+                    GpuMemoryCache::Delta {
+                        k_mem: k_mem_b, v_mem: v_mem_b, q_mem: q_mem_b,
+                        alpha: alpha_b, theta: theta_b, m_states,
+                        k_norms: shard_k_norms.dup(), q_norms: shard_q_norms.dup(),
+                    }
                 }
             }
             _ => unreachable!(), // asserted above
