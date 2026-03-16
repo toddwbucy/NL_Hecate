@@ -763,30 +763,33 @@ pub(crate) fn gpu_memory_backward(
         GpuMemoryCache::TNT {
             shard_inner_caches, shard_y_bufs, k_summaries, v_summaries,
             global_m_before, global_chunk_size, local_chunk_size,
+            total_shards, first_retained_shard,
         } => {
             assert_eq!(batch_size, 1, "TNT backward currently supports batch_size=1 only");
             let cg = *global_chunk_size;
             let cl = *local_chunk_size;
-            let num_shards = shard_inner_caches.len();
+            let n_total = *total_shards;
+            let first_ret = *first_retained_shard;
+            let n_retained = shard_inner_caches.len();
 
             // Accumulators for projection weight grads across all shards
             let mut d_k_mem_total = GpuBuf::<f32>::zeros(s * d);
             let mut d_v_mem_total = GpuBuf::<f32>::zeros(s * d);
             let mut d_q_mem_total = GpuBuf::<f32>::zeros(s * d);
-            // Note: d_alpha/d_theta/d_eta per-shard grads feed directly into gate_backward
-            // for per-shard gate weight grads, accumulated via tmp buffers + saxpy into level_grads.
 
-            // Reverse shard iteration: propagate d_m through global updates
-            // Start with zero d_m_carry (no downstream gradient past last shard)
+            // Reverse shard iteration: propagate d_m through global updates.
+            // Global M backward runs over ALL shards (summaries are retained for all).
+            // Inner backward only runs for retained shards (gradient truncation for evicted ones).
             let mut d_m_carry = GpuBuf::zeros(dd);
 
-            for shard_idx in (0..num_shards).rev() {
+            for shard_idx in (0..n_total).rev() {
                 let shard_start = shard_idx * cg;
                 let shard_end = (shard_start + cg).min(s);
                 let shard_len = shard_end - shard_start;
                 let n_batch = (shard_len + cl - 1) / cl;
 
-                // Step 1: Backward through global M update
+                // Step 1: Backward through global M update (runs for ALL shards —
+                // summaries are retained even for evicted shards).
                 // Forward: m_new = alpha * m_old + v_sum ⊗ k_sum
                 // d_m_new = d_m_carry (gradient from subsequent shards)
                 let mut d_m_old = GpuBuf::zeros(dd);
@@ -797,18 +800,27 @@ pub(crate) fn gpu_memory_backward(
                     &mut d_m_old, &mut d_k_sum, &mut d_v_sum, d, 0.95,
                 );
 
+                // Spec 25: check if this shard's inner cache was retained.
+                // Evicted shards (shard_idx < first_ret) only contribute global M gradients.
+                // Inner backward (projection/gate grads, local M grads) is truncated.
+                if shard_idx < first_ret {
+                    // Gradient truncation: only global M backward for evicted shards.
+                    // Still propagate d_m_carry so the global chain rule is complete.
+                    d_m_carry = d_m_old;
+                    continue;
+                }
+
+                // Map absolute shard_idx to the retained cache index.
+                let cache_idx = shard_idx - first_ret;
+
                 // Step 2: Backward through shard summary mean
-                // d_local_y_global = backward of mean(local_y) → d_k_sum, d_v_sum
                 let mut d_local_y_global = GpuBuf::zeros(shard_len * d);
                 crate::dispatch::tnt_shard_summary_mean_backward_dd(
                     &d_k_sum, &d_v_sum, &mut d_local_y_global, shard_len, d,
                 );
 
                 // Step 3: Combine upstream d_y with d_local_y from global path
-                // d_y_combined[t] = d_y[t] + d_local_y_global[t]
                 let d_y_shard_slice = d_y.slice(shard_start * d, shard_len * d);
-
-                // Combine upstream d_y with d_local_y_global: d_y_combined = upstream + global
                 let mut d_y_upstream_shard = GpuBuf::zeros(shard_len * d);
                 unsafe {
                     let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
@@ -842,19 +854,16 @@ pub(crate) fn gpu_memory_backward(
                 };
 
                 // Step 5: Run inner backward kernel (Titans/Delta with batch_size=n_batch)
-                let inner_cache = &shard_inner_caches[shard_idx];
+                let inner_cache = &shard_inner_caches[cache_idx];
                 let shard_tokens = padded_len;
                 let mut d_k_shard = GpuBuf::zeros(shard_tokens * d);
                 let mut d_v_shard = GpuBuf::zeros(shard_tokens * d);
                 let mut d_q_shard = GpuBuf::zeros(shard_tokens * d);
                 let mut d_alpha_shard = GpuBuf::zeros(shard_tokens);
                 let mut d_theta_shard = GpuBuf::zeros(shard_tokens);
-                // d_eta_shard hoisted out of match for use in gate backward (Step 7)
                 let mut d_eta_shard = GpuBuf::zeros(shard_tokens);
                 let has_eta = matches!(inner_cache, GpuMemoryCache::Titans { .. });
 
-                // Extract k/q norms and normalized k/q refs for Step 5b (L2 backward),
-                // avoiding a redundant rematch after the inner backward kernel.
                 let (shard_k_norms, shard_q_norms, shard_k_mem, shard_q_mem) = match inner_cache {
                     GpuMemoryCache::Titans { k_mem, q_mem, k_norms, q_norms, .. } => (k_norms, q_norms, k_mem, q_mem),
                     GpuMemoryCache::Delta { k_mem, q_mem, k_norms, q_norms, .. } => (k_norms, q_norms, k_mem, q_mem),
@@ -876,9 +885,6 @@ pub(crate) fn gpu_memory_backward(
                             cfg.error_clip_for_level(level),
                         );
 
-                        // Reduce per-local d_m_initial → shared global M gradient.
-                        // Forward broadcasts one global_m to N copies; backward must
-                        // sum all N local d_m_initial slices back into d_m_old.
                         for b in 0..n_batch {
                             unsafe {
                                 crate::cuda_ffi::saxpy_cuda(
@@ -899,7 +905,6 @@ pub(crate) fn gpu_memory_backward(
                             cfg.error_clip_for_level(level),
                         );
 
-                        // Reduce per-local d_m_initial → shared global M gradient.
                         for b in 0..n_batch {
                             unsafe {
                                 crate::cuda_ffi::saxpy_cuda(
@@ -938,8 +943,6 @@ pub(crate) fn gpu_memory_backward(
                 }
 
                 // Step 5b: L2 normalization backward for k/q per shard.
-                // d_k_shard/d_q_shard are gradients w.r.t. normalized k/q from the inner
-                // backward kernel. Transform to gradients w.r.t. raw projections.
                 {
                     let mut d_k_raw = GpuBuf::zeros(shard_tokens * d);
                     let mut d_q_raw = GpuBuf::zeros(shard_tokens * d);
@@ -958,7 +961,6 @@ pub(crate) fn gpu_memory_backward(
                 }
 
                 // Step 6: Accumulate unpadded shard gradients into full-sequence totals.
-                // Only copy the first shard_len elements (skip zero-padding from last chunk).
                 unsafe {
                     crate::cuda_ffi::saxpy_cuda(
                         1.0, d_k_shard.as_ptr(), d_k_mem_total.ptr().add(shard_start * d),
@@ -975,8 +977,6 @@ pub(crate) fn gpu_memory_backward(
                 }
 
                 // Step 7: Gate backward per shard → temp buffers → accumulate into level_grads.
-                // gate_backward_cuda OVERWRITES output buffers (not +=), so we write to
-                // temporaries and saxpy-add into level_grads after each shard.
                 {
                     let mut tmp_dw_alpha = GpuBuf::zeros(2 * d);
                     let mut tmp_db_alpha = GpuBuf::zeros(1);
@@ -1013,7 +1013,6 @@ pub(crate) fn gpu_memory_backward(
                         _ => unreachable!(),
                     }
 
-                    // Accumulate temp gate grads into level_grads (saxpy: dst += 1.0 * src)
                     unsafe {
                         crate::cuda_ffi::saxpy_cuda(1.0, tmp_dw_alpha.as_ptr(), level_grads.d_w_alpha.ptr(), (2 * d) as i32);
                         crate::cuda_ffi::saxpy_cuda(1.0, tmp_db_alpha.as_ptr(), level_grads.d_b_alpha.ptr(), 1);
@@ -1027,7 +1026,6 @@ pub(crate) fn gpu_memory_backward(
                 }
 
                 // Step 8: Propagate d_m_carry backward
-                // d_m_carry for the previous shard = d_m_old from this shard
                 d_m_carry = d_m_old;
             }
 

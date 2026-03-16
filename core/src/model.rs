@@ -713,11 +713,12 @@ pub struct MAGConfig {
     /// Some(C) = store M every C steps, recompute during backward.
     #[serde(default)]
     pub checkpoint_interval: Option<usize>,
-    /// Tape multiplier (spec 25): controls intra-chunk checkpoint density.
-    /// 1 = boundary-only (minimum memory), N = N checkpoints per chunk.
-    /// None or 0 = full trajectory (current behavior, backward compatible).
-    #[serde(default)]
-    pub tape_multiplier: Option<usize>,
+    /// Tape multiplier (spec 25): how many CMS cycles of cache to retain.
+    /// 1 = one cycle (default, minimum for backward).
+    /// N = N cycles (deeper gradient flow, more memory).
+    /// The tape is required for backward — this is not optional.
+    #[serde(default = "default_tape_multiplier")]
+    pub tape_multiplier: usize,
     /// HOPE §6 level-level composition variant. Determines how CMS levels
     /// interact with each other. Default: FreqGated (Variant 2).
     #[serde(default = "default_hope_variant")]
@@ -825,6 +826,8 @@ pub struct MAGConfig {
 
 fn default_one() -> usize { 1 }
 
+fn default_tape_multiplier() -> usize { 1 }
+
 fn default_false() -> bool { false }
 
 fn default_sign_sharpness() -> f32 { 10.0 }
@@ -864,22 +867,42 @@ impl MAGConfig {
         self.error_clip.get(level).copied().unwrap_or(0.0)
     }
 
-    /// Spec 25: compute per-level checkpoint interval from tape_multiplier.
-    /// Returns None when every token should be stored (full trajectory),
-    /// Some(interval) when checkpointed storage should be used.
-    pub fn effective_checkpoint_interval(&self, level: usize) -> Option<usize> {
-        match self.tape_multiplier {
-            None | Some(0) => self.checkpoint_interval,
-            Some(m) => {
-                let chunk_size = self.chunk_sizes.get(level).copied().unwrap_or(1);
-                let interval = (chunk_size / m).max(1);
-                if interval > 1 {
-                    Some(interval)
-                } else {
-                    None // full trajectory — every token is a checkpoint
-                }
-            }
-        }
+    /// Spec 25: the period of the slowest active CMS level.
+    /// One cycle = max(chunk_sizes[0..k]). For k=2 [1,8] → 8 tokens.
+    /// For k=4 [1,8,64,512] → 512 tokens. For k=1 [1] → 1 token.
+    pub fn cycle_length(&self) -> usize {
+        self.chunk_sizes.iter().take(self.k).copied().max().unwrap_or(1)
+    }
+
+    /// Spec 25: how many TNT shards to retain in the cache window.
+    /// retained_shards = ceil(tape_multiplier * cycle_length / shard_size), min 1.
+    /// When cycle_length >= shard_size (e.g. k=4), retained_shards >= tape_multiplier.
+    pub fn retained_shards(&self, shard_size: usize) -> usize {
+        let window_tokens = self.tape_multiplier * self.cycle_length();
+        ((window_tokens + shard_size - 1) / shard_size).max(1)
+    }
+
+    /// Spec 25: deterministic tape budget in bytes from model config.
+    /// tape_bytes = n_blocks × k × retained_cycles × per_cycle_cache
+    pub fn tape_budget_bytes(&self, n_blocks: usize) -> usize {
+        let cl = self.cycle_length();
+        let d = self.swa.d_model / self.swa.num_heads; // head_dim
+        let dd = d * d;
+        let per_cycle = 2 * dd * 4                // M + S boundary states
+                      + cl * d * 3 * 4            // projections (k, v, q)
+                      + cl * 3 * 4                // gates (alpha, theta, eta)
+                      + cl * 2 * 4;               // k_norms, q_norms
+        let seq_len = self.swa.seq_len;
+        let cycles_in_seq = if cl > 0 { seq_len / cl } else { seq_len };
+        let retained = self.tape_multiplier.min(cycles_in_seq.max(1));
+        n_blocks * self.k * retained * per_cycle
+    }
+
+    /// Returns the checkpoint interval for memory rules within a shard/segment.
+    /// None = store full M trajectory (every token), Some(C) = store every C steps.
+    /// Uses checkpoint_interval if explicitly set, otherwise None (full trajectory).
+    pub fn effective_checkpoint_interval(&self, _level: usize) -> Option<usize> {
+        self.checkpoint_interval
     }
 }
 
@@ -950,7 +973,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
-            tape_multiplier: None,
+            tape_multiplier: 1,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
@@ -997,7 +1020,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
-            tape_multiplier: None,
+            tape_multiplier: 1,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
@@ -1044,7 +1067,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
-            tape_multiplier: None,
+            tape_multiplier: 1,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
@@ -1092,7 +1115,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
-            tape_multiplier: None,
+            tape_multiplier: 1,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
@@ -1140,7 +1163,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
-            tape_multiplier: None,
+            tape_multiplier: 1,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
@@ -1188,7 +1211,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
-            tape_multiplier: None,
+            tape_multiplier: 1,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
@@ -1235,7 +1258,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
-            tape_multiplier: None,
+            tape_multiplier: 1,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
@@ -1282,7 +1305,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
-            tape_multiplier: None,
+            tape_multiplier: 1,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
@@ -1329,7 +1352,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
-            tape_multiplier: None,
+            tape_multiplier: 1,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
@@ -1376,7 +1399,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
-            tape_multiplier: None,
+            tape_multiplier: 1,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
@@ -1433,7 +1456,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
-            tape_multiplier: None,
+            tape_multiplier: 1,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
@@ -1490,7 +1513,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
-            tape_multiplier: None,
+            tape_multiplier: 1,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
@@ -1547,7 +1570,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
-            tape_multiplier: None,
+            tape_multiplier: 1,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
@@ -1604,7 +1627,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
-            tape_multiplier: None,
+            tape_multiplier: 1,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
@@ -1661,7 +1684,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
-            tape_multiplier: None,
+            tape_multiplier: 1,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
@@ -1718,7 +1741,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
-            tape_multiplier: None,
+            tape_multiplier: 1,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
@@ -1766,7 +1789,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
-            tape_multiplier: None,
+            tape_multiplier: 1,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
@@ -1814,7 +1837,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
-            tape_multiplier: None,
+            tape_multiplier: 1,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
@@ -1865,7 +1888,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
-            tape_multiplier: None,
+            tape_multiplier: 1,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
@@ -1916,7 +1939,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
-            tape_multiplier: None,
+            tape_multiplier: 1,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
@@ -1963,7 +1986,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
-            tape_multiplier: None,
+            tape_multiplier: 1,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
@@ -2010,7 +2033,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
-            tape_multiplier: None,
+            tape_multiplier: 1,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
@@ -2057,7 +2080,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
-            tape_multiplier: None,
+            tape_multiplier: 1,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
@@ -2104,7 +2127,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
-            tape_multiplier: None,
+            tape_multiplier: 1,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
@@ -2152,7 +2175,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
-            tape_multiplier: None,
+            tape_multiplier: 1,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
@@ -2199,7 +2222,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Fixed,
             checkpoint_interval: None,
-            tape_multiplier: None,
+            tape_multiplier: 1,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
@@ -2247,7 +2270,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Learned(LearnedFreqConfig::default()),
             checkpoint_interval: None,
-            tape_multiplier: None,
+            tape_multiplier: 1,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,
@@ -2295,7 +2318,7 @@ impl MAGConfig {
             m3: None,
             frequency_schedule: FrequencySchedule::Learned(LearnedFreqConfig::default()),
             checkpoint_interval: None,
-            tape_multiplier: None,
+            tape_multiplier: 1,
             hope_variant: HopeVariant::FreqGated,
             lattice_variant: LatticeVariant::Decode,
             n_persistent: 0,

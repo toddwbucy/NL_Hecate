@@ -55,7 +55,7 @@ fn delta_k1_config(fm: FeatureMapKind) -> MAGConfig {
         m3: None,
         frequency_schedule: FrequencySchedule::Fixed,
         checkpoint_interval: None,
-        tape_multiplier: None,
+        tape_multiplier: 1,
         hope_variant: HopeVariant::FreqGated,
         lattice_variant: LatticeVariant::Decode,
         n_persistent: 0,

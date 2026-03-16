@@ -187,19 +187,25 @@ pub enum GpuMemoryCache {
     /// TNT hierarchical — per-shard inner caches + global state trajectory.
     /// The inner caches are Titans/Delta/etc. caches, one per shard.
     TNT {
-        /// Inner memory cache per shard (Titans/Delta/Hebbian variant).
+        /// Inner memory cache per retained shard (Titans/Delta/Hebbian variant).
+        /// Length = min(total_shards, retained_shards). Older shards are evicted
+        /// during forward when the cycle-scoped retention window is exceeded.
         shard_inner_caches: Vec<GpuMemoryCache>,
-        /// Local outputs per shard [shard_len, d] — needed for summary backward.
+        /// Local outputs per retained shard [shard_len, d] — needed for summary backward.
         shard_y_bufs: Vec<GpuBuf<f32>>,
-        /// Summary key vectors [d] per shard.
+        /// Summary key vectors [d] per shard (ALL shards — needed for global M backward).
         k_summaries: Vec<GpuBuf<f32>>,
-        /// Summary value vectors [d] per shard.
+        /// Summary value vectors [d] per shard (ALL shards — needed for global M backward).
         v_summaries: Vec<GpuBuf<f32>>,
-        /// Global M state BEFORE each shard update [d*d] per shard (num_shards entries).
+        /// Global M state BEFORE each shard update [d*d] per shard (ALL shards).
         global_m_before: Vec<GpuBuf<f32>>,
         /// TNT config: global_chunk_size, local_chunk_size.
         global_chunk_size: usize,
         local_chunk_size: usize,
+        /// Total number of shards in the sequence (may exceed retained count).
+        total_shards: usize,
+        /// Index of the first retained shard (0-based). Shards before this were evicted.
+        first_retained_shard: usize,
     },
 }
 
@@ -669,10 +675,10 @@ pub fn gpu_cms_forward(
         let is_tnt_mode = cfg.parallel.as_ref()
             .map(|p| p.strategy == ParallelStrategy::TNTHierarchical)
             .unwrap_or(false);
-        // Spec 25: tape_multiplier routes levels to Ckpt path, which is incompatible
-        // with CUDA graph capture. Disable capture if any level would use Ckpt.
+        // Spec 25: tape_multiplier is always >= 1, and cycle-scoped cache management
+        // is incompatible with CUDA graph capture. Disable capture.
         let has_ckpt = cfg.checkpoint_interval.is_some()
-            || cfg.tape_multiplier.map_or(false, |m| m > 0);
+            || cfg.tape_multiplier >= 1;
         let can_capture = !cfg.residual
             && matches!(cfg.memory_rule, MemoryRuleKind::DeltaRule | MemoryRuleKind::TitansLMM)
             && !has_ckpt
@@ -1047,8 +1053,9 @@ pub(crate) fn gpu_memory_forward(
     let m_norm_max = cfg.max_m_norm(level);
 
     // Spec 25: boundary-scoped Wengert tape. Use effective_checkpoint_interval
-    // which accounts for tape_multiplier — derives per-level intervals from chunk_sizes.
-    // When tape_multiplier is None/0, falls back to cfg.checkpoint_interval (legacy).
+    // Spec 25: effective_checkpoint_interval returns checkpoint_interval if explicitly set,
+    // otherwise None (full trajectory within each shard). Cycle-scoped eviction is handled
+    // at the shard level in gpu_tnt_forward, not within gpu_memory_forward.
     let eff_ckpt = cfg.effective_checkpoint_interval(level);
 
     match (eff_ckpt, cfg.memory_rule) {
@@ -1241,12 +1248,15 @@ pub(crate) fn gpu_tnt_forward(
     // Full output buffer: [s, d]
     let mut y_full = GpuBuf::<f32>::zeros(s * d);
 
-    // Per-shard caches for backward
-    let mut shard_inner_caches = Vec::with_capacity(num_shards);
-    let mut shard_y_bufs = Vec::with_capacity(num_shards);
+    // Spec 25: cycle-scoped cache retention — only keep the last N shards' inner caches.
+    // Summaries and global_m_before are kept for ALL shards (O(d) each, needed for global backward).
+    let max_retained = cfg.retained_shards(cg);
+    let mut shard_inner_caches = Vec::with_capacity(max_retained.min(num_shards));
+    let mut shard_y_bufs = Vec::with_capacity(max_retained.min(num_shards));
     let mut k_summaries = Vec::with_capacity(num_shards);
     let mut v_summaries = Vec::with_capacity(num_shards);
     let mut global_m_before = Vec::with_capacity(num_shards);
+    let mut n_shards_dropped: usize = 0;
 
     for shard_idx in 0..num_shards {
         let shard_start = shard_idx * cg;
@@ -1458,16 +1468,27 @@ pub(crate) fn gpu_tnt_forward(
             crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d_i32, m_norm_max);
         }
 
-        // Save caches for backward
+        // Save caches for backward — inner caches and y_bufs are cycle-scoped,
+        // summaries and global_m_before are kept for all shards (global backward needs them).
         shard_inner_caches.push(inner_cache);
         shard_y_bufs.push(shard_y);
         k_summaries.push(k_sum);
         v_summaries.push(v_sum);
+
+        // Spec 25: rolling eviction — drop oldest inner cache when retention window exceeded.
+        // Summaries/global_m_before are NOT evicted (O(d) each, needed for global M backward).
+        while shard_inner_caches.len() > max_retained {
+            shard_inner_caches.remove(0);
+            shard_y_bufs.remove(0);
+            n_shards_dropped += 1;
+        }
     }
 
+    let first_retained = n_shards_dropped;
     (y_full, GpuMemoryCache::TNT {
         shard_inner_caches, shard_y_bufs, k_summaries, v_summaries,
         global_m_before, global_chunk_size: cg, local_chunk_size: cl,
+        total_shards: num_shards, first_retained_shard: first_retained,
     })
 }
 
