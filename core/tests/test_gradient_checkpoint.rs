@@ -58,6 +58,7 @@ fn make_config(rule: MemoryRuleKind, checkpoint_interval: Option<usize>) -> MAGC
                 residual: false,
                 b_alpha_init: vec![],
                 b_theta_init: vec![],
+                tape_strategies: Vec::new(),
 }
 }
 

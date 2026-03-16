@@ -126,6 +126,11 @@ class BuildConfig:
     # N = N cycles (deeper gradient flow, more memory).
     tape_multiplier: int = 1
 
+    # Per-level tape strategy (spec 27): controls M/S trajectory in backward.
+    # None/empty = auto (L0=exact, L1+=proxy). If set, length must equal k.
+    # "exact" = full M trajectory. "proxy" = M_final only (truncated BPTT).
+    tape_strategies: list | None = None
+
     # Batching
     batch_size: int = 1  # number of sequences per step (GPU batching)
 
@@ -239,6 +244,12 @@ class BuildConfig:
         if not isinstance(self.tape_multiplier, int) or self.tape_multiplier < 1:
             raise ValueError(
                 f"tape_multiplier must be an int >= 1, got {self.tape_multiplier!r}")
+        # Spec 27: normalize tape_strategies
+        if self.tape_strategies is None:
+            self.tape_strategies = []
+        if self.tape_strategies and len(self.tape_strategies) != self.k:
+            raise ValueError(
+                f"tape_strategies length ({len(self.tape_strategies)}) must equal k ({self.k})")
         if self.momentum_d_hidden < 0:
             raise ValueError(
                 f"momentum_d_hidden must be >= 0, got {self.momentum_d_hidden}")

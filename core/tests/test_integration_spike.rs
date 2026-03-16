@@ -85,6 +85,7 @@ fn spike_config_a() -> MAGConfig {
                 residual: false,
                 b_alpha_init: vec![],
                 b_theta_init: vec![],
+                tape_strategies: Vec::new(),
 }
 }
 
@@ -134,6 +135,7 @@ fn spike_config_b() -> MAGConfig {
                 residual: false,
                 b_alpha_init: vec![],
                 b_theta_init: vec![],
+                tape_strategies: Vec::new(),
 }
 }
 
@@ -183,6 +185,7 @@ fn spike_config_c() -> MAGConfig {
                 residual: false,
                 b_alpha_init: vec![],
                 b_theta_init: vec![],
+                tape_strategies: Vec::new(),
 }
 }
 
@@ -802,6 +805,7 @@ fn sweep_config(rule: MemoryRuleKind, comp: CompositionKind, k: usize) -> MAGCon
                 residual: false,
                 b_alpha_init: vec![],
                 b_theta_init: vec![],
+                tape_strategies: Vec::new(),
 }
 }
 

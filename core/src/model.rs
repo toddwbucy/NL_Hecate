@@ -54,6 +54,20 @@ impl Default for MomentumKind {
     }
 }
 
+/// Per-level backward strategy for the M/S recurrence (spec 27).
+/// Does NOT affect the forward pass — only gradient computation.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum LevelTapeStrategy {
+    /// Full M+S trajectory stored. Exact gradients through M recurrence.
+    /// Cost: shard_size × d² per shard.
+    Exact,
+    /// M_final + S_final used as constants for all t within shard.
+    /// Truncated BPTT — no M recurrence gradient chain.
+    /// Outer-loop params still receive gradient through y_t = M_final @ k_t.
+    /// Cost: d² per shard (one M_final snapshot).
+    Proxy,
+}
+
 /// Which memory update rule to use for the inner loop.
 ///
 /// MIRAS Algorithm knob: selects the optimizer for memory updates.
@@ -719,6 +733,11 @@ pub struct MAGConfig {
     /// The tape is required for backward — this is not optional.
     #[serde(default = "default_tape_multiplier", deserialize_with = "deserialize_tape_multiplier")]
     pub tape_multiplier: usize,
+    /// Per-level tape strategy (spec 27): controls M/S trajectory storage in backward.
+    /// Exact = full trajectory (default for L0). Proxy = M_final only (default for L1+).
+    /// Empty = auto-assign (L0=Exact, L1+=Proxy). Length must equal k if non-empty.
+    #[serde(default)]
+    pub tape_strategies: Vec<LevelTapeStrategy>,
     /// HOPE §6 level-level composition variant. Determines how CMS levels
     /// interact with each other. Default: FreqGated (Variant 2).
     #[serde(default = "default_hope_variant")]
@@ -895,20 +914,53 @@ impl MAGConfig {
         ((window_tokens + shard_size - 1) / shard_size).max(1)
     }
 
-    /// Spec 25: deterministic tape budget in bytes from model config.
-    /// tape_bytes = n_blocks × k × retained_cycles × per_cycle_cache
+    /// Spec 25+27: deterministic tape budget in bytes from model config.
+    /// Accounts for per-level tape strategy: exact levels store full M+S trajectory,
+    /// proxy levels store only M_final + S_final (one d² snapshot each).
     pub fn tape_budget_bytes(&self, n_blocks: usize) -> usize {
         let cl = self.cycle_length();
-        let d = self.swa.d_model; // M states and projections are d_model-sized
+        let d = self.swa.d_model;
         let dd = d * d;
-        let per_cycle = cl * 2 * dd * 4            // M + S full trajectories (d_model² per step)
-                      + cl * d * 3 * 4            // projections (k, v, q) — d_model per token
-                      + cl * 3 * 4                // gates (alpha, theta, eta)
-                      + cl * 2 * 4;               // k_norms, q_norms
         let seq_len = self.swa.seq_len;
         let cycles_in_seq = if cl > 0 { (seq_len + cl - 1) / cl } else { seq_len };
         let retained = self.tape_multiplier.min(cycles_in_seq.max(1));
-        n_blocks * self.k * retained * per_cycle
+
+        let mut total = 0usize;
+        for level in 0..self.k {
+            let per_cycle = match self.tape_strategy_for_level(level) {
+                LevelTapeStrategy::Exact => {
+                    cl * 2 * dd * 4            // M + S full trajectories
+                    + cl * d * 3 * 4           // projections (k, v, q)
+                    + cl * 3 * 4               // gates (alpha, theta, eta)
+                    + cl * 2 * 4               // k_norms, q_norms
+                }
+                LevelTapeStrategy::Proxy => {
+                    2 * dd * 4                 // M_final + S_final only
+                    + cl * d * 3 * 4           // projections still stored
+                    + cl * 3 * 4               // gates still stored
+                    + cl * 2 * 4               // k_norms, q_norms
+                }
+            };
+            total += retained * per_cycle;
+        }
+        n_blocks * total
+    }
+
+    /// Spec 27: tape strategy for a given CMS level.
+    /// If tape_strategies is empty, uses default: L0=Exact, L1+=Proxy.
+    /// If tape_strategies is set, its length must equal k (validated here).
+    #[inline]
+    pub fn tape_strategy_for_level(&self, level: usize) -> LevelTapeStrategy {
+        if self.tape_strategies.is_empty() {
+            if level == 0 { LevelTapeStrategy::Exact } else { LevelTapeStrategy::Proxy }
+        } else {
+            assert_eq!(
+                self.tape_strategies.len(), self.k,
+                "tape_strategies length ({}) must equal k ({}) when non-empty",
+                self.tape_strategies.len(), self.k,
+            );
+            self.tape_strategies[level]
+        }
     }
 
     /// Returns the checkpoint interval for memory rules within a shard/segment.
@@ -1009,6 +1061,7 @@ impl MAGConfig {
             residual: false,
             b_alpha_init: vec![],
             b_theta_init: vec![],
+            tape_strategies: Vec::new(),
         }
     }
 
@@ -1056,6 +1109,7 @@ impl MAGConfig {
             residual: false,
             b_alpha_init: vec![],
             b_theta_init: vec![],
+            tape_strategies: Vec::new(),
         }
     }
 
@@ -1103,6 +1157,7 @@ impl MAGConfig {
             residual: false,
             b_alpha_init: vec![],
             b_theta_init: vec![],
+            tape_strategies: Vec::new(),
         }
     }
 
@@ -1151,6 +1206,7 @@ impl MAGConfig {
             residual: false,
             b_alpha_init: vec![],
             b_theta_init: vec![],
+            tape_strategies: Vec::new(),
         }
     }
 
@@ -1199,6 +1255,7 @@ impl MAGConfig {
             residual: false,
             b_alpha_init: vec![],
             b_theta_init: vec![],
+            tape_strategies: Vec::new(),
         }
     }
 
@@ -1247,6 +1304,7 @@ impl MAGConfig {
             residual: false,
             b_alpha_init: vec![],
             b_theta_init: vec![],
+            tape_strategies: Vec::new(),
         }
     }
 
@@ -1294,6 +1352,7 @@ impl MAGConfig {
             residual: false,
             b_alpha_init: vec![],
             b_theta_init: vec![],
+            tape_strategies: Vec::new(),
         }
     }
 
@@ -1341,6 +1400,7 @@ impl MAGConfig {
             residual: false,
             b_alpha_init: vec![],
             b_theta_init: vec![],
+            tape_strategies: Vec::new(),
         }
     }
 
@@ -1388,6 +1448,7 @@ impl MAGConfig {
             residual: false,
             b_alpha_init: vec![],
             b_theta_init: vec![],
+            tape_strategies: Vec::new(),
         }
     }
 
@@ -1435,6 +1496,7 @@ impl MAGConfig {
             residual: false,
             b_alpha_init: vec![],
             b_theta_init: vec![],
+            tape_strategies: Vec::new(),
         }
     }
 
@@ -1492,6 +1554,7 @@ impl MAGConfig {
             residual: false,
             b_alpha_init: vec![],
             b_theta_init: vec![],
+            tape_strategies: Vec::new(),
         }
     }
 
@@ -1549,6 +1612,7 @@ impl MAGConfig {
             residual: false,
             b_alpha_init: vec![],
             b_theta_init: vec![],
+            tape_strategies: Vec::new(),
         }
     }
 
@@ -1606,6 +1670,7 @@ impl MAGConfig {
             residual: false,
             b_alpha_init: vec![],
             b_theta_init: vec![],
+            tape_strategies: Vec::new(),
         }
     }
 
@@ -1663,6 +1728,7 @@ impl MAGConfig {
             residual: false,
             b_alpha_init: vec![],
             b_theta_init: vec![],
+            tape_strategies: Vec::new(),
         }
     }
 
@@ -1720,6 +1786,7 @@ impl MAGConfig {
             residual: false,
             b_alpha_init: vec![],
             b_theta_init: vec![],
+            tape_strategies: Vec::new(),
         }
     }
 
@@ -1777,6 +1844,7 @@ impl MAGConfig {
             residual: false,
             b_alpha_init: vec![],
             b_theta_init: vec![],
+            tape_strategies: Vec::new(),
         }
     }
 
@@ -1825,6 +1893,7 @@ impl MAGConfig {
             residual: false,
             b_alpha_init: vec![],
             b_theta_init: vec![],
+            tape_strategies: Vec::new(),
         }
     }
 
@@ -1873,6 +1942,7 @@ impl MAGConfig {
             residual: false,
             b_alpha_init: vec![],
             b_theta_init: vec![],
+            tape_strategies: Vec::new(),
         }
     }
 
@@ -1924,6 +1994,7 @@ impl MAGConfig {
             residual: false,
             b_alpha_init: vec![],
             b_theta_init: vec![],
+            tape_strategies: Vec::new(),
         }
     }
 
@@ -1975,6 +2046,7 @@ impl MAGConfig {
             residual: false,
             b_alpha_init: vec![],
             b_theta_init: vec![],
+            tape_strategies: Vec::new(),
         }
     }
 
@@ -2022,6 +2094,7 @@ impl MAGConfig {
             residual: false,
             b_alpha_init: vec![],
             b_theta_init: vec![],
+            tape_strategies: Vec::new(),
         }
     }
 
@@ -2069,6 +2142,7 @@ impl MAGConfig {
             residual: false,
             b_alpha_init: vec![],
             b_theta_init: vec![],
+            tape_strategies: Vec::new(),
         }
     }
 
@@ -2116,6 +2190,7 @@ impl MAGConfig {
             residual: false,
             b_alpha_init: vec![],
             b_theta_init: vec![],
+            tape_strategies: Vec::new(),
         }
     }
 
@@ -2163,6 +2238,7 @@ impl MAGConfig {
             residual: false,
             b_alpha_init: vec![],
             b_theta_init: vec![],
+            tape_strategies: Vec::new(),
         }
     }
 
@@ -2211,6 +2287,7 @@ impl MAGConfig {
             residual: false,
             b_alpha_init: vec![],
             b_theta_init: vec![],
+            tape_strategies: Vec::new(),
         }
     }
 
@@ -2258,6 +2335,7 @@ impl MAGConfig {
             residual: false,
             b_alpha_init: vec![],
             b_theta_init: vec![],
+            tape_strategies: Vec::new(),
         }
     }
 
@@ -2306,6 +2384,7 @@ impl MAGConfig {
             residual: false,
             b_alpha_init: vec![],
             b_theta_init: vec![],
+            tape_strategies: Vec::new(),
         }
     }
 
@@ -2354,6 +2433,7 @@ impl MAGConfig {
             residual: false,
             b_alpha_init: vec![],
             b_theta_init: vec![],
+            tape_strategies: Vec::new(),
         }
     }
 }

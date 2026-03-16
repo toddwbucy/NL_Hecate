@@ -336,6 +336,7 @@ fn test_mac_vs_mag() {
                 residual: false,
                 b_alpha_init: vec![],
                 b_theta_init: vec![],
+                tape_strategies: Vec::new(),
 };
     let cfg_mac = MAGConfig {
         swa: swa_mac, memory_enabled: true,
@@ -370,6 +371,7 @@ fn test_mac_vs_mag() {
                 residual: false,
                 b_alpha_init: vec![],
                 b_theta_init: vec![],
+                tape_strategies: Vec::new(),
 };
 
     let seq_len = 8;

@@ -379,6 +379,7 @@ fn tiny_delta_config() -> MAGConfig {
                 residual: false,
                 b_alpha_init: vec![],
                 b_theta_init: vec![],
+                tape_strategies: Vec::new(),
 }
 }
 

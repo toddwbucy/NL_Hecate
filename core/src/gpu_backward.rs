@@ -471,7 +471,7 @@ pub(crate) fn gpu_memory_backward(
     let bs_s = batch_size * s;
 
     match mem_cache {
-        GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states, k_norms, q_norms } => {
+        GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states, k_norms, q_norms, proxy, .. } => {
             let mut d_k_mem = GpuBuf::zeros(bsd);
             let mut d_v_mem = GpuBuf::zeros(bsd);
             let mut d_q_mem = GpuBuf::zeros(bsd);
@@ -479,9 +479,26 @@ pub(crate) fn gpu_memory_backward(
             let mut d_theta = GpuBuf::zeros(bs_s);
             let mut d_m_initial = GpuBuf::zeros(dd);
 
+            // Spec 27: proxy caches store only M_final — broadcast for backward kernel
+            let m_for_bw = if *proxy {
+                let mut m_bcast = GpuBuf::zeros(batch_size * (s + 1) * dd);
+                unsafe {
+                    let rc = crate::cuda_ffi::broadcast_fill_f32_cuda(
+                        m_bcast.ptr(), m_states.as_ptr(),
+                        i32::try_from(dd).expect("dd overflows i32"),
+                        i32::try_from(s + 1).expect("s+1 overflows i32"),
+                        i32::try_from(batch_size).expect("batch_size overflows i32"),
+                    );
+                    assert_eq!(rc, 0, "broadcast_fill_f32_cuda failed (rc={rc})");
+                }
+                m_bcast
+            } else {
+                m_states.dup()
+            };
+
             crate::dispatch::delta_backward_dd(
                 k_mem, v_mem, q_mem, alpha, theta,
-                m_states, d_y,
+                &m_for_bw, d_y,
                 &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
                 &mut d_alpha, &mut d_theta, &mut d_m_initial,
                 s, d, batch_size,
@@ -519,7 +536,7 @@ pub(crate) fn gpu_memory_backward(
                 level_grads, s, d, batch_size,
             )
         }
-        GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states, s_states, k_norms, q_norms } => {
+        GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states, s_states, k_norms, q_norms, proxy, .. } => {
             let mut d_k_mem = GpuBuf::zeros(bsd);
             let mut d_v_mem = GpuBuf::zeros(bsd);
             let mut d_q_mem = GpuBuf::zeros(bsd);
@@ -529,9 +546,33 @@ pub(crate) fn gpu_memory_backward(
             let mut d_m_initial = GpuBuf::zeros(dd);
             let mut d_s_initial = GpuBuf::zeros(dd);
 
+            // Spec 27: proxy caches store only M_final/S_final — broadcast for backward kernel
+            let (m_for_bw, s_for_bw) = if *proxy {
+                let mut m_bcast = GpuBuf::zeros(batch_size * (s + 1) * dd);
+                let mut s_bcast = GpuBuf::zeros(batch_size * (s + 1) * dd);
+                unsafe {
+                    let dd_i32 = i32::try_from(dd).expect("dd overflows i32");
+                    let slots_i32 = i32::try_from(s + 1).expect("s+1 overflows i32");
+                    let bs_i32 = i32::try_from(batch_size).expect("batch_size overflows i32");
+                    let rc = crate::cuda_ffi::broadcast_fill_f32_cuda(
+                        m_bcast.ptr(), m_states.as_ptr(),
+                        dd_i32, slots_i32, bs_i32,
+                    );
+                    assert_eq!(rc, 0, "broadcast_fill M failed (rc={rc})");
+                    let rc = crate::cuda_ffi::broadcast_fill_f32_cuda(
+                        s_bcast.ptr(), s_states.as_ptr(),
+                        dd_i32, slots_i32, bs_i32,
+                    );
+                    assert_eq!(rc, 0, "broadcast_fill S failed (rc={rc})");
+                }
+                (m_bcast, s_bcast)
+            } else {
+                (m_states.dup(), s_states.dup())
+            };
+
             crate::dispatch::titans_backward_dd(
                 k_mem, v_mem, q_mem, alpha, theta, eta,
-                m_states, s_states, d_y,
+                &m_for_bw, &s_for_bw, d_y,
                 &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
                 &mut d_alpha, &mut d_theta, &mut d_eta,
                 &mut d_m_initial, &mut d_s_initial,
@@ -876,14 +917,47 @@ pub(crate) fn gpu_memory_backward(
                     _ => unreachable!("TNT inner cache must be Titans or Delta"),
                 };
 
+                // Spec 27: derive proxy from the cache's layout flag (ground truth set at
+                // construction), not from cfg — the cache knows its own shape.
+                let is_proxy = match inner_cache {
+                    GpuMemoryCache::Titans { proxy, .. } | GpuMemoryCache::Delta { proxy, .. } => *proxy,
+                    _ => false,
+                };
+
                 match inner_cache {
                     GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states, s_states, .. } => {
                         let mut d_m_initial = GpuBuf::zeros(n_batch * dd);
                         let mut d_s_initial = GpuBuf::zeros(n_batch * dd);
 
+                        let (m_for_bw, s_for_bw) = if is_proxy {
+                            // Broadcast M_final/S_final into [(cl+1)*dd] per batch element
+                            // using a single CUDA kernel launch instead of nested host-driven copies.
+                            let mut m_bcast = GpuBuf::zeros(n_batch * (cl + 1) * dd);
+                            let mut s_bcast = GpuBuf::zeros(n_batch * (cl + 1) * dd);
+                            unsafe {
+                                let dd_i32 = i32::try_from(dd).expect("dd overflows i32");
+                                let slots_i32 = i32::try_from(cl + 1).expect("cl+1 overflows i32");
+                                let nb_i32 = i32::try_from(n_batch).expect("n_batch overflows i32");
+                                let rc = crate::cuda_ffi::broadcast_fill_f32_cuda(
+                                    m_bcast.ptr(), m_states.as_ptr(),
+                                    dd_i32, slots_i32, nb_i32,
+                                );
+                                assert_eq!(rc, 0, "broadcast_fill M failed (rc={rc})");
+                                let rc = crate::cuda_ffi::broadcast_fill_f32_cuda(
+                                    s_bcast.ptr(), s_states.as_ptr(),
+                                    dd_i32, slots_i32, nb_i32,
+                                );
+                                assert_eq!(rc, 0, "broadcast_fill S failed (rc={rc})");
+                            }
+                            (m_bcast, s_bcast)
+                        } else {
+                            // Exact: use stored trajectory directly (zero-copy reference via dup)
+                            (m_states.dup(), s_states.dup())
+                        };
+
                         crate::dispatch::titans_backward_dd(
                             k_mem, v_mem, q_mem, alpha, theta, eta,
-                            m_states, s_states, &d_y_padded,
+                            &m_for_bw, &s_for_bw, &d_y_padded,
                             &mut d_k_shard, &mut d_v_shard, &mut d_q_shard,
                             &mut d_alpha_shard, &mut d_theta_shard, &mut d_eta_shard,
                             &mut d_m_initial, &mut d_s_initial,
@@ -891,31 +965,52 @@ pub(crate) fn gpu_memory_backward(
                             cfg.error_clip_for_level(level),
                         );
 
-                        for b in 0..n_batch {
-                            unsafe {
-                                crate::cuda_ffi::saxpy_cuda(
-                                    1.0, d_m_initial.as_ptr().add(b * dd), d_m_old.ptr(), dd as i32,
-                                );
+                        if !is_proxy {
+                            // Only propagate d_m_initial for exact levels — proxy has no M chain
+                            for b in 0..n_batch {
+                                unsafe {
+                                    crate::cuda_ffi::saxpy_cuda(
+                                        1.0, d_m_initial.as_ptr().add(b * dd), d_m_old.ptr(), dd as i32,
+                                    );
+                                }
                             }
                         }
                     }
                     GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states, .. } => {
                         let mut d_m_initial = GpuBuf::zeros(n_batch * dd);
 
+                        let m_for_bw = if is_proxy {
+                            let mut m_bcast = GpuBuf::zeros(n_batch * (cl + 1) * dd);
+                            unsafe {
+                                let rc = crate::cuda_ffi::broadcast_fill_f32_cuda(
+                                    m_bcast.ptr(), m_states.as_ptr(),
+                                    i32::try_from(dd).expect("dd overflows i32"),
+                                    i32::try_from(cl + 1).expect("cl+1 overflows i32"),
+                                    i32::try_from(n_batch).expect("n_batch overflows i32"),
+                                );
+                                assert_eq!(rc, 0, "broadcast_fill M failed (rc={rc})");
+                            }
+                            m_bcast
+                        } else {
+                            m_states.dup()
+                        };
+
                         crate::dispatch::delta_backward_dd(
                             k_mem, v_mem, q_mem, alpha, theta,
-                            m_states, &d_y_padded,
+                            &m_for_bw, &d_y_padded,
                             &mut d_k_shard, &mut d_v_shard, &mut d_q_shard,
                             &mut d_alpha_shard, &mut d_theta_shard, &mut d_m_initial,
                             cl, d, n_batch,
                             cfg.error_clip_for_level(level),
                         );
 
-                        for b in 0..n_batch {
-                            unsafe {
-                                crate::cuda_ffi::saxpy_cuda(
-                                    1.0, d_m_initial.as_ptr().add(b * dd), d_m_old.ptr(), dd as i32,
-                                );
+                        if !is_proxy {
+                            for b in 0..n_batch {
+                                unsafe {
+                                    crate::cuda_ffi::saxpy_cuda(
+                                        1.0, d_m_initial.as_ptr().add(b * dd), d_m_old.ptr(), dd as i32,
+                                    );
+                                }
                             }
                         }
                     }

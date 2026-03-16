@@ -73,6 +73,7 @@ fn make_tnt_config(rule: MemoryRuleKind) -> MAGConfig {
             residual: false,
             b_alpha_init: vec![],
             b_theta_init: vec![],
+            tape_strategies: Vec::new(),
 }
 }
 
