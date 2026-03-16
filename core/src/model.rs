@@ -899,11 +899,10 @@ impl MAGConfig {
     /// tape_bytes = n_blocks × k × retained_cycles × per_cycle_cache
     pub fn tape_budget_bytes(&self, n_blocks: usize) -> usize {
         let cl = self.cycle_length();
-        let d = self.swa.d_model; // M states are d_model × d_model
+        let d = self.swa.d_model; // M states and projections are d_model-sized
         let dd = d * d;
-        let hd = self.swa.d_model / self.swa.num_heads.max(1); // head_dim for projections
         let per_cycle = 2 * dd * 4                // M + S boundary states (d_model²)
-                      + cl * hd * 3 * 4           // projections (k, v, q) per head
+                      + cl * d * 3 * 4            // projections (k, v, q) — d_model per token
                       + cl * 3 * 4                // gates (alpha, theta, eta)
                       + cl * 2 * 4;               // k_norms, q_norms
         let seq_len = self.swa.seq_len;

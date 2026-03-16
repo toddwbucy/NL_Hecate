@@ -199,15 +199,17 @@ contribute global M gradients via their retained summary vectors.
 ### Global Memory Backward
 
 The global memory V evolves sequentially across shards via summary outer products
-(spec 08, TNT eq-005). The backward for the global update chain requires:
-- `global_m_before[shard_idx]`: snapshot of V before each shard's update (d² each)
+(spec 08, TNT eq-005). The backward for the global update chain requires only:
 - `k_summaries[shard_idx]`, `v_summaries[shard_idx]`: mean k/v vectors (d each)
 
-These are O(d²) per shard — ~4MB at d=1024 — and must be retained across all shards
-for the global backward. This is negligible: 8 shards × 4MB = 32MB.
+No per-shard full-matrix snapshots (e.g., `global_m_before`) are kept. The global
+backward propagates `d_m_carry` through the summary update chain in reverse,
+using only the retained summary vectors and the inner caches of retained shards.
+Summaries are O(d) per shard — negligible even at d=1024.
 
-The global backward runs after all shards complete, iterating over the retained
-summary data in reverse. It does not need the shard inner caches.
+The global backward runs within the reverse shard loop: every shard (including
+evicted ones) contributes global M gradients via its summaries. Only retained
+shards also run the inner backward for projection/gate gradients.
 
 ## Design: Cycle-Scoped Cache Management
 
@@ -215,27 +217,60 @@ summary data in reverse. It does not need the shard inner caches.
 
 For each level, within each block:
 
-```text
-Forward step t:
-  1. Compute projections (k_mem, v_mem, q_mem), gates (alpha, theta, eta)
-  2. Run inner memory kernel → update M, produce y_t
-  3. Store (projections, gates, M state) in cycle cache
-  4. If cycle boundary crossed:
-     a. If retained_cycles > tape_multiplier:
-        Free oldest cycle's cache
-     b. Mark new cycle start
+```rust
+// ── Per-cycle cached state ──────────────────────────────────────────
+struct CycleCache {
+    projections: Projections,  // k_mem, v_mem, q_mem — HOPE eq-009
+    gates: Gates,              // alpha (Titans eq-012), theta (HOPE eq-088), eta (Titans eq-014)
+    m_trajectory: Vec<M>,      // M_t at each step — full trajectory (CS-42: no recompute)
+    s_trajectory: Vec<M>,      // S_t (momentum, Titans eq-013 — Titans only)
+    k_norms: Vec<f32>,         // ‖k_t‖₂ per step
+    q_norms: Vec<f32>,         // ‖q_t‖₂ per step
+}
 
-Backward (after full forward):
-  For each retained cycle (newest to oldest):
-    1. Read projections/gates from cache (no recomputation needed)
-    2. Read M/S trajectory from cache (full trajectory stored, no recomputation)
-    3. Compute gradients, accumulate into parameter gradient buffers
-    4. Free this cycle's cache
+struct Projections { k_mem: [f32; d], v_mem: [f32; d], q_mem: [f32; d] }
+struct Gates { alpha: f32, theta: f32, eta: f32 }
+
+// ── Forward: one step within a cycle ────────────────────────────────
+fn forward_step(t: usize, cache: &mut CycleCache, m: &mut M,
+                tape_multiplier: usize, retained: &mut VecDeque<CycleCache>)
+{
+    // 1. Projections + gates (HOPE eq-009, Titans eq-012/014)
+    let (proj, gates) = compute_projections_and_gates(input_t);
+
+    // 2. Inner memory kernel → update M, produce y_t (Titans eq-004)
+    let y_t = memory_update(m, &proj, &gates);
+
+    // 3. Store in current cycle cache (CS-42: arena-allocated)
+    cache.projections = proj;
+    cache.gates = gates;
+    cache.m_trajectory.push(m.clone());
+
+    // 4. Cycle boundary → rolling eviction (spec 25)
+    if is_cycle_boundary(t) {
+        retained.push_back(std::mem::take(cache));
+        while retained.len() > tape_multiplier {
+            retained.pop_front();  // free oldest cycle's cache
+        }
+    }
+}
+
+// ── Backward: reverse over retained cycles ──────────────────────────
+fn backward_pass(retained: &mut VecDeque<CycleCache>, grads: &mut GradBuffers) {
+    // Newest to oldest — gradient flows through tape_multiplier cycles
+    for cache in retained.drain(..).rev() {
+        // 1. Read projections/gates directly (no recomputation — CS-42)
+        // 2. Read M/S trajectory directly (full trajectory stored)
+        // 3. Compute gradients via chain rule (HOPE eq-088, Titans eq-012/013/014)
+        accumulate_gradients(&cache, grads);
+        // 4. Cache freed on drop (cycle-scoped lifetime)
+    }
+}
 ```
 
 The key: **projections, gates, and M/S trajectories are never recomputed**. They
 are always stored in the cache. The full M trajectory within each retained shard
-is available directly — no boundary-checkpoint recomputation is needed.
+is available directly — no boundary-checkpoint recomputation is needed (CS-42).
 
 ### What the Cache Stores per Cycle
 
@@ -284,9 +319,10 @@ cycle_length = max(chunk_sizes[0..k])   # period of slowest level
 cycles_in_seq = ceil(seq_len / cycle_length)  # partial cycles count
 retained_cycles = min(tape_multiplier, max(1, cycles_in_seq))
 
-per_cycle_cache = 2 × d² × sizeof(f32)  # M + S boundary states
-                + cycle_length × d × 3 × sizeof(f32)  # projections
-                + cycle_length × 3 × sizeof(f32)       # gates
+per_cycle_cache = cycle_length × d² × sizeof(f32)  # M trajectory (full, no recomputation)
+                + cycle_length × d² × sizeof(f32)  # S trajectory (Titans only)
+                + cycle_length × d × 3 × sizeof(f32)  # projections (k, v, q)
+                + cycle_length × 3 × sizeof(f32)       # gates (alpha, theta, eta)
 
 tape_bytes = n_blocks × k × retained_cycles × per_cycle_cache
 ```
@@ -380,7 +416,7 @@ To recover the old full-trajectory behavior, set `tape_multiplier` to
 7. Higher tape_multiplier values proportionally increase cache and gradient depth
 8. Tape size is deterministic from model config — can be computed before forward pass
 9. Same model behavior at all multiplier values (only gradient truncation depth changes)
-10. TNT shard caches freed after shard completes — no cross-shard accumulation
+10. TNT shard caches retained up to retained_shards window; oldest shard caches evicted when window exceeded
 
 ## Ontological Compliance
 
