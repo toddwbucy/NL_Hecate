@@ -673,7 +673,8 @@ pub fn gpu_cms_forward(
             .unwrap_or(false);
         // Cycle-scoped eviction (spec 25) is TNT-only — already excluded by is_tnt_mode.
         // CUDA graph capture is only disabled here for explicit checkpoint_interval.
-        let has_ckpt = cfg.checkpoint_interval.is_some();
+        // Use effective_checkpoint_interval() for consistency with the rest of the codebase.
+        let has_ckpt = cfg.effective_checkpoint_interval(0).is_some();
         let can_capture = !cfg.residual
             && matches!(cfg.memory_rule, MemoryRuleKind::DeltaRule | MemoryRuleKind::TitansLMM)
             && !has_ckpt

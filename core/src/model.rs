@@ -717,7 +717,7 @@ pub struct MAGConfig {
     /// 1 = one cycle (default, minimum for backward).
     /// N = N cycles (deeper gradient flow, more memory).
     /// The tape is required for backward — this is not optional.
-    #[serde(default = "default_tape_multiplier")]
+    #[serde(default = "default_tape_multiplier", deserialize_with = "deserialize_tape_multiplier")]
     pub tape_multiplier: usize,
     /// HOPE §6 level-level composition variant. Determines how CMS levels
     /// interact with each other. Default: FreqGated (Variant 2).
@@ -828,6 +828,16 @@ fn default_one() -> usize { 1 }
 
 fn default_tape_multiplier() -> usize { 1 }
 
+/// Deserialize tape_multiplier: accepts a positive integer, null (→ 1), or missing (→ 1).
+/// Clamps values < 1 to 1 since the tape is required for backward.
+fn deserialize_tape_multiplier<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<usize>::deserialize(deserializer)?;
+    Ok(opt.unwrap_or(1).max(1))
+}
+
 fn default_false() -> bool { false }
 
 fn default_sign_sharpness() -> f32 { 10.0 }
@@ -889,10 +899,11 @@ impl MAGConfig {
     /// tape_bytes = n_blocks × k × retained_cycles × per_cycle_cache
     pub fn tape_budget_bytes(&self, n_blocks: usize) -> usize {
         let cl = self.cycle_length();
-        let d = self.swa.d_model / self.swa.num_heads; // head_dim
+        let d = self.swa.d_model; // M states are d_model × d_model
         let dd = d * d;
-        let per_cycle = 2 * dd * 4                // M + S boundary states
-                      + cl * d * 3 * 4            // projections (k, v, q)
+        let hd = self.swa.d_model / self.swa.num_heads.max(1); // head_dim for projections
+        let per_cycle = 2 * dd * 4                // M + S boundary states (d_model²)
+                      + cl * hd * 3 * 4           // projections (k, v, q) per head
                       + cl * 3 * 4                // gates (alpha, theta, eta)
                       + cl * 2 * 4;               // k_norms, q_norms
         let seq_len = self.swa.seq_len;

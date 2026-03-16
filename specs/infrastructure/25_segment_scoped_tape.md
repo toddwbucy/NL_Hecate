@@ -42,7 +42,7 @@ Guarantees: 1. Peak tape memory is a deterministic function of model architectur
                - 2: two cycles (gradient flows through 2 rotations)
                - N: N cycles (deeper gradient flow, more memory)
                The full-trajectory behavior of the naive implementation is
-               equivalent to tape_multiplier = seq_len / cycle_length.
+               equivalent to tape_multiplier = ceil(seq_len / cycle_length).
             6. The tape structure is identical during training and inference.
                Observability metrics (gnorms, M norms, gate values) are computed
                from the retained cache in both contexts.
@@ -191,9 +191,10 @@ boundary**. This means:
   summary vectors (k_sum, v_sum — O(d) each). These are negligible.
 
 The cycle-scoped cache integrates naturally with TNT shards: each shard contains
-one or more cycles. When a cycle completes within a shard, the rolling cache
-policy applies. When a shard completes, its caches are freed (shard independence
-guarantees this is safe).
+one or more cycles. Rolling eviction operates during TNT forward — after each
+shard's inner cache is pushed, caches exceeding the retention window are freed.
+Shard independence (TNT eq-006) guarantees this is safe: evicted shards still
+contribute global M gradients via their retained summary vectors.
 
 ### Global Memory Backward
 
@@ -227,15 +228,14 @@ Forward step t:
 Backward (after full forward):
   For each retained cycle (newest to oldest):
     1. Read projections/gates from cache (no recomputation needed)
-    2. Read M checkpoints from cache (boundary states)
-    3. Recompute within-cycle M trajectory from checkpoints if needed
-    4. Compute gradients, accumulate into parameter gradient buffers
-    5. Free this cycle's cache
+    2. Read M/S trajectory from cache (full trajectory stored, no recomputation)
+    3. Compute gradients, accumulate into parameter gradient buffers
+    4. Free this cycle's cache
 ```
 
-The key: **projections and gates are never recomputed**. They are always in the
-cache. Only the dense M trajectory within a cycle may need recomputation from
-boundary checkpoints, and that recomputation is bounded by one cycle's length.
+The key: **projections, gates, and M/S trajectories are never recomputed**. They
+are always stored in the cache. The full M trajectory within each retained shard
+is available directly — no boundary-checkpoint recomputation is needed.
 
 ### What the Cache Stores per Cycle
 
@@ -243,19 +243,19 @@ boundary checkpoints, and that recomputation is bounded by one cycle's length.
 |-----------|---------------|-------|
 | k_mem, v_mem, q_mem | 3 × cycle_len × d | Projections — always cached |
 | alpha, theta, eta | 3 × cycle_len | Gates — always cached |
-| M boundary states | 2 × d² (start + end) | For within-cycle recomputation |
-| S boundary states | 2 × d² (start + end) | Momentum (Titans only) |
+| M trajectory | cycle_len × d² | Full M at each step (no recomputation) |
+| S trajectory | cycle_len × d² | Momentum (Titans only) |
 | k_norms, q_norms | 2 × cycle_len | L2 norms — always cached |
 
 For k=2 [1,8] at d=512 (cycle_len=8):
 - Projections + gates: 8 × 512 × 3 + 8 × 3 = 12,312 floats ≈ 48 KB
-- M+S boundaries: 4 × 512² = 1,048,576 floats ≈ 4 MB
-- **Total per cycle: ~4 MB**
+- M+S trajectories: 2 × 8 × 512² = 4,194,304 floats ≈ 16 MB
+- **Total per cycle: ~16 MB**
 
 For k=2 [1,8] at d=1024 (cycle_len=8):
 - Projections + gates: ~96 KB
-- M+S boundaries: 4 × 1024² = 4,194,304 floats ≈ 16 MB
-- **Total per cycle: ~16 MB**
+- M+S trajectories: 2 × 8 × 1024² = 16,777,216 floats ≈ 64 MB
+- **Total per cycle: ~64 MB**
 
 ### Memory Budget
 

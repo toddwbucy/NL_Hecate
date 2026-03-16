@@ -771,6 +771,10 @@ pub(crate) fn gpu_memory_backward(
             let n_total = *total_shards;
             let first_ret = *first_retained_shard;
             let n_retained = shard_inner_caches.len();
+            // Spec 25 invariants: retained window must be consistent.
+            assert!(n_total > 0, "TNT backward: total_shards must be > 0");
+            assert!(first_ret < n_total, "TNT backward: first_retained_shard ({first_ret}) >= total_shards ({n_total})");
+            assert_eq!(n_retained, n_total - first_ret, "TNT backward: cache count ({n_retained}) != total_shards - first_retained ({} - {first_ret})", n_total);
 
             // Accumulators for projection weight grads across all shards
             let mut d_k_mem_total = GpuBuf::<f32>::zeros(s * d);
