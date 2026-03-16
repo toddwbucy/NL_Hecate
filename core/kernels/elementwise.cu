@@ -18,6 +18,8 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <math.h>
+#include <climits>
+#include <cstdio>
 
 // ── Sigmoid ───────────────────────────────────────────────────────────
 
@@ -349,17 +351,18 @@ __global__ void dgd_delta_norm_kernel(
 // Fill a [n_batch * n_slots * dd] buffer by broadcasting [n_batch * dd]
 // source into every slot.  Layout: dst[b * n_slots * dd + t * dd + i] = src[b * dd + i].
 // Used in proxy backward to construct full trajectory from M_final.
+// 64-bit index arithmetic: d=1024 → dd=1M, n_batch*n_slots*dd can exceed INT_MAX.
 
 __global__ void broadcast_fill_f32_kernel(
     float* __restrict__ dst,
     const float* __restrict__ src,
     int dd, int n_slots)
 {
-    int b = blockIdx.y;          // batch element
-    int t = blockIdx.x;          // time slot
-    int src_off = b * dd;
-    int dst_off = (b * n_slots + t) * dd;
-    for (int i = threadIdx.x; i < dd; i += blockDim.x) {
+    long long b = blockIdx.y;          // batch element
+    long long t = blockIdx.x;          // time slot
+    long long src_off = b * dd;
+    long long dst_off = (b * n_slots + t) * dd;
+    for (long long i = threadIdx.x; i < dd; i += blockDim.x) {
         dst[dst_off + i] = src[src_off + i];
     }
 }
@@ -368,6 +371,13 @@ extern "C" void broadcast_fill_f32_cuda(
     float* dst, const float* src,
     int dd, int n_slots, int n_batch)
 {
+    // Overflow guard: dd and source size must fit in int (kernel param type)
+    long long dd64 = (long long)dd;
+    if (dd64 > INT_MAX || (long long)n_batch * dd64 > INT_MAX) {
+        fprintf(stderr, "broadcast_fill_f32_cuda: overflow (n_batch=%d, n_slots=%d, dd=%d)\n",
+                n_batch, n_slots, dd);
+        return;
+    }
     int block = (dd < 256) ? dd : 256;
     dim3 grid(n_slots, n_batch);
     broadcast_fill_f32_kernel<<<grid, block>>>(dst, src, dd, n_slots);

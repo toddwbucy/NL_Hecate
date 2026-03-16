@@ -909,11 +909,12 @@ pub(crate) fn gpu_memory_backward(
                     _ => unreachable!("TNT inner cache must be Titans or Delta"),
                 };
 
-                // Spec 27: proxy levels have m_states/s_states containing only M_final/S_final
-                // (n_batch * dd). Broadcast into full trajectory for backward kernel compatibility.
-                // The VRAM savings come from cache storage between forward and backward, not from
-                // the transient backward buffer (freed after this shard completes).
-                let is_proxy = cfg.tape_strategy_for_level(level) == LevelTapeStrategy::Proxy;
+                // Spec 27: derive proxy from the cache's layout flag (ground truth set at
+                // construction), not from cfg — the cache knows its own shape.
+                let is_proxy = match inner_cache {
+                    GpuMemoryCache::Titans { proxy, .. } | GpuMemoryCache::Delta { proxy, .. } => *proxy,
+                    _ => false,
+                };
 
                 match inner_cache {
                     GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states, s_states, .. } => {

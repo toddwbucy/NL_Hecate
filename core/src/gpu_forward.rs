@@ -682,10 +682,14 @@ pub fn gpu_cms_forward(
         // CUDA graph capture is only disabled here for explicit checkpoint_interval.
         // Use effective_checkpoint_interval() for consistency with the rest of the codebase.
         let has_ckpt = cfg.effective_checkpoint_interval(0).is_some();
+        // Spec 27: CUDA graph scratch always allocates full trajectory —
+        // proxy levels must use the standard dispatch path for VRAM savings.
+        let has_proxy = (0..cfg.k).any(|l| cfg.tape_strategy_for_level(l) == LevelTapeStrategy::Proxy);
         let can_capture = !cfg.residual
             && matches!(cfg.memory_rule, MemoryRuleKind::DeltaRule | MemoryRuleKind::TitansLMM)
             && !has_ckpt
-            && !is_tnt_mode;
+            && !is_tnt_mode
+            && !has_proxy;
 
         if can_capture {
             gpu_cms_capture_all_patterns(params, cfg, &input_ids_i32, &target_ids_i32, pulse, context, bs);
