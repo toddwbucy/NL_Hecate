@@ -677,7 +677,13 @@ impl GpuStackedContext {
     /// Per-(block, level) dormancy status: "active", "warning", "dormant".
     /// Warning = above half of dormancy_consecutive threshold.
     /// Dormant = at or above dormancy_consecutive.
+    /// Returns all "active" when dormancy_consecutive == 0 (disabled).
     pub fn dormancy_status(&self) -> Vec<Vec<String>> {
+        if self.dormancy_consecutive == 0 {
+            return self.dormancy_below_count.iter().map(|block| {
+                vec!["active".to_string(); block.len()]
+            }).collect();
+        }
         let half = self.dormancy_consecutive / 2;
         self.dormancy_below_count.iter().map(|block| {
             block.iter().map(|&count| {
@@ -693,9 +699,17 @@ impl GpuStackedContext {
     }
 
     /// Configure dormancy detection thresholds.
+    /// Resets dormancy counters to avoid stale state from a previous configuration.
     pub fn set_dormancy_config(&mut self, floors: Vec<f32>, consecutive: usize) {
         self.dormancy_floors = floors;
         self.dormancy_consecutive = consecutive;
+        // Reset counters to match current block/level structure
+        let k = if let Some(first) = self.dormancy_below_count.first() {
+            first.len()
+        } else {
+            0
+        };
+        self.dormancy_below_count = vec![vec![0; k]; self.n_blocks];
     }
 
     /// Deep clone all GPU memory buffers (D2D copy). Used by tape diagnostics

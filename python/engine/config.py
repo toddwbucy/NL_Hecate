@@ -378,6 +378,9 @@ class BuildConfig:
                 raise ValueError("extend_k requires either push_up=true or stack_up=true")
             if self.push_up and self.stack_up:
                 raise ValueError("push_up and stack_up are mutually exclusive")
+        if self.freeze_embed_after is not None and self.freeze_embed_after < 0:
+            raise ValueError(
+                f"freeze_embed_after must be >= 0, got {self.freeze_embed_after}")
         if self.dormancy_floors is not None and len(self.dormancy_floors) != self.k:
             raise ValueError(
                 f"dormancy_floors length {len(self.dormancy_floors)} must match k={self.k}")

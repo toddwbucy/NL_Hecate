@@ -3232,6 +3232,10 @@ impl GpuStackedModel {
 
         let rule_name = format!("{:?}", self.cfg.memory_rule);
 
+        // Pre-compute dormancy status once (avoid re-allocating in hot loop)
+        let dormancy_status = self.context.dormancy_status();
+        let dormancy_below = &self.context.dormancy_below_count;
+
         // Per-block breakdown
         let blocks_list = pyo3::types::PyList::empty(py);
         let mut agg_gnorms = vec![0.0f32; k]; // max gnorm per level across blocks
@@ -3260,11 +3264,10 @@ impl GpuStackedModel {
                 };
                 ldict.set_item("m_shard_diff", m_diff_abs)?;
                 ldict.set_item("m_shard_diff_relative", m_diff_rel)?;
-                // Dormancy status from live tracking
-                let dormancy_status = self.context.dormancy_status();
+                // Dormancy status from live tracking (hoisted above loop)
                 if bi < dormancy_status.len() && level < dormancy_status[bi].len() {
                     ldict.set_item("dormancy_status", &dormancy_status[bi][level])?;
-                    ldict.set_item("dormancy_below_count", self.context.dormancy_below_count[bi][level])?;
+                    ldict.set_item("dormancy_below_count", dormancy_below[bi][level])?;
                 }
                 // Alpha (retention/forgetting gate) distribution
                 if let Some(ref as_) = alpha_stats_grid[bi][level] {
@@ -3347,8 +3350,7 @@ impl GpuStackedModel {
                 }).fold(0.0f32, f32::max);
                 ldict.set_item("m_shard_diff", max_diff_abs)?;
                 ldict.set_item("m_shard_diff_relative", max_diff_rel)?;
-                // Worst dormancy status across blocks
-                let dormancy_status = self.context.dormancy_status();
+                // Worst dormancy status across blocks (reuses hoisted dormancy_status)
                 let mut worst_rank = 0u8;
                 for bi in 0..self.n_blocks {
                     if bi < dormancy_status.len() && level < dormancy_status[bi].len() {

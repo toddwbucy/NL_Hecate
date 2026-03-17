@@ -1110,9 +1110,10 @@ def run_build(bcfg: BuildConfig):
         if gpu_model is not None and use_adamw_gpu:
             if is_stacked:
                 # Spec 28: freeze_embed schedule
+                # OR logic: freeze if explicitly set OR step has passed freeze_embed_after
                 effective_freeze = bcfg.freeze_embed
                 if bcfg.freeze_embed_after is not None:
-                    effective_freeze = step >= bcfg.freeze_embed_after
+                    effective_freeze = effective_freeze or (step >= bcfg.freeze_embed_after)
                 loss, g_norm = gpu_model.step_adamw(
                     input_ids, target_ids, pulse, current_lr,
                     beta1=bcfg.beta1, beta2=bcfg.beta2, eps=1e-8,
