@@ -1047,10 +1047,17 @@ fn mag_init_params(cfg: &MAGConfig, seed: u64) -> MAGParams {
 /// `new_cfg.k` must equal `old.k + 1`. SWA weights and persistent tokens
 /// are preserved exactly. Old level[i] → new level[i+1].
 #[pyfunction]
-fn extend_params_push_up(old: &MAGParams, new_cfg: &MAGConfig, seed: u64) -> MAGParams {
-    MAGParams {
-        inner: old.inner.extend_push_up(&new_cfg.inner, seed),
-    }
+#[pyo3(signature = (old, new_cfg, seed, push_up_init="random"))]
+fn extend_params_push_up(old: &MAGParams, new_cfg: &MAGConfig, seed: u64, push_up_init: &str) -> PyResult<MAGParams> {
+    let init = match push_up_init {
+        "random" => nl_hecate_core::model::PushUpInit::Random,
+        "clone" => nl_hecate_core::model::PushUpInit::Clone,
+        _ => return Err(pyo3::exceptions::PyValueError::new_err(
+            format!("push_up_init must be 'random' or 'clone', got '{push_up_init}'"))),
+    };
+    Ok(MAGParams {
+        inner: old.inner.extend_push_up(&new_cfg.inner, seed, init),
+    })
 }
 
 /// Stack-up level extension: keep existing levels in place, add fresh level at top.
@@ -1861,16 +1868,24 @@ fn load_stacked_checkpoint(py: Python<'_>, path: &str) -> PyResult<PyObject> {
 /// Push-up level stacking for stacked multi-block models.
 /// Each block independently shifts level[i] → level[i+1], fresh L0 per block.
 #[pyfunction]
+#[pyo3(signature = (path, new_cfg, seed, push_up_init="random"))]
 fn extend_stacked_push_up(
     py: Python<'_>,
     path: &str,
     new_cfg: &MAGConfig,
     seed: u64,
+    push_up_init: &str,
 ) -> PyResult<PyObject> {
+    let init = match push_up_init {
+        "random" => nl_hecate_core::model::PushUpInit::Random,
+        "clone" => nl_hecate_core::model::PushUpInit::Clone,
+        _ => return Err(PyValueError::new_err(
+            format!("push_up_init must be 'random' or 'clone', got '{push_up_init}'"))),
+    };
     let (params, _config, n_blocks, _build_state) = rust_load_stacked(std::path::Path::new(path))
         .map_err(|e| PyValueError::new_err(format!("extend_stacked_push_up: load failed: {e}")))?;
 
-    let extended = params.extend_push_up(&new_cfg.inner, seed);
+    let extended = params.extend_push_up(&new_cfg.inner, seed, init);
 
     // Serialize the extended params for GpuStackedModel construction
     let params_json = serde_json::to_string(&extended)
@@ -2815,11 +2830,11 @@ impl GpuStackedModel {
     }
 
     /// Full GPU build step with AdamW optimizer. Returns (loss, grad_norm).
-    #[pyo3(signature = (input_ids, target_ids, pulse, lr, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.1, max_grad_norm=1.0, collect_block_gnorms=false))]
+    #[pyo3(signature = (input_ids, target_ids, pulse, lr, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.1, max_grad_norm=1.0, collect_block_gnorms=false, freeze_embed=false))]
     fn step_adamw(&mut self, input_ids: Vec<usize>, target_ids: Vec<usize>,
                   pulse: &Pulse, lr: f32, beta1: f32, beta2: f32,
                   eps: f32, weight_decay: f32, max_grad_norm: f32,
-                  collect_block_gnorms: bool) -> PyResult<(f32, f32)> {
+                  collect_block_gnorms: bool, freeze_embed: bool) -> PyResult<(f32, f32)> {
         let s = self.cfg.swa.seq_len;
         let v = self.cfg.swa.vocab_size;
         if s == 0 {
@@ -2876,6 +2891,7 @@ impl GpuStackedModel {
             &mut self.params, &mut grads, state,
             &pulse.inner,
             lr, beta1, beta2, eps, weight_decay, max_grad_norm,
+            freeze_embed,
         );
 
         // Weight tying: sync w_unembed^T → w_embed (same as single-block path).
@@ -2885,6 +2901,9 @@ impl GpuStackedModel {
             self.cfg.swa.d_model,
             self.cfg.swa.vocab_size,
         );
+
+        // Update M-norm tracking for dormancy detection (spec 28).
+        self.context.update_m_norm_tracking();
 
         // TNT periodic reset (2511.07343 eq-006): after observing this step's final M,
         // reset context.memory[k] to zeros for each level that fired this step.
@@ -2926,6 +2945,29 @@ impl GpuStackedModel {
     /// Reset all memory across all blocks.
     fn reset_context(&mut self) {
         self.context.reset();
+    }
+
+    /// Per-(block, level) M norm deltas from the most recent step (spec 28).
+    fn m_norm_deltas(&self) -> Vec<Vec<f32>> {
+        self.context.m_norm_deltas.clone()
+    }
+
+    /// Per-(block, level) dormancy status: "active", "warning", "dormant" (spec 28).
+    fn dormancy_status(&self) -> Vec<Vec<String>> {
+        self.context.dormancy_status()
+    }
+
+    /// Configure dormancy detection thresholds (spec 28).
+    /// floors: per-level M-diff floor (length must equal k, or empty to disable).
+    /// consecutive: number of consecutive below-floor steps to trigger "dormant".
+    fn set_dormancy_config(&mut self, floors: Vec<f32>, consecutive: usize) -> PyResult<()> {
+        if !floors.is_empty() && floors.len() != self.cfg.k {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "dormancy_floors length {} != k {}", floors.len(), self.cfg.k
+            )));
+        }
+        self.context.set_dormancy_config(floors, consecutive);
+        Ok(())
     }
 
     /// Number of blocks.
@@ -3134,6 +3176,9 @@ impl GpuStackedModel {
             &pulse.inner, &mut self.context,
         );
 
+        // Capture post-forward M norms for shard M-diff (spec 28).
+        let m_norms_post = self.context.memory_norms();
+
         // Extract DGD delta norms from cache BEFORE backward consumes it.
         // Per-(block, level) ||M_final @ k_last - v_last||_2
         // Source: HOPE Eq 88, spec 16_dgd_delta_norm_gpu.md
@@ -3206,6 +3251,21 @@ impl GpuStackedModel {
                 ldict.set_item("output_grad_norm", gnorm)?;
                 ldict.set_item("dgd_delta_norm", delta_norms[bi][level])?;
                 ldict.set_item("m_norm", m_norms[bi][level])?;
+                // Shard M-diff: ||M_post - M_pre||_F proxy (spec 28)
+                let m_diff_abs = (m_norms_post[bi][level] - m_norms[bi][level]).abs();
+                let m_diff_rel = if m_norms[bi][level] > 1e-8 {
+                    m_diff_abs / m_norms[bi][level]
+                } else {
+                    0.0
+                };
+                ldict.set_item("m_shard_diff", m_diff_abs)?;
+                ldict.set_item("m_shard_diff_relative", m_diff_rel)?;
+                // Dormancy status from live tracking
+                let dormancy_status = self.context.dormancy_status();
+                if bi < dormancy_status.len() && level < dormancy_status[bi].len() {
+                    ldict.set_item("dormancy_status", &dormancy_status[bi][level])?;
+                    ldict.set_item("dormancy_below_count", self.context.dormancy_below_count[bi][level])?;
+                }
                 // Alpha (retention/forgetting gate) distribution
                 if let Some(ref as_) = alpha_stats_grid[bi][level] {
                     let adict = pyo3::types::PyDict::new(py);
@@ -3274,6 +3334,33 @@ impl GpuStackedModel {
             // Aggregate m_norm: max across blocks for this level
             let max_mnorm = m_norms.iter().map(|bn| bn[level]).fold(0.0f32, f32::max);
             ldict.set_item("m_norm", max_mnorm)?;
+            // Aggregate shard M-diff: max across blocks (spec 28)
+            {
+                let max_diff_abs = (0..self.n_blocks).map(|bi| {
+                    (m_norms_post[bi][level] - m_norms[bi][level]).abs()
+                }).fold(0.0f32, f32::max);
+                let max_diff_rel = (0..self.n_blocks).map(|bi| {
+                    let pre = m_norms[bi][level];
+                    if pre > 1e-8 {
+                        (m_norms_post[bi][level] - pre).abs() / pre
+                    } else { 0.0 }
+                }).fold(0.0f32, f32::max);
+                ldict.set_item("m_shard_diff", max_diff_abs)?;
+                ldict.set_item("m_shard_diff_relative", max_diff_rel)?;
+                // Worst dormancy status across blocks
+                let dormancy_status = self.context.dormancy_status();
+                let mut worst_rank = 0u8;
+                for bi in 0..self.n_blocks {
+                    if bi < dormancy_status.len() && level < dormancy_status[bi].len() {
+                        let rank = match dormancy_status[bi][level].as_str() {
+                            "dormant" => 2, "warning" => 1, _ => 0,
+                        };
+                        if rank > worst_rank { worst_rank = rank; }
+                    }
+                }
+                let worst_str = match worst_rank { 2 => "dormant", 1 => "warning", _ => "active" };
+                ldict.set_item("dormancy_status", worst_str)?;
+            }
             // Aggregate theta stats across blocks: weighted mean, min of mins, max of maxes
             let mut agg_count = 0usize;
             let mut agg_min = f32::MAX;

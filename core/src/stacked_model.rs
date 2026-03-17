@@ -8,7 +8,7 @@
 
 use serde::{Serialize, Deserialize};
 use crate::model::{
-    MAGConfig, MAGParams, SWAConfig, MemoryLevelParams,
+    MAGConfig, MAGParams, SWAConfig, MemoryLevelParams, PushUpInit,
     default_b_alpha, default_b_theta, default_b_eta,
 };
 use crate::tensor::SimpleRng;
@@ -262,7 +262,7 @@ impl StackedMAGParams {
     ///
     /// Mirrors `MAGParams::extend_push_up` (model.rs) but operates per-block.
     /// Spec: specs/infrastructure/22_stacked_extend_k_per_block.md
-    pub fn extend_push_up(&self, new_cfg: &MAGConfig, seed: u64) -> StackedMAGParams {
+    pub fn extend_push_up(&self, new_cfg: &MAGConfig, seed: u64, init: PushUpInit) -> StackedMAGParams {
         let n_blocks = self.blocks.len();
         assert!(n_blocks > 0, "extend_push_up: stacked model must have at least 1 block");
 
@@ -313,16 +313,20 @@ impl StackedMAGParams {
                 new_block.levels[i + 1] = old_block.levels[i].clone();
             }
 
-            // Clone old L0 projections into fresh L0 for scale-matched init.
-            // Gate biases kept at level-0 defaults from BlockParams::init.
-            let donor = &old_block.levels[0];
-            new_block.levels[0].w_k_mem = donor.w_k_mem.clone();
-            new_block.levels[0].w_v_mem = donor.w_v_mem.clone();
-            new_block.levels[0].w_q_mem = donor.w_q_mem.clone();
-            new_block.levels[0].w_alpha = donor.w_alpha.clone();
-            new_block.levels[0].w_theta = donor.w_theta.clone();
-            new_block.levels[0].w_eta = donor.w_eta.clone();
-            new_block.levels[0].w_omega = donor.w_omega.clone();
+            // L0 initialization strategy (spec 28):
+            // - Random: keep fresh Xavier from BlockParams::init (better differentiation)
+            // - Clone: copy donor projections for scale-matched init (legacy behavior)
+            if init == PushUpInit::Clone {
+                let donor = &old_block.levels[0];
+                new_block.levels[0].w_k_mem = donor.w_k_mem.clone();
+                new_block.levels[0].w_v_mem = donor.w_v_mem.clone();
+                new_block.levels[0].w_q_mem = donor.w_q_mem.clone();
+                new_block.levels[0].w_alpha = donor.w_alpha.clone();
+                new_block.levels[0].w_theta = donor.w_theta.clone();
+                new_block.levels[0].w_eta = donor.w_eta.clone();
+                new_block.levels[0].w_omega = donor.w_omega.clone();
+            }
+            // PushUpInit::Random: L0 keeps fresh Xavier init from BlockParams::init.
 
             // Shift alpha logits per block
             for i in 0..old_k {
@@ -572,7 +576,7 @@ mod tests {
         let cfg_k2 = tiny_config_k2();
         let n_blocks = 3;
         let old = StackedMAGParams::init(&cfg_k1, n_blocks, 42);
-        let extended = old.extend_push_up(&cfg_k2, 99);
+        let extended = old.extend_push_up(&cfg_k2, 99, PushUpInit::Clone);
 
         // Structure
         assert_eq!(extended.n_blocks(), n_blocks);
@@ -588,7 +592,7 @@ mod tests {
         let cfg_k1 = tiny_config_k1();
         let cfg_k2 = tiny_config_k2();
         let old = StackedMAGParams::init(&cfg_k1, 4, 42);
-        let extended = old.extend_push_up(&cfg_k2, 99);
+        let extended = old.extend_push_up(&cfg_k2, 99, PushUpInit::Clone);
 
         // Shared params preserved exactly
         assert_eq!(extended.w_embed, old.w_embed);
@@ -602,7 +606,7 @@ mod tests {
         let cfg_k1 = tiny_config_k1();
         let cfg_k2 = tiny_config_k2();
         let old = StackedMAGParams::init(&cfg_k1, 4, 42);
-        let extended = old.extend_push_up(&cfg_k2, 99);
+        let extended = old.extend_push_up(&cfg_k2, 99, PushUpInit::Clone);
 
         // Per-block SWA preserved
         for b in 0..4 {
@@ -620,7 +624,7 @@ mod tests {
         let cfg_k1 = tiny_config_k1();
         let cfg_k2 = tiny_config_k2();
         let old = StackedMAGParams::init(&cfg_k1, 3, 42);
-        let extended = old.extend_push_up(&cfg_k2, 99);
+        let extended = old.extend_push_up(&cfg_k2, 99, PushUpInit::Clone);
 
         // Old level 0 → new level 1 (shifted up)
         for b in 0..3 {
@@ -641,7 +645,7 @@ mod tests {
         let cfg_k1 = tiny_config_k1();
         let cfg_k2 = tiny_config_k2();
         let old = StackedMAGParams::init(&cfg_k1, 3, 42);
-        let extended = old.extend_push_up(&cfg_k2, 99);
+        let extended = old.extend_push_up(&cfg_k2, 99, PushUpInit::Clone);
 
         // Fresh L0 has old L0's projection weights (scale-matched)
         for b in 0..3 {
@@ -658,7 +662,7 @@ mod tests {
         let cfg_k1 = tiny_config_k1();
         let cfg_k2 = tiny_config_k2();
         let old = StackedMAGParams::init(&cfg_k1, 2, 42);
-        let extended = old.extend_push_up(&cfg_k2, 99);
+        let extended = old.extend_push_up(&cfg_k2, 99, PushUpInit::Clone);
 
         // Fresh L0 gate biases should be level-0 defaults, not cloned from old L0
         for b in 0..2 {
@@ -679,7 +683,7 @@ mod tests {
         // Set non-zero alpha to verify shift
         old.blocks[0].alpha_mem[0] = 1.5;
         old.blocks[1].alpha_mem[0] = -0.7;
-        let extended = old.extend_push_up(&cfg_k2, 99);
+        let extended = old.extend_push_up(&cfg_k2, 99, PushUpInit::Clone);
 
         // Alpha[0] should be 0.0 (fresh), alpha[1] should be old alpha[0]
         assert_eq!(extended.blocks[0].alpha_mem[0], 0.0);
@@ -693,7 +697,7 @@ mod tests {
         let cfg_k1 = tiny_config_k1();
         let cfg_k2 = tiny_config_k2();
         let old = StackedMAGParams::init(&cfg_k1, 3, 42);
-        let extended = old.extend_push_up(&cfg_k2, 99);
+        let extended = old.extend_push_up(&cfg_k2, 99, PushUpInit::Clone);
 
         // Fresh L0 projections are donor-cloned from each block's old L0.
         // Since old blocks were initialized with distinct seeds, each block's
@@ -709,6 +713,40 @@ mod tests {
             extended.blocks[1].levels[0].b_theta,
             "gate biases are level-0 defaults, identical across blocks"
         );
+    }
+
+    #[test]
+    fn test_extend_push_up_random_init_differs_from_donor() {
+        let cfg_k1 = tiny_config_k1();
+        let cfg_k2 = tiny_config_k2();
+        let old = StackedMAGParams::init(&cfg_k1, 3, 42);
+        let extended = old.extend_push_up(&cfg_k2, 99, PushUpInit::Random);
+
+        // With Random init, fresh L0 projections should NOT match old L0 (donor).
+        // They get fresh Xavier init from BlockParams::init with a different seed.
+        for b in 0..3 {
+            assert_ne!(
+                extended.blocks[b].levels[0].w_k_mem.master(),
+                old.blocks[b].levels[0].w_k_mem.master(),
+                "block {b}: Random init L0 should differ from donor"
+            );
+        }
+        // Old level 0 should still be shifted to level 1
+        for b in 0..3 {
+            assert_eq!(
+                extended.blocks[b].levels[1].w_k_mem.master(),
+                old.blocks[b].levels[0].w_k_mem.master(),
+                "block {b}: old L0 should be at new L1 regardless of init strategy"
+            );
+        }
+        // Gate biases should still be level-0 defaults
+        for b in 0..3 {
+            let expected_b_alpha = vec![default_b_alpha(0)];
+            assert_eq!(
+                extended.blocks[b].levels[0].b_alpha, expected_b_alpha,
+                "block {b}: Random init L0 b_alpha should be level-0 default"
+            );
+        }
     }
 
     fn tiny_config_k4() -> MAGConfig {

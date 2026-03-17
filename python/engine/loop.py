@@ -357,12 +357,14 @@ def run_build(bcfg: BuildConfig):
                     print("  ERROR: stacked extend_k only supports push_up (not stack_up)")
                     return
                 result = nl_hecate.extend_stacked_push_up(
-                    bcfg.load, new_cfg, bcfg.seed)
+                    bcfg.load, new_cfg, bcfg.seed,
+                    push_up_init=bcfg.push_up_init)
                 _stacked_params_json = result["params_json"]
                 print(f"  Stacked push-up: k={loaded_k} → k={target_k}, "
                       f"n_blocks={result['n_blocks']}, chunks={new_chunks}")
             elif bcfg.push_up:
-                params = nl_hecate.extend_params_push_up(params, new_cfg, bcfg.seed)
+                params = nl_hecate.extend_params_push_up(params, new_cfg, bcfg.seed,
+                                                           push_up_init=bcfg.push_up_init)
                 print(f"  Push-up: k={loaded_k} → k={target_k}, "
                       f"chunks={new_chunks}")
             elif bcfg.stack_up:
@@ -819,6 +821,11 @@ def run_build(bcfg: BuildConfig):
                     batch_size=bcfg.batch_size, memory_reset=periodic)
             print(f"  Stacked:  {n_blocks} blocks x k={bcfg.k} CMS levels"
                   f"  ({gpu_model.total_params():,} params)")
+            # Spec 28: configure dormancy detection
+            if bcfg.dormancy_floors is not None:
+                gpu_model.set_dormancy_config(bcfg.dormancy_floors, bcfg.dormancy_consecutive)
+                print(f"  Dormancy: floors={bcfg.dormancy_floors}, "
+                      f"consecutive={bcfg.dormancy_consecutive}")
         else:
             periodic = (bcfg.memory_reset == "periodic")
             gpu_model = nl_hecate.GpuModel.from_params(
@@ -1102,12 +1109,17 @@ def run_build(bcfg: BuildConfig):
 
         if gpu_model is not None and use_adamw_gpu:
             if is_stacked:
+                # Spec 28: freeze_embed schedule
+                effective_freeze = bcfg.freeze_embed
+                if bcfg.freeze_embed_after is not None:
+                    effective_freeze = step >= bcfg.freeze_embed_after
                 loss, g_norm = gpu_model.step_adamw(
                     input_ids, target_ids, pulse, current_lr,
                     beta1=bcfg.beta1, beta2=bcfg.beta2, eps=1e-8,
                     weight_decay=bcfg.weight_decay,
                     max_grad_norm=bcfg.max_grad_norm,
                     collect_block_gnorms=(log_this and jsonl is not None),
+                    freeze_embed=effective_freeze,
                 )
             else:
                 loss, g_norm = gpu_model.step_adamw(
@@ -1880,7 +1892,8 @@ def run_build(bcfg: BuildConfig):
             )
 
             # Push-up: shift trained levels to slower frequencies, fresh L0
-            params = nl_hecate.extend_params_push_up(params, new_cfg, bcfg.seed)
+            params = nl_hecate.extend_params_push_up(params, new_cfg, bcfg.seed,
+                                                       push_up_init=bcfg.push_up_init)
             cfg = new_cfg
             print(f"  Push-up complete: chunks={new_chunks}")
 

@@ -353,6 +353,13 @@ def print_tape_summary(tape_summary: dict, step: int) -> None:
         # Append m_norm to level line if present
         if "m_norm" in lvl:
             line += f"  m_norm={lvl['m_norm']:.1f}"
+        # Shard M-diff (spec 28): proxy-compatible level differentiation metric
+        if "m_shard_diff" in lvl:
+            line += f"  \u0394M={lvl['m_shard_diff']:.4f}"
+        if "m_shard_diff_relative" in lvl:
+            line += f"  \u0394M_rel={lvl['m_shard_diff_relative']:.4f}"
+        if "dormancy_status" in lvl:
+            line += f"  dormancy={lvl['dormancy_status']}"
         print(line)
         # Alpha (retention/forgetting gate) — before theta
         if "alpha" in lvl and lvl["alpha"] is not None:

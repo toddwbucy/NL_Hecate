@@ -155,6 +155,11 @@ class BuildConfig:
     push_up: bool = False             # Shift existing levels to slower frequencies
     stack_up: bool = False            # Keep existing levels, add fresh level at top
     clone_to: int | None = None       # Clone expansion: duplicate levels to fill target k (any k > loaded_k)
+    push_up_init: str = "random"     # L0 init on push-up: "random" (Xavier, spec 28) or "clone" (legacy)
+    freeze_embed: bool = False       # Freeze w_embed and w_unembed (spec 28)
+    freeze_embed_after: int | None = None  # Step at which to freeze embeddings (None = immediate if freeze_embed)
+    dormancy_floors: list[float] | None = None  # Per-level M-diff floor for dormancy detection (spec 28)
+    dormancy_consecutive: int = 5     # Consecutive below-floor steps to trigger "dormant" status
     data_seek: int | None = None      # Override data cursor to this token position
 
     # Auto-promotion (specs/infrastructure/12_metric_driven_promotion.md)
@@ -373,6 +378,15 @@ class BuildConfig:
                 raise ValueError("extend_k requires either push_up=true or stack_up=true")
             if self.push_up and self.stack_up:
                 raise ValueError("push_up and stack_up are mutually exclusive")
+        if self.dormancy_floors is not None and len(self.dormancy_floors) != self.k:
+            raise ValueError(
+                f"dormancy_floors length {len(self.dormancy_floors)} must match k={self.k}")
+        if self.dormancy_consecutive < 1:
+            raise ValueError(
+                f"dormancy_consecutive must be >= 1, got {self.dormancy_consecutive}")
+        if self.push_up_init not in ("random", "clone"):
+            raise ValueError(
+                f"push_up_init must be 'random' or 'clone', got '{self.push_up_init}'")
         if self.push_up and self.extend_k is None:
             raise ValueError("push_up=true requires extend_k to be set")
         if self.stack_up and self.extend_k is None:

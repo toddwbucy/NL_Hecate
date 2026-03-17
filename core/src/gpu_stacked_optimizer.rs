@@ -378,6 +378,7 @@ pub fn gpu_stacked_adamw_update(
     eps: f32,
     weight_decay: f32,
     max_grad_norm: f32,
+    freeze_embed: bool,
 ) -> f32 {
     state.step += 1;
     let t = state.step as f32;
@@ -396,13 +397,15 @@ pub fn gpu_stacked_adamw_update(
         0.0
     };
 
-    // ── Shared params (always active) ──────────────────────────────────
-    adamw_one(&mut params.w_embed, &grads.d_w_embed,
-              &mut state.m_embed, &mut state.v_embed,
-              lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
-    adamw_one(&mut params.w_unembed, &grads.d_w_unembed,
-              &mut state.m_unembed, &mut state.v_unembed,
-              lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
+    // ── Shared params (always active, unless frozen) ──────────────────
+    if !freeze_embed {
+        adamw_one(&mut params.w_embed, &grads.d_w_embed,
+                  &mut state.m_embed, &mut state.v_embed,
+                  lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
+        adamw_one(&mut params.w_unembed, &grads.d_w_unembed,
+                  &mut state.m_unembed, &mut state.v_unembed,
+                  lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
+    }
     adamw_one(&mut params.ln_final_gamma, &grads.d_ln_final_gamma,
               &mut state.m_ln_final_gamma, &mut state.v_ln_final_gamma,
               lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);

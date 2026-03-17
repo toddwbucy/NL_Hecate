@@ -566,6 +566,17 @@ pub struct GpuStackedContext {
     pub d: usize,
     pub batch_size: usize,
     pub n_blocks: usize,
+    // ── Dormancy tracking (spec 28) ──────────────────────────────────
+    /// Previous step's per-(block, level) M Frobenius norms.
+    pub prev_m_norms: Vec<Vec<f32>>,
+    /// Per-(block, level) absolute M norm delta from last step.
+    pub m_norm_deltas: Vec<Vec<f32>>,
+    /// Per-(block, level) consecutive steps with M-diff below dormancy floor.
+    pub dormancy_below_count: Vec<Vec<usize>>,
+    /// Per-level dormancy floor thresholds (length = k). Empty = disabled.
+    pub dormancy_floors: Vec<f32>,
+    /// Consecutive below-floor steps to trigger "dormant" status.
+    pub dormancy_consecutive: usize,
 }
 
 #[cfg(feature = "cuda")]
@@ -576,7 +587,14 @@ impl GpuStackedContext {
         let blocks = (0..n_blocks)
             .map(|_| GpuContextState::new(k, d, batch_size, None, 0))
             .collect();
-        GpuStackedContext { blocks, d, batch_size, n_blocks }
+        GpuStackedContext {
+            blocks, d, batch_size, n_blocks,
+            prev_m_norms: vec![vec![0.0; k]; n_blocks],
+            m_norm_deltas: vec![vec![0.0; k]; n_blocks],
+            dormancy_below_count: vec![vec![0; k]; n_blocks],
+            dormancy_floors: Vec::new(),
+            dormancy_consecutive: 5,
+        }
     }
 
     /// Zero all memory across all blocks.
@@ -629,6 +647,57 @@ impl GpuStackedContext {
         result
     }
 
+    /// Update M-norm tracking after a forward pass (spec 28 dormancy sentinel).
+    /// Computes current M norms, diffs against prev, updates dormancy counters.
+    pub fn update_m_norm_tracking(&mut self) {
+        let current_norms = self.memory_norms();
+        let k = if let Some(first) = current_norms.first() { first.len() } else { 0 };
+
+        for (bi, block_norms) in current_norms.iter().enumerate() {
+            if bi >= self.prev_m_norms.len() { continue; }
+            for (li, &norm) in block_norms.iter().enumerate() {
+                if li >= self.prev_m_norms[bi].len() { continue; }
+                let delta = (norm - self.prev_m_norms[bi][li]).abs();
+                self.m_norm_deltas[bi][li] = delta;
+
+                // Dormancy counter: check against per-level floor
+                if !self.dormancy_floors.is_empty() && li < self.dormancy_floors.len() {
+                    if delta < self.dormancy_floors[li] {
+                        self.dormancy_below_count[bi][li] += 1;
+                    } else {
+                        self.dormancy_below_count[bi][li] = 0;
+                    }
+                }
+            }
+        }
+
+        self.prev_m_norms = current_norms;
+    }
+
+    /// Per-(block, level) dormancy status: "active", "warning", "dormant".
+    /// Warning = above half of dormancy_consecutive threshold.
+    /// Dormant = at or above dormancy_consecutive.
+    pub fn dormancy_status(&self) -> Vec<Vec<String>> {
+        let half = self.dormancy_consecutive / 2;
+        self.dormancy_below_count.iter().map(|block| {
+            block.iter().map(|&count| {
+                if count >= self.dormancy_consecutive {
+                    "dormant".to_string()
+                } else if count > half {
+                    "warning".to_string()
+                } else {
+                    "active".to_string()
+                }
+            }).collect()
+        }).collect()
+    }
+
+    /// Configure dormancy detection thresholds.
+    pub fn set_dormancy_config(&mut self, floors: Vec<f32>, consecutive: usize) {
+        self.dormancy_floors = floors;
+        self.dormancy_consecutive = consecutive;
+    }
+
     /// Deep clone all GPU memory buffers (D2D copy). Used by tape diagnostics
     /// to save/restore context around a non-destructive forward+backward.
     pub fn deep_clone(&self) -> Self {
@@ -660,6 +729,11 @@ impl GpuStackedContext {
             d: self.d,
             batch_size: self.batch_size,
             n_blocks: self.n_blocks,
+            prev_m_norms: self.prev_m_norms.clone(),
+            m_norm_deltas: self.m_norm_deltas.clone(),
+            dormancy_below_count: self.dormancy_below_count.clone(),
+            dormancy_floors: self.dormancy_floors.clone(),
+            dormancy_consecutive: self.dormancy_consecutive,
         }
     }
 }
