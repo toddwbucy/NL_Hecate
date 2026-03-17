@@ -159,8 +159,10 @@ impl GpuStackedAdamWState {
 // ══════════════════════════════════════════════════════════════════════
 
 /// Compute L2 norm of all stacked gradient buffers on GPU.
+/// When `skip_embed` is true, excludes d_w_embed and d_w_unembed from the norm
+/// to avoid over-clipping trainable gradients when embeddings are frozen.
 #[cfg(feature = "cuda")]
-fn gpu_stacked_grad_norm(grads: &GpuStackedGrads, state: &mut GpuStackedAdamWState) -> f32 {
+fn gpu_stacked_grad_norm_ex(grads: &GpuStackedGrads, state: &mut GpuStackedAdamWState, skip_embed: bool) -> f32 {
     let mut total_sq = 0.0f64;
 
     // NOTE: This accumulates partial sums with a host sync per tensor. For large
@@ -186,9 +188,11 @@ fn gpu_stacked_grad_norm(grads: &GpuStackedGrads, state: &mut GpuStackedAdamWSta
         }
     };
 
-    // Shared grads
-    accum(&grads.d_w_embed);
-    accum(&grads.d_w_unembed);
+    // Shared grads (skip embed/unembed when frozen)
+    if !skip_embed {
+        accum(&grads.d_w_embed);
+        accum(&grads.d_w_unembed);
+    }
     accum(&grads.d_ln_final_gamma);
     accum(&grads.d_ln_final_beta);
 
@@ -318,7 +322,7 @@ pub fn gpu_stacked_per_block_grad_norms(
 
 /// Scale all stacked gradient buffers by a constant factor (for clipping).
 #[cfg(feature = "cuda")]
-fn gpu_stacked_scale_grads(grads: &mut GpuStackedGrads, scale: f32) {
+fn gpu_stacked_scale_grads_ex(grads: &mut GpuStackedGrads, scale: f32, skip_embed: bool) {
     let scale_buf = |g: &mut GpuBuf<f32>| {
         let n = g.len() as i32;
         if n == 0 { return; }
@@ -328,9 +332,11 @@ fn gpu_stacked_scale_grads(grads: &mut GpuStackedGrads, scale: f32) {
         assert_eq!(err, 0, "grad_scale_cuda failed with cudaError_t={}", err);
     };
 
-    // Shared grads
-    scale_buf(&mut grads.d_w_embed);
-    scale_buf(&mut grads.d_w_unembed);
+    // Shared grads (skip embed/unembed when frozen)
+    if !skip_embed {
+        scale_buf(&mut grads.d_w_embed);
+        scale_buf(&mut grads.d_w_unembed);
+    }
     scale_buf(&mut grads.d_ln_final_gamma);
     scale_buf(&mut grads.d_ln_final_beta);
 
@@ -378,31 +384,34 @@ pub fn gpu_stacked_adamw_update(
     eps: f32,
     weight_decay: f32,
     max_grad_norm: f32,
+    freeze_embed: bool,
 ) -> f32 {
     state.step += 1;
     let t = state.step as f32;
     let bc1_inv = 1.0 / (1.0 - beta1.powf(t));
     let bc2_inv = 1.0 / (1.0 - beta2.powf(t));
 
-    // Gradient clipping
+    // Gradient clipping (exclude frozen embed grads from norm to avoid over-clipping)
     let grad_norm = if max_grad_norm > 0.0 {
-        let norm = gpu_stacked_grad_norm(grads, state);
+        let norm = gpu_stacked_grad_norm_ex(grads, state, freeze_embed);
         if norm > max_grad_norm {
             let scale = max_grad_norm / norm;
-            gpu_stacked_scale_grads(grads, scale);
+            gpu_stacked_scale_grads_ex(grads, scale, freeze_embed);
         }
         norm
     } else {
         0.0
     };
 
-    // ── Shared params (always active) ──────────────────────────────────
-    adamw_one(&mut params.w_embed, &grads.d_w_embed,
-              &mut state.m_embed, &mut state.v_embed,
-              lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
-    adamw_one(&mut params.w_unembed, &grads.d_w_unembed,
-              &mut state.m_unembed, &mut state.v_unembed,
-              lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
+    // ── Shared params (always active, unless frozen) ──────────────────
+    if !freeze_embed {
+        adamw_one(&mut params.w_embed, &grads.d_w_embed,
+                  &mut state.m_embed, &mut state.v_embed,
+                  lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
+        adamw_one(&mut params.w_unembed, &grads.d_w_unembed,
+                  &mut state.m_unembed, &mut state.v_unembed,
+                  lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
+    }
     adamw_one(&mut params.ln_final_gamma, &grads.d_ln_final_gamma,
               &mut state.m_ln_final_gamma, &mut state.v_ln_final_gamma,
               lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);

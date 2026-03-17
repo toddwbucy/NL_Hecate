@@ -68,6 +68,21 @@ pub enum LevelTapeStrategy {
     Proxy,
 }
 
+/// Push-up L0 initialization strategy (spec 28).
+///
+/// Controls how the fresh Level 0 is initialized when extending k via push-up.
+/// Spec 25 showed random init outperforms clone for level differentiation.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum PushUpInit {
+    /// Fresh Xavier init for L0 projections (default).
+    /// Gate biases use level-0 defaults from MAGParams::init.
+    /// Produces better level differentiation per spec 25 validation.
+    Random,
+    /// Clone donor (old L0) projections into new L0.
+    /// Scale-matched but risks creating near-duplicate of L1.
+    Clone,
+}
+
 /// Which memory update rule to use for the inner loop.
 ///
 /// MIRAS Algorithm knob: selects the optimizer for memory updates.
@@ -2565,7 +2580,7 @@ impl MAGParams {
     /// SWA weights and persistent tokens are preserved exactly (bitwise).
     /// Old level[i] becomes new level[i+1]; new level[0] gets fresh Xavier init
     /// with level-0 default gate biases from `MAGParams::init`.
-    pub fn extend_push_up(&self, new_cfg: &MAGConfig, seed: u64) -> MAGParams {
+    pub fn extend_push_up(&self, new_cfg: &MAGConfig, seed: u64, init: PushUpInit) -> MAGParams {
         let old_k = self.levels.len();
         assert_eq!(
             new_cfg.k,
@@ -2603,19 +2618,21 @@ impl MAGParams {
         for i in 0..old_k {
             new_params.levels[i + 1] = self.levels[i].clone();
         }
-        // Clone old L0's projection weights into new L0 for scale-matched init.
-        // Without this, fresh Xavier weights (~0.025 RMS) are dwarfed by trained
-        // projections (~0.15 RMS), producing ~0 gradient for L0 (signal swamping).
-        // Gate biases (b_alpha, b_theta, b_eta) are kept at level-0 defaults
-        // from MAGParams::init so firing-frequency semantics are preserved.
-        let donor = &self.levels[0];
-        new_params.levels[0].w_k_mem = donor.w_k_mem.clone();
-        new_params.levels[0].w_v_mem = donor.w_v_mem.clone();
-        new_params.levels[0].w_q_mem = donor.w_q_mem.clone();
-        new_params.levels[0].w_alpha = donor.w_alpha.clone();
-        new_params.levels[0].w_theta = donor.w_theta.clone();
-        new_params.levels[0].w_eta = donor.w_eta.clone();
-        new_params.levels[0].w_omega = donor.w_omega.clone();
+        // L0 initialization strategy (spec 28):
+        // - Random: keep fresh Xavier from MAGParams::init (better differentiation)
+        // - Clone: copy donor projections for scale-matched init (legacy behavior)
+        if init == PushUpInit::Clone {
+            let donor = &self.levels[0];
+            new_params.levels[0].w_k_mem = donor.w_k_mem.clone();
+            new_params.levels[0].w_v_mem = donor.w_v_mem.clone();
+            new_params.levels[0].w_q_mem = donor.w_q_mem.clone();
+            new_params.levels[0].w_alpha = donor.w_alpha.clone();
+            new_params.levels[0].w_theta = donor.w_theta.clone();
+            new_params.levels[0].w_eta = donor.w_eta.clone();
+            new_params.levels[0].w_omega = donor.w_omega.clone();
+        }
+        // PushUpInit::Random: L0 keeps fresh Xavier init from MAGParams::init above.
+        // Gate biases (b_alpha, b_theta, b_eta) always use level-0 defaults.
 
         // Shift alpha logits: old alpha[i] → new alpha[i+1], new alpha[0] = 0.0
         for i in 0..old_k {
