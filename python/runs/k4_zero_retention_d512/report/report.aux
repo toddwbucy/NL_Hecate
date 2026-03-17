@@ -1,0 +1,31 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Executive Summary}{2}{section.1}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Run configuration summary.}}{2}{table.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {2}Loss Trajectory}{2}{section.2}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Loss and perplexity. Red dashed line marks divergence onset at step $\sim $3120.}}{2}{figure.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3}Gradient Explosion}{3}{section.3}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Gradient norm escalation through the divergence event.}}{3}{table.2}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Gradient norms on linear (clipped at 100) and log scales.}}{3}{figure.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {4}Key Finding: Level Self-Organization (Steps 1000--3000)}{3}{section.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Alpha (Retention Gate)}{3}{subsection.4.1}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces Alpha (retention) per level across tape summaries. L1 dropped to 0.673 by step 3000 --- well below the old 0.8 floor. Post-divergence (step 4000), L0 alpha \emph  {increased} to 0.921, indicating gate dynamics were scrambled.}}{3}{table.3}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Alpha evolution per level. The old floor (0.8) is shown for reference. L0 and L1 both dropped below it.}}{4}{figure.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Theta (Write Strength)}{4}{subsection.4.2}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces Theta (write strength) per level. L0 and L1 were both actively writing pre-divergence. Post-divergence, L1 theta collapsed back to 0.038.}}{4}{table.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {5}Divergence Analysis}{4}{section.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Root Cause: Two Fast-Forgetting Levels}{4}{subsection.5.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces Theta evolution per level.}}{5}{figure.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}Why the Floor Prevented This}{5}{subsection.5.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.3}Post-Divergence Gate Scrambling}{5}{subsection.5.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {6}Eta (Momentum Gate)}{5}{section.6}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {5}{\ignorespaces Gate values pre-divergence (step 3000) vs post-divergence (step 4000).}}{6}{figure.5}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {6}{\ignorespaces Eta remained stable across all levels.}}{6}{figure.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {7}Throughput}{6}{section.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {8}Implications}{6}{section.8}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {7}{\ignorespaces Throughput held steady at $\sim $520 tok/s throughout the run.}}{7}{figure.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {9}Comparison with Other Runs}{7}{section.9}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {5}{\ignorespaces Comparison across experiment lineage.}}{7}{table.5}\protected@file@percent }
+\gdef \@abspage@last{7}

@@ -1,0 +1,14 @@
+\contentsline {section}{\numberline {1}Executive Summary}{2}{section.1}%
+\contentsline {section}{\numberline {2}Loss Trajectory}{2}{section.2}%
+\contentsline {section}{\numberline {3}Gradient Explosion}{3}{section.3}%
+\contentsline {section}{\numberline {4}Key Finding: Level Self-Organization (Steps 1000--3000)}{3}{section.4}%
+\contentsline {subsection}{\numberline {4.1}Alpha (Retention Gate)}{3}{subsection.4.1}%
+\contentsline {subsection}{\numberline {4.2}Theta (Write Strength)}{4}{subsection.4.2}%
+\contentsline {section}{\numberline {5}Divergence Analysis}{4}{section.5}%
+\contentsline {subsection}{\numberline {5.1}Root Cause: Two Fast-Forgetting Levels}{4}{subsection.5.1}%
+\contentsline {subsection}{\numberline {5.2}Why the Floor Prevented This}{5}{subsection.5.2}%
+\contentsline {subsection}{\numberline {5.3}Post-Divergence Gate Scrambling}{5}{subsection.5.3}%
+\contentsline {section}{\numberline {6}Eta (Momentum Gate)}{5}{section.6}%
+\contentsline {section}{\numberline {7}Throughput}{6}{section.7}%
+\contentsline {section}{\numberline {8}Implications}{6}{section.8}%
+\contentsline {section}{\numberline {9}Comparison with Other Runs}{7}{section.9}%
