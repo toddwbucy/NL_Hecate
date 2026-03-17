@@ -1,0 +1,45 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Experiment Configuration}{2}{section.1}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Model and training configuration.}}{2}{table.caption.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {2}Results Summary}{3}{section.2}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Key metrics at training milestones.}}{3}{table.caption.3}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces Comparison with prior k=2 experiments.}}{3}{table.caption.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3}Training Dynamics}{4}{section.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Loss and Perplexity}{4}{subsection.3.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Training loss and perplexity over 30K steps. Loss descends in three phases: rapid initial drop (steps 0--2K), steady reduction through the cosine body (2K--25K), and final convergence near LR exhaustion (25K--30K).}}{4}{figure.caption.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}Learning Rate Schedule}{4}{subsection.3.2}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Cosine decay learning rate schedule. 500-step linear warmup to 3e-4 peak, then cosine decay to near-zero by step 30K.}}{4}{figure.caption.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}Throughput}{5}{subsection.3.3}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Training throughput. Mean 1,207 tok/s, stable throughout training. The 2$\times $ improvement over the previous tape implementation (610 tok/s) is the direct result of the segment-scoped tape (Spec~25).}}{5}{figure.caption.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {4}Gradient Analysis}{5}{section.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Global Gradient Norms and Spikes}{5}{subsection.4.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces Left: global gradient norm with spike markers. Right: block gradient norm coefficient of variation (depth specialization). The CV crosses the 0.3 threshold around step 20K, indicating meaningful depth specialization has emerged.}}{5}{figure.caption.8}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces Gradient spike inventory (grad\_norm $>$ 10).}}{6}{table.caption.9}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Per-Block Gradient Norms}{6}{subsection.4.2}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {5}{\ignorespaces Per-block gradient norms (smoothed). Block 0 (input-adjacent) consistently carries the highest gradient load, with a clear hierarchy: Block 0 $>$ Block 1 $\approx $ Block 3 $>$ Block 2. This is the expected pattern for a 4-block transformer with memory.}}{6}{figure.caption.10}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.3}L0 Inner-Loop Gradient Signal}{7}{subsection.4.3}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {6}{\ignorespaces L0 per-block gradient norms. Block 0 receives the strongest L0 signal ($\sim $0.08--0.10), with Blocks 1--3 clustered around 0.04--0.05. This gradient hierarchy drives the depth specialization observed in the block CV metric.}}{7}{figure.caption.11}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {5}Gate Diagnostics}{7}{section.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Theta (Inner-Loop Learning Rate)}{7}{subsection.5.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {7}{\ignorespaces Theta evolution by block. L0 theta (blue) saturates to 1.0 across all blocks by step $\sim $4K, indicating maximum inner-loop learning rate. L1 theta (orange) follows a more nuanced trajectory: initially near zero, it gradually rises to the 0.2--0.4 range in most blocks. This is the \textbf  {healthy differentiation pattern} --- L0 learns fast, L1 learns slow.}}{7}{figure.caption.12}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}Alpha (Retention Gate)}{8}{subsection.5.2}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {8}{\ignorespaces Alpha (retention) evolution by block. L0 alpha (blue) stays in the 0.80--0.93 range, sitting near the floor. L1 alpha (orange) starts high ($\sim $0.98) and drops toward 0.85 in most blocks, establishing a retention differential.}}{8}{figure.caption.13}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.3}Eta (Output Gate)}{8}{subsection.5.3}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {9}{\ignorespaces Eta (output gate) evolution by block. Both levels maintain high eta ($>$0.85 for L0, 0.70--0.99 for L1), indicating both levels contribute meaningfully to the output.}}{8}{figure.caption.14}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.4}DGD Ratio (L0/L1 Update Magnitude)}{9}{subsection.5.4}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {10}{\ignorespaces DGD delta norm ratio (L0/L1) by block. Values consistently above the 2.0 healthy threshold (green dashed) across most blocks and most of training. The ratio indicates L0 is performing larger memory updates than L1, as expected for the fast level.}}{9}{figure.caption.15}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.5}Output Gradient Norms (MAG Identity Check)}{9}{subsection.5.5}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {11}{\ignorespaces Output gradient norms for L0 and L1 by block. In the MAG (Memory-Attention-Gate) composition, L0 and L1 receive identical output gradients by construction. The overlapping traces confirm this structural property holds throughout training.}}{9}{figure.caption.16}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {6}Level Fire Counts}{10}{section.6}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {12}{\ignorespaces Cumulative level fires. L0 fires every step (30,000 total), L1 fires every 8th step (3,750 total). The 8$\times $ ratio is exact throughout training, confirming the CMS frequency hierarchy operates correctly.}}{10}{figure.caption.17}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {7}Comparison with Previous Runs}{10}{section.7}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {5}{\ignorespaces Comprehensive comparison across k=2 experiments.}}{10}{table.caption.18}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {8}Analysis and Conclusions}{10}{section.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.1}Segment-Scoped Tape Validation}{10}{subsection.8.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.2}Level Differentiation}{11}{subsection.8.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.3}Implications for Push-Up Pipeline}{11}{subsection.8.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.4}Next Steps}{11}{subsection.8.4}\protected@file@percent }
+\gdef \@abspage@last{11}

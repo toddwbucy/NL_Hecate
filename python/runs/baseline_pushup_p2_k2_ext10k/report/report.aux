@@ -1,0 +1,56 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Purpose}{1}{section.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {2}Configuration}{1}{section.2}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Extension run configuration. Only differences from the original push-up k=2 are shown.}}{1}{table.caption.1}\protected@file@percent }
+\providecommand*\caption@xref[2]{\@setref\relax\@undefined{#1}}
+\newlabel{tab:config}{{1}{1}{Extension run configuration. Only differences from the original push-up k=2 are shown}{table.caption.1}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {3}Results Summary}{2}{section.3}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Key metrics at milestones (steps 20K--30K).}}{2}{table.caption.2}\protected@file@percent }
+\newlabel{tab:milestones}{{2}{2}{Key metrics at milestones (steps 20K--30K)}{table.caption.2}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces Smoothed loss trajectory (50-step windows).}}{2}{table.caption.3}\protected@file@percent }
+\newlabel{tab:trajectory}{{3}{2}{Smoothed loss trajectory (50-step windows)}{table.caption.3}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {4}Loss: Full Experimental Context}{2}{section.4}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Loss comparison across all four experiments. The extension (dark red) continues the push-up's plateau from steps 20K--30K. The fresh k=2 (green dashed) is already converging faster from random init.}}{2}{figure.caption.4}\protected@file@percent }
+\newlabel{fig:loss_all}{{1}{2}{Loss comparison across all four experiments. The extension (dark red) continues the push-up's plateau from steps 20K--30K. The fresh k=2 (green dashed) is already converging faster from random init}{figure.caption.4}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Extension run loss detail. One major spike at step 24K (loss=5.58) correlates with L1 theta instability (see Section~\ref {sec:theta}).}}{3}{figure.caption.5}\protected@file@percent }
+\newlabel{fig:loss_ext}{{2}{3}{Extension run loss detail. One major spike at step 24K (loss=5.58) correlates with L1 theta instability (see Section~\ref {sec:theta})}{figure.caption.5}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {5}Gradient Analysis}{4}{section.5}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Per-block gradient norms and CV during the extension. CV hovers at $\sim $0.30, below the 0.3 threshold for meaningful specialization.}}{4}{figure.caption.6}\protected@file@percent }
+\newlabel{fig:gnorms}{{3}{4}{Per-block gradient norms and CV during the extension. CV hovers at $\sim $0.30, below the 0.3 threshold for meaningful specialization}{figure.caption.6}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces L0 inner-loop gradient norms. Block~0 dominates ($\sim $0.35) but no growth trend is visible --- the memory mechanism has stagnated.}}{4}{figure.caption.7}\protected@file@percent }
+\newlabel{fig:l0}{{4}{4}{L0 inner-loop gradient norms. Block~0 dominates ($\sim $0.35) but no growth trend is visible --- the memory mechanism has stagnated}{figure.caption.7}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {6}Gate Diagnostics: The Oscillation Problem}{5}{section.6}\protected@file@percent }
+\newlabel{sec:theta}{{6}{5}{Gate Diagnostics: The Oscillation Problem}{section.6}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.1}Theta (Inner-Loop Learning Rate): Oscillation vs Convergence}{5}{subsection.6.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {5}{\ignorespaces Theta (inner-loop LR) for L0 and L1 across two blocks. \textbf  {Left:} Push-up extension --- L1 theta oscillates wildly, especially in Block~3. \textbf  {Right:} Fresh k=2 --- L0 rises to $\sim $0.9, L1 stays low ($<$0.2). Shaded area shows L0-L1 gap.}}{5}{figure.caption.8}\protected@file@percent }
+\newlabel{fig:theta}{{5}{5}{Theta (inner-loop LR) for L0 and L1 across two blocks. \textbf {Left:} Push-up extension --- L1 theta oscillates wildly, especially in Block~3. \textbf {Right:} Fresh k=2 --- L0 rises to $\sim $0.9, L1 stays low ($<$0.2). Shaded area shows L0-L1 gap}{figure.caption.8}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces Block~3 L1 theta: push-up extension showing extreme oscillation.}}{5}{table.caption.9}\protected@file@percent }
+\newlabel{tab:theta_osc}{{4}{5}{Block~3 L1 theta: push-up extension showing extreme oscillation}{table.caption.9}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.2}Alpha (Retention): No Timescale Separation}{6}{subsection.6.2}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {6}{\ignorespaces Alpha (retention) for Block~1. \textbf  {Left:} Push-up extension --- L0 and L1 alpha overlap with no separation trend. \textbf  {Right:} Fresh k=2 --- alpha values cross and wander but show slightly more range.}}{6}{figure.caption.10}\protected@file@percent }
+\newlabel{fig:alpha}{{6}{6}{Alpha (retention) for Block~1. \textbf {Left:} Push-up extension --- L0 and L1 alpha overlap with no separation trend. \textbf {Right:} Fresh k=2 --- alpha values cross and wander but show slightly more range}{figure.caption.10}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.3}Eta (Output Gate): Moderate Separation}{7}{subsection.6.3}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {7}{\ignorespaces Eta (output gate) for Block~1. Both experiments show L0 eta $>$ L1 eta, with the fresh k=2 exhibiting wider separation.}}{7}{figure.caption.11}\protected@file@percent }
+\newlabel{fig:eta}{{7}{7}{Eta (output gate) for Block~1. Both experiments show L0 eta $>$ L1 eta, with the fresh k=2 exhibiting wider separation}{figure.caption.11}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.4}DGD Update Magnitude Ratio}{7}{subsection.6.4}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {8}{\ignorespaces L0/L1 DGD delta norm ratio. Push-up ext (circles) is stuck at $\sim $1.3. Fresh k=2 (squares) reaches 2.5--3.5 --- L0 makes much larger memory updates.}}{7}{figure.caption.12}\protected@file@percent }
+\newlabel{fig:dgd}{{8}{7}{L0/L1 DGD delta norm ratio. Push-up ext (circles) is stuck at $\sim $1.3. Fresh k=2 (squares) reaches 2.5--3.5 --- L0 makes much larger memory updates}{figure.caption.12}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.5}Output Gradient Norms: Identical in Both Experiments}{8}{subsection.6.5}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {9}{\ignorespaces L0/L1 output gradient norm ratio = 1.000 in both experiments. This is a structural property of MAG composition, not a bug.}}{8}{figure.caption.13}\protected@file@percent }
+\newlabel{fig:outgrad}{{9}{8}{L0/L1 output gradient norm ratio = 1.000 in both experiments. This is a structural property of MAG composition, not a bug}{figure.caption.13}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {7}Training Throughput}{8}{section.7}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {10}{\ignorespaces Extension run throughput: stable at 609~tok/s.}}{8}{figure.caption.14}\protected@file@percent }
+\newlabel{fig:throughput}{{10}{8}{Extension run throughput: stable at 609~tok/s}{figure.caption.14}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {8}Root Cause: Cloned Initialization Traps Both Levels}{9}{section.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {9}Control: Fresh k=2 (Concurrent Run)}{9}{section.9}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {5}{\ignorespaces Push-up ext (step 27K) vs fresh k=2 (step 10K) gate diagnostics.}}{9}{table.caption.15}\protected@file@percent }
+\newlabel{tab:comparison}{{5}{9}{Push-up ext (step 27K) vs fresh k=2 (step 10K) gate diagnostics}{table.caption.15}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {10}Conclusions}{9}{section.10}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {10.1}Verdict}{9}{subsection.10.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {10.2}Key Findings}{10}{subsection.10.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {10.3}Implications for the Push-Up Pipeline}{10}{subsection.10.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {10.4}Next Experiments}{10}{subsection.10.4}\protected@file@percent }
+\gdef \@abspage@last{10}

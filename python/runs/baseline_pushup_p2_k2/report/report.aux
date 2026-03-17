@@ -1,0 +1,55 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Purpose}{1}{section.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {2}Configuration}{2}{section.2}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Model and training configuration. \textcolor {nlred}{Red} highlights changes from k=1 baseline.}}{2}{table.caption.1}\protected@file@percent }
+\providecommand*\caption@xref[2]{\@setref\relax\@undefined{#1}}
+\newlabel{tab:config}{{1}{2}{Model and training configuration. \textcolor {nlred}{Red} highlights changes from k=1 baseline}{table.caption.1}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {3}Results Summary}{3}{section.3}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Key metrics at training milestones.}}{3}{table.caption.2}\protected@file@percent }
+\newlabel{tab:milestones}{{2}{3}{Key metrics at training milestones}{table.caption.2}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {3}{\ignorespaces \textbf  {Head-to-head comparison} of final metrics: k=1 vs k=2.}}{3}{table.caption.3}\protected@file@percent }
+\newlabel{tab:comparison}{{3}{3}{\textbf {Head-to-head comparison} of final metrics: k=1 vs k=2}{table.caption.3}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {4}Training Loss}{4}{section.4}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Training loss with k=1 baseline overlay (dashed). The k=2 model starts at the donor's final loss (2.79) but immediately regresses to $\sim $3.5 during warmup.}}{4}{figure.caption.4}\protected@file@percent }
+\newlabel{fig:loss}{{1}{4}{Training loss with k=1 baseline overlay (dashed). The k=2 model starts at the donor's final loss (2.79) but immediately regresses to $\sim $3.5 during warmup}{figure.caption.4}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Heavily-smoothed loss comparison. The red shaded area shows the regression zone where k=2 exceeds k=1 loss. The k=2 model \textbf  {never} reaches the k=1 floor.}}{5}{figure.caption.5}\protected@file@percent }
+\newlabel{fig:loss_compare}{{2}{5}{Heavily-smoothed loss comparison. The red shaded area shows the regression zone where k=2 exceeds k=1 loss. The k=2 model \textbf {never} reaches the k=1 floor}{figure.caption.5}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Training perplexity (log scale). k=2 (red) sits consistently above k=1 (blue dashed).}}{5}{figure.caption.6}\protected@file@percent }
+\newlabel{fig:ppl}{{3}{5}{Training perplexity (log scale). k=2 (red) sits consistently above k=1 (blue dashed)}{figure.caption.6}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {5}Gradient Analysis}{6}{section.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Global and Per-Block Gradient Norms}{6}{subsection.5.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces Top: global gradient norm (k=2 solid, k=1 dashed). Bottom: per-block gradient norms. Block~0 still dominates, but with lower magnitude than at k=1.}}{6}{figure.caption.7}\protected@file@percent }
+\newlabel{fig:gnorms}{{4}{6}{Top: global gradient norm (k=2 solid, k=1 dashed). Bottom: per-block gradient norms. Block~0 still dominates, but with lower magnitude than at k=1}{figure.caption.7}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}Inner-Loop Gradient Norms: k=1 vs k=2}{7}{subsection.5.2}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {5}{\ignorespaces L0 inner-loop gradient norms compared side-by-side. Left: k=1 baseline shows clear Block~0 dominance with strong growth (0.001 $\to $ 0.38). Right: k=2 shows flatter trajectories, especially for Block~0.}}{7}{figure.caption.8}\protected@file@percent }
+\newlabel{fig:l0}{{5}{7}{L0 inner-loop gradient norms compared side-by-side. Left: k=1 baseline shows clear Block~0 dominance with strong growth (0.001 $\to $ 0.38). Right: k=2 shows flatter trajectories, especially for Block~0}{figure.caption.8}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.3}Depth Specialization}{7}{subsection.5.3}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {6}{\ignorespaces Block gradient norm CV. k=2 (red) trends \textbf  {downward} relative to k=1 (blue), ending at 0.29 vs 0.39 --- indicating \emph  {less} depth specialization.}}{7}{figure.caption.9}\protected@file@percent }
+\newlabel{fig:cv}{{6}{7}{Block gradient norm CV. k=2 (red) trends \textbf {downward} relative to k=1 (blue), ending at 0.29 vs 0.39 --- indicating \emph {less} depth specialization}{figure.caption.9}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {6}Level~1 Activity}{8}{section.6}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {7}{\ignorespaces Top: cumulative Level~1 fire count (reaches 2{,}500 by step 20K). Bottom: Level~1 active status per logged step.}}{8}{figure.caption.10}\protected@file@percent }
+\newlabel{fig:l1}{{7}{8}{Top: cumulative Level~1 fire count (reaches 2{,}500 by step 20K). Bottom: Level~1 active status per logged step}{figure.caption.10}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {7}Stability Analysis}{8}{section.7}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {8}{\ignorespaces Loss spikes ($>2\times $ previous step) in the k=2 run. 9 spikes detected, up from 6 in the k=1 baseline.}}{8}{figure.caption.11}\protected@file@percent }
+\newlabel{fig:spikes}{{8}{8}{Loss spikes ($>2\times $ previous step) in the k=2 run. 9 spikes detected, up from 6 in the k=1 baseline}{figure.caption.11}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {8}NIAH Evaluation}{9}{section.8}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {9}{\ignorespaces NIAH pass rate heatmaps. Left: k=1 baseline. Center: k=2 push-up. Right: delta (k=2 $-$ k=1). Blue = k=2 better, red = k=2 worse.}}{9}{figure.caption.12}\protected@file@percent }
+\newlabel{fig:niah}{{9}{9}{NIAH pass rate heatmaps. Left: k=1 baseline. Center: k=2 push-up. Right: delta (k=2 $-$ k=1). Blue = k=2 better, red = k=2 worse}{figure.caption.12}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {4}{\ignorespaces NIAH pass rates at step 20K: k=1 vs k=2.}}{9}{table.caption.13}\protected@file@percent }
+\newlabel{tab:niah}{{4}{9}{NIAH pass rates at step 20K: k=1 vs k=2}{table.caption.13}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {10}{\ignorespaces NIAH mean log-probability lift at step 20K. k=2 (orange) shows weaker or negative lift at all distances beyond 1{,}024 tokens.}}{9}{figure.caption.14}\protected@file@percent }
+\newlabel{fig:niah_lift}{{10}{9}{NIAH mean log-probability lift at step 20K. k=2 (orange) shows weaker or negative lift at all distances beyond 1{,}024 tokens}{figure.caption.14}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {9}Training Throughput}{10}{section.9}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {11}{\ignorespaces Training throughput comparison. k=2 runs 9\% slower than k=1 due to Level~1 memory update overhead.}}{10}{figure.caption.15}\protected@file@percent }
+\newlabel{fig:throughput}{{11}{10}{Training throughput comparison. k=2 runs 9\% slower than k=1 due to Level~1 memory update overhead}{figure.caption.15}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {10}Failure Diagnosis}{10}{section.10}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {10.1}Root Cause: Destructive Level Initialization}{10}{subsection.10.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {10.2}Contributing Factors}{11}{subsection.10.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {11}Conclusions and Recommendations}{11}{section.11}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {11.1}Verdict}{11}{subsection.11.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {11.2}Recommendations for Next Attempt}{11}{subsection.11.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {11.3}What This Tells Us About Push-Up}{12}{subsection.11.3}\protected@file@percent }
+\gdef \@abspage@last{12}

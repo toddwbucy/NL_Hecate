@@ -38,8 +38,11 @@ python/checkpoints/
 **/__pycache__/
 python/.venv/
 
-# Runtime artifacts
-python/runs/
+# Runtime artifacts — track reports, metrics, logs; exclude checkpoints and large binaries
+!python/runs/
+python/runs/**/checkpoints/
+python/runs/**/*.safetensors
+python/runs/**/*.safetensors.cursor.json
 python/nohup.out
 python/*.log
 

@@ -1,0 +1,21 @@
+\contentsline {section}{\numberline {1}Experiment Configuration}{3}{section.1}%
+\contentsline {subsection}{\numberline {1.1}Two-Phase Structure}{3}{subsection.1.1}%
+\contentsline {section}{\numberline {2}Loss Trajectory}{4}{section.2}%
+\contentsline {subsection}{\numberline {2.1}Comparison with spec25 (First 30K)}{5}{subsection.2.1}%
+\contentsline {section}{\numberline {3}Gradient Analysis}{5}{section.3}%
+\contentsline {subsection}{\numberline {3.1}Depth Specialization Collapse}{7}{subsection.3.1}%
+\contentsline {subsection}{\numberline {3.2}Gradient Spikes}{8}{subsection.3.2}%
+\contentsline {section}{\numberline {4}Gate Diagnostics: The Headline Finding}{8}{section.4}%
+\contentsline {subsection}{\numberline {4.1}L1 Eta Collapse (The Headline)}{8}{subsection.4.1}%
+\contentsline {subsection}{\numberline {4.2}L1 Alpha Floor-Pinning}{9}{subsection.4.2}%
+\contentsline {subsection}{\numberline {4.3}L0 Eta Saturation}{9}{subsection.4.3}%
+\contentsline {subsection}{\numberline {4.4}Full Gate Evolution}{10}{subsection.4.4}%
+\contentsline {subsection}{\numberline {4.5}Block 2 L1 Theta: The Persistent Anomaly}{11}{subsection.4.5}%
+\contentsline {section}{\numberline {5}Detailed Gate Comparison Table}{11}{section.5}%
+\contentsline {section}{\numberline {6}Throughput}{12}{section.6}%
+\contentsline {section}{\numberline {7}Conclusions}{12}{section.7}%
+\contentsline {subsection}{\numberline {7.1}Extended Proxy Training Produces Adaptive L1 Suppression}{12}{subsection.7.1}%
+\contentsline {subsection}{\numberline {7.2}Block 2: The Exception That Proves the Rule}{12}{subsection.7.2}%
+\contentsline {subsection}{\numberline {7.3}Implications for k=4 Production}{12}{subsection.7.3}%
+\contentsline {subsection}{\numberline {7.4}Depth Specialization at d=512}{13}{subsection.7.4}%
+\contentsline {subsection}{\numberline {7.5}Next Steps}{13}{subsection.7.5}%

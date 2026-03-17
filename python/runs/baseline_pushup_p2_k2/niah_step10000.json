@@ -1,0 +1,443 @@
+{
+  "checkpoint": "runs/baseline_pushup_p2_k2/model_step10000.safetensors",
+  "model": {
+    "d_model": 512,
+    "k": 2,
+    "chunk_sizes": [
+      1,
+      8
+    ],
+    "vocab_size": 50257,
+    "seq_len": 512
+  },
+  "config": {
+    "haystack_size": 8192,
+    "min_prefix": 512,
+    "min_suffix": 256,
+    "seed": 42,
+    "num_trials": 10
+  },
+  "distances": {
+    "1024": {
+      "pass_rate": 0.4,
+      "mean_lift": 0.068906160648912,
+      "num_pass": 4,
+      "num_trials": 10,
+      "trials": [
+        {
+          "pass": true,
+          "lift": 0.8113998061046015,
+          "answer_logprob": -7.769314848706255,
+          "baseline_logprob": -8.580714654810857,
+          "needle_idx": 0,
+          "needle_depth": 1424,
+          "retrieval_distance": 1024,
+          "answer": "7492"
+        },
+        {
+          "pass": false,
+          "lift": -1.2291407525539402,
+          "answer_logprob": -11.901159624071715,
+          "baseline_logprob": -10.672018871517775,
+          "needle_idx": 1,
+          "needle_depth": 6586,
+          "retrieval_distance": 1024,
+          "answer": "3841"
+        },
+        {
+          "pass": true,
+          "lift": 1.293163993954657,
+          "answer_logprob": -8.442156489400862,
+          "baseline_logprob": -9.735320483355519,
+          "needle_idx": 2,
+          "needle_depth": 2518,
+          "retrieval_distance": 1024,
+          "answer": "6205"
+        },
+        {
+          "pass": false,
+          "lift": 0.0,
+          "error": "answer logprob is NaN (bad logits at this position)",
+          "needle_idx": 3,
+          "needle_depth": 1655,
+          "retrieval_distance": 1024,
+          "answer": "1738"
+        },
+        {
+          "pass": false,
+          "lift": -0.18840443491935766,
+          "answer_logprob": -9.037354707236437,
+          "baseline_logprob": -8.84895027231708,
+          "needle_idx": 4,
+          "needle_depth": 1351,
+          "retrieval_distance": 1024,
+          "answer": "9054"
+        },
+        {
+          "pass": true,
+          "lift": 0.5268124312162392,
+          "answer_logprob": -8.976711542681095,
+          "baseline_logprob": -9.503523973897334,
+          "needle_idx": 0,
+          "needle_depth": 6579,
+          "retrieval_distance": 1024,
+          "answer": "7492"
+        },
+        {
+          "pass": false,
+          "lift": -1.1633301377296448,
+          "answer_logprob": -9.884031487870715,
+          "baseline_logprob": -8.72070135014107,
+          "needle_idx": 1,
+          "needle_depth": 1224,
+          "retrieval_distance": 1024,
+          "answer": "3841"
+        },
+        {
+          "pass": true,
+          "lift": 1.6886474013328563,
+          "answer_logprob": -7.323951694204828,
+          "baseline_logprob": -9.012599095537684,
+          "needle_idx": 2,
+          "needle_depth": 3968,
+          "retrieval_distance": 1024,
+          "answer": "6205"
+        },
+        {
+          "pass": false,
+          "lift": -0.2834304898977278,
+          "answer_logprob": -7.607296832037555,
+          "baseline_logprob": -7.323866342139827,
+          "needle_idx": 3,
+          "needle_depth": 756,
+          "retrieval_distance": 1024,
+          "answer": "1738"
+        },
+        {
+          "pass": false,
+          "lift": -0.7666562110185637,
+          "answer_logprob": -8.91410066769804,
+          "baseline_logprob": -8.147444456679477,
+          "needle_idx": 4,
+          "needle_depth": 2303,
+          "retrieval_distance": 1024,
+          "answer": "9054"
+        }
+      ]
+    },
+    "2048": {
+      "pass_rate": 0.4,
+      "mean_lift": 0.034319970628712504,
+      "num_pass": 4,
+      "num_trials": 10,
+      "trials": [
+        {
+          "pass": true,
+          "lift": 1.6253891706466685,
+          "answer_logprob": -7.042236592615934,
+          "baseline_logprob": -8.667625763262603,
+          "needle_idx": 0,
+          "needle_depth": 4651,
+          "retrieval_distance": 2048,
+          "answer": "7492"
+        },
+        {
+          "pass": true,
+          "lift": 0.07477401793003047,
+          "answer_logprob": -9.284888193160217,
+          "baseline_logprob": -9.359662211090248,
+          "needle_idx": 1,
+          "needle_depth": 729,
+          "retrieval_distance": 2048,
+          "answer": "3841"
+        },
+        {
+          "pass": true,
+          "lift": 1.425448464229703,
+          "answer_logprob": -8.434684656162133,
+          "baseline_logprob": -9.860133120391836,
+          "needle_idx": 2,
+          "needle_depth": 2140,
+          "retrieval_distance": 2048,
+          "answer": "6205"
+        },
+        {
+          "pass": false,
+          "lift": -1.9112637309823182,
+          "answer_logprob": -10.290376442348617,
+          "baseline_logprob": -8.379112711366298,
+          "needle_idx": 3,
+          "needle_depth": 5835,
+          "retrieval_distance": 2048,
+          "answer": "1738"
+        },
+        {
+          "pass": false,
+          "lift": -1.0182891905307763,
+          "answer_logprob": -9.13894229250014,
+          "baseline_logprob": -8.120653101969364,
+          "needle_idx": 4,
+          "needle_depth": 4976,
+          "retrieval_distance": 2048,
+          "answer": "9054"
+        },
+        {
+          "pass": false,
+          "lift": 0.0,
+          "error": "answer logprob is NaN (bad logits at this position)",
+          "needle_idx": 0,
+          "needle_depth": 2317,
+          "retrieval_distance": 2048,
+          "answer": "7492"
+        },
+        {
+          "pass": false,
+          "lift": 0.0,
+          "error": "answer logprob is NaN (bad logits at this position)",
+          "needle_idx": 1,
+          "needle_depth": 5339,
+          "retrieval_distance": 2048,
+          "answer": "3841"
+        },
+        {
+          "pass": true,
+          "lift": 1.7111611579312012,
+          "answer_logprob": -6.363406746869785,
+          "baseline_logprob": -8.074567904800986,
+          "needle_idx": 2,
+          "needle_depth": 565,
+          "retrieval_distance": 2048,
+          "answer": "6205"
+        },
+        {
+          "pass": false,
+          "lift": -1.4027512721717361,
+          "answer_logprob": -9.567124076513801,
+          "baseline_logprob": -8.164372804342065,
+          "needle_idx": 3,
+          "needle_depth": 1819,
+          "retrieval_distance": 2048,
+          "answer": "1738"
+        },
+        {
+          "pass": false,
+          "lift": -0.16126891076564753,
+          "answer_logprob": -9.696247818748569,
+          "baseline_logprob": -9.534978907982921,
+          "needle_idx": 4,
+          "needle_depth": 3974,
+          "retrieval_distance": 2048,
+          "answer": "9054"
+        }
+      ]
+    },
+    "4096": {
+      "pass_rate": 0.4,
+      "mean_lift": 0.2925182886701078,
+      "num_pass": 4,
+      "num_trials": 10,
+      "trials": [
+        {
+          "pass": false,
+          "lift": 0.0,
+          "error": "answer logprob is NaN (bad logits at this position)",
+          "needle_idx": 0,
+          "needle_depth": 1650,
+          "retrieval_distance": 4096,
+          "answer": "7492"
+        },
+        {
+          "pass": false,
+          "lift": 0.0,
+          "error": "answer logprob is NaN (bad logits at this position)",
+          "needle_idx": 1,
+          "needle_depth": 1393,
+          "retrieval_distance": 4096,
+          "answer": "3841"
+        },
+        {
+          "pass": true,
+          "lift": 1.9698930844664577,
+          "answer_logprob": -7.084334347099709,
+          "baseline_logprob": -9.054227431566167,
+          "needle_idx": 2,
+          "needle_depth": 1890,
+          "retrieval_distance": 4096,
+          "answer": "6205"
+        },
+        {
+          "pass": true,
+          "lift": 0.047587122395635006,
+          "answer_logprob": -9.89567823529754,
+          "baseline_logprob": -9.943265357693175,
+          "needle_idx": 3,
+          "needle_depth": 891,
+          "retrieval_distance": 4096,
+          "answer": "1738"
+        },
+        {
+          "pass": false,
+          "lift": 0.0,
+          "error": "answer logprob is NaN (bad logits at this position)",
+          "needle_idx": 4,
+          "needle_depth": 908,
+          "retrieval_distance": 4096,
+          "answer": "9054"
+        },
+        {
+          "pass": false,
+          "lift": 0.0,
+          "error": "answer logprob is NaN (bad logits at this position)",
+          "needle_idx": 0,
+          "needle_depth": 1920,
+          "retrieval_distance": 4096,
+          "answer": "7492"
+        },
+        {
+          "pass": false,
+          "lift": -0.9794263609684997,
+          "answer_logprob": -10.549743351714312,
+          "baseline_logprob": -9.570316990745813,
+          "needle_idx": 1,
+          "needle_depth": 1595,
+          "retrieval_distance": 4096,
+          "answer": "3841"
+        },
+        {
+          "pass": true,
+          "lift": 1.7073639951646324,
+          "answer_logprob": -6.6237203026431075,
+          "baseline_logprob": -8.33108429780774,
+          "needle_idx": 2,
+          "needle_depth": 689,
+          "retrieval_distance": 4096,
+          "answer": "6205"
+        },
+        {
+          "pass": false,
+          "lift": -1.2467937469482422,
+          "answer_logprob": -9.523061605639295,
+          "baseline_logprob": -8.276267858691053,
+          "needle_idx": 3,
+          "needle_depth": 2393,
+          "retrieval_distance": 4096,
+          "answer": "1738"
+        },
+        {
+          "pass": true,
+          "lift": 1.426558792591095,
+          "answer_logprob": -8.51729404797895,
+          "baseline_logprob": -9.943852840570045,
+          "needle_idx": 4,
+          "needle_depth": 1023,
+          "retrieval_distance": 4096,
+          "answer": "9054"
+        }
+      ]
+    },
+    "8192": {
+      "pass_rate": 0.2,
+      "mean_lift": 0.09344487179070686,
+      "num_pass": 2,
+      "num_trials": 10,
+      "trials": [
+        {
+          "pass": false,
+          "lift": 0.0,
+          "error": "answer logprob is NaN (bad logits at this position)",
+          "needle_idx": 0,
+          "needle_depth": 552,
+          "retrieval_distance": 8192,
+          "answer": "7492"
+        },
+        {
+          "pass": false,
+          "lift": -0.3418454226106409,
+          "answer_logprob": -8.968101598199986,
+          "baseline_logprob": -8.626256175589345,
+          "needle_idx": 1,
+          "needle_depth": 662,
+          "retrieval_distance": 8192,
+          "answer": "3841"
+        },
+        {
+          "pass": true,
+          "lift": 1.8184436649084077,
+          "answer_logprob": -6.990083030813242,
+          "baseline_logprob": -8.80852669572165,
+          "needle_idx": 2,
+          "needle_depth": 833,
+          "retrieval_distance": 8192,
+          "answer": "6205"
+        },
+        {
+          "pass": false,
+          "lift": -1.2115688636898998,
+          "answer_logprob": -9.842736239632394,
+          "baseline_logprob": -8.631167375942495,
+          "needle_idx": 3,
+          "needle_depth": 965,
+          "retrieval_distance": 8192,
+          "answer": "1738"
+        },
+        {
+          "pass": true,
+          "lift": 0.6694193392992016,
+          "answer_logprob": -8.6188846321512,
+          "baseline_logprob": -9.288303971450402,
+          "needle_idx": 4,
+          "needle_depth": 697,
+          "retrieval_distance": 8192,
+          "answer": "9054"
+        },
+        {
+          "pass": false,
+          "lift": 0.0,
+          "error": "answer logprob is NaN (bad logits at this position)",
+          "needle_idx": 0,
+          "needle_depth": 610,
+          "retrieval_distance": 8192,
+          "answer": "7492"
+        },
+        {
+          "pass": false,
+          "lift": 0.0,
+          "error": "answer logprob is NaN (bad logits at this position)",
+          "needle_idx": 1,
+          "needle_depth": 547,
+          "retrieval_distance": 8192,
+          "answer": "3841"
+        },
+        {
+          "pass": false,
+          "lift": 0.0,
+          "error": "answer logprob is NaN (bad logits at this position)",
+          "needle_idx": 2,
+          "needle_depth": 850,
+          "retrieval_distance": 8192,
+          "answer": "6205"
+        },
+        {
+          "pass": false,
+          "lift": 0.0,
+          "error": "answer logprob is NaN (bad logits at this position)",
+          "needle_idx": 3,
+          "needle_depth": 907,
+          "retrieval_distance": 8192,
+          "answer": "1738"
+        },
+        {
+          "pass": false,
+          "lift": 0.0,
+          "error": "answer logprob is NaN (bad logits at this position)",
+          "needle_idx": 4,
+          "needle_depth": 552,
+          "retrieval_distance": 8192,
+          "answer": "9054"
+        }
+      ]
+    }
+  },
+  "coherence": [],
+  "elapsed_seconds": 517.7
+}

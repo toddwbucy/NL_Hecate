@@ -1,0 +1,205 @@
+Loaded config: configs/k4_zero_retention_d512_gpu0.json
+Run directory: runs/k4_zero_retention_d512
+  Checkpoints: runs/k4_zero_retention_d512/checkpoints
+  Metrics:     runs/k4_zero_retention_d512/metrics.jsonl
+Loaded dolmino BPE data: 949,999,999 tokens, vocab=32000
+Loaded val set: 49,999,999 tokens
+Tokenizer for samples: BPE
+
+============================================================
+NL-Hecate Build
+============================================================
+  Model:    d=512, heads=8, seq_len=512, vocab=50257
+  Memory:   rule=titans, composition=mag, k=4
+  CMS:      chunk_sizes=[1, 8, 64, 512]
+  α clamps: floor=[0.0, 0.0, 0.0, 0.0], ceil=None
+  θ clamps: floor=None, ceil=[1.0, 1.0, 1.0, 1.0]
+  M-norm:   max=[100.0, 100.0, 100.0, 100.0]
+  ErrClip:  max=[0.0, 0.0, 0.0, 0.0]
+  Params:   57,768,980
+  Data:     949,999,999 tokens (dolmino BPE)
+  Build:    100000 steps (from step 0), lr=0.0003
+  Optimizer: adamw_gpu_stacked (b1=0.9, b2=0.999, wd=0.1, warmup=500)
+  Grad clip: max_norm=1.0
+  Device:   GPU
+  Eval:     every 1000 steps, 100 max chunks
+  Probes:   1 prompt(s), 20 tokens each  | tape every 1000 steps
+  Log:      runs/k4_zero_retention_d512/metrics.jsonl
+============================================================
+
+  Stacked:  4 blocks x k=4 CMS levels  (76,687,440 params)
+  step     0  loss=11.0023  ppl=60014.1  tok/s=147  gnorm=13.8603  lr=0.000000  rss=8283MB
+  step     8  loss=10.8853  ppl=53384.9  tok/s=525  gnorm=6.8446  lr=0.000005  rss=8283MB
+  step    10  loss=10.9411  ppl=56450.6  tok/s=591  gnorm=7.8133  lr=0.000006  rss=8283MB
+  step    16  loss=10.9553  ppl=57255.4  tok/s=508  gnorm=7.3896  lr=0.000010  rss=8283MB
+  step    20  loss=10.7951  ppl=48779.7  tok/s=591  gnorm=8.2434  lr=0.000012  rss=8283MB
+  step    24  loss=10.6673  ppl=42927.9  tok/s=470  gnorm=7.4213  lr=0.000014  rss=8283MB
+  step    30  loss=10.5749  ppl=39139.2  tok/s=590  gnorm=6.5322  lr=0.000018  rss=8283MB
+  step    32  loss=10.5218  ppl=37115.1  tok/s=394  gnorm=6.0930  lr=0.000019  rss=8283MB
+  step    40  loss=10.4326  ppl=33948.9  tok/s=523  gnorm=5.7519  lr=0.000024  rss=8283MB
+  step    48  loss=10.1009  ppl=24365.6  tok/s=523  gnorm=6.9316  lr=0.000029  rss=8283MB
+  step    50  loss=9.9164  ppl=20259.8  tok/s=593  gnorm=4.1660  lr=0.000030  rss=8283MB
+  step    56  loss=9.7663  ppl=17436.9  tok/s=505  gnorm=4.2142  lr=0.000034  rss=8283MB
+  step    60  loss=9.9678  ppl=21328.3  tok/s=589  gnorm=6.4722  lr=0.000036  rss=8283MB
+  step    64  loss=9.3279  ppl=11247.1  tok/s=393  gnorm=6.3957  lr=0.000038  rss=8283MB
+  step    70  loss=9.0397  ppl=8431.0  tok/s=589  gnorm=4.9948  lr=0.000042  rss=8283MB
+  step    72  loss=9.1990  ppl=9887.5  tok/s=393  gnorm=3.0598  lr=0.000043  rss=8283MB
+  step    80  loss=8.8799  ppl=7185.9  tok/s=520  gnorm=3.4863  lr=0.000048  rss=8283MB
+  step    88  loss=8.7399  ppl=6247.5  tok/s=524  gnorm=3.2795  lr=0.000053  rss=8283MB
+  step    90  loss=8.3145  ppl=4082.6  tok/s=585  gnorm=2.9189  lr=0.000054  rss=8283MB
+  step    96  loss=8.2952  ppl=4004.7  tok/s=505  gnorm=2.6045  lr=0.000058  rss=8283MB
+  step   104  loss=8.1217  ppl=3366.6  tok/s=524  gnorm=2.3898  lr=0.000062  rss=8283MB
+  step   112  loss=7.4218  ppl=1672.1  tok/s=522  gnorm=2.3866  lr=0.000067  rss=8283MB
+  step   120  loss=7.4198  ppl=1668.7  tok/s=524  gnorm=2.1830  lr=0.000072  rss=8283MB
+  step   128  loss=6.9314  ppl=1023.9  tok/s=470  gnorm=2.0555  lr=0.000077  rss=8283MB
+  step   136  loss=6.8772  ppl=969.9  tok/s=522  gnorm=2.5129  lr=0.000082  rss=8283MB
+  step   144  loss=6.7162  ppl=825.7  tok/s=523  gnorm=1.8750  lr=0.000086  rss=8283MB
+  step   152  loss=6.7284  ppl=835.8  tok/s=523  gnorm=2.7493  lr=0.000091  rss=8283MB
+  step   160  loss=6.8229  ppl=918.7  tok/s=523  gnorm=1.8849  lr=0.000096  rss=8283MB
+  step   168  loss=6.1864  ppl=486.1  tok/s=522  gnorm=2.4184  lr=0.000101  rss=8283MB
+  step   176  loss=6.5633  ppl=708.6  tok/s=525  gnorm=117.8110  lr=0.000106  rss=8283MB
+  step   184  loss=6.7421  ppl=847.3  tok/s=523  gnorm=89.1530  lr=0.000110  rss=8283MB
+  step   192  loss=6.6163  ppl=747.1  tok/s=470  gnorm=29.9411  lr=0.000115  rss=8283MB
+  step   200  loss=6.3626  ppl=579.8  tok/s=524  gnorm=1.8734  lr=0.000120  rss=8283MB
+  step   208  loss=6.5251  ppl=682.1  tok/s=524  gnorm=1.8598  lr=0.000125  rss=8283MB
+  step   216  loss=6.5832  ppl=722.9  tok/s=522  gnorm=1.8274  lr=0.000130  rss=8283MB
+  step   224  loss=6.5131  ppl=673.9  tok/s=524  gnorm=2.1997  lr=0.000134  rss=8283MB
+  step   232  loss=6.6118  ppl=743.8  tok/s=523  gnorm=1.4030  lr=0.000139  rss=8283MB
+  step   240  loss=6.4461  ppl=630.3  tok/s=524  gnorm=1.7974  lr=0.000144  rss=8283MB
+  step   248  loss=6.2469  ppl=516.4  tok/s=526  gnorm=1.6440  lr=0.000149  rss=8283MB
+  step   256  loss=6.3546  ppl=575.1  tok/s=472  gnorm=1.5345  lr=0.000154  rss=8283MB
+  step   264  loss=6.4117  ppl=608.9  tok/s=525  gnorm=2.6063  lr=0.000158  rss=8283MB
+  step   272  loss=6.3944  ppl=598.5  tok/s=519  gnorm=1.8111  lr=0.000163  rss=8283MB
+  step   280  loss=6.3685  ppl=583.2  tok/s=523  gnorm=2.4449  lr=0.000168  rss=8283MB
+  step   288  loss=6.2988  ppl=543.9  tok/s=523  gnorm=2.2930  lr=0.000173  rss=8283MB
+  step   296  loss=5.9895  ppl=399.2  tok/s=524  gnorm=1.8428  lr=0.000178  rss=8283MB
+  step   304  loss=6.6174  ppl=748.0  tok/s=525  gnorm=1.5587  lr=0.000182  rss=8283MB
+  step   312  loss=6.3035  ppl=546.5  tok/s=525  gnorm=2.1673  lr=0.000187  rss=8283MB
+  step   320  loss=6.0482  ppl=423.4  tok/s=469  gnorm=2.2655  lr=0.000192  rss=8283MB
+  step   328  loss=6.6713  ppl=789.4  tok/s=522  gnorm=4891067.0000  lr=0.000197  rss=8283MB
+  step   336  loss=6.3151  ppl=552.8  tok/s=526  gnorm=503.6557  lr=0.000202  rss=8283MB
+  step   344  loss=5.8708  ppl=354.5  tok/s=522  gnorm=1.8616  lr=0.000206  rss=8283MB
+  step   352  loss=6.3228  ppl=557.1  tok/s=522  gnorm=6.4822  lr=0.000211  rss=8283MB
+  step   360  loss=7.0270  ppl=1126.6  tok/s=523  gnorm=3.1692  lr=0.000216  rss=8283MB
+  step   368  loss=5.9010  ppl=365.4  tok/s=523  gnorm=2.0038  lr=0.000221  rss=8283MB
+  step   376  loss=5.5899  ppl=267.7  tok/s=523  gnorm=3.7058  lr=0.000226  rss=8283MB
+  step   384  loss=5.8170  ppl=336.0  tok/s=470  gnorm=1.8815  lr=0.000230  rss=8283MB
+  step   392  loss=5.5184  ppl=249.2  tok/s=523  gnorm=3.8030  lr=0.000235  rss=8283MB
+  step   400  loss=6.2804  ppl=534.0  tok/s=525  gnorm=2.6642  lr=0.000240  rss=8283MB
+  step   408  loss=6.0523  ppl=425.1  tok/s=524  gnorm=2.8605  lr=0.000245  rss=8283MB
+  step   416  loss=5.8624  ppl=351.6  tok/s=524  gnorm=1.7320  lr=0.000250  rss=8283MB
+  step   424  loss=6.6246  ppl=753.4  tok/s=523  gnorm=2.3230  lr=0.000254  rss=8283MB
+  step   432  loss=5.9407  ppl=380.2  tok/s=521  gnorm=1.7329  lr=0.000259  rss=8283MB
+  step   440  loss=6.2226  ppl=504.0  tok/s=522  gnorm=2.1987  lr=0.000264  rss=8283MB
+  step   448  loss=5.9334  ppl=377.4  tok/s=471  gnorm=2.7279  lr=0.000269  rss=8283MB
+  step   456  loss=5.5877  ppl=267.1  tok/s=522  gnorm=1.7907  lr=0.000274  rss=8283MB
+  step   464  loss=5.4557  ppl=234.1  tok/s=522  gnorm=2.8116  lr=0.000278  rss=8283MB
+  step   472  loss=6.0327  ppl=416.8  tok/s=524  gnorm=2.0581  lr=0.000283  rss=8283MB
+  step   480  loss=5.8664  ppl=353.0  tok/s=523  gnorm=1.7624  lr=0.000288  rss=8283MB
+  step   488  loss=5.4639  ppl=236.0  tok/s=522  gnorm=2.7054  lr=0.000293  rss=8283MB
+  step   496  loss=5.6155  ppl=274.6  tok/s=521  gnorm=1.7234  lr=0.000298  rss=8283MB
+  step   504  loss=5.5639  ppl=260.8  tok/s=524  gnorm=2.4056  lr=0.000300  rss=8283MB
+  step   512  loss=5.1993  ppl=181.1  tok/s=421  gnorm=2.1250  lr=0.000300  rss=8283MB
+  step   520  loss=5.7069  ppl=300.9  tok/s=526  gnorm=1.9953  lr=0.000300  rss=8283MB
+  step   528  loss=5.6996  ppl=298.8  tok/s=525  gnorm=1.9718  lr=0.000300  rss=8283MB
+  step   536  loss=5.3608  ppl=212.9  tok/s=516  gnorm=3.5212  lr=0.000300  rss=8283MB
+  step   544  loss=5.3259  ppl=205.6  tok/s=527  gnorm=3.8888  lr=0.000300  rss=8283MB
+  step   552  loss=5.8440  ppl=345.2  tok/s=524  gnorm=2.3757  lr=0.000300  rss=8283MB
+  step   560  loss=5.8255  ppl=338.8  tok/s=526  gnorm=5.4499  lr=0.000300  rss=8283MB
+  step   568  loss=5.8968  ppl=363.9  tok/s=518  gnorm=7.7610  lr=0.000300  rss=8283MB
+  step   576  loss=5.5109  ppl=247.4  tok/s=472  gnorm=2.8591  lr=0.000300  rss=8283MB
+  step   584  loss=5.4674  ppl=236.8  tok/s=524  gnorm=1.7304  lr=0.000300  rss=8283MB
+  step   592  loss=5.9543  ppl=385.4  tok/s=524  gnorm=2.2621  lr=0.000300  rss=8283MB
+  step   600  loss=5.7992  ppl=330.1  tok/s=525  gnorm=2.0243  lr=0.000300  rss=8283MB
+  step   608  loss=5.4104  ppl=223.7  tok/s=523  gnorm=1.9209  lr=0.000300  rss=8283MB
+  step   616  loss=5.9895  ppl=399.2  tok/s=522  gnorm=3.0392  lr=0.000300  rss=8283MB
+  step   624  loss=5.8246  ppl=338.5  tok/s=524  gnorm=3.0747  lr=0.000300  rss=8283MB
+  step   632  loss=5.2830  ppl=197.0  tok/s=522  gnorm=1.9300  lr=0.000300  rss=8283MB
+  step   640  loss=5.5905  ppl=267.9  tok/s=468  gnorm=3.8512  lr=0.000300  rss=8283MB
+  step   648  loss=5.7420  ppl=311.7  tok/s=524  gnorm=2.0350  lr=0.000300  rss=8283MB
+  step   656  loss=5.8581  ppl=350.1  tok/s=524  gnorm=2.1080  lr=0.000300  rss=8283MB
+  step   664  loss=6.1613  ppl=474.1  tok/s=524  gnorm=2.2167  lr=0.000300  rss=8283MB
+  step   672  loss=4.6827  ppl=108.1  tok/s=521  gnorm=2.5503  lr=0.000300  rss=8283MB
+  step   680  loss=5.3896  ppl=219.1  tok/s=520  gnorm=2.1299  lr=0.000300  rss=8283MB
+  step   688  loss=5.3284  ppl=206.1  tok/s=523  gnorm=2.2891  lr=0.000300  rss=8283MB
+  step   696  loss=4.7057  ppl=110.6  tok/s=522  gnorm=3.1906  lr=0.000300  rss=8283MB
+  step   704  loss=5.2634  ppl=193.1  tok/s=470  gnorm=2.4605  lr=0.000300  rss=8283MB
+  step   712  loss=6.5288  ppl=684.6  tok/s=523  gnorm=2.4829  lr=0.000300  rss=8283MB
+  step   720  loss=5.1727  ppl=176.4  tok/s=523  gnorm=3.0768  lr=0.000300  rss=8283MB
+  step   728  loss=5.3050  ppl=201.3  tok/s=524  gnorm=2.3005  lr=0.000300  rss=8283MB
+  step   736  loss=4.8056  ppl=122.2  tok/s=521  gnorm=2.1959  lr=0.000300  rss=8283MB
+  step   744  loss=5.3698  ppl=214.8  tok/s=523  gnorm=2.4846  lr=0.000300  rss=8283MB
+  step   752  loss=4.0365  ppl=56.6  tok/s=520  gnorm=5.9927  lr=0.000300  rss=8283MB
+  step   760  loss=5.5240  ppl=250.6  tok/s=523  gnorm=2.9116  lr=0.000300  rss=8283MB
+  step   768  loss=5.0728  ppl=159.6  tok/s=472  gnorm=2.6590  lr=0.000300  rss=8283MB
+  step   776  loss=5.0261  ppl=152.3  tok/s=522  gnorm=2.3262  lr=0.000300  rss=8283MB
+  step   784  loss=5.7297  ppl=307.9  tok/s=521  gnorm=1.9851  lr=0.000300  rss=8283MB
+  step   792  loss=5.0225  ppl=151.8  tok/s=523  gnorm=2.1554  lr=0.000300  rss=8283MB
+  step   800  loss=5.1227  ppl=167.8  tok/s=523  gnorm=2.4461  lr=0.000300  rss=8283MB
+  step   808  loss=5.2391  ppl=188.5  tok/s=524  gnorm=3.5429  lr=0.000300  rss=8283MB
+  step   816  loss=5.3768  ppl=216.3  tok/s=523  gnorm=2.1165  lr=0.000300  rss=8283MB
+  step   824  loss=6.4492  ppl=632.2  tok/s=525  gnorm=3.3735  lr=0.000300  rss=8283MB
+  step   832  loss=4.6852  ppl=108.3  tok/s=469  gnorm=2.9535  lr=0.000300  rss=8283MB
+  step   840  loss=5.4977  ppl=244.1  tok/s=523  gnorm=2.0643  lr=0.000300  rss=8283MB
+  step   848  loss=5.0707  ppl=159.3  tok/s=523  gnorm=2.2748  lr=0.000300  rss=8283MB
+  step   856  loss=5.5251  ppl=250.9  tok/s=524  gnorm=2.7505  lr=0.000300  rss=8283MB
+  step   864  loss=5.3106  ppl=202.5  tok/s=525  gnorm=2.4183  lr=0.000300  rss=8283MB
+  step   872  loss=4.7091  ppl=110.9  tok/s=525  gnorm=2.2370  lr=0.000300  rss=8283MB
+  step   880  loss=5.5346  ppl=253.3  tok/s=525  gnorm=1.8680  lr=0.000300  rss=8283MB
+  step   888  loss=5.1359  ppl=170.0  tok/s=523  gnorm=1.9844  lr=0.000300  rss=8283MB
+  step   896  loss=6.9109  ppl=1003.2  tok/s=471  gnorm=4.9676  lr=0.000300  rss=8283MB
+  step   904  loss=4.8149  ppl=123.3  tok/s=522  gnorm=2.3073  lr=0.000300  rss=8283MB
+  step   912  loss=5.0970  ppl=163.5  tok/s=518  gnorm=1.7742  lr=0.000300  rss=8283MB
+  step   920  loss=4.9660  ppl=143.4  tok/s=522  gnorm=2.5785  lr=0.000300  rss=8283MB
+  step   928  loss=4.8340  ppl=125.7  tok/s=523  gnorm=2.4207  lr=0.000300  rss=8283MB
+  step   936  loss=5.4328  ppl=228.8  tok/s=521  gnorm=2.8248  lr=0.000300  rss=8283MB
+  step   944  loss=4.6681  ppl=106.5  tok/s=523  gnorm=1.8466  lr=0.000300  rss=8283MB
+  step   952  loss=5.3327  ppl=207.0  tok/s=523  gnorm=2.1674  lr=0.000300  rss=8283MB
+  step   960  loss=4.8390  ppl=126.3  tok/s=471  gnorm=1.9978  lr=0.000300  rss=8283MB
+  step   968  loss=5.8120  ppl=334.3  tok/s=523  gnorm=2.1022  lr=0.000300  rss=8283MB
+  step   976  loss=4.6709  ppl=106.8  tok/s=523  gnorm=2.6868  lr=0.000300  rss=8283MB
+  step   984  loss=5.1800  ppl=177.7  tok/s=522  gnorm=1.8506  lr=0.000300  rss=8283MB
+  step   992  loss=5.4213  ppl=226.2  tok/s=524  gnorm=2.5242  lr=0.000300  rss=8283MB
+  step  1000  loss=5.1497  ppl=172.4  tok/s=523  gnorm=1.8673  lr=0.000300  rss=8283MB
+  [tape] step=1000  loss=5.0619  total_blocks=16
+    L0 [TitansLMM]  blocks=4  out_gnorm=9.7246e-03  dgd_delta=5.0436e+01  m_norm=0.0
+           α  mean=0.7491  p99=0.9979  max=0.9984  @floor=0.0%
+           θ  mean=0.1933  p99=1.0000  max=1.0000  @ceil=8.9%
+           η  mean=0.9277  p99=1.0000  max=1.0000
+    L1 [TitansLMM]  blocks=4  out_gnorm=9.7246e-03  dgd_delta=0.0000e+00  m_norm=0.0
+           α  mean=0.9193  p99=0.9872  max=0.9886  @floor=0.0%
+           θ  mean=0.0128  p99=0.0925  max=0.0927  @ceil=0.0%
+           η  mean=0.8723  p99=0.9996  max=0.9996
+    L2 [TitansLMM]  blocks=4  out_gnorm=9.7246e-03  dgd_delta=0.0000e+00  m_norm=0.0
+           α  mean=0.9876  p99=0.9930  max=0.9934  @floor=0.0%
+           θ  mean=0.0016  p99=0.0027  max=0.0032  @ceil=0.0%
+           η  mean=0.9257  p99=0.9584  max=0.9632
+    L3 [TitansLMM]  blocks=4  out_gnorm=9.7246e-03  dgd_delta=0.0000e+00  m_norm=0.0
+           α  mean=0.9926  p99=0.9961  max=0.9962  @floor=0.0%
+           θ  mean=0.0005  p99=0.0008  max=0.0009  @ceil=0.0%
+           η  mean=0.9498  p99=0.9752  max=0.9773
+  step  1008  loss=5.1394  ppl=170.6  tok/s=362  gnorm=2.6359  lr=0.000300  rss=8283MB
+  step  1016  loss=5.4410  ppl=230.7  tok/s=520  gnorm=2.0981  lr=0.000300  rss=8283MB
+  step  1024  loss=5.0519  ppl=156.3  tok/s=426  gnorm=2.0726  lr=0.000300  rss=8283MB
+  step  1032  loss=4.7050  ppl=110.5  tok/s=522  gnorm=3.6618  lr=0.000300  rss=8283MB
+  step  1040  loss=5.5113  ppl=247.5  tok/s=522  gnorm=2.1683  lr=0.000300  rss=8283MB
+  step  1048  loss=4.9601  ppl=142.6  tok/s=523  gnorm=1.9412  lr=0.000300  rss=8283MB
+  step  1056  loss=5.1576  ppl=173.7  tok/s=523  gnorm=2.2762  lr=0.000300  rss=8283MB
+  step  1064  loss=5.1095  ppl=165.6  tok/s=522  gnorm=2.3698  lr=0.000300  rss=8283MB
+  step  1072  loss=4.7405  ppl=114.5  tok/s=522  gnorm=2.0799  lr=0.000300  rss=8283MB
+  step  1080  loss=5.2830  ppl=197.0  tok/s=521  gnorm=3.2012  lr=0.000300  rss=8283MB
+  step  1088  loss=5.0160  ppl=150.8  tok/s=470  gnorm=2.6188  lr=0.000300  rss=8283MB
+  step  1096  loss=5.7233  ppl=305.9  tok/s=519  gnorm=2.3178  lr=0.000300  rss=8283MB
+  step  1104  loss=5.4431  ppl=231.2  tok/s=522  gnorm=2.1078  lr=0.000300  rss=8283MB
+  step  1112  loss=5.1084  ppl=165.4  tok/s=523  gnorm=3.2171  lr=0.000300  rss=8283MB
+  step  1120  loss=4.5613  ppl=95.7  tok/s=525  gnorm=2.5615  lr=0.000300  rss=8283MB
+  step  1128  loss=5.2226  ppl=185.4  tok/s=522  gnorm=2.7567  lr=0.000300  rss=8283MB
+  step  1136  loss=4.9708  ppl=144.1  tok/s=521  gnorm=3.0415  lr=0.000300  rss=8283MB
+  step  1144  loss=5.0991  ppl=163.9  tok/s=525  gnorm=2.1449  lr=0.000300  rss=8283MB
+  step  1152  loss=4.4745  ppl=87.8  tok/s=469  gnorm=2.6833  lr=0.000300  rss=8283MB
+  step  1160  loss=4.9530  ppl=141.6  tok/s=522  gnorm=2.6115  lr=0.000300  rss=8283MB
+  step  1168  loss=4.9621  ppl=142.9  tok/s=522  gnorm=19.4193  lr=0.000300  rss=8283MB
+  step  1176  loss=5.6399  ppl=281.4  tok/s=524  gnorm=3.2925  lr=0.000300  rss=8283MB
+  step  1184  loss=5.2672  ppl=193.9  tok/s=524  gnorm=3.0250  lr=0.000300  rss=8283MB
+  step  1192  loss=4.7311  ppl=113.4  tok/s=525  gnorm=3.7264  lr=0.000300  rss=8283MB
+  step  1200  loss=5.2870  ppl=197.8  tok/s=522  gnorm=100.1908  lr=0.000300  rss=8283MB

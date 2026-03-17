@@ -1,0 +1,47 @@
+{
+    "description": "Baseline push-up Phase 1: 4 blocks x k=1, d=512, 8 heads, TNT chunkwise, dolmino_100b. 20K steps on GPU0. Config matches proven stacked_fresh_4b_k1_learned_cs39 formula: periodic reset, no m_norm clamp, GPT2 vocab.",
+    "model": {
+        "d_model": 512,
+        "num_heads": 8,
+        "seq_len": 512,
+        "window_size": 512,
+        "vocab_size": 50257,
+        "memory_rule": "titans",
+        "composition": "mag",
+        "k": 1,
+        "chunk_sizes": [1],
+        "m_norm_max": [0.0],
+        "error_clip": [0.0],
+        "residual": true,
+        "n_blocks": 4,
+        "parallel_strategy": "tnt_hierarchical",
+        "tnt_global_chunk_size": 64,
+        "tnt_local_chunk_size": 8,
+        "memory_reset": "periodic"
+    },
+    "build": {
+        "lr": 0.0003,
+        "steps": 20000,
+        "optimizer": "adamw_gpu_stacked",
+        "warmup_steps": 500,
+        "weight_decay": 0.1,
+        "beta1": 0.9,
+        "beta2": 0.999,
+        "max_grad_norm": 1.0,
+        "theta_ceil": [1.0],
+        "batch_size": 1,
+        "log_every": 8,
+        "eval_every": 500,
+        "save_every": 5000,
+        "save_path": "runs/baseline_pushup_p1_k1/model.safetensors",
+        "log_file": "runs/baseline_pushup_p1_k1/metrics.jsonl",
+        "tape_every": 500,
+        "tape_device": "gpu",
+        "gpu": true,
+        "seed": 42
+    },
+    "data": {
+        "path": "data/dolmino_100b",
+        "format": "dolmino"
+    }
+}

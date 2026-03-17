@@ -1,0 +1,74 @@
+{
+  "d_model": 512,
+  "num_heads": 8,
+  "seq_len": 512,
+  "window_size": 512,
+  "vocab_size": 50257,
+  "memory_rule": "titans",
+  "composition": "mag",
+  "k": 4,
+  "chunk_sizes": [
+    1,
+    8,
+    64,
+    512
+  ],
+  "m_norm_max": [
+    100.0,
+    100.0,
+    100.0,
+    100.0
+  ],
+  "error_clip": [
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "residual": true,
+  "n_blocks": 4,
+  "parallel_strategy": "tnt_hierarchical",
+  "tnt_global_chunk_size": 64,
+  "tnt_local_chunk_size": 8,
+  "memory_reset": "periodic",
+  "tape_multiplier": 1,
+  "tape_strategies": [
+    "exact",
+    "proxy",
+    "proxy",
+    "proxy"
+  ],
+  "lr": 0.0003,
+  "steps": 100000,
+  "optimizer": "adamw_gpu_stacked",
+  "warmup_steps": 500,
+  "weight_decay": 0.1,
+  "beta1": 0.9,
+  "beta2": 0.999,
+  "max_grad_norm": 1.0,
+  "alpha_floor": [
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "theta_ceil": [
+    1.0,
+    1.0,
+    1.0,
+    1.0
+  ],
+  "batch_size": 1,
+  "log_every": 8,
+  "eval_every": 1000,
+  "save_every": 5000,
+  "run_dir": "runs/k4_zero_retention_d512",
+  "tape_every": 1000,
+  "tape_device": "gpu",
+  "gpu": true,
+  "seed": 42,
+  "data_path": "data/dolmino_100b",
+  "data_format": "dolmino",
+  "save_path": "runs/k4_zero_retention_d512/checkpoints/model.safetensors",
+  "log_file": "runs/k4_zero_retention_d512/metrics.jsonl"
+}
