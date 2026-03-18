@@ -1426,7 +1426,7 @@ pub fn cms_backward(
     //             (3) add to d_attn_out (from residual skip 1).
     // When residual=false: d_mem_input_total is d(embedded) from memory
     // branch — handled the same as before, just with a different name.
-    let mut d_embedded_mem_total = if cfg.residual {
+    let d_embedded_mem_total = if cfg.residual {
         let res_attn = cache.residual_after_attn.as_ref().unwrap();
         let (d_ln_mem_input, d_ln_mem_gamma, d_ln_mem_beta) = layer_norm_backward(
             &d_mem_input_total, res_attn,

@@ -331,8 +331,8 @@ pub fn deep_momentum_step_backward(
     mlp: &DeepMomentumMLP,
     cache: &DeepMomentumCache,
     t: usize,
-    eta_t: f32,
-    theta_t: f32,
+    _eta_t: f32,
+    _theta_t: f32,
     grad_t: &[f32],
     d_output: &[f32],
 ) -> (f32, f32, Vec<f32>) {

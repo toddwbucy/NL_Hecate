@@ -29,7 +29,6 @@ use crate::tensor::{
 use crate::retention::{l2_apply_retention, l2_retention_gradient, lq_normalize};
 use crate::model::MemoryLevelParams;
 use crate::delta_rule::{MemoryRule, Gates, MemoryError};
-use crate::bf16::Bf16Storage;
 
 // ── MLP State ───────────────────────────────────────────────────────
 
@@ -591,9 +590,9 @@ impl MemoryRule for Moneta {
                 crate::retention::lq_normalize_backward(&d_w2, a2_next, &mut d_a2_from_w, q);
 
                 // Total dL/dA_{t+1}
-                let mut d_a1: Vec<f32> = d_a1_from_w.iter().zip(d_a1_accum.iter())
+                let d_a1: Vec<f32> = d_a1_from_w.iter().zip(d_a1_accum.iter())
                     .map(|(&a, &b)| a + b).collect();
-                let mut d_a2: Vec<f32> = d_a2_from_w.iter().zip(d_a2_accum.iter())
+                let d_a2: Vec<f32> = d_a2_from_w.iter().zip(d_a2_accum.iter())
                     .map(|(&a, &b)| a + b).collect();
 
                 // Step 2: Gate gradients

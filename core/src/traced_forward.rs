@@ -349,8 +349,8 @@ pub fn traced_cms_forward(
     // ── Dynamic frequency gate ─────────────────────────────────────
     // Learned schedule: tape-recorded gate ops so gradients flow to w_freq/b_freq.
     // Fixed schedule: pass through unchanged.
-    let mut freq_w_freq_ids: Vec<Option<BufId>> = vec![None; cfg.k];
-    let mut freq_b_freq_ids: Vec<Option<BufId>> = vec![None; cfg.k];
+    let freq_w_freq_ids: Vec<Option<BufId>> = vec![None; cfg.k];
+    let freq_b_freq_ids: Vec<Option<BufId>> = vec![None; cfg.k];
     let (effective_pulse, freq_cache) = match &cfg.frequency_schedule {
         FrequencySchedule::Learned(learned_cfg)
             if !should_anneal(pulse.global_step, learned_cfg.anneal_steps) =>
@@ -1204,7 +1204,7 @@ pub fn traced_layernorm(
 
 // ── P2.10: Traced Stacked Forward ────────────────────────────────────
 
-use crate::stacked_model::{StackedMAGParams, BlockParams};
+use crate::stacked_model::StackedMAGParams;
 
 /// BufId map for stacked model parameters — needed to extract gradients after backward.
 #[derive(Debug, Clone)]

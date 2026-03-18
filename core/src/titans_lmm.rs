@@ -27,7 +27,6 @@ use crate::retention::l2_apply_retention;
 use crate::model::MemoryLevelParams;
 use crate::moneta::{apply_attentional_bias, apply_attentional_bias_backward};
 use crate::delta_rule::{MemoryRule, MemoryState, Gates, MemoryError};
-use crate::bf16::Bf16Storage;
 use crate::feature_map::{self, FeatureMapKind};
 
 // ── Titans LMM implementation ───────────────────────────────────────

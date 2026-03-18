@@ -8,7 +8,7 @@
 #[cfg(feature = "cuda")]
 use crate::gpu_buf::GpuBuf;
 #[cfg(feature = "cuda")]
-use crate::gpu_params::{GpuStackedParams, GpuBlockParams};
+use crate::gpu_params::GpuStackedParams;
 #[cfg(feature = "cuda")]
 use crate::gpu_stacked_backward::GpuStackedGrads;
 #[cfg(feature = "cuda")]

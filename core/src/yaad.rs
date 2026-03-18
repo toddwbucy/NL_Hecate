@@ -38,7 +38,6 @@ use crate::retention::{l2_apply_retention, l2_decoupled_gradient};
 use crate::model::MemoryLevelParams;
 use crate::delta_rule::{MemoryRule, Gates, MemoryError};
 use crate::moneta::MlpState;
-use crate::bf16::Bf16Storage;
 
 // ── YAAD implementation ─────────────────────────────────────────────
 

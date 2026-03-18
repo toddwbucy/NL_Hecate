@@ -241,7 +241,7 @@ impl GpuMemoryCache {
 
         // Helper: compute ‖M @ k - v‖₂ from GPU buffers.
         let compute_norm = |m_ptr: *const f32, k_ptr: *const f32, v_ptr: *const f32| -> f32 {
-            let mut norm_out = GpuBuf::<f32>::zeros(1);
+            let norm_out = GpuBuf::<f32>::zeros(1);
             unsafe {
                 crate::cuda_ffi::dgd_delta_norm_cuda(m_ptr, k_ptr, v_ptr, norm_out.ptr(), d as i32);
             }
@@ -728,7 +728,7 @@ pub fn gpu_cms_forward(
     }
 
     // ── Stage 1: Embedding gather on GPU ──────────────────────────────
-    let mut embedded = GpuBuf::<f32>::zeros(bs * s * d);
+    let embedded = GpuBuf::<f32>::zeros(bs * s * d);
     unsafe {
         crate::cuda_ffi::embedding_gather_cuda(
             params.swa.w_embed.as_ptr(),
@@ -741,9 +741,9 @@ pub fn gpu_cms_forward(
     // ── Stage 2a: Pre-LN for attention (residual path) + QKV projections ──
     let n_tokens = bs * s;
     let (ln_attn_out, ln_attn_mean, ln_attn_rstd) = if cfg.residual {
-        let mut out = GpuBuf::<f32>::zeros(n_tokens * d);
-        let mut mean = GpuBuf::<f32>::zeros(n_tokens);
-        let mut rstd = GpuBuf::<f32>::zeros(n_tokens);
+        let out = GpuBuf::<f32>::zeros(n_tokens * d);
+        let mean = GpuBuf::<f32>::zeros(n_tokens);
+        let rstd = GpuBuf::<f32>::zeros(n_tokens);
         unsafe {
             crate::cuda_ffi::layer_norm_forward_cuda(
                 embedded.as_ptr(),
@@ -771,9 +771,9 @@ pub fn gpu_cms_forward(
     let total = bs * s * d;
     let aw_total = bs * nh * s * ws;
     let total_i32 = i32::try_from(total).expect("bs*s*d exceeds i32::MAX");
-    let mut q_bf16 = GpuBuf::<u16>::zeros(total);
-    let mut k_bf16 = GpuBuf::<u16>::zeros(total);
-    let mut v_bf16 = GpuBuf::<u16>::zeros(total);
+    let q_bf16 = GpuBuf::<u16>::zeros(total);
+    let k_bf16 = GpuBuf::<u16>::zeros(total);
+    let v_bf16 = GpuBuf::<u16>::zeros(total);
     let mut attn_out_bf16 = GpuBuf::<u16>::zeros(total);
     let mut attn_weights_bf16 = GpuBuf::<u16>::zeros(aw_total);
 
@@ -792,7 +792,7 @@ pub fn gpu_cms_forward(
     );
 
     // bf16 → f32 for attn_out (needed for gating)
-    let mut attn_out = GpuBuf::<f32>::zeros(total);
+    let attn_out = GpuBuf::<f32>::zeros(total);
     unsafe {
         crate::cuda_ffi::bf16_to_f32_cuda(attn_out_bf16.as_ptr(), attn_out.ptr(), total_i32);
     }
@@ -800,7 +800,7 @@ pub fn gpu_cms_forward(
     // ── Residual skip 1: embedded + attn_out ────────────────────────
     let (residual_after_attn, ln_mem_out, ln_mem_mean, ln_mem_rstd) = if cfg.residual {
         // residual = embedded + attn_out
-        let mut residual = GpuBuf::<f32>::zeros(n_tokens * d);
+        let residual = GpuBuf::<f32>::zeros(n_tokens * d);
         unsafe {
             // Copy embedded, then add attn_out
             crate::cuda_ffi::saxpy_cuda(0.0, embedded.as_ptr(), residual.ptr(), total_i32); // zero residual
@@ -810,9 +810,9 @@ pub fn gpu_cms_forward(
             crate::cuda_ffi::saxpy_cuda(1.0, attn_out.as_ptr(), residual.ptr(), total_i32);
         }
         // LN_mem on residual
-        let mut ln_out = GpuBuf::<f32>::zeros(n_tokens * d);
-        let mut mean = GpuBuf::<f32>::zeros(n_tokens);
-        let mut rstd = GpuBuf::<f32>::zeros(n_tokens);
+        let ln_out = GpuBuf::<f32>::zeros(n_tokens * d);
+        let mean = GpuBuf::<f32>::zeros(n_tokens);
+        let rstd = GpuBuf::<f32>::zeros(n_tokens);
         unsafe {
             crate::cuda_ffi::layer_norm_forward_cuda(
                 residual.as_ptr(),
@@ -883,7 +883,7 @@ pub fn gpu_cms_forward(
     }
 
     // ── Combine levels: y_combined = sum with 1/sqrt(k) for k>2 ───────
-    let mut y_combined = GpuBuf::<f32>::zeros(bs * s * d);
+    let y_combined = GpuBuf::<f32>::zeros(bs * s * d);
     for y_level in &y_per_level {
         unsafe {
             crate::cuda_ffi::saxpy_cuda(1.0, y_level.as_ptr(), y_combined.ptr(), total_i32);
@@ -897,14 +897,14 @@ pub fn gpu_cms_forward(
     }
 
     // ── Stage 4+5: Gating/residual → output projection ────────────────
-    let mut gate = GpuBuf::<f32>::zeros(bs * s * d);
-    let mut gated_out = GpuBuf::<f32>::zeros(bs * s * d);
+    let gate = GpuBuf::<f32>::zeros(bs * s * d);
+    let gated_out = GpuBuf::<f32>::zeros(bs * s * d);
     let mut projected = GpuBuf::<f32>::zeros(bs * s * d);
 
     let residual_final = if cfg.residual {
         // Residual path: residual_final = residual_after_attn + y_combined (additive, no sigmoid)
         let residual_attn = residual_after_attn.as_ref().unwrap();
-        let mut res_final = GpuBuf::<f32>::zeros(n_tokens * d);
+        let res_final = GpuBuf::<f32>::zeros(n_tokens * d);
         unsafe {
             // res_final = residual_after_attn + y_combined
             crate::cuda_ffi::saxpy_cuda(1.0, residual_attn.as_ptr(), res_final.ptr(), total_i32);
@@ -934,7 +934,7 @@ pub fn gpu_cms_forward(
     crate::dispatch::cublas_matmul_dd(&projected, &params.swa.w_unembed, &mut logits, bs * s, d, v, 0.0);
 
     // ── Stage 7: Cross-entropy loss (GPU → scalar D2H) ────────────────
-    let mut loss_gpu = GpuBuf::<f32>::zeros(1);
+    let loss_gpu = GpuBuf::<f32>::zeros(1);
     unsafe {
         crate::cuda_ffi::cross_entropy_forward_cuda(
             logits.as_ptr(),
@@ -1016,8 +1016,8 @@ pub(crate) fn gpu_memory_forward(
     crate::dispatch::cublas_matmul_transb_dd(embedded, &level_params.w_q_mem, &mut q_mem, bs * s, d, d, 0.0);
 
     // L2-normalize keys and queries (Titans paper: "normalize queries and keys using l_2-norm")
-    let mut k_norms = GpuBuf::zeros(bs * s);
-    let mut q_norms = GpuBuf::zeros(bs * s);
+    let k_norms = GpuBuf::zeros(bs * s);
+    let q_norms = GpuBuf::zeros(bs * s);
     unsafe {
         crate::cuda_ffi::l2_normalize_rows_f32_cuda(k_mem.ptr(), k_norms.ptr(), tokens_i32, d_i32, 1e-8);
         crate::cuda_ffi::l2_normalize_rows_f32_cuda(q_mem.ptr(), q_norms.ptr(), tokens_i32, d_i32, 1e-8);
@@ -1026,8 +1026,8 @@ pub(crate) fn gpu_memory_forward(
     // Compute per-token gates: alpha[bs*s], theta[bs*s]
     // b_alpha and b_theta are passed as device pointers (CUDA-graph-capture-safe):
     // the graph captures the stable pointer; optimizer updates the value in-place.
-    let mut alpha = GpuBuf::zeros(bs * s);
-    let mut theta = GpuBuf::zeros(bs * s);
+    let alpha = GpuBuf::zeros(bs * s);
+    let theta = GpuBuf::zeros(bs * s);
 
     unsafe {
         crate::cuda_ffi::gate_compute_cuda(
@@ -1088,7 +1088,7 @@ pub(crate) fn gpu_memory_forward(
             }
             // Spec 27: proxy levels extract M_final, discard full trajectory
             let (cache_m, cache_proxy) = if is_proxy {
-                let mut m_final = GpuBuf::zeros(bs * dd);
+                let m_final = GpuBuf::zeros(bs * dd);
                 for b in 0..bs {
                     unsafe {
                         let rc = gpu_buf_memcpy_d2d(
@@ -1132,8 +1132,8 @@ pub(crate) fn gpu_memory_forward(
             }
             // Spec 27: proxy levels extract M_final/S_final, discard full trajectory
             let (cache_m, cache_s, cache_proxy) = if is_proxy {
-                let mut m_final = GpuBuf::zeros(bs * dd);
-                let mut s_final = GpuBuf::zeros(bs * dd);
+                let m_final = GpuBuf::zeros(bs * dd);
+                let s_final = GpuBuf::zeros(bs * dd);
                 for b in 0..bs {
                     unsafe {
                         let rc = gpu_buf_memcpy_d2d(
@@ -1227,11 +1227,11 @@ pub(crate) fn gpu_memory_forward(
         // ── SwiGLU: stateless MLP, no M state, no m_norm_clamp ──────────
         (_, MemoryRuleKind::SwiGluMlp) => {
             let inter = cfg.intermediate_size;
-            let mut gate_buf  = GpuBuf::zeros(bs * s * inter);
-            let mut up_buf    = GpuBuf::zeros(bs * s * inter);
-            let mut fused_buf = GpuBuf::zeros(bs * s * inter);
-            let mut cache_buf = GpuBuf::zeros(bs * s * inter);
-            let mut y = GpuBuf::zeros(bs * s * d);
+            let gate_buf  = GpuBuf::zeros(bs * s * inter);
+            let up_buf    = GpuBuf::zeros(bs * s * inter);
+            let fused_buf = GpuBuf::zeros(bs * s * inter);
+            let cache_buf = GpuBuf::zeros(bs * s * inter);
+            let y = GpuBuf::zeros(bs * s * d);
             unsafe {
                 crate::cuda_ffi::swiglu_forward_f32_cuda_dd(
                     embedded.as_ptr(),
@@ -1294,7 +1294,7 @@ pub(crate) fn gpu_tnt_forward(
     let m_norm_max = cfg.max_m_norm(level);
 
     // Full output buffer: [s, d]
-    let mut y_full = GpuBuf::<f32>::zeros(s * d);
+    let y_full = GpuBuf::<f32>::zeros(s * d);
 
     // Spec 25: cycle-scoped cache retention — only keep the last N shards' inner caches.
     // Summaries are kept for ALL shards (O(d) each, needed for global backward).
@@ -1325,7 +1325,7 @@ pub(crate) fn gpu_tnt_forward(
         let mut q_mem = GpuBuf::zeros(shard_len * d);
 
         // Copy shard embeddings to owned buffer for cuBLAS
-        let mut shard_embedded = GpuBuf::<f32>::zeros(shard_len * d);
+        let shard_embedded = GpuBuf::<f32>::zeros(shard_len * d);
         unsafe {
             let rc = gpu_buf_memcpy_d2d(
                 shard_embedded.ptr() as *mut std::ffi::c_void,
@@ -1340,16 +1340,16 @@ pub(crate) fn gpu_tnt_forward(
         crate::dispatch::cublas_matmul_transb_dd(&shard_embedded, &level_params.w_q_mem, &mut q_mem, shard_len, d, d, 0.0);
 
         // L2-normalize keys and queries (Titans paper: "normalize queries and keys using l_2-norm")
-        let mut shard_k_norms = GpuBuf::zeros(shard_len);
-        let mut shard_q_norms = GpuBuf::zeros(shard_len);
+        let shard_k_norms = GpuBuf::zeros(shard_len);
+        let shard_q_norms = GpuBuf::zeros(shard_len);
         unsafe {
             crate::cuda_ffi::l2_normalize_rows_f32_cuda(k_mem.ptr(), shard_k_norms.ptr(), shard_tokens_i32, d_i32, 1e-8);
             crate::cuda_ffi::l2_normalize_rows_f32_cuda(q_mem.ptr(), shard_q_norms.ptr(), shard_tokens_i32, d_i32, 1e-8);
         }
 
         // Step 3: Compute gates for shard tokens
-        let mut alpha = GpuBuf::zeros(shard_len);
-        let mut theta = GpuBuf::zeros(shard_len);
+        let alpha = GpuBuf::zeros(shard_len);
+        let theta = GpuBuf::zeros(shard_len);
         unsafe {
             crate::cuda_ffi::gate_compute_cuda(
                 k_mem.as_ptr(), v_mem.as_ptr(), level_params.w_alpha.as_ptr(),
@@ -1382,11 +1382,11 @@ pub(crate) fn gpu_tnt_forward(
             (k_mem, v_mem, q_mem, alpha, theta)
         } else {
             // Pad with zeros (allocate padded buffers, copy actual data)
-            let mut kp = GpuBuf::zeros(padded_len * d);
-            let mut vp = GpuBuf::zeros(padded_len * d);
-            let mut qp = GpuBuf::zeros(padded_len * d);
-            let mut ap = GpuBuf::zeros(padded_len);
-            let mut tp = GpuBuf::zeros(padded_len);
+            let kp = GpuBuf::zeros(padded_len * d);
+            let vp = GpuBuf::zeros(padded_len * d);
+            let qp = GpuBuf::zeros(padded_len * d);
+            let ap = GpuBuf::zeros(padded_len);
+            let tp = GpuBuf::zeros(padded_len);
             unsafe {
                 let rc = gpu_buf_memcpy_d2d(kp.ptr() as *mut _, k_mem.as_ptr() as *const _, shard_len * d * 4);
                 assert_eq!(rc, 0, "TNT pad copy kp failed (rc={rc})");
@@ -1411,7 +1411,7 @@ pub(crate) fn gpu_tnt_forward(
         let inner_cache = match cfg.memory_rule {
             MemoryRuleKind::TitansLMM => {
                 // Compute eta gate for shard tokens (unpadded first, then pad)
-                let mut eta = GpuBuf::zeros(shard_len);
+                let eta = GpuBuf::zeros(shard_len);
                 unsafe {
                     crate::cuda_ffi::gate_compute_cuda(
                         k_mem_b.as_ptr(), v_mem_b.as_ptr(), level_params.w_eta.as_ptr(),
@@ -1422,7 +1422,7 @@ pub(crate) fn gpu_tnt_forward(
                 let eta_b = if shard_len == padded_len {
                     eta
                 } else {
-                    let mut ep = GpuBuf::zeros(padded_len);
+                    let ep = GpuBuf::zeros(padded_len);
                     unsafe {
                         let rc = gpu_buf_memcpy_d2d(ep.ptr() as *mut _, eta.as_ptr() as *const _, shard_len * 4);
                         assert_eq!(rc, 0, "TNT pad copy eta failed (rc={rc})");
@@ -1446,8 +1446,8 @@ pub(crate) fn gpu_tnt_forward(
                 if is_proxy {
                     // Spec 27 proxy: extract M_final and S_final, discard full trajectory.
                     // M_final is at offset cl*dd per batch element (last timestep of trajectory).
-                    let mut m_final = GpuBuf::zeros(n_batch * dd);
-                    let mut s_final = GpuBuf::zeros(n_batch * dd);
+                    let m_final = GpuBuf::zeros(n_batch * dd);
+                    let s_final = GpuBuf::zeros(n_batch * dd);
                     for b in 0..n_batch {
                         unsafe {
                             let rc = gpu_buf_memcpy_d2d(
@@ -1494,7 +1494,7 @@ pub(crate) fn gpu_tnt_forward(
 
                 if is_proxy {
                     // Spec 27 proxy: extract M_final only, discard full trajectory.
-                    let mut m_final = GpuBuf::zeros(n_batch * dd);
+                    let m_final = GpuBuf::zeros(n_batch * dd);
                     for b in 0..n_batch {
                         unsafe {
                             let rc = gpu_buf_memcpy_d2d(
@@ -1540,7 +1540,7 @@ pub(crate) fn gpu_tnt_forward(
 
         // Step 7: Compute shard summary (mean-pooling on GPU)
         // Use the unpadded shard output for summary
-        let mut shard_y = GpuBuf::<f32>::zeros(shard_len * d);
+        let shard_y = GpuBuf::<f32>::zeros(shard_len * d);
         unsafe {
             let rc = gpu_buf_memcpy_d2d(
                 shard_y.ptr() as *mut std::ffi::c_void,
@@ -1806,7 +1806,7 @@ fn gpu_cms_capture_all_patterns(
 
     // Save context_m state for each level (D2D into host-side Vec<Vec<f32>>)
     let dd = d * d;
-    let mut saved_m: Vec<Vec<f32>> = context.memory.iter()
+    let saved_m: Vec<Vec<f32>> = context.memory.iter()
         .map(|buf| {
             let mut v = vec![0.0f32; bs * dd];
             buf.copy_to_host(&mut v);
@@ -1992,7 +1992,7 @@ fn gpu_cms_capture_all_patterns(
 /// Returns `None` if replay fails (caller falls through to standard dispatch).
 #[cfg(feature = "cuda")]
 fn gpu_cms_replay(
-    params: &GpuMAGParams,
+    _params: &GpuMAGParams,
     cfg: &MAGConfig,
     input_ids_i32: &[i32],
     target_ids_i32: &[i32],
@@ -2011,9 +2011,9 @@ fn gpu_cms_replay(
     let dd = d * d;
 
     let fwd = context.forward_scratch.as_ref()?;
-    let d_i32      = i32::try_from(d).expect("d_model exceeds i32::MAX");
-    let tokens_i32 = i32::try_from(bs * s).expect("bs*s exceeds i32::MAX");
-    let v_i32      = i32::try_from(v).expect("vocab_size exceeds i32::MAX");
+    let d_i32       = i32::try_from(d).expect("d_model exceeds i32::MAX");
+    let _tokens_i32 = i32::try_from(bs * s).expect("bs*s exceeds i32::MAX");
+    let _v_i32      = i32::try_from(v).expect("vocab_size exceeds i32::MAX");
 
     // H2D upload BEFORE graph launch (outside captured region, on default stream)
     unsafe {
@@ -2176,7 +2176,7 @@ fn compute_eta(
     k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>,
     s: usize, d: usize,
 ) -> GpuBuf<f32> {
-    let mut eta = GpuBuf::zeros(s);
+    let eta = GpuBuf::zeros(s);
     // Pass b_eta as device pointer (CUDA-graph-capture-safe: stable pointer, value updated in-place).
     unsafe {
         crate::cuda_ffi::gate_compute_cuda(
@@ -2380,7 +2380,7 @@ pub fn gpu_prefill_forward(
     }
 
     // ── Stage 1: Embedding gather ──────────────────────────────────
-    let mut embedded = GpuBuf::<f32>::zeros(s * d);
+    let embedded = GpuBuf::<f32>::zeros(s * d);
     unsafe {
         crate::cuda_ffi::embedding_gather_cuda(
             params.swa.w_embed.as_ptr(),
@@ -2406,9 +2406,9 @@ pub fn gpu_prefill_forward(
     // ── Stage 3a: SWA attention (bf16) ─────────────────────────────
     let total = s * d;
     let aw_total = nh * s * ws;
-    let mut q_bf16 = GpuBuf::<u16>::zeros(total);
-    let mut k_bf16 = GpuBuf::<u16>::zeros(total);
-    let mut v_bf16 = GpuBuf::<u16>::zeros(total);
+    let q_bf16 = GpuBuf::<u16>::zeros(total);
+    let k_bf16 = GpuBuf::<u16>::zeros(total);
+    let v_bf16 = GpuBuf::<u16>::zeros(total);
     let mut attn_out_bf16 = GpuBuf::<u16>::zeros(total);
     let mut attn_weights_bf16 = GpuBuf::<u16>::zeros(aw_total);
 
@@ -2425,7 +2425,7 @@ pub fn gpu_prefill_forward(
         s, nh, hd, ws, 1,
     );
 
-    let mut attn_out = GpuBuf::<f32>::zeros(total);
+    let attn_out = GpuBuf::<f32>::zeros(total);
     unsafe {
         crate::cuda_ffi::bf16_to_f32_cuda(attn_out_bf16.as_ptr(), attn_out.ptr(), total as i32);
     }
@@ -2451,7 +2451,7 @@ pub fn gpu_prefill_forward(
     }
 
     // ── Combine levels ─────────────────────────────────────────────
-    let mut y_combined = GpuBuf::<f32>::zeros(s * d);
+    let y_combined = GpuBuf::<f32>::zeros(s * d);
     for y_level in &y_per_level {
         unsafe {
             crate::cuda_ffi::saxpy_cuda(1.0, y_level.as_ptr(), y_combined.ptr(), (s * d) as i32);
@@ -2465,8 +2465,8 @@ pub fn gpu_prefill_forward(
     }
 
     // ── Stage 4: Gating ────────────────────────────────────────────
-    let mut gate = GpuBuf::<f32>::zeros(s * d);
-    let mut gated_out = GpuBuf::<f32>::zeros(s * d);
+    let gate = GpuBuf::<f32>::zeros(s * d);
+    let gated_out = GpuBuf::<f32>::zeros(s * d);
     unsafe {
         crate::cuda_ffi::sigmoid_cuda(y_combined.as_ptr(), gate.ptr(), (s * d) as i32);
         crate::cuda_ffi::elemwise_mul_cuda(attn_out.as_ptr(), gate.as_ptr(), gated_out.ptr(), (s * d) as i32);
@@ -2478,7 +2478,7 @@ pub fn gpu_prefill_forward(
 
     // ── Stage 6: Unembed (only last position) ──────────────────────
     // Extract last position projected[s-1] as [1, d] and unembed to [1, v]
-    let mut last_projected = GpuBuf::<f32>::zeros(d);
+    let last_projected = GpuBuf::<f32>::zeros(d);
     unsafe {
         let rc = gpu_buf_memcpy_d2d(
             last_projected.ptr() as *mut std::ffi::c_void,

@@ -6,12 +6,9 @@
 /// Applies to Hebbian (full: M update is linear in M) and Titans
 /// (momentum S only: S update is linear in S, but M depends on S nonlinearly).
 
-use crate::model::{MAGConfig, MemoryLevelParams};
 use crate::bf16::Bf16Storage;
-use crate::delta_rule::MemoryRule;
-use crate::hebbian_rule::HebbianRule;
+use crate::model::MemoryLevelParams;
 use crate::tensor::{matmul_f32, transpose_f32, sigmoid_f32};
-use crate::mag::MemoryCache;
 
 // ═════════════════════════════════════════════════════════════════════
 // Core associative scan: s_t = a_t * s_{t-1} + b_t
@@ -60,7 +57,7 @@ pub fn associative_scan(
     }
 
     // Build scan elements
-    let mut elements: Vec<ScanElement> = (0..n).map(|t| {
+    let elements: Vec<ScanElement> = (0..n).map(|t| {
         ScanElement {
             a: a_seq[t],
             b: b_seq[t * state_size..(t + 1) * state_size].to_vec(),
@@ -499,6 +496,8 @@ fn matmul_f32_at_b(a: &[f32], b: &[f32], out: &mut [f32], m: usize, n: usize, p:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hebbian_rule::HebbianRule;
+    use crate::delta_rule::MemoryRule;
     use crate::model::{MAGConfig, MAGParams};
     use crate::tensor::SimpleRng;
 

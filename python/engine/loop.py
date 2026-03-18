@@ -23,14 +23,14 @@ from engine.config import BuildConfig, cosine_lr
 from engine.data import BpeTokenStream, CursorMismatchError, CursorOutOfBounds, DEMO_TEXT, MmapTokenStream, ShardTokenStream
 from engine.evaluation import (
     evaluate, evaluate_numpy, print_level_metrics, print_tape_summary,
-    eval_coherence_samples, generate_samples,
+    eval_coherence_samples,
     full_snapshot, full_restore,
     probe_within_generation, probe_cross_exposure, probe_context_value,
     probe_memory_vocab,
     EVAL_PROMPTS, SAMPLE_PROMPTS,
 )
 from engine.logging_utils import JSONLLogger, rss_mb
-from engine.tokenizer import ByteTokenizer, BpeTokenizer, load_tokenizer
+from engine.tokenizer import BpeTokenizer, load_tokenizer
 
 
 def _encode_bytes(text: str) -> list[int]:

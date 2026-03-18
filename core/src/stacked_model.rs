@@ -8,7 +8,7 @@
 
 use serde::{Serialize, Deserialize};
 use crate::model::{
-    MAGConfig, MAGParams, SWAConfig, MemoryLevelParams, PushUpInit,
+    MAGConfig, MAGParams, MemoryLevelParams, PushUpInit,
     default_b_alpha, default_b_theta, default_b_eta,
 };
 use crate::tensor::SimpleRng;
@@ -442,6 +442,7 @@ impl StackedMAGParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::SWAConfig;
 
     fn tiny_config() -> MAGConfig {
         use crate::model::{CompositionKind, MemoryRuleKind, AttentionalBias,
