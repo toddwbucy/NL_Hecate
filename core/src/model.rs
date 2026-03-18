@@ -2912,17 +2912,6 @@ pub struct DeclaredCheckpoint {
     pub build_state: Option<BuildResumeState>,
 }
 
-/// Generate ISO 8601 timestamp without chrono dependency.
-fn iso8601_now() -> String {
-    // Use UNIX_EPOCH elapsed seconds; format as readable timestamp.
-    // For a proper ISO 8601, we'd need chrono — but the spec says "no chrono dep".
-    // We format epoch seconds as a string; consumers who need human-readable can parse.
-    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => format!("epoch:{}", d.as_secs()),
-        Err(_) => "epoch:0".to_string(),
-    }
-}
-
 /// Save MAGParams + MAGConfig as a safetensors binary checkpoint (no build state).
 pub fn save_checkpoint(path: &std::path::Path, params: &MAGParams, config: &MAGConfig) -> std::io::Result<()> {
     crate::checkpoint::save_safetensors(path, params, config, None)

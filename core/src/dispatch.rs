@@ -1874,7 +1874,7 @@ fn cuda_dgd_backward(
 // ══════════════════════════════════════════════════════════════════════
 
 #[cfg(feature = "cuda")]
-use crate::gpu_buf::{GpuBuf, GpuSlice, GpuSliceMut};
+use crate::gpu_buf::{GpuBuf, GpuSlice};
 
 /// cuBLAS sgemm on device buffers: C = alpha * A[m,k] @ B[k,n] + beta * C.
 /// Row-major trick: call sgemm(N, N, n, m, k, alpha, B, n, A, k, beta, C, n).
@@ -2365,7 +2365,7 @@ pub fn gate_backward_dd(
     d_w_alpha: &mut GpuBuf<f32>, d_b_alpha: &mut GpuBuf<f32>,
     d_w_theta: &mut GpuBuf<f32>, d_b_theta: &mut GpuBuf<f32>,
     d_w_eta:   &mut GpuBuf<f32>, d_b_eta:   &mut GpuBuf<f32>,
-    T: usize, d: usize,
+    seq_len: usize, d: usize,
 ) {
     let has_theta = d_theta.is_some() as i32;
     let has_eta   = d_eta.is_some() as i32;
@@ -2384,7 +2384,7 @@ pub fn gate_backward_dd(
             if has_theta == 1 { d_b_theta.ptr() } else { null_mut },
             if has_eta   == 1 { d_w_eta.ptr() }   else { null_mut },
             if has_eta   == 1 { d_b_eta.ptr() }    else { null_mut },
-            T as i32, d as i32, has_theta, has_eta,
+            seq_len as i32, d as i32, has_theta, has_eta,
         );
     }
 }

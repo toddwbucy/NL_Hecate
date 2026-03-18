@@ -18,14 +18,6 @@
 
 use crate::model::{MAGConfig, MemoryLevelParams, MemoryRuleKind};
 use crate::chunkwise_gd::{chunkwise_gd_forward, chunkwise_gd_backward, ChunkwiseGDCache};
-use crate::delta_rule::DeltaRule;
-use crate::titans_lmm::TitansLMM;
-use crate::hebbian_rule::HebbianRule;
-use crate::moneta::Moneta;
-use crate::yaad::YAAD;
-use crate::memora::MEMORA;
-use crate::lattice_osr::LatticeOSR;
-use crate::trellis::Trellis;
 
 /// TNT configuration.
 #[derive(Clone, Debug)]

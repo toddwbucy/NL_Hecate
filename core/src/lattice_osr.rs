@@ -31,12 +31,11 @@
 
 use crate::tensor::{
     matmul_f32, transpose_f32, sigmoid_f32, softmax_f32,
-    frobenius_dot_f32, vec_norm_f32, vec_normalize_f32, init_slots,
+    frobenius_dot_f32, vec_normalize_f32, init_slots,
 };
 use crate::retention::sphere_project_and_normalize_inplace;
 use crate::model::{MemoryLevelParams, LatticeVariant};
 use crate::delta_rule::{MemoryRule, Gates, MemoryError};
-use crate::bf16::Bf16Storage;
 
 // ── LatticeOSR State ────────────────────────────────────────────────
 
@@ -700,7 +699,7 @@ pub fn lattice_read_only_backward(
 mod tests {
     use super::*;
     use crate::model::{MAGConfig, MAGParams};
-    use crate::tensor::SimpleRng;
+    use crate::tensor::{SimpleRng, vec_norm_f32};
     use crate::delta_rule::MemoryRule;
 
     fn test_config() -> MAGConfig {

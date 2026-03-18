@@ -41,7 +41,6 @@ use crate::retention::kl_apply_retention_inplace;
 use crate::model::MemoryLevelParams;
 use crate::delta_rule::{MemoryRule, Gates, MemoryError};
 use crate::moneta::MlpState;
-use crate::bf16::Bf16Storage;
 
 // ── MEMORA implementation ─────────────────────────────────────────────
 

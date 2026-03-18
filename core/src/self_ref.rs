@@ -436,7 +436,7 @@ pub fn self_ref_read_only_backward(
     frozen_combined: &[f32],
     q_mem: &[f32],
     d_y: &[f32],
-    embedded: &[f32],
+    _embedded: &[f32],
     seq_len: usize,
     d: usize,
 ) -> (crate::model::MemoryLevelParams, Vec<f32>) {
@@ -453,7 +453,7 @@ pub fn self_ref_read_only_backward(
     let m_q = &frozen_combined[dd..2 * dd];
 
     for t in 0..seq_len {
-        let q_t = &q_mem[t * d..(t + 1) * d];
+        let _q_t = &q_mem[t * d..(t + 1) * d];
         let dy_t = &d_y[t * d..(t + 1) * d];
 
         // Backward through y_t = M_mem @ q_t

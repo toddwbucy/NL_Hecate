@@ -416,6 +416,7 @@ extern "C" {
     pub(crate) fn sigmoid_cuda(x: *const f32, out: *mut f32, n: i32);
 
     /// Element-wise softplus: out[i] = log(1+exp(x[i])).
+    #[allow(dead_code)]
     pub(crate) fn softplus_cuda(x: *const f32, out: *mut f32, n: i32);
 
     /// Element-wise multiply: out[i] = a[i] * b[i].
@@ -558,6 +559,7 @@ extern "C" {
     /// Iterative GPU-side reduction of partial sums to a single scalar.
     /// Uses ping-pong between buf_a and buf_b. Result in buf_a[0].
     /// buf_b must be at least ceil(n/256) elements.
+    #[allow(dead_code)]
     pub(crate) fn reduce_sum_cuda(buf_a: *mut f32, buf_b: *mut f32, n: i32);
 
     /// Scale gradient buffer in-place: g[i] *= scale.

@@ -27,7 +27,6 @@ use crate::dgd::dgd_error_into;
 use crate::model::MemoryLevelParams;
 use crate::moneta::{apply_attentional_bias, apply_attentional_bias_backward};
 use crate::tape::OpaqueVjp;
-use crate::bf16::Bf16Storage;
 use crate::feature_map::{self, FeatureMapKind};
 
 // ── Memory rule trait ────────────────────────────────────────────────

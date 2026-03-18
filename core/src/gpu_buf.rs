@@ -1,12 +1,12 @@
-/// GPU-resident buffer: typed RAII wrapper for device memory.
-///
-/// `GpuBuf<T>` owns a contiguous allocation on the CUDA device. T must implement
-/// `GpuElement` (sealed to f32 and u16/bf16). Drop calls cudaFree.
-///
-/// `GpuSlice<T>` provides a non-owning view into a GpuBuf — used for indexing
-/// into large allocations like m_states[(seq_len+1)*d*d] by level offset.
-///
-/// Feature-gated: only available with `--features cuda`.
+//! GPU-resident buffer: typed RAII wrapper for device memory.
+//!
+//! `GpuBuf<T>` owns a contiguous allocation on the CUDA device. T must implement
+//! `GpuElement` (sealed to f32 and u16/bf16). Drop calls cudaFree.
+//!
+//! `GpuSlice<T>` provides a non-owning view into a GpuBuf — used for indexing
+//! into large allocations like m_states[(seq_len+1)*d*d] by level offset.
+//!
+//! Feature-gated: only available with `--features cuda`.
 
 #[cfg(feature = "cuda")]
 extern "C" {

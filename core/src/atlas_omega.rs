@@ -31,7 +31,6 @@ use crate::tensor::{
 use crate::retention::l2_apply_retention;
 use crate::model::MemoryLevelParams;
 use crate::delta_rule::{MemoryRule, MemoryState, Gates, MemoryError};
-use crate::bf16::Bf16Storage;
 
 // ── Atlas Omega implementation ──────────────────────────────────────
 

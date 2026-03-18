@@ -117,7 +117,7 @@ pub fn extract_tape_summary(
 // ── Stacked Tape Summary ──────────────────────────────────────────────
 
 use crate::stacked_model::StackedMAGParams;
-use crate::traced_forward::{traced_stacked_forward, TracedStackedParamIds};
+use crate::traced_forward::traced_stacked_forward;
 
 /// Per-(block, level) entry in a `StackedTapeSummary`.
 #[derive(Debug, Clone)]

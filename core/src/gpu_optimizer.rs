@@ -13,7 +13,7 @@
 #[cfg(feature = "cuda")]
 use crate::gpu_buf::GpuBuf;
 #[cfg(feature = "cuda")]
-use crate::gpu_params::{GpuMAGParams, GpuMemoryLevelParams};
+use crate::gpu_params::GpuMAGParams;
 #[cfg(feature = "cuda")]
 use crate::gpu_backward::GpuMAGGrads;
 #[cfg(feature = "cuda")]

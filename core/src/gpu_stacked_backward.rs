@@ -11,9 +11,9 @@
 #[cfg(feature = "cuda")]
 use crate::gpu_buf::GpuBuf;
 #[cfg(feature = "cuda")]
-use crate::gpu_params::{GpuStackedParams, GpuBlockParams};
+use crate::gpu_params::GpuStackedParams;
 #[cfg(feature = "cuda")]
-use crate::gpu_stacked_forward::{GpuStackedCache, GpuStackedBlockCache};
+use crate::gpu_stacked_forward::GpuStackedCache;
 #[cfg(feature = "cuda")]
 use crate::gpu_backward::{GpuLevelGrads, gpu_memory_backward, gpu_memory_read_only_backward, gpu_matmul_transa_dd};
 #[cfg(feature = "cuda")]
@@ -99,13 +99,13 @@ pub fn gpu_stacked_backward(
     let inter = if cfg.memory_rule == MemoryRuleKind::SwiGluMlp { cfg.intermediate_size } else { 0 };
 
     // Initialize shared gradient buffers
-    let mut d_w_embed = GpuBuf::zeros(v * d);
+    let d_w_embed = GpuBuf::zeros(v * d);
     let mut d_w_unembed = GpuBuf::zeros(d * v);
-    let mut d_ln_final_gamma = GpuBuf::zeros(d);
-    let mut d_ln_final_beta = GpuBuf::zeros(d);
+    let d_ln_final_gamma = GpuBuf::zeros(d);
+    let d_ln_final_beta = GpuBuf::zeros(d);
 
     // ── Cross-entropy backward ─────────────────────────────────────────
-    let mut d_logits = GpuBuf::zeros(bsv);
+    let d_logits = GpuBuf::zeros(bsv);
     let valid_count = cache.target_ids_i32.iter()
         .filter(|&&t| t >= 0 && (t as usize) < v)
         .count() as f32;
@@ -135,8 +135,8 @@ pub fn gpu_stacked_backward(
     // Reconstruct: residual_out = block_input + gated_out
     //   where gated_out = attn_proj * gate (MAG sigmoid gating)
     let last_block_cache = &cache.block_caches[n_blocks - 1];
-    let mut residual_stream_final = GpuBuf::zeros(bsd);
-    let mut gated_out_last = GpuBuf::zeros(bsd);
+    let residual_stream_final = GpuBuf::zeros(bsd);
+    let gated_out_last = GpuBuf::zeros(bsd);
     unsafe {
         crate::cuda_ffi::elemwise_mul_cuda(
             last_block_cache.attn_proj.as_ptr(), last_block_cache.gate.as_ptr(),
@@ -177,10 +177,10 @@ pub fn gpu_stacked_backward(
         let mut d_w_k = GpuBuf::zeros(d * d);
         let mut d_w_v = GpuBuf::zeros(d * d);
         let mut d_w_o = GpuBuf::zeros(d * d);
-        let mut d_ln_attn_gamma = GpuBuf::zeros(d);
-        let mut d_ln_attn_beta = GpuBuf::zeros(d);
-        let mut d_ln_mem_gamma = GpuBuf::zeros(d);
-        let mut d_ln_mem_beta = GpuBuf::zeros(d);
+        let d_ln_attn_gamma = GpuBuf::zeros(d);
+        let d_ln_attn_beta = GpuBuf::zeros(d);
+        let d_ln_mem_gamma = GpuBuf::zeros(d);
+        let d_ln_mem_beta = GpuBuf::zeros(d);
         let mut level_grads: Vec<GpuLevelGrads> = (0..cfg.k)
             .map(|_| GpuLevelGrads::zeros_mlp(d, inter))
             .collect();
@@ -193,8 +193,8 @@ pub fn gpu_stacked_backward(
 
         // d_gated_out = d_residual_stream (from output residual skip)
         // Gating backward: gated_out = attn_proj * gate
-        let mut d_attn_proj = GpuBuf::zeros(bsd);
-        let mut d_gate = GpuBuf::zeros(bsd);
+        let d_attn_proj = GpuBuf::zeros(bsd);
+        let d_gate = GpuBuf::zeros(bsd);
         unsafe {
             crate::cuda_ffi::gating_backward_cuda(
                 d_residual_stream.as_ptr(), bc.attn_proj.as_ptr(), bc.gate.as_ptr(),
@@ -203,7 +203,7 @@ pub fn gpu_stacked_backward(
         }
 
         // Sigmoid backward: gate = sigmoid(y_combined)
-        let mut d_y_combined = GpuBuf::zeros(bsd);
+        let d_y_combined = GpuBuf::zeros(bsd);
         unsafe {
             crate::cuda_ffi::sigmoid_backward_cuda(
                 d_gate.as_ptr(), bc.gate.as_ptr(), d_y_combined.ptr(), bsd_i32,
@@ -237,7 +237,7 @@ pub fn gpu_stacked_backward(
         {
             let mut num_blocks_out: i32 = 0;
             let max_norm_blocks = (bsd + 255) / 256;
-            let mut scratch = GpuBuf::zeros(max_norm_blocks);
+            let scratch = GpuBuf::zeros(max_norm_blocks);
             let err = unsafe {
                 crate::cuda_ffi::grad_norm_sq_cuda(
                     d_y_combined.as_ptr(), scratch.ptr(), bsd as i32, &mut num_blocks_out,
@@ -259,10 +259,10 @@ pub fn gpu_stacked_backward(
 
         // ── Memory backward per level (weighted by alpha) ──────────
         // Each level receives d_y_level[l] = w[l] * d_y_combined
-        let mut d_mem_input = GpuBuf::zeros(bsd);
+        let d_mem_input = GpuBuf::zeros(bsd);
         for level in 0..cfg.k {
             // Scale d_y_combined by alpha weight for this level
-            let mut d_y_level = GpuBuf::zeros(bsd);
+            let d_y_level = GpuBuf::zeros(bsd);
             unsafe {
                 crate::cuda_ffi::saxpy_cuda(w[level], d_y_combined.as_ptr(), d_y_level.ptr(), bsd_i32);
             }
@@ -293,7 +293,7 @@ pub fn gpu_stacked_backward(
         }
 
         // ── LN_mem backward ────────────────────────────────────────
-        let mut d_residual_after_attn = GpuBuf::zeros(bsd);
+        let d_residual_after_attn = GpuBuf::zeros(bsd);
         unsafe {
             crate::cuda_ffi::layer_norm_backward_cuda(
                 d_mem_input.as_ptr(),
@@ -354,7 +354,7 @@ pub fn gpu_stacked_backward(
         gpu_matmul_transa_dd(&d_v, &bc.ln_attn_out, &mut d_w_v, d, n_tokens, d);
 
         // ── LN_attn backward ──────────────────────────────────────
-        let mut d_block_input = GpuBuf::zeros(bsd);
+        let d_block_input = GpuBuf::zeros(bsd);
         unsafe {
             crate::cuda_ffi::layer_norm_backward_cuda(
                 d_qkv_source.as_ptr(),

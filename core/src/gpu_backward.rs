@@ -12,7 +12,7 @@ use crate::gpu_buf::GpuBuf;
 #[cfg(feature = "cuda")]
 use crate::gpu_params::{GpuMAGParams, GpuMemoryLevelParams};
 #[cfg(feature = "cuda")]
-use crate::gpu_forward::{GpuCMSCache, GpuMemoryCache, gpu_buf_memcpy_d2d};
+use crate::gpu_forward::{GpuCMSCache, GpuMemoryCache};
 #[cfg(feature = "cuda")]
 use crate::model::{MAGConfig, MemoryRuleKind};
 
@@ -178,7 +178,7 @@ pub fn gpu_cms_backward(
     };
 
     // ── Stage 7: Cross-entropy backward ──────────────────────────────
-    let mut d_logits = GpuBuf::zeros(bsv);
+    let d_logits = GpuBuf::zeros(bsv);
     // Count valid targets (masked targets with id < 0 or >= vocab are skipped
     // by the kernel — we must normalize by the same count as forward).
     let valid_count = cache.target_ids_i32.iter()
@@ -236,7 +236,7 @@ pub fn gpu_cms_backward(
     }
 
     // ── Stage 4: Gating / residual gradient routing ───────────────────
-    let mut d_attn_out;
+    let d_attn_out;
     let d_y_combined;
 
     if cfg.residual {
@@ -248,7 +248,7 @@ pub fn gpu_cms_backward(
         unsafe {
             crate::cuda_ffi::saxpy_cuda(1.0, d_gated_out.as_ptr(), d_y_combined.ptr(), bsd as i32);
         }
-        let mut d_residual_after_attn = GpuBuf::zeros(bsd);
+        let d_residual_after_attn = GpuBuf::zeros(bsd);
         unsafe {
             crate::cuda_ffi::saxpy_cuda(1.0, d_gated_out.as_ptr(), d_residual_after_attn.ptr(), bsd as i32);
         }
@@ -257,7 +257,7 @@ pub fn gpu_cms_backward(
     } else {
         // Legacy: gated_out = attn_out * gate → gating_backward + sigmoid_backward
         d_attn_out = GpuBuf::zeros(bsd);
-        let mut d_gate = GpuBuf::zeros(bsd);
+        let d_gate = GpuBuf::zeros(bsd);
         unsafe {
             crate::cuda_ffi::gating_backward_cuda(
                 d_gated_out.as_ptr(), cache.attn_out.as_ptr(), cache.gate.as_ptr(),
@@ -285,7 +285,7 @@ pub fn gpu_cms_backward(
     // ── Capture d_y_combined L2 norm for GPU tape summary (opt-in) ──
     if collect_output_gnorms {
         let max_blocks = (bsd + 255) / 256;
-        let mut scratch = GpuBuf::zeros(max_blocks);
+        let scratch = GpuBuf::zeros(max_blocks);
         let mut num_blocks: i32 = 0;
         let err = unsafe {
             crate::cuda_ffi::grad_norm_sq_cuda(
@@ -313,7 +313,7 @@ pub fn gpu_cms_backward(
     } else {
         &cache.embedded
     };
-    let mut d_mem_input = GpuBuf::zeros(bsd);
+    let d_mem_input = GpuBuf::zeros(bsd);
 
     for level in 0..cfg.k {
         if cache.pulse.active_levels[level] {
@@ -347,7 +347,7 @@ pub fn gpu_cms_backward(
             .expect("residual_after_attn must be Some");
         let ln_mem_mean = cache.ln_mem_mean.as_ref().expect("ln_mem_mean");
         let ln_mem_rstd = cache.ln_mem_rstd.as_ref().expect("ln_mem_rstd");
-        let mut d_residual_from_mem = GpuBuf::zeros(bsd);
+        let d_residual_from_mem = GpuBuf::zeros(bsd);
         unsafe {
             crate::cuda_ffi::layer_norm_backward_cuda(
                 d_mem_input.as_ptr(),
@@ -398,7 +398,7 @@ pub fn gpu_cms_backward(
     gpu_matmul_transa_dd(&d_v, qkv_source, &mut grads.d_w_v, d, bs * s, d);
 
     // ── LN_attn backward (residual path) ─────────────────────────────
-    let mut d_embedded = GpuBuf::zeros(bsd);
+    let d_embedded = GpuBuf::zeros(bsd);
     if cfg.residual {
         // d_qkv_source flows through LN_attn backward to d_embedded
         let ln_attn_mean = cache.ln_attn_mean.as_ref().expect("ln_attn_mean");
@@ -481,7 +481,7 @@ pub(crate) fn gpu_memory_backward(
 
             // Spec 27: proxy caches store only M_final — broadcast for backward kernel
             let m_for_bw = if *proxy {
-                let mut m_bcast = GpuBuf::zeros(batch_size * (s + 1) * dd);
+                let m_bcast = GpuBuf::zeros(batch_size * (s + 1) * dd);
                 unsafe {
                     let rc = crate::cuda_ffi::broadcast_fill_f32_cuda(
                         m_bcast.ptr(), m_states.as_ptr(),
@@ -548,8 +548,8 @@ pub(crate) fn gpu_memory_backward(
 
             // Spec 27: proxy caches store only M_final/S_final — broadcast for backward kernel
             let (m_for_bw, s_for_bw) = if *proxy {
-                let mut m_bcast = GpuBuf::zeros(batch_size * (s + 1) * dd);
-                let mut s_bcast = GpuBuf::zeros(batch_size * (s + 1) * dd);
+                let m_bcast = GpuBuf::zeros(batch_size * (s + 1) * dd);
+                let s_bcast = GpuBuf::zeros(batch_size * (s + 1) * dd);
                 unsafe {
                     let dd_i32 = i32::try_from(dd).expect("dd overflows i32");
                     let slots_i32 = i32::try_from(s + 1).expect("s+1 overflows i32");
@@ -641,7 +641,7 @@ pub(crate) fn gpu_memory_backward(
         // ── Checkpointed variants: segment-based backward ──────────
         GpuMemoryCache::DeltaCkpt { k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, checkpoint_interval, k_norms, q_norms } => {
             let c = *checkpoint_interval;
-            let (d_k_mem, d_v_mem, d_q_mem, mut d_alpha, mut d_theta) =
+            let (d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta) =
                 delta_backward_checkpointed(k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, d_y, s, d, c, cfg.error_clip_for_level(level));
             // CS-39 straight-through: zero d_alpha where alpha was clamped.
             let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
@@ -674,7 +674,7 @@ pub(crate) fn gpu_memory_backward(
         }
         GpuMemoryCache::TitansCkpt { k_mem, v_mem, q_mem, alpha, theta, eta, m_checkpoints, s_checkpoints, checkpoint_interval, k_norms, q_norms } => {
             let c = *checkpoint_interval;
-            let (d_k_mem, d_v_mem, d_q_mem, mut d_alpha, mut d_theta, d_eta) =
+            let (d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta, d_eta) =
                 titans_backward_checkpointed(k_mem, v_mem, q_mem, alpha, theta, eta, m_checkpoints, s_checkpoints, d_y, s, d, c, cfg.error_clip_for_level(level));
             // CS-39 straight-through: zero d_alpha where alpha was clamped.
             let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
@@ -769,7 +769,7 @@ pub(crate) fn gpu_memory_backward(
         }
         GpuMemoryCache::DGDCkpt { k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, checkpoint_interval, k_norms, q_norms } => {
             let c = *checkpoint_interval;
-            let (d_k_mem, d_v_mem, d_q_mem, mut d_alpha, mut d_theta) =
+            let (d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta) =
                 delta_backward_checkpointed(k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, d_y, s, d, c, cfg.error_clip_for_level(level));
             // CS-39 straight-through: zero d_alpha where alpha was clamped.
             let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
@@ -820,9 +820,9 @@ pub(crate) fn gpu_memory_backward(
             assert_eq!(v_summaries.len(), n_total, "TNT backward: v_summaries.len() ({}) != total_shards ({n_total})", v_summaries.len());
 
             // Accumulators for projection weight grads across all shards
-            let mut d_k_mem_total = GpuBuf::<f32>::zeros(s * d);
-            let mut d_v_mem_total = GpuBuf::<f32>::zeros(s * d);
-            let mut d_q_mem_total = GpuBuf::<f32>::zeros(s * d);
+            let d_k_mem_total = GpuBuf::<f32>::zeros(s * d);
+            let d_v_mem_total = GpuBuf::<f32>::zeros(s * d);
+            let d_q_mem_total = GpuBuf::<f32>::zeros(s * d);
 
             // Reverse shard iteration: propagate d_m through global updates.
             // Global M backward runs over ALL shards (summaries are retained for all).
@@ -868,7 +868,7 @@ pub(crate) fn gpu_memory_backward(
 
                 // Step 3: Combine upstream d_y with d_local_y from global path
                 let d_y_shard_slice = d_y.slice(shard_start * d, shard_len * d);
-                let mut d_y_upstream_shard = GpuBuf::zeros(shard_len * d);
+                let d_y_upstream_shard = GpuBuf::zeros(shard_len * d);
                 unsafe {
                     let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
                         d_y_upstream_shard.ptr() as *mut std::ffi::c_void,
@@ -888,7 +888,7 @@ pub(crate) fn gpu_memory_backward(
                 let d_y_padded = if shard_len == padded_len {
                     d_y_combined
                 } else {
-                    let mut dp = GpuBuf::zeros(padded_len * d);
+                    let dp = GpuBuf::zeros(padded_len * d);
                     unsafe {
                         let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
                             dp.ptr() as *mut std::ffi::c_void,
@@ -932,8 +932,8 @@ pub(crate) fn gpu_memory_backward(
                         let (m_for_bw, s_for_bw) = if is_proxy {
                             // Broadcast M_final/S_final into [(cl+1)*dd] per batch element
                             // using a single CUDA kernel launch instead of nested host-driven copies.
-                            let mut m_bcast = GpuBuf::zeros(n_batch * (cl + 1) * dd);
-                            let mut s_bcast = GpuBuf::zeros(n_batch * (cl + 1) * dd);
+                            let m_bcast = GpuBuf::zeros(n_batch * (cl + 1) * dd);
+                            let s_bcast = GpuBuf::zeros(n_batch * (cl + 1) * dd);
                             unsafe {
                                 let dd_i32 = i32::try_from(dd).expect("dd overflows i32");
                                 let slots_i32 = i32::try_from(cl + 1).expect("cl+1 overflows i32");
@@ -980,7 +980,7 @@ pub(crate) fn gpu_memory_backward(
                         let mut d_m_initial = GpuBuf::zeros(n_batch * dd);
 
                         let m_for_bw = if is_proxy {
-                            let mut m_bcast = GpuBuf::zeros(n_batch * (cl + 1) * dd);
+                            let m_bcast = GpuBuf::zeros(n_batch * (cl + 1) * dd);
                             unsafe {
                                 let rc = crate::cuda_ffi::broadcast_fill_f32_cuda(
                                     m_bcast.ptr(), m_states.as_ptr(),
@@ -1045,8 +1045,8 @@ pub(crate) fn gpu_memory_backward(
 
                 // Step 5b: L2 normalization backward for k/q per shard.
                 {
-                    let mut d_k_raw = GpuBuf::zeros(shard_tokens * d);
-                    let mut d_q_raw = GpuBuf::zeros(shard_tokens * d);
+                    let d_k_raw = GpuBuf::zeros(shard_tokens * d);
+                    let d_q_raw = GpuBuf::zeros(shard_tokens * d);
                     unsafe {
                         crate::cuda_ffi::l2_normalize_backward_f32_cuda(
                             d_k_shard.as_ptr(), shard_k_mem.as_ptr(), shard_k_norms.as_ptr(),
@@ -1146,7 +1146,7 @@ pub(crate) fn gpu_memory_backward(
         // ── SwiGLU: stateless MLP, direct weight grads ───────────────
         GpuMemoryCache::SwiGlu { gate_buf, up_buf, fused_buf, cache_buf } => {
             let inter = cfg.intermediate_size;
-            let mut d_x = GpuBuf::zeros(batch_size * s * d);
+            let d_x = GpuBuf::zeros(batch_size * s * d);
             unsafe {
                 crate::cuda_ffi::swiglu_backward_f32_cuda_dd(
                     d_y.as_ptr(),
@@ -1213,12 +1213,12 @@ fn delta_backward_checkpointed(
     let mut d_theta = GpuBuf::zeros(s);
 
     // d_M seed: starts as zeros for the last segment
-    let mut d_m_seed = GpuBuf::zeros(dd);
+    let d_m_seed = GpuBuf::zeros(dd);
 
     // Pre-allocate scratch buffers sized for max segment (CS-42: no per-segment cudaMalloc)
     let max_seg = c.min(s);
-    let mut local_m_states = GpuBuf::zeros((max_seg + 1) * dd);
-    let mut local_y = GpuBuf::zeros(max_seg * d);
+    let local_m_states = GpuBuf::zeros((max_seg + 1) * dd);
+    let local_y = GpuBuf::zeros(max_seg * d);
     let mut seg_d_m_out = GpuBuf::zeros(dd);
 
     // Process segments in reverse
@@ -1287,14 +1287,14 @@ fn titans_backward_checkpointed(
     let mut d_alpha = GpuBuf::zeros(s);
     let mut d_theta = GpuBuf::zeros(s);
     let mut d_eta = GpuBuf::zeros(s);
-    let mut d_m_seed = GpuBuf::zeros(dd);
-    let mut d_s_seed = GpuBuf::zeros(dd);
+    let d_m_seed = GpuBuf::zeros(dd);
+    let d_s_seed = GpuBuf::zeros(dd);
 
     // Pre-allocate scratch buffers sized for max segment (CS-42: no per-segment cudaMalloc)
     let max_seg = c.min(s);
-    let mut local_m_states = GpuBuf::zeros((max_seg + 1) * dd);
-    let mut local_s_states = GpuBuf::zeros((max_seg + 1) * dd);
-    let mut local_y = GpuBuf::zeros(max_seg * d);
+    let local_m_states = GpuBuf::zeros((max_seg + 1) * dd);
+    let local_s_states = GpuBuf::zeros((max_seg + 1) * dd);
+    let local_y = GpuBuf::zeros(max_seg * d);
     let mut seg_d_m_out = GpuBuf::zeros(dd);
     let mut seg_d_s_out = GpuBuf::zeros(dd);
 
@@ -1365,12 +1365,12 @@ fn hebbian_backward_checkpointed(
     let mut d_v_mem = GpuBuf::zeros(sd);
     let mut d_q_mem = GpuBuf::zeros(sd);
     let mut d_alpha = GpuBuf::zeros(s);
-    let mut d_m_seed = GpuBuf::zeros(dd);
+    let d_m_seed = GpuBuf::zeros(dd);
 
     // Pre-allocate scratch buffers sized for max segment (CS-42: no per-segment cudaMalloc)
     let max_seg = c.min(s);
-    let mut local_m_states = GpuBuf::zeros((max_seg + 1) * dd);
-    let mut local_y = GpuBuf::zeros(max_seg * d);
+    let local_m_states = GpuBuf::zeros((max_seg + 1) * dd);
+    let local_y = GpuBuf::zeros(max_seg * d);
     let mut seg_d_m_out = GpuBuf::zeros(dd);
 
     for &(t_start, t_end, ckpt_idx) in segments.iter().rev() {
@@ -1453,8 +1453,8 @@ fn accumulate_projection_grads(
 
     // L2 normalization backward: d_k_mem and d_q_mem are gradients w.r.t. normalized k/q.
     // Transform to gradients w.r.t. raw (pre-normalization) projections.
-    let mut d_k_raw = GpuBuf::zeros(bsd);
-    let mut d_q_raw = GpuBuf::zeros(bsd);
+    let d_k_raw = GpuBuf::zeros(bsd);
+    let d_q_raw = GpuBuf::zeros(bsd);
     unsafe {
         crate::cuda_ffi::l2_normalize_backward_f32_cuda(
             d_k_mem.as_ptr(), k_mem.as_ptr(), k_norms.as_ptr(),

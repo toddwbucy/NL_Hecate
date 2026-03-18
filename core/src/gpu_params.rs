@@ -395,7 +395,7 @@ impl GpuContextState {
         let dd = d * d;
         let bytes = dd * 4;
         let memory = host.memory.iter().map(|m| {
-            let mut buf = GpuBuf::<f32>::zeros(batch_size * dd);
+            let buf = GpuBuf::<f32>::zeros(batch_size * dd);
             // Upload host M once, then D2D-copy to all slots.
             let slot0 = GpuBuf::<f32>::from_host(m);
             for b in 0..batch_size {
@@ -628,7 +628,7 @@ impl GpuStackedContext {
                 let n = slot_size.min(buf.len()) as i32;
                 let mut num_blocks_out: i32 = 0;
                 let max_norm_blocks = (n as usize + 255) / 256;
-                let mut scratch = GpuBuf::zeros(max_norm_blocks);
+                let scratch = GpuBuf::zeros(max_norm_blocks);
                 let err = unsafe {
                     crate::cuda_ffi::grad_norm_sq_cuda(
                         buf.as_ptr(), scratch.ptr(), n, &mut num_blocks_out,
@@ -651,7 +651,7 @@ impl GpuStackedContext {
     /// Computes current M norms, diffs against prev, updates dormancy counters.
     pub fn update_m_norm_tracking(&mut self) {
         let current_norms = self.memory_norms();
-        let k = if let Some(first) = current_norms.first() { first.len() } else { 0 };
+        let _k = if let Some(first) = current_norms.first() { first.len() } else { 0 };
 
         for (bi, block_norms) in current_norms.iter().enumerate() {
             if bi >= self.prev_m_norms.len() { continue; }
@@ -717,7 +717,7 @@ impl GpuStackedContext {
     pub fn deep_clone(&self) -> Self {
         let blocks = self.blocks.iter().map(|ctx| {
             let memory = ctx.memory.iter().map(|buf| {
-                let mut copy = GpuBuf::zeros(buf.len());
+                let copy = GpuBuf::zeros(buf.len());
                 let err = unsafe {
                     crate::gpu_forward::gpu_buf_memcpy_d2d(
                         copy.ptr() as *mut std::ffi::c_void,
