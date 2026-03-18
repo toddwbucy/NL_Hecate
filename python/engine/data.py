@@ -1,4 +1,4 @@
-"""Data loading: mmap byte stream, BPE token stream, demo text."""
+"""Data loading: mmap byte stream, BPE token stream, shard stream, demo text."""
 
 import json
 import mmap
@@ -184,6 +184,184 @@ class BpeTokenStream:
         self._chunk_id  = chunk_id
         self._seq_len   = seq_len
         self._last_hash = saved_hash
+
+    def __len__(self) -> int:
+        return self.total_tokens
+
+
+class ShardTokenStream:
+    """Load pre-tokenized uint16 memmap shards and serve chunks.
+
+    Designed for the SmolLM corpus format: a directory of shard_NNN.bin files
+    (flat uint16), a manifest.json with vocab_size, and a tokenizers/ subdirectory.
+    Targets are derived from input shifted by 1 position (standard causal LM).
+
+    Each shard is memory-mapped individually. Offset arithmetic maps a global
+    position to the correct shard + local offset, keeping RAM usage near zero
+    (OS page cache handles the rest).
+
+    Implements the same interface as BpeTokenStream: next_chunk(), cursor(),
+    restore(), __len__(), plus .tokens and .targets properties for val carving.
+    """
+
+    def __init__(self, data_dir: str, split: str = "train"):
+        import numpy as np
+        data_path = Path(data_dir)
+        shard_dir = data_path / split
+
+        # Load manifest
+        manifest_path = data_path / "manifest.json"
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                f"No manifest.json found in {data_path}. "
+                "Expected SmolLM corpus format.")
+        with open(manifest_path) as f:
+            self._manifest = json.load(f)
+        self.vocab_size = self._manifest["tokenizer"]["vocab_size"]
+
+        # Discover and memory-map shards in sorted order
+        shard_files = sorted(shard_dir.glob("shard_*.bin"))
+        if not shard_files:
+            raise FileNotFoundError(
+                f"No shard_*.bin files found in {shard_dir}")
+
+        self._shards: list = []       # list of np.memmap
+        self._shard_offsets: list[int] = []  # cumulative start position per shard
+        cumulative = 0
+        for sf in shard_files:
+            mm = np.memmap(str(sf), dtype=np.uint16, mode='r')
+            self._shards.append(mm)
+            self._shard_offsets.append(cumulative)
+            cumulative += len(mm)
+
+        # Total usable tokens: last token has no target, so total_tokens = cumulative - 1
+        self.total_tokens = cumulative - 1
+        self._total_raw = cumulative  # raw token count across all shards
+
+        self._path = str(shard_dir.resolve())
+        self._split = split
+        self.position = 0
+        self._chunk_id = 0
+        self._last_hash = 0
+        self._seq_len = 0
+
+        # Expose meta dict for compatibility with code that reads loader.meta
+        self.meta = {"vocab_size": self.vocab_size}
+
+    def _read_range(self, start: int, end: int) -> list[int]:
+        """Read token IDs from global position [start, end) across shard boundaries."""
+        import numpy as np
+        result = []
+        pos = start
+        while pos < end:
+            # Binary search for the shard containing pos
+            shard_idx = self._find_shard(pos)
+            local_start = pos - self._shard_offsets[shard_idx]
+            shard_len = len(self._shards[shard_idx])
+            local_end = min(local_start + (end - pos), shard_len)
+            result.extend(self._shards[shard_idx][local_start:local_end].tolist())
+            pos += (local_end - local_start)
+        return result
+
+    def _find_shard(self, global_pos: int) -> int:
+        """Find which shard contains global_pos via binary search."""
+        import bisect
+        # _shard_offsets[i] is the start of shard i. We want the last shard
+        # whose offset <= global_pos.
+        idx = bisect.bisect_right(self._shard_offsets, global_pos) - 1
+        return max(0, idx)
+
+    def next_chunk(self, seq_len: int) -> tuple[list[int], list[int]] | None:
+        """Get next chunk of (input_ids, target_ids).
+
+        Wraps position to 0 when remaining tokens < seq_len.
+        Returns None only when total_tokens < seq_len (corpus too short).
+        Targets are input shifted by 1 position (standard causal LM).
+        """
+        if self.position + seq_len > self.total_tokens:
+            self.position = 0  # wrap
+        if self.total_tokens < seq_len:
+            return None
+
+        # Read seq_len + 1 tokens: first seq_len are input, last seq_len are target
+        raw = self._read_range(self.position, self.position + seq_len + 1)
+        input_ids = raw[:seq_len]
+        target_ids = raw[1:seq_len + 1]
+
+        self._last_hash = _fnv1a_32(input_ids)
+        self._chunk_id += 1
+        self._seq_len = seq_len
+        self.position += seq_len
+        return input_ids, target_ids
+
+    def cursor(self) -> dict:
+        """Return a serializable cursor capturing exact stream position."""
+        return {
+            "position":     self.position,
+            "total_tokens": self.total_tokens,
+            "content_hash": self._last_hash,
+            "chunk_id":     self._chunk_id,
+            "seq_len":      self._seq_len,
+            "dataset_path": self._path,
+        }
+
+    def restore(self, cursor: dict) -> None:
+        """Seek to saved cursor position and validate dataset integrity."""
+        saved_total = cursor.get("total_tokens", 0)
+        if saved_total != self.total_tokens:
+            raise CursorMismatchError(
+                f"Dataset size mismatch: checkpoint has {saved_total:,} tokens, "
+                f"current dataset has {self.total_tokens:,}. Wrong dataset?"
+            )
+
+        pos = cursor.get("position", 0)
+        if pos < 0 or pos > self.total_tokens:
+            raise CursorOutOfBounds(
+                f"Cursor position {pos:,} is out of bounds for dataset "
+                f"size {self.total_tokens:,}."
+            )
+
+        saved_hash = cursor.get("content_hash", 0)
+        seq_len    = cursor.get("seq_len", 0)
+        chunk_id   = cursor.get("chunk_id", 0)
+        if saved_hash != 0:
+            if seq_len <= 0 or pos < seq_len:
+                raise CursorMismatchError(
+                    f"Malformed cursor: content_hash is non-zero "
+                    f"({saved_hash:#010x}) but pos={pos:,} < "
+                    f"seq_len={seq_len:,} — cannot verify integrity."
+                )
+            last_chunk = self._read_range(pos - seq_len, pos)
+            actual_hash = _fnv1a_32(last_chunk)
+            if actual_hash != saved_hash:
+                raise CursorMismatchError(
+                    f"Content hash mismatch at position {pos:,}: "
+                    f"expected {saved_hash:#010x}, got {actual_hash:#010x}. "
+                    "Wrong dataset or corrupted file?"
+                )
+
+        self.position   = pos
+        self._chunk_id  = chunk_id
+        self._seq_len   = seq_len
+        self._last_hash = saved_hash
+
+    @property
+    def tokens(self):
+        """Lazy numpy view over all shard tokens (for val carving compatibility).
+
+        Returns a concatenated numpy array. This loads all shards into a single
+        array — only call this for val carving (small slices), not for training.
+        """
+        import numpy as np
+        if not hasattr(self, '_tokens_concat'):
+            self._tokens_concat = np.concatenate(
+                [s[:] for s in self._shards])
+        return self._tokens_concat
+
+    @property
+    def targets(self):
+        """Shifted-by-1 view of tokens (for val carving compatibility)."""
+        return self.tokens[1:]
 
     def __len__(self) -> int:
         return self.total_tokens

@@ -20,7 +20,7 @@ from typing import Any, Optional
 import nl_hecate
 
 from engine.config import BuildConfig, cosine_lr
-from engine.data import BpeTokenStream, CursorMismatchError, CursorOutOfBounds, DEMO_TEXT, MmapTokenStream
+from engine.data import BpeTokenStream, CursorMismatchError, CursorOutOfBounds, DEMO_TEXT, MmapTokenStream, ShardTokenStream
 from engine.evaluation import (
     evaluate, evaluate_numpy, print_level_metrics, print_tape_summary,
     eval_coherence_samples, generate_samples,
@@ -48,7 +48,7 @@ def _safetensors_path(path_str: str) -> str:
 # Data formats that use the numpy/BPE loader path (BpeTokenStream + sidecar cursor).
 # The byte-level path (VecStream / MmapTokenStream) uses a separate resume mechanism
 # and is unaffected by this constant.
-_NUMPY_LOADER_FORMATS = frozenset({"sharegpt", "dolmino"})
+_NUMPY_LOADER_FORMATS = frozenset({"sharegpt", "dolmino", "smollm"})
 
 
 def _carve_window_val(loader: BpeTokenStream, val_tokens: int,
@@ -104,9 +104,15 @@ def run_build(bcfg: BuildConfig):
     _window_val_targets = None
 
     if use_bpe:
-        active_loader = BpeTokenStream(bcfg.data_path, split="train")
-        print(f"Loaded {bcfg.data_format} BPE data: {len(active_loader):,} tokens, "
-              f"vocab={active_loader.vocab_size}")
+        if bcfg.data_format == "smollm":
+            active_loader = ShardTokenStream(bcfg.data_path, split="train")
+            print(f"Loaded SmolLM shard data: {len(active_loader):,} tokens, "
+                  f"vocab={active_loader.vocab_size}, "
+                  f"shards={len(active_loader._shards)}")
+        else:
+            active_loader = BpeTokenStream(bcfg.data_path, split="train")
+            print(f"Loaded {bcfg.data_format} BPE data: {len(active_loader):,} tokens, "
+                  f"vocab={active_loader.vocab_size}")
         if len(active_loader) < bcfg.seq_len:
             print(f"Error: data too short ({len(active_loader)} tokens < seq_len={bcfg.seq_len}, "
                   f"format={bcfg.data_format})")
@@ -118,13 +124,23 @@ def run_build(bcfg: BuildConfig):
                 # the remaining training window, not from already-consumed data.
                 pass
             else:
-                val_path = Path(bcfg.data_path) / "val_tokens.npy"
-                if val_path.exists():
-                    val_stream = BpeTokenStream(bcfg.data_path, split="val")
-                    print(f"Loaded val set: {len(val_stream):,} tokens")
+                if bcfg.data_format == "smollm":
+                    val_shard_dir = Path(bcfg.data_path) / "val"
+                    if val_shard_dir.exists() and list(val_shard_dir.glob("shard_*.bin")):
+                        val_stream = ShardTokenStream(bcfg.data_path, split="val")
+                        print(f"Loaded val set: {len(val_stream):,} tokens "
+                              f"({len(val_stream._shards)} shards)")
+                    else:
+                        print("Warning: eval_every set but no val shards found, disabling eval")
+                        bcfg.eval_every = 0
                 else:
-                    print("Warning: eval_every set but no val data found, disabling eval")
-                    bcfg.eval_every = 0  # safe: bcfg is consumed only by this function
+                    val_path = Path(bcfg.data_path) / "val_tokens.npy"
+                    if val_path.exists():
+                        val_stream = BpeTokenStream(bcfg.data_path, split="val")
+                        print(f"Loaded val set: {len(val_stream):,} tokens")
+                    else:
+                        print("Warning: eval_every set but no val data found, disabling eval")
+                        bcfg.eval_every = 0  # safe: bcfg is consumed only by this function
     elif bcfg.data_path:
         if bcfg.data_path.endswith(".bin"):
             fsize = os.path.getsize(bcfg.data_path)

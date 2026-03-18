@@ -298,9 +298,10 @@ class BuildConfig:
                 f"momentum 'deep_momentum' is Tier 3 (research stub). Not production-ready. "
                 f"Proceeding on CPU. See specs/infrastructure/01_variant_tier_policy.md.",
                 stacklevel=3)
-        if self.data_format not in ("byte", "sharegpt", "dolmino"):
+        if self.data_format not in ("byte", "sharegpt", "dolmino", "smollm"):
             raise ValueError(
-                f"data_format must be 'byte', 'sharegpt', or 'dolmino', got '{self.data_format}'")
+                f"data_format must be 'byte', 'sharegpt', 'dolmino', or 'smollm', "
+                f"got '{self.data_format}'")
         if self.alpha_floor is not None and len(self.alpha_floor) != self.k:
             raise ValueError(
                 f"alpha_floor length {len(self.alpha_floor)} must match k={self.k}")
@@ -490,7 +491,7 @@ class BuildConfig:
         # Rename head_dim if present (derived, not stored)
         flat.pop("head_dim", None)
         flat.pop("format", None)
-        # Auto-load vocab_size from meta.json for sharegpt/dolmino formats
+        # Auto-load vocab_size from meta/manifest for BPE formats
         if flat.get("data_format") in ("sharegpt", "dolmino") and "data_path" in flat:
             meta_path = Path(flat["data_path"]) / "meta.json"
             if meta_path.exists() and "vocab_size" not in flat:
@@ -501,6 +502,18 @@ class BuildConfig:
                 else:
                     raise ValueError(
                         f"meta.json at {meta_path} missing 'vocab_size' key")
+        if flat.get("data_format") == "smollm" and "data_path" in flat:
+            manifest_path = Path(flat["data_path"]) / "manifest.json"
+            if manifest_path.exists() and "vocab_size" not in flat:
+                with open(manifest_path) as f:
+                    manifest = json.load(f)
+                vs = manifest.get("tokenizer", {}).get("vocab_size")
+                if vs is not None:
+                    flat["vocab_size"] = vs
+                else:
+                    raise ValueError(
+                        f"manifest.json at {manifest_path} missing "
+                        f"'tokenizer.vocab_size' key")
         return cls(**flat)
 
     def apply_cli(self, args: argparse.Namespace):

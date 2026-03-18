@@ -7,7 +7,7 @@ No train/eval distinction — same forward path everywhere (CS-10).
 
 from engine.config import BuildConfig, cosine_lr
 from engine.tokenizer import ByteTokenizer, BpeTokenizer, load_tokenizer
-from engine.data import MmapTokenStream, BpeTokenStream, load_binary_tokens, DEMO_TEXT
+from engine.data import MmapTokenStream, BpeTokenStream, ShardTokenStream, load_binary_tokens, DEMO_TEXT
 from engine.generation import (
     generate, generate_cached, generate_learning, IM_START, IM_END, PAD,
     chatml_encode_turn, chatml_encode_prompt,
@@ -29,7 +29,7 @@ __all__ = [
     # tokenizer
     "ByteTokenizer", "BpeTokenizer", "load_tokenizer",
     # data
-    "MmapTokenStream", "BpeTokenStream", "load_binary_tokens", "DEMO_TEXT",
+    "MmapTokenStream", "BpeTokenStream", "ShardTokenStream", "load_binary_tokens", "DEMO_TEXT",
     # generation
     "generate", "generate_cached", "generate_learning",
     "IM_START", "IM_END", "PAD",

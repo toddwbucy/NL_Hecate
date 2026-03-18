@@ -51,7 +51,9 @@ def load_tokenizer(tokenizer_path: str | None = None,
                 f"Tokenizer file not found: {tokenizer_path}")
         return BpeTokenizer(tokenizer_path)
     if data_dir:
-        bpe_path = Path(data_dir) / "tokenizer.json"
-        if bpe_path.exists():
-            return BpeTokenizer(str(bpe_path))
+        # Check root first, then tokenizers/ subdirectory (SmolLM corpus layout)
+        for subpath in ("tokenizer.json", "tokenizers/tokenizer.json"):
+            bpe_path = Path(data_dir) / subpath
+            if bpe_path.exists():
+                return BpeTokenizer(str(bpe_path))
     return ByteTokenizer()
