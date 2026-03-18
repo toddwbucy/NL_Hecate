@@ -149,14 +149,16 @@ pub fn swa_single_token_forward(
     }
 }
 
-/// SWA backward pass — Rust reference implementation.
+/// SWA backward — CPU reference implementation (kernel-pair pattern).
 ///
 /// Computes dQ, dK, dV from d_attn_out and cached attn_weights/Q/K/V.
-/// This is the exact logic from backward.rs Stage 3, extracted for dispatch.
+/// Not called in the GPU build path (which uses `swa_backward_f32_cuda`),
+/// but retained as the ground-truth reference for verifying that the CUDA
+/// backward kernel produces correct gradients. Test suite runs both paths
+/// and asserts element-wise agreement within tolerance.
 ///
 /// All slices are [seq_len, num_heads * head_dim] row-major flat,
 /// except attn_weights which is [num_heads, seq_len, window_size].
-/// SWA backward — public for CUDA comparison tests.
 #[allow(dead_code)]
 pub fn swa_backward_rust(
     q: &[f32],

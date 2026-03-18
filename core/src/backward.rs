@@ -140,7 +140,11 @@ fn backward_internal(
 }
 
 /// Backward pass returning parameter gradients (without embedding gradient).
-/// Used by Phase 2 CUDA dispatch where some callers don't need embedding gradients.
+///
+/// CPU reference implementation (kernel-pair pattern). The production GPU path
+/// uses `backward_full` which includes embedding gradients. This function is
+/// retained as a verification reference: tests compare its output against the
+/// CUDA backward to confirm correctness of the GPU kernels.
 #[allow(dead_code)]
 pub fn backward(
     params: &SWAParams,

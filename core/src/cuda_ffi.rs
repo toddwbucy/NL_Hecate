@@ -7,6 +7,12 @@
 // SWA kernels use bf16 storage (*const u16 / *mut u16).
 // Memory rule kernels (Delta, Titans, Hebbian) use all-f32.
 //
+// Kernel-pair pattern: every kernel declared here has a corresponding
+// CPU reference in Rust (swa.rs, backward.rs, delta_rule.rs, etc.).
+// The CPU references are kept for verification — tests run both paths
+// and assert element-wise agreement. See individual Rust files for
+// which functions serve as the CPU counterpart.
+//
 // Only available when compiled with `--features cuda`.
 
 extern "C" {
@@ -415,10 +421,6 @@ extern "C" {
     /// Element-wise sigmoid: out[i] = 1/(1+exp(-x[i])).
     pub(crate) fn sigmoid_cuda(x: *const f32, out: *mut f32, n: i32);
 
-    /// Element-wise softplus: out[i] = log(1+exp(x[i])).
-    #[allow(dead_code)]
-    pub(crate) fn softplus_cuda(x: *const f32, out: *mut f32, n: i32);
-
     /// Element-wise multiply: out[i] = a[i] * b[i].
     pub(crate) fn elemwise_mul_cuda(a: *const f32, b: *const f32, out: *mut f32, n: i32);
 
@@ -555,12 +557,6 @@ extern "C" {
         g: *const f32, partial_sums: *mut f32,
         n: i32, out_num_blocks: *mut i32,
     ) -> u32;  // cudaError_t: 0 = cudaSuccess
-
-    /// Iterative GPU-side reduction of partial sums to a single scalar.
-    /// Uses ping-pong between buf_a and buf_b. Result in buf_a[0].
-    /// buf_b must be at least ceil(n/256) elements.
-    #[allow(dead_code)]
-    pub(crate) fn reduce_sum_cuda(buf_a: *mut f32, buf_b: *mut f32, n: i32);
 
     /// Scale gradient buffer in-place: g[i] *= scale.
     pub(crate) fn grad_scale_cuda(g: *mut f32, scale: f32, n: i32) -> u32;  // cudaError_t: 0 = cudaSuccess

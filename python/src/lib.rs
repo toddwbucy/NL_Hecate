@@ -21,9 +21,9 @@ use nl_hecate_core::cms_variants::{
 use nl_hecate_core::forward::{forward as rust_forward, ForwardCache as RustCache};
 use nl_hecate_core::backward::backward_full as rust_backward_full;
 use nl_hecate_core::gradient::compute_gradients as rust_compute_gradients;
-use nl_hecate_core::mag::{mag_forward as rust_mag_forward, MAGForwardCache as RustMAGCache, mag_backward as rust_mag_backward};
+use nl_hecate_core::mag::{mag_forward as rust_mag_forward, MAGForwardCache as RustMAGCache};
 use nl_hecate_core::gradient::mag_compute_gradients as rust_mag_compute_gradients;
-use nl_hecate_core::mag::{cms_forward as rust_cms_forward, cms_backward as rust_cms_backward, CMSForwardCache as RustCMSCache};
+use nl_hecate_core::mag::{cms_forward as rust_cms_forward, CMSForwardCache as RustCMSCache};
 use nl_hecate_core::gradient::cms_compute_gradients as rust_cms_compute_gradients;
 use nl_hecate_core::conductor::{Conductor as RustConductor, Pulse as RustPulse, ContextState as RustContextState, ErrorBuffer as RustErrorBuffer, Checkpoint as RustCheckpoint, ConductorState as RustConductorState};
 use nl_hecate_core::context_stream::StreamCursor;
@@ -1106,19 +1106,6 @@ fn mag_forward(params: &MAGParams, cfg: &MAGConfig, input_ids: Vec<usize>, targe
 }
 
 #[pyfunction]
-fn mag_backward(
-    params: &MAGParams,
-    cfg: &MAGConfig,
-    cache: &MAGForwardCache,
-    input_ids: Vec<usize>,
-    target_ids: Vec<usize>,
-) -> PyResult<MAGParams> {
-    validate_mag_seq_lens(cfg, &input_ids, &target_ids)?;
-    let grads = rust_mag_backward(&params.inner, &cfg.inner, &cache.inner, &input_ids, &target_ids);
-    Ok(MAGParams { inner: grads })
-}
-
-#[pyfunction]
 fn mag_compute_gradients(
     params: &MAGParams,
     cfg: &MAGConfig,
@@ -1616,23 +1603,6 @@ fn cms_forward(
         &pulse.inner, &mut context.inner,
     );
     Ok((loss, CMSForwardCache { inner: cache }))
-}
-
-#[pyfunction]
-fn cms_backward(
-    params: &MAGParams,
-    cfg: &MAGConfig,
-    cache: &CMSForwardCache,
-    input_ids: Vec<usize>,
-    target_ids: Vec<usize>,
-    error_buffers: &mut ErrorBufferList,
-) -> PyResult<MAGParams> {
-    validate_mag_seq_lens(cfg, &input_ids, &target_ids)?;
-    let grads = rust_cms_backward(
-        &params.inner, &cfg.inner, &cache.inner,
-        &input_ids, &target_ids, &mut error_buffers.inner,
-    );
-    Ok(MAGParams { inner: grads })
 }
 
 /// Compute CMS gradients via the Wengert tape (traced forward + automatic backward).
@@ -3537,7 +3507,6 @@ fn nl_hecate(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(extend_params_push_up, m)?)?;
     m.add_function(wrap_pyfunction!(extend_params_stack_up, m)?)?;
     m.add_function(wrap_pyfunction!(mag_forward, m)?)?;
-    m.add_function(wrap_pyfunction!(mag_backward, m)?)?;
     m.add_function(wrap_pyfunction!(mag_compute_gradients, m)?)?;
     m.add_function(wrap_pyfunction!(mag_apply_weight_gradients, m)?)?;
     // CMS Variants
@@ -3550,7 +3519,6 @@ fn nl_hecate(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<VecStream>()?;
     m.add_class::<CMSForwardCache>()?;
     m.add_function(wrap_pyfunction!(cms_forward, m)?)?;
-    m.add_function(wrap_pyfunction!(cms_backward, m)?)?;
     m.add_function(wrap_pyfunction!(cms_compute_gradients, m)?)?;
     m.add_function(wrap_pyfunction!(save_checkpoint, m)?)?;
     m.add_function(wrap_pyfunction!(save_build_checkpoint, m)?)?;

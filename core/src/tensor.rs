@@ -42,6 +42,11 @@ pub fn f32_to_bf16(x: f32) -> f32 {
 }
 
 /// Truncate a slice to bf16 precision in-place.
+///
+/// Used in precision-boundary tests to simulate bf16 storage quantization
+/// on CPU. The GPU path uses native bf16 via `f32_to_bf16_cuda`. Retained
+/// for verifying that Rust-side bf16 rounding matches the CUDA kernel's
+/// __float2bfloat16 behavior.
 #[allow(dead_code)]
 pub fn truncate_to_bf16(buf: &mut [f32]) {
     for v in buf.iter_mut() {
