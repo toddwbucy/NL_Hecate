@@ -1500,9 +1500,9 @@ def run_build(bcfg: BuildConfig):
                 print(f"    [coherence skipped: {', '.join(skip_reasons)}]")
             if can_coherence:
                 # Learning probes (CS-10: model learns during forward)
-                # TODO: full_snapshot/full_restore don't preserve optimizer moments.
+                # NOTE: full_snapshot/full_restore don't preserve optimizer moments.
                 # reset_optimizer() after restore loses accumulated AdamW state.
-                # Pre-existing issue (pre-spec-32). Fix requires snapshot_optimizer/restore_optimizer.
+                # Tracked: https://github.com/toddwbucy/NL_Hecate/issues/206
                 snapshot = None
                 try:
                     snapshot = full_snapshot(gpu_model)
@@ -1575,8 +1575,9 @@ def run_build(bcfg: BuildConfig):
                     print(f"    [vocab probe failed: {e}]")
 
                 # Learning samples + Probe 3 (context value)
-                ckpt_snapshot = full_snapshot(gpu_model)
+                ckpt_snapshot = None
                 try:
+                    ckpt_snapshot = full_snapshot(gpu_model)
                     from engine.generation import generate_learning
                     sample_budget = bcfg.probe_max_tokens
                     n_sampled = 0
@@ -1624,8 +1625,9 @@ def run_build(bcfg: BuildConfig):
                 except Exception as e:
                     print(f"  [checkpoint samples/probe3 failed: {e}]")
                 finally:
-                    full_restore(gpu_model, ckpt_snapshot)
-                    gpu_model.reset_optimizer()
+                    if ckpt_snapshot is not None:
+                        full_restore(gpu_model, ckpt_snapshot)
+                        gpu_model.reset_optimizer()
 
             if jsonl:
                 jsonl.log(event="checkpoint", step=step)
