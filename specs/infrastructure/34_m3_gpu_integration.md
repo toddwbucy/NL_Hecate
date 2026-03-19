@@ -41,40 +41,58 @@ structure but with three buffers per param instead of two (m, v → m1, m2, v).
 
 ### Phase 2: CUDA Kernels
 
-**Kernel 1: `m3_ema_update`** — Fused M1 + V + conditional M2 update.
-```
-For each element i:
-  m1[i] = beta1 * m1[i] + (1 - beta1) * grad[i]
-  v[i]  = beta2 * v[i]  + (1 - beta2) * grad[i]^2
-  if step % chunk_size == 0:
-    m2[i] = beta3 * m2[i] + (1 - beta3) * grad[i]
+**Kernel 1: `m3_ema_update`** — Fused M1 + V + conditional M2 update (HOPE Eq 75, 2512.24695).
+```rust
+/// Fused EMA update: M1 (fast), V (second moment), M2 (slow, every Ĉ steps).
+fn m3_ema_update(m1: &mut [f32], m2: &mut [f32], v: &mut [f32],
+                 grad: &[f32], beta1: f32, beta2: f32, beta3: f32,
+                 update_m2: bool) {
+    for i in 0..grad.len() {
+        m1[i] = beta1 * m1[i] + (1.0 - beta1) * grad[i];
+        v[i]  = beta2 * v[i]  + (1.0 - beta2) * grad[i] * grad[i];
+        if update_m2 {  // step % chunk_size == 0
+            m2[i] = beta3 * m2[i] + (1.0 - beta3) * grad[i];
+        }
+    }
+}
 ```
 One kernel launch per param group. Grid: ceil(n / 256). Simple elementwise, high bandwidth utilization.
 
-**Kernel 2: `m3_apply_1d`** — Adam-style param update for 1D params.
-```
-For each element i:
-  bc = 1.0 - beta2^step
-  update = (m1[i] + alpha * m2[i]) / (sqrt(v[i] / bc) + eps)
-  param[i] -= lr * update
-```
-
-**Kernel 3: `m3_apply_2d`** — Muon-style param update for 2D params.
-NS is called from Rust (cuBLAS matmul) rather than a custom kernel — the matmul
-is the hot path and cuBLAS is already optimized for it. The combination + param
-update is a simple elementwise kernel:
-```
-For each element i:
-  param[i] -= lr * (o1[i] + alpha * o2[i])
-```
-
-**Newton-Schulz (Rust + cuBLAS)**:
+**Kernel 2: `m3_apply_1d`** — Adam-style param update for 1D params (HOPE Eq 75 1D path).
 ```rust
-fn gpu_newton_schulz(m: &GpuBuf<f32>, rows: usize, cols: usize,
-                     iterations: usize, scratch: &mut NSScratch) -> GpuBuf<f32> {
-    // Transpose tall matrices: work on min(rows, cols) dimension
-    // T=5 polynomial: a=3.4445, b=-4.7750, c=2.0315
-    // Uses cublasSgemm for A = X @ X^T and X_new = a*X + b*(A@X) + c*(A@(A@X))
+/// 1D update: Adam-style V division with bias correction.
+fn m3_apply_1d(param: &mut [f32], m1: &[f32], m2: &[f32], v: &[f32],
+               lr: f32, alpha: f32, eps: f32, bc2: f32) {
+    for i in 0..param.len() {
+        let update = (m1[i] + alpha * m2[i]) / (f32::sqrt(v[i] / bc2) + eps);
+        param[i] -= lr * update;
+    }
+}
+```
+
+**Kernel 3: `m3_apply_2d`** — Muon-style NS-orthogonalized update for 2D params (HOPE Eq 75 2D path).
+NS is called from Rust (cuBLAS sgemm) rather than a custom kernel — the matmul
+is the hot path and cuBLAS is already optimized for it. The apply step uses
+`saxpy_cuda` for weight update:
+```rust
+/// 2D update: w += lr_scale * ||m|| * NS(m / ||m||)
+/// Called twice per 2D param: once for M1 (lr_scale = -lr),
+/// once for M2 (lr_scale = -lr * alpha).
+fn m3_ns_apply(w: &mut GpuBuf<f32>, m: &GpuBuf<f32>,
+               rows: usize, cols: usize, lr_scale: f32,
+               ns_iters: u32, scratch: &mut NSScratch) {
+    let frob = gpu_frob_norm(m);
+    let x = normalize(m, 1.0 / frob);  // X = m / ||m||
+    if rows > cols { x = transpose(x); }  // tall → fat for smaller ATA
+    for _ in 0..ns_iters {
+        // Newton-Schulz: X_new = a*X + b*(A@X) + c*(A@(A@X))
+        // where A = X @ X^T, (a, b, c) = (3.4445, -4.7750, 2.0315)
+        let ata = cublas_matmul_transb(x, x);  // X @ X^T → [r, r]
+        let ax = cublas_matmul(ata, x);         // A @ X → [r, c]
+        let aax = cublas_matmul(ata, ax);        // A @ (A @ X)
+        x = a * x + b * ax + c * aax;           // m3_ns_poly_cuda
+    }
+    saxpy(w, lr_scale * frob, x);  // w += scale * ||m|| * NS(m/||m||)
 }
 ```
 cuBLAS is already linked (used by existing matmul paths). NS scratch buffers

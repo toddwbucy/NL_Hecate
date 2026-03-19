@@ -1798,6 +1798,15 @@ def run_build(bcfg: BuildConfig):
             gpu_model = nl_hecate.GpuModel.from_params(
                 params, cfg, batch_size=bcfg.batch_size, memory_reset=periodic)
 
+            # Re-init M3 optimizer on rebuilt model (from_params creates fresh m3_state=None)
+            if use_m3:
+                gpu_model.init_m3(
+                    beta1=bcfg.m3_beta1, beta2=bcfg.m3_beta2, beta3=bcfg.m3_beta3,
+                    alpha=bcfg.m3_alpha, chunk_size=bcfg.m3_chunk_size,
+                    ns_iterations=bcfg.m3_ns_iterations,
+                    eps=bcfg.m3_eps,
+                )
+
             # Fresh conductor and context for new k
             conductor = nl_hecate.Conductor(new_k, new_chunks)
             context = nl_hecate.ContextState(new_k, bcfg.d_model)
