@@ -284,6 +284,13 @@ impl GpuAdamWState {
         };
         assert_eq!(c, s.len(), "SWA moment size mismatch: expected {} but snapshot has {}", c, s.len());
 
+        assert!(
+            host.level_moments.len() == host.level_steps.len()
+                && host.level_steps.len() == params.levels.len(),
+            "Level count mismatch: snapshot has {} moment vecs, {} step counters, but model has {} levels",
+            host.level_moments.len(), host.level_steps.len(), params.levels.len(),
+        );
+
         let levels: Vec<MomentLevel> = host.level_moments.iter()
             .zip(host.level_steps.iter())
             .zip(params.levels.iter())
