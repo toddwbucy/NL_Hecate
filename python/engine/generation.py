@@ -2,7 +2,6 @@
 
 import math
 import random
-import time
 
 import nl_hecate
 
@@ -279,7 +278,7 @@ def generate_stacked(
     safe_pad = _safe_pad_token(prompt_tokens, vocab)
 
     try:
-        for i in range(max_tokens):
+        for _ in range(max_tokens):
             # Take last seq_len tokens as context window
             ctx = seq[-seq_len:]
             while len(ctx) < seq_len:
