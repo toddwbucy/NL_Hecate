@@ -1402,7 +1402,9 @@ def run_build(bcfg: BuildConfig):
                             v_params, v_cfg = nl_hecate.load_checkpoint(ckpt_path)
                         else:
                             v_params, v_cfg, _ = nl_hecate.load_build_checkpoint(ckpt_path)
-                        v_model = nl_hecate.GpuModel.from_params(v_params, v_cfg, batch_size=bcfg.batch_size)
+                        v_model = nl_hecate.GpuModel.from_params(
+                            v_params, v_cfg, batch_size=bcfg.batch_size,
+                            memory_reset=(bcfg.memory_reset == "periodic"))
                         rt_input = list(input_ids[:bcfg.seq_len])
                         rt_target = list(target_ids[:bcfg.seq_len])
                         rt_ctx = gpu_model.to_host_context()
@@ -1572,25 +1574,31 @@ def run_build(bcfg: BuildConfig):
                 ckpt_snapshot = full_snapshot(gpu_model)
                 try:
                     from engine.generation import generate_learning
+                    sample_budget = bcfg.probe_max_tokens
+                    n_sampled = 0
                     for prompt_text in SAMPLE_PROMPTS:
+                        if sample_budget <= 0:
+                            break
                         full_restore(gpu_model, ckpt_snapshot)
                         gpu_model.reset_optimizer()
                         gpu_model.reset_context()
                         prompt_ids = tokenizer.encode(prompt_text)
                         tokens, losses, _ = generate_learning(
                             gpu_model, cfg, prompt_ids,
-                            max_tokens=128, temperature=0.7, lr=bcfg.lr)
+                            max_tokens=sample_budget, temperature=0.7, lr=bcfg.lr)
                         gen_text = tokenizer.decode(tokens[len(prompt_ids):])
                         preview = gen_text[:80].replace("\n", " ")
                         valid = [v for v in losses if not math.isnan(v)]
                         avg_loss = sum(valid) / len(valid) if valid else float('nan')
                         n_gen = len(tokens) - len(prompt_ids)
+                        sample_budget -= n_gen
+                        n_sampled += 1
                         print(f"  [sample] {prompt_text[:40]}... → {preview}...")
                         print(f"    avg_loss={avg_loss:.4f} over {n_gen} tokens"
                               f" ({len(valid)}/{len(losses)} valid)")
                     if jsonl:
                         jsonl.log(event="sample", step=step,
-                                  mode="learning", n_prompts=len(SAMPLE_PROMPTS))
+                                  mode="learning", n_prompts=n_sampled)
 
                     # Probe 3: accumulated context vs cold start
                     full_restore(gpu_model, ckpt_snapshot)
@@ -1599,7 +1607,7 @@ def run_build(bcfg: BuildConfig):
                     prompt_ids = tokenizer.encode(prompt_text)
                     cresult = probe_context_value(
                         gpu_model, cfg, prompt_ids, ckpt_snapshot,
-                        max_tokens=30, temperature=0.7, lr=bcfg.lr)
+                        max_tokens=bcfg.probe_max_tokens, temperature=0.7, lr=bcfg.lr)
                     print(f"  [probe3] cold={cresult['cold_avg_loss']:.4f} "
                           f"warm={cresult['warm_avg_loss']:.4f} "
                           f"benefit={cresult['context_benefit']:.4f}")

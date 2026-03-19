@@ -48,7 +48,7 @@ def _deprecated_checkpoint_fields(flat: dict) -> None:
             )
     for old_field in ("val_path", "val_doc_starts_path",
                       "window_local_val", "window_val_tokens"):
-        if old_field in flat and flat[old_field]:
+        if old_field in flat:
             warnings.warn(
                 f"{old_field} is deprecated (spec 32) and ignored. "
                 "Coherence samples use the build stream (CS-10).",

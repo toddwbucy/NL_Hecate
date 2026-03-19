@@ -7,8 +7,8 @@
 | **Purpose** | Consolidate three independent timing loops (save_every, tape_every, eval_every) into a single checkpoint event that fires atomically |
 | **Expects** | BuildConfig with save_every > 0; CMS chunk_sizes for alignment validation |
 | **Guarantees** | One checkpoint cadence controls save + tape + coherence sample; no sawtooth GPU dips between checkpoints |
-| **Cost** | No new operations. Checkpoint event bundles existing save + tape + coherence at one cadence. Per-checkpoint cost unchanged; total cost depends on save_every frequency vs prior independent timer frequencies |
-| **Trade-off** | Loses independent tape/eval frequency; gains deterministic, predictable checkpoint behavior |
+| **Cost** | Each checkpoint fires save + tape + heatmap + drift + roundtrip + probes atomically. Per-checkpoint latency is the sum of all components. Total cost depends on save_every vs prior independent timer frequencies |
+| **Trade-off** | Loses independent tape/eval frequency; per-checkpoint latency higher (all diagnostics bundled). Gains deterministic scheduling, no sawtooth dips, consolidated verification |
 | **Position** | Python tier only (config.py, loop.py, evaluation.py, hecate.py). No Rust changes |
 | **Source** | Empirical: GPU0 k=3 SmolLM 3.9% tok/s CV from independent timer dips |
 
@@ -43,6 +43,7 @@ At every `save_every` step, the checkpoint event fires. It performs, in order:
 - `eval_every` → mapped to `save_every` if `save_every` not set
 - `eval_max_chunks` → replaced by single-chunk coherence sample
 - `val_path`, `val_doc_starts_path` → no separate validation corpus
+- `window_local_val`, `window_val_tokens` → no window-carved validation (CS-10)
 - `tape_every` → fires at checkpoint cadence, no independent frequency
 
 **New field**:
