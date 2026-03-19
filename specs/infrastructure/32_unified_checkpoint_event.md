@@ -7,7 +7,7 @@
 | **Purpose** | Consolidate three independent timing loops (save_every, tape_every, eval_every) into a single checkpoint event that fires atomically |
 | **Expects** | BuildConfig with save_every > 0; CMS chunk_sizes for alignment validation |
 | **Guarantees** | One checkpoint cadence controls save + tape + coherence sample; no sawtooth GPU dips between checkpoints |
-| **Cost** | Zero runtime cost change — same operations, different scheduling |
+| **Cost** | No new operations. Checkpoint event bundles existing save + tape + coherence at one cadence. Per-checkpoint cost unchanged; total cost depends on save_every frequency vs prior independent timer frequencies |
 | **Trade-off** | Loses independent tape/eval frequency; gains deterministic, predictable checkpoint behavior |
 | **Position** | Python tier only (config.py, loop.py, evaluation.py, hecate.py). No Rust changes |
 | **Source** | Empirical: GPU0 k=3 SmolLM 3.9% tok/s CV from independent timer dips |
@@ -87,7 +87,7 @@ continuous stream. We just peek at its output quality periodically.
 ### Files to modify
 - `python/engine/config.py` — remove deprecated fields, add coher_sample, backward compat
 - `python/engine/loop.py` — merge eval/tape/save blocks into single checkpoint event
-- `python/hecate.py` — remove --eval_every, --eval_max_chunks CLI args
+- `python/hecate.py` — deprecate --eval_every (maps to --save_every), remove --eval_max_chunks
 - `python/configs/*.json` — update active configs to use save_every only
 
 ### Files NOT modified

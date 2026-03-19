@@ -24,14 +24,21 @@ _RETENTION_KINDS = {"l2_weight_decay", "kl_divergence", "elastic_net", "sphere_n
 
 def _deprecated_checkpoint_fields(flat: dict) -> None:
     """Spec 32: migrate eval_every/tape_every → save_every with deprecation warnings."""
-    if "eval_every" in flat and "save_every" not in flat:
-        flat["save_every"] = flat["eval_every"]
-        warnings.warn(
-            f"eval_every={flat['eval_every']} is deprecated (spec 32). "
-            f"Mapped to save_every={flat['save_every']}. "
-            "Use save_every directly in config.",
-            DeprecationWarning, stacklevel=3,
-        )
+    if "eval_every" in flat:
+        if "save_every" not in flat:
+            flat["save_every"] = flat["eval_every"]
+            warnings.warn(
+                f"eval_every={flat['eval_every']} is deprecated (spec 32). "
+                f"Mapped to save_every={flat['save_every']}. "
+                "Use save_every directly in config.",
+                DeprecationWarning, stacklevel=3,
+            )
+        else:
+            warnings.warn(
+                f"eval_every={flat['eval_every']} ignored — save_every={flat['save_every']} "
+                "takes precedence (spec 32).",
+                DeprecationWarning, stacklevel=3,
+            )
     for old_field in ("tape_every", "eval_max_chunks"):
         if old_field in flat and flat[old_field]:
             warnings.warn(
@@ -39,6 +46,15 @@ def _deprecated_checkpoint_fields(flat: dict) -> None:
                 "Tape diagnostics fire at checkpoint cadence (save_every).",
                 DeprecationWarning, stacklevel=3,
             )
+    for old_field in ("val_path", "val_doc_starts_path",
+                      "window_local_val", "window_val_tokens"):
+        if old_field in flat and flat[old_field]:
+            warnings.warn(
+                f"{old_field} is deprecated (spec 32) and ignored. "
+                "Coherence samples use the build stream (CS-10).",
+                DeprecationWarning, stacklevel=3,
+            )
+            del flat[old_field]
 
 
 class BuildConfig:
@@ -553,7 +569,7 @@ class BuildConfig:
             "warmup_steps": "warmup_steps", "weight_decay": "weight_decay",
             "beta1": "beta1", "beta2": "beta2", "max_grad_norm": "max_grad_norm",
             "load": "load", "log_file": "log_file",
-            "eval_every": "save_every",  # backward compat: --eval_every maps to save_every
+            # eval_every handled separately below (must not overwrite explicit --save_every)
             "checkpoint_interval": "checkpoint_interval",
             "batch_size": "batch_size",
             "projection_kind": "projection_kind",
@@ -572,6 +588,10 @@ class BuildConfig:
                 if cli_name == "chunk_sizes" and isinstance(val, str):
                     val = [int(x) for x in val.split(",") if x]
                 setattr(self, cfg_name, val)
+        # --eval_every backward compat: only apply if --save_every not explicitly set
+        cli_eval = getattr(args, "eval_every", None)
+        if cli_eval is not None and getattr(args, "save_every", None) is None:
+            self.save_every = cli_eval
         # --cpu overrides the default GPU mode
         if getattr(args, "cpu", False):
             self.gpu = False

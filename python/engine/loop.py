@@ -1483,8 +1483,20 @@ def run_build(bcfg: BuildConfig):
                 level_fire_counts = [0] * bcfg.k
 
             # ── 5. Coherence sample: probes + learning samples ─────────
+            if bcfg.coher_sample and not (gpu_model is not None and tokenizer is not None and not is_stacked):
+                skip_reasons = []
+                if gpu_model is None:
+                    skip_reasons.append("no GPU model")
+                if tokenizer is None:
+                    skip_reasons.append("no tokenizer (byte-level)")
+                if is_stacked:
+                    skip_reasons.append("stacked model")
+                print(f"    [coherence skipped: {', '.join(skip_reasons)}]")
             if bcfg.coher_sample and gpu_model is not None and tokenizer is not None and not is_stacked:
                 # Learning probes (CS-10: model learns during forward)
+                # TODO: full_snapshot/full_restore don't preserve optimizer moments.
+                # reset_optimizer() after restore loses accumulated AdamW state.
+                # Pre-existing issue (pre-spec-32). Fix requires snapshot_optimizer/restore_optimizer.
                 snapshot = None
                 try:
                     snapshot = full_snapshot(gpu_model)
