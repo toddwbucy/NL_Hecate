@@ -60,7 +60,7 @@ struct OptimizerState { inner: HostOptimizerState }
 
 #[pymethods]
 impl GpuModel {
-    fn snapshot_optimizer(&self) -> PyResult<Option<OptimizerState>> { ... }
+    fn snapshot_optimizer(&self) -> Option<OptimizerState> { ... }
     fn restore_optimizer(&mut self, state: &OptimizerState) -> PyResult<()> { ... }
 }
 ```

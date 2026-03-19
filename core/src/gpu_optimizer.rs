@@ -282,7 +282,7 @@ impl GpuAdamWState {
             m_ln_mem_beta: upload_buf(s, &mut c, params.swa.ln_mem_beta.len()),
             v_ln_mem_beta: upload_buf(s, &mut c, params.swa.ln_mem_beta.len()),
         };
-        debug_assert_eq!(c, s.len(), "SWA moment size mismatch");
+        assert_eq!(c, s.len(), "SWA moment size mismatch: expected {} but snapshot has {}", c, s.len());
 
         let levels: Vec<MomentLevel> = host.level_moments.iter()
             .zip(host.level_steps.iter())
@@ -317,7 +317,7 @@ impl GpuAdamWState {
                     level_step: ls,
                     has_mlp: lp.has_mlp,
                 };
-                debug_assert_eq!(c, lm.len(), "Level moment size mismatch");
+                assert_eq!(c, lm.len(), "Level moment size mismatch: expected {} but snapshot has {}", c, lm.len());
                 ml
             })
             .collect();
