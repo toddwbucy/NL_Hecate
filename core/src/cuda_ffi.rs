@@ -561,6 +561,50 @@ extern "C" {
     /// Scale gradient buffer in-place: g[i] *= scale.
     pub(crate) fn grad_scale_cuda(g: *mut f32, scale: f32, n: i32) -> u32;  // cudaError_t: 0 = cudaSuccess
 
+    // ── M3 optimizer kernels (spec 34) ────────────────────────────────
+
+    /// Fused M1 + V + conditional M2 EMA update.
+    /// update_m2: 1 if step % chunk_size == 0, else 0.
+    pub(crate) fn m3_ema_update_cuda(
+        m1: *mut f32, m2: *mut f32, v: *mut f32, g: *const f32,
+        n: i32,
+        beta1: f32, beta2: f32, beta3: f32,
+        update_m2: i32,
+    ) -> u32;
+
+    /// 1D param update: w -= lr * (m1 + alpha*m2) / (sqrt(v/bc2) + eps)
+    pub(crate) fn m3_apply_1d_cuda(
+        w: *mut f32, m1: *const f32, m2: *const f32, v: *const f32,
+        n: i32,
+        lr: f32, alpha: f32, eps: f32, bc2: f32,
+    ) -> u32;
+
+    /// 2D param update: w -= lr * (o1 + alpha*o2)  (o1, o2 already NS-orthogonalized)
+    /// Currently unused — M3 uses split saxpy for M1/M2, but this fused kernel
+    /// is available for future optimization (single launch instead of two saxpy).
+    #[allow(dead_code)]
+    pub(crate) fn m3_apply_2d_cuda(
+        w: *mut f32, o1: *const f32, o2: *const f32,
+        n: i32,
+        lr: f32, alpha: f32,
+    ) -> u32;
+
+    /// Frobenius norm squared with partial reduction (same as grad_norm_sq but generic).
+    pub(crate) fn frob_norm_sq_cuda(
+        x: *const f32, partial_sums: *mut f32,
+        n: i32, out_num_blocks: *mut i32,
+    ) -> u32;
+
+    /// Scale buffer in-place: x[i] *= scale.
+    pub(crate) fn scale_buf_cuda(x: *mut f32, scale: f32, n: i32) -> u32;
+
+    /// NS polynomial combination: x[i] = a*x[i] + b*y[i] + c*z[i].
+    /// Used in Newton-Schulz iteration for Muon orthogonalization.
+    pub(crate) fn m3_ns_poly_cuda(
+        x: *mut f32, y: *const f32, z: *const f32,
+        n: i32, a: f32, b: f32, c: f32,
+    ) -> u32;
+
     // ── Cross-entropy kernels ─────────────────────────────────────────
 
     /// Fused softmax + NLL forward. Produces scalar loss via atomicAdd.

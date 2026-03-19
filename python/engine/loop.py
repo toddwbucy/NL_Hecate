@@ -640,6 +640,8 @@ def run_build(bcfg: BuildConfig):
     # Auto-promote adamw → adamw_gpu when on GPU (no reason to round-trip to CPU)
     if use_gpu and bcfg.optimizer == "adamw":
         bcfg.optimizer = "adamw_gpu"
+    if bcfg.optimizer == "m3" and not use_gpu:
+        raise RuntimeError("optimizer='m3' requires GPU and a CUDA-enabled build")
     if is_stacked and bcfg.optimizer == "adamw_gpu":
         bcfg.optimizer = "adamw_gpu_stacked"
     if is_stacked and bcfg.optimizer != "adamw_gpu_stacked":
@@ -673,7 +675,9 @@ def run_build(bcfg: BuildConfig):
     print(f"  Build:    {bcfg.steps} steps (from step {resume_step}), lr={bcfg.lr}")
     print(f"  Optimizer: {bcfg.optimizer}" +
           (f" (b1={bcfg.beta1}, b2={bcfg.beta2}, wd={bcfg.weight_decay}, warmup={bcfg.warmup_steps})"
-           if bcfg.optimizer in ("adamw", "adamw_gpu", "adamw_gpu_stacked") else ""))
+           if bcfg.optimizer in ("adamw", "adamw_gpu", "adamw_gpu_stacked") else
+           f" (b1={bcfg.m3_beta1}, b2={bcfg.m3_beta2}, b3={bcfg.m3_beta3}, α={bcfg.m3_alpha}, Ĉ={bcfg.m3_chunk_size}, T={bcfg.m3_ns_iterations})"
+           if bcfg.optimizer == "m3" else ""))
     if bcfg.max_grad_norm > 0:
         print(f"  Grad clip: max_norm={bcfg.max_grad_norm}")
     print(f"  Device:   {'GPU' if use_gpu else 'CPU'}")
@@ -795,10 +799,18 @@ def run_build(bcfg: BuildConfig):
 
     adamw_opt = None
     use_adamw_gpu = (bcfg.optimizer in ("adamw_gpu", "adamw_gpu_stacked"))
+    use_m3 = (bcfg.optimizer == "m3")
     if bcfg.optimizer == "adamw":
         adamw_opt = nl_hecate.FrequencyAwareAdamW(
             params, beta1=bcfg.beta1, beta2=bcfg.beta2,
             weight_decay=bcfg.weight_decay,
+        )
+    if use_m3 and gpu_model is not None:
+        gpu_model.init_m3(
+            beta1=bcfg.m3_beta1, beta2=bcfg.m3_beta2, beta3=bcfg.m3_beta3,
+            alpha=bcfg.m3_alpha, chunk_size=bcfg.m3_chunk_size,
+            ns_iterations=bcfg.m3_ns_iterations,
+            eps=bcfg.m3_eps,
         )
 
     jsonl: Optional[JSONLLogger] = None
@@ -868,9 +880,9 @@ def run_build(bcfg: BuildConfig):
     for step in range(resume_step, end_step):
         if use_bpe:
             if bcfg.batch_size > 1:
-                if gpu_model is None or not use_adamw_gpu:
+                if gpu_model is None or not (use_adamw_gpu or use_m3):
                     raise RuntimeError(
-                        "batch_size > 1 currently requires GPU with optimizer=adamw_gpu"
+                        "batch_size > 1 currently requires GPU with optimizer=adamw_gpu or m3"
                     )
                 # Per-slot chunk collection: each loader_b yields its own sequential
                 # chunk from sub-corpus b, giving each slot a dense M stream.
@@ -1017,7 +1029,7 @@ def run_build(bcfg: BuildConfig):
                     tape_strategies=(bcfg.tape_strategies if bcfg.tape_strategies is not None else list(getattr(cfg, "tape_strategies", []))),
                 )
 
-        use_cosine = (adamw_opt is not None or use_adamw_gpu)
+        use_cosine = (adamw_opt is not None or use_adamw_gpu or use_m3)
         current_lr = cosine_lr(step, bcfg.warmup_steps, end_step, bcfg.lr) if use_cosine else bcfg.lr
 
         g_norm = 0.0
@@ -1035,7 +1047,12 @@ def run_build(bcfg: BuildConfig):
         ) if len(pulse.active_levels) > 2 else False
         need_gnorms = log_this or slow_level_fires
 
-        if gpu_model is not None and use_adamw_gpu:
+        if gpu_model is not None and use_m3:
+            loss, g_norm = gpu_model.step_m3(
+                input_ids, target_ids, pulse, current_lr,
+                max_grad_norm=bcfg.max_grad_norm,
+            )
+        elif gpu_model is not None and use_adamw_gpu:
             if is_stacked:
                 # Spec 28: freeze_embed schedule
                 # OR logic: freeze if explicitly set OR step has passed freeze_embed_after
@@ -1780,6 +1797,15 @@ def run_build(bcfg: BuildConfig):
             periodic = (bcfg.memory_reset == "periodic")
             gpu_model = nl_hecate.GpuModel.from_params(
                 params, cfg, batch_size=bcfg.batch_size, memory_reset=periodic)
+
+            # Re-init M3 optimizer on rebuilt model (from_params creates fresh m3_state=None)
+            if use_m3:
+                gpu_model.init_m3(
+                    beta1=bcfg.m3_beta1, beta2=bcfg.m3_beta2, beta3=bcfg.m3_beta3,
+                    alpha=bcfg.m3_alpha, chunk_size=bcfg.m3_chunk_size,
+                    ns_iterations=bcfg.m3_ns_iterations,
+                    eps=bcfg.m3_eps,
+                )
 
             # Fresh conductor and context for new k
             conductor = nl_hecate.Conductor(new_k, new_chunks)

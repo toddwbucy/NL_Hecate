@@ -67,6 +67,7 @@ fn main() {
             .file("kernels/layer_norm.cu")
             .file("kernels/moneta_forward.cu")
             .file("kernels/moneta_backward.cu")
+            .file("kernels/m3_optimizer.cu")
             .compile("nl_hecate_cuda_kernels");
 
         println!("cargo:rustc-link-search=native={}/lib64", cuda_path);
@@ -96,5 +97,6 @@ fn main() {
         println!("cargo:rerun-if-changed=kernels/moneta_forward.cu");
         println!("cargo:rerun-if-changed=kernels/moneta_backward.cu");
         println!("cargo:rerun-if-changed=kernels/error_clip.cuh");
+        println!("cargo:rerun-if-changed=kernels/m3_optimizer.cu");
     }
 }
