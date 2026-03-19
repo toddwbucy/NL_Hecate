@@ -131,6 +131,15 @@ class BuildConfig:
     beta2: float = 0.999
     max_grad_norm: float = 0.0  # 0 = disabled
 
+    # M3 optimizer (spec 34): multi-scale momentum with NS orthogonalization
+    # Only used when optimizer="m3". See specs/infrastructure/34_m3_gpu_integration.md
+    m3_beta1: float = 0.9      # fast momentum coefficient
+    m3_beta2: float = 0.999    # second moment coefficient
+    m3_beta3: float = 0.99     # slow momentum coefficient
+    m3_alpha: float = 0.5      # weight of slow momentum in combined update
+    m3_chunk_size: int = 8     # Ĉ — slow momentum (M2) update frequency
+    m3_ns_iterations: int = 5  # Newton-Schulz iterations T
+
     # Data
     data_path: str | None = None
     data_format: str = "byte"  # "byte", "sharegpt", or "dolmino"
@@ -263,9 +272,9 @@ class BuildConfig:
             raise ValueError("window_size must be positive")
         if self.k < 1:
             raise ValueError("k must be >= 1")
-        if self.optimizer not in ("sgd", "adamw", "adamw_gpu", "adamw_gpu_stacked"):
+        if self.optimizer not in ("sgd", "adamw", "adamw_gpu", "adamw_gpu_stacked", "m3"):
             raise ValueError(
-                f"optimizer must be 'sgd', 'adamw', 'adamw_gpu', or 'adamw_gpu_stacked', got '{self.optimizer}'")
+                f"optimizer must be 'sgd', 'adamw', 'adamw_gpu', 'adamw_gpu_stacked', or 'm3', got '{self.optimizer}'")
         if self.lr <= 0:
             raise ValueError("lr must be positive")
         if self.max_grad_norm < 0:

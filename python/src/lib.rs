@@ -1927,6 +1927,7 @@ struct GpuModel {
     context: nl_hecate_core::gpu_params::GpuContextState,
     cfg: nl_hecate_core::model::MAGConfig,
     adamw_state: Option<nl_hecate_core::gpu_optimizer::GpuAdamWState>,
+    m3_state: Option<nl_hecate_core::gpu_optimizer::GpuM3State>,
     kv_cache: Option<nl_hecate_core::gpu_forward::GpuKVCache>,
     decode_workspace: Option<nl_hecate_core::gpu_forward::DecodeWorkspace>,
     /// TNT periodic reset mode. When true, context.memory[k] is zeroed after
@@ -1960,6 +1961,7 @@ impl GpuModel {
             context: gpu_context,
             cfg: cfg.inner.clone(),
             adamw_state: None,
+            m3_state: None,
             kv_cache: None,
             decode_workspace: None,
             memory_reset,
@@ -1986,6 +1988,7 @@ impl GpuModel {
             context: gpu_context,
             cfg: cfg.inner.clone(),
             adamw_state: None,
+            m3_state: None,
             kv_cache: None,
             decode_workspace: None,
             memory_reset,
@@ -2295,6 +2298,88 @@ impl GpuModel {
             )
         );
         Ok(())
+    }
+
+    /// Initialize M3 optimizer state (spec 34). Call once before step_m3.
+    /// Creates GPU-resident M1/M2/V buffers + NS scratch space.
+    #[pyo3(signature = (beta1=0.9, beta2=0.999, beta3=0.99, alpha=0.5, chunk_size=8, ns_iterations=5, eps=1e-8))]
+    fn init_m3(&mut self, beta1: f32, beta2: f32, beta3: f32,
+               alpha: f32, chunk_size: u32, ns_iterations: u32, eps: f32) {
+        let config = nl_hecate_core::gpu_optimizer::GpuM3Config {
+            beta1, beta2, beta3, alpha, chunk_size, ns_iterations, eps,
+        };
+        let d = self.cfg.swa.d_model;
+        self.m3_state = Some(
+            nl_hecate_core::gpu_optimizer::GpuM3State::from_params(
+                &self.params, config, d,
+            )
+        );
+    }
+
+    /// Full GPU build step with M3 optimizer (spec 34). Returns (loss, grad_norm).
+    /// M3 state must be initialized via init_m3() first.
+    #[pyo3(signature = (input_ids, target_ids, pulse, lr, max_grad_norm=1.0))]
+    fn step_m3(&mut self, input_ids: Vec<usize>, target_ids: Vec<usize>,
+               pulse: &Pulse, lr: f32, max_grad_norm: f32) -> PyResult<(f32, f32)> {
+        let s = self.cfg.swa.seq_len;
+        let v = self.cfg.swa.vocab_size;
+        let d = self.cfg.swa.d_model;
+        if s == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err("seq_len must be > 0"));
+        }
+        if input_ids.is_empty() || input_ids.len() % s != 0 || target_ids.len() != input_ids.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("input/target length must be batch_size * seq_len {} (got {})", s, input_ids.len())));
+        }
+        if let Some(&max_id) = input_ids.iter().max() {
+            if max_id >= v {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("input_ids contains {} >= vocab_size {}", max_id, v)));
+            }
+        }
+
+        // Forward
+        let (loss, cache) = nl_hecate_core::gpu_forward::gpu_cms_forward(
+            &self.params, &self.cfg, &input_ids, &target_ids,
+            &pulse.inner, &mut self.context,
+        );
+
+        // Backward
+        let mut grads = nl_hecate_core::gpu_backward::gpu_cms_backward(
+            &self.params, &self.cfg, &cache, false,
+        );
+
+        // M3 update (Pulse-gated, with grad clipping)
+        let state = self.m3_state.as_mut().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "M3 state not initialized — call init_m3() before step_m3()")
+        })?;
+
+        let grad_norm = nl_hecate_core::gpu_optimizer::gpu_m3_update(
+            &mut self.params, &mut grads, state,
+            &pulse.inner, lr, max_grad_norm, d,
+        );
+
+        // Weight tying: sync w_unembed^T → w_embed
+        nl_hecate_core::gpu_backward::gpu_sync_embed_weights(
+            &mut self.params, d, v,
+        );
+
+        // TNT periodic reset
+        if self.memory_reset {
+            for (k, &active) in pulse.inner.active_levels.iter().enumerate() {
+                if active {
+                    self.context.periodic_reset_level(k);
+                }
+            }
+        }
+
+        Ok((loss, grad_norm))
+    }
+
+    /// Get the current M3 optimizer step count.
+    fn m3_step(&self) -> u32 {
+        self.m3_state.as_ref().map_or(0, |s| s.step)
     }
 
     /// Prefill: process full prompt, populate KV cache, return last-position logits.

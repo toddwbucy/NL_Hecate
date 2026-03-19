@@ -1,4 +1,11 @@
-/// GPU-resident AdamW optimizer state and update functions.
+/// GPU-resident optimizer state and update functions (AdamW + M3).
+///
+/// AdamW: single-frequency, diagonal scaling. Suitable for k=1 CMS.
+/// M3: multi-scale momentum with Newton-Schulz orthogonalization (Eq 75).
+///     Suitable for k>=2 CMS. See spec 34 (34_m3_gpu_integration.md).
+///
+/// Both are outer-loop optimizers only (CS-27). Inner-loop memory updates
+/// are handled by the memory rules themselves.
 ///
 /// Maintains first-moment (m) and second-moment (v) buffers on GPU,
 /// mirroring every parameter buffer in GpuMAGParams. The fused AdamW
@@ -665,4 +672,556 @@ fn gpu_scale_grads(grads: &mut GpuMAGGrads, scale: f32) {
     }
 
     crate::dispatch::cuda_sync();
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// M3 Optimizer — multi-scale momentum with Newton-Schulz (spec 34)
+// ══════════════════════════════════════════════════════════════════════
+
+/// M3 optimizer configuration.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Debug)]
+pub struct GpuM3Config {
+    pub beta1: f32,         // fast momentum (default 0.9)
+    pub beta2: f32,         // second moment (default 0.999)
+    pub beta3: f32,         // slow momentum (default 0.99)
+    pub alpha: f32,         // slow momentum weight in combined update (default 0.5)
+    pub chunk_size: u32,    // Ĉ — M2 update frequency (default 8)
+    pub ns_iterations: u32, // Newton-Schulz iterations T (default 5)
+    pub eps: f32,           // numerical stability (default 1e-8)
+}
+
+#[cfg(feature = "cuda")]
+impl Default for GpuM3Config {
+    fn default() -> Self {
+        GpuM3Config {
+            beta1: 0.9,
+            beta2: 0.999,
+            beta3: 0.99,
+            alpha: 0.5,
+            chunk_size: 8,
+            ns_iterations: 5,
+            eps: 1e-8,
+        }
+    }
+}
+
+/// M3 moment buffers for SWA weights.
+/// Three buffers per param: m1 (fast), m2 (slow), v (second moment).
+#[cfg(feature = "cuda")]
+struct M3MomentSWA {
+    // 2D params — will get NS orthogonalization
+    m1_embed: GpuBuf<f32>,   m2_embed: GpuBuf<f32>,   v_embed: GpuBuf<f32>,
+    m1_q: GpuBuf<f32>,       m2_q: GpuBuf<f32>,       v_q: GpuBuf<f32>,
+    m1_k: GpuBuf<f32>,       m2_k: GpuBuf<f32>,       v_k: GpuBuf<f32>,
+    m1_v: GpuBuf<f32>,       m2_v: GpuBuf<f32>,       v_v: GpuBuf<f32>,
+    m1_o: GpuBuf<f32>,       m2_o: GpuBuf<f32>,       v_o: GpuBuf<f32>,
+    m1_unembed: GpuBuf<f32>, m2_unembed: GpuBuf<f32>, v_unembed: GpuBuf<f32>,
+    // 1D params — Adam-style V division
+    m1_ln_attn_gamma: GpuBuf<f32>, m2_ln_attn_gamma: GpuBuf<f32>, v_ln_attn_gamma: GpuBuf<f32>,
+    m1_ln_attn_beta: GpuBuf<f32>,  m2_ln_attn_beta: GpuBuf<f32>,  v_ln_attn_beta: GpuBuf<f32>,
+    m1_ln_mem_gamma: GpuBuf<f32>,  m2_ln_mem_gamma: GpuBuf<f32>,  v_ln_mem_gamma: GpuBuf<f32>,
+    m1_ln_mem_beta: GpuBuf<f32>,   m2_ln_mem_beta: GpuBuf<f32>,   v_ln_mem_beta: GpuBuf<f32>,
+}
+
+/// M3 moment buffers for one memory level.
+#[cfg(feature = "cuda")]
+struct M3MomentLevel {
+    // 2D params
+    m1_w_k_mem: GpuBuf<f32>,  m2_w_k_mem: GpuBuf<f32>,  v_w_k_mem: GpuBuf<f32>,
+    m1_w_v_mem: GpuBuf<f32>,  m2_w_v_mem: GpuBuf<f32>,  v_w_v_mem: GpuBuf<f32>,
+    m1_w_q_mem: GpuBuf<f32>,  m2_w_q_mem: GpuBuf<f32>,  v_w_q_mem: GpuBuf<f32>,
+    // 1D params (gate biases)
+    m1_w_alpha: GpuBuf<f32>,  m2_w_alpha: GpuBuf<f32>,  v_w_alpha: GpuBuf<f32>,
+    m1_b_alpha: GpuBuf<f32>,  m2_b_alpha: GpuBuf<f32>,  v_b_alpha: GpuBuf<f32>,
+    m1_w_theta: GpuBuf<f32>,  m2_w_theta: GpuBuf<f32>,  v_w_theta: GpuBuf<f32>,
+    m1_b_theta: GpuBuf<f32>,  m2_b_theta: GpuBuf<f32>,  v_b_theta: GpuBuf<f32>,
+    m1_w_eta: GpuBuf<f32>,    m2_w_eta: GpuBuf<f32>,    v_w_eta: GpuBuf<f32>,
+    m1_b_eta: GpuBuf<f32>,    m2_b_eta: GpuBuf<f32>,    v_b_eta: GpuBuf<f32>,
+    // MLP weights (2D)
+    m1_gate_proj: GpuBuf<f32>,  m2_gate_proj: GpuBuf<f32>,  v_gate_proj: GpuBuf<f32>,
+    m1_up_proj: GpuBuf<f32>,    m2_up_proj: GpuBuf<f32>,    v_up_proj: GpuBuf<f32>,
+    m1_down_proj: GpuBuf<f32>,  m2_down_proj: GpuBuf<f32>,  v_down_proj: GpuBuf<f32>,
+    level_step: u32,
+    has_mlp: bool,
+}
+
+/// GPU-resident M3 optimizer state. Spec 34.
+#[cfg(feature = "cuda")]
+pub struct GpuM3State {
+    swa: M3MomentSWA,
+    levels: Vec<M3MomentLevel>,
+    pub step: u32,
+    pub config: GpuM3Config,
+    /// NS scratch buffers (allocated once in from_params, reused every step).
+    /// Layout: ns_ata is [d × d] for X @ X^T. The others are [max_2d]
+    /// to hold working copies during NS iteration.
+    ns_ata: GpuBuf<f32>,    // X @ X^T intermediate [d × d]
+    ns_work: GpuBuf<f32>,   // working copy of normalized X [max_2d]
+    ns_ax: GpuBuf<f32>,     // A @ X intermediate [max_2d]
+    ns_aax: GpuBuf<f32>,    // A @ (A @ X) intermediate [max_2d]
+    /// Scratch for Frobenius norm partial reduction
+    norm_scratch: GpuBuf<f32>,
+    norm_host: Vec<f32>,
+}
+
+#[cfg(feature = "cuda")]
+impl GpuM3State {
+    /// Create zero-initialized M3 state matching param shapes.
+    ///
+    /// `d` is the model dimension — needed to size the NS ATA scratch buffer
+    /// (the min dimension of all weight matrices is d, so ATA is d×d).
+    pub fn from_params(params: &GpuMAGParams, config: GpuM3Config, d: usize) -> Self {
+        let z3 = |len: usize| -> (GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>) {
+            (GpuBuf::zeros(len), GpuBuf::zeros(len), GpuBuf::zeros(len))
+        };
+
+        let (m1_embed, m2_embed, v_embed) = z3(params.swa.w_embed.len());
+        let (m1_q, m2_q, v_q) = z3(params.swa.w_q.len());
+        let (m1_k, m2_k, v_k) = z3(params.swa.w_k.len());
+        let (m1_v, m2_v, v_v) = z3(params.swa.w_v.len());
+        let (m1_o, m2_o, v_o) = z3(params.swa.w_o.len());
+        let (m1_unembed, m2_unembed, v_unembed) = z3(params.swa.w_unembed.len());
+        let (m1_ln_attn_gamma, m2_ln_attn_gamma, v_ln_attn_gamma) = z3(params.swa.ln_attn_gamma.len());
+        let (m1_ln_attn_beta, m2_ln_attn_beta, v_ln_attn_beta) = z3(params.swa.ln_attn_beta.len());
+        let (m1_ln_mem_gamma, m2_ln_mem_gamma, v_ln_mem_gamma) = z3(params.swa.ln_mem_gamma.len());
+        let (m1_ln_mem_beta, m2_ln_mem_beta, v_ln_mem_beta) = z3(params.swa.ln_mem_beta.len());
+
+        let swa = M3MomentSWA {
+            m1_embed, m2_embed, v_embed,
+            m1_q, m2_q, v_q,
+            m1_k, m2_k, v_k,
+            m1_v, m2_v, v_v,
+            m1_o, m2_o, v_o,
+            m1_unembed, m2_unembed, v_unembed,
+            m1_ln_attn_gamma, m2_ln_attn_gamma, v_ln_attn_gamma,
+            m1_ln_attn_beta, m2_ln_attn_beta, v_ln_attn_beta,
+            m1_ln_mem_gamma, m2_ln_mem_gamma, v_ln_mem_gamma,
+            m1_ln_mem_beta, m2_ln_mem_beta, v_ln_mem_beta,
+        };
+
+        let levels: Vec<M3MomentLevel> = params.levels.iter().map(|lp| {
+            let (m1_w_k_mem, m2_w_k_mem, v_w_k_mem) = z3(lp.w_k_mem.len());
+            let (m1_w_v_mem, m2_w_v_mem, v_w_v_mem) = z3(lp.w_v_mem.len());
+            let (m1_w_q_mem, m2_w_q_mem, v_w_q_mem) = z3(lp.w_q_mem.len());
+            let (m1_w_alpha, m2_w_alpha, v_w_alpha) = z3(lp.w_alpha.len());
+            let (m1_b_alpha, m2_b_alpha, v_b_alpha) = z3(lp.b_alpha.len());
+            let (m1_w_theta, m2_w_theta, v_w_theta) = z3(lp.w_theta.len());
+            let (m1_b_theta, m2_b_theta, v_b_theta) = z3(lp.b_theta.len());
+            let (m1_w_eta, m2_w_eta, v_w_eta) = z3(lp.w_eta.len());
+            let (m1_b_eta, m2_b_eta, v_b_eta) = z3(lp.b_eta.len());
+            let (m1_gate_proj, m2_gate_proj, v_gate_proj) = z3(lp.gate_proj.len().max(1));
+            let (m1_up_proj, m2_up_proj, v_up_proj) = z3(lp.up_proj.len().max(1));
+            let (m1_down_proj, m2_down_proj, v_down_proj) = z3(lp.down_proj.len().max(1));
+            M3MomentLevel {
+                m1_w_k_mem, m2_w_k_mem, v_w_k_mem,
+                m1_w_v_mem, m2_w_v_mem, v_w_v_mem,
+                m1_w_q_mem, m2_w_q_mem, v_w_q_mem,
+                m1_w_alpha, m2_w_alpha, v_w_alpha,
+                m1_b_alpha, m2_b_alpha, v_b_alpha,
+                m1_w_theta, m2_w_theta, v_w_theta,
+                m1_b_theta, m2_b_theta, v_b_theta,
+                m1_w_eta, m2_w_eta, v_w_eta,
+                m1_b_eta, m2_b_eta, v_b_eta,
+                m1_gate_proj, m2_gate_proj, v_gate_proj,
+                m1_up_proj, m2_up_proj, v_up_proj,
+                m1_down_proj, m2_down_proj, v_down_proj,
+                level_step: 0,
+                has_mlp: lp.has_mlp,
+            }
+        }).collect();
+
+        // NS scratch: sized for largest 2D param buffer
+        let mut max_2d = params.swa.w_embed.len();
+        for buf in [&params.swa.w_q, &params.swa.w_k, &params.swa.w_v,
+                     &params.swa.w_o, &params.swa.w_unembed] {
+            max_2d = max_2d.max(buf.len());
+        }
+        for lp in &params.levels {
+            for buf in [&lp.w_k_mem, &lp.w_v_mem, &lp.w_q_mem] {
+                max_2d = max_2d.max(buf.len());
+            }
+            if lp.has_mlp {
+                for buf in [&lp.gate_proj, &lp.up_proj, &lp.down_proj] {
+                    max_2d = max_2d.max(buf.len());
+                }
+            }
+        }
+
+        let max_partials = max_2d / 256 + 1;
+
+        GpuM3State {
+            swa,
+            levels,
+            step: 0,
+            config,
+            ns_ata: GpuBuf::zeros(d * d),
+            ns_work: GpuBuf::zeros(max_2d),
+            ns_ax: GpuBuf::zeros(max_2d),
+            ns_aax: GpuBuf::zeros(max_2d),
+            norm_scratch: GpuBuf::zeros(max_partials),
+            norm_host: vec![0.0f32; max_partials],
+        }
+    }
+}
+
+// ── M3 helper: EMA update for one param group ──────────────────────────
+
+/// Call the fused M3 EMA kernel for one param group.
+#[cfg(feature = "cuda")]
+#[inline]
+fn m3_ema_one(
+    m1: &mut GpuBuf<f32>, m2: &mut GpuBuf<f32>, v: &mut GpuBuf<f32>,
+    g: &GpuBuf<f32>,
+    beta1: f32, beta2: f32, beta3: f32,
+    update_m2: bool,
+) {
+    let n = g.len() as i32;
+    let err = unsafe {
+        crate::cuda_ffi::m3_ema_update_cuda(
+            m1.ptr(), m2.ptr(), v.ptr(), g.as_ptr(),
+            n, beta1, beta2, beta3,
+            if update_m2 { 1 } else { 0 },
+        )
+    };
+    assert_eq!(err, 0, "m3_ema_update_cuda failed: {}", err);
+}
+
+/// Apply 1D (Adam-style) param update.
+#[cfg(feature = "cuda")]
+#[inline]
+fn m3_apply_1d_one(
+    w: &mut GpuBuf<f32>,
+    m1: &GpuBuf<f32>, m2: &GpuBuf<f32>, v: &GpuBuf<f32>,
+    lr: f32, alpha: f32, eps: f32, bc2: f32,
+) {
+    let n = w.len() as i32;
+    let err = unsafe {
+        crate::cuda_ffi::m3_apply_1d_cuda(
+            w.ptr(), m1.as_ptr(), m2.as_ptr(), v.as_ptr(),
+            n, lr, alpha, eps, bc2,
+        )
+    };
+    assert_eq!(err, 0, "m3_apply_1d_cuda failed: {}", err);
+}
+
+/// Compute Frobenius norm of a GPU buffer using partial reduction.
+#[cfg(feature = "cuda")]
+fn gpu_frob_norm(buf: &GpuBuf<f32>, scratch: &mut GpuBuf<f32>, host: &mut [f32]) -> f32 {
+    let n = buf.len() as i32;
+    let mut num_blocks: i32 = 0;
+    let err = unsafe {
+        crate::cuda_ffi::frob_norm_sq_cuda(
+            buf.as_ptr(), scratch.ptr(), n, &mut num_blocks,
+        )
+    };
+    assert_eq!(err, 0, "frob_norm_sq_cuda failed: {}", err);
+    crate::dispatch::cuda_sync();
+    let nb = num_blocks as usize;
+    scratch.copy_to_host(&mut host[..nb]);
+    host[..nb].iter().sum::<f32>().sqrt()
+}
+
+/// Apply one NS-orthogonalized momentum to a 2D weight matrix.
+///
+/// Computes: w += lr_scale * ||m|| * NS(m / ||m||)
+///
+/// For M1: call with lr_scale = -lr
+/// For M2: call with lr_scale = -lr * alpha
+///
+/// Tall matrices (rows > cols) are transposed before NS so the iteration
+/// always works on the smaller (d × d) ATA matrix. Uses existing
+/// `transpose_copy_cuda` — the O(rows*cols) copy is negligible vs T matmuls.
+#[cfg(feature = "cuda")]
+fn m3_ns_apply(
+    w: &mut GpuBuf<f32>,
+    m: &GpuBuf<f32>,         // momentum buffer (M1 or M2)
+    rows: usize, cols: usize,
+    lr_scale: f32,            // -lr for M1, -lr*alpha for M2
+    ns_iters: u32,
+    ns_ata: &mut GpuBuf<f32>,
+    ns_work: &mut GpuBuf<f32>,
+    ns_ax: &mut GpuBuf<f32>,
+    ns_aax: &mut GpuBuf<f32>,
+    norm_scratch: &mut GpuBuf<f32>,
+    norm_host: &mut [f32],
+) {
+    let n = rows * cols;
+
+    // Frobenius norm for pre-normalization
+    let frob = gpu_frob_norm(m, norm_scratch, norm_host);
+    if frob < 1e-7 {
+        return; // near-zero momentum — skip
+    }
+
+    let tall = rows > cols;
+    let (r, c) = if tall { (cols, rows) } else { (rows, cols) };
+
+    // Copy m into ns_work and normalize. For tall matrices, transpose first
+    // so ns_work holds a fat [r, c] matrix (r <= c).
+    if tall {
+        unsafe {
+            crate::cuda_ffi::transpose_copy_cuda(
+                m.as_ptr(), ns_work.ptr(), rows as i32, cols as i32,
+            );
+        }
+    } else {
+        ns_work.copy_from_device(m);
+    }
+    let err = unsafe { crate::cuda_ffi::scale_buf_cuda(ns_work.ptr(), 1.0 / frob, n as i32) };
+    assert_eq!(err, 0);
+
+    // Newton-Schulz iterations: X_new = a*X + b*(A@X) + c*(A@(A@X))
+    // where A = X @ X^T. Muon polynomial coefficients (T=5 convergence).
+    let (a, b, c_coeff) = (3.4445f32, -4.7750f32, 2.0315f32);
+
+    for _ in 0..ns_iters {
+        // A = X @ X^T → ns_ata[r, r]
+        crate::dispatch::cublas_matmul_transb_dd(
+            ns_work, ns_work, ns_ata, r, c, r, 0.0,
+        );
+        // AX = A @ X → ns_ax[r, c]
+        crate::dispatch::cublas_matmul_dd(ns_ata, ns_work, ns_ax, r, r, c, 0.0);
+        // A²X = A @ AX → ns_aax[r, c]
+        crate::dispatch::cublas_matmul_dd(ns_ata, ns_ax, ns_aax, r, r, c, 0.0);
+        // Polynomial: X = a*X + b*AX + c*A²X
+        let err = unsafe {
+            crate::cuda_ffi::m3_ns_poly_cuda(
+                ns_work.ptr(), ns_ax.as_ptr(), ns_aax.as_ptr(),
+                (r * c) as i32, a, b, c_coeff,
+            )
+        };
+        assert_eq!(err, 0, "m3_ns_poly_cuda failed");
+    }
+
+    // Apply: w += lr_scale * ||m|| * NS(m/||m||)
+    let final_scale = lr_scale * frob;
+    if tall {
+        // Transpose ns_work[cols,rows] → ns_ax[rows,cols], then apply via saxpy
+        unsafe {
+            crate::cuda_ffi::transpose_copy_cuda(
+                ns_work.as_ptr(), ns_ax.ptr(), cols as i32, rows as i32,
+            );
+            crate::cuda_ffi::saxpy_cuda(final_scale, ns_ax.as_ptr(), w.ptr(), n as i32);
+        }
+    } else {
+        unsafe {
+            crate::cuda_ffi::saxpy_cuda(final_scale, ns_work.as_ptr(), w.ptr(), n as i32);
+        }
+    }
+}
+
+/// Full M3 optimizer step on GPU. Updates all params in-place.
+///
+/// Pulse-gated: SWA params always update; CMS level params only update
+/// when the Pulse fires for that level.
+///
+/// Returns the pre-clip gradient L2 norm (for logging). Returns 0.0 if clipping disabled.
+#[cfg(feature = "cuda")]
+pub fn gpu_m3_update(
+    params: &mut GpuMAGParams,
+    grads: &mut GpuMAGGrads,
+    state: &mut GpuM3State,
+    pulse: &Pulse,
+    lr: f32,
+    max_grad_norm: f32,
+    d: usize,  // model dimension (for NS reshape: weight matrices are d x d or vocab x d)
+) -> f32 {
+    state.step += 1;
+    let cfg = &state.config;
+    let update_m2 = state.step % cfg.chunk_size == 0;
+    let bc2 = 1.0 - cfg.beta2.powi(state.step as i32);
+
+    // ── Gradient clipping (reuse AdamW norm infrastructure) ───────────
+    let grad_norm = if max_grad_norm > 0.0 {
+        // Borrow norm scratch temporarily — this is the same pattern as AdamW
+        let norm = gpu_grad_norm_with_scratch(grads, &mut state.norm_scratch, &mut state.norm_host);
+        if norm > max_grad_norm {
+            let scale = max_grad_norm / norm;
+            gpu_scale_grads(grads, scale);
+        }
+        norm
+    } else {
+        0.0
+    };
+
+    // ── SWA weights (always active) ──────────────────────────────────
+    let s = &mut state.swa;
+
+    // EMA updates (all 2D SWA)
+    m3_ema_one(&mut s.m1_embed, &mut s.m2_embed, &mut s.v_embed, &grads.d_w_embed,
+               cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+    m3_ema_one(&mut s.m1_q, &mut s.m2_q, &mut s.v_q, &grads.d_w_q,
+               cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+    m3_ema_one(&mut s.m1_k, &mut s.m2_k, &mut s.v_k, &grads.d_w_k,
+               cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+    m3_ema_one(&mut s.m1_v, &mut s.m2_v, &mut s.v_v, &grads.d_w_v,
+               cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+    m3_ema_one(&mut s.m1_o, &mut s.m2_o, &mut s.v_o, &grads.d_w_o,
+               cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+    m3_ema_one(&mut s.m1_unembed, &mut s.m2_unembed, &mut s.v_unembed, &grads.d_w_unembed,
+               cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+
+    // 1D SWA params: EMA + Adam-style apply
+    m3_ema_one(&mut s.m1_ln_attn_gamma, &mut s.m2_ln_attn_gamma, &mut s.v_ln_attn_gamma, &grads.d_ln_attn_gamma,
+               cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+    m3_ema_one(&mut s.m1_ln_attn_beta, &mut s.m2_ln_attn_beta, &mut s.v_ln_attn_beta, &grads.d_ln_attn_beta,
+               cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+    m3_ema_one(&mut s.m1_ln_mem_gamma, &mut s.m2_ln_mem_gamma, &mut s.v_ln_mem_gamma, &grads.d_ln_mem_gamma,
+               cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+    m3_ema_one(&mut s.m1_ln_mem_beta, &mut s.m2_ln_mem_beta, &mut s.v_ln_mem_beta, &grads.d_ln_mem_beta,
+               cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+
+    // Apply 1D params (LN)
+    m3_apply_1d_one(&mut params.swa.ln_attn_gamma, &s.m1_ln_attn_gamma, &s.m2_ln_attn_gamma, &s.v_ln_attn_gamma,
+                    lr, cfg.alpha, cfg.eps, bc2);
+    m3_apply_1d_one(&mut params.swa.ln_attn_beta, &s.m1_ln_attn_beta, &s.m2_ln_attn_beta, &s.v_ln_attn_beta,
+                    lr, cfg.alpha, cfg.eps, bc2);
+    m3_apply_1d_one(&mut params.swa.ln_mem_gamma, &s.m1_ln_mem_gamma, &s.m2_ln_mem_gamma, &s.v_ln_mem_gamma,
+                    lr, cfg.alpha, cfg.eps, bc2);
+    m3_apply_1d_one(&mut params.swa.ln_mem_beta, &s.m1_ln_mem_beta, &s.m2_ln_mem_beta, &s.v_ln_mem_beta,
+                    lr, cfg.alpha, cfg.eps, bc2);
+
+    // Apply 2D SWA params via NS (M1 and M2 applied separately via saxpy)
+    // embed: vocab × d, q/k/v/o: d × d, unembed: d × vocab
+    let vocab = params.swa.w_embed.len() / d;
+    let ns_iters = cfg.ns_iterations;
+    let m2_scale = -lr * cfg.alpha;
+
+    // Helper macro for 2D NS apply (M1 then M2)
+    macro_rules! ns_2d {
+        ($w:expr, $m1:expr, $m2:expr, $rows:expr, $cols:expr) => {
+            m3_ns_apply(&mut $w, &$m1, $rows, $cols, -lr, ns_iters,
+                        &mut state.ns_ata, &mut state.ns_work,
+                        &mut state.ns_ax, &mut state.ns_aax,
+                        &mut state.norm_scratch, &mut state.norm_host);
+            m3_ns_apply(&mut $w, &$m2, $rows, $cols, m2_scale, ns_iters,
+                        &mut state.ns_ata, &mut state.ns_work,
+                        &mut state.ns_ax, &mut state.ns_aax,
+                        &mut state.norm_scratch, &mut state.norm_host);
+        };
+    }
+
+    ns_2d!(params.swa.w_embed, s.m1_embed, s.m2_embed, vocab, d);
+    ns_2d!(params.swa.w_q, s.m1_q, s.m2_q, d, d);
+    ns_2d!(params.swa.w_k, s.m1_k, s.m2_k, d, d);
+    ns_2d!(params.swa.w_v, s.m1_v, s.m2_v, d, d);
+    ns_2d!(params.swa.w_o, s.m1_o, s.m2_o, d, d);
+    ns_2d!(params.swa.w_unembed, s.m1_unembed, s.m2_unembed, d, vocab);
+
+    // ── Per-level memory weights (Pulse-gated) ───────────────────────
+    for (i, lg) in grads.levels.iter().enumerate() {
+        if i >= pulse.active_levels.len() || !pulse.active_levels[i] {
+            continue;
+        }
+
+        let lp = &mut params.levels[i];
+        let ml = &mut state.levels[i];
+        ml.level_step += 1;
+        let level_bc2 = 1.0 - cfg.beta2.powi(ml.level_step as i32);
+
+        // 2D level params: EMA
+        m3_ema_one(&mut ml.m1_w_k_mem, &mut ml.m2_w_k_mem, &mut ml.v_w_k_mem, &lg.d_w_k_mem,
+                   cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+        m3_ema_one(&mut ml.m1_w_v_mem, &mut ml.m2_w_v_mem, &mut ml.v_w_v_mem, &lg.d_w_v_mem,
+                   cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+        m3_ema_one(&mut ml.m1_w_q_mem, &mut ml.m2_w_q_mem, &mut ml.v_w_q_mem, &lg.d_w_q_mem,
+                   cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+
+        // 1D level params: EMA
+        m3_ema_one(&mut ml.m1_w_alpha, &mut ml.m2_w_alpha, &mut ml.v_w_alpha, &lg.d_w_alpha,
+                   cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+        m3_ema_one(&mut ml.m1_b_alpha, &mut ml.m2_b_alpha, &mut ml.v_b_alpha, &lg.d_b_alpha,
+                   cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+        m3_ema_one(&mut ml.m1_w_theta, &mut ml.m2_w_theta, &mut ml.v_w_theta, &lg.d_w_theta,
+                   cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+        m3_ema_one(&mut ml.m1_b_theta, &mut ml.m2_b_theta, &mut ml.v_b_theta, &lg.d_b_theta,
+                   cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+        m3_ema_one(&mut ml.m1_w_eta, &mut ml.m2_w_eta, &mut ml.v_w_eta, &lg.d_w_eta,
+                   cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+        m3_ema_one(&mut ml.m1_b_eta, &mut ml.m2_b_eta, &mut ml.v_b_eta, &lg.d_b_eta,
+                   cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+
+        // Apply 1D level params
+        m3_apply_1d_one(&mut lp.w_alpha, &ml.m1_w_alpha, &ml.m2_w_alpha, &ml.v_w_alpha,
+                        lr, cfg.alpha, cfg.eps, level_bc2);
+        m3_apply_1d_one(&mut lp.b_alpha, &ml.m1_b_alpha, &ml.m2_b_alpha, &ml.v_b_alpha,
+                        lr, cfg.alpha, cfg.eps, level_bc2);
+        m3_apply_1d_one(&mut lp.w_theta, &ml.m1_w_theta, &ml.m2_w_theta, &ml.v_w_theta,
+                        lr, cfg.alpha, cfg.eps, level_bc2);
+        m3_apply_1d_one(&mut lp.b_theta, &ml.m1_b_theta, &ml.m2_b_theta, &ml.v_b_theta,
+                        lr, cfg.alpha, cfg.eps, level_bc2);
+        // CS-39: clamp b_theta
+        unsafe {
+            crate::cuda_ffi::clamp_f32_cuda(lp.b_theta.ptr(), lp.b_theta.len() as i32, -10.0, 2.0);
+        }
+        m3_apply_1d_one(&mut lp.w_eta, &ml.m1_w_eta, &ml.m2_w_eta, &ml.v_w_eta,
+                        lr, cfg.alpha, cfg.eps, level_bc2);
+        m3_apply_1d_one(&mut lp.b_eta, &ml.m1_b_eta, &ml.m2_b_eta, &ml.v_b_eta,
+                        lr, cfg.alpha, cfg.eps, level_bc2);
+
+        // Apply 2D level params via NS
+        ns_2d!(lp.w_k_mem, ml.m1_w_k_mem, ml.m2_w_k_mem, d, d);
+        ns_2d!(lp.w_v_mem, ml.m1_w_v_mem, ml.m2_w_v_mem, d, d);
+        ns_2d!(lp.w_q_mem, ml.m1_w_q_mem, ml.m2_w_q_mem, d, d);
+
+        // MLP weights (2D)
+        if ml.has_mlp {
+            m3_ema_one(&mut ml.m1_gate_proj, &mut ml.m2_gate_proj, &mut ml.v_gate_proj, &lg.d_gate_proj,
+                       cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+            m3_ema_one(&mut ml.m1_up_proj, &mut ml.m2_up_proj, &mut ml.v_up_proj, &lg.d_up_proj,
+                       cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+            m3_ema_one(&mut ml.m1_down_proj, &mut ml.m2_down_proj, &mut ml.v_down_proj, &lg.d_down_proj,
+                       cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+
+            // MLP matrices are (d, d_ff) or similar — treat as 2D
+            let ff_dim = lp.gate_proj.len() / d;
+            ns_2d!(lp.gate_proj, ml.m1_gate_proj, ml.m2_gate_proj, d, ff_dim);
+            ns_2d!(lp.up_proj, ml.m1_up_proj, ml.m2_up_proj, d, ff_dim);
+            ns_2d!(lp.down_proj, ml.m1_down_proj, ml.m2_down_proj, ff_dim, d);
+        }
+    }
+
+    crate::dispatch::cuda_sync();
+    grad_norm
+}
+
+/// Compute gradient norm using provided scratch buffers (for M3).
+#[cfg(feature = "cuda")]
+fn gpu_grad_norm_with_scratch(
+    grads: &GpuMAGGrads,
+    scratch: &mut GpuBuf<f32>,
+    host: &mut Vec<f32>,
+) -> f32 {
+    let mut total = 0.0f32;
+    let mut add_norm = |g: &GpuBuf<f32>| {
+        total += gpu_frob_norm(g, scratch, host).powi(2);
+    };
+    add_norm(&grads.d_w_embed);
+    add_norm(&grads.d_w_q);
+    add_norm(&grads.d_w_k);
+    add_norm(&grads.d_w_v);
+    add_norm(&grads.d_w_o);
+    add_norm(&grads.d_w_unembed);
+    add_norm(&grads.d_ln_attn_gamma);
+    add_norm(&grads.d_ln_attn_beta);
+    add_norm(&grads.d_ln_mem_gamma);
+    add_norm(&grads.d_ln_mem_beta);
+    for lg in &grads.levels {
+        add_norm(&lg.d_w_k_mem);
+        add_norm(&lg.d_w_v_mem);
+        add_norm(&lg.d_w_q_mem);
+        add_norm(&lg.d_w_alpha);
+        add_norm(&lg.d_b_alpha);
+        add_norm(&lg.d_w_theta);
+        add_norm(&lg.d_b_theta);
+        add_norm(&lg.d_w_eta);
+        add_norm(&lg.d_b_eta);
+        if lg.has_mlp {
+            add_norm(&lg.d_gate_proj);
+            add_norm(&lg.d_up_proj);
+            add_norm(&lg.d_down_proj);
+        }
+    }
+    total.sqrt()
 }
