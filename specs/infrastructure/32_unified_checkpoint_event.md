@@ -16,7 +16,7 @@
 
 Three independent timers create unpredictable GPU utilization dips:
 
-```
+```text
 step 1000: eval fires    → context save/restore + val forward
 step 1024: tape fires    → CPU/GPU tape replay
 step 5000: save fires    → host param download + safetensors write

@@ -1485,7 +1485,11 @@ def run_build(bcfg: BuildConfig):
                 level_fire_counts = [0] * bcfg.k
 
             # ── 5. Coherence sample: probes + learning samples ─────────
-            if bcfg.coher_sample and not (gpu_model is not None and tokenizer is not None and not is_stacked):
+            can_coherence = (bcfg.coher_sample
+                             and gpu_model is not None
+                             and tokenizer is not None
+                             and not is_stacked)
+            if bcfg.coher_sample and not can_coherence:
                 skip_reasons = []
                 if gpu_model is None:
                     skip_reasons.append("no GPU model")
@@ -1494,7 +1498,7 @@ def run_build(bcfg: BuildConfig):
                 if is_stacked:
                     skip_reasons.append("stacked model")
                 print(f"    [coherence skipped: {', '.join(skip_reasons)}]")
-            if bcfg.coher_sample and gpu_model is not None and tokenizer is not None and not is_stacked:
+            if can_coherence:
                 # Learning probes (CS-10: model learns during forward)
                 # TODO: full_snapshot/full_restore don't preserve optimizer moments.
                 # reset_optimizer() after restore loses accumulated AdamW state.

@@ -143,7 +143,7 @@ class BuildConfig:
 
     # Probe tuning (probes fire at each checkpoint event; these control their cost)
     probe_max_tokens: int = 20   # tokens generated per probe (was hardcoded 60)
-    probe_prompts: int = 1       # how many EVAL_PROMPTS to run for probe1 (1–4)
+    probe_prompts: int = 1       # how many EVAL_PROMPTS to run for probe1 (1-4)
 
     # Deprecated fields (backward compat — mapped to save_every, logged as warnings)
     eval_every: int = 0          # DEPRECATED: use save_every
@@ -591,6 +591,11 @@ class BuildConfig:
         # --eval_every backward compat: only apply if --save_every not explicitly set
         cli_eval = getattr(args, "eval_every", None)
         if cli_eval is not None and getattr(args, "save_every", None) is None:
+            warnings.warn(
+                f"--eval_every={cli_eval} is deprecated (spec 32). "
+                f"Mapped to save_every={cli_eval}. Use --save_every directly.",
+                DeprecationWarning, stacklevel=2,
+            )
             self.save_every = cli_eval
         # --cpu overrides the default GPU mode
         if getattr(args, "cpu", False):
