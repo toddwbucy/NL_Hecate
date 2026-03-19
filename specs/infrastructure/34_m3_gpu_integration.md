@@ -86,13 +86,17 @@ are allocated once in GpuM3State and reused.
 ```python
 # In BuildConfig:
 optimizer: str = "adamw_gpu_stacked"  # existing default
-m3_beta1: float = 0.9
-m3_beta2: float = 0.999
-m3_beta3: float = 0.99
-m3_alpha: float = 0.5
-m3_chunk_size: int = 8
-m3_ns_iterations: int = 5
+m3_beta1: float = 0.9      # fast momentum coefficient
+m3_beta2: float = 0.999    # second moment coefficient (V, for 1D params)
+m3_beta3: float = 0.99     # slow momentum coefficient
+m3_alpha: float = 0.5      # weight of slow momentum in combined update
+m3_chunk_size: int = 8     # Ĉ — slow momentum (M2) update frequency
+m3_ns_iterations: int = 5  # Newton-Schulz iterations T
+m3_eps: float = 1e-8       # epsilon for 1D Adam-style V division
 ```
+
+Validation: `m3_beta{1,2,3} ∈ (0, 1)`, `m3_alpha ≥ 0`, `m3_chunk_size ≥ 1`,
+`m3_ns_iterations ≥ 1`.
 
 When `optimizer: "m3"` is set, loop.py creates `GpuM3State` instead of
 `GpuAdamWState`. The optimizer field accepts: `"adamw"`, `"adamw_gpu"`,
@@ -100,26 +104,25 @@ When `optimizer: "m3"` is set, loop.py creates `GpuM3State` instead of
 
 **Loop dispatch** (`loop.py`):
 ```python
-if bcfg.optimizer == "m3":
-    gpu_model.step_m3(lr=bcfg.lr)  # calls gpu_m3_update in Rust
-else:
-    gpu_model.step_adamw(lr=bcfg.lr)  # existing path
+if gpu_model is not None and use_m3:
+    loss, g_norm = gpu_model.step_m3(
+        input_ids, target_ids, pulse, current_lr,
+        max_grad_norm=bcfg.max_grad_norm,
+    )
 ```
 
 **PyO3 bindings** (`lib.rs`):
-- `GpuModel.init_m3(config)` — creates GpuM3State from GpuM3Config
-- `GpuModel.step_m3(lr)` — one M3 optimizer step (EMA + NS + apply)
-- M3 state participates in spec 33 snapshot/restore
+- `GpuModel.init_m3(beta1, beta2, beta3, alpha, chunk_size, ns_iterations, eps) -> PyResult<()>`
+  — creates GpuM3State; rejects `chunk_size == 0`
+- `GpuModel.step_m3(input_ids, target_ids, pulse, lr, max_grad_norm) -> (loss, grad_norm)`
+  — full forward/backward/update cycle
 
 ### Phase 4: Checkpoint
 
-M3 state snapshot/restore follows the spec 33 `HostOptimizerState` pattern:
-- `GpuM3State::to_host()` → flat Vec<f32> concatenation of all M1, M2, V buffers
-- `GpuM3State::from_host()` → upload and reconstruct
-
-The Python `full_snapshot`/`full_restore` path handles M3 transparently — the
-`snapshot_optimizer`/`restore_optimizer` methods dispatch based on which optimizer
-is active.
+**NOTE**: `snapshot_optimizer()` / `restore_optimizer()` do NOT include M3 state.
+M3 moments and step counters are re-initialized from scratch on restore. M3
+EMA re-warms quickly, so this is acceptable for checkpoint recovery. Full M3
+serialization (to_host/from_host) is tracked for a follow-up PR.
 
 ## Scope
 

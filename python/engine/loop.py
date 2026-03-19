@@ -880,9 +880,9 @@ def run_build(bcfg: BuildConfig):
     for step in range(resume_step, end_step):
         if use_bpe:
             if bcfg.batch_size > 1:
-                if gpu_model is None or not use_adamw_gpu:
+                if gpu_model is None or not (use_adamw_gpu or use_m3):
                     raise RuntimeError(
-                        "batch_size > 1 currently requires GPU with optimizer=adamw_gpu"
+                        "batch_size > 1 currently requires GPU with optimizer=adamw_gpu or m3"
                     )
                 # Per-slot chunk collection: each loader_b yields its own sequential
                 # chunk from sub-corpus b, giving each slot a dense M stream.

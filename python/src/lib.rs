@@ -2289,6 +2289,10 @@ impl GpuModel {
     /// quickly (EMA), so this is acceptable for checkpoint recovery. Full M3
     /// serialization is tracked for a follow-up PR.
     fn snapshot_optimizer(&self) -> Option<OptimizerState> {
+        if self.m3_state.is_some() {
+            eprintln!("WARNING: snapshot_optimizer() does not include M3 state — \
+                       M3 moments/step will be re-initialized on restore");
+        }
         self.adamw_state.as_ref().map(|state| {
             OptimizerState { inner: state.to_host() }
         })
@@ -2366,6 +2370,9 @@ impl GpuModel {
                 "M3 state not initialized — call init_m3() before step_m3()")
         })?;
 
+        // TODO: gpu_m3_update returns scalar grad_norm only; per-level gnorms
+        // (for level_grad_norms() / saturation monitoring) require returning
+        // Vec<f32> from the Rust side — tracked for follow-up PR.
         let grad_norm = nl_hecate_core::gpu_optimizer::gpu_m3_update(
             &mut self.params, &mut grads, state,
             &pulse.inner, lr, max_grad_norm, d,
