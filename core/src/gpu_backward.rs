@@ -1182,7 +1182,7 @@ pub(crate) fn gpu_memory_backward(
                     }
                 }
                 // MONETA: l_p bias + L2 retention (LQ backward deferred — q must be 2)
-                _ => {
+                (None, None) => {
                     assert!(
                         (cfg.lq_q - 2.0).abs() < 1e-6,
                         "MONETA GPU backward only supports lq_q=2.0 (L2 retention). \
@@ -1202,6 +1202,13 @@ pub(crate) fn gpu_memory_backward(
                             cfg.lp_p, cfg.sign_sharpness, cfg.lambda_2, cfg.lq_q,
                         );
                     }
+                }
+                // Mismatched boundary snapshots — invariant violation
+                (Some(_), None) | (None, Some(_)) => {
+                    panic!(
+                        "MLP backward: mismatched boundary snapshots — \
+                         W1 and W2 boundaries must both be present (YAAD) or both absent (MONETA)"
+                    );
                 }
             }
 

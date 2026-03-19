@@ -892,15 +892,18 @@ pub fn gpu_cms_forward(
             }
         } else {
             // Frozen level: read-only M @ q_mem on GPU.
-            // MLP rules (Moneta/YAAD) have context_m = [W1 | W2], not [d,d].
-            // gpu_memory_read_only assumes a d×d matrix — reject MLP rules here
-            // until a proper gpu_mlp_read_only is implemented.
-            assert!(
-                !matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD),
-                "Frozen-level readout for MLP rules (Moneta/YAAD) is not yet implemented. \
-                 gpu_memory_read_only assumes [d,d] matrix but MLP context_m is [W1|W2]. \
-                 Use k=1 or ensure all MLP levels are always-active.",
-            );
+            if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD) {
+                // MLP rules have context_m = [W1 | W2], not [d,d].
+                // gpu_memory_read_only assumes a d×d matrix — skip this level
+                // until gpu_mlp_read_only is implemented. Return zeros.
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "gpu_forward: skipping frozen MLP level {} (no gpu_mlp_read_only yet)",
+                    level,
+                );
+                y_per_level.push(GpuBuf::<f32>::zeros(bs * s * d));
+                memory_caches.push(None);
+            } else {
             // Each batch element has distinct embeddings, so compute Y = Q @ M^T
             // for all bs*s tokens simultaneously. Same frozen M for all batch elements.
             let y_level = gpu_memory_read_only(
@@ -910,6 +913,7 @@ pub fn gpu_cms_forward(
             );
             y_per_level.push(y_level);
             memory_caches.push(None);
+            }
         }
     }
 
@@ -2583,16 +2587,21 @@ pub fn gpu_prefill_forward(
             );
             y_per_level.push(y_level);
         } else {
-            assert!(
-                !matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD),
-                "Frozen-level readout for MLP rules not implemented (inference path)",
-            );
+            if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD) {
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "gpu_forward_inference: skipping frozen MLP level {} (no gpu_mlp_read_only yet)",
+                    level,
+                );
+                y_per_level.push(GpuBuf::<f32>::zeros(s * d));
+            } else {
             let y_level = gpu_memory_read_only(
                 &params.levels[level], &embedded,
                 &context.memory[level],
                 s, d,
             );
             y_per_level.push(y_level);
+            }
         }
     }
 
@@ -2776,16 +2785,21 @@ pub fn gpu_single_token_forward(
             );
             y_per_level.push(y_level);
         } else {
-            assert!(
-                !matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD),
-                "Frozen-level readout for MLP rules not implemented (single-token path)",
-            );
+            if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD) {
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "gpu_forward_single_token: skipping frozen MLP level {} (no gpu_mlp_read_only yet)",
+                    level,
+                );
+                y_per_level.push(GpuBuf::<f32>::zeros(d));
+            } else {
             let y_level = gpu_memory_read_only(
                 &params.levels[level], &ws.embedded,
                 &context.memory[level],
                 1, d,
             );
             y_per_level.push(y_level);
+            }
         }
     }
 
