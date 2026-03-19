@@ -11,6 +11,8 @@
 /// Feature-gated: only available with `--features cuda`.
 
 #[cfg(feature = "cuda")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "cuda")]
 use crate::gpu_buf::GpuBuf;
 #[cfg(feature = "cuda")]
 use crate::gpu_params::{GpuMAGParams, GpuContextState};
@@ -18,6 +20,10 @@ use crate::gpu_params::{GpuMAGParams, GpuContextState};
 use crate::model::{MAGConfig, MemoryRuleKind, LevelTapeStrategy};
 #[cfg(feature = "cuda")]
 use crate::conductor::Pulse;
+
+/// One-shot warning: frozen MLP level skipped (no gpu_mlp_read_only yet).
+#[cfg(feature = "cuda")]
+static WARNED_FROZEN_MLP: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "cuda")]
 use crate::parallel::ParallelStrategy;
 
@@ -896,11 +902,13 @@ pub fn gpu_cms_forward(
                 // MLP rules have context_m = [W1 | W2], not [d,d].
                 // gpu_memory_read_only assumes a d×d matrix — skip this level
                 // until gpu_mlp_read_only is implemented. Return zeros.
-                #[cfg(debug_assertions)]
-                eprintln!(
-                    "gpu_forward: skipping frozen MLP level {} (no gpu_mlp_read_only yet)",
-                    level,
-                );
+                if !WARNED_FROZEN_MLP.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "WARNING: gpu_forward: frozen MLP level {} ({:?}) returning zeros — \
+                         gpu_mlp_read_only not yet implemented. This message prints once.",
+                        level, cfg.memory_rule,
+                    );
+                }
                 y_per_level.push(GpuBuf::<f32>::zeros(bs * s * d));
                 memory_caches.push(None);
             } else {
@@ -1393,7 +1401,14 @@ pub(crate) fn gpu_memory_forward(
                 w1_boundary: Some(w1_boundary), w2_boundary: Some(w2_boundary),
             })
         }
-        _ => panic!("GPU-resident forward only supports DeltaRule, TitansLMM, HebbianRule, DGD, SwiGluMlp, Moneta, YAAD. Got {:?}", cfg.memory_rule),
+        (Some(_), MemoryRuleKind::Moneta) | (Some(_), MemoryRuleKind::YAAD) => {
+            panic!(
+                "Checkpointed (gradient-checkpoint) MLP forward is not supported for {:?}. \
+                 Use checkpoint_interval=None (full trajectory) for Moneta/YAAD levels.",
+                cfg.memory_rule,
+            );
+        }
+        _ => panic!("GPU-resident forward: unsupported (checkpoint, rule) combination. Got {:?}", cfg.memory_rule),
     }
 }
 
@@ -2588,11 +2603,13 @@ pub fn gpu_prefill_forward(
             y_per_level.push(y_level);
         } else {
             if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD) {
-                #[cfg(debug_assertions)]
-                eprintln!(
-                    "gpu_forward_inference: skipping frozen MLP level {} (no gpu_mlp_read_only yet)",
-                    level,
-                );
+                if !WARNED_FROZEN_MLP.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "WARNING: gpu_forward_inference: frozen MLP level {} ({:?}) returning zeros — \
+                         gpu_mlp_read_only not yet implemented. This message prints once.",
+                        level, cfg.memory_rule,
+                    );
+                }
                 y_per_level.push(GpuBuf::<f32>::zeros(s * d));
             } else {
             let y_level = gpu_memory_read_only(
@@ -2786,11 +2803,13 @@ pub fn gpu_single_token_forward(
             y_per_level.push(y_level);
         } else {
             if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD) {
-                #[cfg(debug_assertions)]
-                eprintln!(
-                    "gpu_forward_single_token: skipping frozen MLP level {} (no gpu_mlp_read_only yet)",
-                    level,
-                );
+                if !WARNED_FROZEN_MLP.swap(true, Ordering::Relaxed) {
+                    eprintln!(
+                        "WARNING: gpu_forward_single_token: frozen MLP level {} ({:?}) returning zeros — \
+                         gpu_mlp_read_only not yet implemented. This message prints once.",
+                        level, cfg.memory_rule,
+                    );
+                }
                 y_per_level.push(GpuBuf::<f32>::zeros(d));
             } else {
             let y_level = gpu_memory_read_only(
