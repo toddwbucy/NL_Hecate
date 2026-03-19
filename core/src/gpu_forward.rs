@@ -24,6 +24,21 @@ use crate::conductor::Pulse;
 /// One-shot warning: frozen MLP level skipped (no gpu_mlp_read_only yet).
 #[cfg(feature = "cuda")]
 static WARNED_FROZEN_MLP: AtomicBool = AtomicBool::new(false);
+
+/// Returns a zeroed GPU buffer for a frozen MLP level, with a one-time warning.
+/// MLP rules (Moneta/YAAD) have context_m = [W1|W2], incompatible with
+/// gpu_memory_read_only's [d,d] matrix assumption.
+#[cfg(feature = "cuda")]
+fn frozen_mlp_fallback(path: &str, level: usize, rule: MemoryRuleKind, n_elements: usize) -> GpuBuf<f32> {
+    if !WARNED_FROZEN_MLP.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "WARNING: {}: frozen MLP level {} ({:?}) returning zeros — \
+             gpu_mlp_read_only not yet implemented. This message prints once.",
+            path, level, rule,
+        );
+    }
+    GpuBuf::<f32>::zeros(n_elements)
+}
 #[cfg(feature = "cuda")]
 use crate::parallel::ParallelStrategy;
 
@@ -899,17 +914,7 @@ pub fn gpu_cms_forward(
         } else {
             // Frozen level: read-only M @ q_mem on GPU.
             if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD) {
-                // MLP rules have context_m = [W1 | W2], not [d,d].
-                // gpu_memory_read_only assumes a d×d matrix — skip this level
-                // until gpu_mlp_read_only is implemented. Return zeros.
-                if !WARNED_FROZEN_MLP.swap(true, Ordering::Relaxed) {
-                    eprintln!(
-                        "WARNING: gpu_forward: frozen MLP level {} ({:?}) returning zeros — \
-                         gpu_mlp_read_only not yet implemented. This message prints once.",
-                        level, cfg.memory_rule,
-                    );
-                }
-                y_per_level.push(GpuBuf::<f32>::zeros(bs * s * d));
+                y_per_level.push(frozen_mlp_fallback("gpu_cms_forward", level, cfg.memory_rule, bs * s * d));
                 memory_caches.push(None);
             } else {
             // Each batch element has distinct embeddings, so compute Y = Q @ M^T
@@ -1296,6 +1301,13 @@ pub(crate) fn gpu_memory_forward(
             let dh = cfg.d_hidden;
             let w1_size = dh * d;
             let w2_size = d * dh;
+            let required = w1_size + w2_size;
+            assert!(
+                context_m.len() >= required,
+                "MONETA: context_m too small ({} elements) for MLP layout [W1|W2] = {} \
+                 (d_hidden={}, d={}). GpuContextState must allocate d_hidden*d + d*d_hidden.",
+                context_m.len(), required, dh, d,
+            );
             // context_m layout: [w1_size + w2_size] = [W1 | W2]
             let w1_initial = context_m.slice(0, w1_size);
             let w2_initial = context_m.slice(w1_size, w2_size);
@@ -1342,6 +1354,13 @@ pub(crate) fn gpu_memory_forward(
             let dh = cfg.d_hidden;
             let w1_size = dh * d;
             let w2_size = d * dh;
+            let required = w1_size + w2_size;
+            assert!(
+                context_m.len() >= required,
+                "YAAD: context_m too small ({} elements) for MLP layout [W1|W2] = {} \
+                 (d_hidden={}, d={}). GpuContextState must allocate d_hidden*d + d*d_hidden.",
+                context_m.len(), required, dh, d,
+            );
             // context_m layout: [w1_size + w2_size] = [W1 | W2]
             let w1_initial = context_m.slice(0, w1_size);
             let w2_initial = context_m.slice(w1_size, w2_size);
@@ -2603,14 +2622,7 @@ pub fn gpu_prefill_forward(
             y_per_level.push(y_level);
         } else {
             if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD) {
-                if !WARNED_FROZEN_MLP.swap(true, Ordering::Relaxed) {
-                    eprintln!(
-                        "WARNING: gpu_forward_inference: frozen MLP level {} ({:?}) returning zeros — \
-                         gpu_mlp_read_only not yet implemented. This message prints once.",
-                        level, cfg.memory_rule,
-                    );
-                }
-                y_per_level.push(GpuBuf::<f32>::zeros(s * d));
+                y_per_level.push(frozen_mlp_fallback("gpu_prefill_forward", level, cfg.memory_rule, s * d));
             } else {
             let y_level = gpu_memory_read_only(
                 &params.levels[level], &embedded,
@@ -2803,14 +2815,7 @@ pub fn gpu_single_token_forward(
             y_per_level.push(y_level);
         } else {
             if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD) {
-                if !WARNED_FROZEN_MLP.swap(true, Ordering::Relaxed) {
-                    eprintln!(
-                        "WARNING: gpu_forward_single_token: frozen MLP level {} ({:?}) returning zeros — \
-                         gpu_mlp_read_only not yet implemented. This message prints once.",
-                        level, cfg.memory_rule,
-                    );
-                }
-                y_per_level.push(GpuBuf::<f32>::zeros(d));
+                y_per_level.push(frozen_mlp_fallback("gpu_single_token_forward", level, cfg.memory_rule, d));
             } else {
             let y_level = gpu_memory_read_only(
                 &params.levels[level], &ws.embedded,
