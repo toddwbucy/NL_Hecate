@@ -12,7 +12,9 @@ _TIER_1 = {"titans"}
 _TIER_2A = {"delta", "hebbian"}
 _TIER_2B = {"moneta", "yaad", "memora", "trellis"}
 _TIER_3_RULES = {"lattice", "atlas", "atlas_omega", "swiglu_mlp", "swiglu"}
-_GPU_CAPABLE = _TIER_1 | _TIER_2A  # Tier 1 + Tier 2a have CUDA kernels
+_GPU_CAPABLE = _TIER_1 | _TIER_2A  # Tier 1 + Tier 2a have full CUDA support
+# TODO: promote moneta+yaad to _GPU_CAPABLE after config plumbing PR lands
+# (GpuContextState sizing for MLP memory, frozen-level MLP readout)
 # Rules that support ema / delta_momentum (V-02)
 _MOMENTUM_RULES = {"titans", "atlas", "atlas_omega"}
 # Enum sets for direct field validation
@@ -576,7 +578,7 @@ class BuildConfig:
                 f"  This combination runs on CPU only. Either:\n"
                 f"    (a) add \"gpu\": false to your config build section, or\n"
                 f"    (b) pass --cpu at the command line, or\n"
-                f"    (c) use a Tier 1 or Tier 2a memory_rule (titans_lmm, delta_rule, hebbian)\n"
+                f"    (c) use a GPU-capable memory_rule (titans, delta, hebbian)\n"
                 f"       to run on GPU.\n"
                 f"  See specs/infrastructure/01_variant_tier_policy.md for the full tier matrix.")
 

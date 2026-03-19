@@ -3,12 +3,15 @@
 /// Mirrors `cms_forward` in mag.rs but operates entirely on device pointers.
 /// Only input_ids (4KB), target_ids (4KB), and loss (4 bytes) cross PCIe.
 ///
-/// Supports matrix-based memory rules: DeltaRule, TitansLMM, HebbianRule.
-/// MLP/slot-based rules (Moneta, YAAD, MEMORA, Lattice, Trellis, Atlas) fall
+/// Supports matrix-based memory rules: DeltaRule, TitansLMM, HebbianRule, DGD.
+/// Supports MLP-based memory rules: Moneta, YAAD.
+/// Remaining MLP/slot-based rules (MEMORA, Lattice, Trellis, Atlas) fall
 /// back to the CPU reference path since they lack CUDA kernels.
 ///
 /// Feature-gated: only available with `--features cuda`.
 
+#[cfg(feature = "cuda")]
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "cuda")]
 use crate::gpu_buf::GpuBuf;
 #[cfg(feature = "cuda")]
@@ -17,6 +20,28 @@ use crate::gpu_params::{GpuMAGParams, GpuContextState};
 use crate::model::{MAGConfig, MemoryRuleKind, LevelTapeStrategy};
 #[cfg(feature = "cuda")]
 use crate::conductor::Pulse;
+
+/// One-shot warning: frozen MLP level skipped (no gpu_mlp_read_only yet).
+#[cfg(feature = "cuda")]
+static WARNED_FROZEN_MLP: AtomicBool = AtomicBool::new(false);
+
+/// Returns a zeroed GPU buffer for a frozen MLP level, with a one-time warning.
+/// MLP rules (Moneta/YAAD) have context_m = [W1|W2], incompatible with
+/// gpu_memory_read_only's [d,d] matrix assumption.
+#[cfg(feature = "cuda")]
+fn frozen_mlp_fallback(path: &str, level: usize, rule: MemoryRuleKind, n_elements: usize) -> GpuBuf<f32> {
+    if !WARNED_FROZEN_MLP.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "WARNING: {}: frozen MLP level {} ({:?}) contributing zeros to y_combined — \
+             gpu_mlp_read_only (y = W2 @ silu(W1 @ q)) not yet implemented. \
+             Moneta/YAAD are recommended with k=1; in k>1 configs, frozen levels \
+             produce zero contribution. Use matrix-based rules (TitansLMM, DeltaRule) \
+             if frozen-level read-only M @ q_mem is required. This message prints once.",
+            path, level, rule,
+        );
+    }
+    GpuBuf::<f32>::zeros(n_elements)
+}
 #[cfg(feature = "cuda")]
 use crate::parallel::ParallelStrategy;
 
@@ -186,6 +211,22 @@ pub enum GpuMemoryCache {
         fused_buf: GpuBuf<f32>,   // [s × inter]
         cache_buf: GpuBuf<f32>,   // [s × inter] sigmoid(gate_out)
     },
+    /// MLP memory (MONETA/YAAD) — full W1/W2 trajectory.
+    /// W1[d_hidden, d], W2[d, d_hidden] per timestep.
+    Mlp {
+        k_mem: GpuBuf<f32>,       // [s, d]
+        v_mem: GpuBuf<f32>,       // [s, d]
+        q_mem: GpuBuf<f32>,       // [s, d]
+        alpha: GpuBuf<f32>,       // [s]
+        theta: GpuBuf<f32>,       // [s]
+        w1_states: GpuBuf<f32>,   // [(s+1) * d_hidden * d]
+        w2_states: GpuBuf<f32>,   // [(s+1) * d * d_hidden]
+        k_norms: GpuBuf<f32>,     // [s] — L2 norms before normalization
+        q_norms: GpuBuf<f32>,     // [s]
+        // YAAD-only: boundary snapshots for decoupled L2 retention (None for MONETA)
+        w1_boundary: Option<GpuBuf<f32>>,  // [d_hidden * d]
+        w2_boundary: Option<GpuBuf<f32>>,  // [d * d_hidden]
+    },
     /// TNT hierarchical — per-shard inner caches + global state trajectory.
     /// The inner caches are Titans/Delta/etc. caches, one per shard.
     TNT {
@@ -302,6 +343,8 @@ impl GpuMemoryCache {
                 }
                 max_delta
             }
+            // MLP memory (MONETA/YAAD): delta norm not supported yet (needs MLP-specific norm)
+            GpuMemoryCache::Mlp { .. } => 0.0,
             // Hebbian has no error vector; SwiGlu has no M state
             GpuMemoryCache::Hebbian { .. }
             | GpuMemoryCache::HebbianCkpt { .. }
@@ -327,7 +370,8 @@ impl GpuMemoryCache {
             | GpuMemoryCache::DeltaCkpt { alpha, .. }
             | GpuMemoryCache::TitansCkpt { alpha, .. }
             | GpuMemoryCache::HebbianCkpt { alpha, .. }
-            | GpuMemoryCache::DGDCkpt { alpha, .. } => Some(alpha),
+            | GpuMemoryCache::DGDCkpt { alpha, .. }
+            | GpuMemoryCache::Mlp { alpha, .. } => Some(alpha),
             GpuMemoryCache::SwiGlu { .. } => None,
             GpuMemoryCache::TNT { .. } => None, // handled separately below
         };
@@ -389,6 +433,7 @@ impl GpuMemoryCache {
             | GpuMemoryCache::DeltaCkpt { .. }
             | GpuMemoryCache::HebbianCkpt { .. }
             | GpuMemoryCache::DGDCkpt { .. }
+            | GpuMemoryCache::Mlp { .. }
             | GpuMemoryCache::SwiGlu { .. } => None,
             GpuMemoryCache::TNT { .. } => None, // handled separately below
         };
@@ -444,7 +489,8 @@ impl GpuMemoryCache {
             | GpuMemoryCache::DGD { theta, .. }
             | GpuMemoryCache::DeltaCkpt { theta, .. }
             | GpuMemoryCache::TitansCkpt { theta, .. }
-            | GpuMemoryCache::DGDCkpt { theta, .. } => Some(theta),
+            | GpuMemoryCache::DGDCkpt { theta, .. }
+            | GpuMemoryCache::Mlp { theta, .. } => Some(theta),
             GpuMemoryCache::Hebbian { .. }
             | GpuMemoryCache::HebbianCkpt { .. }
             | GpuMemoryCache::SwiGlu { .. } => None,
@@ -870,6 +916,10 @@ pub fn gpu_cms_forward(
             }
         } else {
             // Frozen level: read-only M @ q_mem on GPU.
+            if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD) {
+                y_per_level.push(frozen_mlp_fallback("gpu_cms_forward", level, cfg.memory_rule, bs * s * d));
+                memory_caches.push(None);
+            } else {
             // Each batch element has distinct embeddings, so compute Y = Q @ M^T
             // for all bs*s tokens simultaneously. Same frozen M for all batch elements.
             let y_level = gpu_memory_read_only(
@@ -879,6 +929,7 @@ pub fn gpu_cms_forward(
             );
             y_per_level.push(y_level);
             memory_caches.push(None);
+            }
         }
     }
 
@@ -1247,7 +1298,139 @@ pub(crate) fn gpu_memory_forward(
             // context_m is unused for SwiGLU (no M state) — not updated.
             (y, GpuMemoryCache::SwiGlu { gate_buf, up_buf, fused_buf, cache_buf })
         }
-        _ => panic!("GPU-resident forward only supports DeltaRule, TitansLMM, HebbianRule, DGD, SwiGluMlp. Got {:?}", cfg.memory_rule),
+        // ── MLP memory: MONETA (l_p bias, L2/Lq retention) ─────────────
+        (None, MemoryRuleKind::Moneta) => {
+            assert_eq!(bs, 1, "MONETA GPU forward with batch_size > 1 is not supported");
+            let dh = cfg.d_hidden;
+            let w1_size = dh * d;
+            let w2_size = d * dh;
+            let required = w1_size + w2_size;
+            assert!(
+                context_m.len() >= required,
+                "MONETA: context_m too small ({} elements) for MLP layout [W1|W2] = {} \
+                 (d_hidden={}, d={}). GpuContextState must allocate d_hidden*d + d*d_hidden.",
+                context_m.len(), required, dh, d,
+            );
+            // context_m layout: [w1_size + w2_size] = [W1 | W2]
+            let w1_initial = context_m.slice(0, w1_size);
+            let w2_initial = context_m.slice(w1_size, w2_size);
+            let w1_states = GpuBuf::zeros((s + 1) * w1_size);
+            let w2_states = GpuBuf::zeros((s + 1) * w2_size);
+            let y = GpuBuf::zeros(s * d);
+            let dh_i32 = i32::try_from(dh).expect("d_hidden exceeds i32::MAX");
+            unsafe {
+                crate::cuda_ffi::mlp_forward_lp_f32_cuda(
+                    k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
+                    alpha.as_ptr(), theta.as_ptr(),
+                    w1_initial.as_ptr(), w2_initial.as_ptr(),
+                    w1_states.ptr(), w2_states.ptr(), y.ptr(),
+                    s as i32, d_i32, dh_i32,
+                    cfg.lp_p, cfg.sign_sharpness, cfg.lambda_2, cfg.lq_q,
+                );
+            }
+            crate::dispatch::cuda_sync();
+            // Copy final W1/W2 back to context_m: [W1_final | W2_final]
+            unsafe {
+                let rc = gpu_buf_memcpy_d2d(
+                    context_m.ptr() as *mut std::ffi::c_void,
+                    (w1_states.as_ptr() as *const u8).add(s * w1_size * 4) as *const std::ffi::c_void,
+                    w1_size * 4,
+                );
+                assert_eq!(rc, 0, "copy final W1 failed");
+                let rc = gpu_buf_memcpy_d2d(
+                    (context_m.ptr() as *mut u8).add(w1_size * 4) as *mut std::ffi::c_void,
+                    (w2_states.as_ptr() as *const u8).add(s * w2_size * 4) as *const std::ffi::c_void,
+                    w2_size * 4,
+                );
+                assert_eq!(rc, 0, "copy final W2 failed");
+            }
+            // m_norm_clamp not applicable to MLP memory (different topology)
+            (y, GpuMemoryCache::Mlp {
+                k_mem, v_mem, q_mem, alpha, theta,
+                w1_states, w2_states, k_norms, q_norms,
+                w1_boundary: None, w2_boundary: None,
+            })
+        }
+        // ── MLP memory: YAAD (Huber bias, decoupled L2 retention) ─────
+        (None, MemoryRuleKind::YAAD) => {
+            assert_eq!(bs, 1, "YAAD GPU forward with batch_size > 1 is not supported");
+            let dh = cfg.d_hidden;
+            let w1_size = dh * d;
+            let w2_size = d * dh;
+            let required = w1_size + w2_size;
+            assert!(
+                context_m.len() >= required,
+                "YAAD: context_m too small ({} elements) for MLP layout [W1|W2] = {} \
+                 (d_hidden={}, d={}). GpuContextState must allocate d_hidden*d + d*d_hidden.",
+                context_m.len(), required, dh, d,
+            );
+            // context_m layout: [w1_size + w2_size] = [W1 | W2]
+            let w1_initial = context_m.slice(0, w1_size);
+            let w2_initial = context_m.slice(w1_size, w2_size);
+            // YAAD boundary snapshots: chunk-start W1/W2 for decoupled retention
+            let w1_boundary = GpuBuf::zeros(w1_size);
+            unsafe {
+                let rc = gpu_buf_memcpy_d2d(
+                    w1_boundary.ptr() as *mut std::ffi::c_void,
+                    context_m.as_ptr() as *const std::ffi::c_void,
+                    w1_size * 4,
+                );
+                assert_eq!(rc, 0, "copy W1 boundary failed");
+            }
+            let w2_boundary = GpuBuf::zeros(w2_size);
+            unsafe {
+                let rc = gpu_buf_memcpy_d2d(
+                    w2_boundary.ptr() as *mut std::ffi::c_void,
+                    (context_m.as_ptr() as *const u8).add(w1_size * 4) as *const std::ffi::c_void,
+                    w2_size * 4,
+                );
+                assert_eq!(rc, 0, "copy W2 boundary failed");
+            }
+            let w1_states = GpuBuf::zeros((s + 1) * w1_size);
+            let w2_states = GpuBuf::zeros((s + 1) * w2_size);
+            let y = GpuBuf::zeros(s * d);
+            let dh_i32 = i32::try_from(dh).expect("d_hidden exceeds i32::MAX");
+            unsafe {
+                crate::cuda_ffi::mlp_forward_huber_f32_cuda(
+                    k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
+                    alpha.as_ptr(), theta.as_ptr(),
+                    w1_initial.as_ptr(), w2_initial.as_ptr(),
+                    w1_boundary.as_ptr(), w2_boundary.as_ptr(),
+                    w1_states.ptr(), w2_states.ptr(), y.ptr(),
+                    s as i32, d_i32, dh_i32,
+                    cfg.delta, cfg.lambda_local, cfg.lambda_2,
+                );
+            }
+            crate::dispatch::cuda_sync();
+            // Copy final W1/W2 back to context_m: [W1_final | W2_final]
+            unsafe {
+                let rc = gpu_buf_memcpy_d2d(
+                    context_m.ptr() as *mut std::ffi::c_void,
+                    (w1_states.as_ptr() as *const u8).add(s * w1_size * 4) as *const std::ffi::c_void,
+                    w1_size * 4,
+                );
+                assert_eq!(rc, 0, "copy final W1 failed");
+                let rc = gpu_buf_memcpy_d2d(
+                    (context_m.ptr() as *mut u8).add(w1_size * 4) as *mut std::ffi::c_void,
+                    (w2_states.as_ptr() as *const u8).add(s * w2_size * 4) as *const std::ffi::c_void,
+                    w2_size * 4,
+                );
+                assert_eq!(rc, 0, "copy final W2 failed");
+            }
+            (y, GpuMemoryCache::Mlp {
+                k_mem, v_mem, q_mem, alpha, theta,
+                w1_states, w2_states, k_norms, q_norms,
+                w1_boundary: Some(w1_boundary), w2_boundary: Some(w2_boundary),
+            })
+        }
+        (Some(_), MemoryRuleKind::Moneta) | (Some(_), MemoryRuleKind::YAAD) => {
+            panic!(
+                "Checkpointed (gradient-checkpoint) MLP forward is not supported for {:?}. \
+                 Use checkpoint_interval=None (full trajectory) for Moneta/YAAD levels.",
+                cfg.memory_rule,
+            );
+        }
+        _ => panic!("GPU-resident forward: unsupported (checkpoint, rule) combination. Got {:?}", cfg.memory_rule),
     }
 }
 
@@ -2441,12 +2624,16 @@ pub fn gpu_prefill_forward(
             );
             y_per_level.push(y_level);
         } else {
+            if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD) {
+                y_per_level.push(frozen_mlp_fallback("gpu_prefill_forward", level, cfg.memory_rule, s * d));
+            } else {
             let y_level = gpu_memory_read_only(
                 &params.levels[level], &embedded,
                 &context.memory[level],
                 s, d,
             );
             y_per_level.push(y_level);
+            }
         }
     }
 
@@ -2630,12 +2817,16 @@ pub fn gpu_single_token_forward(
             );
             y_per_level.push(y_level);
         } else {
+            if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD) {
+                y_per_level.push(frozen_mlp_fallback("gpu_single_token_forward", level, cfg.memory_rule, d));
+            } else {
             let y_level = gpu_memory_read_only(
                 &params.levels[level], &ws.embedded,
                 &context.memory[level],
                 1, d,
             );
             y_per_level.push(y_level);
+            }
         }
     }
 
