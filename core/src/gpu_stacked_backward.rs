@@ -13,11 +13,11 @@ use crate::gpu_buf::GpuBuf;
 #[cfg(feature = "cuda")]
 use crate::gpu_params::GpuStackedParams;
 #[cfg(feature = "cuda")]
-use crate::gpu_stacked_forward::GpuStackedCache;
+use crate::gpu_stacked_forward::{GpuStackedCache, GpuBufClone};
 #[cfg(feature = "cuda")]
 use crate::gpu_backward::{GpuLevelGrads, gpu_memory_backward, gpu_memory_read_only_backward, gpu_matmul_transa_dd};
 #[cfg(feature = "cuda")]
-use crate::model::{MAGConfig, MemoryRuleKind};
+use crate::model::{MAGConfig, MemoryRuleKind, HopeVariant};
 
 // ══════════════════════════════════════════════════════════════════════
 // GpuStackedBlockGrads — per-block gradient buffers
@@ -210,27 +210,7 @@ pub fn gpu_stacked_backward(
             );
         }
 
-        // ── Learnable aggregation backward ──────────────────────────
-        // Forward: y_combined = Σ_l w[l] * y_level[l], w = softmax(alpha_mem)
-        // Spec: specs/infrastructure/21_stacked_alpha_aggregation.md
-
-        // Compute d_alpha_mem via softmax Jacobian (reference: mac.rs:904-915).
-        // dot_l = <d_y_combined, y_level[l]> — inner products on host.
-        let w = &bc.alpha_weights;
-        let mut d_y_host = vec![0.0f32; bsd];
-        crate::dispatch::cuda_sync();
-        d_y_combined.slice(0, bsd).copy_to_host(&mut d_y_host);
-        let mut dots = vec![0.0f64; cfg.k];
-        for l in 0..cfg.k {
-            let mut y_l_host = vec![0.0f32; bsd];
-            bc.y_per_level[l].slice(0, bsd).copy_to_host(&mut y_l_host);
-            dots[l] = d_y_host.iter().zip(y_l_host.iter())
-                .map(|(&dy, &y)| dy as f64 * y as f64).sum();
-        }
-        let weighted_dot_sum: f64 = (0..cfg.k).map(|j| w[j] as f64 * dots[j]).sum();
-        let d_alpha_mem: Vec<f32> = (0..cfg.k)
-            .map(|l| (w[l] as f64 * (dots[l] - weighted_dot_sum)) as f32)
-            .collect();
+        let is_chained = matches!(cfg.hope_variant, HopeVariant::Chained | HopeVariant::Sequential);
 
         // ── Per-level output gradient norms (tape diagnostics) ─────
         let mut block_level_gnorms = vec![0.0f32; cfg.k];
@@ -257,37 +237,102 @@ pub fn gpu_stacked_backward(
             }
         }
 
-        // ── Memory backward per level (weighted by alpha) ──────────
-        // Each level receives d_y_level[l] = w[l] * d_y_combined
-        let d_mem_input = GpuBuf::zeros(bsd);
-        for level in 0..cfg.k {
-            // Scale d_y_combined by alpha weight for this level
-            let d_y_level = GpuBuf::zeros(bsd);
-            unsafe {
-                crate::cuda_ffi::saxpy_cuda(w[level], d_y_combined.as_ptr(), d_y_level.ptr(), bsd_i32);
+        let d_alpha_mem: Vec<f32>;
+        let d_mem_input;
+
+        if is_chained {
+            // ── Chain CMS backward (HOPE Eq 70/97) ──────────────────
+            // Spec: specs/infrastructure/35_chain_cms_gpu.md
+            // No alpha_mem in chain mode — gradient flows serially through levels.
+            d_alpha_mem = vec![0.0f32; cfg.k];
+
+            // d_y_combined IS d_y for level k-1 (no weighted sum)
+            let mut d_upstream = d_y_combined.clone_buf();
+
+            // Reverse chain: k-1 → 0
+            for level in (0..cfg.k).rev() {
+                // In chain mode, each level's input is the previous level's output
+                // Level 0's input is ln_mem_out
+                let level_input = if level == 0 {
+                    &bc.ln_mem_out
+                } else {
+                    &bc.y_per_level[level - 1]
+                };
+
+                if cache.pulse.active_levels[level] {
+                    if let Some(ref mem_cache) = bc.memory_caches[level] {
+                        let d_emb_level = gpu_memory_backward(
+                            &block.levels[level], cfg, mem_cache,
+                            &d_upstream, level_input,
+                            &mut level_grads[level],
+                            s, d, level, bs,
+                        );
+                        d_upstream = d_emb_level;
+                    }
+                } else {
+                    // Frozen level: identity pass-through, gradient flows unchanged
+                    let d_emb_level = gpu_memory_read_only_backward(
+                        &block.levels[level], &bc.y_per_level[level],
+                        &d_upstream, level_input,
+                        &mut level_grads[level],
+                        s, d, bs,
+                    );
+                    d_upstream = d_emb_level;
+                }
             }
 
-            if cache.pulse.active_levels[level] {
-                if let Some(ref mem_cache) = bc.memory_caches[level] {
-                    let d_emb_level = gpu_memory_backward(
-                        &block.levels[level], cfg, mem_cache,
+            // d_upstream is now d_ln_mem_out
+            d_mem_input = d_upstream;
+        } else {
+            // ── Independent/FreqGated aggregation backward ──────────
+            // Forward: y_combined = Σ_l w[l] * y_level[l], w = softmax(alpha_mem)
+            // Spec: specs/infrastructure/21_stacked_alpha_aggregation.md
+            let w = &bc.alpha_weights;
+            let mut d_y_host = vec![0.0f32; bsd];
+            crate::dispatch::cuda_sync();
+            d_y_combined.slice(0, bsd).copy_to_host(&mut d_y_host);
+            let mut dots = vec![0.0f64; cfg.k];
+            for l in 0..cfg.k {
+                let mut y_l_host = vec![0.0f32; bsd];
+                bc.y_per_level[l].slice(0, bsd).copy_to_host(&mut y_l_host);
+                dots[l] = d_y_host.iter().zip(y_l_host.iter())
+                    .map(|(&dy, &y)| dy as f64 * y as f64).sum();
+            }
+            let weighted_dot_sum: f64 = (0..cfg.k).map(|j| w[j] as f64 * dots[j]).sum();
+            d_alpha_mem = (0..cfg.k)
+                .map(|l| (w[l] as f64 * (dots[l] - weighted_dot_sum)) as f32)
+                .collect();
+
+            // Each level receives d_y_level[l] = w[l] * d_y_combined
+            d_mem_input = GpuBuf::zeros(bsd);
+            for level in 0..cfg.k {
+                let d_y_level = GpuBuf::zeros(bsd);
+                unsafe {
+                    crate::cuda_ffi::saxpy_cuda(w[level], d_y_combined.as_ptr(), d_y_level.ptr(), bsd_i32);
+                }
+
+                if cache.pulse.active_levels[level] {
+                    if let Some(ref mem_cache) = bc.memory_caches[level] {
+                        let d_emb_level = gpu_memory_backward(
+                            &block.levels[level], cfg, mem_cache,
+                            &d_y_level, &bc.ln_mem_out,
+                            &mut level_grads[level],
+                            s, d, level, bs,
+                        );
+                        unsafe {
+                            crate::cuda_ffi::saxpy_cuda(1.0, d_emb_level.as_ptr(), d_mem_input.ptr(), bsd_i32);
+                        }
+                    }
+                } else {
+                    let d_emb_level = gpu_memory_read_only_backward(
+                        &block.levels[level], &bc.y_per_level[level],
                         &d_y_level, &bc.ln_mem_out,
                         &mut level_grads[level],
-                        s, d, level, bs,
+                        s, d, bs,
                     );
                     unsafe {
                         crate::cuda_ffi::saxpy_cuda(1.0, d_emb_level.as_ptr(), d_mem_input.ptr(), bsd_i32);
                     }
-                }
-            } else {
-                let d_emb_level = gpu_memory_read_only_backward(
-                    &block.levels[level], &bc.y_per_level[level],
-                    &d_y_level, &bc.ln_mem_out,
-                    &mut level_grads[level],
-                    s, d, bs,
-                );
-                unsafe {
-                    crate::cuda_ffi::saxpy_cuda(1.0, d_emb_level.as_ptr(), d_mem_input.ptr(), bsd_i32);
                 }
             }
         }

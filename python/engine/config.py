@@ -74,6 +74,7 @@ class BuildConfig:
     chunk_sizes: list[int] | None = None
     memory_rule: str = "delta"
     composition: str = "mag"
+    hope_variant: str = "freq_gated"  # "freq_gated" (default/Variant 5) or "chained" (Variant 1)
 
     # HOPE (self-referential projections)
     projection_kind: str = "static"         # "static" or "adaptive"
@@ -287,6 +288,9 @@ class BuildConfig:
                     raise ValueError(f"{name} must be in (0, 1), got {val}")
             if self.m3_alpha < 0.0:
                 raise ValueError(f"m3_alpha must be >= 0, got {self.m3_alpha}")
+        if self.hope_variant not in ("freq_gated", "chained"):
+            raise ValueError(
+                f"hope_variant must be 'freq_gated' or 'chained', got '{self.hope_variant}'")
         if self.lr <= 0:
             raise ValueError("lr must be positive")
         if self.max_grad_norm < 0:
