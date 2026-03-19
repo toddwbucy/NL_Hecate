@@ -32,8 +32,11 @@ static WARNED_FROZEN_MLP: AtomicBool = AtomicBool::new(false);
 fn frozen_mlp_fallback(path: &str, level: usize, rule: MemoryRuleKind, n_elements: usize) -> GpuBuf<f32> {
     if !WARNED_FROZEN_MLP.swap(true, Ordering::Relaxed) {
         eprintln!(
-            "WARNING: {}: frozen MLP level {} ({:?}) returning zeros — \
-             gpu_mlp_read_only not yet implemented. This message prints once.",
+            "WARNING: {}: frozen MLP level {} ({:?}) contributing zeros to y_combined — \
+             gpu_mlp_read_only (y = W2 @ silu(W1 @ q)) not yet implemented. \
+             Moneta/YAAD are recommended with k=1; in k>1 configs, frozen levels \
+             produce zero contribution. Use matrix-based rules (TitansLMM, DeltaRule) \
+             if frozen-level read-only M @ q_mem is required. This message prints once.",
             path, level, rule,
         );
     }
