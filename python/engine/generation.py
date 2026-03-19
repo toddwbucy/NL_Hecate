@@ -278,26 +278,29 @@ def generate_stacked(
 
     safe_pad = _safe_pad_token(prompt_tokens, vocab)
 
-    for i in range(max_tokens):
-        # Take last seq_len tokens as context window
-        ctx = seq[-seq_len:]
-        while len(ctx) < seq_len:
-            ctx = [safe_pad, *ctx]
+    try:
+        for i in range(max_tokens):
+            # Take last seq_len tokens as context window
+            ctx = seq[-seq_len:]
+            while len(ctx) < seq_len:
+                ctx = [safe_pad, *ctx]
 
-        # Forward pass — target_ids = shifted input (dummy for loss, we want logits)
-        target = ctx[1:] + [safe_pad]
-        pulse = conductor.pulse()
-        _loss, logits_flat = gpu_model.forward(ctx, target, pulse)
-        conductor.advance()
+            # Forward pass — target_ids = shifted input (dummy for loss, we want logits)
+            target = ctx[1:] + [safe_pad]
+            pulse = conductor.pulse()
+            _loss, logits_flat = gpu_model.forward(ctx, target, pulse)
+            conductor.advance()
 
-        # Extract last-position logits
-        last_logits = logits_flat[(seq_len - 1) * vocab: seq_len * vocab]
-        next_tok = _sample_token(last_logits, vocab, temperature, top_k)
+            # Extract last-position logits
+            last_logits = logits_flat[(seq_len - 1) * vocab: seq_len * vocab]
+            next_tok = _sample_token(last_logits, vocab, temperature, top_k)
 
-        if stop_token is not None and next_tok == stop_token:
-            break
+            if stop_token is not None and next_tok == stop_token:
+                break
 
-        seq.append(next_tok)
+            seq.append(next_tok)
+    finally:
+        gpu_model.reset_context()
 
     return seq
 
@@ -326,8 +329,16 @@ def generate(
     """
     is_stacked = hasattr(gpu_model, 'n_blocks') if gpu_model is not None else False
 
+    # Stacked models don't support learning mode (no step_generate method)
+    if gpu_model is not None and learn and is_stacked:
+        raise NotImplementedError(
+            "generate_learning is not supported with stacked (multi-block) models. "
+            "GpuStackedModel lacks step_generate(). Remove --learn or use a "
+            "single-block checkpoint."
+        )
+
     # Delegate to learning path for GPU models with --learn
-    if gpu_model is not None and learn and not is_stacked:
+    if gpu_model is not None and learn:
         kw = learn_kwargs or {}
         seq, _losses, _gnorms = generate_learning(
             gpu_model, cfg, prompt_tokens, max_tokens,
