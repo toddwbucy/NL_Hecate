@@ -1484,6 +1484,29 @@ impl ContextState {
     fn d(&self) -> usize { self.inner.d }
 }
 
+// ── OptimizerState (spec 33: optimizer snapshot/restore) ────────────
+
+/// Host-side snapshot of AdamW optimizer moments and step counters.
+/// Opaque to Python — created by `GpuModel.snapshot_optimizer()`,
+/// consumed by `GpuModel.restore_optimizer()`.
+#[cfg(feature = "cuda")]
+#[pyclass]
+struct OptimizerState {
+    inner: nl_hecate_core::gpu_optimizer::HostOptimizerState,
+}
+
+#[cfg(feature = "cuda")]
+#[pymethods]
+impl OptimizerState {
+    /// Global optimizer step counter.
+    #[getter]
+    fn step(&self) -> u32 { self.inner.step }
+
+    /// Number of CMS levels in this snapshot.
+    #[getter]
+    fn k(&self) -> usize { self.inner.level_steps.len() }
+}
+
 // ── ErrorBufferList ─────────────────────────────────────────────────
 
 #[pyclass]
@@ -2253,6 +2276,25 @@ impl GpuModel {
     /// Use after learning probes to prevent corrupted moments from affecting training.
     fn reset_optimizer(&mut self) {
         self.adamw_state = None;
+    }
+
+    /// Snapshot AdamW optimizer state to host memory (spec 33).
+    /// Returns None if optimizer hasn't been initialized yet (no training steps taken).
+    fn snapshot_optimizer(&self) -> Option<OptimizerState> {
+        self.adamw_state.as_ref().map(|state| {
+            OptimizerState { inner: state.to_host() }
+        })
+    }
+
+    /// Restore AdamW optimizer state from a host snapshot (spec 33).
+    /// Replaces the current optimizer state with the snapshot's moments and step counters.
+    fn restore_optimizer(&mut self, state: &OptimizerState) -> PyResult<()> {
+        self.adamw_state = Some(
+            nl_hecate_core::gpu_optimizer::GpuAdamWState::from_host(
+                &state.inner, &self.params,
+            )
+        );
+        Ok(())
     }
 
     /// Prefill: process full prompt, populate KV cache, return last-position logits.

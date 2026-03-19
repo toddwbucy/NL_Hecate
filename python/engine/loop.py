@@ -1500,9 +1500,6 @@ def run_build(bcfg: BuildConfig):
                 print(f"    [coherence skipped: {', '.join(skip_reasons)}]")
             if can_coherence:
                 # Learning probes (CS-10: model learns during forward)
-                # NOTE: full_snapshot/full_restore don't preserve optimizer moments.
-                # reset_optimizer() after restore loses accumulated AdamW state.
-                # Tracked: https://github.com/toddwbucy/NL_Hecate/issues/206
                 snapshot = None
                 try:
                     snapshot = full_snapshot(gpu_model)
@@ -1510,7 +1507,6 @@ def run_build(bcfg: BuildConfig):
                     n_prompts = max(1, min(bcfg.probe_prompts, len(EVAL_PROMPTS)))
                     for prompt_text in EVAL_PROMPTS[:n_prompts]:
                         full_restore(gpu_model, snapshot)
-                        gpu_model.reset_optimizer()
                         prompt_ids = tokenizer.encode(prompt_text)
                         result = probe_within_generation(
                             gpu_model, cfg, prompt_ids, tokenizer,
@@ -1531,7 +1527,6 @@ def run_build(bcfg: BuildConfig):
 
                     # Probe 2: cross-exposure adaptation (first prompt only)
                     full_restore(gpu_model, snapshot)
-                    gpu_model.reset_optimizer()
                     prompt_text = EVAL_PROMPTS[0]
                     prompt_ids = tokenizer.encode(prompt_text)
                     xresult = probe_cross_exposure(
@@ -1556,7 +1551,6 @@ def run_build(bcfg: BuildConfig):
                 finally:
                     if snapshot is not None:
                         full_restore(gpu_model, snapshot)
-                        gpu_model.reset_optimizer()
 
                 # Memory vocab probe (logit lens for CMS levels)
                 try:
@@ -1585,7 +1579,6 @@ def run_build(bcfg: BuildConfig):
                         if sample_budget <= 0:
                             break
                         full_restore(gpu_model, ckpt_snapshot)
-                        gpu_model.reset_optimizer()
                         gpu_model.reset_context()
                         prompt_ids = tokenizer.encode(prompt_text)
                         tokens, losses, _ = generate_learning(
@@ -1607,7 +1600,6 @@ def run_build(bcfg: BuildConfig):
 
                     # Probe 3: accumulated context vs cold start
                     full_restore(gpu_model, ckpt_snapshot)
-                    gpu_model.reset_optimizer()
                     prompt_text = EVAL_PROMPTS[0]
                     prompt_ids = tokenizer.encode(prompt_text)
                     cresult = probe_context_value(
@@ -1627,7 +1619,6 @@ def run_build(bcfg: BuildConfig):
                 finally:
                     if ckpt_snapshot is not None:
                         full_restore(gpu_model, ckpt_snapshot)
-                        gpu_model.reset_optimizer()
 
             if jsonl:
                 jsonl.log(event="checkpoint", step=step)
