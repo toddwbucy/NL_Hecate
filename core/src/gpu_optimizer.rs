@@ -1174,11 +1174,11 @@ pub fn gpu_m3_update(
             m3_ema_one(&mut ml.m1_down_proj, &mut ml.m2_down_proj, &mut ml.v_down_proj, &lg.d_down_proj,
                        cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
 
-            // MLP matrices are (d, d_ff) or similar — treat as 2D
+            // MLP shapes per MAGParams: gate_proj/up_proj are [inter, d], down_proj is [d, inter]
             let ff_dim = lp.gate_proj.len() / d;
-            ns_2d!(lp.gate_proj, ml.m1_gate_proj, ml.m2_gate_proj, d, ff_dim);
-            ns_2d!(lp.up_proj, ml.m1_up_proj, ml.m2_up_proj, d, ff_dim);
-            ns_2d!(lp.down_proj, ml.m1_down_proj, ml.m2_down_proj, ff_dim, d);
+            ns_2d!(lp.gate_proj, ml.m1_gate_proj, ml.m2_gate_proj, ff_dim, d);
+            ns_2d!(lp.up_proj, ml.m1_up_proj, ml.m2_up_proj, ff_dim, d);
+            ns_2d!(lp.down_proj, ml.m1_down_proj, ml.m2_down_proj, d, ff_dim);
         }
     }
 

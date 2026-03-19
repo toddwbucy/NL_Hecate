@@ -2283,6 +2283,11 @@ impl GpuModel {
 
     /// Snapshot AdamW optimizer state to host memory (spec 33).
     /// Returns None if optimizer hasn't been initialized yet (no training steps taken).
+    ///
+    /// NOTE: M3 optimizer state is NOT included in the snapshot — M3 moments and
+    /// step counters will be re-initialized from scratch on restore. M3 re-warms
+    /// quickly (EMA), so this is acceptable for checkpoint recovery. Full M3
+    /// serialization is tracked for a follow-up PR.
     fn snapshot_optimizer(&self) -> Option<OptimizerState> {
         self.adamw_state.as_ref().map(|state| {
             OptimizerState { inner: state.to_host() }
@@ -2304,7 +2309,12 @@ impl GpuModel {
     /// Creates GPU-resident M1/M2/V buffers + NS scratch space.
     #[pyo3(signature = (beta1=0.9, beta2=0.999, beta3=0.99, alpha=0.5, chunk_size=8, ns_iterations=5, eps=1e-8))]
     fn init_m3(&mut self, beta1: f32, beta2: f32, beta3: f32,
-               alpha: f32, chunk_size: u32, ns_iterations: u32, eps: f32) {
+               alpha: f32, chunk_size: u32, ns_iterations: u32, eps: f32) -> PyResult<()> {
+        if chunk_size == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "chunk_size must be >= 1 (used as modulus in gpu_m3_update)"
+            ));
+        }
         let config = nl_hecate_core::gpu_optimizer::GpuM3Config {
             beta1, beta2, beta3, alpha, chunk_size, ns_iterations, eps,
         };
@@ -2314,6 +2324,7 @@ impl GpuModel {
                 &self.params, config, d,
             )
         );
+        Ok(())
     }
 
     /// Full GPU build step with M3 optimizer (spec 34). Returns (loss, grad_norm).

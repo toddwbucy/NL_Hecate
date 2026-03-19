@@ -810,6 +810,7 @@ def run_build(bcfg: BuildConfig):
             beta1=bcfg.m3_beta1, beta2=bcfg.m3_beta2, beta3=bcfg.m3_beta3,
             alpha=bcfg.m3_alpha, chunk_size=bcfg.m3_chunk_size,
             ns_iterations=bcfg.m3_ns_iterations,
+            eps=bcfg.m3_eps,
         )
 
     jsonl: Optional[JSONLLogger] = None

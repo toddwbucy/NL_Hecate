@@ -139,6 +139,7 @@ class BuildConfig:
     m3_alpha: float = 0.5      # weight of slow momentum in combined update
     m3_chunk_size: int = 8     # Ĉ — slow momentum (M2) update frequency
     m3_ns_iterations: int = 5  # Newton-Schulz iterations T
+    m3_eps: float = 1e-8       # epsilon for 1D Adam-style V division
 
     # Data
     data_path: str | None = None
@@ -275,6 +276,17 @@ class BuildConfig:
         if self.optimizer not in ("sgd", "adamw", "adamw_gpu", "adamw_gpu_stacked", "m3"):
             raise ValueError(
                 f"optimizer must be 'sgd', 'adamw', 'adamw_gpu', 'adamw_gpu_stacked', or 'm3', got '{self.optimizer}'")
+        if self.optimizer == "m3":
+            if self.m3_ns_iterations < 1:
+                raise ValueError(f"m3_ns_iterations must be >= 1, got {self.m3_ns_iterations}")
+            if self.m3_chunk_size < 1:
+                raise ValueError(f"m3_chunk_size must be >= 1, got {self.m3_chunk_size}")
+            for name, val in [("m3_beta1", self.m3_beta1), ("m3_beta2", self.m3_beta2),
+                              ("m3_beta3", self.m3_beta3)]:
+                if not (0.0 < val < 1.0):
+                    raise ValueError(f"{name} must be in (0, 1), got {val}")
+            if self.m3_alpha < 0.0:
+                raise ValueError(f"m3_alpha must be >= 0, got {self.m3_alpha}")
         if self.lr <= 0:
             raise ValueError("lr must be positive")
         if self.max_grad_norm < 0:

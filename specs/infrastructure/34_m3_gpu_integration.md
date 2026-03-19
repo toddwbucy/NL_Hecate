@@ -124,11 +124,10 @@ is active.
 ## Scope
 
 ### Files to modify
-- `core/src/gpu_optimizer.rs` — add GpuM3State, GpuM3Config, gpu_m3_update()
-- `core/src/m3.rs` — add GPU NS wrapper, update M3Config for 2D/1D split
-- `core/kernels/m3_ema.cu` — fused EMA kernel
-- `core/kernels/m3_apply.cu` — 1D and 2D apply kernels
-- `python/src/lib.rs` — PyO3 bindings for M3
+- `core/src/gpu_optimizer.rs` — GpuM3State, GpuM3Config, gpu_m3_update(), m3_ns_apply()
+- `core/kernels/m3_optimizer.cu` — EMA, 1D/2D apply, Frobenius norm, scale, NS polynomial kernels
+- `core/src/cuda_ffi.rs` — FFI declarations for M3 CUDA kernels
+- `python/src/lib.rs` — PyO3 bindings (init_m3, step_m3)
 - `python/engine/config.py` — M3 config fields
 - `python/engine/loop.py` — optimizer dispatch
 
