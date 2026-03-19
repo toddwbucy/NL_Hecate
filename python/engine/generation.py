@@ -1,7 +1,8 @@
-"""Autoregressive generation: standard, KV-cached, and learning modes."""
+"""Autoregressive generation: standard, KV-cached, stacked, and learning modes."""
 
 import math
 import random
+import time
 
 import nl_hecate
 
@@ -249,6 +250,58 @@ def generate_learning(
     return seq, losses, grad_norms
 
 
+# ── Stacked model generation (GpuStackedModel.forward) ───────────
+
+def generate_stacked(
+    gpu_model,
+    cfg,
+    prompt_tokens: list[int],
+    max_tokens: int = 64,
+    temperature: float = 0.8,
+    top_k: int = 0,
+    stop_token: int | None = None,
+    conductor=None,
+) -> list[int]:
+    """
+    Autoregressive generation using GpuStackedModel.forward().
+
+    Uses full forward pass per token (no KV cache). Slower than cached decode
+    but works with multi-block stacked models that don't have prefill/decode_token.
+    """
+    seq = list(prompt_tokens)
+    vocab = cfg.vocab_size
+    seq_len = cfg.seq_len
+
+    if conductor is None:
+        conductor = nl_hecate.Conductor(
+            cfg.k, list(cfg.chunk_sizes) if hasattr(cfg, 'chunk_sizes') else [1] * cfg.k)
+
+    safe_pad = _safe_pad_token(prompt_tokens, vocab)
+
+    for i in range(max_tokens):
+        # Take last seq_len tokens as context window
+        ctx = seq[-seq_len:]
+        while len(ctx) < seq_len:
+            ctx = [safe_pad, *ctx]
+
+        # Forward pass — target_ids = shifted input (dummy for loss, we want logits)
+        target = ctx[1:] + [safe_pad]
+        pulse = conductor.pulse()
+        _loss, logits_flat = gpu_model.forward(ctx, target, pulse)
+        conductor.advance()
+
+        # Extract last-position logits
+        last_logits = logits_flat[(seq_len - 1) * vocab: seq_len * vocab]
+        next_tok = _sample_token(last_logits, vocab, temperature, top_k)
+
+        if stop_token is not None and next_tok == stop_token:
+            break
+
+        seq.append(next_tok)
+
+    return seq
+
+
 # ── Unified generation entry point ───────────────────────────────
 
 def generate(
@@ -271,8 +324,10 @@ def generate(
 
     Routes to the appropriate backend: learning, KV-cached GPU, or CPU.
     """
+    is_stacked = hasattr(gpu_model, 'n_blocks') if gpu_model is not None else False
+
     # Delegate to learning path for GPU models with --learn
-    if gpu_model is not None and learn:
+    if gpu_model is not None and learn and not is_stacked:
         kw = learn_kwargs or {}
         seq, _losses, _gnorms = generate_learning(
             gpu_model, cfg, prompt_tokens, max_tokens,
@@ -280,7 +335,14 @@ def generate(
         )
         return seq
 
-    # Delegate to KV-cached path for GPU models
+    # Stacked models use forward()-based generation
+    if gpu_model is not None and is_stacked:
+        return generate_stacked(
+            gpu_model, cfg, prompt_tokens, max_tokens,
+            temperature, top_k, stop_token, conductor,
+        )
+
+    # Delegate to KV-cached path for single-block GPU models
     if gpu_model is not None:
         return generate_cached(
             gpu_model, cfg, prompt_tokens, max_tokens,

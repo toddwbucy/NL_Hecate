@@ -155,28 +155,62 @@ modes:
 
 
 def _load_model(args):
-    """Load checkpoint, tokenizer, and optionally GPU model."""
+    """Load checkpoint, tokenizer, and optionally GPU model.
+
+    Detects stacked (multi-block) vs single-block checkpoints automatically.
+    Stacked checkpoints use GpuStackedModel; single-block use GpuModel.
+    """
     if not os.path.isfile(args.checkpoint):
         print(f"Error: checkpoint not found: {args.checkpoint}", file=sys.stderr)
         sys.exit(1)
     print(f"Loading checkpoint: {args.checkpoint}")
-    params, cfg = nl_hecate.load_checkpoint(args.checkpoint)
-    print(f"  Model: d={cfg.d_model}, heads={cfg.num_heads}, "
-          f"seq_len={cfg.seq_len}, vocab={cfg.vocab_size}")
-    print(f"  Memory: rule={cfg.memory_rule}, composition={cfg.composition}, k={cfg.k}")
-    print(f"  Params: {params.num_params():,}")
+
+    # Detect stacked vs single-block checkpoint
+    is_stacked = (
+        hasattr(nl_hecate, "is_stacked_checkpoint")
+        and nl_hecate.is_stacked_checkpoint(args.checkpoint)
+    )
+
+    gpu_model = None
+    use_gpu = not args.cpu
+
+    if is_stacked:
+        result = nl_hecate.load_stacked_checkpoint(args.checkpoint)
+        cfg = result["config"]
+        n_blocks = result["n_blocks"]
+        params_json = result["params_json"]
+        print(f"  Model: d={cfg.d_model}, heads={cfg.num_heads}, "
+              f"seq_len={cfg.seq_len}, vocab={cfg.vocab_size}")
+        print(f"  Memory: rule={cfg.memory_rule}, composition={cfg.composition}, k={cfg.k}")
+        print(f"  Stacked: {n_blocks} blocks")
+
+        if use_gpu and hasattr(nl_hecate, "GpuStackedModel"):
+            gpu_model = nl_hecate.GpuStackedModel.from_params_json(
+                params_json, cfg, n_blocks,
+                batch_size=1, memory_reset=True)
+            print(f"  Params: {gpu_model.total_params():,}")
+            print("  Device: GPU (stacked)")
+        else:
+            print("  Error: stacked checkpoints require GPU + CUDA build",
+                  file=sys.stderr)
+            sys.exit(1)
+        params = None
+    else:
+        params, cfg = nl_hecate.load_checkpoint(args.checkpoint)
+        print(f"  Model: d={cfg.d_model}, heads={cfg.num_heads}, "
+              f"seq_len={cfg.seq_len}, vocab={cfg.vocab_size}")
+        print(f"  Memory: rule={cfg.memory_rule}, composition={cfg.composition}, k={cfg.k}")
+        print(f"  Params: {params.num_params():,}")
+
+        if use_gpu and hasattr(nl_hecate, "GpuModel"):
+            gpu_model = nl_hecate.GpuModel.from_params(params, cfg)
+            print("  Device: GPU")
+        else:
+            print("  Device: CPU")
 
     tokenizer = load_tokenizer(args.tokenizer, args.data_dir)
     tok_type = "BPE" if isinstance(tokenizer, BpeTokenizer) else "byte-level"
     print(f"  Tokenizer: {tok_type}")
-
-    gpu_model = None
-    use_gpu = not args.cpu and hasattr(nl_hecate, "GpuModel")
-    if use_gpu:
-        gpu_model = nl_hecate.GpuModel.from_params(params, cfg)
-        print("  Device: GPU")
-    else:
-        print("  Device: CPU")
 
     return params, cfg, tokenizer, gpu_model
 
