@@ -65,6 +65,8 @@ fn main() {
             .file("kernels/tnt_forward.cu")
             .file("kernels/tnt_backward.cu")
             .file("kernels/layer_norm.cu")
+            .file("kernels/moneta_forward.cu")
+            .file("kernels/moneta_backward.cu")
             .compile("nl_hecate_cuda_kernels");
 
         println!("cargo:rustc-link-search=native={}/lib64", cuda_path);
@@ -91,6 +93,8 @@ fn main() {
         println!("cargo:rerun-if-changed=kernels/gate_backward.cu");
         println!("cargo:rerun-if-changed=kernels/tnt_forward.cu");
         println!("cargo:rerun-if-changed=kernels/tnt_backward.cu");
+        println!("cargo:rerun-if-changed=kernels/moneta_forward.cu");
+        println!("cargo:rerun-if-changed=kernels/moneta_backward.cu");
         println!("cargo:rerun-if-changed=kernels/error_clip.cuh");
     }
 }

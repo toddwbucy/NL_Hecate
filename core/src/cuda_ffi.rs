@@ -576,6 +576,71 @@ extern "C" {
         seq_len: i32, vocab: i32, inv_count: f32,
     );
 
+    // ── MLP memory kernels (MONETA + YAAD, all f32) ─────────────────────
+
+    /// CUDA MONETA (l_p bias) forward inner loop (all f32).
+    ///
+    /// 2-layer MLP memory: W1[d_hidden, d], W2[d, d_hidden].
+    /// Runs sequential recurrence with l_p attentional bias and L2/Lq retention.
+    /// w1_states/w2_states: [(s+1)*w_size] trajectory storage.
+    /// Source: MIRAS (2504.13173); core/src/moneta.rs
+    pub(crate) fn mlp_forward_lp_f32_cuda(
+        k_mem: *const f32, v_mem: *const f32, q_mem: *const f32,
+        alpha: *const f32, theta: *const f32,
+        w1_initial: *const f32, w2_initial: *const f32,
+        w1_states: *mut f32, w2_states: *mut f32, y: *mut f32,
+        seq_len: i32, d: i32, d_hidden: i32,
+        lp_p: f32, sign_sharpness: f32, lambda_2: f32, lq_q: f32,
+    );
+
+    /// CUDA YAAD (Huber bias) forward inner loop (all f32).
+    ///
+    /// Same MLP structure as MONETA but with Huber attentional bias
+    /// and decoupled L2 retention (requires boundary snapshots).
+    /// Source: MIRAS (2504.13173); core/src/yaad.rs
+    pub(crate) fn mlp_forward_huber_f32_cuda(
+        k_mem: *const f32, v_mem: *const f32, q_mem: *const f32,
+        alpha: *const f32, theta: *const f32,
+        w1_initial: *const f32, w2_initial: *const f32,
+        w1_boundary: *const f32, w2_boundary: *const f32,
+        w1_states: *mut f32, w2_states: *mut f32, y: *mut f32,
+        seq_len: i32, d: i32, d_hidden: i32,
+        huber_delta: f32, lambda_local: f32, lambda_2: f32,
+    );
+
+    /// CUDA MONETA (l_p bias) backward inner loop (all f32, q=2 only).
+    ///
+    /// Produces gradients on k_mem, v_mem, q_mem, alpha, theta, w1_initial, w2_initial.
+    /// LQ backward (q > 2) is deferred — current kernel only supports L2 retention.
+    pub(crate) fn mlp_backward_lp_f32_cuda(
+        k_mem: *const f32, v_mem: *const f32, q_mem: *const f32,
+        alpha: *const f32, theta: *const f32,
+        w1_states: *const f32, w2_states: *const f32,
+        d_y: *const f32,
+        d_k_mem: *mut f32, d_v_mem: *mut f32, d_q_mem: *mut f32,
+        d_alpha: *mut f32, d_theta: *mut f32,
+        d_w1_initial: *mut f32, d_w2_initial: *mut f32,
+        seq_len: i32, d: i32, d_hidden: i32,
+        lp_p: f32, sign_sharpness: f32, lambda_2: f32, lq_q: f32,
+    );
+
+    /// CUDA YAAD (Huber bias) backward inner loop (all f32).
+    ///
+    /// Same structure as MONETA backward but with Huber gradient
+    /// and decoupled L2 retention (uses boundary snapshots).
+    pub(crate) fn mlp_backward_huber_f32_cuda(
+        k_mem: *const f32, v_mem: *const f32, q_mem: *const f32,
+        alpha: *const f32, theta: *const f32,
+        w1_states: *const f32, w2_states: *const f32,
+        w1_boundary: *const f32, w2_boundary: *const f32,
+        d_y: *const f32,
+        d_k_mem: *mut f32, d_v_mem: *mut f32, d_q_mem: *mut f32,
+        d_alpha: *mut f32, d_theta: *mut f32,
+        d_w1_initial: *mut f32, d_w2_initial: *mut f32,
+        seq_len: i32, d: i32, d_hidden: i32,
+        huber_delta: f32, lambda_local: f32, lambda_2: f32,
+    );
+
     // ── SwiGLU MLP device-to-device kernels ────────────────────────────
     // Zero-PCIe variants used in the GPU training path. All pointers are
     // device memory. Caller provides pre-allocated GpuBuf<f32> buffers.
