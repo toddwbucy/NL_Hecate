@@ -22,6 +22,41 @@ _ATTENTIONAL_BIASES = {"l2", "l1", "lp", "kl", "huber"}
 _RETENTION_KINDS = {"l2_weight_decay", "kl_divergence", "elastic_net", "sphere_normalization"}
 
 
+def _deprecated_checkpoint_fields(flat: dict) -> None:
+    """Spec 32: migrate eval_every/tape_every → save_every with deprecation warnings."""
+    if "eval_every" in flat:
+        if "save_every" not in flat:
+            flat["save_every"] = flat["eval_every"]
+            warnings.warn(
+                f"eval_every={flat['eval_every']} is deprecated (spec 32). "
+                f"Mapped to save_every={flat['save_every']}. "
+                "Use save_every directly in config.",
+                DeprecationWarning, stacklevel=3,
+            )
+        else:
+            warnings.warn(
+                f"eval_every={flat['eval_every']} ignored — save_every={flat['save_every']} "
+                "takes precedence (spec 32).",
+                DeprecationWarning, stacklevel=3,
+            )
+    for old_field in ("tape_every", "eval_max_chunks"):
+        if old_field in flat and flat[old_field]:
+            warnings.warn(
+                f"{old_field} is deprecated (spec 32) and ignored. "
+                "Tape diagnostics fire at checkpoint cadence (save_every).",
+                DeprecationWarning, stacklevel=3,
+            )
+    for old_field in ("val_path", "val_doc_starts_path",
+                      "window_local_val", "window_val_tokens"):
+        if old_field in flat:
+            warnings.warn(
+                f"{old_field} is deprecated (spec 32) and ignored. "
+                "Coherence samples use the build stream (CS-10).",
+                DeprecationWarning, stacklevel=3,
+            )
+            del flat[old_field]
+
+
 class BuildConfig:
     """Validated build configuration. Replaces raw dict parsing.
 
@@ -103,15 +138,17 @@ class BuildConfig:
     val_path: str | None = None  # byte-level val corpus
     val_doc_starts_path: str | None = None  # val doc boundaries
 
-    # Eval
-    eval_every: int = 0  # 0 = disabled; evaluate on val set every N steps
-    eval_max_chunks: int = 100  # max chunks per eval pass
+    # Checkpoint event (spec 32): save + tape + coherence sample fire together
+    coher_sample: bool = True    # Decode coherence sample at each checkpoint event
 
-    # Probe tuning (learning probes fire at every eval; these control their cost)
-    probe_max_tokens: int = 20   # tokens generated per learning probe (was hardcoded 60)
-    probe_prompts: int = 1       # how many EVAL_PROMPTS to run for probe1 (1–4)
-    tape_every: int = 0          # 0 = same as eval_every; set to a multiple (e.g. 4×) to run
-    #                            # tape_forward_summary less often (it runs a CPU forward pass)
+    # Probe tuning (probes fire at each checkpoint event; these control their cost)
+    probe_max_tokens: int = 20   # tokens generated per probe (was hardcoded 60)
+    probe_prompts: int = 1       # how many EVAL_PROMPTS to run for probe1 (1-4)
+
+    # Deprecated fields (backward compat — mapped to save_every, logged as warnings)
+    eval_every: int = 0          # DEPRECATED: use save_every
+    eval_max_chunks: int = 100   # DEPRECATED: ignored (single-chunk coherence sample)
+    tape_every: int = 0          # DEPRECATED: tape fires at checkpoint cadence
 
     # Parameter saturation detection (task_962e72)
     # Tracks per-level EMA of gradient norm at each slow_level_fire event.
@@ -516,6 +553,8 @@ class BuildConfig:
                     raise ValueError(
                         f"manifest.json at {manifest_path} missing "
                         f"'tokenizer.vocab_size' key")
+        # Spec 32 backward compat: eval_every → save_every migration
+        _deprecated_checkpoint_fields(flat)
         return cls(**flat)
 
     def apply_cli(self, args: argparse.Namespace):
@@ -530,7 +569,7 @@ class BuildConfig:
             "warmup_steps": "warmup_steps", "weight_decay": "weight_decay",
             "beta1": "beta1", "beta2": "beta2", "max_grad_norm": "max_grad_norm",
             "load": "load", "log_file": "log_file",
-            "eval_every": "eval_every", "eval_max_chunks": "eval_max_chunks",
+            # eval_every handled separately below (must not overwrite explicit --save_every)
             "checkpoint_interval": "checkpoint_interval",
             "batch_size": "batch_size",
             "projection_kind": "projection_kind",
@@ -549,6 +588,15 @@ class BuildConfig:
                 if cli_name == "chunk_sizes" and isinstance(val, str):
                     val = [int(x) for x in val.split(",") if x]
                 setattr(self, cfg_name, val)
+        # --eval_every backward compat: only apply if --save_every not explicitly set
+        cli_eval = getattr(args, "eval_every", None)
+        if cli_eval is not None and getattr(args, "save_every", None) is None:
+            warnings.warn(
+                f"--eval_every={cli_eval} is deprecated (spec 32). "
+                f"Mapped to save_every={cli_eval}. Use --save_every directly.",
+                DeprecationWarning, stacklevel=2,
+            )
+            self.save_every = cli_eval
         # --cpu overrides the default GPU mode
         if getattr(args, "cpu", False):
             self.gpu = False

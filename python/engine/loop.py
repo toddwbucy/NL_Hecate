@@ -51,28 +51,6 @@ def _safetensors_path(path_str: str) -> str:
 _NUMPY_LOADER_FORMATS = frozenset({"sharegpt", "dolmino", "smollm"})
 
 
-def _carve_window_val(loader: BpeTokenStream, val_tokens: int,
-                      cursor_pos: int = 0):
-    """Carve a validation slice from the END of the remaining training window.
-
-    Returns (val_tokens_np, val_targets_np, val_boundary) where val_boundary
-    is the token position where training must stop (BpeTokenStream wraps at
-    corpus end, so the caller must enforce this).
-
-    Spec 12 §5: each phase gets its own val slice from its own data window.
-    No level ever re-encounters val data from a prior lifetime.
-    """
-    total = loader.total_tokens
-    remaining = total - cursor_pos
-    val_size = min(val_tokens, remaining // 5)  # Never more than 20% of remaining
-    if val_size < 100:
-        return None, None, total  # Not enough data for meaningful val
-    val_boundary = total - val_size
-    return (loader.tokens[val_boundary:total],
-            loader.targets[val_boundary:total],
-            val_boundary)
-
-
 def run_build(bcfg: BuildConfig):
     """Execute the full build loop. All state managed internally."""
 
@@ -98,10 +76,8 @@ def run_build(bcfg: BuildConfig):
     active_loader: BpeTokenStream | None = None
     token_ids: list[int] | MmapTokenStream | None = None
 
-    val_stream: BpeTokenStream | None = None
-    # Window-local val: numpy slices from current training window (spec 12 §5)
-    _window_val_tokens = None  # np.ndarray or None
-    _window_val_targets = None
+    # Deprecated: val_stream removed by spec 32 (unified checkpoint event).
+    # Coherence samples use the build stream, not a separate val corpus.
 
     if use_bpe:
         if bcfg.data_format == "smollm":
@@ -117,30 +93,7 @@ def run_build(bcfg: BuildConfig):
             print(f"Error: data too short ({len(active_loader)} tokens < seq_len={bcfg.seq_len}, "
                   f"format={bcfg.data_format})")
             return
-        if bcfg.eval_every > 0:
-            if bcfg.window_local_val:
-                # Window-local val carve is deferred until after cursor restore
-                # (see below). This ensures the val slice comes from the END of
-                # the remaining training window, not from already-consumed data.
-                pass
-            else:
-                if bcfg.data_format == "smollm":
-                    val_shard_dir = Path(bcfg.data_path) / "val"
-                    if val_shard_dir.exists() and list(val_shard_dir.glob("shard_*.bin")):
-                        val_stream = ShardTokenStream(bcfg.data_path, split="val")
-                        print(f"Loaded val set: {len(val_stream):,} tokens "
-                              f"({len(val_stream._shards)} shards)")
-                    else:
-                        print("Warning: eval_every set but no val shards found, disabling eval")
-                        bcfg.eval_every = 0
-                else:
-                    val_path = Path(bcfg.data_path) / "val_tokens.npy"
-                    if val_path.exists():
-                        val_stream = BpeTokenStream(bcfg.data_path, split="val")
-                        print(f"Loaded val set: {len(val_stream):,} tokens")
-                    else:
-                        print("Warning: eval_every set but no val data found, disabling eval")
-                        bcfg.eval_every = 0  # safe: bcfg is consumed only by this function
+        # Spec 32: val stream loading removed — coherence samples use build stream
     elif bcfg.data_path:
         if bcfg.data_path.endswith(".bin"):
             fsize = os.path.getsize(bcfg.data_path)
@@ -167,21 +120,7 @@ def run_build(bcfg: BuildConfig):
         doc_starts = np.load(bcfg.doc_starts_path).astype(np.uint64)
         print(f"Loaded {len(doc_starts):,} document boundaries from {bcfg.doc_starts_path}")
 
-    # ── Load byte-level val data ─────────────────────────────────────
-    val_bytes: bytes | None = None
-    val_doc_starts = None
-    if not use_bpe and bcfg.eval_every > 0 and bcfg.val_path:
-        if os.path.exists(bcfg.val_path):
-            with open(bcfg.val_path, "rb") as f:
-                val_bytes = f.read()
-            print(f"Loaded val corpus: {len(val_bytes):,} bytes from {bcfg.val_path}")
-            if bcfg.val_doc_starts_path and os.path.exists(bcfg.val_doc_starts_path):
-                val_doc_starts = np.load(bcfg.val_doc_starts_path).astype(np.uint64)
-                print(f"Loaded {len(val_doc_starts):,} val document boundaries")
-            val_stream = val_bytes  # evaluate() accepts bytes for byte-level
-        else:
-            print(f"Warning: val_path {bcfg.val_path} not found, disabling eval")
-            bcfg.eval_every = 0
+    # Spec 32: byte-level val loading removed — no separate val corpus
 
     if not use_bpe and token_ids is not None and len(token_ids) < bcfg.seq_len + 1:
         print(f"Error: text too short ({len(token_ids)} tokens < seq_len+1={bcfg.seq_len + 1})")
@@ -189,7 +128,7 @@ def run_build(bcfg: BuildConfig):
 
     # ── Load tokenizer for sample generation ──────────────────────────
     tokenizer = None
-    if use_bpe and (bcfg.save_every > 0 or bcfg.eval_every > 0 or bcfg.auto_promote):
+    if use_bpe and (bcfg.save_every > 0 or bcfg.auto_promote):
         tokenizer = load_tokenizer(data_dir=bcfg.data_path)
         tok_type = "BPE" if isinstance(tokenizer, BpeTokenizer) else "byte-level"
         print(f"Tokenizer for samples: {tok_type}")
@@ -738,11 +677,11 @@ def run_build(bcfg: BuildConfig):
     if bcfg.max_grad_norm > 0:
         print(f"  Grad clip: max_norm={bcfg.max_grad_norm}")
     print(f"  Device:   {'GPU' if use_gpu else 'CPU'}")
-    if bcfg.eval_every > 0:
-        tape_eff_disp = bcfg.tape_every if bcfg.tape_every > 0 else bcfg.eval_every
-        print(f"  Eval:     every {bcfg.eval_every} steps, {bcfg.eval_max_chunks} max chunks")
+    if bcfg.save_every > 0:
+        tape_device = getattr(bcfg, "tape_device", "off")
+        print(f"  Checkpoint: every {bcfg.save_every} steps (save + tape + coherence)")
         print(f"  Probes:   {bcfg.probe_prompts} prompt(s), {bcfg.probe_max_tokens} tokens each  "
-              f"| tape every {tape_eff_disp} steps")
+              f"| tape_device={tape_device}")
     if bcfg.log_file:
         print(f"  Log:      {bcfg.log_file}")
     print(f"{'=' * 60}\n")
@@ -918,23 +857,7 @@ def run_build(bcfg: BuildConfig):
     if gpu_model is not None and hasattr(gpu_model, "memory_norms"):
         level_param_norms_init = list(gpu_model.memory_norms())
 
-    # ── Deferred window-local val carve ─────────────────────────────
-    # Must happen AFTER cursor restore so val comes from the END of the
-    # remaining training window, not from already-consumed data.
-    _window_val_boundary = None  # token position where training must stop
-    if bcfg.window_local_val and active_loader is not None and bcfg.eval_every > 0:
-        if bcfg.batch_size > 1:
-            print("Warning: window_local_val disabled for batch_size > 1 "
-                  "(per-slot loaders have independent cursors)")
-        else:
-            cursor_pos = active_loader.cursor()["position"]
-            _window_val_tokens, _window_val_targets, _window_val_boundary = _carve_window_val(
-                active_loader, bcfg.window_val_tokens, cursor_pos)
-            if _window_val_tokens is not None:
-                print(f"Window-local val: {len(_window_val_tokens):,} tokens "
-                      f"from training window end (boundary={_window_val_boundary:,})")
-            else:
-                print("Window-local val: not enough data remaining, eval disabled")
+    # Spec 32: window-local val removed (coherence samples use build stream)
 
     losses = []
     t_start = time.perf_counter()
@@ -944,17 +867,6 @@ def run_build(bcfg: BuildConfig):
 
     for step in range(resume_step, end_step):
         if use_bpe:
-            # Enforce window-local val boundary: stop before training into val data
-            if _window_val_boundary is not None:
-                _loaders_to_check = bpe_loaders if bpe_loaders else (
-                    [active_loader] if active_loader is not None else [])
-                if any(ld.position + bcfg.seq_len >= _window_val_boundary
-                       for ld in _loaders_to_check):
-                    max_pos = max(ld.position for ld in _loaders_to_check)
-                    print(f"  [window-val] Reached val boundary at position "
-                          f"{max_pos:,}/{_window_val_boundary:,}, "
-                          f"stopping at step {step}")
-                    break
             if bcfg.batch_size > 1:
                 if gpu_model is None or not use_adamw_gpu:
                     raise RuntimeError(
@@ -1333,7 +1245,7 @@ def run_build(bcfg: BuildConfig):
             # Component 1: per-level gnorms in JSONL
             if level_gnorms:
                 log_fields["level_grad_norms"] = [round(n, 6) for n in level_gnorms]
-            if (bcfg.eval_every > 0 and step % bcfg.eval_every == 0
+            if (bcfg.save_every > 0 and step % bcfg.save_every == 0
                     and gpu_model is not None
                     and hasattr(gpu_model, "memory_norms")):
                 log_fields["memory_norms"] = [
@@ -1400,68 +1312,132 @@ def run_build(bcfg: BuildConfig):
             level3_prev_fires = level3_total_fires
             level3_prev_active = level3_active_fires
 
-        # Component 4: level activity heatmap at eval intervals.
-        # Stats computed over active-step samples only (same as dead level check).
-        if (jsonl and bcfg.eval_every > 0 and step > 0
-                and step % bcfg.eval_every == 0):
-            heatmap_levels = []
-            for i in range(bcfg.k):
-                hist = level_gnorm_history[i]
-                n_samples = len(hist)
-                win_avg = sum(hist) / n_samples if n_samples else 0.0
-                win_min = min(hist) if n_samples else 0.0
-                win_max = max(hist) if n_samples else 0.0
-                is_dead = (n_samples >= _DEAD_LEVEL_MIN_SAMPLES
-                           and win_avg < _DEAD_LEVEL_THRESHOLD)
-                heatmap_levels.append({
-                    "level": i,
-                    "fires": level_fire_counts[i],
-                    "active_samples": n_samples,
-                    "gnorm_avg": round(win_avg, 6),
-                    "gnorm_min": round(win_min, 6),
-                    "gnorm_max": round(win_max, 6),
-                    "dead": is_dead,
-                })
-            jsonl.log(event="level_heatmap", step=step, levels=heatmap_levels)
+        # ══════════════════════════════════════════════════════════════
+        # Spec 32: Unified checkpoint event — save + tape + coherence
+        # One cadence (save_every) replaces eval_every/tape_every/save_every.
+        # ══════════════════════════════════════════════════════════════
+        if bcfg.save_every > 0 and step > 0 and step % bcfg.save_every == 0:
 
-        _has_val = (val_stream is not None or _window_val_tokens is not None)
-        if (bcfg.eval_every > 0 and _has_val
-                and step > 0 and step % bcfg.eval_every == 0
-                and not is_stacked):
-            saved_ctx = None
-            try:
+            # ── 1. Level activity heatmap ──────────────────────────────
+            if jsonl:
+                heatmap_levels = []
+                for i in range(bcfg.k):
+                    hist = level_gnorm_history[i]
+                    n_samples = len(hist)
+                    win_avg = sum(hist) / n_samples if n_samples else 0.0
+                    win_min = min(hist) if n_samples else 0.0
+                    win_max = max(hist) if n_samples else 0.0
+                    is_dead = (n_samples >= _DEAD_LEVEL_MIN_SAMPLES
+                               and win_avg < _DEAD_LEVEL_THRESHOLD)
+                    heatmap_levels.append({
+                        "level": i,
+                        "fires": level_fire_counts[i],
+                        "active_samples": n_samples,
+                        "gnorm_avg": round(win_avg, 6),
+                        "gnorm_min": round(win_min, 6),
+                        "gnorm_max": round(win_max, 6),
+                        "dead": is_dead,
+                    })
+                jsonl.log(event="level_heatmap", step=step, levels=heatmap_levels)
+
+            # ── 2. Save checkpoint (safetensors + cursor sidecar) ──────
+            if is_stacked and gpu_model is not None:
+                p = Path(_safetensors_path(bcfg.save_path))
+                ckpt_path = str(p.with_stem(f"{p.stem}_step{step}"))
+                os.makedirs(os.path.dirname(ckpt_path) or ".", exist_ok=True)
+                nl_hecate.save_stacked_checkpoint(
+                    ckpt_path, gpu_model,
+                    conductor=conductor, context=context)
+                sidecar = Path(str(ckpt_path) + ".cursor.json")
+                if bpe_loaders:
+                    sidecar.write_text(json.dumps(
+                        {"slots": [loader.cursor() for loader in bpe_loaders],
+                         "level_start_cursor": _level_start_cursor}, indent=2))
+                elif active_loader is not None:
+                    cursor_data = active_loader.cursor()
+                    cursor_data["level_start_cursor"] = _level_start_cursor
+                    sidecar.write_text(json.dumps(cursor_data, indent=2))
+                print(f"  [checkpoint saved: {ckpt_path}]")
+            elif not is_stacked:
                 if gpu_model is not None:
-                    saved_ctx = gpu_model.to_host_context()
-                    gpu_model.reset_context()
-                if _window_val_tokens is not None:
-                    # Window-local val: eval on data the model hasn't trained on
-                    eval_loss, eval_ppl = evaluate_numpy(
-                        gpu_model, bcfg, _window_val_tokens,
-                        _window_val_targets, max_chunks=bcfg.eval_max_chunks)
+                    params = gpu_model.to_host_params()
+                    context = gpu_model.to_host_context()
+                p = Path(_safetensors_path(bcfg.save_path))
+                ckpt_path = str(p.with_stem(f"{p.stem}_step{step}"))
+                os.makedirs(os.path.dirname(ckpt_path) or ".", exist_ok=True)
+                if use_bpe:
+                    nl_hecate.save_checkpoint_with_context(ckpt_path, params, cfg, conductor, context)
                 else:
-                    eval_loss, eval_ppl = evaluate(
-                        gpu_model, bcfg, val_stream, bcfg.eval_max_chunks,
-                        val_doc_starts=val_doc_starts)
-            finally:
-                if gpu_model is not None and saved_ctx is not None:
-                    gpu_model.upload_context(saved_ctx)
-            print(f"  [eval] step {step:5d}  loss={eval_loss:.4f}  ppl={eval_ppl:.1f}")
-            if gpu_model is not None and hasattr(gpu_model, "gate_biases"):
-                print_level_metrics(gpu_model, bcfg.k)
+                    nl_hecate.save_build_checkpoint(ckpt_path, params, cfg, conductor, context)
+                sidecar = Path(str(ckpt_path) + ".cursor.json")
+                if bpe_loaders:
+                    sidecar.write_text(json.dumps(
+                        {"slots": [loader.cursor() for loader in bpe_loaders],
+                         "level_start_cursor": _level_start_cursor}, indent=2))
+                elif active_loader is not None:
+                    cursor_data = active_loader.cursor()
+                    cursor_data["level_start_cursor"] = _level_start_cursor
+                    sidecar.write_text(json.dumps(cursor_data, indent=2))
+                print(f"  [checkpoint saved: {ckpt_path}]")
+
+                # Per-level parameter drift (||M_t||_F vs ||M_0||_F)
+                if jsonl and gpu_model is not None and hasattr(gpu_model, "memory_norms"):
+                    cur_norms = list(gpu_model.memory_norms())
+                    drift_info = []
+                    for i, cur_n in enumerate(cur_norms):
+                        init_n = level_param_norms_init[i] if i < len(level_param_norms_init) else 0.0
+                        drift_info.append({
+                            "level": i,
+                            "norm_init": round(init_n, 6),
+                            "norm_now": round(cur_n, 6),
+                            "norm_ratio": round(cur_n / init_n, 4) if init_n > 1e-8 else None,
+                        })
+                    jsonl.log(event="level_param_drift", step=step, levels=drift_info)
+
+                # Checkpoint roundtrip verification
+                if use_gpu:
+                    v_model = None
+                    try:
+                        if use_bpe:
+                            v_params, v_cfg = nl_hecate.load_checkpoint(ckpt_path)
+                        else:
+                            v_params, v_cfg, _ = nl_hecate.load_build_checkpoint(ckpt_path)
+                        v_model = nl_hecate.GpuModel.from_params(
+                            v_params, v_cfg, batch_size=bcfg.batch_size,
+                            memory_reset=(bcfg.memory_reset == "periodic"))
+                        rt_input = list(input_ids[:bcfg.seq_len])
+                        rt_target = list(target_ids[:bcfg.seq_len])
+                        rt_ctx = gpu_model.to_host_context()
+                        try:
+                            v_model.upload_context(rt_ctx)
+                            train_fwd, _ = gpu_model.forward(rt_input, rt_target, pulse)
+                            verify_fwd, _ = v_model.forward(rt_input, rt_target, pulse)
+                        finally:
+                            gpu_model.upload_context(rt_ctx)
+                        delta = abs(verify_fwd - train_fwd)
+                        if jsonl:
+                            jsonl.log(event="checkpoint_roundtrip", step=step,
+                                      delta=delta, loss=train_fwd,
+                                      verify_loss=verify_fwd)
+                        if delta > 1e-6:
+                            print(f"  [WARNING] checkpoint roundtrip "
+                                  f"delta={delta:.2e}")
+                        else:
+                            print(f"  [checkpoint roundtrip OK, "
+                                  f"delta={delta:.2e}]")
+                    except (OSError, RuntimeError, ValueError) as e:
+                        print(f"  [checkpoint roundtrip failed: {e}]")
+                    finally:
+                        del v_model
+
+            # ── 3. Tape diagnostic ─────────────────────────────────────
             tape_device = getattr(bcfg, "tape_device", "off")
-            tape_enabled = tape_device != "off"
-            tape_eff = bcfg.tape_every if bcfg.tape_every > 0 else bcfg.eval_every
-            if (tape_eff > 0 and step % tape_eff == 0
+            if (tape_device != "off"
                     and gpu_model is not None
-                    and tape_enabled
                     and input_ids is not None and target_ids is not None
                     and max(target_ids) < bcfg.vocab_size):
-                # Skip silently when batch contains masked targets (vocab_size sentinel).
-                # The Rust binding rejects target_ids >= vocab_size; masked batches are
-                # normal (all-user-turn chunks) and should not generate warning noise.
                 try:
                     if is_stacked and tape_device == "cpu":
-                        # Stacked model -- CPU Wengert tape for full gradient observability
                         if not hasattr(gpu_model, "cpu_stacked_tape_summary"):
                             raise RuntimeError(
                                 "tape_device='cpu' requested for stacked model but "
@@ -1471,7 +1447,6 @@ def run_build(bcfg: BuildConfig):
                             input_ids, target_ids, pulse
                         )
                     elif is_stacked and hasattr(gpu_model, "gpu_stacked_tape_summary"):
-                        # Stacked model -- per-(block, level) diagnostics (GPU fast path)
                         tape_sum = gpu_model.gpu_stacked_tape_summary(
                             input_ids, target_ids, pulse
                         )
@@ -1484,7 +1459,6 @@ def run_build(bcfg: BuildConfig):
                             input_ids, target_ids, pulse
                         )
                     elif hasattr(gpu_model, "gpu_tape_forward_summary"):
-                        # Fallback: prefer GPU if available
                         tape_sum = gpu_model.gpu_tape_forward_summary(
                             input_ids, target_ids, pulse
                         )
@@ -1501,17 +1475,38 @@ def run_build(bcfg: BuildConfig):
                         print_tape_summary(tape_sum, step)
                         if jsonl:
                             jsonl.log(event="tape_summary", step=step, **tape_sum)
+
+            # ── 4. Level metrics + fire counts ─────────────────────────
+            if gpu_model is not None and hasattr(gpu_model, "gate_biases"):
+                print_level_metrics(gpu_model, bcfg.k)
             if bcfg.k > 1:
                 fires_str = "  ".join(f"L{i}:{level_fire_counts[i]}" for i in range(bcfg.k))
                 print(f"    [fires] {fires_str}")
                 level_fire_counts = [0] * bcfg.k
-            # ── Learning probes (CS-10: model learns during eval) ─────
-            snapshot = None
-            if gpu_model is not None and tokenizer is not None:
+
+            # ── 5. Coherence sample: probes + learning samples ─────────
+            can_coherence = (bcfg.coher_sample
+                             and gpu_model is not None
+                             and tokenizer is not None
+                             and not is_stacked)
+            if bcfg.coher_sample and not can_coherence:
+                skip_reasons = []
+                if gpu_model is None:
+                    skip_reasons.append("no GPU model")
+                if tokenizer is None:
+                    skip_reasons.append("no tokenizer (byte-level)")
+                if is_stacked:
+                    skip_reasons.append("stacked model")
+                print(f"    [coherence skipped: {', '.join(skip_reasons)}]")
+            if can_coherence:
+                # Learning probes (CS-10: model learns during forward)
+                # NOTE: full_snapshot/full_restore don't preserve optimizer moments.
+                # reset_optimizer() after restore loses accumulated AdamW state.
+                # Tracked: https://github.com/toddwbucy/NL_Hecate/issues/206
+                snapshot = None
                 try:
                     snapshot = full_snapshot(gpu_model)
                     # Probe 1: within-generation learning curve
-                    # Restore between probes: step_generate modifies params
                     n_prompts = max(1, min(bcfg.probe_prompts, len(EVAL_PROMPTS)))
                     for prompt_text in EVAL_PROMPTS[:n_prompts]:
                         full_restore(gpu_model, snapshot)
@@ -1536,7 +1531,7 @@ def run_build(bcfg: BuildConfig):
 
                     # Probe 2: cross-exposure adaptation (first prompt only)
                     full_restore(gpu_model, snapshot)
-                    gpu_model.reset_optimizer()  # probe1 corrupts AdamW moments
+                    gpu_model.reset_optimizer()
                     prompt_text = EVAL_PROMPTS[0]
                     prompt_ids = tokenizer.encode(prompt_text)
                     xresult = probe_cross_exposure(
@@ -1561,12 +1556,10 @@ def run_build(bcfg: BuildConfig):
                 finally:
                     if snapshot is not None:
                         full_restore(gpu_model, snapshot)
-                        gpu_model.reset_optimizer()  # probes corrupt AdamW moments
-            # ── Memory vocab probe (logit lens for CMS levels) ────────
-            if gpu_model is not None and tokenizer is not None:
+                        gpu_model.reset_optimizer()
+
+                # Memory vocab probe (logit lens for CMS levels)
                 try:
-                    # Reuse params/context already downloaded by full_snapshot.
-                    # Guard: full_snapshot may have failed or been skipped; re-acquire if needed.
                     if snapshot is None:
                         snapshot = full_snapshot(gpu_model)
                     vprobe = probe_memory_vocab(
@@ -1580,9 +1573,64 @@ def run_build(bcfg: BuildConfig):
                         jsonl.log(event="memory_vocab_probe", **vprobe)
                 except Exception as e:
                     print(f"    [vocab probe failed: {e}]")
+
+                # Learning samples + Probe 3 (context value)
+                ckpt_snapshot = None
+                try:
+                    ckpt_snapshot = full_snapshot(gpu_model)
+                    from engine.generation import generate_learning
+                    sample_budget = bcfg.probe_max_tokens
+                    n_sampled = 0
+                    for prompt_text in SAMPLE_PROMPTS:
+                        if sample_budget <= 0:
+                            break
+                        full_restore(gpu_model, ckpt_snapshot)
+                        gpu_model.reset_optimizer()
+                        gpu_model.reset_context()
+                        prompt_ids = tokenizer.encode(prompt_text)
+                        tokens, losses, _ = generate_learning(
+                            gpu_model, cfg, prompt_ids,
+                            max_tokens=sample_budget, temperature=0.7, lr=bcfg.lr)
+                        gen_text = tokenizer.decode(tokens[len(prompt_ids):])
+                        preview = gen_text[:80].replace("\n", " ")
+                        valid = [v for v in losses if not math.isnan(v)]
+                        avg_loss = sum(valid) / len(valid) if valid else float('nan')
+                        n_gen = len(tokens) - len(prompt_ids)
+                        sample_budget -= n_gen
+                        n_sampled += 1
+                        print(f"  [sample] {prompt_text[:40]}... → {preview}...")
+                        print(f"    avg_loss={avg_loss:.4f} over {n_gen} tokens"
+                              f" ({len(valid)}/{len(losses)} valid)")
+                    if jsonl:
+                        jsonl.log(event="sample", step=step,
+                                  mode="learning", n_prompts=n_sampled)
+
+                    # Probe 3: accumulated context vs cold start
+                    full_restore(gpu_model, ckpt_snapshot)
+                    gpu_model.reset_optimizer()
+                    prompt_text = EVAL_PROMPTS[0]
+                    prompt_ids = tokenizer.encode(prompt_text)
+                    cresult = probe_context_value(
+                        gpu_model, cfg, prompt_ids, ckpt_snapshot,
+                        max_tokens=bcfg.probe_max_tokens, temperature=0.7, lr=bcfg.lr)
+                    print(f"  [probe3] cold={cresult['cold_avg_loss']:.4f} "
+                          f"warm={cresult['warm_avg_loss']:.4f} "
+                          f"benefit={cresult['context_benefit']:.4f}")
+                    if jsonl:
+                        jsonl.log(event="learning_probe",
+                                  probe="context_value", step=step,
+                                  cold_loss=cresult["cold_avg_loss"],
+                                  warm_loss=cresult["warm_avg_loss"],
+                                  context_benefit=cresult["context_benefit"])
+                except Exception as e:
+                    print(f"  [checkpoint samples/probe3 failed: {e}]")
+                finally:
+                    if ckpt_snapshot is not None:
+                        full_restore(gpu_model, ckpt_snapshot)
+                        gpu_model.reset_optimizer()
+
             if jsonl:
-                jsonl.log(event="eval", step=step, eval_loss=eval_loss,
-                          eval_ppl=eval_ppl, eval_chunks=bcfg.eval_max_chunks)
+                jsonl.log(event="checkpoint", step=step)
 
         # ── S4-M7: Phase boundary curriculum probe ────────────────────
         if (step in phase_boundaries and gpu_model is not None
@@ -1627,185 +1675,6 @@ def run_build(bcfg: BuildConfig):
                     for pname, pl in phase_losses.items():
                         log_entry[f"{pname}_loss"] = pl
                     jsonl.log(**log_entry)
-
-        # ── Stacked tape diagnostics (independent of eval block) ──────
-        if is_stacked and gpu_model is not None:
-            tape_eff_stacked = bcfg.tape_every if bcfg.tape_every > 0 else bcfg.eval_every
-            tape_device_stacked = getattr(bcfg, "tape_device", "off")
-            if (tape_device_stacked != "off" and tape_eff_stacked > 0
-                    and step > 0 and step % tape_eff_stacked == 0
-                    and input_ids is not None and target_ids is not None
-                    and max(target_ids) < bcfg.vocab_size):
-                try:
-                    if tape_device_stacked == "cpu":
-                        if not hasattr(gpu_model, "cpu_stacked_tape_summary"):
-                            raise RuntimeError(
-                                "tape_device='cpu' requested for stacked model but "
-                                "cpu_stacked_tape_summary() is unavailable"
-                            )
-                        tape_sum = gpu_model.cpu_stacked_tape_summary(
-                            input_ids, target_ids, pulse
-                        )
-                    elif hasattr(gpu_model, "gpu_stacked_tape_summary"):
-                        tape_sum = gpu_model.gpu_stacked_tape_summary(
-                            input_ids, target_ids, pulse
-                        )
-                    else:
-                        tape_sum = None
-                except (ValueError, KeyError, TypeError, OSError) as exc:
-                    print(f"  [tape] WARNING: stacked tape summary failed at step {step}: {exc}")
-                else:
-                    if tape_sum is not None:
-                        print_tape_summary(tape_sum, step)
-                        if jsonl:
-                            jsonl.log(event="tape_summary", step=step, **tape_sum)
-
-        # Periodic checkpoint
-        if bcfg.save_every > 0 and step > 0 and step % bcfg.save_every == 0:
-            if is_stacked and gpu_model is not None:
-                p = Path(_safetensors_path(bcfg.save_path))
-                ckpt_path = str(p.with_stem(f"{p.stem}_step{step}"))
-                os.makedirs(os.path.dirname(ckpt_path) or ".", exist_ok=True)
-                nl_hecate.save_stacked_checkpoint(
-                    ckpt_path, gpu_model,
-                    conductor=conductor, context=context)
-                sidecar = Path(str(ckpt_path) + ".cursor.json")
-                if bpe_loaders:
-                    sidecar.write_text(json.dumps(
-                        {"slots": [loader.cursor() for loader in bpe_loaders],
-                         "level_start_cursor": _level_start_cursor}, indent=2))
-                elif active_loader is not None:
-                    cursor_data = active_loader.cursor()
-                    cursor_data["level_start_cursor"] = _level_start_cursor
-                    sidecar.write_text(json.dumps(cursor_data, indent=2))
-                print(f"  [checkpoint saved: {ckpt_path}]")
-            elif not is_stacked:
-                if gpu_model is not None:
-                    params = gpu_model.to_host_params()
-                    context = gpu_model.to_host_context()
-                p = Path(_safetensors_path(bcfg.save_path))
-                ckpt_path = str(p.with_stem(f"{p.stem}_step{step}"))
-                os.makedirs(os.path.dirname(ckpt_path) or ".", exist_ok=True)
-                if use_bpe:
-                    nl_hecate.save_checkpoint_with_context(ckpt_path, params, cfg, conductor, context)
-                else:
-                    nl_hecate.save_build_checkpoint(ckpt_path, params, cfg, conductor, context)
-                sidecar = Path(str(ckpt_path) + ".cursor.json")
-                if bpe_loaders:
-                    sidecar.write_text(json.dumps(
-                        {"slots": [loader.cursor() for loader in bpe_loaders],
-                         "level_start_cursor": _level_start_cursor}, indent=2))
-                elif active_loader is not None:
-                    cursor_data = active_loader.cursor()
-                    cursor_data["level_start_cursor"] = _level_start_cursor
-                    sidecar.write_text(json.dumps(cursor_data, indent=2))
-                print(f"  [checkpoint saved: {ckpt_path}]")
-
-                # Component 3: per-level parameter drift (||M_t||_F vs ||M_0||_F)
-                # Uses memory_norms as proxy for parameter magnitude per level.
-                # ||M_t - M_0|| is approximated by tracking norm evolution over time
-                # since storing full initial M tensors would require d*d*k floats.
-                if jsonl and gpu_model is not None and hasattr(gpu_model, "memory_norms"):
-                    cur_norms = list(gpu_model.memory_norms())
-                    drift_info = []
-                    for i, cur_n in enumerate(cur_norms):
-                        init_n = level_param_norms_init[i] if i < len(level_param_norms_init) else 0.0
-                        drift_info.append({
-                            "level": i,
-                            "norm_init": round(init_n, 6),
-                            "norm_now": round(cur_n, 6),
-                            "norm_ratio": round(cur_n / init_n, 4) if init_n > 1e-8 else None,
-                        })
-                    jsonl.log(event="level_param_drift", step=step, levels=drift_info)
-
-                # S4-M7: Checkpoint roundtrip verification
-                if use_gpu:
-                    v_model = None
-                    try:
-                        if use_bpe:
-                            v_params, v_cfg = nl_hecate.load_checkpoint(ckpt_path)
-                        else:
-                            v_params, v_cfg, _ = nl_hecate.load_build_checkpoint(ckpt_path)
-                        v_model = nl_hecate.GpuModel.from_params(v_params, v_cfg, batch_size=bcfg.batch_size)
-                        # Save context before verification forward passes
-                        # Slice to single seq_len chunk -- forward() expects exactly
-                        # seq_len tokens regardless of batch_size used in step_adamw
-                        rt_input = list(input_ids[:bcfg.seq_len])
-                        rt_target = list(target_ids[:bcfg.seq_len])
-                        rt_ctx = gpu_model.to_host_context()
-                        try:
-                            v_model.upload_context(rt_ctx)
-                            train_fwd, _ = gpu_model.forward(rt_input, rt_target, pulse)
-                            verify_fwd, _ = v_model.forward(rt_input, rt_target, pulse)
-                        finally:
-                            # Restore context after verification (forward modifies M)
-                            gpu_model.upload_context(rt_ctx)
-                        delta = abs(verify_fwd - train_fwd)
-                        if jsonl:
-                            jsonl.log(event="checkpoint_roundtrip", step=step,
-                                      delta=delta, loss=train_fwd,
-                                      verify_loss=verify_fwd)
-                        if delta > 1e-6:
-                            print(f"  [WARNING] checkpoint roundtrip "
-                                  f"delta={delta:.2e}")
-                        else:
-                            print(f"  [checkpoint roundtrip OK, "
-                                  f"delta={delta:.2e}]")
-                    except (OSError, RuntimeError, ValueError) as e:
-                        print(f"  [checkpoint roundtrip failed: {e}]")
-                    finally:
-                        del v_model
-
-                # ── Checkpoint learning samples + Probe 3 ─────────────────
-                if tokenizer is not None and gpu_model is not None:
-                    ckpt_snapshot = full_snapshot(gpu_model)
-                    try:
-                        # Learning samples (generate_learning, not frozen)
-                        # Restore between samples: each 128-step generate_learning
-                        # heavily modifies params toward one prompt's pattern.
-                        from engine.generation import generate_learning
-                        for prompt_text in SAMPLE_PROMPTS:
-                            full_restore(gpu_model, ckpt_snapshot)
-                            gpu_model.reset_optimizer()
-                            gpu_model.reset_context()
-                            prompt_ids = tokenizer.encode(prompt_text)
-                            tokens, losses, _ = generate_learning(
-                                gpu_model, cfg, prompt_ids,
-                                max_tokens=128, temperature=0.7, lr=bcfg.lr)
-                            gen_text = tokenizer.decode(tokens[len(prompt_ids):])
-                            preview = gen_text[:80].replace("\n", " ")
-                            valid = [v for v in losses if not math.isnan(v)]
-                            avg_loss = sum(valid) / len(valid) if valid else float('nan')
-                            n_gen = len(tokens) - len(prompt_ids)
-                            print(f"  [sample] {prompt_text[:40]}... → {preview}...")
-                            print(f"    avg_loss={avg_loss:.4f} over {n_gen} tokens"
-                                  f" ({len(valid)}/{len(losses)} valid)")
-                        if jsonl:
-                            jsonl.log(event="sample", step=step,
-                                      mode="learning", n_prompts=len(SAMPLE_PROMPTS))
-
-                        # Probe 3: accumulated context vs cold start (first prompt)
-                        full_restore(gpu_model, ckpt_snapshot)
-                        gpu_model.reset_optimizer()  # prior probes/samples corrupt AdamW moments
-                        prompt_text = EVAL_PROMPTS[0]
-                        prompt_ids = tokenizer.encode(prompt_text)
-                        cresult = probe_context_value(
-                            gpu_model, cfg, prompt_ids, ckpt_snapshot,
-                            max_tokens=30, temperature=0.7, lr=bcfg.lr)
-                        print(f"  [probe3] cold={cresult['cold_avg_loss']:.4f} "
-                              f"warm={cresult['warm_avg_loss']:.4f} "
-                              f"benefit={cresult['context_benefit']:.4f}")
-                        if jsonl:
-                            jsonl.log(event="learning_probe",
-                                      probe="context_value", step=step,
-                                      cold_loss=cresult["cold_avg_loss"],
-                                      warm_loss=cresult["warm_avg_loss"],
-                                      context_benefit=cresult["context_benefit"])
-                    except Exception as e:
-                        print(f"  [checkpoint samples/probe3 failed: {e}]")
-                    finally:
-                        full_restore(gpu_model, ckpt_snapshot)
-                        gpu_model.reset_optimizer()  # probes corrupt AdamW moments
 
         # ── Auto-promotion: L0 saturated → push up to k+1 ──────────
         if (bcfg.auto_promote and _sat_announced[0]
@@ -1982,19 +1851,7 @@ def run_build(bcfg: BuildConfig):
                     print(f"  Data cursor: {cur_pos:,} (continues naturally)")
                 _level_start_cursor = (active_loader.cursor()["position"]
                                        if active_loader is not None else 0)
-            # Re-carve window-local val for the new data window
-            if bcfg.window_local_val and bcfg.eval_every > 0 and active_loader is not None:
-                if bcfg.batch_size > 1:
-                    print("  Window-local val: skipped (batch_size > 1)")
-                else:
-                    cursor_pos = active_loader.cursor()["position"]
-                    _window_val_tokens, _window_val_targets, _window_val_boundary = _carve_window_val(
-                        active_loader, bcfg.window_val_tokens, cursor_pos)
-                    if _window_val_tokens is not None:
-                        print(f"  Window-local val: re-carved {len(_window_val_tokens):,} "
-                              f"tokens from new window (boundary={_window_val_boundary:,})")
-                    else:
-                        print("  Window-local val: not enough data remaining, eval disabled")
+            # Spec 32: window-local val re-carve removed
 
             print(f"  Promotion complete, continuing at step {step + 1}\n")
 

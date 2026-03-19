@@ -99,8 +99,8 @@ modes:
                        help="Resume from a build checkpoint")
     build.add_argument("--log_file", type=str, default=None,
                        help="Path for structured JSONL log")
-    build.add_argument("--eval_every", type=int, default=None)
-    build.add_argument("--eval_max_chunks", type=int, default=None)
+    build.add_argument("--eval_every", type=int, default=None,
+                       help="DEPRECATED: mapped to --save_every (spec 32)")
 
     # ── Model / optimizer (shared between build modes) ─────────────────
     optim = parser.add_argument_group("optimizer")
