@@ -156,6 +156,9 @@ pub fn m3_step(state: &mut M3State, cfg: &M3Config, grad: &[f32]) -> Vec<f32> {
     let n = state.total_params;
 
     // Step 1: per-level accumulate or update
+    // All levels use additive EMA (matching HOPE reference, not paper LaTeX).
+    // Paper Eq 75 shows M² -= beta*sum(g), but reference code uses +=.
+    // Multi-scale benefit is temporal resolution, not directional opposition.
     for level in 0..cfg.k {
         if m3_is_active(cfg, state.step, level) {
             // Active: EMA update with accumulated error + current gradient
@@ -603,6 +606,33 @@ mod tests {
         assert!(!m3_is_active(&cfg, 7, 1));
         assert!(m3_is_active(&cfg, 8, 1));
         assert!(m3_is_active(&cfg, 16, 1));
+    }
+
+    /// Verify M¹ and M² align directionally (both additive EMA).
+    ///
+    /// Paper Eq 75 LaTeX shows M² with subtraction, but the HOPE reference
+    /// implementation uses addition for both. We match the reference.
+    /// This test encodes that invariant so a sign change is deliberate.
+    #[test]
+    fn test_m1_m2_align_directionally() {
+        let cfg = M3Config::default_k2();
+        let mut state = M3State::new(&cfg, 4);
+        // Feed a consistent positive gradient for 8 steps (one full M² cycle)
+        let grad = vec![1.0, 2.0, 3.0, 4.0];
+        for _ in 0..8 {
+            let _ = m3_step(&mut state, &cfg, &grad);
+        }
+        // Both momentum buffers should point in the same direction as grad
+        for i in 0..4 {
+            assert!(state.momentum[0][i] > 0.0,
+                "M¹[{i}] should be positive for positive grad, got {}", state.momentum[0][i]);
+            assert!(state.momentum[1][i] > 0.0,
+                "M² [{i}] should be positive for positive grad (additive EMA), got {}", state.momentum[1][i]);
+        }
+        // Dot product should be positive (aligned, not opposed)
+        let dot: f32 = (0..4).map(|i| state.momentum[0][i] * state.momentum[1][i]).sum();
+        assert!(dot > 0.0,
+            "M¹ · M² should be positive (aligned), got {dot}");
     }
 
     #[test]
