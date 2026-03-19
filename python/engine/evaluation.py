@@ -27,13 +27,13 @@ EVAL_PROMPTS = [
 def full_snapshot(gpu_model):
     """Save complete model state for later restoration.
 
-    Captures params (outer-loop) and context (inner-loop M matrices).
-    AdamW moment buffers are NOT captured (Option B from eval spec) —
-    the minor perturbation reconverges within ~100 training steps.
+    Captures params (outer-loop), context (inner-loop M matrices),
+    and optimizer moments (spec 33) so probes don't corrupt training state.
     """
     return {
         "params": gpu_model.to_host_params(),
         "context": gpu_model.to_host_context(),
+        "optimizer": gpu_model.snapshot_optimizer(),
     }
 
 
@@ -41,6 +41,9 @@ def full_restore(gpu_model, snapshot):
     """Restore complete model state from snapshot."""
     gpu_model.upload_params(snapshot["params"])
     gpu_model.upload_context(snapshot["context"])
+    opt = snapshot.get("optimizer")
+    if opt is not None:
+        gpu_model.restore_optimizer(opt)
 
 
 # ── Learning probes (CS-10 compliant eval) ────────────────────────
@@ -174,11 +177,8 @@ def probe_context_value(gpu_model, cfg, prompt_ids, snapshot,
     valid_cold = [v for v in cold_losses if not (math.isnan(v) or math.isinf(v))]
     cold_avg = sum(valid_cold) / max(len(valid_cold), 1)
 
-    # Restore params (cold run modified them) and optimizer state, keep training context
-    gpu_model.upload_params(snapshot["params"])
-    gpu_model.reset_optimizer()
-    gpu_model.upload_context(snapshot["context"])
-    gpu_model.reset_optimizer()  # cold run corrupts AdamW moments
+    # Restore full state (params + context + optimizer moments)
+    full_restore(gpu_model, snapshot)
 
     # Warm start: accumulated training M
     _, warm_losses, _ = generate_learning(

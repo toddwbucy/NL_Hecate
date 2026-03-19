@@ -166,6 +166,200 @@ impl GpuAdamWState {
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// Host-side optimizer snapshot (spec 33)
+// ══════════════════════════════════════════════════════════════════════
+
+/// Host-resident copy of AdamW optimizer state for snapshot/restore.
+/// Flat concatenation avoids mirroring every field name — layout is
+/// deterministic within a single (params, k) shape.
+#[cfg(feature = "cuda")]
+pub struct HostOptimizerState {
+    /// Concatenated m+v for all SWA params.
+    pub swa_moments: Vec<f32>,
+    /// Concatenated m+v per CMS level.
+    pub level_moments: Vec<Vec<f32>>,
+    /// Per-level step counters (for bias correction).
+    pub level_steps: Vec<u32>,
+    /// Global optimizer step counter.
+    pub step: u32,
+}
+
+/// Download one GpuBuf to the end of a host Vec.
+#[cfg(feature = "cuda")]
+#[inline]
+fn download_buf(buf: &GpuBuf<f32>, dst: &mut Vec<f32>) {
+    let offset = dst.len();
+    dst.resize(offset + buf.len(), 0.0);
+    buf.copy_to_host(&mut dst[offset..]);
+}
+
+/// Upload a slice from a host Vec into a new GpuBuf, advancing the cursor.
+#[cfg(feature = "cuda")]
+#[inline]
+fn upload_buf(src: &[f32], cursor: &mut usize, len: usize) -> GpuBuf<f32> {
+    let buf = GpuBuf::from_host(&src[*cursor..*cursor + len]);
+    *cursor += len;
+    buf
+}
+
+#[cfg(feature = "cuda")]
+impl GpuAdamWState {
+    /// Download all optimizer state to host (spec 33).
+    pub fn to_host(&self) -> HostOptimizerState {
+        let mut swa_moments = Vec::new();
+        // SWA: m then v for each param, in field order
+        for buf in [
+            &self.swa.m_embed, &self.swa.v_embed,
+            &self.swa.m_q, &self.swa.v_q,
+            &self.swa.m_k, &self.swa.v_k,
+            &self.swa.m_v, &self.swa.v_v,
+            &self.swa.m_o, &self.swa.v_o,
+            &self.swa.m_unembed, &self.swa.v_unembed,
+            &self.swa.m_ln_attn_gamma, &self.swa.v_ln_attn_gamma,
+            &self.swa.m_ln_attn_beta, &self.swa.v_ln_attn_beta,
+            &self.swa.m_ln_mem_gamma, &self.swa.v_ln_mem_gamma,
+            &self.swa.m_ln_mem_beta, &self.swa.v_ln_mem_beta,
+        ] {
+            download_buf(buf, &mut swa_moments);
+        }
+
+        let mut level_moments = Vec::with_capacity(self.levels.len());
+        let mut level_steps = Vec::with_capacity(self.levels.len());
+        for lv in &self.levels {
+            let mut lm = Vec::new();
+            for buf in [
+                &lv.m_w_k_mem, &lv.v_w_k_mem,
+                &lv.m_w_v_mem, &lv.v_w_v_mem,
+                &lv.m_w_q_mem, &lv.v_w_q_mem,
+                &lv.m_w_alpha, &lv.v_w_alpha,
+                &lv.m_b_alpha, &lv.v_b_alpha,
+                &lv.m_w_theta, &lv.v_w_theta,
+                &lv.m_b_theta, &lv.v_b_theta,
+                &lv.m_w_eta, &lv.v_w_eta,
+                &lv.m_b_eta, &lv.v_b_eta,
+                &lv.m_gate_proj, &lv.v_gate_proj,
+                &lv.m_up_proj, &lv.v_up_proj,
+                &lv.m_down_proj, &lv.v_down_proj,
+            ] {
+                download_buf(buf, &mut lm);
+            }
+            level_moments.push(lm);
+            level_steps.push(lv.level_step);
+        }
+
+        HostOptimizerState {
+            swa_moments,
+            level_moments,
+            level_steps,
+            step: self.step,
+        }
+    }
+
+    /// Reconstruct GPU optimizer state from host snapshot (spec 33).
+    /// `params` provides buffer sizes for the norm_scratch allocation.
+    pub fn from_host(host: &HostOptimizerState, params: &GpuMAGParams) -> Self {
+        let mut c = 0usize;
+        let s = &host.swa_moments;
+        let swa = MomentSWA {
+            m_embed: upload_buf(s, &mut c, params.swa.w_embed.len()),
+            v_embed: upload_buf(s, &mut c, params.swa.w_embed.len()),
+            m_q: upload_buf(s, &mut c, params.swa.w_q.len()),
+            v_q: upload_buf(s, &mut c, params.swa.w_q.len()),
+            m_k: upload_buf(s, &mut c, params.swa.w_k.len()),
+            v_k: upload_buf(s, &mut c, params.swa.w_k.len()),
+            m_v: upload_buf(s, &mut c, params.swa.w_v.len()),
+            v_v: upload_buf(s, &mut c, params.swa.w_v.len()),
+            m_o: upload_buf(s, &mut c, params.swa.w_o.len()),
+            v_o: upload_buf(s, &mut c, params.swa.w_o.len()),
+            m_unembed: upload_buf(s, &mut c, params.swa.w_unembed.len()),
+            v_unembed: upload_buf(s, &mut c, params.swa.w_unembed.len()),
+            m_ln_attn_gamma: upload_buf(s, &mut c, params.swa.ln_attn_gamma.len()),
+            v_ln_attn_gamma: upload_buf(s, &mut c, params.swa.ln_attn_gamma.len()),
+            m_ln_attn_beta: upload_buf(s, &mut c, params.swa.ln_attn_beta.len()),
+            v_ln_attn_beta: upload_buf(s, &mut c, params.swa.ln_attn_beta.len()),
+            m_ln_mem_gamma: upload_buf(s, &mut c, params.swa.ln_mem_gamma.len()),
+            v_ln_mem_gamma: upload_buf(s, &mut c, params.swa.ln_mem_gamma.len()),
+            m_ln_mem_beta: upload_buf(s, &mut c, params.swa.ln_mem_beta.len()),
+            v_ln_mem_beta: upload_buf(s, &mut c, params.swa.ln_mem_beta.len()),
+        };
+        assert_eq!(c, s.len(), "SWA moment size mismatch: expected {} but snapshot has {}", c, s.len());
+
+        assert!(
+            host.level_moments.len() == host.level_steps.len()
+                && host.level_steps.len() == params.levels.len(),
+            "Level count mismatch: snapshot has {} moment vecs, {} step counters, but model has {} levels",
+            host.level_moments.len(), host.level_steps.len(), params.levels.len(),
+        );
+
+        let levels: Vec<MomentLevel> = host.level_moments.iter()
+            .zip(host.level_steps.iter())
+            .zip(params.levels.iter())
+            .map(|((lm, &ls), lp)| {
+                let mut c = 0usize;
+                let ml = MomentLevel {
+                    m_w_k_mem: upload_buf(lm, &mut c, lp.w_k_mem.len()),
+                    v_w_k_mem: upload_buf(lm, &mut c, lp.w_k_mem.len()),
+                    m_w_v_mem: upload_buf(lm, &mut c, lp.w_v_mem.len()),
+                    v_w_v_mem: upload_buf(lm, &mut c, lp.w_v_mem.len()),
+                    m_w_q_mem: upload_buf(lm, &mut c, lp.w_q_mem.len()),
+                    v_w_q_mem: upload_buf(lm, &mut c, lp.w_q_mem.len()),
+                    m_w_alpha: upload_buf(lm, &mut c, lp.w_alpha.len()),
+                    v_w_alpha: upload_buf(lm, &mut c, lp.w_alpha.len()),
+                    m_b_alpha: upload_buf(lm, &mut c, lp.b_alpha.len()),
+                    v_b_alpha: upload_buf(lm, &mut c, lp.b_alpha.len()),
+                    m_w_theta: upload_buf(lm, &mut c, lp.w_theta.len()),
+                    v_w_theta: upload_buf(lm, &mut c, lp.w_theta.len()),
+                    m_b_theta: upload_buf(lm, &mut c, lp.b_theta.len()),
+                    v_b_theta: upload_buf(lm, &mut c, lp.b_theta.len()),
+                    m_w_eta: upload_buf(lm, &mut c, lp.w_eta.len()),
+                    v_w_eta: upload_buf(lm, &mut c, lp.w_eta.len()),
+                    m_b_eta: upload_buf(lm, &mut c, lp.b_eta.len()),
+                    v_b_eta: upload_buf(lm, &mut c, lp.b_eta.len()),
+                    m_gate_proj: upload_buf(lm, &mut c, lp.gate_proj.len().max(1)),
+                    v_gate_proj: upload_buf(lm, &mut c, lp.gate_proj.len().max(1)),
+                    m_up_proj: upload_buf(lm, &mut c, lp.up_proj.len().max(1)),
+                    v_up_proj: upload_buf(lm, &mut c, lp.up_proj.len().max(1)),
+                    m_down_proj: upload_buf(lm, &mut c, lp.down_proj.len().max(1)),
+                    v_down_proj: upload_buf(lm, &mut c, lp.down_proj.len().max(1)),
+                    level_step: ls,
+                    has_mlp: lp.has_mlp,
+                };
+                assert_eq!(c, lm.len(), "Level moment size mismatch: expected {} but snapshot has {}", c, lm.len());
+                ml
+            })
+            .collect();
+
+        // Recompute norm_scratch from params (same logic as from_params)
+        let mut max_len = params.swa.w_embed.len();
+        for buf in [&params.swa.w_q, &params.swa.w_k, &params.swa.w_v,
+                     &params.swa.w_o, &params.swa.w_unembed] {
+            max_len = max_len.max(buf.len());
+        }
+        for lp in &params.levels {
+            for buf in [&lp.w_k_mem, &lp.w_v_mem, &lp.w_q_mem,
+                         &lp.w_alpha, &lp.b_alpha, &lp.w_theta, &lp.b_theta,
+                         &lp.w_eta, &lp.b_eta] {
+                max_len = max_len.max(buf.len());
+            }
+            if lp.has_mlp {
+                for buf in [&lp.gate_proj, &lp.up_proj, &lp.down_proj] {
+                    max_len = max_len.max(buf.len());
+                }
+            }
+        }
+        let max_partials = max_len / 256 + 1;
+
+        GpuAdamWState {
+            swa,
+            levels,
+            step: host.step,
+            norm_scratch: GpuBuf::zeros(max_partials),
+            norm_host: vec![0.0f32; max_partials],
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // AdamW update — calls fused kernel for each param/grad/m/v pair
 // ══════════════════════════════════════════════════════════════════════
 
