@@ -617,9 +617,11 @@ mod tests {
     fn test_m1_m2_align_directionally() {
         let cfg = M3Config::default_k2();
         let mut state = M3State::new(&cfg, 4);
-        // Feed a consistent positive gradient for 8 steps (one full M² cycle)
+        // Feed a consistent positive gradient for 24 steps (three full M² cycles).
+        // M² fires at steps 0, 8, 16 — this exercises the accumulate→fire path
+        // multiple times, not just the initial step.
         let grad = vec![1.0, 2.0, 3.0, 4.0];
-        for _ in 0..8 {
+        for _ in 0..24 {
             let _ = m3_step(&mut state, &cfg, &grad);
         }
         // Both momentum buffers should point in the same direction as grad
