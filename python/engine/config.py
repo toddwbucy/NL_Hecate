@@ -10,10 +10,11 @@ from typing import Any
 # Tier taxonomy for V-05/V-06 validation (spec: 01_variant_tier_policy.md)
 _TIER_1 = {"titans"}
 _TIER_2A = {"delta", "hebbian"}
-_TIER_2B = {"moneta", "yaad"}
-_TIER_2C = {"memora", "trellis"}
+_TIER_2B = {"moneta", "yaad", "memora", "trellis"}
 _TIER_3_RULES = {"lattice", "atlas", "atlas_omega", "swiglu_mlp", "swiglu"}
-_GPU_CAPABLE = _TIER_1 | _TIER_2A | _TIER_2B  # Tiers 1, 2a, 2b have CUDA kernels
+_GPU_CAPABLE = _TIER_1 | _TIER_2A  # Tier 1 + Tier 2a have full CUDA support
+# TODO: promote moneta+yaad to _GPU_CAPABLE after config plumbing PR lands
+# (GpuContextState sizing for MLP memory, frozen-level MLP readout)
 # Rules that support ema / delta_momentum (V-02)
 _MOMENTUM_RULES = {"titans", "atlas", "atlas_omega"}
 # Enum sets for direct field validation
@@ -571,14 +572,14 @@ class BuildConfig:
         (e.g., in the validate-config subcommand).
         """
         if self.gpu and self.memory_rule not in _GPU_CAPABLE:
-            tier = "3" if self.memory_rule in _TIER_3_RULES else "2c"
+            tier = "3" if self.memory_rule in _TIER_3_RULES else "2b"
             raise ValueError(
                 f"'{self.memory_rule}' is Tier {tier} — no GPU kernels available.\n"
                 f"  This combination runs on CPU only. Either:\n"
                 f"    (a) add \"gpu\": false to your config build section, or\n"
                 f"    (b) pass --cpu at the command line, or\n"
-                f"    (c) use a GPU-capable memory_rule (titans_lmm, delta_rule, hebbian,\n"
-                f"       moneta, yaad) to run on GPU.\n"
+                f"    (c) use a GPU-capable memory_rule (titans, delta, hebbian)\n"
+                f"       to run on GPU.\n"
                 f"  See specs/infrastructure/01_variant_tier_policy.md for the full tier matrix.")
 
 

@@ -1181,8 +1181,14 @@ pub(crate) fn gpu_memory_backward(
                         );
                     }
                 }
-                // MONETA: l_p bias + L2/Lq retention
+                // MONETA: l_p bias + L2 retention (LQ backward deferred — q must be 2)
                 _ => {
+                    assert!(
+                        (cfg.lq_q - 2.0).abs() < 1e-6,
+                        "MONETA GPU backward only supports lq_q=2.0 (L2 retention). \
+                         Got lq_q={:.4}. LQ backward (q > 2) is deferred.",
+                        cfg.lq_q,
+                    );
                     unsafe {
                         crate::cuda_ffi::mlp_backward_lp_f32_cuda(
                             k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),

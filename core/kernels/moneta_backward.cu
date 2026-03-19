@@ -567,11 +567,19 @@ extern "C" void mlp_backward_lp_f32_cuda(
         exit(1);
     }
 
-    // Block size capped at d for register pressure (matching Titans backward)
+    // LQ backward (q > 2) is not implemented — reject at the CUDA level.
+    if (fabsf(lq_q - 2.0f) > 1e-6f) {
+        fprintf(stderr, "mlp_backward_lp_f32_cuda: lq_q=%.4f but only q=2.0 (L2 retention) "
+                "is supported. LQ backward (q > 2) is deferred.\n", lq_q);
+        exit(1);
+    }
+
+    // Block size capped at d for register pressure (matching Titans backward).
+    // Round DOWN to largest power-of-2 <= d to ensure reduce_buf (aliased to
+    // dbuf_dh[0..blockDim.x]) never exceeds d_hidden elements.
     int block_size = (d < 1024) ? d : 1024;
     int rounded = 1;
-    while (rounded < block_size) rounded <<= 1;
-    if (rounded > 1024) rounded = 1024;
+    while ((rounded << 1) <= block_size) rounded <<= 1;
     block_size = rounded;
 
     dim3 grid(1);
@@ -638,10 +646,10 @@ extern "C" void mlp_backward_huber_f32_cuda(
         exit(1);
     }
 
+    // Round DOWN to largest power-of-2 <= d (same as lp variant).
     int block_size = (d < 1024) ? d : 1024;
     int rounded = 1;
-    while (rounded < block_size) rounded <<= 1;
-    if (rounded > 1024) rounded = 1024;
+    while ((rounded << 1) <= block_size) rounded <<= 1;
     block_size = rounded;
 
     dim3 grid(1);
