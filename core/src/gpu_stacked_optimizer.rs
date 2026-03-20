@@ -684,18 +684,22 @@ impl GpuStackedM3State {
 }
 
 /// Compute gradient norm for stacked grads using M3's scratch buffers.
+/// When `skip_embed` is true, excludes embed/unembed from the norm (frozen case).
 #[cfg(feature = "cuda")]
 fn gpu_stacked_m3_grad_norm(
     grads: &GpuStackedGrads,
     scratch: &mut GpuBuf<f32>,
     host: &mut Vec<f32>,
+    skip_embed: bool,
 ) -> f32 {
     let mut total = 0.0f32;
     let mut add = |g: &GpuBuf<f32>| {
         total += gpu_frob_norm(g, scratch, host).powi(2);
     };
-    add(&grads.d_w_embed);
-    add(&grads.d_w_unembed);
+    if !skip_embed {
+        add(&grads.d_w_embed);
+        add(&grads.d_w_unembed);
+    }
     add(&grads.d_ln_final_gamma);
     add(&grads.d_ln_final_beta);
     for bg in &grads.blocks {
@@ -719,12 +723,20 @@ fn gpu_stacked_m3_grad_norm(
             add(&lg.d_b_eta);
         }
     }
+    drop(add);
+    // alpha_mem gradients (host-side scalars, accumulated after closure dropped)
+    for bg in &grads.blocks {
+        for &g in &bg.d_alpha_mem {
+            total += g * g;
+        }
+    }
     total.sqrt()
 }
 
 /// Scale all stacked grads in-place for gradient clipping.
+/// When `skip_embed` is true, excludes embed/unembed from scaling (frozen case).
 #[cfg(feature = "cuda")]
-fn gpu_stacked_m3_scale_grads(grads: &mut GpuStackedGrads, scale: f32) {
+fn gpu_stacked_m3_scale_grads(grads: &mut GpuStackedGrads, scale: f32, skip_embed: bool) {
     let scale_buf = |g: &mut GpuBuf<f32>| {
         let n = g.len() as i32;
         if n == 0 { return; }
@@ -733,8 +745,10 @@ fn gpu_stacked_m3_scale_grads(grads: &mut GpuStackedGrads, scale: f32) {
         };
         assert_eq!(err, 0, "grad_scale_cuda failed with cudaError_t={}", err);
     };
-    scale_buf(&mut grads.d_w_embed);
-    scale_buf(&mut grads.d_w_unembed);
+    if !skip_embed {
+        scale_buf(&mut grads.d_w_embed);
+        scale_buf(&mut grads.d_w_unembed);
+    }
     scale_buf(&mut grads.d_ln_final_gamma);
     scale_buf(&mut grads.d_ln_final_beta);
     for bg in &mut grads.blocks {
@@ -756,6 +770,10 @@ fn gpu_stacked_m3_scale_grads(grads: &mut GpuStackedGrads, scale: f32) {
             scale_buf(&mut lg.d_b_theta);
             scale_buf(&mut lg.d_w_eta);
             scale_buf(&mut lg.d_b_eta);
+        }
+        // alpha_mem (host-side scalars)
+        for g in &mut bg.d_alpha_mem {
+            *g *= scale;
         }
     }
 }
@@ -780,10 +798,10 @@ pub fn gpu_stacked_m3_update(
 
     // ── Gradient clipping ─────────────────────────────────────────────
     let grad_norm = if max_grad_norm > 0.0 {
-        let norm = gpu_stacked_m3_grad_norm(grads, &mut state.norm_scratch, &mut state.norm_host);
+        let norm = gpu_stacked_m3_grad_norm(grads, &mut state.norm_scratch, &mut state.norm_host, freeze_embed);
         if norm > max_grad_norm {
             let scale = max_grad_norm / norm;
-            gpu_stacked_m3_scale_grads(grads, scale);
+            gpu_stacked_m3_scale_grads(grads, scale, freeze_embed);
         }
         norm
     } else {

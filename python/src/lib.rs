@@ -3067,7 +3067,7 @@ impl GpuStackedModel {
                alpha: f32, chunk_size: u32, ns_iterations: u32, eps: f32) -> PyResult<()> {
         if chunk_size == 0 {
             return Err(pyo3::exceptions::PyValueError::new_err(
-                "chunk_size must be >= 1 (used as modulus in gpu_m3_update)"
+                "chunk_size must be >= 1 (used as modulus in gpu_stacked_m3_update)"
             ));
         }
         let config = nl_hecate_core::gpu_optimizer::GpuM3Config {
@@ -3110,6 +3110,12 @@ impl GpuStackedModel {
             }
         }
 
+        // Fail fast if M3 not initialized (before expensive forward/backward)
+        if self.m3_state.is_none() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "M3 state not initialized — call init_m3() before step_m3()"));
+        }
+
         // Forward
         let (loss, cache) = nl_hecate_core::gpu_stacked_forward::gpu_stacked_forward(
             &self.params, &self.cfg, &input_ids, &target_ids,
@@ -3121,11 +3127,8 @@ impl GpuStackedModel {
             &self.params, &self.cfg, &cache,
         );
 
-        // M3 update
-        let state = self.m3_state.as_mut().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "M3 state not initialized — call init_m3() before step_m3()")
-        })?;
+        // M3 update (state guaranteed Some by guard above)
+        let state = self.m3_state.as_mut().unwrap();
 
         let grad_norm = nl_hecate_core::gpu_stacked_optimizer::gpu_stacked_m3_update(
             &mut self.params, &mut grads, state,
