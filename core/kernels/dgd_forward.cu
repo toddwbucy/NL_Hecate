@@ -775,12 +775,13 @@ extern "C" void dgd_fused_forward_f32_cuda(
     // Shared memory: 9*d + 32 floats
     int smem_floats = 9 * d + 32;
     int smem_bytes = smem_floats * (int)sizeof(float);
-    if (d <= 0 || smem_bytes > 204800) {
+    if (d <= 0 || smem_bytes > 163840) {
         fprintf(stderr, "dgd_fused_forward_f32_cuda: d=%d out of range.\n", d);
         exit(1);
     }
     int dd = d * d;
-    int block_size = (dd < 1024) ? dd : 1024;
+    // Round up to warp boundary so all warps are full (no partial-warp UB in __shfl_down_sync)
+    int block_size = (dd < 1024) ? ((dd + 31) & ~31) : 1024;
 
     dim3 grid(batch_size);
     dim3 block(block_size);

@@ -1097,7 +1097,7 @@ pub(crate) fn gpu_memory_forward(
                 let mut m_states = GpuBuf::zeros(bs * (s + 1) * dd);
                 let mut y = GpuBuf::zeros(bs * s * d);
                 crate::dispatch::delta_fused_forward_dd(
-                    &k_mem, &v_mem, &q_mem,
+                    &mut k_mem, &v_mem, &mut q_mem,
                     &level_params.w_alpha, &level_params.b_alpha,
                     &level_params.w_theta, &level_params.b_theta,
                     alpha_floor, alpha_ceil, theta_floor, theta_ceil,
@@ -1143,7 +1143,7 @@ pub(crate) fn gpu_memory_forward(
                 let mut s_states = GpuBuf::zeros(bs * (s + 1) * dd);
                 let mut y = GpuBuf::zeros(bs * s * d);
                 crate::dispatch::titans_fused_forward_dd(
-                    &k_mem, &v_mem, &q_mem,
+                    &mut k_mem, &v_mem, &mut q_mem,
                     &level_params.w_alpha, &level_params.b_alpha,
                     &level_params.w_theta, &level_params.b_theta,
                     &level_params.w_eta, &level_params.b_eta,
@@ -3096,8 +3096,8 @@ mod fused_tests {
         k_unf.copy_to_host(&mut k_norm_h);
 
         // ── Fused path ──
-        let k_fused = GpuBuf::from_host(&k_raw);
-        let q_fused = GpuBuf::from_host(&q_raw);
+        let mut k_fused = GpuBuf::from_host(&k_raw);
+        let mut q_fused = GpuBuf::from_host(&q_raw);
         let v_fused = GpuBuf::from_host(&v_raw);
         let m_init_fused = GpuBuf::from_host(&m_init);
         let mut m_states_fused = GpuBuf::zeros(bs * (s + 1) * dd);
@@ -3108,7 +3108,7 @@ mod fused_tests {
         let mut q_norms_fused = GpuBuf::zeros(bs * s);
 
         crate::dispatch::delta_fused_forward_dd(
-            &k_fused, &v_fused, &q_fused,
+            &mut k_fused, &v_fused, &mut q_fused,
             &d_w_alpha, &d_b_alpha,
             &d_w_theta, &d_b_theta,
             alpha_floor, alpha_ceil, theta_floor, theta_ceil,
@@ -3250,8 +3250,8 @@ mod fused_tests {
         q_norms_unf.copy_to_host(&mut q_norms_unf_h);
 
         // ── Fused path ──
-        let k_fused = GpuBuf::from_host(&k_raw);
-        let q_fused = GpuBuf::from_host(&q_raw);
+        let mut k_fused = GpuBuf::from_host(&k_raw);
+        let mut q_fused = GpuBuf::from_host(&q_raw);
         let v_fused = GpuBuf::from_host(&v_raw);
         let m_init_fused = GpuBuf::from_host(&m_init);
         let s_init_fused = GpuBuf::from_host(&s_init);
@@ -3265,7 +3265,7 @@ mod fused_tests {
         let mut q_norms_fused = GpuBuf::zeros(bs * s);
 
         crate::dispatch::titans_fused_forward_dd(
-            &k_fused, &v_fused, &q_fused,
+            &mut k_fused, &v_fused, &mut q_fused,
             &d_w_alpha, &d_b_alpha,
             &d_w_theta, &d_b_theta,
             &d_w_eta, &d_b_eta,

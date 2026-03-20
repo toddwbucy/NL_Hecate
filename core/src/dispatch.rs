@@ -2080,7 +2080,7 @@ pub fn titans_backward_dd(
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub fn delta_fused_forward_dd(
-    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    k_mem: &mut GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &mut GpuBuf<f32>,
     w_alpha: &GpuBuf<f32>, b_alpha: &GpuBuf<f32>,
     w_theta: &GpuBuf<f32>, b_theta: &GpuBuf<f32>,
     alpha_floor: f32, alpha_ceil: f32,
@@ -2093,7 +2093,7 @@ pub fn delta_fused_forward_dd(
 ) {
     unsafe {
         crate::cuda_ffi::dgd_fused_forward_f32_cuda(
-            k_mem.as_ptr() as *mut f32, v_mem.as_ptr(), q_mem.as_ptr() as *mut f32,
+            k_mem.ptr(), v_mem.as_ptr(), q_mem.ptr(),
             w_alpha.as_ptr(), b_alpha.as_ptr(),
             w_theta.as_ptr(), b_theta.as_ptr(),
             alpha_floor, alpha_ceil, theta_floor, theta_ceil,
@@ -2110,7 +2110,7 @@ pub fn delta_fused_forward_dd(
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub fn titans_fused_forward_dd(
-    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    k_mem: &mut GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &mut GpuBuf<f32>,
     w_alpha: &GpuBuf<f32>, b_alpha: &GpuBuf<f32>,
     w_theta: &GpuBuf<f32>, b_theta: &GpuBuf<f32>,
     w_eta: &GpuBuf<f32>, b_eta: &GpuBuf<f32>,
@@ -2124,7 +2124,7 @@ pub fn titans_fused_forward_dd(
 ) {
     unsafe {
         crate::cuda_ffi::titans_fused_forward_f32_cuda(
-            k_mem.as_ptr() as *mut f32, v_mem.as_ptr(), q_mem.as_ptr() as *mut f32,
+            k_mem.ptr(), v_mem.as_ptr(), q_mem.ptr(),
             w_alpha.as_ptr(), b_alpha.as_ptr(),
             w_theta.as_ptr(), b_theta.as_ptr(),
             w_eta.as_ptr(), b_eta.as_ptr(),
