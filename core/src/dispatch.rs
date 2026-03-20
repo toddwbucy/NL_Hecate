@@ -2075,6 +2075,69 @@ pub fn titans_backward_dd(
     }
 }
 
+/// Fused DGD forward: L2-normalize + gate compute + DGD recurrence in one kernel (spec 39).
+/// k_mem and q_mem are normalized in-place. alpha/theta/norms written to output buffers for backward.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn delta_fused_forward_dd(
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    w_alpha: &GpuBuf<f32>, b_alpha: &GpuBuf<f32>,
+    w_theta: &GpuBuf<f32>, b_theta: &GpuBuf<f32>,
+    alpha_floor: f32, alpha_ceil: f32,
+    theta_floor: f32, theta_ceil: f32,
+    m_initial: &GpuSlice<f32>,
+    m_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
+    alpha_out: &mut GpuBuf<f32>, theta_out: &mut GpuBuf<f32>,
+    k_norms_out: &mut GpuBuf<f32>, q_norms_out: &mut GpuBuf<f32>,
+    seq_len: usize, d: usize, batch_size: usize, error_clip: f32,
+) {
+    unsafe {
+        crate::cuda_ffi::dgd_fused_forward_f32_cuda(
+            k_mem.as_ptr() as *mut f32, v_mem.as_ptr(), q_mem.as_ptr() as *mut f32,
+            w_alpha.as_ptr(), b_alpha.as_ptr(),
+            w_theta.as_ptr(), b_theta.as_ptr(),
+            alpha_floor, alpha_ceil, theta_floor, theta_ceil,
+            m_initial.as_ptr(),
+            m_states.ptr(), y.ptr(),
+            alpha_out.ptr(), theta_out.ptr(),
+            k_norms_out.ptr(), q_norms_out.ptr(),
+            seq_len as i32, d as i32, batch_size as i32, error_clip,
+        );
+    }
+}
+
+/// Fused Titans forward: L2-normalize + gate compute (alpha/theta/eta) + Titans recurrence (spec 39).
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn titans_fused_forward_dd(
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    w_alpha: &GpuBuf<f32>, b_alpha: &GpuBuf<f32>,
+    w_theta: &GpuBuf<f32>, b_theta: &GpuBuf<f32>,
+    w_eta: &GpuBuf<f32>, b_eta: &GpuBuf<f32>,
+    alpha_floor: f32, alpha_ceil: f32,
+    theta_floor: f32, theta_ceil: f32,
+    m_initial: &GpuSlice<f32>, s_initial: &GpuSlice<f32>,
+    m_states: &mut GpuBuf<f32>, s_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
+    alpha_out: &mut GpuBuf<f32>, theta_out: &mut GpuBuf<f32>, eta_out: &mut GpuBuf<f32>,
+    k_norms_out: &mut GpuBuf<f32>, q_norms_out: &mut GpuBuf<f32>,
+    seq_len: usize, d: usize, batch_size: usize, error_clip: f32,
+) {
+    unsafe {
+        crate::cuda_ffi::titans_fused_forward_f32_cuda(
+            k_mem.as_ptr() as *mut f32, v_mem.as_ptr(), q_mem.as_ptr() as *mut f32,
+            w_alpha.as_ptr(), b_alpha.as_ptr(),
+            w_theta.as_ptr(), b_theta.as_ptr(),
+            w_eta.as_ptr(), b_eta.as_ptr(),
+            alpha_floor, alpha_ceil, theta_floor, theta_ceil,
+            m_initial.as_ptr(), s_initial.as_ptr(),
+            m_states.ptr(), s_states.ptr(), y.ptr(),
+            alpha_out.ptr(), theta_out.ptr(), eta_out.ptr(),
+            k_norms_out.ptr(), q_norms_out.ptr(),
+            seq_len as i32, d as i32, batch_size as i32, error_clip,
+        );
+    }
+}
+
 /// Hebbian forward on device buffers.
 #[cfg(feature = "cuda")]
 pub fn hebbian_forward_dd(
