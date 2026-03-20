@@ -507,3 +507,294 @@ extern "C" void dgd_forward_f32_cuda(
         m_states, y, seq_len, d, error_clip);
     check_cuda_launch("dgd_forward_kernel", d, smem_bytes);
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// Fused DGD Forward — Spec 39
+//
+// Fuses L2 normalization, gate compute (alpha/theta), gate clamping,
+// and the DGD recurrence into a single kernel.
+// cuBLAS K/V/Q projections remain separate (called before this).
+//
+// Eliminates:
+//   - 2× l2_normalize kernel launches (k, q)
+//   - 2× gate_compute kernel launches (alpha, theta)
+//   - 1× clamp kernel launch (optional)
+//   - Intermediate global memory buffers (k_norms, q_norms, alpha, theta)
+//
+// Grid=(batch_size), Block=(min(d*d, 1024)).
+// Shared memory: prediction[d] + error[d] + w_alpha[2d] + w_theta[2d]
+//                + warp_scratch[32] + k_buf[d] + v_buf[d] + q_buf[d]
+//                = 9*d + 32 floats
+//
+// Gate weights are loaded into shared memory once at kernel start,
+// then reused for every token (constant across the sequence).
+// ══════════════════════════════════════════════════════════════════════
+
+__global__ void dgd_fused_forward_kernel(
+    float* __restrict__ k_mem,              // [bs*s, d] — raw projections, normalized in-place
+    const float* __restrict__ v_mem,        // [bs*s, d]
+    float* __restrict__ q_mem,              // [bs*s, d] — raw projections, normalized in-place
+    const float* __restrict__ w_alpha,      // [2*d] gate weights
+    const float* __restrict__ b_alpha_ptr,  // [1] gate bias (device pointer)
+    const float* __restrict__ w_theta,      // [2*d] gate weights
+    const float* __restrict__ b_theta_ptr,  // [1] gate bias
+    float alpha_floor, float alpha_ceil,
+    float theta_floor, float theta_ceil,
+    const float* __restrict__ m_initial,    // [bs, d*d]
+    float* __restrict__ m_states,           // [bs, (s+1)*d*d]
+    float* __restrict__ y,                  // [bs, s, d]
+    float* __restrict__ alpha_out,          // [bs*s] — gate values for backward
+    float* __restrict__ theta_out,          // [bs*s] — gate values for backward
+    float* __restrict__ k_norms_out,        // [bs*s] — L2 norms for backward
+    float* __restrict__ q_norms_out,        // [bs*s] — L2 norms for backward
+    int seq_len, int d, float error_clip)
+{
+    int b = blockIdx.x;   // batch index
+    int tid = threadIdx.x;
+    int dd = d * d;
+    int n_warps = (blockDim.x + WARP_SZ - 1) / WARP_SZ;
+    int warp_id = tid / WARP_SZ;
+    int lane = tid % WARP_SZ;
+
+    // Offset pointers to this batch element's data
+    k_mem       += b * seq_len * d;
+    v_mem       += b * seq_len * d;
+    q_mem       += b * seq_len * d;
+    m_initial   += b * dd;
+    m_states    += b * (seq_len + 1) * dd;
+    y           += b * seq_len * d;
+    alpha_out   += b * seq_len;
+    theta_out   += b * seq_len;
+    k_norms_out += b * seq_len;
+    q_norms_out += b * seq_len;
+
+    // ── Shared memory layout ──
+    // prediction[d] + error[d] + s_w_alpha[2*d] + s_w_theta[2*d]
+    // + warp_scratch[32] + k_buf[d] + v_buf[d] + q_buf[d]
+    extern __shared__ float smem[];
+    float* prediction  = smem;                  // [d]
+    float* error_buf   = smem + d;              // [d]
+    float* s_w_alpha   = smem + 2 * d;          // [2*d]
+    float* s_w_theta   = smem + 4 * d;          // [2*d]
+    float* warp_scratch = smem + 6 * d;         // [32]
+    float* k_buf       = smem + 6 * d + 32;     // [d]
+    float* v_buf       = smem + 7 * d + 32;     // [d]
+    float* q_buf       = smem + 8 * d + 32;     // [d]
+
+    // Load gate weights into shared memory (constant across all tokens)
+    for (int i = tid; i < 2 * d; i += blockDim.x) {
+        s_w_alpha[i] = w_alpha[i];
+        s_w_theta[i] = w_theta[i];
+    }
+    float b_alpha_val = *b_alpha_ptr;
+    float b_theta_val = *b_theta_ptr;
+
+    // Store M_0 from m_initial
+    for (int idx = tid; idx < dd; idx += blockDim.x) {
+        m_states[idx] = m_initial[idx];
+    }
+    __syncthreads();
+
+    // Sequential token loop
+    for (int t = 0; t < seq_len; t++) {
+
+        // ── Phase 1: Load raw k, v, q into shared memory ──
+        for (int i = tid; i < d; i += blockDim.x) {
+            k_buf[i] = k_mem[t * d + i];
+            v_buf[i] = v_mem[t * d + i];
+            q_buf[i] = q_mem[t * d + i];
+        }
+        __syncthreads();
+
+        // ── Phase 2a: L2-normalize k ──
+        float k_sq = 0.0f;
+        for (int j = tid; j < d; j += blockDim.x) {
+            k_sq += k_buf[j] * k_buf[j];
+        }
+        for (int off = WARP_SZ / 2; off > 0; off >>= 1) {
+            k_sq += __shfl_down_sync(0xFFFFFFFF, k_sq, off);
+        }
+        if (lane == 0 && warp_id < 32) warp_scratch[warp_id] = k_sq;
+        __syncthreads();
+        if (warp_id == 0) {
+            float val = (lane < n_warps) ? warp_scratch[lane] : 0.0f;
+            for (int off = WARP_SZ / 2; off > 0; off >>= 1) {
+                val += __shfl_down_sync(0xFFFFFFFF, val, off);
+            }
+            if (lane == 0) warp_scratch[0] = val;
+        }
+        __syncthreads();
+        float k_norm = sqrtf(warp_scratch[0]);
+        float k_inv = 1.0f / fmaxf(k_norm, 1e-8f);
+        if (tid == 0) k_norms_out[t] = k_norm;
+        for (int j = tid; j < d; j += blockDim.x) {
+            float nk = k_buf[j] * k_inv;
+            k_buf[j] = nk;
+            k_mem[t * d + j] = nk;   // write normalized k back for backward
+        }
+        __syncthreads();
+
+        // ── Phase 2b: L2-normalize q ──
+        float q_sq = 0.0f;
+        for (int j = tid; j < d; j += blockDim.x) {
+            q_sq += q_buf[j] * q_buf[j];
+        }
+        for (int off = WARP_SZ / 2; off > 0; off >>= 1) {
+            q_sq += __shfl_down_sync(0xFFFFFFFF, q_sq, off);
+        }
+        if (lane == 0 && warp_id < 32) warp_scratch[warp_id] = q_sq;
+        __syncthreads();
+        if (warp_id == 0) {
+            float val = (lane < n_warps) ? warp_scratch[lane] : 0.0f;
+            for (int off = WARP_SZ / 2; off > 0; off >>= 1) {
+                val += __shfl_down_sync(0xFFFFFFFF, val, off);
+            }
+            if (lane == 0) warp_scratch[0] = val;
+        }
+        __syncthreads();
+        float q_norm = sqrtf(warp_scratch[0]);
+        float q_inv = 1.0f / fmaxf(q_norm, 1e-8f);
+        if (tid == 0) q_norms_out[t] = q_norm;
+        for (int j = tid; j < d; j += blockDim.x) {
+            float nq = q_buf[j] * q_inv;
+            q_buf[j] = nq;
+            q_mem[t * d + j] = nq;   // write normalized q back for backward
+        }
+        __syncthreads();
+
+        // ── Phase 3a: Alpha gate = sigmoid(dot(concat(k,v), w_alpha) + b_alpha) ──
+        float dot_a = 0.0f;
+        for (int j = tid; j < d; j += blockDim.x) {
+            dot_a += k_buf[j] * s_w_alpha[j];
+        }
+        for (int j = tid; j < d; j += blockDim.x) {
+            dot_a += v_buf[j] * s_w_alpha[d + j];
+        }
+        for (int off = WARP_SZ / 2; off > 0; off >>= 1) {
+            dot_a += __shfl_down_sync(0xFFFFFFFF, dot_a, off);
+        }
+        if (lane == 0 && warp_id < 32) warp_scratch[warp_id] = dot_a;
+        __syncthreads();
+        if (warp_id == 0) {
+            float val = (lane < n_warps) ? warp_scratch[lane] : 0.0f;
+            for (int off = WARP_SZ / 2; off > 0; off >>= 1) {
+                val += __shfl_down_sync(0xFFFFFFFF, val, off);
+            }
+            val += b_alpha_val;
+            val = 1.0f / (1.0f + expf(-val));  // sigmoid
+            val = fmaxf(val, alpha_floor);
+            val = fminf(val, alpha_ceil);
+            if (lane == 0) warp_scratch[0] = val;
+        }
+        __syncthreads();
+        float alpha_t = warp_scratch[0];
+        if (tid == 0) alpha_out[t] = alpha_t;
+
+        // ── Phase 3b: Theta gate = softplus(dot(concat(k,v), w_theta) + b_theta) ──
+        float dot_t = 0.0f;
+        for (int j = tid; j < d; j += blockDim.x) {
+            dot_t += k_buf[j] * s_w_theta[j];
+        }
+        for (int j = tid; j < d; j += blockDim.x) {
+            dot_t += v_buf[j] * s_w_theta[d + j];
+        }
+        for (int off = WARP_SZ / 2; off > 0; off >>= 1) {
+            dot_t += __shfl_down_sync(0xFFFFFFFF, dot_t, off);
+        }
+        if (lane == 0 && warp_id < 32) warp_scratch[warp_id] = dot_t;
+        __syncthreads();
+        if (warp_id == 0) {
+            float val = (lane < n_warps) ? warp_scratch[lane] : 0.0f;
+            for (int off = WARP_SZ / 2; off > 0; off >>= 1) {
+                val += __shfl_down_sync(0xFFFFFFFF, val, off);
+            }
+            val += b_theta_val;
+            val = (val > 20.0f) ? val : logf(1.0f + expf(val));  // softplus
+            val = fmaxf(val, theta_floor);
+            val = fminf(val, theta_ceil);
+            if (lane == 0) warp_scratch[0] = val;
+        }
+        __syncthreads();
+        float theta_t = warp_scratch[0];
+        if (tid == 0) theta_out[t] = theta_t;
+
+        // ── Phase 4: DGD recurrence (unchanged math) ──
+        int m_t_off = t * dd;
+        int m_next_off = (t + 1) * dd;
+
+        // prediction[i] = sum_j M_t[i,j] * k_t[j]
+        for (int row = tid; row < d; row += blockDim.x) {
+            float sum = 0.0f;
+            for (int j = 0; j < d; j++) {
+                sum += m_states[m_t_off + row * d + j] * k_buf[j];
+            }
+            prediction[row] = sum;
+        }
+        __syncthreads();
+
+        // error[i] = prediction[i] - v_t[i]
+        for (int row = tid; row < d; row += blockDim.x) {
+            error_buf[row] = prediction[row] - v_buf[row];
+        }
+        __syncthreads();
+        error_clip_inplace(error_buf, prediction, d, tid, error_clip);
+
+        // M_{t+1} = (1-alpha_t) * M_t - theta_t * outer(error, k)
+        float retention = 1.0f - alpha_t;
+        for (int idx = tid; idx < dd; idx += blockDim.x) {
+            int i = idx / d;
+            int j = idx % d;
+            m_states[m_next_off + idx] = retention * m_states[m_t_off + idx]
+                                         - theta_t * error_buf[i] * k_buf[j];
+        }
+        __syncthreads();
+
+        // y_t[i] = sum_j M_{t+1}[i,j] * q_t[j]
+        for (int row = tid; row < d; row += blockDim.x) {
+            float sum = 0.0f;
+            for (int j = 0; j < d; j++) {
+                sum += m_states[m_next_off + row * d + j] * q_buf[j];
+            }
+            y[t * d + row] = sum;
+        }
+        __syncthreads();
+    }
+}
+
+extern "C" void dgd_fused_forward_f32_cuda(
+    float* k_mem, const float* v_mem, float* q_mem,
+    const float* w_alpha, const float* b_alpha_ptr,
+    const float* w_theta, const float* b_theta_ptr,
+    float alpha_floor, float alpha_ceil,
+    float theta_floor, float theta_ceil,
+    const float* m_initial, float* m_states, float* y,
+    float* alpha_out, float* theta_out,
+    float* k_norms_out, float* q_norms_out,
+    int seq_len, int d, int batch_size, float error_clip)
+{
+    // Shared memory: 9*d + 32 floats
+    int smem_floats = 9 * d + 32;
+    int smem_bytes = smem_floats * (int)sizeof(float);
+    if (d <= 0 || smem_bytes > 163840) {
+        fprintf(stderr, "dgd_fused_forward_f32_cuda: d=%d out of range.\n", d);
+        exit(1);
+    }
+    int dd = d * d;
+    // Round up to warp boundary so all warps are full (no partial-warp UB in __shfl_down_sync)
+    int block_size = (dd < 1024) ? ((dd + 31) & ~31) : 1024;
+
+    dim3 grid(batch_size);
+    dim3 block(block_size);
+
+    check_cuda_alloc("dgd_fused_forward: cudaFuncSetAttribute",
+                     cudaFuncSetAttribute(dgd_fused_forward_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+    dgd_fused_forward_kernel<<<grid, block, smem_bytes>>>(
+        k_mem, v_mem, q_mem,
+        w_alpha, b_alpha_ptr, w_theta, b_theta_ptr,
+        alpha_floor, alpha_ceil, theta_floor, theta_ceil,
+        m_initial, m_states, y,
+        alpha_out, theta_out, k_norms_out, q_norms_out,
+        seq_len, d, error_clip);
+    check_cuda_launch("dgd_fused_forward_kernel", d, smem_bytes);
+}

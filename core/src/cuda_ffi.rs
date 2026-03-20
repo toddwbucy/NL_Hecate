@@ -733,4 +733,70 @@ extern "C" {
         d_model: i32,
         intermediate: i32,
     );
+
+    // ── Fused memory forward kernels (spec 39) ───────────────────────
+    //
+    // Fuse L2 normalization + gate compute + gate clamping into the
+    // main DGD/Titans recurrence kernel. Eliminates 4-5 separate launches
+    // and intermediate buffer round-trips per level.
+
+    /// Fused DGD forward: normalize + gates + DGD recurrence in one kernel.
+    /// k_mem and q_mem are normalized IN-PLACE (backward needs normalized values).
+    /// alpha_out, theta_out, k_norms_out, q_norms_out written for backward.
+    pub(crate) fn dgd_fused_forward_f32_cuda(
+        k_mem: *mut f32,           // [bs*s, d] — normalized in-place
+        v_mem: *const f32,         // [bs*s, d]
+        q_mem: *mut f32,           // [bs*s, d] — normalized in-place
+        w_alpha: *const f32,       // [2*d]
+        b_alpha_ptr: *const f32,   // [1]
+        w_theta: *const f32,       // [2*d]
+        b_theta_ptr: *const f32,   // [1]
+        alpha_floor: f32,
+        alpha_ceil: f32,
+        theta_floor: f32,
+        theta_ceil: f32,
+        m_initial: *const f32,     // [bs, d*d]
+        m_states: *mut f32,        // [bs, (s+1)*d*d]
+        y: *mut f32,               // [bs, s, d]
+        alpha_out: *mut f32,       // [bs*s]
+        theta_out: *mut f32,       // [bs*s]
+        k_norms_out: *mut f32,     // [bs*s]
+        q_norms_out: *mut f32,     // [bs*s]
+        seq_len: i32,
+        d: i32,
+        batch_size: i32,
+        error_clip: f32,
+    );
+
+    /// Fused Titans forward: normalize + gates (alpha/theta/eta) + Titans recurrence.
+    /// Same as DGD fused but adds eta gate and momentum S.
+    pub(crate) fn titans_fused_forward_f32_cuda(
+        k_mem: *mut f32,           // [bs*s, d] — normalized in-place
+        v_mem: *const f32,         // [bs*s, d]
+        q_mem: *mut f32,           // [bs*s, d] — normalized in-place
+        w_alpha: *const f32,       // [2*d]
+        b_alpha_ptr: *const f32,   // [1]
+        w_theta: *const f32,       // [2*d]
+        b_theta_ptr: *const f32,   // [1]
+        w_eta: *const f32,         // [2*d]
+        b_eta_ptr: *const f32,     // [1]
+        alpha_floor: f32,
+        alpha_ceil: f32,
+        theta_floor: f32,
+        theta_ceil: f32,
+        m_initial: *const f32,     // [bs, d*d]
+        s_initial: *const f32,     // [bs, d*d]
+        m_states: *mut f32,        // [bs, (s+1)*d*d]
+        s_states: *mut f32,        // [bs, (s+1)*d*d]
+        y: *mut f32,               // [bs, s, d]
+        alpha_out: *mut f32,       // [bs*s]
+        theta_out: *mut f32,       // [bs*s]
+        eta_out: *mut f32,         // [bs*s]
+        k_norms_out: *mut f32,     // [bs*s]
+        q_norms_out: *mut f32,     // [bs*s]
+        seq_len: i32,
+        d: i32,
+        batch_size: i32,
+        error_clip: f32,
+    );
 }

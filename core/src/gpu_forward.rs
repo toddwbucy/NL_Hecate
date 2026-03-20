@@ -1066,6 +1066,134 @@ pub(crate) fn gpu_memory_forward(
     crate::dispatch::cublas_matmul_transb_dd(embedded, &level_params.w_v_mem, &mut v_mem, bs * s, d, d, 0.0);
     crate::dispatch::cublas_matmul_transb_dd(embedded, &level_params.w_q_mem, &mut q_mem, bs * s, d, d, 0.0);
 
+    // context_m is [bs * dd] — slot b's initial M occupies offset b*dd.
+    let m_initial_slice = context_m.slice(0, bs * dd);
+    let m_norm_max = cfg.max_m_norm(level);
+    let eff_ckpt = cfg.effective_checkpoint_interval(level);
+    let is_proxy = cfg.tape_strategy_for_level(level) == LevelTapeStrategy::Proxy;
+
+    // Per-level gate clamp bounds
+    let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
+    let alpha_ceil  = cfg.alpha_ceil.get(level).copied().unwrap_or(1.0);
+    let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
+    let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
+
+    // ── Spec 39: Fused forward path ──────────────────────────────────
+    // For full-trajectory (no checkpoint_interval) DeltaRule and TitansLMM,
+    // fuse L2-normalize + gate compute + gate clamp + memory recurrence
+    // into a single kernel. Eliminates 4-5 separate kernel launches.
+    let use_fused = eff_ckpt.is_none()
+        && matches!(cfg.memory_rule, MemoryRuleKind::DeltaRule | MemoryRuleKind::TitansLMM);
+
+    if use_fused {
+        // Allocate output buffers for gates and norms (produced by fused kernel)
+        let mut alpha = GpuBuf::zeros(bs * s);
+        let mut theta = GpuBuf::zeros(bs * s);
+        let mut k_norms = GpuBuf::zeros(bs * s);
+        let mut q_norms = GpuBuf::zeros(bs * s);
+
+        match cfg.memory_rule {
+            MemoryRuleKind::DeltaRule => {
+                let mut m_states = GpuBuf::zeros(bs * (s + 1) * dd);
+                let mut y = GpuBuf::zeros(bs * s * d);
+                crate::dispatch::delta_fused_forward_dd(
+                    &mut k_mem, &v_mem, &mut q_mem,
+                    &level_params.w_alpha, &level_params.b_alpha,
+                    &level_params.w_theta, &level_params.b_theta,
+                    alpha_floor, alpha_ceil, theta_floor, theta_ceil,
+                    &m_initial_slice,
+                    &mut m_states, &mut y,
+                    &mut alpha, &mut theta,
+                    &mut k_norms, &mut q_norms,
+                    s, d, bs, cfg.error_clip_for_level(level),
+                );
+                crate::dispatch::cuda_sync();
+                copy_final_m_batch(&m_states, context_m, s, dd, bs);
+                for b in 0..bs {
+                    unsafe {
+                        crate::cuda_ffi::m_norm_clamp_f32_cuda(
+                            (context_m.ptr() as *mut u8).add(b * dd * 4) as *mut f32,
+                            d_i32, m_norm_max,
+                        );
+                    }
+                }
+                let (cache_m, cache_proxy) = if is_proxy {
+                    let m_final = GpuBuf::zeros(bs * dd);
+                    for b in 0..bs {
+                        unsafe {
+                            let rc = gpu_buf_memcpy_d2d(
+                                (m_final.ptr() as *mut u8).add(b * dd * 4) as *mut _,
+                                (m_states.as_ptr() as *const u8).add((b * (s + 1) + s) * dd * 4) as *const _,
+                                dd * 4,
+                            );
+                            assert_eq!(rc, 0, "proxy M_final copy failed");
+                        }
+                    }
+                    (m_final, true)
+                } else {
+                    (m_states, false)
+                };
+                return (y, GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states: cache_m, k_norms, q_norms, proxy: cache_proxy });
+            }
+            MemoryRuleKind::TitansLMM => {
+                let mut eta = GpuBuf::zeros(bs * s);
+                let batch_s_initial = GpuBuf::zeros(bs * dd);
+                let s_initial_slice = batch_s_initial.slice(0, bs * dd);
+                let mut m_states = GpuBuf::zeros(bs * (s + 1) * dd);
+                let mut s_states = GpuBuf::zeros(bs * (s + 1) * dd);
+                let mut y = GpuBuf::zeros(bs * s * d);
+                crate::dispatch::titans_fused_forward_dd(
+                    &mut k_mem, &v_mem, &mut q_mem,
+                    &level_params.w_alpha, &level_params.b_alpha,
+                    &level_params.w_theta, &level_params.b_theta,
+                    &level_params.w_eta, &level_params.b_eta,
+                    alpha_floor, alpha_ceil, theta_floor, theta_ceil,
+                    &m_initial_slice, &s_initial_slice,
+                    &mut m_states, &mut s_states, &mut y,
+                    &mut alpha, &mut theta, &mut eta,
+                    &mut k_norms, &mut q_norms,
+                    s, d, bs, cfg.error_clip_for_level(level),
+                );
+                crate::dispatch::cuda_sync();
+                copy_final_m_batch(&m_states, context_m, s, dd, bs);
+                for b in 0..bs {
+                    unsafe {
+                        crate::cuda_ffi::m_norm_clamp_f32_cuda(
+                            (context_m.ptr() as *mut u8).add(b * dd * 4) as *mut f32,
+                            d_i32, m_norm_max,
+                        );
+                    }
+                }
+                let (cache_m, cache_s, cache_proxy) = if is_proxy {
+                    let m_final = GpuBuf::zeros(bs * dd);
+                    let s_final = GpuBuf::zeros(bs * dd);
+                    for b in 0..bs {
+                        unsafe {
+                            let rc = gpu_buf_memcpy_d2d(
+                                (m_final.ptr() as *mut u8).add(b * dd * 4) as *mut _,
+                                (m_states.as_ptr() as *const u8).add((b * (s + 1) + s) * dd * 4) as *const _,
+                                dd * 4,
+                            );
+                            assert_eq!(rc, 0, "proxy M_final copy failed");
+                            let rc = gpu_buf_memcpy_d2d(
+                                (s_final.ptr() as *mut u8).add(b * dd * 4) as *mut _,
+                                (s_states.as_ptr() as *const u8).add((b * (s + 1) + s) * dd * 4) as *const _,
+                                dd * 4,
+                            );
+                            assert_eq!(rc, 0, "proxy S_final copy failed");
+                        }
+                    }
+                    (m_final, s_final, true)
+                } else {
+                    (m_states, s_states, false)
+                };
+                return (y, GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states: cache_m, s_states: cache_s, k_norms, q_norms, proxy: cache_proxy });
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // ── Unfused path (checkpointed variants, Hebbian, SwiGLU MLP) ────
     // L2-normalize keys and queries (Titans paper: "normalize queries and keys using l_2-norm")
     let k_norms = GpuBuf::zeros(bs * s);
     let q_norms = GpuBuf::zeros(bs * s);
@@ -1092,30 +1220,14 @@ pub(crate) fn gpu_memory_forward(
             tokens_i32, d_i32, 1, // 1=softplus
         );
         // CS-39: clamp post-sigmoid alpha to [floor, ceil] per level.
-        let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
-        let alpha_ceil  = cfg.alpha_ceil.get(level).copied().unwrap_or(1.0);
         if alpha_floor > 0.0 || alpha_ceil < 1.0 {
             crate::cuda_ffi::clamp_f32_cuda(alpha.ptr(), tokens_i32, alpha_floor, alpha_ceil);
         }
         // CS-39: clamp post-softplus theta to [floor, ceil] per level.
-        let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
-        let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
         if theta_floor > 0.0 || theta_ceil < f32::MAX {
             crate::cuda_ffi::clamp_f32_cuda(theta.ptr(), tokens_i32, theta_floor, theta_ceil);
         }
     }
-
-    // context_m is [bs * dd] — slot b's initial M occupies offset b*dd.
-    // No broadcast: pass context_m directly; the kernel reads m_initial + b*dd per element.
-    let m_initial_slice = context_m.slice(0, bs * dd);
-    let m_norm_max = cfg.max_m_norm(level);
-
-    // Spec 25: boundary-scoped Wengert tape. Use effective_checkpoint_interval
-    // Spec 25: effective_checkpoint_interval returns checkpoint_interval if explicitly set,
-    // otherwise None (full trajectory within each shard). Cycle-scoped eviction is handled
-    // at the shard level in gpu_tnt_forward, not within gpu_memory_forward.
-    let eff_ckpt = cfg.effective_checkpoint_interval(level);
-    let is_proxy = cfg.tape_strategy_for_level(level) == LevelTapeStrategy::Proxy;
 
     match (eff_ckpt, cfg.memory_rule) {
         // ── Full-trajectory paths (checkpoint_interval=None, current behavior) ──
@@ -2879,4 +2991,322 @@ pub(crate) unsafe fn gpu_buf_memcpy_d2d(
                       count: usize, kind: i32) -> i32;
     }
     cudaMemcpy(dst, src, bytes, 3) // 3 = D2D
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Tests: Fused vs unfused kernel bit-identity (spec 39)
+// ══════════════════════════════════════════════════════════════════════
+
+#[cfg(all(test, feature = "cuda"))]
+mod fused_tests {
+    use crate::gpu_buf::GpuBuf;
+
+    fn rand_vec(n: usize, seed: u64) -> Vec<f32> {
+        let mut v = Vec::with_capacity(n);
+        let mut state = seed;
+        for _ in 0..n {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let f = ((state >> 33) as f32) / (u32::MAX as f32) * 2.0 - 1.0;
+            v.push(f * 0.1);
+        }
+        v
+    }
+
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+    }
+
+    #[test]
+    fn test_dgd_fused_matches_unfused() {
+        let d = 32;
+        let s = 8;
+        let dd = d * d;
+        let bs = 1;
+
+        // Random inputs
+        let k_raw = rand_vec(bs * s * d, 42);
+        let v_raw = rand_vec(bs * s * d, 43);
+        let q_raw = rand_vec(bs * s * d, 44);
+        let m_init = rand_vec(bs * dd, 45);
+        let w_alpha = rand_vec(2 * d, 46);
+        let b_alpha_v = vec![3.0f32]; // sigmoid(3) ≈ 0.95
+        let w_theta = rand_vec(2 * d, 47);
+        let b_theta_v = vec![-4.6f32]; // softplus(-4.6) ≈ 0.01
+        let alpha_floor = 0.0f32;
+        let alpha_ceil = 1.0f32;
+        let theta_floor = 0.0f32;
+        let theta_ceil = 1.0f32;
+        let error_clip = 0.0f32;
+
+        // ── Unfused path: l2_normalize → gate_compute → dgd_forward ──
+        let k_unf = GpuBuf::from_host(&k_raw);
+        let q_unf = GpuBuf::from_host(&q_raw);
+        let v_unf = GpuBuf::from_host(&v_raw);
+        let k_norms_unf = GpuBuf::zeros(bs * s);
+        let q_norms_unf = GpuBuf::zeros(bs * s);
+        let alpha_unf = GpuBuf::zeros(bs * s);
+        let theta_unf = GpuBuf::zeros(bs * s);
+        let d_w_alpha = GpuBuf::from_host(&w_alpha);
+        let d_b_alpha = GpuBuf::from_host(&b_alpha_v);
+        let d_w_theta = GpuBuf::from_host(&w_theta);
+        let d_b_theta = GpuBuf::from_host(&b_theta_v);
+
+        unsafe {
+            crate::cuda_ffi::l2_normalize_rows_f32_cuda(
+                k_unf.as_ptr() as *mut f32, k_norms_unf.as_ptr() as *mut f32,
+                (bs * s) as i32, d as i32, 1e-8,
+            );
+            crate::cuda_ffi::l2_normalize_rows_f32_cuda(
+                q_unf.as_ptr() as *mut f32, q_norms_unf.as_ptr() as *mut f32,
+                (bs * s) as i32, d as i32, 1e-8,
+            );
+            crate::cuda_ffi::gate_compute_cuda(
+                k_unf.as_ptr(), v_unf.as_ptr(), d_w_alpha.as_ptr(),
+                d_b_alpha.as_ptr(), alpha_unf.as_ptr() as *mut f32,
+                (bs * s) as i32, d as i32, 0,
+            );
+            crate::cuda_ffi::gate_compute_cuda(
+                k_unf.as_ptr(), v_unf.as_ptr(), d_w_theta.as_ptr(),
+                d_b_theta.as_ptr(), theta_unf.as_ptr() as *mut f32,
+                (bs * s) as i32, d as i32, 1,
+            );
+        }
+        let m_init_buf = GpuBuf::from_host(&m_init);
+        let mut m_states_unf = GpuBuf::zeros(bs * (s + 1) * dd);
+        let mut y_unf = GpuBuf::zeros(bs * s * d);
+        crate::dispatch::delta_forward_dd(
+            &k_unf, &v_unf, &q_unf, &alpha_unf, &theta_unf,
+            &m_init_buf.slice(0, bs * dd),
+            &mut m_states_unf, &mut y_unf, s, d, bs, error_clip,
+        );
+        crate::dispatch::cuda_sync();
+
+        // Read results
+        let mut y_unf_h = vec![0.0f32; bs * s * d];
+        let mut alpha_unf_h = vec![0.0f32; bs * s];
+        let mut theta_unf_h = vec![0.0f32; bs * s];
+        let mut k_norms_unf_h = vec![0.0f32; bs * s];
+        let mut q_norms_unf_h = vec![0.0f32; bs * s];
+        let mut k_norm_h = vec![0.0f32; bs * s * d];
+        y_unf.copy_to_host(&mut y_unf_h);
+        alpha_unf.copy_to_host(&mut alpha_unf_h);
+        theta_unf.copy_to_host(&mut theta_unf_h);
+        k_norms_unf.copy_to_host(&mut k_norms_unf_h);
+        q_norms_unf.copy_to_host(&mut q_norms_unf_h);
+        k_unf.copy_to_host(&mut k_norm_h);
+
+        // ── Fused path ──
+        let mut k_fused = GpuBuf::from_host(&k_raw);
+        let mut q_fused = GpuBuf::from_host(&q_raw);
+        let v_fused = GpuBuf::from_host(&v_raw);
+        let m_init_fused = GpuBuf::from_host(&m_init);
+        let mut m_states_fused = GpuBuf::zeros(bs * (s + 1) * dd);
+        let mut y_fused = GpuBuf::zeros(bs * s * d);
+        let mut alpha_fused = GpuBuf::zeros(bs * s);
+        let mut theta_fused = GpuBuf::zeros(bs * s);
+        let mut k_norms_fused = GpuBuf::zeros(bs * s);
+        let mut q_norms_fused = GpuBuf::zeros(bs * s);
+
+        crate::dispatch::delta_fused_forward_dd(
+            &mut k_fused, &v_fused, &mut q_fused,
+            &d_w_alpha, &d_b_alpha,
+            &d_w_theta, &d_b_theta,
+            alpha_floor, alpha_ceil, theta_floor, theta_ceil,
+            &m_init_fused.slice(0, bs * dd),
+            &mut m_states_fused, &mut y_fused,
+            &mut alpha_fused, &mut theta_fused,
+            &mut k_norms_fused, &mut q_norms_fused,
+            s, d, bs, error_clip,
+        );
+        crate::dispatch::cuda_sync();
+
+        // Read fused results
+        let mut y_fused_h = vec![0.0f32; bs * s * d];
+        let mut alpha_fused_h = vec![0.0f32; bs * s];
+        let mut theta_fused_h = vec![0.0f32; bs * s];
+        let mut k_norms_fused_h = vec![0.0f32; bs * s];
+        let mut q_norms_fused_h = vec![0.0f32; bs * s];
+        let mut k_norm_fused_h = vec![0.0f32; bs * s * d];
+        y_fused.copy_to_host(&mut y_fused_h);
+        alpha_fused.copy_to_host(&mut alpha_fused_h);
+        theta_fused.copy_to_host(&mut theta_fused_h);
+        k_norms_fused.copy_to_host(&mut k_norms_fused_h);
+        q_norms_fused.copy_to_host(&mut q_norms_fused_h);
+        k_fused.copy_to_host(&mut k_norm_fused_h);
+
+        // Compare — should be identical (same math, same precision)
+        let y_diff = max_abs_diff(&y_unf_h, &y_fused_h);
+        let alpha_diff = max_abs_diff(&alpha_unf_h, &alpha_fused_h);
+        let theta_diff = max_abs_diff(&theta_unf_h, &theta_fused_h);
+        let k_norms_diff = max_abs_diff(&k_norms_unf_h, &k_norms_fused_h);
+        let q_norms_diff = max_abs_diff(&q_norms_unf_h, &q_norms_fused_h);
+        let k_diff = max_abs_diff(&k_norm_h, &k_norm_fused_h);
+
+        eprintln!("DGD fused vs unfused — y_diff={y_diff:.2e}, alpha_diff={alpha_diff:.2e}, theta_diff={theta_diff:.2e}, k_norms_diff={k_norms_diff:.2e}, q_norms_diff={q_norms_diff:.2e}, k_diff={k_diff:.2e}");
+
+        // Tolerance: 1e-5 per spec (CUDA vs CUDA, same precision)
+        assert!(y_diff < 1e-5, "y output mismatch: {y_diff}");
+        assert!(alpha_diff < 1e-5, "alpha mismatch: {alpha_diff}");
+        assert!(theta_diff < 1e-5, "theta mismatch: {theta_diff}");
+        assert!(k_norms_diff < 1e-5, "k_norms mismatch: {k_norms_diff}");
+        assert!(q_norms_diff < 1e-5, "q_norms mismatch: {q_norms_diff}");
+        assert!(k_diff < 1e-5, "normalized k mismatch: {k_diff}");
+    }
+
+    #[test]
+    fn test_titans_fused_matches_unfused() {
+        let d = 32;
+        let s = 8;
+        let dd = d * d;
+        let bs = 1;
+
+        // Random inputs
+        let k_raw = rand_vec(bs * s * d, 52);
+        let v_raw = rand_vec(bs * s * d, 53);
+        let q_raw = rand_vec(bs * s * d, 54);
+        let m_init = rand_vec(bs * dd, 55);
+        let s_init = vec![0.0f32; bs * dd]; // momentum starts at zero
+        let w_alpha = rand_vec(2 * d, 56);
+        let b_alpha_v = vec![3.0f32];
+        let w_theta = rand_vec(2 * d, 57);
+        let b_theta_v = vec![-4.6f32];
+        let w_eta = rand_vec(2 * d, 58);
+        let b_eta_v = vec![2.0f32]; // sigmoid(2) ≈ 0.88
+        let alpha_floor = 0.0f32;
+        let alpha_ceil = 1.0f32;
+        let theta_floor = 0.0f32;
+        let theta_ceil = 1.0f32;
+        let error_clip = 0.0f32;
+
+        // ── Unfused path: l2_normalize → gate_compute × 3 → titans_forward ──
+        let k_unf = GpuBuf::from_host(&k_raw);
+        let q_unf = GpuBuf::from_host(&q_raw);
+        let v_unf = GpuBuf::from_host(&v_raw);
+        let k_norms_unf = GpuBuf::zeros(bs * s);
+        let q_norms_unf = GpuBuf::zeros(bs * s);
+        let alpha_unf = GpuBuf::zeros(bs * s);
+        let theta_unf = GpuBuf::zeros(bs * s);
+        let eta_unf = GpuBuf::zeros(bs * s);
+        let d_w_alpha = GpuBuf::from_host(&w_alpha);
+        let d_b_alpha = GpuBuf::from_host(&b_alpha_v);
+        let d_w_theta = GpuBuf::from_host(&w_theta);
+        let d_b_theta = GpuBuf::from_host(&b_theta_v);
+        let d_w_eta = GpuBuf::from_host(&w_eta);
+        let d_b_eta = GpuBuf::from_host(&b_eta_v);
+
+        unsafe {
+            crate::cuda_ffi::l2_normalize_rows_f32_cuda(
+                k_unf.as_ptr() as *mut f32, k_norms_unf.as_ptr() as *mut f32,
+                (bs * s) as i32, d as i32, 1e-8,
+            );
+            crate::cuda_ffi::l2_normalize_rows_f32_cuda(
+                q_unf.as_ptr() as *mut f32, q_norms_unf.as_ptr() as *mut f32,
+                (bs * s) as i32, d as i32, 1e-8,
+            );
+            // alpha: mode=0 (sigmoid)
+            crate::cuda_ffi::gate_compute_cuda(
+                k_unf.as_ptr(), v_unf.as_ptr(), d_w_alpha.as_ptr(),
+                d_b_alpha.as_ptr(), alpha_unf.as_ptr() as *mut f32,
+                (bs * s) as i32, d as i32, 0,
+            );
+            // theta: mode=1 (softplus)
+            crate::cuda_ffi::gate_compute_cuda(
+                k_unf.as_ptr(), v_unf.as_ptr(), d_w_theta.as_ptr(),
+                d_b_theta.as_ptr(), theta_unf.as_ptr() as *mut f32,
+                (bs * s) as i32, d as i32, 1,
+            );
+            // eta: mode=0 (sigmoid)
+            crate::cuda_ffi::gate_compute_cuda(
+                k_unf.as_ptr(), v_unf.as_ptr(), d_w_eta.as_ptr(),
+                d_b_eta.as_ptr(), eta_unf.as_ptr() as *mut f32,
+                (bs * s) as i32, d as i32, 0,
+            );
+        }
+        let m_init_buf = GpuBuf::from_host(&m_init);
+        let s_init_buf = GpuBuf::from_host(&s_init);
+        let mut m_states_unf = GpuBuf::zeros(bs * (s + 1) * dd);
+        let mut s_states_unf = GpuBuf::zeros(bs * (s + 1) * dd);
+        let mut y_unf = GpuBuf::zeros(bs * s * d);
+        crate::dispatch::titans_forward_dd(
+            &k_unf, &v_unf, &q_unf, &alpha_unf, &theta_unf, &eta_unf,
+            &m_init_buf.slice(0, bs * dd), &s_init_buf.slice(0, bs * dd),
+            &mut m_states_unf, &mut s_states_unf, &mut y_unf,
+            s, d, bs, error_clip,
+        );
+        crate::dispatch::cuda_sync();
+
+        // Read unfused results
+        let mut y_unf_h = vec![0.0f32; bs * s * d];
+        let mut alpha_unf_h = vec![0.0f32; bs * s];
+        let mut theta_unf_h = vec![0.0f32; bs * s];
+        let mut eta_unf_h = vec![0.0f32; bs * s];
+        let mut k_norms_unf_h = vec![0.0f32; bs * s];
+        let mut q_norms_unf_h = vec![0.0f32; bs * s];
+        y_unf.copy_to_host(&mut y_unf_h);
+        alpha_unf.copy_to_host(&mut alpha_unf_h);
+        theta_unf.copy_to_host(&mut theta_unf_h);
+        eta_unf.copy_to_host(&mut eta_unf_h);
+        k_norms_unf.copy_to_host(&mut k_norms_unf_h);
+        q_norms_unf.copy_to_host(&mut q_norms_unf_h);
+
+        // ── Fused path ──
+        let mut k_fused = GpuBuf::from_host(&k_raw);
+        let mut q_fused = GpuBuf::from_host(&q_raw);
+        let v_fused = GpuBuf::from_host(&v_raw);
+        let m_init_fused = GpuBuf::from_host(&m_init);
+        let s_init_fused = GpuBuf::from_host(&s_init);
+        let mut m_states_fused = GpuBuf::zeros(bs * (s + 1) * dd);
+        let mut s_states_fused = GpuBuf::zeros(bs * (s + 1) * dd);
+        let mut y_fused = GpuBuf::zeros(bs * s * d);
+        let mut alpha_fused = GpuBuf::zeros(bs * s);
+        let mut theta_fused = GpuBuf::zeros(bs * s);
+        let mut eta_fused = GpuBuf::zeros(bs * s);
+        let mut k_norms_fused = GpuBuf::zeros(bs * s);
+        let mut q_norms_fused = GpuBuf::zeros(bs * s);
+
+        crate::dispatch::titans_fused_forward_dd(
+            &mut k_fused, &v_fused, &mut q_fused,
+            &d_w_alpha, &d_b_alpha,
+            &d_w_theta, &d_b_theta,
+            &d_w_eta, &d_b_eta,
+            alpha_floor, alpha_ceil, theta_floor, theta_ceil,
+            &m_init_fused.slice(0, bs * dd), &s_init_fused.slice(0, bs * dd),
+            &mut m_states_fused, &mut s_states_fused, &mut y_fused,
+            &mut alpha_fused, &mut theta_fused, &mut eta_fused,
+            &mut k_norms_fused, &mut q_norms_fused,
+            s, d, bs, error_clip,
+        );
+        crate::dispatch::cuda_sync();
+
+        // Read fused results
+        let mut y_fused_h = vec![0.0f32; bs * s * d];
+        let mut alpha_fused_h = vec![0.0f32; bs * s];
+        let mut theta_fused_h = vec![0.0f32; bs * s];
+        let mut eta_fused_h = vec![0.0f32; bs * s];
+        let mut k_norms_fused_h = vec![0.0f32; bs * s];
+        let mut q_norms_fused_h = vec![0.0f32; bs * s];
+        y_fused.copy_to_host(&mut y_fused_h);
+        alpha_fused.copy_to_host(&mut alpha_fused_h);
+        theta_fused.copy_to_host(&mut theta_fused_h);
+        eta_fused.copy_to_host(&mut eta_fused_h);
+        k_norms_fused.copy_to_host(&mut k_norms_fused_h);
+        q_norms_fused.copy_to_host(&mut q_norms_fused_h);
+
+        // Compare
+        let y_diff = max_abs_diff(&y_unf_h, &y_fused_h);
+        let alpha_diff = max_abs_diff(&alpha_unf_h, &alpha_fused_h);
+        let theta_diff = max_abs_diff(&theta_unf_h, &theta_fused_h);
+        let eta_diff = max_abs_diff(&eta_unf_h, &eta_fused_h);
+        let k_norms_diff = max_abs_diff(&k_norms_unf_h, &k_norms_fused_h);
+        let q_norms_diff = max_abs_diff(&q_norms_unf_h, &q_norms_fused_h);
+
+        eprintln!("Titans fused vs unfused — y_diff={y_diff:.2e}, alpha_diff={alpha_diff:.2e}, theta_diff={theta_diff:.2e}, eta_diff={eta_diff:.2e}, k_norms_diff={k_norms_diff:.2e}, q_norms_diff={q_norms_diff:.2e}");
+
+        assert!(y_diff < 1e-5, "y output mismatch: {y_diff}");
+        assert!(alpha_diff < 1e-5, "alpha mismatch: {alpha_diff}");
+        assert!(theta_diff < 1e-5, "theta mismatch: {theta_diff}");
+        assert!(eta_diff < 1e-5, "eta mismatch: {eta_diff}");
+        assert!(k_norms_diff < 1e-5, "k_norms mismatch: {k_norms_diff}");
+        assert!(q_norms_diff < 1e-5, "q_norms mismatch: {q_norms_diff}");
+    }
 }
