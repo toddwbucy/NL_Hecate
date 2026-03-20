@@ -743,6 +743,16 @@ impl MAGConfig {
     fn tape_strategies(&self) -> Vec<String> {
         self.inner.tape_strategies.iter().map(|s| format_tape_strategy(s).to_string()).collect()
     }
+    #[getter]
+    fn hope_variant(&self) -> &str {
+        match self.inner.hope_variant {
+            nl_hecate_core::model::HopeVariant::FreqGated => "freq_gated",
+            nl_hecate_core::model::HopeVariant::Chained => "chained",
+            nl_hecate_core::model::HopeVariant::Independent => "independent",
+            nl_hecate_core::model::HopeVariant::Sequential => "sequential",
+            nl_hecate_core::model::HopeVariant::Nested => "nested",
+        }
+    }
 }
 
 // ── MAGParams ──────────────────────────────────────────────────────

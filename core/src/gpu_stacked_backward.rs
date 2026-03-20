@@ -214,28 +214,26 @@ pub fn gpu_stacked_backward(
 
         // ── Per-level output gradient norms (tape diagnostics) ─────
         let mut block_level_gnorms = vec![0.0f32; cfg.k];
-        {
+        // Shared scratch buffer for grad_norm_sq_cuda calls
+        let max_norm_blocks = (bsd + 255) / 256;
+        let gnorm_scratch = GpuBuf::zeros(max_norm_blocks);
+
+        // Helper: compute L2 norm of a GPU buffer using grad_norm_sq_cuda
+        let compute_gnorm = |buf: &GpuBuf<f32>, scratch: &GpuBuf<f32>| -> f32 {
             let mut num_blocks_out: i32 = 0;
-            let max_norm_blocks = (bsd + 255) / 256;
-            let scratch = GpuBuf::zeros(max_norm_blocks);
             let err = unsafe {
                 crate::cuda_ffi::grad_norm_sq_cuda(
-                    d_y_combined.as_ptr(), scratch.ptr(), bsd as i32, &mut num_blocks_out,
+                    buf.as_ptr(), scratch.ptr(), bsd as i32, &mut num_blocks_out,
                 )
             };
-            assert_eq!(err, 0, "grad_norm_sq_cuda for d_y_combined failed");
+            assert_eq!(err, 0, "grad_norm_sq_cuda failed");
             crate::dispatch::cuda_sync();
             let nb = num_blocks_out as usize;
             let mut host = vec![0.0f32; nb];
             scratch.slice(0, nb).copy_to_host(&mut host);
             let sq_sum: f64 = host.iter().map(|x| *x as f64).sum();
-            let d_y_norm = sq_sum.sqrt() as f32;
-            for level in 0..cfg.k {
-                if cache.pulse.active_levels[level] {
-                    block_level_gnorms[level] = d_y_norm;
-                }
-            }
-        }
+            sq_sum.sqrt() as f32
+        };
 
         let d_alpha_mem: Vec<f32>;
         let d_mem_input;
@@ -259,18 +257,23 @@ pub fn gpu_stacked_backward(
                     &bc.y_per_level[level - 1]
                 };
 
-                if cache.pulse.active_levels[level] {
-                    if let Some(ref mem_cache) = bc.memory_caches[level] {
-                        let d_emb_level = gpu_memory_backward(
-                            &block.levels[level], cfg, mem_cache,
-                            &d_upstream, level_input,
-                            &mut level_grads[level],
-                            s, d, level, bs,
-                        );
-                        d_upstream = d_emb_level;
-                    }
+                // Record per-level gnorm of the actual gradient entering this level
+                if bc.memory_caches[level].is_some() {
+                    block_level_gnorms[level] = compute_gnorm(&d_upstream, &gnorm_scratch);
+                }
+
+                // Dispatch based on forward's cached mode (memory_caches[level].is_some()),
+                // not pulse.active_levels, to match SwiGluMlp promotion logic.
+                if let Some(ref mem_cache) = bc.memory_caches[level] {
+                    let d_emb_level = gpu_memory_backward(
+                        &block.levels[level], cfg, mem_cache,
+                        &d_upstream, level_input,
+                        &mut level_grads[level],
+                        s, d, level, bs,
+                    );
+                    d_upstream = d_emb_level;
                 } else {
-                    // Frozen level: identity pass-through, gradient flows unchanged
+                    // Frozen level: read-only backward, gradient flows through
                     let d_emb_level = gpu_memory_read_only_backward(
                         &block.levels[level], &bc.y_per_level[level],
                         &d_upstream, level_input,
@@ -287,6 +290,15 @@ pub fn gpu_stacked_backward(
             // ── Independent/FreqGated aggregation backward ──────────
             // Forward: y_combined = Σ_l w[l] * y_level[l], w = softmax(alpha_mem)
             // Spec: specs/infrastructure/21_stacked_alpha_aggregation.md
+
+            // Compute d_y_combined norm once (same gradient for all levels in this mode)
+            let d_y_norm = compute_gnorm(&d_y_combined, &gnorm_scratch);
+            for level in 0..cfg.k {
+                if bc.memory_caches[level].is_some() {
+                    block_level_gnorms[level] = d_y_norm;
+                }
+            }
+
             let w = &bc.alpha_weights;
             let mut d_y_host = vec![0.0f32; bsd];
             crate::dispatch::cuda_sync();
@@ -311,17 +323,16 @@ pub fn gpu_stacked_backward(
                     crate::cuda_ffi::saxpy_cuda(w[level], d_y_combined.as_ptr(), d_y_level.ptr(), bsd_i32);
                 }
 
-                if cache.pulse.active_levels[level] {
-                    if let Some(ref mem_cache) = bc.memory_caches[level] {
-                        let d_emb_level = gpu_memory_backward(
-                            &block.levels[level], cfg, mem_cache,
-                            &d_y_level, &bc.ln_mem_out,
-                            &mut level_grads[level],
-                            s, d, level, bs,
-                        );
-                        unsafe {
-                            crate::cuda_ffi::saxpy_cuda(1.0, d_emb_level.as_ptr(), d_mem_input.ptr(), bsd_i32);
-                        }
+                // Dispatch based on forward's cached mode (memory_caches.is_some())
+                if let Some(ref mem_cache) = bc.memory_caches[level] {
+                    let d_emb_level = gpu_memory_backward(
+                        &block.levels[level], cfg, mem_cache,
+                        &d_y_level, &bc.ln_mem_out,
+                        &mut level_grads[level],
+                        s, d, level, bs,
+                    );
+                    unsafe {
+                        crate::cuda_ffi::saxpy_cuda(1.0, d_emb_level.as_ptr(), d_mem_input.ptr(), bsd_i32);
                     }
                 } else {
                     let d_emb_level = gpu_memory_read_only_backward(
