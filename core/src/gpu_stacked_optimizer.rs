@@ -692,9 +692,10 @@ fn gpu_stacked_m3_grad_norm(
     host: &mut Vec<f32>,
     skip_embed: bool,
 ) -> f32 {
-    let mut total = 0.0f32;
+    let mut total = 0.0f64;
     let mut add = |g: &GpuBuf<f32>| {
-        total += gpu_frob_norm(g, scratch, host).powi(2);
+        let n = gpu_frob_norm(g, scratch, host) as f64;
+        total += n * n;
     };
     if !skip_embed {
         add(&grads.d_w_embed);
@@ -727,10 +728,11 @@ fn gpu_stacked_m3_grad_norm(
     // alpha_mem gradients (host-side scalars, accumulated after closure dropped)
     for bg in &grads.blocks {
         for &g in &bg.d_alpha_mem {
-            total += g * g;
+            let g64 = g as f64;
+            total += g64 * g64;
         }
     }
-    total.sqrt()
+    total.sqrt() as f32
 }
 
 /// Scale all stacked grads in-place for gradient clipping.
