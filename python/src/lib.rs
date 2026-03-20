@@ -2828,6 +2828,7 @@ struct GpuStackedModel {
     context: nl_hecate_core::gpu_params::GpuStackedContext,
     cfg: nl_hecate_core::model::MAGConfig,
     adamw_state: Option<nl_hecate_core::gpu_stacked_optimizer::GpuStackedAdamWState>,
+    m3_state: Option<nl_hecate_core::gpu_stacked_optimizer::GpuStackedM3State>,
     n_blocks: usize,
     /// TNT periodic reset mode. When true, context.memory[k] is zeroed after
     /// each step where pulse.active_levels[k] is true (eq-006, 2511.07343).
@@ -2866,6 +2867,7 @@ impl GpuStackedModel {
             context: gpu_context,
             cfg: cfg.inner.clone(),
             adamw_state: None,
+            m3_state: None,
             n_blocks,
             memory_reset,
             last_block_gnorms: Vec::new(),
@@ -2912,6 +2914,7 @@ impl GpuStackedModel {
             context: gpu_context,
             cfg: cfg.inner.clone(),
             adamw_state: None,
+            m3_state: None,
             n_blocks,
             memory_reset,
             last_block_gnorms: Vec::new(),
@@ -3056,6 +3059,102 @@ impl GpuStackedModel {
         }
 
         Ok((loss, grad_norm))
+    }
+
+    /// Initialize M3 optimizer state for stacked model. Call once before step_m3.
+    #[pyo3(signature = (beta1=0.9, beta2=0.999, beta3=0.99, alpha=0.5, chunk_size=8, ns_iterations=5, eps=1e-8))]
+    fn init_m3(&mut self, beta1: f32, beta2: f32, beta3: f32,
+               alpha: f32, chunk_size: u32, ns_iterations: u32, eps: f32) -> PyResult<()> {
+        if chunk_size == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "chunk_size must be >= 1 (used as modulus in gpu_m3_update)"
+            ));
+        }
+        let config = nl_hecate_core::gpu_optimizer::GpuM3Config {
+            beta1, beta2, beta3, alpha, chunk_size, ns_iterations, eps,
+        };
+        let d = self.cfg.swa.d_model;
+        self.m3_state = Some(
+            nl_hecate_core::gpu_stacked_optimizer::GpuStackedM3State::from_params(
+                &self.params, config, d,
+            )
+        );
+        Ok(())
+    }
+
+    /// Full GPU build step with M3 optimizer for stacked model. Returns (loss, grad_norm).
+    #[pyo3(signature = (input_ids, target_ids, pulse, lr, max_grad_norm=1.0, freeze_embed=false))]
+    fn step_m3(&mut self, input_ids: Vec<usize>, target_ids: Vec<usize>,
+               pulse: &Pulse, lr: f32, max_grad_norm: f32,
+               freeze_embed: bool) -> PyResult<(f32, f32)> {
+        let s = self.cfg.swa.seq_len;
+        let v = self.cfg.swa.vocab_size;
+        let d = self.cfg.swa.d_model;
+        if s == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err("seq_len must be > 0"));
+        }
+        if input_ids.is_empty() || input_ids.len() % s != 0 || target_ids.len() != input_ids.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("input/target length must be batch_size * seq_len {} (got {})", s, input_ids.len())));
+        }
+        let bs = input_ids.len() / s;
+        if bs != self.context.batch_size {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("batch mismatch: input has {} samples but context allocated for batch_size={}",
+                        bs, self.context.batch_size)));
+        }
+        if let Some(&max_id) = input_ids.iter().max() {
+            if max_id >= v {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("input_ids contains {} >= vocab_size {}", max_id, v)));
+            }
+        }
+
+        // Forward
+        let (loss, cache) = nl_hecate_core::gpu_stacked_forward::gpu_stacked_forward(
+            &self.params, &self.cfg, &input_ids, &target_ids,
+            &pulse.inner, &mut self.context,
+        );
+
+        // Backward
+        let mut grads = nl_hecate_core::gpu_stacked_backward::gpu_stacked_backward(
+            &self.params, &self.cfg, &cache,
+        );
+
+        // M3 update
+        let state = self.m3_state.as_mut().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "M3 state not initialized — call init_m3() before step_m3()")
+        })?;
+
+        let grad_norm = nl_hecate_core::gpu_stacked_optimizer::gpu_stacked_m3_update(
+            &mut self.params, &mut grads, state,
+            &pulse.inner, lr, max_grad_norm, d, freeze_embed,
+        );
+
+        // Weight tying: sync w_unembed^T → w_embed
+        nl_hecate_core::gpu_stacked_optimizer::gpu_stacked_sync_embed_weights(
+            &mut self.params, d, v,
+        );
+
+        // Update M-norm tracking for dormancy detection (spec 28)
+        self.context.update_m_norm_tracking();
+
+        // TNT periodic reset (CS-32 compliant)
+        if self.memory_reset {
+            for (k, &active) in pulse.inner.active_levels.iter().enumerate() {
+                if active {
+                    self.context.periodic_reset_level(k);
+                }
+            }
+        }
+
+        Ok((loss, grad_norm))
+    }
+
+    /// Get the current M3 optimizer step count.
+    fn m3_step(&self) -> u32 {
+        self.m3_state.as_ref().map_or(0, |s| s.step)
     }
 
     /// Update per-level theta_floor values on the live model config.
