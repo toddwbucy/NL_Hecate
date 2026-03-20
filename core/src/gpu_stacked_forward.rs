@@ -13,7 +13,7 @@ use crate::gpu_buf::GpuBuf;
 #[cfg(feature = "cuda")]
 use crate::gpu_params::{GpuStackedParams, GpuStackedContext};
 #[cfg(feature = "cuda")]
-use crate::model::{MAGConfig, MemoryRuleKind};
+use crate::model::{MAGConfig, MemoryRuleKind, HopeVariant};
 #[cfg(feature = "cuda")]
 use crate::conductor::Pulse;
 #[cfg(feature = "cuda")]
@@ -271,53 +271,114 @@ pub fn gpu_stacked_forward(
         let mut memory_caches = Vec::with_capacity(cfg.k);
         let mut y_per_level = Vec::with_capacity(cfg.k);
 
-        for level in 0..cfg.k {
-            let effective_active = pulse.active_levels[level]
-                || matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp);
+        let is_chained = matches!(cfg.hope_variant, HopeVariant::Chained | HopeVariant::Sequential);
 
-            if effective_active {
-                if is_tnt
-                    && bs == 1
-                    && matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM | MemoryRuleKind::DeltaRule)
-                {
-                    let parallel_cfg = cfg.parallel.as_ref().unwrap();
-                    let (y_level, mem_cache) = gpu_tnt_forward(
-                        &block.levels[level], cfg, &ln_mem_out,
-                        &mut block_ctx.memory[level],
-                        s, d, level, bs, parallel_cfg,
-                    );
-                    y_per_level.push(y_level);
-                    memory_caches.push(Some(mem_cache));
+        if is_chained {
+            // HOPE Eq 70 / Eq 97: Chain CMS — each level processes previous level's output.
+            // Spec: specs/infrastructure/35_chain_cms_gpu.md
+            let mut h = ln_mem_out.clone_buf();
+            for level in 0..cfg.k {
+                let effective_active = pulse.active_levels[level]
+                    || matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp);
+
+                if effective_active {
+                    if is_tnt
+                        && bs == 1
+                        && matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM | MemoryRuleKind::DeltaRule)
+                    {
+                        let parallel_cfg = cfg.parallel.as_ref().unwrap();
+                        let (y_level, mem_cache) = gpu_tnt_forward(
+                            &block.levels[level], cfg, &h,
+                            &mut block_ctx.memory[level],
+                            s, d, level, bs, parallel_cfg,
+                        );
+                        y_per_level.push(y_level);
+                        memory_caches.push(Some(mem_cache));
+                    } else {
+                        let (y_level, mem_cache) = gpu_memory_forward(
+                            &block.levels[level], cfg, &h,
+                            &mut block_ctx.memory[level],
+                            s, d, level, bs,
+                        );
+                        y_per_level.push(y_level);
+                        memory_caches.push(Some(mem_cache));
+                    }
                 } else {
-                    let (y_level, mem_cache) = gpu_memory_forward(
-                        &block.levels[level], cfg, &ln_mem_out,
-                        &mut block_ctx.memory[level],
-                        s, d, level, bs,
+                    // Frozen: identity pass-through, read-only M@q
+                    let y_level = gpu_memory_read_only(
+                        &block.levels[level], &h,
+                        &block_ctx.memory[level],
+                        n_tokens, d,
                     );
                     y_per_level.push(y_level);
-                    memory_caches.push(Some(mem_cache));
+                    memory_caches.push(None);
                 }
-            } else {
-                let y_level = gpu_memory_read_only(
-                    &block.levels[level], &ln_mem_out,
-                    &block_ctx.memory[level],
-                    n_tokens, d,
-                );
-                y_per_level.push(y_level);
-                memory_caches.push(None);
+                // Chain: next level's input is this level's output
+                if level < cfg.k - 1 {
+                    h = y_per_level[level].clone_buf();
+                }
+            }
+        } else {
+            // FreqGated/Independent: all levels process same ln_mem_out
+            for level in 0..cfg.k {
+                let effective_active = pulse.active_levels[level]
+                    || matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp);
+
+                if effective_active {
+                    if is_tnt
+                        && bs == 1
+                        && matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM | MemoryRuleKind::DeltaRule)
+                    {
+                        let parallel_cfg = cfg.parallel.as_ref().unwrap();
+                        let (y_level, mem_cache) = gpu_tnt_forward(
+                            &block.levels[level], cfg, &ln_mem_out,
+                            &mut block_ctx.memory[level],
+                            s, d, level, bs, parallel_cfg,
+                        );
+                        y_per_level.push(y_level);
+                        memory_caches.push(Some(mem_cache));
+                    } else {
+                        let (y_level, mem_cache) = gpu_memory_forward(
+                            &block.levels[level], cfg, &ln_mem_out,
+                            &mut block_ctx.memory[level],
+                            s, d, level, bs,
+                        );
+                        y_per_level.push(y_level);
+                        memory_caches.push(Some(mem_cache));
+                    }
+                } else {
+                    let y_level = gpu_memory_read_only(
+                        &block.levels[level], &ln_mem_out,
+                        &block_ctx.memory[level],
+                        n_tokens, d,
+                    );
+                    y_per_level.push(y_level);
+                    memory_caches.push(None);
+                }
             }
         }
 
-        // ── Learnable level aggregation: weights = softmax(alpha_mem) ────
-        // Spec: specs/infrastructure/21_stacked_alpha_aggregation.md
-        // HOPE eq-074: y_t = Agg(...), "learnable weighted sum"
-        let mut alpha_host = vec![0.0f32; cfg.k];
-        block.alpha_mem.slice(0, cfg.k).copy_to_host(&mut alpha_host);
-        let alpha_weights = crate::stacked_model::host_softmax(&alpha_host);
-        let y_combined = GpuBuf::<f32>::zeros(total);
-        for (l, y_level) in y_per_level.iter().enumerate() {
-            unsafe {
-                crate::cuda_ffi::saxpy_cuda(alpha_weights[l], y_level.as_ptr(), y_combined.ptr(), total_i32);
+        // ── Level aggregation ────────────────────────────────────────
+        let alpha_weights;
+        let y_combined;
+
+        if is_chained {
+            // Chain CMS: y_combined = y_per_level[k-1] directly (no weighted sum)
+            // Spec 35: alpha_mem aggregation weights are NOT used in chain mode
+            alpha_weights = vec![0.0f32; cfg.k];
+            y_combined = y_per_level.last().unwrap().clone_buf();
+        } else {
+            // Learnable level aggregation: weights = softmax(alpha_mem)
+            // Spec: specs/infrastructure/21_stacked_alpha_aggregation.md
+            // HOPE eq-074: y_t = Agg(...), "learnable weighted sum"
+            let mut alpha_host = vec![0.0f32; cfg.k];
+            block.alpha_mem.slice(0, cfg.k).copy_to_host(&mut alpha_host);
+            alpha_weights = crate::stacked_model::host_softmax(&alpha_host);
+            y_combined = GpuBuf::<f32>::zeros(total);
+            for (l, y_level) in y_per_level.iter().enumerate() {
+                unsafe {
+                    crate::cuda_ffi::saxpy_cuda(alpha_weights[l], y_level.as_ptr(), y_combined.ptr(), total_i32);
+                }
             }
         }
 
@@ -419,7 +480,7 @@ pub fn gpu_stacked_forward(
 
 /// Clone a GpuBuf by allocating a new buffer and doing D2D copy.
 #[cfg(feature = "cuda")]
-trait GpuBufClone {
+pub(crate) trait GpuBufClone {
     fn clone_buf(&self) -> Self;
 }
 

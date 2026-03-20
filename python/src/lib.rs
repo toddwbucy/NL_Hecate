@@ -314,6 +314,7 @@ impl MAGConfig {
         b_alpha_init=None,
         b_theta_init=None,
         tape_strategies=None,
+        hope_variant=None,
     ))]
     fn new(
         d_model: usize,
@@ -366,6 +367,7 @@ impl MAGConfig {
         b_alpha_init: Option<Vec<f32>>,
         b_theta_init: Option<Vec<f32>>,
         tape_strategies: Option<Vec<String>>,
+        hope_variant: Option<&str>,
     ) -> PyResult<Self> {
         if d_model != num_heads * head_dim {
             return Err(PyValueError::new_err(format!(
@@ -585,7 +587,16 @@ impl MAGConfig {
                 frequency_schedule: freq_sched,
                 checkpoint_interval,
                 tape_multiplier: tape_multiplier.max(1),
-                hope_variant: nl_hecate_core::model::HopeVariant::FreqGated,
+                hope_variant: match hope_variant.unwrap_or("freq_gated").to_lowercase().as_str() {
+                    "freq_gated" | "freqgated" => nl_hecate_core::model::HopeVariant::FreqGated,
+                    "chained" | "chain" => nl_hecate_core::model::HopeVariant::Chained,
+                    "independent" => nl_hecate_core::model::HopeVariant::Independent,
+                    "sequential" => nl_hecate_core::model::HopeVariant::Sequential,
+                    "nested" => nl_hecate_core::model::HopeVariant::Nested,
+                    other => return Err(PyValueError::new_err(format!(
+                        "Unknown hope_variant '{other}'. Expected: freq_gated, chained, independent, sequential, nested"
+                    ))),
+                },
                 lattice_variant: nl_hecate_core::model::LatticeVariant::Decode,
                 n_persistent: 0,
                 attentional_bias: bias_kind,
@@ -731,6 +742,16 @@ impl MAGConfig {
     #[getter]
     fn tape_strategies(&self) -> Vec<String> {
         self.inner.tape_strategies.iter().map(|s| format_tape_strategy(s).to_string()).collect()
+    }
+    #[getter]
+    fn hope_variant(&self) -> &str {
+        match self.inner.hope_variant {
+            nl_hecate_core::model::HopeVariant::FreqGated => "freq_gated",
+            nl_hecate_core::model::HopeVariant::Chained => "chained",
+            nl_hecate_core::model::HopeVariant::Independent => "independent",
+            nl_hecate_core::model::HopeVariant::Sequential => "sequential",
+            nl_hecate_core::model::HopeVariant::Nested => "nested",
+        }
     }
 }
 
@@ -965,6 +986,7 @@ impl MAGForwardCache {
     b_alpha_init=None,
     b_theta_init=None,
     tape_strategies=None,
+    hope_variant=None,
 ))]
 fn mag_create_config(
     d_model: usize,
@@ -1017,6 +1039,7 @@ fn mag_create_config(
     b_alpha_init: Option<Vec<f32>>,
     b_theta_init: Option<Vec<f32>>,
     tape_strategies: Option<Vec<String>>,
+    hope_variant: Option<&str>,
 ) -> PyResult<MAGConfig> {
     MAGConfig::new(
         d_model, num_heads, head_dim, seq_len, window_size, vocab_size, memory_enabled,
@@ -1031,6 +1054,7 @@ fn mag_create_config(
         residual,
         b_alpha_init, b_theta_init,
         tape_strategies,
+        hope_variant,
     )
 }
 
