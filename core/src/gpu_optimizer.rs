@@ -870,7 +870,7 @@ impl GpuM3State {
 /// Call the fused M3 EMA kernel for one param group.
 #[cfg(feature = "cuda")]
 #[inline]
-fn m3_ema_one(
+pub(crate) fn m3_ema_one(
     m1: &mut GpuBuf<f32>, m2: &mut GpuBuf<f32>, v: &mut GpuBuf<f32>,
     g: &GpuBuf<f32>,
     beta1: f32, beta2: f32, beta3: f32,
@@ -890,7 +890,7 @@ fn m3_ema_one(
 /// Apply 1D (Adam-style) param update.
 #[cfg(feature = "cuda")]
 #[inline]
-fn m3_apply_1d_one(
+pub(crate) fn m3_apply_1d_one(
     w: &mut GpuBuf<f32>,
     m1: &GpuBuf<f32>, m2: &GpuBuf<f32>, v: &GpuBuf<f32>,
     lr: f32, alpha: f32, eps: f32, bc2: f32,
@@ -907,7 +907,7 @@ fn m3_apply_1d_one(
 
 /// Compute Frobenius norm of a GPU buffer using partial reduction.
 #[cfg(feature = "cuda")]
-fn gpu_frob_norm(buf: &GpuBuf<f32>, scratch: &mut GpuBuf<f32>, host: &mut [f32]) -> f32 {
+pub(crate) fn gpu_frob_norm(buf: &GpuBuf<f32>, scratch: &mut GpuBuf<f32>, host: &mut [f32]) -> f32 {
     let n = buf.len() as i32;
     let mut num_blocks: i32 = 0;
     let err = unsafe {
@@ -933,7 +933,7 @@ fn gpu_frob_norm(buf: &GpuBuf<f32>, scratch: &mut GpuBuf<f32>, host: &mut [f32])
 /// always works on the smaller (d × d) ATA matrix. Uses existing
 /// `transpose_copy_cuda` — the O(rows*cols) copy is negligible vs T matmuls.
 #[cfg(feature = "cuda")]
-fn m3_ns_apply(
+pub(crate) fn m3_ns_apply(
     w: &mut GpuBuf<f32>,
     m: &GpuBuf<f32>,         // momentum buffer (M1 or M2)
     rows: usize, cols: usize,

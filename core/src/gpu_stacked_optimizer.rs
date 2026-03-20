@@ -520,3 +520,452 @@ pub fn gpu_stacked_sync_embed_weights(params: &mut GpuStackedParams, d: usize, v
     }
     crate::dispatch::cuda_sync();
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// GpuStackedM3State — M3 optimizer for stacked multi-block models
+// ══════════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "cuda")]
+use crate::gpu_optimizer::{GpuM3Config, m3_ema_one, m3_apply_1d_one, m3_ns_apply, gpu_frob_norm};
+
+/// M3 moment buffers for one block's SWA + LN weights.
+/// Three buffers per param: m1 (fast momentum), m2 (slow momentum), v (second moment).
+#[cfg(feature = "cuda")]
+struct M3MomentBlockStacked {
+    // 2D SWA projections
+    m1_q: GpuBuf<f32>, m2_q: GpuBuf<f32>, v_q: GpuBuf<f32>,
+    m1_k: GpuBuf<f32>, m2_k: GpuBuf<f32>, v_k: GpuBuf<f32>,
+    m1_v: GpuBuf<f32>, m2_v: GpuBuf<f32>, v_v: GpuBuf<f32>,
+    m1_o: GpuBuf<f32>, m2_o: GpuBuf<f32>, v_o: GpuBuf<f32>,
+    // 1D LayerNorms
+    m1_ln_attn_gamma: GpuBuf<f32>, m2_ln_attn_gamma: GpuBuf<f32>, v_ln_attn_gamma: GpuBuf<f32>,
+    m1_ln_attn_beta: GpuBuf<f32>,  m2_ln_attn_beta: GpuBuf<f32>,  v_ln_attn_beta: GpuBuf<f32>,
+    m1_ln_mem_gamma: GpuBuf<f32>,  m2_ln_mem_gamma: GpuBuf<f32>,  v_ln_mem_gamma: GpuBuf<f32>,
+    m1_ln_mem_beta: GpuBuf<f32>,   m2_ln_mem_beta: GpuBuf<f32>,   v_ln_mem_beta: GpuBuf<f32>,
+    // alpha_mem: host-side (1D, small — k scalars)
+    m1_alpha_mem: Vec<f32>, m2_alpha_mem: Vec<f32>, v_alpha_mem: Vec<f32>,
+    // Per-level CMS
+    levels: Vec<M3MomentLevelStacked>,
+}
+
+/// M3 moment buffers for one CMS level within a stacked block.
+#[cfg(feature = "cuda")]
+struct M3MomentLevelStacked {
+    // 2D memory projections
+    m1_w_k_mem: GpuBuf<f32>, m2_w_k_mem: GpuBuf<f32>, v_w_k_mem: GpuBuf<f32>,
+    m1_w_v_mem: GpuBuf<f32>, m2_w_v_mem: GpuBuf<f32>, v_w_v_mem: GpuBuf<f32>,
+    m1_w_q_mem: GpuBuf<f32>, m2_w_q_mem: GpuBuf<f32>, v_w_q_mem: GpuBuf<f32>,
+    // 1D gate params
+    m1_w_alpha: GpuBuf<f32>, m2_w_alpha: GpuBuf<f32>, v_w_alpha: GpuBuf<f32>,
+    m1_b_alpha: GpuBuf<f32>, m2_b_alpha: GpuBuf<f32>, v_b_alpha: GpuBuf<f32>,
+    m1_w_theta: GpuBuf<f32>, m2_w_theta: GpuBuf<f32>, v_w_theta: GpuBuf<f32>,
+    m1_b_theta: GpuBuf<f32>, m2_b_theta: GpuBuf<f32>, v_b_theta: GpuBuf<f32>,
+    m1_w_eta: GpuBuf<f32>,   m2_w_eta: GpuBuf<f32>,   v_w_eta: GpuBuf<f32>,
+    m1_b_eta: GpuBuf<f32>,   m2_b_eta: GpuBuf<f32>,   v_b_eta: GpuBuf<f32>,
+    level_step: u32,
+}
+
+/// M3 optimizer state for stacked model: shared embed/unembed/ln_final + N blocks.
+#[cfg(feature = "cuda")]
+pub struct GpuStackedM3State {
+    // Shared param moments
+    m1_embed: GpuBuf<f32>,   m2_embed: GpuBuf<f32>,   v_embed: GpuBuf<f32>,
+    m1_unembed: GpuBuf<f32>, m2_unembed: GpuBuf<f32>, v_unembed: GpuBuf<f32>,
+    m1_ln_final_gamma: GpuBuf<f32>, m2_ln_final_gamma: GpuBuf<f32>, v_ln_final_gamma: GpuBuf<f32>,
+    m1_ln_final_beta: GpuBuf<f32>,  m2_ln_final_beta: GpuBuf<f32>,  v_ln_final_beta: GpuBuf<f32>,
+    // Per-block moments
+    blocks: Vec<M3MomentBlockStacked>,
+    pub step: u32,
+    pub config: GpuM3Config,
+    // NS scratch buffers (allocated once, reused every step)
+    ns_ata: GpuBuf<f32>,
+    ns_work: GpuBuf<f32>,
+    ns_ax: GpuBuf<f32>,
+    ns_aax: GpuBuf<f32>,
+    norm_scratch: GpuBuf<f32>,
+    norm_host: Vec<f32>,
+}
+
+#[cfg(feature = "cuda")]
+impl GpuStackedM3State {
+    /// Create zero-initialized M3 state matching stacked param shapes.
+    pub fn from_params(params: &GpuStackedParams, config: GpuM3Config, d: usize) -> Self {
+        let z3 = |len: usize| -> (GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>) {
+            (GpuBuf::zeros(len), GpuBuf::zeros(len), GpuBuf::zeros(len))
+        };
+
+        let (m1_embed, m2_embed, v_embed) = z3(params.w_embed.len());
+        let (m1_unembed, m2_unembed, v_unembed) = z3(params.w_unembed.len());
+        let (m1_ln_final_gamma, m2_ln_final_gamma, v_ln_final_gamma) = z3(params.ln_final_gamma.len());
+        let (m1_ln_final_beta, m2_ln_final_beta, v_ln_final_beta) = z3(params.ln_final_beta.len());
+
+        // Pre-compute max 2D buffer size for NS scratch allocation
+        let mut max_2d = params.w_embed.len().max(params.w_unembed.len());
+        for bp in &params.blocks {
+            for buf in [&bp.w_q, &bp.w_k, &bp.w_v, &bp.w_o] {
+                max_2d = max_2d.max(buf.len());
+            }
+            for lp in &bp.levels {
+                for buf in [&lp.w_k_mem, &lp.w_v_mem, &lp.w_q_mem] {
+                    max_2d = max_2d.max(buf.len());
+                }
+            }
+        }
+
+        let blocks = params.blocks.iter().map(|bp| {
+            let levels = bp.levels.iter().map(|lp| {
+                let (m1_w_k_mem, m2_w_k_mem, v_w_k_mem) = z3(lp.w_k_mem.len());
+                let (m1_w_v_mem, m2_w_v_mem, v_w_v_mem) = z3(lp.w_v_mem.len());
+                let (m1_w_q_mem, m2_w_q_mem, v_w_q_mem) = z3(lp.w_q_mem.len());
+                let (m1_w_alpha, m2_w_alpha, v_w_alpha) = z3(lp.w_alpha.len());
+                let (m1_b_alpha, m2_b_alpha, v_b_alpha) = z3(lp.b_alpha.len());
+                let (m1_w_theta, m2_w_theta, v_w_theta) = z3(lp.w_theta.len());
+                let (m1_b_theta, m2_b_theta, v_b_theta) = z3(lp.b_theta.len());
+                let (m1_w_eta, m2_w_eta, v_w_eta) = z3(lp.w_eta.len());
+                let (m1_b_eta, m2_b_eta, v_b_eta) = z3(lp.b_eta.len());
+                M3MomentLevelStacked {
+                    m1_w_k_mem, m2_w_k_mem, v_w_k_mem,
+                    m1_w_v_mem, m2_w_v_mem, v_w_v_mem,
+                    m1_w_q_mem, m2_w_q_mem, v_w_q_mem,
+                    m1_w_alpha, m2_w_alpha, v_w_alpha,
+                    m1_b_alpha, m2_b_alpha, v_b_alpha,
+                    m1_w_theta, m2_w_theta, v_w_theta,
+                    m1_b_theta, m2_b_theta, v_b_theta,
+                    m1_w_eta, m2_w_eta, v_w_eta,
+                    m1_b_eta, m2_b_eta, v_b_eta,
+                    level_step: 0,
+                }
+            }).collect();
+
+            let k = bp.alpha_mem.len();
+            let (m1_q, m2_q, v_q) = z3(bp.w_q.len());
+            let (m1_k, m2_k, v_k) = z3(bp.w_k.len());
+            let (m1_v, m2_v, v_v) = z3(bp.w_v.len());
+            let (m1_o, m2_o, v_o) = z3(bp.w_o.len());
+            let (m1_ln_attn_gamma, m2_ln_attn_gamma, v_ln_attn_gamma) = z3(bp.ln_attn_gamma.len());
+            let (m1_ln_attn_beta, m2_ln_attn_beta, v_ln_attn_beta) = z3(bp.ln_attn_beta.len());
+            let (m1_ln_mem_gamma, m2_ln_mem_gamma, v_ln_mem_gamma) = z3(bp.ln_mem_gamma.len());
+            let (m1_ln_mem_beta, m2_ln_mem_beta, v_ln_mem_beta) = z3(bp.ln_mem_beta.len());
+
+            M3MomentBlockStacked {
+                m1_q, m2_q, v_q,
+                m1_k, m2_k, v_k,
+                m1_v, m2_v, v_v,
+                m1_o, m2_o, v_o,
+                m1_ln_attn_gamma, m2_ln_attn_gamma, v_ln_attn_gamma,
+                m1_ln_attn_beta, m2_ln_attn_beta, v_ln_attn_beta,
+                m1_ln_mem_gamma, m2_ln_mem_gamma, v_ln_mem_gamma,
+                m1_ln_mem_beta, m2_ln_mem_beta, v_ln_mem_beta,
+                m1_alpha_mem: vec![0.0f32; k],
+                m2_alpha_mem: vec![0.0f32; k],
+                v_alpha_mem: vec![0.0f32; k],
+                levels,
+            }
+        }).collect();
+
+        let max_partials = max_2d / 256 + 1;
+
+        GpuStackedM3State {
+            m1_embed, m2_embed, v_embed,
+            m1_unembed, m2_unembed, v_unembed,
+            m1_ln_final_gamma, m2_ln_final_gamma, v_ln_final_gamma,
+            m1_ln_final_beta, m2_ln_final_beta, v_ln_final_beta,
+            blocks,
+            step: 0,
+            config,
+            ns_ata: GpuBuf::zeros(d * d),
+            ns_work: GpuBuf::zeros(max_2d),
+            ns_ax: GpuBuf::zeros(max_2d),
+            ns_aax: GpuBuf::zeros(max_2d),
+            norm_scratch: GpuBuf::zeros(max_partials),
+            norm_host: vec![0.0f32; max_partials],
+        }
+    }
+}
+
+/// Compute gradient norm for stacked grads using M3's scratch buffers.
+/// When `skip_embed` is true, excludes embed/unembed from the norm (frozen case).
+#[cfg(feature = "cuda")]
+fn gpu_stacked_m3_grad_norm(
+    grads: &GpuStackedGrads,
+    scratch: &mut GpuBuf<f32>,
+    host: &mut Vec<f32>,
+    skip_embed: bool,
+) -> f32 {
+    let mut total = 0.0f64;
+    let mut add = |g: &GpuBuf<f32>| {
+        let n = gpu_frob_norm(g, scratch, host) as f64;
+        total += n * n;
+    };
+    if !skip_embed {
+        add(&grads.d_w_embed);
+        add(&grads.d_w_unembed);
+    }
+    add(&grads.d_ln_final_gamma);
+    add(&grads.d_ln_final_beta);
+    for bg in &grads.blocks {
+        add(&bg.d_w_q);
+        add(&bg.d_w_k);
+        add(&bg.d_w_v);
+        add(&bg.d_w_o);
+        add(&bg.d_ln_attn_gamma);
+        add(&bg.d_ln_attn_beta);
+        add(&bg.d_ln_mem_gamma);
+        add(&bg.d_ln_mem_beta);
+        for lg in &bg.levels {
+            add(&lg.d_w_k_mem);
+            add(&lg.d_w_v_mem);
+            add(&lg.d_w_q_mem);
+            add(&lg.d_w_alpha);
+            add(&lg.d_b_alpha);
+            add(&lg.d_w_theta);
+            add(&lg.d_b_theta);
+            add(&lg.d_w_eta);
+            add(&lg.d_b_eta);
+        }
+    }
+    drop(add);
+    // alpha_mem gradients (host-side scalars, accumulated after closure dropped)
+    for bg in &grads.blocks {
+        for &g in &bg.d_alpha_mem {
+            let g64 = g as f64;
+            total += g64 * g64;
+        }
+    }
+    total.sqrt() as f32
+}
+
+/// Scale all stacked grads in-place for gradient clipping.
+/// When `skip_embed` is true, excludes embed/unembed from scaling (frozen case).
+#[cfg(feature = "cuda")]
+fn gpu_stacked_m3_scale_grads(grads: &mut GpuStackedGrads, scale: f32, skip_embed: bool) {
+    let scale_buf = |g: &mut GpuBuf<f32>| {
+        let n = g.len() as i32;
+        if n == 0 { return; }
+        let err = unsafe {
+            crate::cuda_ffi::grad_scale_cuda(g.ptr(), scale, n)
+        };
+        assert_eq!(err, 0, "grad_scale_cuda failed with cudaError_t={}", err);
+    };
+    if !skip_embed {
+        scale_buf(&mut grads.d_w_embed);
+        scale_buf(&mut grads.d_w_unembed);
+    }
+    scale_buf(&mut grads.d_ln_final_gamma);
+    scale_buf(&mut grads.d_ln_final_beta);
+    for bg in &mut grads.blocks {
+        scale_buf(&mut bg.d_w_q);
+        scale_buf(&mut bg.d_w_k);
+        scale_buf(&mut bg.d_w_v);
+        scale_buf(&mut bg.d_w_o);
+        scale_buf(&mut bg.d_ln_attn_gamma);
+        scale_buf(&mut bg.d_ln_attn_beta);
+        scale_buf(&mut bg.d_ln_mem_gamma);
+        scale_buf(&mut bg.d_ln_mem_beta);
+        for lg in &mut bg.levels {
+            scale_buf(&mut lg.d_w_k_mem);
+            scale_buf(&mut lg.d_w_v_mem);
+            scale_buf(&mut lg.d_w_q_mem);
+            scale_buf(&mut lg.d_w_alpha);
+            scale_buf(&mut lg.d_b_alpha);
+            scale_buf(&mut lg.d_w_theta);
+            scale_buf(&mut lg.d_b_theta);
+            scale_buf(&mut lg.d_w_eta);
+            scale_buf(&mut lg.d_b_eta);
+        }
+        // alpha_mem (host-side scalars)
+        for g in &mut bg.d_alpha_mem {
+            *g *= scale;
+        }
+    }
+}
+
+/// M3 optimizer update for stacked multi-block model.
+/// Mirrors `gpu_m3_update` from `gpu_optimizer.rs` but iterates over blocks.
+#[cfg(feature = "cuda")]
+pub fn gpu_stacked_m3_update(
+    params: &mut GpuStackedParams,
+    grads: &mut GpuStackedGrads,
+    state: &mut GpuStackedM3State,
+    pulse: &Pulse,
+    lr: f32,
+    max_grad_norm: f32,
+    d: usize,
+    freeze_embed: bool,
+) -> f32 {
+    state.step += 1;
+    let cfg = &state.config;
+    let update_m2 = state.step % cfg.chunk_size == 0;
+    let bc2 = 1.0 - cfg.beta2.powi(state.step as i32);
+
+    // ── Gradient clipping ─────────────────────────────────────────────
+    let grad_norm = if max_grad_norm > 0.0 {
+        let norm = gpu_stacked_m3_grad_norm(grads, &mut state.norm_scratch, &mut state.norm_host, freeze_embed);
+        if norm > max_grad_norm {
+            let scale = max_grad_norm / norm;
+            gpu_stacked_m3_scale_grads(grads, scale, freeze_embed);
+        }
+        norm
+    } else {
+        0.0
+    };
+
+    let ns_iters = cfg.ns_iterations;
+    let m2_scale = -lr * cfg.alpha;
+    let vocab = params.w_embed.len() / d;
+
+    // Helper macro for 2D NS apply (M1 then M2)
+    macro_rules! ns_2d {
+        ($w:expr, $m1:expr, $m2:expr, $rows:expr, $cols:expr) => {
+            m3_ns_apply(&mut $w, &$m1, $rows, $cols, -lr, ns_iters,
+                        &mut state.ns_ata, &mut state.ns_work,
+                        &mut state.ns_ax, &mut state.ns_aax,
+                        &mut state.norm_scratch, &mut state.norm_host);
+            m3_ns_apply(&mut $w, &$m2, $rows, $cols, m2_scale, ns_iters,
+                        &mut state.ns_ata, &mut state.ns_work,
+                        &mut state.ns_ax, &mut state.ns_aax,
+                        &mut state.norm_scratch, &mut state.norm_host);
+        };
+    }
+
+    // ── Shared params (always active, unless frozen) ──────────────────
+    if !freeze_embed {
+        m3_ema_one(&mut state.m1_embed, &mut state.m2_embed, &mut state.v_embed, &grads.d_w_embed,
+                   cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+        m3_ema_one(&mut state.m1_unembed, &mut state.m2_unembed, &mut state.v_unembed, &grads.d_w_unembed,
+                   cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+        ns_2d!(params.w_embed, state.m1_embed, state.m2_embed, vocab, d);
+        ns_2d!(params.w_unembed, state.m1_unembed, state.m2_unembed, d, vocab);
+    }
+
+    // ln_final: 1D
+    m3_ema_one(&mut state.m1_ln_final_gamma, &mut state.m2_ln_final_gamma, &mut state.v_ln_final_gamma, &grads.d_ln_final_gamma,
+               cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+    m3_ema_one(&mut state.m1_ln_final_beta, &mut state.m2_ln_final_beta, &mut state.v_ln_final_beta, &grads.d_ln_final_beta,
+               cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+    m3_apply_1d_one(&mut params.ln_final_gamma, &state.m1_ln_final_gamma, &state.m2_ln_final_gamma, &state.v_ln_final_gamma,
+                    lr, cfg.alpha, cfg.eps, bc2);
+    m3_apply_1d_one(&mut params.ln_final_beta, &state.m1_ln_final_beta, &state.m2_ln_final_beta, &state.v_ln_final_beta,
+                    lr, cfg.alpha, cfg.eps, bc2);
+
+    // ── Per-block params ──────────────────────────────────────────────
+    for (b, bg) in grads.blocks.iter().enumerate() {
+        let bp = &mut params.blocks[b];
+        let mb = &mut state.blocks[b];
+
+        // 2D SWA projections: EMA + NS apply
+        m3_ema_one(&mut mb.m1_q, &mut mb.m2_q, &mut mb.v_q, &bg.d_w_q,
+                   cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+        m3_ema_one(&mut mb.m1_k, &mut mb.m2_k, &mut mb.v_k, &bg.d_w_k,
+                   cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+        m3_ema_one(&mut mb.m1_v, &mut mb.m2_v, &mut mb.v_v, &bg.d_w_v,
+                   cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+        m3_ema_one(&mut mb.m1_o, &mut mb.m2_o, &mut mb.v_o, &bg.d_w_o,
+                   cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+
+        ns_2d!(bp.w_q, mb.m1_q, mb.m2_q, d, d);
+        ns_2d!(bp.w_k, mb.m1_k, mb.m2_k, d, d);
+        ns_2d!(bp.w_v, mb.m1_v, mb.m2_v, d, d);
+        ns_2d!(bp.w_o, mb.m1_o, mb.m2_o, d, d);
+
+        // 1D LayerNorms: EMA + 1D apply
+        m3_ema_one(&mut mb.m1_ln_attn_gamma, &mut mb.m2_ln_attn_gamma, &mut mb.v_ln_attn_gamma, &bg.d_ln_attn_gamma,
+                   cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+        m3_ema_one(&mut mb.m1_ln_attn_beta, &mut mb.m2_ln_attn_beta, &mut mb.v_ln_attn_beta, &bg.d_ln_attn_beta,
+                   cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+        m3_ema_one(&mut mb.m1_ln_mem_gamma, &mut mb.m2_ln_mem_gamma, &mut mb.v_ln_mem_gamma, &bg.d_ln_mem_gamma,
+                   cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+        m3_ema_one(&mut mb.m1_ln_mem_beta, &mut mb.m2_ln_mem_beta, &mut mb.v_ln_mem_beta, &bg.d_ln_mem_beta,
+                   cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+
+        m3_apply_1d_one(&mut bp.ln_attn_gamma, &mb.m1_ln_attn_gamma, &mb.m2_ln_attn_gamma, &mb.v_ln_attn_gamma,
+                        lr, cfg.alpha, cfg.eps, bc2);
+        m3_apply_1d_one(&mut bp.ln_attn_beta, &mb.m1_ln_attn_beta, &mb.m2_ln_attn_beta, &mb.v_ln_attn_beta,
+                        lr, cfg.alpha, cfg.eps, bc2);
+        m3_apply_1d_one(&mut bp.ln_mem_gamma, &mb.m1_ln_mem_gamma, &mb.m2_ln_mem_gamma, &mb.v_ln_mem_gamma,
+                        lr, cfg.alpha, cfg.eps, bc2);
+        m3_apply_1d_one(&mut bp.ln_mem_beta, &mb.m1_ln_mem_beta, &mb.m2_ln_mem_beta, &mb.v_ln_mem_beta,
+                        lr, cfg.alpha, cfg.eps, bc2);
+
+        // alpha_mem: host-side 1D M3 (same pattern as AdamW host-side, but with 3 moments)
+        {
+            let k = bg.d_alpha_mem.len();
+            let mut alpha_host = vec![0.0f32; k];
+            bp.alpha_mem.slice(0, k).copy_to_host(&mut alpha_host);
+            for i in 0..k {
+                let g = bg.d_alpha_mem[i];
+                mb.m1_alpha_mem[i] = cfg.beta1 * mb.m1_alpha_mem[i] + (1.0 - cfg.beta1) * g;
+                if update_m2 {
+                    mb.m2_alpha_mem[i] = cfg.beta3 * mb.m2_alpha_mem[i] + (1.0 - cfg.beta3) * g;
+                }
+                mb.v_alpha_mem[i] = cfg.beta2 * mb.v_alpha_mem[i] + (1.0 - cfg.beta2) * g * g;
+                let v_hat = mb.v_alpha_mem[i] / bc2;
+                let denom = v_hat.sqrt() + cfg.eps;
+                // Combined M1 + alpha*M2 update (Adam-style for 1D scalars)
+                let update = mb.m1_alpha_mem[i] + cfg.alpha * mb.m2_alpha_mem[i];
+                alpha_host[i] -= lr * update / denom;
+            }
+            bp.alpha_mem.copy_from_host(&alpha_host);
+        }
+
+        // Per-level CMS weights (pulse-gated)
+        for (i, lg) in bg.levels.iter().enumerate() {
+            if i >= pulse.active_levels.len() || !pulse.active_levels[i] {
+                continue;
+            }
+            let lp = &mut bp.levels[i];
+            let ml = &mut mb.levels[i];
+            ml.level_step += 1;
+            let level_bc2 = 1.0 - cfg.beta2.powi(ml.level_step as i32);
+
+            // 2D level params: EMA
+            m3_ema_one(&mut ml.m1_w_k_mem, &mut ml.m2_w_k_mem, &mut ml.v_w_k_mem, &lg.d_w_k_mem,
+                       cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+            m3_ema_one(&mut ml.m1_w_v_mem, &mut ml.m2_w_v_mem, &mut ml.v_w_v_mem, &lg.d_w_v_mem,
+                       cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+            m3_ema_one(&mut ml.m1_w_q_mem, &mut ml.m2_w_q_mem, &mut ml.v_w_q_mem, &lg.d_w_q_mem,
+                       cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+
+            // 1D level params: EMA
+            m3_ema_one(&mut ml.m1_w_alpha, &mut ml.m2_w_alpha, &mut ml.v_w_alpha, &lg.d_w_alpha,
+                       cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+            m3_ema_one(&mut ml.m1_b_alpha, &mut ml.m2_b_alpha, &mut ml.v_b_alpha, &lg.d_b_alpha,
+                       cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+            m3_ema_one(&mut ml.m1_w_theta, &mut ml.m2_w_theta, &mut ml.v_w_theta, &lg.d_w_theta,
+                       cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+            m3_ema_one(&mut ml.m1_b_theta, &mut ml.m2_b_theta, &mut ml.v_b_theta, &lg.d_b_theta,
+                       cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+            m3_ema_one(&mut ml.m1_w_eta, &mut ml.m2_w_eta, &mut ml.v_w_eta, &lg.d_w_eta,
+                       cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+            m3_ema_one(&mut ml.m1_b_eta, &mut ml.m2_b_eta, &mut ml.v_b_eta, &lg.d_b_eta,
+                       cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+
+            // Apply 1D level params
+            m3_apply_1d_one(&mut lp.w_alpha, &ml.m1_w_alpha, &ml.m2_w_alpha, &ml.v_w_alpha,
+                            lr, cfg.alpha, cfg.eps, level_bc2);
+            m3_apply_1d_one(&mut lp.b_alpha, &ml.m1_b_alpha, &ml.m2_b_alpha, &ml.v_b_alpha,
+                            lr, cfg.alpha, cfg.eps, level_bc2);
+            m3_apply_1d_one(&mut lp.w_theta, &ml.m1_w_theta, &ml.m2_w_theta, &ml.v_w_theta,
+                            lr, cfg.alpha, cfg.eps, level_bc2);
+            m3_apply_1d_one(&mut lp.b_theta, &ml.m1_b_theta, &ml.m2_b_theta, &ml.v_b_theta,
+                            lr, cfg.alpha, cfg.eps, level_bc2);
+            // CS-39: clamp b_theta
+            unsafe {
+                crate::cuda_ffi::clamp_f32_cuda(lp.b_theta.ptr(), lp.b_theta.len() as i32, -10.0, 2.0);
+            }
+            crate::dispatch::cuda_sync();
+            m3_apply_1d_one(&mut lp.w_eta, &ml.m1_w_eta, &ml.m2_w_eta, &ml.v_w_eta,
+                            lr, cfg.alpha, cfg.eps, level_bc2);
+            m3_apply_1d_one(&mut lp.b_eta, &ml.m1_b_eta, &ml.m2_b_eta, &ml.v_b_eta,
+                            lr, cfg.alpha, cfg.eps, level_bc2);
+
+            // Apply 2D level params via NS
+            ns_2d!(lp.w_k_mem, ml.m1_w_k_mem, ml.m2_w_k_mem, d, d);
+            ns_2d!(lp.w_v_mem, ml.m1_w_v_mem, ml.m2_w_v_mem, d, d);
+            ns_2d!(lp.w_q_mem, ml.m1_w_q_mem, ml.m2_w_q_mem, d, d);
+        }
+    }
+
+    crate::dispatch::cuda_sync();
+    grad_norm
+}

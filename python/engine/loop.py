@@ -648,10 +648,10 @@ def run_build(bcfg: BuildConfig):
         raise RuntimeError("optimizer='m3' requires GPU and a CUDA-enabled build")
     if is_stacked and bcfg.optimizer == "adamw_gpu":
         bcfg.optimizer = "adamw_gpu_stacked"
-    if is_stacked and bcfg.optimizer != "adamw_gpu_stacked":
+    if is_stacked and bcfg.optimizer not in ("adamw_gpu_stacked", "m3"):
         raise RuntimeError(
-            f"n_blocks > 1 requires optimizer='adamw_gpu_stacked' (got '{bcfg.optimizer}'). "
-            "GpuStackedModel only supports step_adamw()."
+            f"n_blocks > 1 requires optimizer='adamw_gpu_stacked' or 'm3' (got '{bcfg.optimizer}'). "
+            "GpuStackedModel supports step_adamw() and step_m3()."
         )
     if bcfg.optimizer == "adamw_gpu" and not use_gpu:
         raise RuntimeError(
@@ -1054,10 +1054,20 @@ def run_build(bcfg: BuildConfig):
         need_gnorms = log_this or slow_level_fires
 
         if gpu_model is not None and use_m3:
-            loss, g_norm = gpu_model.step_m3(
-                input_ids, target_ids, pulse, current_lr,
-                max_grad_norm=bcfg.max_grad_norm,
-            )
+            if is_stacked:
+                effective_freeze = bcfg.freeze_embed
+                if bcfg.freeze_embed_after is not None:
+                    effective_freeze = effective_freeze or (step >= bcfg.freeze_embed_after)
+                loss, g_norm = gpu_model.step_m3(
+                    input_ids, target_ids, pulse, current_lr,
+                    max_grad_norm=bcfg.max_grad_norm,
+                    freeze_embed=effective_freeze,
+                )
+            else:
+                loss, g_norm = gpu_model.step_m3(
+                    input_ids, target_ids, pulse, current_lr,
+                    max_grad_norm=bcfg.max_grad_norm,
+                )
         elif gpu_model is not None and use_adamw_gpu:
             if is_stacked:
                 # Spec 28: freeze_embed schedule
