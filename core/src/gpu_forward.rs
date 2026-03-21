@@ -1912,84 +1912,63 @@ fn gpu_memory_forward_into_scratch(
 ) -> bool {
     let bs = batch_size;
     let dd = d * d;
-    let tokens_i32 = i32::try_from(bs * s).expect("bs*s exceeds i32::MAX");
-    let d_i32      = i32::try_from(d).expect("d_model exceeds i32::MAX");
-
     // Memory projections into pre-allocated scratch.k_mem, v_mem, q_mem
     crate::dispatch::cublas_matmul_transb_dd(embedded, &level_params.w_k_mem, &mut scratch.k_mem, bs * s, d, d, 0.0);
     crate::dispatch::cublas_matmul_transb_dd(embedded, &level_params.w_v_mem, &mut scratch.v_mem, bs * s, d, d, 0.0);
     crate::dispatch::cublas_matmul_transb_dd(embedded, &level_params.w_q_mem, &mut scratch.q_mem, bs * s, d, d, 0.0);
 
-    // L2-normalize keys and queries (Titans paper: "normalize queries and keys using l_2-norm")
-    unsafe {
-        crate::cuda_ffi::l2_normalize_rows_f32_cuda(scratch.k_mem.ptr(), scratch.k_norms.ptr(), tokens_i32, d_i32, 1e-8);
-        crate::cuda_ffi::l2_normalize_rows_f32_cuda(scratch.q_mem.ptr(), scratch.q_norms.ptr(), tokens_i32, d_i32, 1e-8);
-    }
-
-    // Gates into pre-allocated scratch.alpha, theta (device pointers — graph-capture-safe)
-    unsafe {
-        crate::cuda_ffi::gate_compute_cuda(
-            scratch.k_mem.as_ptr(), scratch.v_mem.as_ptr(), level_params.w_alpha.as_ptr(),
-            level_params.b_alpha.as_ptr(), scratch.alpha.ptr(),
-            tokens_i32, d_i32, 0, // 0=sigmoid
-        );
-        crate::cuda_ffi::gate_compute_cuda(
-            scratch.k_mem.as_ptr(), scratch.v_mem.as_ptr(), level_params.w_theta.as_ptr(),
-            level_params.b_theta.as_ptr(), scratch.theta.ptr(),
-            tokens_i32, d_i32, 1, // 1=softplus
-        );
-        let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
-        let alpha_ceil  = cfg.alpha_ceil.get(level).copied().unwrap_or(1.0);
-        if alpha_floor > 0.0 || alpha_ceil < 1.0 {
-            crate::cuda_ffi::clamp_f32_cuda(scratch.alpha.ptr(), tokens_i32, alpha_floor, alpha_ceil);
-        }
-        let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
-        let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
-        if theta_floor > 0.0 || theta_ceil < f32::MAX {
-            crate::cuda_ffi::clamp_f32_cuda(scratch.theta.ptr(), tokens_i32, theta_floor, theta_ceil);
-        }
-    }
-
+    let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
+    let alpha_ceil  = cfg.alpha_ceil.get(level).copied().unwrap_or(1.0);
+    let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
+    let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
     let m_initial_slice = context_m.slice(0, bs * dd);
 
-    match (cfg.checkpoint_interval, cfg.memory_rule) {
+    let eff_ckpt = cfg.effective_checkpoint_interval(level);
+
+    match (eff_ckpt, cfg.memory_rule) {
         (None, MemoryRuleKind::DeltaRule) => {
-            // Zero scratch.m_states at start of each step (initial M from context_m is copied in)
+            // Spec 39: Fused kernel — L2-normalize + gate compute + clamp + DGD recurrence
+            // in a single launch. Writes normalized k/q back to scratch.k_mem/q_mem,
+            // gates to scratch.alpha/theta, norms to scratch.k_norms/q_norms.
             scratch.m_states.zero();
-            crate::dispatch::delta_forward_dd(
-                &scratch.k_mem, &scratch.v_mem, &scratch.q_mem,
-                &scratch.alpha, &scratch.theta,
-                &m_initial_slice, &mut scratch.m_states, &mut scratch.y, s, d, bs,
-                cfg.error_clip_for_level(level),
+            crate::dispatch::delta_fused_forward_dd(
+                &mut scratch.k_mem, &scratch.v_mem, &mut scratch.q_mem,
+                &level_params.w_alpha, &level_params.b_alpha,
+                &level_params.w_theta, &level_params.b_theta,
+                alpha_floor, alpha_ceil, theta_floor, theta_ceil,
+                &m_initial_slice,
+                &mut scratch.m_states, &mut scratch.y,
+                &mut scratch.alpha, &mut scratch.theta,
+                &mut scratch.k_norms, &mut scratch.q_norms,
+                s, d, bs, cfg.error_clip_for_level(level),
             );
             // NOTE: copy_final_m_batch is NOT called here — caller does it outside the graph.
             true
         }
         (None, MemoryRuleKind::TitansLMM) => {
-            // Eta gate for Titans
-            unsafe {
-                crate::cuda_ffi::gate_compute_cuda(
-                    scratch.k_mem.as_ptr(), scratch.v_mem.as_ptr(), level_params.w_eta.as_ptr(),
-                    level_params.b_eta.as_ptr(), scratch.eta.ptr(),
-                    tokens_i32, d_i32, 0,
-                );
-            }
-            // Use the persistent scratch.s_initial buffer (stable device pointer, safe for CUDA graph capture).
-            // Titans: s_initial is always zero per chunk; re-zero on each step.
+            // Spec 39: Fused kernel — L2-normalize + gate compute (alpha/theta/eta) + clamp
+            // + Titans recurrence in a single launch.
             scratch.s_initial.zero();
             let s_initial_slice = scratch.s_initial.slice(0, bs * dd);
-            if scratch.has_s_states {
-                scratch.m_states.zero();
-                scratch.s_states.zero();
-                crate::dispatch::titans_forward_dd(
-                    &scratch.k_mem, &scratch.v_mem, &scratch.q_mem,
-                    &scratch.alpha, &scratch.theta, &scratch.eta,
-                    &m_initial_slice, &s_initial_slice,
-                    &mut scratch.m_states, &mut scratch.s_states, &mut scratch.y, s, d, bs,
-                    cfg.error_clip_for_level(level),
-                );
-                // NOTE: copy_final_m_batch NOT called here — caller does it outside the graph.
+            if !scratch.has_s_states {
+                eprintln!("[cuda_graph] gpu_memory_forward_into_scratch: TitansLMM requires has_s_states=true — falling back");
+                return false;
             }
+            scratch.m_states.zero();
+            scratch.s_states.zero();
+            crate::dispatch::titans_fused_forward_dd(
+                &mut scratch.k_mem, &scratch.v_mem, &mut scratch.q_mem,
+                &level_params.w_alpha, &level_params.b_alpha,
+                &level_params.w_theta, &level_params.b_theta,
+                &level_params.w_eta, &level_params.b_eta,
+                alpha_floor, alpha_ceil, theta_floor, theta_ceil,
+                &m_initial_slice, &s_initial_slice,
+                &mut scratch.m_states, &mut scratch.s_states, &mut scratch.y,
+                &mut scratch.alpha, &mut scratch.theta, &mut scratch.eta,
+                &mut scratch.k_norms, &mut scratch.q_norms,
+                s, d, bs, cfg.error_clip_for_level(level),
+            );
+            // NOTE: copy_final_m_batch NOT called here — caller does it outside the graph.
             true
         }
         _ => {
@@ -2994,14 +2973,12 @@ pub(crate) unsafe fn gpu_buf_memcpy_d2d(
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// Tests: Fused vs unfused kernel bit-identity (spec 39)
+// Shared test helpers (spec 39 CUDA tests)
 // ══════════════════════════════════════════════════════════════════════
 
 #[cfg(all(test, feature = "cuda"))]
-mod fused_tests {
-    use crate::gpu_buf::GpuBuf;
-
-    fn rand_vec(n: usize, seed: u64) -> Vec<f32> {
+mod test_helpers {
+    pub fn rand_vec(n: usize, seed: u64) -> Vec<f32> {
         let mut v = Vec::with_capacity(n);
         let mut state = seed;
         for _ in 0..n {
@@ -3012,9 +2989,19 @@ mod fused_tests {
         v
     }
 
-    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+    pub fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
         a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
     }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Tests: Fused vs unfused kernel bit-identity (spec 39)
+// ══════════════════════════════════════════════════════════════════════
+
+#[cfg(all(test, feature = "cuda"))]
+mod fused_tests {
+    use crate::gpu_buf::GpuBuf;
+    use super::test_helpers::{rand_vec, max_abs_diff};
 
     #[test]
     fn test_dgd_fused_matches_unfused() {
@@ -3308,5 +3295,343 @@ mod fused_tests {
         assert!(eta_diff < 1e-5, "eta mismatch: {eta_diff}");
         assert!(k_norms_diff < 1e-5, "k_norms mismatch: {k_norms_diff}");
         assert!(q_norms_diff < 1e-5, "q_norms mismatch: {q_norms_diff}");
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Tests: Scratch path (CUDA-graph-compatible) matches standard forward
+// ══════════════════════════════════════════════════════════════════════
+
+#[cfg(all(test, feature = "cuda"))]
+mod scratch_tests {
+    use crate::gpu_buf::GpuBuf;
+    use crate::model::{MAGConfig, MemoryRuleKind};
+    use crate::cuda_graph::GpuLevelScratch;
+    use super::test_helpers::{rand_vec, max_abs_diff};
+
+    /// Build a minimal GpuMemoryLevelParams from random weights for testing.
+    fn make_level_params(d: usize, seed: u64) -> crate::gpu_params::GpuMemoryLevelParams {
+        crate::gpu_params::GpuMemoryLevelParams {
+            w_k_mem: GpuBuf::from_host(&rand_vec(d * d, seed)),
+            w_v_mem: GpuBuf::from_host(&rand_vec(d * d, seed + 1)),
+            w_q_mem: GpuBuf::from_host(&rand_vec(d * d, seed + 2)),
+            w_alpha: GpuBuf::from_host(&rand_vec(2 * d, seed + 3)),
+            b_alpha: GpuBuf::from_host(&[3.0f32]),
+            w_theta: GpuBuf::from_host(&rand_vec(2 * d, seed + 4)),
+            b_theta: GpuBuf::from_host(&[-4.6f32]),
+            w_eta:   GpuBuf::from_host(&rand_vec(2 * d, seed + 5)),
+            b_eta:   GpuBuf::from_host(&[2.0f32]),
+            w_omega: GpuBuf::from_host(&rand_vec(d * 2 * d, seed + 6)),
+            w_freq:  GpuBuf::zeros(1),
+            b_freq:  GpuBuf::zeros(1),
+            has_freq: false,
+            w_k_conv: GpuBuf::zeros(1),
+            b_k_conv: GpuBuf::zeros(1),
+            w_q_conv: GpuBuf::zeros(1),
+            b_q_conv: GpuBuf::zeros(1),
+            has_conv: false,
+            gate_proj: GpuBuf::zeros(1),
+            up_proj:   GpuBuf::zeros(1),
+            down_proj: GpuBuf::zeros(1),
+            has_mlp: false,
+            w_rand_cpu: vec![],
+            b_rand_cpu: vec![],
+            has_fm: false,
+        }
+    }
+
+    /// Build a minimal MAGConfig for scratch path testing.
+    fn make_cfg(d: usize, s: usize, rule: MemoryRuleKind) -> MAGConfig {
+        let mut cfg = MAGConfig::test_config();
+        cfg.swa.d_model = d;
+        cfg.swa.num_heads = 2;
+        cfg.swa.head_dim = d / 2;
+        cfg.swa.seq_len = s;
+        cfg.swa.window_size = s;
+        cfg.memory_rule = rule;
+        cfg
+    }
+
+    /// DeltaRule: scratch path matches gpu_memory_forward within 1e-5.
+    #[test]
+    fn test_dgd_scratch_matches_standard() {
+        let d = 32;
+        let s = 8;
+        let dd = d * d;
+        let bs = 1;
+
+        let level_params = make_level_params(d, 100);
+        let cfg = make_cfg(d, s, MemoryRuleKind::DeltaRule);
+        let embedded = GpuBuf::from_host(&rand_vec(bs * s * d, 200));
+        let m_init = rand_vec(bs * dd, 201);
+
+        // ── Standard path: gpu_memory_forward ──
+        let mut context_m_std = GpuBuf::from_host(&m_init);
+        let (y_std, cache_std) = super::gpu_memory_forward(
+            &level_params, &cfg, &embedded, &mut context_m_std,
+            s, d, 0, bs,
+        );
+        crate::dispatch::cuda_sync();
+
+        // Extract cache fields
+        let (alpha_std, theta_std, k_norms_std, q_norms_std, k_std, q_std) = match &cache_std {
+            super::GpuMemoryCache::Delta { alpha, theta, k_norms, q_norms, k_mem, q_mem, .. } =>
+                (alpha, theta, k_norms, q_norms, k_mem, q_mem),
+            _ => panic!("Expected Delta cache"),
+        };
+
+        // ── Scratch path: gpu_memory_forward_into_scratch ──
+        let context_m_scratch = GpuBuf::from_host(&m_init);
+        let mut scratch = GpuLevelScratch::new(bs, s, d, false);
+        let ok = super::gpu_memory_forward_into_scratch(
+            &level_params, &cfg, &embedded, &context_m_scratch,
+            &mut scratch, s, d, 0, bs,
+        );
+        assert!(ok, "Scratch path should return true for DeltaRule");
+        crate::dispatch::cuda_sync();
+
+        // ── Compare y ──
+        let mut y_std_h = vec![0.0f32; bs * s * d];
+        let mut y_scr_h = vec![0.0f32; bs * s * d];
+        y_std.copy_to_host(&mut y_std_h);
+        scratch.y.copy_to_host(&mut y_scr_h);
+        let y_diff = max_abs_diff(&y_std_h, &y_scr_h);
+
+        // ── Compare alpha/theta ──
+        let mut alpha_std_h = vec![0.0f32; bs * s];
+        let mut alpha_scr_h = vec![0.0f32; bs * s];
+        alpha_std.copy_to_host(&mut alpha_std_h);
+        scratch.alpha.copy_to_host(&mut alpha_scr_h);
+        let alpha_diff = max_abs_diff(&alpha_std_h, &alpha_scr_h);
+
+        let mut theta_std_h = vec![0.0f32; bs * s];
+        let mut theta_scr_h = vec![0.0f32; bs * s];
+        theta_std.copy_to_host(&mut theta_std_h);
+        scratch.theta.copy_to_host(&mut theta_scr_h);
+        let theta_diff = max_abs_diff(&theta_std_h, &theta_scr_h);
+
+        // ── Compare k_norms/q_norms ──
+        let mut kn_std_h = vec![0.0f32; bs * s];
+        let mut kn_scr_h = vec![0.0f32; bs * s];
+        k_norms_std.copy_to_host(&mut kn_std_h);
+        scratch.k_norms.copy_to_host(&mut kn_scr_h);
+        let kn_diff = max_abs_diff(&kn_std_h, &kn_scr_h);
+
+        let mut qn_std_h = vec![0.0f32; bs * s];
+        let mut qn_scr_h = vec![0.0f32; bs * s];
+        q_norms_std.copy_to_host(&mut qn_std_h);
+        scratch.q_norms.copy_to_host(&mut qn_scr_h);
+        let qn_diff = max_abs_diff(&qn_std_h, &qn_scr_h);
+
+        // ── Compare normalized k/q ──
+        let mut k_std_h = vec![0.0f32; bs * s * d];
+        let mut k_scr_h = vec![0.0f32; bs * s * d];
+        k_std.copy_to_host(&mut k_std_h);
+        scratch.k_mem.copy_to_host(&mut k_scr_h);
+        let k_diff = max_abs_diff(&k_std_h, &k_scr_h);
+
+        let mut q_std_h = vec![0.0f32; bs * s * d];
+        let mut q_scr_h = vec![0.0f32; bs * s * d];
+        q_std.copy_to_host(&mut q_std_h);
+        scratch.q_mem.copy_to_host(&mut q_scr_h);
+        let q_diff = max_abs_diff(&q_std_h, &q_scr_h);
+
+        eprintln!("DGD scratch vs standard — y={y_diff:.2e}, alpha={alpha_diff:.2e}, theta={theta_diff:.2e}, kn={kn_diff:.2e}, qn={qn_diff:.2e}, k={k_diff:.2e}, q={q_diff:.2e}");
+
+        assert!(y_diff < 1e-5, "y mismatch: {y_diff}");
+        assert!(alpha_diff < 1e-5, "alpha mismatch: {alpha_diff}");
+        assert!(theta_diff < 1e-5, "theta mismatch: {theta_diff}");
+        assert!(kn_diff < 1e-5, "k_norms mismatch: {kn_diff}");
+        assert!(qn_diff < 1e-5, "q_norms mismatch: {qn_diff}");
+        assert!(k_diff < 1e-5, "normalized k mismatch: {k_diff}");
+        assert!(q_diff < 1e-5, "normalized q mismatch: {q_diff}");
+    }
+
+    /// TitansLMM: scratch path matches gpu_memory_forward within 1e-5.
+    #[test]
+    fn test_titans_scratch_matches_standard() {
+        let d = 32;
+        let s = 8;
+        let dd = d * d;
+        let bs = 1;
+
+        let level_params = make_level_params(d, 300);
+        let cfg = make_cfg(d, s, MemoryRuleKind::TitansLMM);
+        let embedded = GpuBuf::from_host(&rand_vec(bs * s * d, 400));
+        let m_init = rand_vec(bs * dd, 401);
+
+        // ── Standard path: gpu_memory_forward ──
+        let mut context_m_std = GpuBuf::from_host(&m_init);
+        let (y_std, cache_std) = super::gpu_memory_forward(
+            &level_params, &cfg, &embedded, &mut context_m_std,
+            s, d, 0, bs,
+        );
+        crate::dispatch::cuda_sync();
+
+        // Extract cache fields
+        let (alpha_std, theta_std, eta_std, k_norms_std, q_norms_std) = match &cache_std {
+            super::GpuMemoryCache::Titans { alpha, theta, eta, k_norms, q_norms, .. } =>
+                (alpha, theta, eta, k_norms, q_norms),
+            _ => panic!("Expected Titans cache"),
+        };
+
+        // ── Scratch path: gpu_memory_forward_into_scratch ──
+        let context_m_scratch = GpuBuf::from_host(&m_init);
+        let mut scratch = GpuLevelScratch::new(bs, s, d, true);
+        let ok = super::gpu_memory_forward_into_scratch(
+            &level_params, &cfg, &embedded, &context_m_scratch,
+            &mut scratch, s, d, 0, bs,
+        );
+        assert!(ok, "Scratch path should return true for TitansLMM");
+        crate::dispatch::cuda_sync();
+
+        // ── Compare y ──
+        let mut y_std_h = vec![0.0f32; bs * s * d];
+        let mut y_scr_h = vec![0.0f32; bs * s * d];
+        y_std.copy_to_host(&mut y_std_h);
+        scratch.y.copy_to_host(&mut y_scr_h);
+        let y_diff = max_abs_diff(&y_std_h, &y_scr_h);
+
+        // ── Compare alpha/theta/eta ──
+        let mut alpha_std_h = vec![0.0f32; bs * s];
+        let mut alpha_scr_h = vec![0.0f32; bs * s];
+        alpha_std.copy_to_host(&mut alpha_std_h);
+        scratch.alpha.copy_to_host(&mut alpha_scr_h);
+        let alpha_diff = max_abs_diff(&alpha_std_h, &alpha_scr_h);
+
+        let mut theta_std_h = vec![0.0f32; bs * s];
+        let mut theta_scr_h = vec![0.0f32; bs * s];
+        theta_std.copy_to_host(&mut theta_std_h);
+        scratch.theta.copy_to_host(&mut theta_scr_h);
+        let theta_diff = max_abs_diff(&theta_std_h, &theta_scr_h);
+
+        let mut eta_std_h = vec![0.0f32; bs * s];
+        let mut eta_scr_h = vec![0.0f32; bs * s];
+        eta_std.copy_to_host(&mut eta_std_h);
+        scratch.eta.copy_to_host(&mut eta_scr_h);
+        let eta_diff = max_abs_diff(&eta_std_h, &eta_scr_h);
+
+        // ── Compare k_norms/q_norms ──
+        let mut kn_std_h = vec![0.0f32; bs * s];
+        let mut kn_scr_h = vec![0.0f32; bs * s];
+        k_norms_std.copy_to_host(&mut kn_std_h);
+        scratch.k_norms.copy_to_host(&mut kn_scr_h);
+        let kn_diff = max_abs_diff(&kn_std_h, &kn_scr_h);
+
+        let mut qn_std_h = vec![0.0f32; bs * s];
+        let mut qn_scr_h = vec![0.0f32; bs * s];
+        q_norms_std.copy_to_host(&mut qn_std_h);
+        scratch.q_norms.copy_to_host(&mut qn_scr_h);
+        let qn_diff = max_abs_diff(&qn_std_h, &qn_scr_h);
+
+        eprintln!("Titans scratch vs standard — y={y_diff:.2e}, alpha={alpha_diff:.2e}, theta={theta_diff:.2e}, eta={eta_diff:.2e}, kn={kn_diff:.2e}, qn={qn_diff:.2e}");
+
+        assert!(y_diff < 1e-5, "y mismatch: {y_diff}");
+        assert!(alpha_diff < 1e-5, "alpha mismatch: {alpha_diff}");
+        assert!(theta_diff < 1e-5, "theta mismatch: {theta_diff}");
+        assert!(eta_diff < 1e-5, "eta mismatch: {eta_diff}");
+        assert!(kn_diff < 1e-5, "k_norms mismatch: {kn_diff}");
+        assert!(qn_diff < 1e-5, "q_norms mismatch: {qn_diff}");
+    }
+
+    /// Unsupported rule returns false (graceful fallback, no panic).
+    #[test]
+    fn test_scratch_unsupported_rule_returns_false() {
+        let d = 32;
+        let s = 8;
+        let dd = d * d;
+        let bs = 1;
+
+        let level_params = make_level_params(d, 500);
+        let cfg = make_cfg(d, s, MemoryRuleKind::HebbianRule);
+        let embedded = GpuBuf::from_host(&rand_vec(bs * s * d, 600));
+        let context_m = GpuBuf::from_host(&rand_vec(bs * dd, 601));
+        let mut scratch = GpuLevelScratch::new(bs, s, d, false);
+
+        let ok = super::gpu_memory_forward_into_scratch(
+            &level_params, &cfg, &embedded, &context_m,
+            &mut scratch, s, d, 0, bs,
+        );
+        assert!(!ok, "HebbianRule should return false (unsupported for scratch path)");
+    }
+
+    /// DeltaRule scratch path with non-default clamp bounds exercises the fused kernel's
+    /// gate clamping logic (alpha_floor/ceil, theta_ceil).
+    #[test]
+    fn test_dgd_scratch_with_clamp_bounds() {
+        let d = 32;
+        let s = 8;
+        let dd = d * d;
+        let bs = 1;
+
+        let level_params = make_level_params(d, 700);
+        let mut cfg = make_cfg(d, s, MemoryRuleKind::DeltaRule);
+        cfg.alpha_floor = vec![0.1];
+        cfg.alpha_ceil = vec![0.9];
+        cfg.theta_floor = vec![0.01];
+        cfg.theta_ceil = vec![0.5];
+        let embedded = GpuBuf::from_host(&rand_vec(bs * s * d, 800));
+        let m_init = rand_vec(bs * dd, 801);
+
+        // ── Standard path ──
+        let mut context_m_std = GpuBuf::from_host(&m_init);
+        let (y_std, cache_std) = super::gpu_memory_forward(
+            &level_params, &cfg, &embedded, &mut context_m_std,
+            s, d, 0, bs,
+        );
+        crate::dispatch::cuda_sync();
+
+        let (alpha_std, theta_std) = match &cache_std {
+            super::GpuMemoryCache::Delta { alpha, theta, .. } => (alpha, theta),
+            _ => panic!("Expected Delta cache"),
+        };
+
+        // ── Scratch path ──
+        let context_m_scratch = GpuBuf::from_host(&m_init);
+        let mut scratch = GpuLevelScratch::new(bs, s, d, false);
+        let ok = super::gpu_memory_forward_into_scratch(
+            &level_params, &cfg, &embedded, &context_m_scratch,
+            &mut scratch, s, d, 0, bs,
+        );
+        assert!(ok);
+        crate::dispatch::cuda_sync();
+
+        // ── Compare y ──
+        let mut y_std_h = vec![0.0f32; bs * s * d];
+        let mut y_scr_h = vec![0.0f32; bs * s * d];
+        y_std.copy_to_host(&mut y_std_h);
+        scratch.y.copy_to_host(&mut y_scr_h);
+        let y_diff = max_abs_diff(&y_std_h, &y_scr_h);
+
+        // ── Compare alpha (should be clamped to [0.1, 0.9]) ──
+        let mut alpha_std_h = vec![0.0f32; bs * s];
+        let mut alpha_scr_h = vec![0.0f32; bs * s];
+        alpha_std.copy_to_host(&mut alpha_std_h);
+        scratch.alpha.copy_to_host(&mut alpha_scr_h);
+        let alpha_diff = max_abs_diff(&alpha_std_h, &alpha_scr_h);
+
+        // Verify clamping is active: all alpha values within [0.1, 0.9]
+        for (i, &a) in alpha_scr_h.iter().enumerate() {
+            assert!(a >= 0.1 - 1e-6 && a <= 0.9 + 1e-6,
+                "alpha[{i}]={a} outside clamped range [0.1, 0.9]");
+        }
+
+        // ── Compare theta (should be clamped to [0.01, 0.5]) ──
+        let mut theta_std_h = vec![0.0f32; bs * s];
+        let mut theta_scr_h = vec![0.0f32; bs * s];
+        theta_std.copy_to_host(&mut theta_std_h);
+        scratch.theta.copy_to_host(&mut theta_scr_h);
+        let theta_diff = max_abs_diff(&theta_std_h, &theta_scr_h);
+
+        for (i, &t) in theta_scr_h.iter().enumerate() {
+            assert!(t >= 0.01 - 1e-6 && t <= 0.5 + 1e-6,
+                "theta[{i}]={t} outside clamped range [0.01, 0.5]");
+        }
+
+        eprintln!("DGD scratch with clamps — y={y_diff:.2e}, alpha={alpha_diff:.2e}, theta={theta_diff:.2e}");
+
+        assert!(y_diff < 1e-5, "y mismatch: {y_diff}");
+        assert!(alpha_diff < 1e-5, "alpha mismatch: {alpha_diff}");
+        assert!(theta_diff < 1e-5, "theta mismatch: {theta_diff}");
     }
 }
