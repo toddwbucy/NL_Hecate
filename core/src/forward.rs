@@ -173,6 +173,13 @@ mod tests {
 
     #[test]
     fn test_forward_deterministic() {
+        // Pin dispatch backend so concurrent gradient tests toggling
+        // FORCE_BACKEND don't change arithmetic between the two calls.
+        #[cfg(feature = "cuda")]
+        let _prev = crate::dispatch::is_rust_forced();
+        #[cfg(feature = "cuda")]
+        crate::dispatch::force_rust_reference(true);
+
         let cfg = SWAConfig::test_config();
         let params = SWAParams::init(&cfg, 42);
         let input_ids: Vec<usize> = (0..cfg.seq_len).collect();
@@ -181,5 +188,8 @@ mod tests {
         let (loss1, _) = forward(&params, &cfg, &input_ids, &target_ids);
         let (loss2, _) = forward(&params, &cfg, &input_ids, &target_ids);
         assert_eq!(loss1, loss2, "Forward pass should be deterministic");
+
+        #[cfg(feature = "cuda")]
+        crate::dispatch::force_rust_reference(_prev);
     }
 }

@@ -612,6 +612,100 @@ pub(crate) fn gpu_memory_backward(
                 level_grads, s, d, batch_size,
             )
         }
+        // ── Chunkwise variants (spec 43 — frozen-M₀ backward) ──────────
+        GpuMemoryCache::DeltaChunkwise { k_mem, v_mem, q_mem, alpha, theta, m_chunk_states, k_norms, q_norms, chunk_size, .. } => {
+            let mut d_k_mem = GpuBuf::zeros(bsd);
+            let mut d_v_mem = GpuBuf::zeros(bsd);
+            let mut d_q_mem = GpuBuf::zeros(bsd);
+            let mut d_alpha = GpuBuf::zeros(bs_s);
+            let mut d_theta = GpuBuf::zeros(bs_s);
+            let mut d_m_initial = GpuBuf::zeros(dd);
+
+            crate::dispatch::delta_chunkwise_backward_dd(
+                k_mem, v_mem, q_mem, alpha, theta,
+                m_chunk_states, d_y,
+                &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
+                &mut d_alpha, &mut d_theta, &mut d_m_initial,
+                s, d, batch_size, *chunk_size,
+                cfg.error_clip_for_level(level),
+            );
+
+            let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
+            let alpha_ceil  = cfg.alpha_ceil.get(level).copied().unwrap_or(1.0);
+            if alpha_floor > 0.0 || alpha_ceil < 1.0 {
+                unsafe {
+                    crate::cuda_ffi::theta_clamp_mask_cuda(
+                        alpha.as_ptr(), d_alpha.ptr(), bs_s as i32, alpha_floor, alpha_ceil,
+                    );
+                }
+            }
+            let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
+            let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
+            if theta_floor > 0.0 || theta_ceil < f32::MAX {
+                unsafe {
+                    crate::cuda_ffi::theta_clamp_mask_cuda(
+                        theta.as_ptr(), d_theta.ptr(), bs_s as i32, theta_floor, theta_ceil,
+                    );
+                }
+            }
+
+            accumulate_projection_grads(
+                level_params, embedded,
+                k_mem, v_mem, q_mem, alpha, Some(theta), None,
+                &d_k_mem, &d_v_mem, &d_q_mem,
+                &d_alpha, Some(&d_theta), None,
+                k_norms, q_norms,
+                level_grads, s, d, batch_size,
+            )
+        }
+        GpuMemoryCache::TitansChunkwise { k_mem, v_mem, q_mem, alpha, theta, eta, m_chunk_states, s_chunk_states, k_norms, q_norms, chunk_size, .. } => {
+            let mut d_k_mem = GpuBuf::zeros(bsd);
+            let mut d_v_mem = GpuBuf::zeros(bsd);
+            let mut d_q_mem = GpuBuf::zeros(bsd);
+            let mut d_alpha = GpuBuf::zeros(bs_s);
+            let mut d_theta = GpuBuf::zeros(bs_s);
+            let mut d_eta = GpuBuf::zeros(bs_s);
+            let mut d_m_initial = GpuBuf::zeros(dd);
+            let mut d_s_initial = GpuBuf::zeros(dd);
+
+            crate::dispatch::titans_chunkwise_backward_dd(
+                k_mem, v_mem, q_mem, alpha, theta, eta,
+                m_chunk_states, s_chunk_states, d_y,
+                &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
+                &mut d_alpha, &mut d_theta, &mut d_eta,
+                &mut d_m_initial, &mut d_s_initial,
+                s, d, batch_size, *chunk_size,
+                cfg.error_clip_for_level(level),
+            );
+
+            let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
+            let alpha_ceil  = cfg.alpha_ceil.get(level).copied().unwrap_or(1.0);
+            if alpha_floor > 0.0 || alpha_ceil < 1.0 {
+                unsafe {
+                    crate::cuda_ffi::theta_clamp_mask_cuda(
+                        alpha.as_ptr(), d_alpha.ptr(), bs_s as i32, alpha_floor, alpha_ceil,
+                    );
+                }
+            }
+            let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
+            let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
+            if theta_floor > 0.0 || theta_ceil < f32::MAX {
+                unsafe {
+                    crate::cuda_ffi::theta_clamp_mask_cuda(
+                        theta.as_ptr(), d_theta.ptr(), bs_s as i32, theta_floor, theta_ceil,
+                    );
+                }
+            }
+
+            accumulate_projection_grads(
+                level_params, embedded,
+                k_mem, v_mem, q_mem, alpha, Some(theta), Some(eta),
+                &d_k_mem, &d_v_mem, &d_q_mem,
+                &d_alpha, Some(&d_theta), Some(&d_eta),
+                k_norms, q_norms,
+                level_grads, s, d, batch_size,
+            )
+        }
         GpuMemoryCache::Hebbian { k_mem, v_mem, q_mem, alpha, m_states, k_norms, q_norms } => {
             // Hebbian kernels don't yet support batch_size > 1
             assert_eq!(batch_size, 1, "Hebbian batch_size > 1 not yet supported");
