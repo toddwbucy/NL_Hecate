@@ -1923,7 +1923,9 @@ fn gpu_memory_forward_into_scratch(
     let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
     let m_initial_slice = context_m.slice(0, bs * dd);
 
-    match (cfg.checkpoint_interval, cfg.memory_rule) {
+    let eff_ckpt = cfg.effective_checkpoint_interval(level);
+
+    match (eff_ckpt, cfg.memory_rule) {
         (None, MemoryRuleKind::DeltaRule) => {
             // Spec 39: Fused kernel — L2-normalize + gate compute + clamp + DGD recurrence
             // in a single launch. Writes normalized k/q back to scratch.k_mem/q_mem,
@@ -3555,5 +3557,85 @@ mod scratch_tests {
             &mut scratch, s, d, 0, bs,
         );
         assert!(!ok, "HebbianRule should return false (unsupported for scratch path)");
+    }
+
+    /// DeltaRule scratch path with non-default clamp bounds exercises the fused kernel's
+    /// gate clamping logic (alpha_floor/ceil, theta_ceil).
+    #[test]
+    fn test_dgd_scratch_with_clamp_bounds() {
+        let d = 32;
+        let s = 8;
+        let dd = d * d;
+        let bs = 1;
+
+        let level_params = make_level_params(d, 700);
+        let mut cfg = make_cfg(d, s, MemoryRuleKind::DeltaRule);
+        cfg.alpha_floor = vec![0.1];
+        cfg.alpha_ceil = vec![0.9];
+        cfg.theta_floor = vec![0.01];
+        cfg.theta_ceil = vec![0.5];
+        let embedded = GpuBuf::from_host(&rand_vec(bs * s * d, 800));
+        let m_init = rand_vec(bs * dd, 801);
+
+        // ── Standard path ──
+        let mut context_m_std = GpuBuf::from_host(&m_init);
+        let (y_std, cache_std) = super::gpu_memory_forward(
+            &level_params, &cfg, &embedded, &mut context_m_std,
+            s, d, 0, bs,
+        );
+        crate::dispatch::cuda_sync();
+
+        let (alpha_std, theta_std) = match &cache_std {
+            super::GpuMemoryCache::Delta { alpha, theta, .. } => (alpha, theta),
+            _ => panic!("Expected Delta cache"),
+        };
+
+        // ── Scratch path ──
+        let context_m_scratch = GpuBuf::from_host(&m_init);
+        let mut scratch = GpuLevelScratch::new(bs, s, d, false);
+        let ok = super::gpu_memory_forward_into_scratch(
+            &level_params, &cfg, &embedded, &context_m_scratch,
+            &mut scratch, s, d, 0, bs,
+        );
+        assert!(ok);
+        crate::dispatch::cuda_sync();
+
+        // ── Compare y ──
+        let mut y_std_h = vec![0.0f32; bs * s * d];
+        let mut y_scr_h = vec![0.0f32; bs * s * d];
+        y_std.copy_to_host(&mut y_std_h);
+        scratch.y.copy_to_host(&mut y_scr_h);
+        let y_diff = max_abs_diff(&y_std_h, &y_scr_h);
+
+        // ── Compare alpha (should be clamped to [0.1, 0.9]) ──
+        let mut alpha_std_h = vec![0.0f32; bs * s];
+        let mut alpha_scr_h = vec![0.0f32; bs * s];
+        alpha_std.copy_to_host(&mut alpha_std_h);
+        scratch.alpha.copy_to_host(&mut alpha_scr_h);
+        let alpha_diff = max_abs_diff(&alpha_std_h, &alpha_scr_h);
+
+        // Verify clamping is active: all alpha values within [0.1, 0.9]
+        for (i, &a) in alpha_scr_h.iter().enumerate() {
+            assert!(a >= 0.1 - 1e-6 && a <= 0.9 + 1e-6,
+                "alpha[{i}]={a} outside clamped range [0.1, 0.9]");
+        }
+
+        // ── Compare theta (should be clamped to [0.01, 0.5]) ──
+        let mut theta_std_h = vec![0.0f32; bs * s];
+        let mut theta_scr_h = vec![0.0f32; bs * s];
+        theta_std.copy_to_host(&mut theta_std_h);
+        scratch.theta.copy_to_host(&mut theta_scr_h);
+        let theta_diff = max_abs_diff(&theta_std_h, &theta_scr_h);
+
+        for (i, &t) in theta_scr_h.iter().enumerate() {
+            assert!(t >= 0.01 - 1e-6 && t <= 0.5 + 1e-6,
+                "theta[{i}]={t} outside clamped range [0.01, 0.5]");
+        }
+
+        eprintln!("DGD scratch with clamps — y={y_diff:.2e}, alpha={alpha_diff:.2e}, theta={theta_diff:.2e}");
+
+        assert!(y_diff < 1e-5, "y mismatch: {y_diff}");
+        assert!(alpha_diff < 1e-5, "alpha mismatch: {alpha_diff}");
+        assert!(theta_diff < 1e-5, "theta mismatch: {theta_diff}");
     }
 }
