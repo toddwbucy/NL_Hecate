@@ -954,8 +954,9 @@ impl MAGConfig {
                     // With chunk_size=cl (single chunk): num_chunks=1, stores M₀+M_final = 2*dd.
                     // Titans also stores S₀+S_final; Delta has no momentum S.
                     let m_s_bytes = match self.memory_rule {
-                        MemoryRuleKind::TitansLMM => 2 * 2 * dd * 4, // M+S boundary pairs
-                        _ => 2 * dd * 4,                              // M boundary pair only
+                        MemoryRuleKind::TitansLMM
+                        | MemoryRuleKind::AtlasOmega => 2 * 2 * dd * 4, // M+S boundary pairs
+                        _ => 2 * dd * 4,                                 // M boundary pair only
                     };
                     m_s_bytes
                     + cl * d * 3 * 4           // projections still stored

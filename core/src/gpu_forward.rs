@@ -323,11 +323,21 @@ impl GpuMemoryCache {
 
         match self {
             GpuMemoryCache::Delta { proxy: true, .. }
-            | GpuMemoryCache::Titans { proxy: true, .. }
-            | GpuMemoryCache::DeltaChunkwise { .. }
-            | GpuMemoryCache::TitansChunkwise { .. } => {
-                // Proxy/chunkwise caches don't have full trajectory — no M_{s-1} to measure.
+            | GpuMemoryCache::Titans { proxy: true, .. } => {
+                // Proxy caches (pre-spec-43 legacy) don't store M states.
                 return 0.0;
+            }
+            GpuMemoryCache::DeltaChunkwise { k_mem, v_mem, m_chunk_states, num_chunks, .. }
+            | GpuMemoryCache::TitansChunkwise { k_mem, v_mem, m_chunk_states, num_chunks, .. } => {
+                // Spec 43: use last chunk's M₀ as approximate pre-update M.
+                // m_chunk_states layout: [(num_chunks+1)*dd]. Index (num_chunks-1) = last chunk start.
+                if *num_chunks == 0 || s == 0 {
+                    return 0.0;
+                }
+                let m_last_chunk_start = m_chunk_states.slice((*num_chunks - 1) * dd, dd);
+                let k_last = k_mem.slice((s - 1) * d, d);
+                let v_last = v_mem.slice((s - 1) * d, d);
+                return compute_norm(m_last_chunk_start.as_ptr(), k_last.as_ptr(), v_last.as_ptr());
             }
             GpuMemoryCache::Delta { k_mem, v_mem, m_states, .. }
             | GpuMemoryCache::DGD { k_mem, v_mem, m_states, .. }
@@ -3806,9 +3816,10 @@ mod chunkwise_tests {
         assert!(s_diff < 1e-5, "Titans chunkwise C=1 S_final mismatch: {s_diff}");
     }
 
-    /// Delta chunkwise backward FD gradient check.
+    /// Delta chunkwise backward FD gradient check (d_k only).
     /// Uses chunk_size=s (single chunk) — the frozen-M₀ formulation.
-    /// Verifies d_k, d_v, d_theta, d_alpha via finite differences.
+    /// Validates d_k via central differences; other grads (d_v, d_q, d_alpha,
+    /// d_theta) are exercised but not FD-checked here.
     #[test]
     fn test_delta_chunkwise_backward_fd() {
         let d = 8;
@@ -3924,7 +3935,7 @@ mod chunkwise_tests {
         assert!(pass_rate >= 0.90, "Delta chunkwise d_k FD check failed: {pass_rate:.2}");
     }
 
-    /// Titans chunkwise backward FD gradient check.
+    /// Titans chunkwise backward FD gradient check (d_k only).
     #[test]
     fn test_titans_chunkwise_backward_fd() {
         let d = 8;
