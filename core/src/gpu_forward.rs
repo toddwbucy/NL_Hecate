@@ -1950,23 +1950,25 @@ fn gpu_memory_forward_into_scratch(
             // + Titans recurrence in a single launch.
             scratch.s_initial.zero();
             let s_initial_slice = scratch.s_initial.slice(0, bs * dd);
-            if scratch.has_s_states {
-                scratch.m_states.zero();
-                scratch.s_states.zero();
-                crate::dispatch::titans_fused_forward_dd(
-                    &mut scratch.k_mem, &scratch.v_mem, &mut scratch.q_mem,
-                    &level_params.w_alpha, &level_params.b_alpha,
-                    &level_params.w_theta, &level_params.b_theta,
-                    &level_params.w_eta, &level_params.b_eta,
-                    alpha_floor, alpha_ceil, theta_floor, theta_ceil,
-                    &m_initial_slice, &s_initial_slice,
-                    &mut scratch.m_states, &mut scratch.s_states, &mut scratch.y,
-                    &mut scratch.alpha, &mut scratch.theta, &mut scratch.eta,
-                    &mut scratch.k_norms, &mut scratch.q_norms,
-                    s, d, bs, cfg.error_clip_for_level(level),
-                );
-                // NOTE: copy_final_m_batch NOT called here — caller does it outside the graph.
+            if !scratch.has_s_states {
+                eprintln!("[cuda_graph] gpu_memory_forward_into_scratch: TitansLMM requires has_s_states=true — falling back");
+                return false;
             }
+            scratch.m_states.zero();
+            scratch.s_states.zero();
+            crate::dispatch::titans_fused_forward_dd(
+                &mut scratch.k_mem, &scratch.v_mem, &mut scratch.q_mem,
+                &level_params.w_alpha, &level_params.b_alpha,
+                &level_params.w_theta, &level_params.b_theta,
+                &level_params.w_eta, &level_params.b_eta,
+                alpha_floor, alpha_ceil, theta_floor, theta_ceil,
+                &m_initial_slice, &s_initial_slice,
+                &mut scratch.m_states, &mut scratch.s_states, &mut scratch.y,
+                &mut scratch.alpha, &mut scratch.theta, &mut scratch.eta,
+                &mut scratch.k_norms, &mut scratch.q_norms,
+                s, d, bs, cfg.error_clip_for_level(level),
+            );
+            // NOTE: copy_final_m_batch NOT called here — caller does it outside the graph.
             true
         }
         _ => {
@@ -2971,14 +2973,12 @@ pub(crate) unsafe fn gpu_buf_memcpy_d2d(
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// Tests: Fused vs unfused kernel bit-identity (spec 39)
+// Shared test helpers (spec 39 CUDA tests)
 // ══════════════════════════════════════════════════════════════════════
 
 #[cfg(all(test, feature = "cuda"))]
-mod fused_tests {
-    use crate::gpu_buf::GpuBuf;
-
-    fn rand_vec(n: usize, seed: u64) -> Vec<f32> {
+mod test_helpers {
+    pub fn rand_vec(n: usize, seed: u64) -> Vec<f32> {
         let mut v = Vec::with_capacity(n);
         let mut state = seed;
         for _ in 0..n {
@@ -2989,9 +2989,19 @@ mod fused_tests {
         v
     }
 
-    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+    pub fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
         a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
     }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Tests: Fused vs unfused kernel bit-identity (spec 39)
+// ══════════════════════════════════════════════════════════════════════
+
+#[cfg(all(test, feature = "cuda"))]
+mod fused_tests {
+    use crate::gpu_buf::GpuBuf;
+    use super::test_helpers::{rand_vec, max_abs_diff};
 
     #[test]
     fn test_dgd_fused_matches_unfused() {
@@ -3297,21 +3307,7 @@ mod scratch_tests {
     use crate::gpu_buf::GpuBuf;
     use crate::model::{MAGConfig, MemoryRuleKind};
     use crate::cuda_graph::GpuLevelScratch;
-
-    fn rand_vec(n: usize, seed: u64) -> Vec<f32> {
-        let mut v = Vec::with_capacity(n);
-        let mut state = seed;
-        for _ in 0..n {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            let f = ((state >> 33) as f32) / (u32::MAX as f32) * 2.0 - 1.0;
-            v.push(f * 0.1);
-        }
-        v
-    }
-
-    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-        a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
-    }
+    use super::test_helpers::{rand_vec, max_abs_diff};
 
     /// Build a minimal GpuMemoryLevelParams from random weights for testing.
     fn make_level_params(d: usize, seed: u64) -> crate::gpu_params::GpuMemoryLevelParams {
