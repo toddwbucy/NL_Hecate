@@ -205,6 +205,10 @@ extern "C" void titans_chunkwise_forward_f32_cuda(
     check_cuda_alloc("titans_chunkwise_fwd: cudaMalloc error_work",
                      cudaMalloc(&error_work, (size_t)batch_size * chunk_size * d * sizeof(float)));
 
+    check_cuda_alloc("titans_chunkwise_fwd: cudaFuncSetAttribute",
+                     cudaFuncSetAttribute(titans_chunkwise_forward_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+
     titans_chunkwise_forward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, eta,
         m_initial, s_initial, m_chunk_states, s_chunk_states, y,

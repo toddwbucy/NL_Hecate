@@ -3795,6 +3795,15 @@ mod chunkwise_tests {
         let m_diff = max_abs_diff(&m_final_pt, &m_final_cw);
         eprintln!("Titans C=1 parity: M_final_diff = {m_diff:.2e}");
         assert!(m_diff < 1e-5, "Titans chunkwise C=1 M_final mismatch: {m_diff}");
+
+        // S_final parity: momentum state must also match at C=1.
+        let mut s_final_pt = vec![0.0f32; dd];
+        let mut s_final_cw = vec![0.0f32; dd];
+        s_states_pt.slice(s * dd, dd).copy_to_host(&mut s_final_pt);
+        s_chunk_states.slice(num_chunks * dd, dd).copy_to_host(&mut s_final_cw);
+        let s_diff = max_abs_diff(&s_final_pt, &s_final_cw);
+        eprintln!("Titans C=1 parity: S_final_diff = {s_diff:.2e}");
+        assert!(s_diff < 1e-5, "Titans chunkwise C=1 S_final mismatch: {s_diff}");
     }
 
     /// Delta chunkwise backward FD gradient check.

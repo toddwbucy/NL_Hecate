@@ -952,8 +952,12 @@ impl MAGConfig {
                 LevelTapeStrategy::Proxy => {
                     // Spec 43: chunkwise stores (num_chunks+1) M states.
                     // With chunk_size=cl (single chunk): num_chunks=1, stores M₀+M_final = 2*dd.
-                    // S_final: same 2*dd for Titans.
-                    2 * 2 * dd * 4             // (M₀+M_final) + (S₀+S_final)
+                    // Titans also stores S₀+S_final; Delta has no momentum S.
+                    let m_s_bytes = match self.memory_rule {
+                        MemoryRuleKind::TitansLMM => 2 * 2 * dd * 4, // M+S boundary pairs
+                        _ => 2 * dd * 4,                              // M boundary pair only
+                    };
+                    m_s_bytes
                     + cl * d * 3 * 4           // projections still stored
                     + cl * 3 * 4               // gates still stored
                     + cl * 2 * 4               // k_norms, q_norms

@@ -199,6 +199,10 @@ extern "C" void delta_chunkwise_forward_f32_cuda(
     check_cuda_alloc("delta_chunkwise_fwd: cudaMalloc error_work",
                      cudaMalloc(&error_work, (size_t)batch_size * chunk_size * d * sizeof(float)));
 
+    check_cuda_alloc("delta_chunkwise_fwd: cudaFuncSetAttribute",
+                     cudaFuncSetAttribute(delta_chunkwise_forward_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+
     delta_chunkwise_forward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_initial,
         m_chunk_states, y, m_work, error_work,
