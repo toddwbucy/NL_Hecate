@@ -227,6 +227,35 @@ pub enum GpuMemoryCache {
         w1_boundary: Option<GpuBuf<f32>>,  // [d_hidden * d]
         w2_boundary: Option<GpuBuf<f32>>,  // [d * d_hidden]
     },
+    /// Delta chunkwise (spec 43 — frozen-M₀). Stores chunk boundary M states.
+    /// m_chunk_states: [bs * (num_chunks+1) * d*d].
+    DeltaChunkwise {
+        k_mem: GpuBuf<f32>,
+        v_mem: GpuBuf<f32>,
+        q_mem: GpuBuf<f32>,
+        alpha: GpuBuf<f32>,
+        theta: GpuBuf<f32>,
+        m_chunk_states: GpuBuf<f32>,  // [(num_chunks+1)*d*d]
+        k_norms: GpuBuf<f32>,
+        q_norms: GpuBuf<f32>,
+        chunk_size: usize,
+        num_chunks: usize,
+    },
+    /// Titans chunkwise (spec 43 — frozen-M₀). Stores chunk boundary M and S states.
+    TitansChunkwise {
+        k_mem: GpuBuf<f32>,
+        v_mem: GpuBuf<f32>,
+        q_mem: GpuBuf<f32>,
+        alpha: GpuBuf<f32>,
+        theta: GpuBuf<f32>,
+        eta: GpuBuf<f32>,
+        m_chunk_states: GpuBuf<f32>,  // [(num_chunks+1)*d*d]
+        s_chunk_states: GpuBuf<f32>,  // [(num_chunks+1)*d*d]
+        k_norms: GpuBuf<f32>,
+        q_norms: GpuBuf<f32>,
+        chunk_size: usize,
+        num_chunks: usize,
+    },
     /// TNT hierarchical — per-shard inner caches + global state trajectory.
     /// The inner caches are Titans/Delta/etc. caches, one per shard.
     TNT {
@@ -295,8 +324,20 @@ impl GpuMemoryCache {
         match self {
             GpuMemoryCache::Delta { proxy: true, .. }
             | GpuMemoryCache::Titans { proxy: true, .. } => {
-                // Proxy caches don't have full trajectory — no M_{s-1} to measure.
+                // Proxy caches (pre-spec-43 legacy) don't store M states.
                 return 0.0;
+            }
+            GpuMemoryCache::DeltaChunkwise { k_mem, v_mem, m_chunk_states, num_chunks, .. }
+            | GpuMemoryCache::TitansChunkwise { k_mem, v_mem, m_chunk_states, num_chunks, .. } => {
+                // Spec 43: use last chunk's M₀ as approximate pre-update M.
+                // m_chunk_states layout: [(num_chunks+1)*dd]. Index (num_chunks-1) = last chunk start.
+                if *num_chunks == 0 || s == 0 {
+                    return 0.0;
+                }
+                let m_last_chunk_start = m_chunk_states.slice((*num_chunks - 1) * dd, dd);
+                let k_last = k_mem.slice((s - 1) * d, d);
+                let v_last = v_mem.slice((s - 1) * d, d);
+                return compute_norm(m_last_chunk_start.as_ptr(), k_last.as_ptr(), v_last.as_ptr());
             }
             GpuMemoryCache::Delta { k_mem, v_mem, m_states, .. }
             | GpuMemoryCache::DGD { k_mem, v_mem, m_states, .. }
@@ -371,7 +412,9 @@ impl GpuMemoryCache {
             | GpuMemoryCache::TitansCkpt { alpha, .. }
             | GpuMemoryCache::HebbianCkpt { alpha, .. }
             | GpuMemoryCache::DGDCkpt { alpha, .. }
-            | GpuMemoryCache::Mlp { alpha, .. } => Some(alpha),
+            | GpuMemoryCache::Mlp { alpha, .. }
+            | GpuMemoryCache::DeltaChunkwise { alpha, .. }
+            | GpuMemoryCache::TitansChunkwise { alpha, .. } => Some(alpha),
             GpuMemoryCache::SwiGlu { .. } => None,
             GpuMemoryCache::TNT { .. } => None, // handled separately below
         };
@@ -426,8 +469,10 @@ impl GpuMemoryCache {
     pub fn eta_stats(&self) -> Option<GateStats> {
         let eta_buf: Option<&GpuBuf<f32>> = match self {
             GpuMemoryCache::Titans { eta, .. }
-            | GpuMemoryCache::TitansCkpt { eta, .. } => Some(eta),
+            | GpuMemoryCache::TitansCkpt { eta, .. }
+            | GpuMemoryCache::TitansChunkwise { eta, .. } => Some(eta),
             GpuMemoryCache::Delta { .. }
+            | GpuMemoryCache::DeltaChunkwise { .. }
             | GpuMemoryCache::Hebbian { .. }
             | GpuMemoryCache::DGD { .. }
             | GpuMemoryCache::DeltaCkpt { .. }
@@ -490,7 +535,9 @@ impl GpuMemoryCache {
             | GpuMemoryCache::DeltaCkpt { theta, .. }
             | GpuMemoryCache::TitansCkpt { theta, .. }
             | GpuMemoryCache::DGDCkpt { theta, .. }
-            | GpuMemoryCache::Mlp { theta, .. } => Some(theta),
+            | GpuMemoryCache::Mlp { theta, .. }
+            | GpuMemoryCache::DeltaChunkwise { theta, .. }
+            | GpuMemoryCache::TitansChunkwise { theta, .. } => Some(theta),
             GpuMemoryCache::Hebbian { .. }
             | GpuMemoryCache::HebbianCkpt { .. }
             | GpuMemoryCache::SwiGlu { .. } => None,
@@ -1082,7 +1129,9 @@ pub(crate) fn gpu_memory_forward(
     // For full-trajectory (no checkpoint_interval) DeltaRule and TitansLMM,
     // fuse L2-normalize + gate compute + gate clamp + memory recurrence
     // into a single kernel. Eliminates 4-5 separate kernel launches.
+    // Spec 43: proxy levels use chunkwise kernels (frozen-M₀) — skip fused path.
     let use_fused = eff_ckpt.is_none()
+        && !is_proxy
         && matches!(cfg.memory_rule, MemoryRuleKind::DeltaRule | MemoryRuleKind::TitansLMM);
 
     if use_fused {
@@ -1117,23 +1166,8 @@ pub(crate) fn gpu_memory_forward(
                         );
                     }
                 }
-                let (cache_m, cache_proxy) = if is_proxy {
-                    let m_final = GpuBuf::zeros(bs * dd);
-                    for b in 0..bs {
-                        unsafe {
-                            let rc = gpu_buf_memcpy_d2d(
-                                (m_final.ptr() as *mut u8).add(b * dd * 4) as *mut _,
-                                (m_states.as_ptr() as *const u8).add((b * (s + 1) + s) * dd * 4) as *const _,
-                                dd * 4,
-                            );
-                            assert_eq!(rc, 0, "proxy M_final copy failed");
-                        }
-                    }
-                    (m_final, true)
-                } else {
-                    (m_states, false)
-                };
-                return (y, GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states: cache_m, k_norms, q_norms, proxy: cache_proxy });
+                // Fused path is exact only (spec 43: proxy uses chunkwise, not fused)
+                return (y, GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states, k_norms, q_norms, proxy: false });
             }
             MemoryRuleKind::TitansLMM => {
                 let mut eta = GpuBuf::zeros(bs * s);
@@ -1164,36 +1198,14 @@ pub(crate) fn gpu_memory_forward(
                         );
                     }
                 }
-                let (cache_m, cache_s, cache_proxy) = if is_proxy {
-                    let m_final = GpuBuf::zeros(bs * dd);
-                    let s_final = GpuBuf::zeros(bs * dd);
-                    for b in 0..bs {
-                        unsafe {
-                            let rc = gpu_buf_memcpy_d2d(
-                                (m_final.ptr() as *mut u8).add(b * dd * 4) as *mut _,
-                                (m_states.as_ptr() as *const u8).add((b * (s + 1) + s) * dd * 4) as *const _,
-                                dd * 4,
-                            );
-                            assert_eq!(rc, 0, "proxy M_final copy failed");
-                            let rc = gpu_buf_memcpy_d2d(
-                                (s_final.ptr() as *mut u8).add(b * dd * 4) as *mut _,
-                                (s_states.as_ptr() as *const u8).add((b * (s + 1) + s) * dd * 4) as *const _,
-                                dd * 4,
-                            );
-                            assert_eq!(rc, 0, "proxy S_final copy failed");
-                        }
-                    }
-                    (m_final, s_final, true)
-                } else {
-                    (m_states, s_states, false)
-                };
-                return (y, GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states: cache_m, s_states: cache_s, k_norms, q_norms, proxy: cache_proxy });
+                // Fused path is exact only (spec 43: proxy uses chunkwise, not fused)
+                return (y, GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states, s_states, k_norms, q_norms, proxy: false });
             }
             _ => unreachable!(),
         }
     }
 
-    // ── Unfused path (checkpointed variants, Hebbian, SwiGLU MLP) ────
+    // ── Unfused path (checkpointed variants, Hebbian, chunkwise, SwiGLU MLP) ──
     // L2-normalize keys and queries (Titans paper: "normalize queries and keys using l_2-norm")
     let k_norms = GpuBuf::zeros(bs * s);
     let q_norms = GpuBuf::zeros(bs * s);
@@ -1230,8 +1242,32 @@ pub(crate) fn gpu_memory_forward(
     }
 
     match (eff_ckpt, cfg.memory_rule) {
-        // ── Full-trajectory paths (checkpoint_interval=None, current behavior) ──
+        // ── Full-trajectory / chunkwise paths (checkpoint_interval=None) ──
+        (None, MemoryRuleKind::DeltaRule) if is_proxy => {
+            // Spec 43: chunkwise forward (frozen-M₀). chunk_size=s → single chunk.
+            let chunk_size = s;
+            let num_chunks = (s + chunk_size - 1) / chunk_size;
+            let mut m_chunk_states = GpuBuf::zeros(bs * (num_chunks + 1) * dd);
+            let mut y = GpuBuf::zeros(bs * s * d);
+            crate::dispatch::delta_chunkwise_forward_dd(
+                &k_mem, &v_mem, &q_mem, &alpha, &theta,
+                &m_initial_slice, &mut m_chunk_states, &mut y,
+                s, d, bs, chunk_size, cfg.error_clip_for_level(level),
+            );
+            crate::dispatch::cuda_sync();
+            copy_final_m_batch(&m_chunk_states, context_m, num_chunks, dd, bs);
+            for b in 0..bs {
+                unsafe {
+                    crate::cuda_ffi::m_norm_clamp_f32_cuda(
+                        (context_m.ptr() as *mut u8).add(b * dd * 4) as *mut f32,
+                        d_i32, m_norm_max,
+                    );
+                }
+            }
+            (y, GpuMemoryCache::DeltaChunkwise { k_mem, v_mem, q_mem, alpha, theta, m_chunk_states, k_norms, q_norms, chunk_size, num_chunks })
+        }
         (None, MemoryRuleKind::DeltaRule) => {
+            // Exact: full per-token trajectory
             let mut m_states = GpuBuf::zeros(bs * (s + 1) * dd);
             let mut y = GpuBuf::zeros(bs * s * d);
             crate::dispatch::delta_forward_dd(
@@ -1249,29 +1285,39 @@ pub(crate) fn gpu_memory_forward(
                     );
                 }
             }
-            // Spec 27: proxy levels extract M_final, discard full trajectory
-            let (cache_m, cache_proxy) = if is_proxy {
-                let m_final = GpuBuf::zeros(bs * dd);
-                for b in 0..bs {
-                    unsafe {
-                        let rc = gpu_buf_memcpy_d2d(
-                            (m_final.ptr() as *mut u8).add(b * dd * 4) as *mut _,
-                            (m_states.as_ptr() as *const u8).add((b * (s + 1) + s) * dd * 4) as *const _,
-                            dd * 4,
-                        );
-                        assert_eq!(rc, 0, "proxy M_final copy failed");
-                    }
+            (y, GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states, k_norms, q_norms, proxy: false })
+        }
+        (None, MemoryRuleKind::TitansLMM) if is_proxy => {
+            // Spec 43: chunkwise forward (frozen-M₀). chunk_size=s → single chunk.
+            let eta = compute_eta(level_params, &k_mem, &v_mem, bs * s, d);
+            let batch_s_initial = GpuBuf::zeros(bs * dd);
+            let s_initial_slice = batch_s_initial.slice(0, bs * dd);
+            let chunk_size = s;
+            let num_chunks = (s + chunk_size - 1) / chunk_size;
+            let mut m_chunk_states = GpuBuf::zeros(bs * (num_chunks + 1) * dd);
+            let mut s_chunk_states = GpuBuf::zeros(bs * (num_chunks + 1) * dd);
+            let mut y = GpuBuf::zeros(bs * s * d);
+            crate::dispatch::titans_chunkwise_forward_dd(
+                &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
+                &m_initial_slice, &s_initial_slice,
+                &mut m_chunk_states, &mut s_chunk_states, &mut y,
+                s, d, bs, chunk_size, cfg.error_clip_for_level(level),
+            );
+            crate::dispatch::cuda_sync();
+            copy_final_m_batch(&m_chunk_states, context_m, num_chunks, dd, bs);
+            for b in 0..bs {
+                unsafe {
+                    crate::cuda_ffi::m_norm_clamp_f32_cuda(
+                        (context_m.ptr() as *mut u8).add(b * dd * 4) as *mut f32,
+                        d_i32, m_norm_max,
+                    );
                 }
-                (m_final, true)
-            } else {
-                (m_states, false)
-            };
-            (y, GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states: cache_m, k_norms, q_norms, proxy: cache_proxy })
+            }
+            (y, GpuMemoryCache::TitansChunkwise { k_mem, v_mem, q_mem, alpha, theta, eta, m_chunk_states, s_chunk_states, k_norms, q_norms, chunk_size, num_chunks })
         }
         (None, MemoryRuleKind::TitansLMM) => {
-            // Compute eta gate for all bs*s tokens (Titans uses 3 gates: alpha, theta, eta)
+            // Exact: full per-token trajectory
             let eta = compute_eta(level_params, &k_mem, &v_mem, bs * s, d);
-            // s_initial: all-zeros per batch element (bs * dd floats)
             let batch_s_initial = GpuBuf::zeros(bs * dd);
             let s_initial_slice = batch_s_initial.slice(0, bs * dd);
             let mut m_states = GpuBuf::zeros(bs * (s + 1) * dd);
@@ -1293,31 +1339,7 @@ pub(crate) fn gpu_memory_forward(
                     );
                 }
             }
-            // Spec 27: proxy levels extract M_final/S_final, discard full trajectory
-            let (cache_m, cache_s, cache_proxy) = if is_proxy {
-                let m_final = GpuBuf::zeros(bs * dd);
-                let s_final = GpuBuf::zeros(bs * dd);
-                for b in 0..bs {
-                    unsafe {
-                        let rc = gpu_buf_memcpy_d2d(
-                            (m_final.ptr() as *mut u8).add(b * dd * 4) as *mut _,
-                            (m_states.as_ptr() as *const u8).add((b * (s + 1) + s) * dd * 4) as *const _,
-                            dd * 4,
-                        );
-                        assert_eq!(rc, 0, "proxy M_final copy failed");
-                        let rc = gpu_buf_memcpy_d2d(
-                            (s_final.ptr() as *mut u8).add(b * dd * 4) as *mut _,
-                            (s_states.as_ptr() as *const u8).add((b * (s + 1) + s) * dd * 4) as *const _,
-                            dd * 4,
-                        );
-                        assert_eq!(rc, 0, "proxy S_final copy failed");
-                    }
-                }
-                (m_final, s_final, true)
-            } else {
-                (m_states, s_states, false)
-            };
-            (y, GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states: cache_m, s_states: cache_s, k_norms, q_norms, proxy: cache_proxy })
+            (y, GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states, s_states, k_norms, q_norms, proxy: false })
         }
         (None, MemoryRuleKind::HebbianRule) => {
             assert_eq!(bs, 1, "Hebbian GPU forward with batch_size > 1 is not supported");
@@ -3633,5 +3655,471 @@ mod scratch_tests {
         assert!(y_diff < 1e-5, "y mismatch: {y_diff}");
         assert!(alpha_diff < 1e-5, "alpha mismatch: {alpha_diff}");
         assert!(theta_diff < 1e-5, "theta mismatch: {theta_diff}");
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Tests: Chunkwise frozen-M₀ kernels (spec 43)
+// ══════════════════════════════════════════════════════════════════════
+
+#[cfg(all(test, feature = "cuda"))]
+mod chunkwise_tests {
+    use crate::gpu_buf::GpuBuf;
+    use super::test_helpers::{rand_vec, max_abs_diff};
+
+    /// Delta chunkwise forward with chunk_size=1 must match per-token forward exactly.
+    /// At C=1, frozen M₀ = M_{t-1} — identical to evolving-M_t per-token formulation.
+    #[test]
+    fn test_delta_chunkwise_c1_matches_per_token() {
+        let d = 32;
+        let s = 16;
+        let dd = d * d;
+        let bs = 1;
+        let error_clip = 1.0f32;
+
+        let k_mem = rand_vec(bs * s * d, 4300);
+        let v_mem = rand_vec(bs * s * d, 4301);
+        let q_mem = rand_vec(bs * s * d, 4302);
+        // Small alpha (retention ≈ 0.95) and theta (learning rate ≈ 0.01)
+        let alpha: Vec<f32> = (0..bs * s).map(|i| 0.05 + 0.001 * (i as f32)).collect();
+        let theta: Vec<f32> = (0..bs * s).map(|i| 0.01 + 0.001 * (i as f32)).collect();
+        let m_init = rand_vec(bs * dd, 4303);
+
+        // GPU buffers
+        let k_gpu = GpuBuf::from_host(&k_mem);
+        let v_gpu = GpuBuf::from_host(&v_mem);
+        let q_gpu = GpuBuf::from_host(&q_mem);
+        let alpha_gpu = GpuBuf::from_host(&alpha);
+        let theta_gpu = GpuBuf::from_host(&theta);
+        let m_init_gpu = GpuBuf::from_host(&m_init);
+        let m_init_slice = m_init_gpu.slice(0, bs * dd);
+
+        // ── Per-token forward ──
+        let mut m_states_pt = GpuBuf::zeros(bs * (s + 1) * dd);
+        let mut y_pt = GpuBuf::zeros(bs * s * d);
+        crate::dispatch::delta_forward_dd(
+            &k_gpu, &v_gpu, &q_gpu, &alpha_gpu, &theta_gpu,
+            &m_init_slice, &mut m_states_pt, &mut y_pt, s, d, bs, error_clip,
+        );
+        crate::dispatch::cuda_sync();
+
+        // ── Chunkwise forward with chunk_size=1 ──
+        let chunk_size = 1;
+        let num_chunks = s; // s/1 = s chunks
+        let mut m_chunk_states = GpuBuf::zeros(bs * (num_chunks + 1) * dd);
+        let mut y_cw = GpuBuf::zeros(bs * s * d);
+        crate::dispatch::delta_chunkwise_forward_dd(
+            &k_gpu, &v_gpu, &q_gpu, &alpha_gpu, &theta_gpu,
+            &m_init_slice, &mut m_chunk_states, &mut y_cw,
+            s, d, bs, chunk_size, error_clip,
+        );
+        crate::dispatch::cuda_sync();
+
+        // Compare y outputs
+        let mut y_pt_host = vec![0.0f32; bs * s * d];
+        let mut y_cw_host = vec![0.0f32; bs * s * d];
+        y_pt.copy_to_host(&mut y_pt_host);
+        y_cw.copy_to_host(&mut y_cw_host);
+        let y_diff = max_abs_diff(&y_pt_host, &y_cw_host);
+        eprintln!("Delta C=1 parity: y_diff = {y_diff:.2e}");
+        assert!(y_diff < 1e-5, "Delta chunkwise C=1 y mismatch: {y_diff}");
+
+        // Compare M_final (last chunk state vs last per-token state)
+        let mut m_final_pt = vec![0.0f32; dd];
+        let mut m_final_cw = vec![0.0f32; dd];
+        let m_pt_slice = m_states_pt.slice(s * dd, dd);
+        let m_cw_slice = m_chunk_states.slice(num_chunks * dd, dd);
+        m_pt_slice.copy_to_host(&mut m_final_pt);
+        m_cw_slice.copy_to_host(&mut m_final_cw);
+        let m_diff = max_abs_diff(&m_final_pt, &m_final_cw);
+        eprintln!("Delta C=1 parity: M_final_diff = {m_diff:.2e}");
+        assert!(m_diff < 1e-5, "Delta chunkwise C=1 M_final mismatch: {m_diff}");
+    }
+
+    /// Titans chunkwise forward with chunk_size=1 must match per-token forward exactly.
+    #[test]
+    fn test_titans_chunkwise_c1_matches_per_token() {
+        let d = 32;
+        let s = 16;
+        let dd = d * d;
+        let bs = 1;
+        let error_clip = 1.0f32;
+
+        let k_mem = rand_vec(bs * s * d, 4310);
+        let v_mem = rand_vec(bs * s * d, 4311);
+        let q_mem = rand_vec(bs * s * d, 4312);
+        let alpha: Vec<f32> = (0..bs * s).map(|i| 0.05 + 0.001 * (i as f32)).collect();
+        let theta: Vec<f32> = (0..bs * s).map(|i| 0.01 + 0.001 * (i as f32)).collect();
+        let eta: Vec<f32> = (0..bs * s).map(|i| 0.9 + 0.001 * (i as f32)).collect();
+        let m_init = rand_vec(bs * dd, 4313);
+        let s_init = vec![0.0f32; bs * dd];
+
+        let k_gpu = GpuBuf::from_host(&k_mem);
+        let v_gpu = GpuBuf::from_host(&v_mem);
+        let q_gpu = GpuBuf::from_host(&q_mem);
+        let alpha_gpu = GpuBuf::from_host(&alpha);
+        let theta_gpu = GpuBuf::from_host(&theta);
+        let eta_gpu = GpuBuf::from_host(&eta);
+        let m_init_gpu = GpuBuf::from_host(&m_init);
+        let s_init_gpu = GpuBuf::from_host(&s_init);
+        let m_init_slice = m_init_gpu.slice(0, bs * dd);
+        let s_init_slice = s_init_gpu.slice(0, bs * dd);
+
+        // ── Per-token forward ──
+        let mut m_states_pt = GpuBuf::zeros(bs * (s + 1) * dd);
+        let mut s_states_pt = GpuBuf::zeros(bs * (s + 1) * dd);
+        let mut y_pt = GpuBuf::zeros(bs * s * d);
+        crate::dispatch::titans_forward_dd(
+            &k_gpu, &v_gpu, &q_gpu, &alpha_gpu, &theta_gpu, &eta_gpu,
+            &m_init_slice, &s_init_slice,
+            &mut m_states_pt, &mut s_states_pt, &mut y_pt, s, d, bs, error_clip,
+        );
+        crate::dispatch::cuda_sync();
+
+        // ── Chunkwise forward with chunk_size=1 ──
+        let chunk_size = 1;
+        let num_chunks = s;
+        let mut m_chunk_states = GpuBuf::zeros(bs * (num_chunks + 1) * dd);
+        let mut s_chunk_states = GpuBuf::zeros(bs * (num_chunks + 1) * dd);
+        let mut y_cw = GpuBuf::zeros(bs * s * d);
+        crate::dispatch::titans_chunkwise_forward_dd(
+            &k_gpu, &v_gpu, &q_gpu, &alpha_gpu, &theta_gpu, &eta_gpu,
+            &m_init_slice, &s_init_slice,
+            &mut m_chunk_states, &mut s_chunk_states, &mut y_cw,
+            s, d, bs, chunk_size, error_clip,
+        );
+        crate::dispatch::cuda_sync();
+
+        let mut y_pt_host = vec![0.0f32; bs * s * d];
+        let mut y_cw_host = vec![0.0f32; bs * s * d];
+        y_pt.copy_to_host(&mut y_pt_host);
+        y_cw.copy_to_host(&mut y_cw_host);
+        let y_diff = max_abs_diff(&y_pt_host, &y_cw_host);
+        eprintln!("Titans C=1 parity: y_diff = {y_diff:.2e}");
+        assert!(y_diff < 1e-5, "Titans chunkwise C=1 y mismatch: {y_diff}");
+
+        let mut m_final_pt = vec![0.0f32; dd];
+        let mut m_final_cw = vec![0.0f32; dd];
+        m_states_pt.slice(s * dd, dd).copy_to_host(&mut m_final_pt);
+        m_chunk_states.slice(num_chunks * dd, dd).copy_to_host(&mut m_final_cw);
+        let m_diff = max_abs_diff(&m_final_pt, &m_final_cw);
+        eprintln!("Titans C=1 parity: M_final_diff = {m_diff:.2e}");
+        assert!(m_diff < 1e-5, "Titans chunkwise C=1 M_final mismatch: {m_diff}");
+
+        // S_final parity: momentum state must also match at C=1.
+        let mut s_final_pt = vec![0.0f32; dd];
+        let mut s_final_cw = vec![0.0f32; dd];
+        s_states_pt.slice(s * dd, dd).copy_to_host(&mut s_final_pt);
+        s_chunk_states.slice(num_chunks * dd, dd).copy_to_host(&mut s_final_cw);
+        let s_diff = max_abs_diff(&s_final_pt, &s_final_cw);
+        eprintln!("Titans C=1 parity: S_final_diff = {s_diff:.2e}");
+        assert!(s_diff < 1e-5, "Titans chunkwise C=1 S_final mismatch: {s_diff}");
+    }
+
+    /// Delta chunkwise backward FD gradient check (d_k only).
+    /// Uses chunk_size=s (single chunk) — the frozen-M₀ formulation.
+    /// Validates d_k via central differences; other grads (d_v, d_q, d_alpha,
+    /// d_theta) are exercised but not FD-checked here.
+    #[test]
+    fn test_delta_chunkwise_backward_fd() {
+        let d = 8;
+        let s = 4;
+        let dd = d * d;
+        let bs = 1;
+        let chunk_size = s; // single chunk — full frozen-M₀ approximation
+        let num_chunks = 1;
+        let error_clip = 0.0f32; // no clip for cleaner FD
+        let eps = 1e-2f32;
+        let fd_tol = 0.10; // 10% relative tolerance
+
+        let k_mem = rand_vec(bs * s * d, 4320);
+        let v_mem = rand_vec(bs * s * d, 4321);
+        let q_mem = rand_vec(bs * s * d, 4322);
+        let alpha: Vec<f32> = (0..bs * s).map(|_| 0.05).collect();
+        let theta: Vec<f32> = (0..bs * s).map(|_| 0.01).collect();
+        let m_init = rand_vec(bs * dd, 4323);
+        // Upstream gradient: uniform 1s for simple loss = sum(y)
+        let d_y = vec![1.0f32; bs * s * d];
+
+        // ── Analytical backward ──
+        let k_gpu = GpuBuf::from_host(&k_mem);
+        let v_gpu = GpuBuf::from_host(&v_mem);
+        let q_gpu = GpuBuf::from_host(&q_mem);
+        let alpha_gpu = GpuBuf::from_host(&alpha);
+        let theta_gpu = GpuBuf::from_host(&theta);
+        let m_init_gpu = GpuBuf::from_host(&m_init);
+        let m_init_slice = m_init_gpu.slice(0, bs * dd);
+        let d_y_gpu = GpuBuf::from_host(&d_y);
+
+        // Forward
+        let mut m_chunk_states = GpuBuf::zeros(bs * (num_chunks + 1) * dd);
+        let mut y = GpuBuf::zeros(bs * s * d);
+        crate::dispatch::delta_chunkwise_forward_dd(
+            &k_gpu, &v_gpu, &q_gpu, &alpha_gpu, &theta_gpu,
+            &m_init_slice, &mut m_chunk_states, &mut y,
+            s, d, bs, chunk_size, error_clip,
+        );
+        crate::dispatch::cuda_sync();
+
+        // Backward
+        let mut d_k = GpuBuf::zeros(bs * s * d);
+        let mut d_v = GpuBuf::zeros(bs * s * d);
+        let mut d_q = GpuBuf::zeros(bs * s * d);
+        let mut d_alpha_buf = GpuBuf::zeros(bs * s);
+        let mut d_theta_buf = GpuBuf::zeros(bs * s);
+        let mut d_m_init = GpuBuf::zeros(dd);
+        crate::dispatch::delta_chunkwise_backward_dd(
+            &k_gpu, &v_gpu, &q_gpu, &alpha_gpu, &theta_gpu,
+            &m_chunk_states, &d_y_gpu,
+            &mut d_k, &mut d_v, &mut d_q,
+            &mut d_alpha_buf, &mut d_theta_buf, &mut d_m_init,
+            s, d, bs, chunk_size, error_clip,
+        );
+        crate::dispatch::cuda_sync();
+
+        let mut d_k_host = vec![0.0f32; bs * s * d];
+        let mut d_v_host = vec![0.0f32; bs * s * d];
+        d_k.copy_to_host(&mut d_k_host);
+        d_v.copy_to_host(&mut d_v_host);
+
+        // ── FD check on k_mem ──
+        let loss_fn = |k_perturbed: &[f32]| -> f32 {
+            let k_g = GpuBuf::from_host(k_perturbed);
+            let v_g = GpuBuf::from_host(&v_mem);
+            let q_g = GpuBuf::from_host(&q_mem);
+            let a_g = GpuBuf::from_host(&alpha);
+            let t_g = GpuBuf::from_host(&theta);
+            let mi_g = GpuBuf::from_host(&m_init);
+            let mi_s = mi_g.slice(0, bs * dd);
+            let mut mc = GpuBuf::zeros(bs * (num_chunks + 1) * dd);
+            let mut yy = GpuBuf::zeros(bs * s * d);
+            crate::dispatch::delta_chunkwise_forward_dd(
+                &k_g, &v_g, &q_g, &a_g, &t_g,
+                &mi_s, &mut mc, &mut yy,
+                s, d, bs, chunk_size, error_clip,
+            );
+            crate::dispatch::cuda_sync();
+            let mut y_host = vec![0.0f32; bs * s * d];
+            yy.copy_to_host(&mut y_host);
+            y_host.iter().sum::<f32>()
+        };
+
+        let mut n_checked = 0;
+        let mut n_passed = 0;
+        let abs_threshold = 5e-4;
+        for i in 0..k_mem.len().min(32) {
+            let mut k_plus = k_mem.clone();
+            let mut k_minus = k_mem.clone();
+            k_plus[i] += eps;
+            k_minus[i] -= eps;
+            let fd_grad = (loss_fn(&k_plus) - loss_fn(&k_minus)) / (2.0 * eps);
+            let anal_grad = d_k_host[i];
+            if anal_grad.abs() < abs_threshold && fd_grad.abs() < abs_threshold {
+                n_passed += 1;
+                n_checked += 1;
+                continue;
+            }
+            let rel_err = if anal_grad.abs() > 1e-8 {
+                ((fd_grad - anal_grad) / anal_grad).abs()
+            } else {
+                (fd_grad - anal_grad).abs()
+            };
+            n_checked += 1;
+            if rel_err < fd_tol { n_passed += 1; }
+            if rel_err >= fd_tol {
+                eprintln!("  d_k[{i}]: anal={anal_grad:.6e} fd={fd_grad:.6e} rel_err={rel_err:.4}");
+            }
+        }
+        let pass_rate = n_passed as f64 / n_checked as f64;
+        eprintln!("Delta chunkwise FD (d_k): {n_passed}/{n_checked} passed ({:.1}%)", pass_rate * 100.0);
+        assert!(pass_rate >= 0.90, "Delta chunkwise d_k FD check failed: {pass_rate:.2}");
+    }
+
+    /// Titans chunkwise backward FD gradient check (d_k only).
+    #[test]
+    fn test_titans_chunkwise_backward_fd() {
+        let d = 8;
+        let s = 4;
+        let dd = d * d;
+        let bs = 1;
+        let chunk_size = s;
+        let num_chunks = 1;
+        let error_clip = 0.0f32;
+        let eps = 1e-2f32;
+        let fd_tol = 0.10;
+
+        let k_mem = rand_vec(bs * s * d, 4330);
+        let v_mem = rand_vec(bs * s * d, 4331);
+        let q_mem = rand_vec(bs * s * d, 4332);
+        let alpha: Vec<f32> = (0..bs * s).map(|_| 0.05).collect();
+        let theta: Vec<f32> = (0..bs * s).map(|_| 0.01).collect();
+        let eta: Vec<f32> = (0..bs * s).map(|_| 0.9).collect();
+        let m_init = rand_vec(bs * dd, 4333);
+        let s_init = vec![0.0f32; bs * dd];
+        let d_y = vec![1.0f32; bs * s * d];
+
+        // ── Analytical backward ──
+        let k_gpu = GpuBuf::from_host(&k_mem);
+        let v_gpu = GpuBuf::from_host(&v_mem);
+        let q_gpu = GpuBuf::from_host(&q_mem);
+        let alpha_gpu = GpuBuf::from_host(&alpha);
+        let theta_gpu = GpuBuf::from_host(&theta);
+        let eta_gpu = GpuBuf::from_host(&eta);
+        let m_init_gpu = GpuBuf::from_host(&m_init);
+        let s_init_gpu = GpuBuf::from_host(&s_init);
+        let m_init_slice = m_init_gpu.slice(0, bs * dd);
+        let s_init_slice = s_init_gpu.slice(0, bs * dd);
+        let d_y_gpu = GpuBuf::from_host(&d_y);
+
+        // Forward
+        let mut m_chunk_states = GpuBuf::zeros(bs * (num_chunks + 1) * dd);
+        let mut s_chunk_states = GpuBuf::zeros(bs * (num_chunks + 1) * dd);
+        let mut y = GpuBuf::zeros(bs * s * d);
+        crate::dispatch::titans_chunkwise_forward_dd(
+            &k_gpu, &v_gpu, &q_gpu, &alpha_gpu, &theta_gpu, &eta_gpu,
+            &m_init_slice, &s_init_slice,
+            &mut m_chunk_states, &mut s_chunk_states, &mut y,
+            s, d, bs, chunk_size, error_clip,
+        );
+        crate::dispatch::cuda_sync();
+
+        // Backward
+        let mut d_k = GpuBuf::zeros(bs * s * d);
+        let mut d_v = GpuBuf::zeros(bs * s * d);
+        let mut d_q = GpuBuf::zeros(bs * s * d);
+        let mut d_alpha_buf = GpuBuf::zeros(bs * s);
+        let mut d_theta_buf = GpuBuf::zeros(bs * s);
+        let mut d_eta_buf = GpuBuf::zeros(bs * s);
+        let mut d_m_init_buf = GpuBuf::zeros(dd);
+        let mut d_s_init_buf = GpuBuf::zeros(dd);
+        crate::dispatch::titans_chunkwise_backward_dd(
+            &k_gpu, &v_gpu, &q_gpu, &alpha_gpu, &theta_gpu, &eta_gpu,
+            &m_chunk_states, &s_chunk_states, &d_y_gpu,
+            &mut d_k, &mut d_v, &mut d_q,
+            &mut d_alpha_buf, &mut d_theta_buf, &mut d_eta_buf,
+            &mut d_m_init_buf, &mut d_s_init_buf,
+            s, d, bs, chunk_size, error_clip,
+        );
+        crate::dispatch::cuda_sync();
+
+        let mut d_k_host = vec![0.0f32; bs * s * d];
+        d_k.copy_to_host(&mut d_k_host);
+
+        // ── FD check on k_mem ──
+        let loss_fn = |k_perturbed: &[f32]| -> f32 {
+            let k_g = GpuBuf::from_host(k_perturbed);
+            let v_g = GpuBuf::from_host(&v_mem);
+            let q_g = GpuBuf::from_host(&q_mem);
+            let a_g = GpuBuf::from_host(&alpha);
+            let t_g = GpuBuf::from_host(&theta);
+            let e_g = GpuBuf::from_host(&eta);
+            let mi_g = GpuBuf::from_host(&m_init);
+            let si_g = GpuBuf::from_host(&s_init);
+            let mi_s = mi_g.slice(0, bs * dd);
+            let si_s = si_g.slice(0, bs * dd);
+            let mut mc = GpuBuf::zeros(bs * (num_chunks + 1) * dd);
+            let mut sc = GpuBuf::zeros(bs * (num_chunks + 1) * dd);
+            let mut yy = GpuBuf::zeros(bs * s * d);
+            crate::dispatch::titans_chunkwise_forward_dd(
+                &k_g, &v_g, &q_g, &a_g, &t_g, &e_g,
+                &mi_s, &si_s,
+                &mut mc, &mut sc, &mut yy,
+                s, d, bs, chunk_size, error_clip,
+            );
+            crate::dispatch::cuda_sync();
+            let mut y_host = vec![0.0f32; bs * s * d];
+            yy.copy_to_host(&mut y_host);
+            y_host.iter().sum::<f32>()
+        };
+
+        let mut n_checked = 0;
+        let mut n_passed = 0;
+        let abs_threshold = 5e-4;
+        for i in 0..k_mem.len().min(32) {
+            let mut k_plus = k_mem.clone();
+            let mut k_minus = k_mem.clone();
+            k_plus[i] += eps;
+            k_minus[i] -= eps;
+            let fd_grad = (loss_fn(&k_plus) - loss_fn(&k_minus)) / (2.0 * eps);
+            let anal_grad = d_k_host[i];
+            if anal_grad.abs() < abs_threshold && fd_grad.abs() < abs_threshold {
+                n_passed += 1;
+                n_checked += 1;
+                continue;
+            }
+            let rel_err = if anal_grad.abs() > 1e-8 {
+                ((fd_grad - anal_grad) / anal_grad).abs()
+            } else {
+                (fd_grad - anal_grad).abs()
+            };
+            n_checked += 1;
+            if rel_err < fd_tol { n_passed += 1; }
+            if rel_err >= fd_tol {
+                eprintln!("  d_k[{i}]: anal={anal_grad:.6e} fd={fd_grad:.6e} rel_err={rel_err:.4}");
+            }
+        }
+        let pass_rate = n_passed as f64 / n_checked as f64;
+        eprintln!("Titans chunkwise FD (d_k): {n_passed}/{n_checked} passed ({:.1}%)", pass_rate * 100.0);
+        assert!(pass_rate >= 0.90, "Titans chunkwise d_k FD check failed: {pass_rate:.2}");
+    }
+
+    /// Delta chunkwise with chunk_size>1 should produce different y than per-token
+    /// (validating that frozen-M₀ IS a different formulation, not just the same math).
+    #[test]
+    fn test_delta_chunkwise_c4_differs_from_per_token() {
+        let d = 16;
+        let s = 8;
+        let dd = d * d;
+        let bs = 1;
+        let error_clip = 1.0f32;
+
+        // Use larger values so the difference is visible
+        let k_mem = rand_vec(bs * s * d, 4340);
+        let v_mem = rand_vec(bs * s * d, 4341);
+        let q_mem = rand_vec(bs * s * d, 4342);
+        let alpha: Vec<f32> = (0..bs * s).map(|_| 0.05).collect();
+        let theta: Vec<f32> = (0..bs * s).map(|_| 0.1).collect(); // larger theta to amplify difference
+        let m_init = rand_vec(bs * dd, 4343);
+
+        let k_gpu = GpuBuf::from_host(&k_mem);
+        let v_gpu = GpuBuf::from_host(&v_mem);
+        let q_gpu = GpuBuf::from_host(&q_mem);
+        let alpha_gpu = GpuBuf::from_host(&alpha);
+        let theta_gpu = GpuBuf::from_host(&theta);
+        let m_init_gpu = GpuBuf::from_host(&m_init);
+        let m_init_slice = m_init_gpu.slice(0, bs * dd);
+
+        // Per-token
+        let mut m_states_pt = GpuBuf::zeros(bs * (s + 1) * dd);
+        let mut y_pt = GpuBuf::zeros(bs * s * d);
+        crate::dispatch::delta_forward_dd(
+            &k_gpu, &v_gpu, &q_gpu, &alpha_gpu, &theta_gpu,
+            &m_init_slice, &mut m_states_pt, &mut y_pt, s, d, bs, error_clip,
+        );
+        crate::dispatch::cuda_sync();
+
+        // Chunkwise with chunk_size=4 (2 chunks of 4 tokens each)
+        let chunk_size = 4;
+        let num_chunks = 2;
+        let mut m_chunk_states = GpuBuf::zeros(bs * (num_chunks + 1) * dd);
+        let mut y_cw = GpuBuf::zeros(bs * s * d);
+        crate::dispatch::delta_chunkwise_forward_dd(
+            &k_gpu, &v_gpu, &q_gpu, &alpha_gpu, &theta_gpu,
+            &m_init_slice, &mut m_chunk_states, &mut y_cw,
+            s, d, bs, chunk_size, error_clip,
+        );
+        crate::dispatch::cuda_sync();
+
+        let mut y_pt_host = vec![0.0f32; bs * s * d];
+        let mut y_cw_host = vec![0.0f32; bs * s * d];
+        y_pt.copy_to_host(&mut y_pt_host);
+        y_cw.copy_to_host(&mut y_cw_host);
+        let y_diff = max_abs_diff(&y_pt_host, &y_cw_host);
+        eprintln!("Delta C=4 vs per-token: y_diff = {y_diff:.2e}");
+
+        // Should differ — frozen-M₀ uses chunk-start M, not evolving M_t
+        // First token in each chunk should match (t=0 sees same M₀), but subsequent
+        // tokens within a chunk will diverge since errors differ.
+        assert!(y_diff > 1e-6, "Expected difference between C=4 and per-token, got {y_diff}");
     }
 }

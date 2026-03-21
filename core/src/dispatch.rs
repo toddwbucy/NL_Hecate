@@ -2075,6 +2075,100 @@ pub fn titans_backward_dd(
     }
 }
 
+// ── Chunkwise dispatch wrappers (spec 43 — frozen-M₀) ──────────────
+
+/// Delta chunkwise forward on device buffers.
+/// m_chunk_states: [bs * (num_chunks+1) * d*d] — M at each chunk boundary + final.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn delta_chunkwise_forward_dd(
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>,
+    m_initial: &GpuSlice<f32>,
+    m_chunk_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
+    seq_len: usize, d: usize, batch_size: usize, chunk_size: usize, error_clip: f32,
+) {
+    unsafe {
+        crate::cuda_ffi::delta_chunkwise_forward_f32_cuda(
+            k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
+            alpha.as_ptr(), theta.as_ptr(),
+            m_initial.as_ptr(),
+            m_chunk_states.ptr(), y.ptr(),
+            seq_len as i32, d as i32, batch_size as i32, chunk_size as i32, error_clip,
+        );
+    }
+}
+
+/// Delta chunkwise backward on device buffers.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn delta_chunkwise_backward_dd(
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>,
+    m_chunk_states: &GpuBuf<f32>, d_y: &GpuBuf<f32>,
+    d_k_mem: &mut GpuBuf<f32>, d_v_mem: &mut GpuBuf<f32>, d_q_mem: &mut GpuBuf<f32>,
+    d_alpha: &mut GpuBuf<f32>, d_theta: &mut GpuBuf<f32>, d_m_initial: &mut GpuBuf<f32>,
+    seq_len: usize, d: usize, batch_size: usize, chunk_size: usize, error_clip: f32,
+) {
+    unsafe {
+        crate::cuda_ffi::delta_chunkwise_backward_f32_cuda(
+            k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
+            alpha.as_ptr(), theta.as_ptr(), m_chunk_states.as_ptr(),
+            d_y.as_ptr(),
+            d_k_mem.ptr(), d_v_mem.ptr(), d_q_mem.ptr(),
+            d_alpha.ptr(), d_theta.ptr(), d_m_initial.ptr(),
+            seq_len as i32, d as i32, batch_size as i32, chunk_size as i32, error_clip,
+        );
+    }
+}
+
+/// Titans chunkwise forward on device buffers.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn titans_chunkwise_forward_dd(
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>, eta: &GpuBuf<f32>,
+    m_initial: &GpuSlice<f32>, s_initial: &GpuSlice<f32>,
+    m_chunk_states: &mut GpuBuf<f32>, s_chunk_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
+    seq_len: usize, d: usize, batch_size: usize, chunk_size: usize, error_clip: f32,
+) {
+    unsafe {
+        crate::cuda_ffi::titans_chunkwise_forward_f32_cuda(
+            k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
+            alpha.as_ptr(), theta.as_ptr(), eta.as_ptr(),
+            m_initial.as_ptr(), s_initial.as_ptr(),
+            m_chunk_states.ptr(), s_chunk_states.ptr(), y.ptr(),
+            seq_len as i32, d as i32, batch_size as i32, chunk_size as i32, error_clip,
+        );
+    }
+}
+
+/// Titans chunkwise backward on device buffers.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn titans_chunkwise_backward_dd(
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>, eta: &GpuBuf<f32>,
+    m_chunk_states: &GpuBuf<f32>, s_chunk_states: &GpuBuf<f32>, d_y: &GpuBuf<f32>,
+    d_k_mem: &mut GpuBuf<f32>, d_v_mem: &mut GpuBuf<f32>, d_q_mem: &mut GpuBuf<f32>,
+    d_alpha: &mut GpuBuf<f32>, d_theta: &mut GpuBuf<f32>, d_eta: &mut GpuBuf<f32>,
+    d_m_initial: &mut GpuBuf<f32>, d_s_initial: &mut GpuBuf<f32>,
+    seq_len: usize, d: usize, batch_size: usize, chunk_size: usize, error_clip: f32,
+) {
+    unsafe {
+        crate::cuda_ffi::titans_chunkwise_backward_f32_cuda(
+            k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
+            alpha.as_ptr(), theta.as_ptr(), eta.as_ptr(),
+            m_chunk_states.as_ptr(), s_chunk_states.as_ptr(),
+            d_y.as_ptr(),
+            d_k_mem.ptr(), d_v_mem.ptr(), d_q_mem.ptr(),
+            d_alpha.ptr(), d_theta.ptr(), d_eta.ptr(),
+            d_m_initial.ptr(), d_s_initial.ptr(),
+            seq_len as i32, d as i32, batch_size as i32, chunk_size as i32, error_clip,
+        );
+    }
+}
+
 /// Fused DGD forward: L2-normalize + gate compute + DGD recurrence in one kernel (spec 39).
 /// k_mem and q_mem are normalized in-place. alpha/theta/norms written to output buffers for backward.
 #[cfg(feature = "cuda")]

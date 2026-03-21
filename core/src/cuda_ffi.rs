@@ -325,6 +325,52 @@ extern "C" {
         t_start: i32, t_end: i32, d: i32, error_clip: f32,
     );
 
+    // ── Chunkwise kernels (spec 43 — frozen-M₀) ──────────────────────
+    //
+    // Paper-aligned formulation: errors computed against frozen chunk-start M₀.
+    // Phase 1: error_t = M₀ @ k_t - v_t (frozen M₀, parallelizable)
+    // Phase 2: M_t = (1-α)M_{t-1} - θ·outer(error_t, k_t), y_t = M_t @ q_t
+    // Source: Titans eq-016/017, TNT eq-003/004, HOPE eq-090.
+
+    /// Delta chunkwise forward (frozen-M₀). Stores (num_chunks+1) M states.
+    pub(crate) fn delta_chunkwise_forward_f32_cuda(
+        k_mem: *const f32, v_mem: *const f32, q_mem: *const f32,
+        alpha: *const f32, theta: *const f32, m_initial: *const f32,
+        m_chunk_states: *mut f32, y: *mut f32,
+        seq_len: i32, d: i32, batch_size: i32, chunk_size: i32, error_clip: f32,
+    );
+
+    /// Delta chunkwise backward (frozen-M₀). Key: d_M = (1-α)d_M only, no error chain.
+    pub(crate) fn delta_chunkwise_backward_f32_cuda(
+        k_mem: *const f32, v_mem: *const f32, q_mem: *const f32,
+        alpha: *const f32, theta: *const f32, m_chunk_states: *const f32,
+        d_y: *const f32,
+        d_k_mem: *mut f32, d_v_mem: *mut f32, d_q_mem: *mut f32,
+        d_alpha: *mut f32, d_theta: *mut f32, d_m_initial: *mut f32,
+        seq_len: i32, d: i32, batch_size: i32, chunk_size: i32, error_clip: f32,
+    );
+
+    /// Titans chunkwise forward (frozen-M₀). Stores (num_chunks+1) M and S states.
+    pub(crate) fn titans_chunkwise_forward_f32_cuda(
+        k_mem: *const f32, v_mem: *const f32, q_mem: *const f32,
+        alpha: *const f32, theta: *const f32, eta: *const f32,
+        m_initial: *const f32, s_initial: *const f32,
+        m_chunk_states: *mut f32, s_chunk_states: *mut f32, y: *mut f32,
+        seq_len: i32, d: i32, batch_size: i32, chunk_size: i32, error_clip: f32,
+    );
+
+    /// Titans chunkwise backward (frozen-M₀). Three accumulators: d_M, d_S, d_M₀.
+    pub(crate) fn titans_chunkwise_backward_f32_cuda(
+        k_mem: *const f32, v_mem: *const f32, q_mem: *const f32,
+        alpha: *const f32, theta: *const f32, eta: *const f32,
+        m_chunk_states: *const f32, s_chunk_states: *const f32,
+        d_y: *const f32,
+        d_k_mem: *mut f32, d_v_mem: *mut f32, d_q_mem: *mut f32,
+        d_alpha: *mut f32, d_theta: *mut f32, d_eta: *mut f32,
+        d_m_initial: *mut f32, d_s_initial: *mut f32,
+        seq_len: i32, d: i32, batch_size: i32, chunk_size: i32, error_clip: f32,
+    );
+
     // ── Broadcast fill (spec 27) ───────────────────────────────────────
 
     /// Fill dst[b*n_slots*dd + t*dd + i] = src[b*dd + i] for all (b,t,i).

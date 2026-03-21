@@ -171,8 +171,40 @@ mod tests {
         assert_eq!(cache.logits.len(), cfg.seq_len * cfg.vocab_size);
     }
 
+    /// RAII guard that pins FORCE_BACKEND to Rust reference and restores on drop.
+    /// Serializes via a mutex so concurrent tests don't race on the global atomic.
+    #[cfg(feature = "cuda")]
+    struct RustBackendGuard {
+        prev: bool,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(feature = "cuda")]
+    impl RustBackendGuard {
+        fn new() -> Self {
+            static BACKEND_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let lock = BACKEND_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = crate::dispatch::is_rust_forced();
+            crate::dispatch::force_rust_reference(true);
+            Self { prev, _lock: lock }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    impl Drop for RustBackendGuard {
+        fn drop(&mut self) {
+            crate::dispatch::force_rust_reference(self.prev);
+        }
+    }
+
     #[test]
     fn test_forward_deterministic() {
+        // Pin dispatch backend so concurrent gradient tests toggling
+        // FORCE_BACKEND don't change arithmetic between the two calls.
+        // Drop guard restores even on panic.
+        #[cfg(feature = "cuda")]
+        let _guard = RustBackendGuard::new();
+
         let cfg = SWAConfig::test_config();
         let params = SWAParams::init(&cfg, 42);
         let input_ids: Vec<usize> = (0..cfg.seq_len).collect();

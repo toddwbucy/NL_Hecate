@@ -122,6 +122,7 @@ class BuildConfig:
     seed: int = 42
     save_path: str = "checkpoints/model.json"
     save_every: int = 0
+    profile_step: int = 0   # 0 = disabled; N > 0 = profile every N steps (spec 38)
     log_every: int = 10
 
     # Optimizer
@@ -176,9 +177,9 @@ class BuildConfig:
     # N = N cycles (deeper gradient flow, more memory).
     tape_multiplier: int = 1
 
-    # Per-level tape strategy (spec 27): controls M/S trajectory in backward.
+    # Per-level tape strategy (spec 27/43): controls M/S trajectory in backward.
     # None/empty = auto (L0=exact, L1+=proxy). If set, length must equal k.
-    # "exact" = full M trajectory. "proxy" = M_final only (truncated BPTT).
+    # "exact" = full M trajectory per token. "proxy" = chunkwise frozen-M₀ (spec 43).
     tape_strategies: list | None = None
 
     # Batching
@@ -590,7 +591,7 @@ class BuildConfig:
             "chunk_sizes": "chunk_sizes", "memory_rule": "memory_rule",
             "composition": "composition", "lr": "lr", "steps": "steps",
             "seed": "seed", "save_path": "save_path", "save_every": "save_every",
-            "log_every": "log_every", "optimizer": "optimizer",
+            "profile_step": "profile_step", "log_every": "log_every", "optimizer": "optimizer",
             "warmup_steps": "warmup_steps", "weight_decay": "weight_decay",
             "beta1": "beta1", "beta2": "beta2", "max_grad_norm": "max_grad_norm",
             "load": "load", "log_file": "log_file",

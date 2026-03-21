@@ -68,6 +68,10 @@ fn main() {
             .file("kernels/moneta_forward.cu")
             .file("kernels/moneta_backward.cu")
             .file("kernels/m3_optimizer.cu")
+            .file("kernels/delta_chunkwise_forward.cu")
+            .file("kernels/delta_chunkwise_backward.cu")
+            .file("kernels/titans_chunkwise_forward.cu")
+            .file("kernels/titans_chunkwise_backward.cu")
             .compile("nl_hecate_cuda_kernels");
 
         println!("cargo:rustc-link-search=native={}/lib64", cuda_path);
@@ -98,5 +102,9 @@ fn main() {
         println!("cargo:rerun-if-changed=kernels/moneta_backward.cu");
         println!("cargo:rerun-if-changed=kernels/error_clip.cuh");
         println!("cargo:rerun-if-changed=kernels/m3_optimizer.cu");
+        println!("cargo:rerun-if-changed=kernels/delta_chunkwise_forward.cu");
+        println!("cargo:rerun-if-changed=kernels/delta_chunkwise_backward.cu");
+        println!("cargo:rerun-if-changed=kernels/titans_chunkwise_forward.cu");
+        println!("cargo:rerun-if-changed=kernels/titans_chunkwise_backward.cu");
     }
 }
