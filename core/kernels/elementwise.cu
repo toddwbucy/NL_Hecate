@@ -403,3 +403,133 @@ extern "C" void dgd_delta_norm_cuda(
     int smem_bytes = d * sizeof(float);
     dgd_delta_norm_kernel<<<1, block_size, smem_bytes>>>(M, k, v, norm_out, d);
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// Per-head memory transpose kernels (Spec 45)
+// ══════════════════════════════════════════════════════════════════════
+
+// Transpose [bs, s, nh, hd] → [bs, nh, s, hd] (= [bs*nh, s, hd])
+// Used to split projected k/v/q from d_model into per-head layout before
+// passing to memory kernels.
+__global__ void transpose_heads_forward_kernel(
+    const float* __restrict__ in,   // [bs * s * nh * hd]
+    float* __restrict__ out,        // [bs * nh * s * hd]
+    int s, int nh, int hd)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = gridDim.x * blockDim.x;  // may overshoot — guard below
+    int d = nh * hd;
+    (void)0;  // grid.x covers nh*s*hd per batch
+    // Use grid-stride loop for large tensors
+    int n = s * d;  // elements per batch (grid.y = bs)
+    int b = blockIdx.y;
+    for (int i = idx; i < n; i += total) {
+        // Decode as [s, nh, hd] position
+        int j  = i % hd;
+        int h  = (i / hd) % nh;
+        int t  = i / (nh * hd);
+        // Output position: [nh, s, hd]
+        int out_idx = b * (nh * s * hd) + h * (s * hd) + t * hd + j;
+        int in_idx  = b * (s * d) + t * d + h * hd + j;
+        out[out_idx] = in[in_idx];
+    }
+}
+
+// Transpose [bs, nh, s, hd] → [bs, s, nh, hd] (= [bs*s, d])
+// Used to merge per-head output y back to d_model layout after memory kernels.
+__global__ void transpose_heads_backward_kernel(
+    const float* __restrict__ in,   // [bs * nh * s * hd]
+    float* __restrict__ out,        // [bs * s * nh * hd]
+    int s, int nh, int hd)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int d = nh * hd;
+    int n = s * d;
+    int b = blockIdx.y;
+    for (int i = idx; i < n; i += gridDim.x * blockDim.x) {
+        int j  = i % hd;
+        int h  = (i / hd) % nh;
+        int t  = i / (nh * hd);
+        int in_idx  = b * (nh * s * hd) + h * (s * hd) + t * hd + j;
+        int out_idx = b * (s * d) + t * d + h * hd + j;
+        out[out_idx] = in[in_idx];
+    }
+}
+
+extern "C" void transpose_heads_f32_cuda(
+    const float* in, float* out,
+    int bs, int s, int nh, int hd, int forward)
+{
+    int d = nh * hd;
+    int total_per_batch = s * d;
+    int block = 256;
+    int grid_x = (total_per_batch + block - 1) / block;
+    dim3 grid(grid_x, bs);
+    dim3 blk(block);
+    if (forward) {
+        transpose_heads_forward_kernel<<<grid, blk>>>(in, out, s, nh, hd);
+    } else {
+        transpose_heads_backward_kernel<<<grid, blk>>>(in, out, s, nh, hd);
+    }
+}
+
+// Broadcast [bs, s] → [bs * nh, s] by repeating each batch's values nh times.
+// Used to expand position-level gates (alpha, theta, eta) to per-head layout.
+__global__ void broadcast_heads_f32_kernel(
+    const float* __restrict__ in,   // [bs * s]
+    float* __restrict__ out,        // [bs * nh * s]
+    int s, int nh)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = gridDim.x * blockDim.x;
+    // grid.y = bs (one y-block per batch element)
+    // Flat index into output [bs * nh * s]
+    // Decode: which batch, which head, which position
+    for (int i = idx; i < nh * s; i += total) {
+        int t = i % s;
+        int h = i / s;
+        int b = blockIdx.y;
+        out[b * nh * s + h * s + t] = in[b * s + t];
+    }
+}
+
+extern "C" void broadcast_heads_f32_cuda(
+    const float* in, float* out,
+    int bs, int s, int nh)
+{
+    int total_per_batch = nh * s;
+    int block = 256;
+    int grid_x = (total_per_batch + block - 1) / block;
+    dim3 grid(grid_x, bs);
+    dim3 blk(block);
+    broadcast_heads_f32_kernel<<<grid, blk>>>(in, out, s, nh);
+}
+
+// Sum [bs * nh, s] → [bs, s] across the head dimension (backward of broadcast).
+// Each output element sums nh corresponding input elements.
+__global__ void sum_heads_f32_kernel(
+    const float* __restrict__ in,   // [bs * nh * s]
+    float* __restrict__ out,        // [bs * s]
+    int s, int nh)
+{
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    int b = blockIdx.y;
+    if (t < s) {
+        float acc = 0.0f;
+        for (int h = 0; h < nh; h++) {
+            acc += in[b * nh * s + h * s + t];
+        }
+        out[b * s + t] = acc;
+    }
+}
+
+extern "C" void sum_heads_f32_cuda(
+    const float* in, float* out,
+    int bs, int s, int nh)
+{
+    int block = 256;
+    int grid_x = (s + block - 1) / block;
+    dim3 grid(grid_x, bs);
+    dim3 blk(block);
+    sum_heads_f32_kernel<<<grid, blk>>>(in, out, s, nh);
+}

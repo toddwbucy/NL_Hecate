@@ -273,20 +273,23 @@ impl GpuMAGParams {
 
 /// Per-level M matrices resident on GPU. Persists across steps.
 ///
-/// With batch_size > 1 each level buffer holds [batch_size * d*d] floats:
-/// slot b's M matrix occupies bytes [b*d*d .. (b+1)*d*d] within the buffer.
+/// With batch_size > 1, each level buffer holds [batch_size * mem_dd] floats where
+/// mem_dd = num_heads * head_dim * head_dim. For per-head memory (num_heads > 1),
+/// the buffer is tightly packed: batch b, head h at offset (b*nh + h) * hd*hd.
 /// Slot 0 is the "primary" context used for checkpointing and inference.
-///
-/// For matrix rules (Delta/Titans/Hebbian): each level has batch_size * d*d floats.
 ///
 /// When `cuda_graph_warmup > 0`: also holds pre-allocated `ForwardScratch` and per-level
 /// `GpuLevelScratch` with fixed GPU addresses for CUDA graph capture/replay.
 #[cfg(feature = "cuda")]
 pub struct GpuContextState {
-    /// Per-level M matrices on GPU. Each is [batch_size * d*d].
+    /// Per-level M matrices on GPU. Each is [batch_size * mem_dd].
     pub memory: Vec<GpuBuf<f32>>,
     pub d: usize,
     pub batch_size: usize,
+    /// Number of memory heads (1 = monolithic d×d, >1 = per-head hd×hd).
+    pub num_heads: usize,
+    /// Per-head dimension (d / num_heads).
+    pub head_dim: usize,
     /// Pre-allocated forward buffers for CUDA graph capture (None when warmup_steps=0).
     pub forward_scratch: Option<crate::cuda_graph::ForwardScratch>,
     /// Pre-allocated per-level activation buffers for CUDA graph capture (empty when warmup_steps=0).
@@ -297,8 +300,16 @@ pub struct GpuContextState {
 
 #[cfg(feature = "cuda")]
 impl GpuContextState {
-    /// Initialize zero M matrices for k levels, each [batch_size * d*d].
+    /// Per-head M element count: num_heads * head_dim * head_dim.
+    /// For monolithic (nh=1): equals d*d. For per-head: equals d * head_dim.
+    #[inline]
+    pub fn mem_dd(&self) -> usize {
+        self.num_heads * self.head_dim * self.head_dim
+    }
+
+    /// Initialize zero M matrices for k levels, each [batch_size * mem_dd].
     ///
+    /// Extracts num_heads/head_dim from cfg (defaults to nh=1, hd=d when cfg is None).
     /// When `cuda_graph_warmup > 0`, also pre-allocates scratch buffers for all k levels
     /// and the forward pass. This adds persistent VRAM equal to ~one forward pass's
     /// intermediates — the same memory that would be dynamically allocated per step.
@@ -307,7 +318,9 @@ impl GpuContextState {
         cfg: Option<&crate::model::MAGConfig>,
         cuda_graph_warmup: usize,
     ) -> Self {
-        let memory = (0..k).map(|_| GpuBuf::zeros(batch_size * d * d)).collect();
+        let (nh, hd) = cfg.map_or((1, d), |c| (c.swa.num_heads, c.swa.head_dim));
+        let mem_dd = nh * hd * hd;
+        let memory = (0..k).map(|_| GpuBuf::zeros(batch_size * mem_dd)).collect();
         let (forward_scratch, level_scratch) = if cuda_graph_warmup > 0 {
             if let Some(cfg) = cfg {
                 let fwd = crate::cuda_graph::ForwardScratch::from_cfg(cfg, batch_size);
@@ -325,6 +338,8 @@ impl GpuContextState {
             memory,
             d,
             batch_size,
+            num_heads: nh,
+            head_dim: hd,
             forward_scratch,
             level_scratch,
             cuda_graph: crate::cuda_graph::CudaGraphStore::new(cuda_graph_warmup),
@@ -333,18 +348,19 @@ impl GpuContextState {
 
     /// Download slot-0 M to host ContextState (for checkpoint / inference).
     /// Only the primary context (slot 0) is exported — sufficient for restore.
+    /// Copies mem_dd = num_heads * head_dim^2 floats (all heads of batch 0).
     pub fn to_host(&self, k: usize) -> crate::conductor::ContextState {
-        let dd = self.d * self.d;
-        let mut ctx = crate::conductor::ContextState::new(k, self.d);
+        let mem_dd = self.mem_dd();
+        let mut ctx = crate::conductor::ContextState::new_with_memory_size(k, self.d, mem_dd);
         for (i, gpu_mem) in self.memory.iter().enumerate() {
-            // Copy only slot-0: first d*d floats of the [batch_size * d*d] buffer.
-            gpu_mem.slice(0, dd).copy_to_host(&mut ctx.memory[i]);
+            // Copy only slot-0: first mem_dd floats (all heads of batch element 0).
+            gpu_mem.slice(0, mem_dd).copy_to_host(&mut ctx.memory[i]);
         }
         ctx
     }
 
     /// Zero all memory matrices on GPU in-place (cudaMemset).
-    /// Zeros all batch_size * d*d floats per level.
+    /// Zeros all batch_size * mem_dd floats per level.
     /// Used at document boundaries — same semantics as ContextState::reset().
     pub fn reset(&mut self) {
         for buf in &self.memory {
@@ -367,11 +383,11 @@ impl GpuContextState {
     }
 
     /// Upload host M matrices into existing GPU buffers (in-place).
-    /// Broadcasts slot-0 to all batch slots. Preserves scratch/cuda_graph state.
+    /// Broadcasts slot-0 to all batch slots at mem_dd stride. Preserves scratch/cuda_graph state.
     /// Used by gpu_tape_forward_summary to restore context after diagnostic.
     pub fn upload_memory(&mut self, host: &crate::conductor::ContextState) {
-        let dd = self.d * self.d;
-        let bytes = dd * 4;
+        let mem_dd = self.mem_dd();
+        let bytes = mem_dd * 4;
         for (i, m) in host.memory.iter().enumerate() {
             let slot0 = GpuBuf::<f32>::from_host(m);
             for b in 0..self.batch_size {
@@ -390,12 +406,20 @@ impl GpuContextState {
     /// Upload from host ContextState and broadcast to all batch_size slots.
     /// Used for checkpoint restore: host M is written to every slot so all
     /// batch elements start from the same saved context.
-    pub fn from_host_context(host: &crate::conductor::ContextState, batch_size: usize) -> Self {
+    ///
+    /// `num_heads` and `head_dim` determine the per-slot M size (mem_dd = nh * hd * hd).
+    /// For monolithic models pass (1, d); for per-head pass the actual head config.
+    pub fn from_host_context(
+        host: &crate::conductor::ContextState,
+        batch_size: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> Self {
         let d = host.d;
-        let dd = d * d;
-        let bytes = dd * 4;
+        let mem_dd = num_heads * head_dim * head_dim;
+        let bytes = mem_dd * 4;
         let memory = host.memory.iter().map(|m| {
-            let buf = GpuBuf::<f32>::zeros(batch_size * dd);
+            let buf = GpuBuf::<f32>::zeros(batch_size * mem_dd);
             // Upload host M once, then D2D-copy to all slots.
             let slot0 = GpuBuf::<f32>::from_host(m);
             for b in 0..batch_size {
@@ -414,6 +438,8 @@ impl GpuContextState {
             memory,
             d,
             batch_size,
+            num_heads,
+            head_dim,
             forward_scratch: None,
             level_scratch: Vec::new(),
             cuda_graph: crate::cuda_graph::CudaGraphStore::new(0),
@@ -733,6 +759,8 @@ impl GpuStackedContext {
                 memory,
                 d: ctx.d,
                 batch_size: ctx.batch_size,
+                num_heads: ctx.num_heads,
+                head_dim: ctx.head_dim,
                 forward_scratch: None,
                 level_scratch: Vec::new(),
                 cuda_graph: crate::cuda_graph::CudaGraphStore::new(0),

@@ -468,27 +468,44 @@ pub(crate) fn gpu_memory_backward(
     batch_size: usize,
 ) -> GpuBuf<f32> {
     let dd = d * d;
-    let bsd = batch_size * s * d;
+    let _bsd = batch_size * s * d;
     let bs_s = batch_size * s;
+
+    // Spec 45: per-head memory dimensions
+    let nh = cfg.swa.num_heads;
+    let hd = cfg.swa.head_dim;
+    let dd_mem = hd * hd;
+    let bs_mem = batch_size * nh;
+    let bs_mem_s = bs_mem * s;
+    let bs_mem_d = bs_mem * s * hd;
 
     match mem_cache {
         GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states, k_norms, q_norms, proxy, .. } => {
-            let mut d_k_mem = GpuBuf::zeros(bsd);
-            let mut d_v_mem = GpuBuf::zeros(bsd);
-            let mut d_q_mem = GpuBuf::zeros(bsd);
-            let mut d_alpha = GpuBuf::zeros(bs_s);
-            let mut d_theta = GpuBuf::zeros(bs_s);
-            let mut d_m_initial = GpuBuf::zeros(dd);
+            // Spec 45: per-head backward
+            // Transpose cached d_model k/v/q and d_y to per-head layout
+            let d_y_ph = crate::gpu_forward::reshape_to_per_head(d_y, batch_size, s, nh, hd);
+            let k_mem_ph = crate::gpu_forward::reshape_to_per_head(k_mem, batch_size, s, nh, hd);
+            let v_mem_ph = crate::gpu_forward::reshape_to_per_head(v_mem, batch_size, s, nh, hd);
+            let q_mem_ph = crate::gpu_forward::reshape_to_per_head(q_mem, batch_size, s, nh, hd);
+            let alpha_ph = crate::gpu_forward::broadcast_gates(alpha, batch_size, s, nh);
+            let theta_ph = crate::gpu_forward::broadcast_gates(theta, batch_size, s, nh);
 
-            // Spec 27: proxy caches store only M_final — broadcast for backward kernel
+            let mut d_k_ph = GpuBuf::zeros(bs_mem_d);
+            let mut d_v_ph = GpuBuf::zeros(bs_mem_d);
+            let mut d_q_ph = GpuBuf::zeros(bs_mem_d);
+            let mut d_alpha_ph = GpuBuf::zeros(bs_mem_s);
+            let mut d_theta_ph = GpuBuf::zeros(bs_mem_s);
+            let mut d_m_initial = GpuBuf::zeros(dd_mem);
+
+            // m_states are already per-head layout from forward
             let m_for_bw = if *proxy {
-                let m_bcast = GpuBuf::zeros(batch_size * (s + 1) * dd);
+                let m_bcast = GpuBuf::zeros(bs_mem * (s + 1) * dd_mem);
                 unsafe {
                     let rc = crate::cuda_ffi::broadcast_fill_f32_cuda(
                         m_bcast.ptr(), m_states.as_ptr(),
-                        i32::try_from(dd).expect("dd overflows i32"),
+                        i32::try_from(dd_mem).expect("dd_mem overflows i32"),
                         i32::try_from(s + 1).expect("s+1 overflows i32"),
-                        i32::try_from(batch_size).expect("batch_size overflows i32"),
+                        i32::try_from(bs_mem).expect("bs_mem overflows i32"),
                     );
                     assert_eq!(rc, 0, "broadcast_fill_f32_cuda failed (rc={rc})");
                 }
@@ -498,13 +515,17 @@ pub(crate) fn gpu_memory_backward(
             };
 
             crate::dispatch::delta_backward_dd(
-                k_mem, v_mem, q_mem, alpha, theta,
-                &m_for_bw, d_y,
-                &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
-                &mut d_alpha, &mut d_theta, &mut d_m_initial,
-                s, d, batch_size,
+                &k_mem_ph, &v_mem_ph, &q_mem_ph, &alpha_ph, &theta_ph,
+                &m_for_bw, &d_y_ph,
+                &mut d_k_ph, &mut d_v_ph, &mut d_q_ph,
+                &mut d_alpha_ph, &mut d_theta_ph, &mut d_m_initial,
+                s, hd, bs_mem,
                 cfg.error_clip_for_level(level),
             );
+
+            // Sum per-head gate grads → d_model resolution
+            let d_alpha = crate::gpu_forward::sum_gates_across_heads(&d_alpha_ph, batch_size, s, nh);
+            let d_theta = crate::gpu_forward::sum_gates_across_heads(&d_theta_ph, batch_size, s, nh);
 
             // CS-39 straight-through: zero d_alpha where alpha was clamped.
             let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
@@ -528,6 +549,11 @@ pub(crate) fn gpu_memory_backward(
                 }
             }
 
+            // Transpose d_k/d_v/d_q back to d_model for projection grads
+            let d_k_mem = crate::gpu_forward::reshape_from_per_head(&d_k_ph, batch_size, s, nh, hd);
+            let d_v_mem = crate::gpu_forward::reshape_from_per_head(&d_v_ph, batch_size, s, nh, hd);
+            let d_q_mem = crate::gpu_forward::reshape_from_per_head(&d_q_ph, batch_size, s, nh, hd);
+
             accumulate_projection_grads(
                 level_params, embedded,
                 k_mem, v_mem, q_mem, alpha, Some(theta), None,
@@ -538,23 +564,32 @@ pub(crate) fn gpu_memory_backward(
             )
         }
         GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states, s_states, k_norms, q_norms, proxy, .. } => {
-            let mut d_k_mem = GpuBuf::zeros(bsd);
-            let mut d_v_mem = GpuBuf::zeros(bsd);
-            let mut d_q_mem = GpuBuf::zeros(bsd);
-            let mut d_alpha = GpuBuf::zeros(bs_s);
-            let mut d_theta = GpuBuf::zeros(bs_s);
-            let mut d_eta = GpuBuf::zeros(bs_s);
-            let mut d_m_initial = GpuBuf::zeros(dd);
-            let mut d_s_initial = GpuBuf::zeros(dd);
+            // Spec 45: per-head backward
+            let d_y_ph = crate::gpu_forward::reshape_to_per_head(d_y, batch_size, s, nh, hd);
+            let k_mem_ph = crate::gpu_forward::reshape_to_per_head(k_mem, batch_size, s, nh, hd);
+            let v_mem_ph = crate::gpu_forward::reshape_to_per_head(v_mem, batch_size, s, nh, hd);
+            let q_mem_ph = crate::gpu_forward::reshape_to_per_head(q_mem, batch_size, s, nh, hd);
+            let alpha_ph = crate::gpu_forward::broadcast_gates(alpha, batch_size, s, nh);
+            let theta_ph = crate::gpu_forward::broadcast_gates(theta, batch_size, s, nh);
+            let eta_ph = crate::gpu_forward::broadcast_gates(eta, batch_size, s, nh);
 
-            // Spec 27: proxy caches store only M_final/S_final — broadcast for backward kernel
+            let mut d_k_ph = GpuBuf::zeros(bs_mem_d);
+            let mut d_v_ph = GpuBuf::zeros(bs_mem_d);
+            let mut d_q_ph = GpuBuf::zeros(bs_mem_d);
+            let mut d_alpha_ph = GpuBuf::zeros(bs_mem_s);
+            let mut d_theta_ph = GpuBuf::zeros(bs_mem_s);
+            let mut d_eta_ph = GpuBuf::zeros(bs_mem_s);
+            let mut d_m_initial = GpuBuf::zeros(dd_mem);
+            let mut d_s_initial = GpuBuf::zeros(dd_mem);
+
+            // m_states/s_states are already per-head layout from forward
             let (m_for_bw, s_for_bw) = if *proxy {
-                let m_bcast = GpuBuf::zeros(batch_size * (s + 1) * dd);
-                let s_bcast = GpuBuf::zeros(batch_size * (s + 1) * dd);
+                let m_bcast = GpuBuf::zeros(bs_mem * (s + 1) * dd_mem);
+                let s_bcast = GpuBuf::zeros(bs_mem * (s + 1) * dd_mem);
                 unsafe {
-                    let dd_i32 = i32::try_from(dd).expect("dd overflows i32");
+                    let dd_i32 = i32::try_from(dd_mem).expect("dd_mem overflows i32");
                     let slots_i32 = i32::try_from(s + 1).expect("s+1 overflows i32");
-                    let bs_i32 = i32::try_from(batch_size).expect("batch_size overflows i32");
+                    let bs_i32 = i32::try_from(bs_mem).expect("bs_mem overflows i32");
                     let rc = crate::cuda_ffi::broadcast_fill_f32_cuda(
                         m_bcast.ptr(), m_states.as_ptr(),
                         dd_i32, slots_i32, bs_i32,
@@ -572,14 +607,19 @@ pub(crate) fn gpu_memory_backward(
             };
 
             crate::dispatch::titans_backward_dd(
-                k_mem, v_mem, q_mem, alpha, theta, eta,
-                &m_for_bw, &s_for_bw, d_y,
-                &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
-                &mut d_alpha, &mut d_theta, &mut d_eta,
+                &k_mem_ph, &v_mem_ph, &q_mem_ph, &alpha_ph, &theta_ph, &eta_ph,
+                &m_for_bw, &s_for_bw, &d_y_ph,
+                &mut d_k_ph, &mut d_v_ph, &mut d_q_ph,
+                &mut d_alpha_ph, &mut d_theta_ph, &mut d_eta_ph,
                 &mut d_m_initial, &mut d_s_initial,
-                s, d, batch_size,
+                s, hd, bs_mem,
                 cfg.error_clip_for_level(level),
             );
+
+            // Sum per-head gate grads → d_model resolution
+            let d_alpha = crate::gpu_forward::sum_gates_across_heads(&d_alpha_ph, batch_size, s, nh);
+            let d_theta = crate::gpu_forward::sum_gates_across_heads(&d_theta_ph, batch_size, s, nh);
+            let d_eta = crate::gpu_forward::sum_gates_across_heads(&d_eta_ph, batch_size, s, nh);
 
             // CS-39 straight-through: zero d_alpha where alpha was clamped.
             let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
@@ -602,6 +642,11 @@ pub(crate) fn gpu_memory_backward(
                     );
                 }
             }
+
+            // Transpose d_k/d_v/d_q back to d_model for projection grads
+            let d_k_mem = crate::gpu_forward::reshape_from_per_head(&d_k_ph, batch_size, s, nh, hd);
+            let d_v_mem = crate::gpu_forward::reshape_from_per_head(&d_v_ph, batch_size, s, nh, hd);
+            let d_q_mem = crate::gpu_forward::reshape_from_per_head(&d_q_ph, batch_size, s, nh, hd);
 
             accumulate_projection_grads(
                 level_params, embedded,
@@ -614,33 +659,43 @@ pub(crate) fn gpu_memory_backward(
         }
         // ── Chunkwise variants (spec 43 — frozen-M₀ backward) ──────────
         GpuMemoryCache::DeltaChunkwise { k_mem, v_mem, q_mem, alpha, theta, m_chunk_states, k_norms, q_norms, chunk_size, .. } => {
-            let mut d_k_mem = GpuBuf::zeros(bsd);
-            let mut d_v_mem = GpuBuf::zeros(bsd);
-            let mut d_q_mem = GpuBuf::zeros(bsd);
-            let mut d_alpha = GpuBuf::zeros(bs_s);
-            let mut d_theta = GpuBuf::zeros(bs_s);
-            let mut d_m_initial = GpuBuf::zeros(dd);
+            // Spec 45: per-head backward for chunkwise Delta
+            let d_y_ph = crate::gpu_forward::reshape_to_per_head(d_y, batch_size, s, nh, hd);
+            let k_mem_ph = crate::gpu_forward::reshape_to_per_head(k_mem, batch_size, s, nh, hd);
+            let v_mem_ph = crate::gpu_forward::reshape_to_per_head(v_mem, batch_size, s, nh, hd);
+            let q_mem_ph = crate::gpu_forward::reshape_to_per_head(q_mem, batch_size, s, nh, hd);
+            let alpha_ph = crate::gpu_forward::broadcast_gates(alpha, batch_size, s, nh);
+            let theta_ph = crate::gpu_forward::broadcast_gates(theta, batch_size, s, nh);
+
+            let mut d_k_ph = GpuBuf::zeros(bs_mem_d);
+            let mut d_v_ph = GpuBuf::zeros(bs_mem_d);
+            let mut d_q_ph = GpuBuf::zeros(bs_mem_d);
+            let mut d_alpha_ph = GpuBuf::zeros(bs_mem_s);
+            let mut d_theta_ph = GpuBuf::zeros(bs_mem_s);
+            let mut d_m_initial = GpuBuf::zeros(dd_mem);
 
             if *chunk_size > 1 {
-                // Spec 44: batched cuBLAS backward
                 crate::dispatch::delta_chunkwise_backward_batched_dd(
-                    k_mem, v_mem, q_mem, alpha, theta,
-                    m_chunk_states, d_y,
-                    &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
-                    &mut d_alpha, &mut d_theta, &mut d_m_initial,
-                    s, d, batch_size, *chunk_size,
+                    &k_mem_ph, &v_mem_ph, &q_mem_ph, &alpha_ph, &theta_ph,
+                    m_chunk_states, &d_y_ph,
+                    &mut d_k_ph, &mut d_v_ph, &mut d_q_ph,
+                    &mut d_alpha_ph, &mut d_theta_ph, &mut d_m_initial,
+                    s, hd, bs_mem, *chunk_size,
                     cfg.error_clip_for_level(level),
                 );
             } else {
                 crate::dispatch::delta_chunkwise_backward_dd(
-                    k_mem, v_mem, q_mem, alpha, theta,
-                    m_chunk_states, d_y,
-                    &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
-                    &mut d_alpha, &mut d_theta, &mut d_m_initial,
-                    s, d, batch_size, *chunk_size,
+                    &k_mem_ph, &v_mem_ph, &q_mem_ph, &alpha_ph, &theta_ph,
+                    m_chunk_states, &d_y_ph,
+                    &mut d_k_ph, &mut d_v_ph, &mut d_q_ph,
+                    &mut d_alpha_ph, &mut d_theta_ph, &mut d_m_initial,
+                    s, hd, bs_mem, *chunk_size,
                     cfg.error_clip_for_level(level),
                 );
             }
+
+            let d_alpha = crate::gpu_forward::sum_gates_across_heads(&d_alpha_ph, batch_size, s, nh);
+            let d_theta = crate::gpu_forward::sum_gates_across_heads(&d_theta_ph, batch_size, s, nh);
 
             let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
             let alpha_ceil  = cfg.alpha_ceil.get(level).copied().unwrap_or(1.0);
@@ -660,6 +715,10 @@ pub(crate) fn gpu_memory_backward(
                     );
                 }
             }
+
+            let d_k_mem = crate::gpu_forward::reshape_from_per_head(&d_k_ph, batch_size, s, nh, hd);
+            let d_v_mem = crate::gpu_forward::reshape_from_per_head(&d_v_ph, batch_size, s, nh, hd);
+            let d_q_mem = crate::gpu_forward::reshape_from_per_head(&d_q_ph, batch_size, s, nh, hd);
 
             accumulate_projection_grads(
                 level_params, embedded,
@@ -671,37 +730,49 @@ pub(crate) fn gpu_memory_backward(
             )
         }
         GpuMemoryCache::TitansChunkwise { k_mem, v_mem, q_mem, alpha, theta, eta, m_chunk_states, s_chunk_states, k_norms, q_norms, chunk_size, .. } => {
-            let mut d_k_mem = GpuBuf::zeros(bsd);
-            let mut d_v_mem = GpuBuf::zeros(bsd);
-            let mut d_q_mem = GpuBuf::zeros(bsd);
-            let mut d_alpha = GpuBuf::zeros(bs_s);
-            let mut d_theta = GpuBuf::zeros(bs_s);
-            let mut d_eta = GpuBuf::zeros(bs_s);
-            let mut d_m_initial = GpuBuf::zeros(dd);
-            let mut d_s_initial = GpuBuf::zeros(dd);
+            // Spec 45: per-head backward for chunkwise Titans
+            let d_y_ph = crate::gpu_forward::reshape_to_per_head(d_y, batch_size, s, nh, hd);
+            let k_mem_ph = crate::gpu_forward::reshape_to_per_head(k_mem, batch_size, s, nh, hd);
+            let v_mem_ph = crate::gpu_forward::reshape_to_per_head(v_mem, batch_size, s, nh, hd);
+            let q_mem_ph = crate::gpu_forward::reshape_to_per_head(q_mem, batch_size, s, nh, hd);
+            let alpha_ph = crate::gpu_forward::broadcast_gates(alpha, batch_size, s, nh);
+            let theta_ph = crate::gpu_forward::broadcast_gates(theta, batch_size, s, nh);
+            let eta_ph = crate::gpu_forward::broadcast_gates(eta, batch_size, s, nh);
+
+            let mut d_k_ph = GpuBuf::zeros(bs_mem_d);
+            let mut d_v_ph = GpuBuf::zeros(bs_mem_d);
+            let mut d_q_ph = GpuBuf::zeros(bs_mem_d);
+            let mut d_alpha_ph = GpuBuf::zeros(bs_mem_s);
+            let mut d_theta_ph = GpuBuf::zeros(bs_mem_s);
+            let mut d_eta_ph = GpuBuf::zeros(bs_mem_s);
+            let mut d_m_initial = GpuBuf::zeros(dd_mem);
+            let mut d_s_initial = GpuBuf::zeros(dd_mem);
 
             if *chunk_size > 1 {
-                // Spec 44: batched cuBLAS backward
                 crate::dispatch::titans_chunkwise_backward_batched_dd(
-                    k_mem, v_mem, q_mem, alpha, theta, eta,
-                    m_chunk_states, s_chunk_states, d_y,
-                    &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
-                    &mut d_alpha, &mut d_theta, &mut d_eta,
+                    &k_mem_ph, &v_mem_ph, &q_mem_ph, &alpha_ph, &theta_ph, &eta_ph,
+                    m_chunk_states, s_chunk_states, &d_y_ph,
+                    &mut d_k_ph, &mut d_v_ph, &mut d_q_ph,
+                    &mut d_alpha_ph, &mut d_theta_ph, &mut d_eta_ph,
                     &mut d_m_initial, &mut d_s_initial,
-                    s, d, batch_size, *chunk_size,
+                    s, hd, bs_mem, *chunk_size,
                     cfg.error_clip_for_level(level),
                 );
             } else {
                 crate::dispatch::titans_chunkwise_backward_dd(
-                    k_mem, v_mem, q_mem, alpha, theta, eta,
-                    m_chunk_states, s_chunk_states, d_y,
-                    &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
-                    &mut d_alpha, &mut d_theta, &mut d_eta,
+                    &k_mem_ph, &v_mem_ph, &q_mem_ph, &alpha_ph, &theta_ph, &eta_ph,
+                    m_chunk_states, s_chunk_states, &d_y_ph,
+                    &mut d_k_ph, &mut d_v_ph, &mut d_q_ph,
+                    &mut d_alpha_ph, &mut d_theta_ph, &mut d_eta_ph,
                     &mut d_m_initial, &mut d_s_initial,
-                    s, d, batch_size, *chunk_size,
+                    s, hd, bs_mem, *chunk_size,
                     cfg.error_clip_for_level(level),
                 );
             }
+
+            let d_alpha = crate::gpu_forward::sum_gates_across_heads(&d_alpha_ph, batch_size, s, nh);
+            let d_theta = crate::gpu_forward::sum_gates_across_heads(&d_theta_ph, batch_size, s, nh);
+            let d_eta = crate::gpu_forward::sum_gates_across_heads(&d_eta_ph, batch_size, s, nh);
 
             let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
             let alpha_ceil  = cfg.alpha_ceil.get(level).copied().unwrap_or(1.0);
@@ -722,6 +793,10 @@ pub(crate) fn gpu_memory_backward(
                 }
             }
 
+            let d_k_mem = crate::gpu_forward::reshape_from_per_head(&d_k_ph, batch_size, s, nh, hd);
+            let d_v_mem = crate::gpu_forward::reshape_from_per_head(&d_v_ph, batch_size, s, nh, hd);
+            let d_q_mem = crate::gpu_forward::reshape_from_per_head(&d_q_ph, batch_size, s, nh, hd);
+
             accumulate_projection_grads(
                 level_params, embedded,
                 k_mem, v_mem, q_mem, alpha, Some(theta), Some(eta),
@@ -732,21 +807,43 @@ pub(crate) fn gpu_memory_backward(
             )
         }
         GpuMemoryCache::Hebbian { k_mem, v_mem, q_mem, alpha, m_states, k_norms, q_norms } => {
-            // Hebbian kernels don't yet support batch_size > 1
             assert_eq!(batch_size, 1, "Hebbian batch_size > 1 not yet supported");
-            let sd = s * d;
-            let mut d_k_mem = GpuBuf::zeros(sd);
-            let mut d_v_mem = GpuBuf::zeros(sd);
-            let mut d_q_mem = GpuBuf::zeros(sd);
-            let mut d_alpha = GpuBuf::zeros(s);
-            let mut d_m_initial = GpuBuf::zeros(dd);
+            // Spec 45: per-head backward — loop over nh heads (hebbian is single-batch)
+            let d_y_ph = crate::gpu_forward::reshape_to_per_head(d_y, batch_size, s, nh, hd);
+            let k_mem_ph = crate::gpu_forward::reshape_to_per_head(k_mem, batch_size, s, nh, hd);
+            let v_mem_ph = crate::gpu_forward::reshape_to_per_head(v_mem, batch_size, s, nh, hd);
+            let q_mem_ph = crate::gpu_forward::reshape_to_per_head(q_mem, batch_size, s, nh, hd);
+            let alpha_ph = crate::gpu_forward::broadcast_gates(alpha, batch_size, s, nh);
 
-            crate::dispatch::hebbian_backward_dd(
-                k_mem, v_mem, q_mem, alpha, m_states, d_y,
-                &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
-                &mut d_alpha, &mut d_m_initial,
-                s, d,
-            );
+            let d_k_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s * hd);
+            let d_v_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s * hd);
+            let d_q_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s * hd);
+            let d_alpha_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s);
+            let d_m_initial: GpuBuf<f32> = GpuBuf::zeros(dd_mem);
+
+            for h in 0..nh {
+                unsafe {
+                    crate::cuda_ffi::hebbian_backward_f32_cuda(
+                        k_mem_ph.as_ptr().add(h * s * hd),
+                        v_mem_ph.as_ptr().add(h * s * hd),
+                        q_mem_ph.as_ptr().add(h * s * hd),
+                        alpha_ph.as_ptr().add(h * s),
+                        m_states.as_ptr().add(h * (s + 1) * dd_mem),
+                        d_y_ph.as_ptr().add(h * s * hd),
+                        d_k_ph.ptr().add(h * s * hd),
+                        d_v_ph.ptr().add(h * s * hd),
+                        d_q_ph.ptr().add(h * s * hd),
+                        d_alpha_ph.ptr().add(h * s),
+                        d_m_initial.ptr(),  // accumulate across heads (overwritten, not summed)
+                        s as i32, hd as i32,
+                    );
+                }
+            }
+
+            let d_alpha = crate::gpu_forward::sum_gates_across_heads(&d_alpha_ph, batch_size, s, nh);
+            let d_k_mem = crate::gpu_forward::reshape_from_per_head(&d_k_ph, batch_size, s, nh, hd);
+            let d_v_mem = crate::gpu_forward::reshape_from_per_head(&d_v_ph, batch_size, s, nh, hd);
+            let d_q_mem = crate::gpu_forward::reshape_from_per_head(&d_q_ph, batch_size, s, nh, hd);
 
             // Hebbian has no theta or eta — pass None
             accumulate_projection_grads(
@@ -759,11 +856,67 @@ pub(crate) fn gpu_memory_backward(
             )
         }
         // ── Checkpointed variants: segment-based backward ──────────
+        // Spec 45: per-head — loop over nh heads, call single-batch helper per head
         GpuMemoryCache::DeltaCkpt { k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, checkpoint_interval, k_norms, q_norms } => {
             let c = *checkpoint_interval;
-            let (d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta) =
-                delta_backward_checkpointed(k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, d_y, s, d, c, cfg.error_clip_for_level(level));
-            // CS-39 straight-through: zero d_alpha where alpha was clamped.
+            let d_y_ph = crate::gpu_forward::reshape_to_per_head(d_y, 1, s, nh, hd);
+            let k_mem_ph = crate::gpu_forward::reshape_to_per_head(k_mem, 1, s, nh, hd);
+            let v_mem_ph = crate::gpu_forward::reshape_to_per_head(v_mem, 1, s, nh, hd);
+            let q_mem_ph = crate::gpu_forward::reshape_to_per_head(q_mem, 1, s, nh, hd);
+            let alpha_ph = crate::gpu_forward::broadcast_gates(alpha, 1, s, nh);
+            let theta_ph = crate::gpu_forward::broadcast_gates(theta, 1, s, nh);
+
+            let num_ckpt = crate::gpu_forward::checkpoint_count(s, c);
+            let d_k_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s * hd);
+            let d_v_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s * hd);
+            let d_q_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s * hd);
+            let d_alpha_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s);
+            let d_theta_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s);
+
+            for h in 0..nh {
+                let off_shd = h * s * hd;
+                let off_s = h * s;
+                let off_ckpt = h * num_ckpt * dd_mem;
+                unsafe {
+                    let k_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(k_mem_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
+                    let v_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(v_mem_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
+                    let q_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(q_mem_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
+                    let a_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(alpha_ph.as_ptr().add(off_s) as *mut f32, s);
+                    let t_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(theta_ph.as_ptr().add(off_s) as *mut f32, s);
+                    let m_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(m_checkpoints.as_ptr().add(off_ckpt) as *mut f32, num_ckpt * dd_mem);
+                    let dy_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(d_y_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
+
+                    let (dk, dv, dq, da, dt) = delta_backward_checkpointed(
+                        &k_h, &v_h, &q_h, &a_h, &t_h, &m_h, &dy_h,
+                        s, hd, c, cfg.error_clip_for_level(level),
+                    );
+                    // Copy results into contiguous per-head buffers
+                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        d_k_ph.ptr().add(off_shd) as *mut std::ffi::c_void,
+                        dk.as_ptr() as *const std::ffi::c_void, s * hd * 4);
+                    assert_eq!(rc, 0);
+                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        d_v_ph.ptr().add(off_shd) as *mut std::ffi::c_void,
+                        dv.as_ptr() as *const std::ffi::c_void, s * hd * 4);
+                    assert_eq!(rc, 0);
+                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        d_q_ph.ptr().add(off_shd) as *mut std::ffi::c_void,
+                        dq.as_ptr() as *const std::ffi::c_void, s * hd * 4);
+                    assert_eq!(rc, 0);
+                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        d_alpha_ph.ptr().add(off_s) as *mut std::ffi::c_void,
+                        da.as_ptr() as *const std::ffi::c_void, s * 4);
+                    assert_eq!(rc, 0);
+                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        d_theta_ph.ptr().add(off_s) as *mut std::ffi::c_void,
+                        dt.as_ptr() as *const std::ffi::c_void, s * 4);
+                    assert_eq!(rc, 0);
+                }
+            }
+
+            let d_alpha = crate::gpu_forward::sum_gates_across_heads(&d_alpha_ph, 1, s, nh);
+            let d_theta = crate::gpu_forward::sum_gates_across_heads(&d_theta_ph, 1, s, nh);
+
             let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
             let alpha_ceil  = cfg.alpha_ceil.get(level).copied().unwrap_or(1.0);
             if alpha_floor > 0.0 || alpha_ceil < 1.0 {
@@ -773,7 +926,6 @@ pub(crate) fn gpu_memory_backward(
                     );
                 }
             }
-            // CS-39 straight-through: zero d_theta where theta was clamped.
             let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
             let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
             if theta_floor > 0.0 || theta_ceil < f32::MAX {
@@ -783,6 +935,11 @@ pub(crate) fn gpu_memory_backward(
                     );
                 }
             }
+
+            let d_k_mem = crate::gpu_forward::reshape_from_per_head(&d_k_ph, 1, s, nh, hd);
+            let d_v_mem = crate::gpu_forward::reshape_from_per_head(&d_v_ph, 1, s, nh, hd);
+            let d_q_mem = crate::gpu_forward::reshape_from_per_head(&d_q_ph, 1, s, nh, hd);
+
             accumulate_projection_grads(
                 level_params, embedded,
                 k_mem, v_mem, q_mem, alpha, Some(theta), None,
@@ -794,9 +951,72 @@ pub(crate) fn gpu_memory_backward(
         }
         GpuMemoryCache::TitansCkpt { k_mem, v_mem, q_mem, alpha, theta, eta, m_checkpoints, s_checkpoints, checkpoint_interval, k_norms, q_norms } => {
             let c = *checkpoint_interval;
-            let (d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta, d_eta) =
-                titans_backward_checkpointed(k_mem, v_mem, q_mem, alpha, theta, eta, m_checkpoints, s_checkpoints, d_y, s, d, c, cfg.error_clip_for_level(level));
-            // CS-39 straight-through: zero d_alpha where alpha was clamped.
+            let d_y_ph = crate::gpu_forward::reshape_to_per_head(d_y, 1, s, nh, hd);
+            let k_mem_ph = crate::gpu_forward::reshape_to_per_head(k_mem, 1, s, nh, hd);
+            let v_mem_ph = crate::gpu_forward::reshape_to_per_head(v_mem, 1, s, nh, hd);
+            let q_mem_ph = crate::gpu_forward::reshape_to_per_head(q_mem, 1, s, nh, hd);
+            let alpha_ph = crate::gpu_forward::broadcast_gates(alpha, 1, s, nh);
+            let theta_ph = crate::gpu_forward::broadcast_gates(theta, 1, s, nh);
+            let eta_ph = crate::gpu_forward::broadcast_gates(eta, 1, s, nh);
+
+            let num_ckpt = crate::gpu_forward::checkpoint_count(s, c);
+            let d_k_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s * hd);
+            let d_v_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s * hd);
+            let d_q_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s * hd);
+            let d_alpha_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s);
+            let d_theta_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s);
+            let d_eta_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s);
+
+            for h in 0..nh {
+                let off_shd = h * s * hd;
+                let off_s = h * s;
+                let off_ckpt = h * num_ckpt * dd_mem;
+                unsafe {
+                    let k_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(k_mem_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
+                    let v_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(v_mem_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
+                    let q_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(q_mem_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
+                    let a_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(alpha_ph.as_ptr().add(off_s) as *mut f32, s);
+                    let t_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(theta_ph.as_ptr().add(off_s) as *mut f32, s);
+                    let e_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(eta_ph.as_ptr().add(off_s) as *mut f32, s);
+                    let m_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(m_checkpoints.as_ptr().add(off_ckpt) as *mut f32, num_ckpt * dd_mem);
+                    let s_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(s_checkpoints.as_ptr().add(off_ckpt) as *mut f32, num_ckpt * dd_mem);
+                    let dy_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(d_y_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
+
+                    let (dk, dv, dq, da, dt, de) = titans_backward_checkpointed(
+                        &k_h, &v_h, &q_h, &a_h, &t_h, &e_h, &m_h, &s_h, &dy_h,
+                        s, hd, c, cfg.error_clip_for_level(level),
+                    );
+                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        d_k_ph.ptr().add(off_shd) as *mut std::ffi::c_void,
+                        dk.as_ptr() as *const std::ffi::c_void, s * hd * 4);
+                    assert_eq!(rc, 0);
+                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        d_v_ph.ptr().add(off_shd) as *mut std::ffi::c_void,
+                        dv.as_ptr() as *const std::ffi::c_void, s * hd * 4);
+                    assert_eq!(rc, 0);
+                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        d_q_ph.ptr().add(off_shd) as *mut std::ffi::c_void,
+                        dq.as_ptr() as *const std::ffi::c_void, s * hd * 4);
+                    assert_eq!(rc, 0);
+                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        d_alpha_ph.ptr().add(off_s) as *mut std::ffi::c_void,
+                        da.as_ptr() as *const std::ffi::c_void, s * 4);
+                    assert_eq!(rc, 0);
+                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        d_theta_ph.ptr().add(off_s) as *mut std::ffi::c_void,
+                        dt.as_ptr() as *const std::ffi::c_void, s * 4);
+                    assert_eq!(rc, 0);
+                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        d_eta_ph.ptr().add(off_s) as *mut std::ffi::c_void,
+                        de.as_ptr() as *const std::ffi::c_void, s * 4);
+                    assert_eq!(rc, 0);
+                }
+            }
+
+            let d_alpha = crate::gpu_forward::sum_gates_across_heads(&d_alpha_ph, 1, s, nh);
+            let d_theta = crate::gpu_forward::sum_gates_across_heads(&d_theta_ph, 1, s, nh);
+            let d_eta = crate::gpu_forward::sum_gates_across_heads(&d_eta_ph, 1, s, nh);
+
             let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
             let alpha_ceil  = cfg.alpha_ceil.get(level).copied().unwrap_or(1.0);
             if alpha_floor > 0.0 || alpha_ceil < 1.0 {
@@ -806,7 +1026,6 @@ pub(crate) fn gpu_memory_backward(
                     );
                 }
             }
-            // CS-39 straight-through: zero d_theta where theta was clamped.
             let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
             let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
             if theta_floor > 0.0 || theta_ceil < f32::MAX {
@@ -816,6 +1035,11 @@ pub(crate) fn gpu_memory_backward(
                     );
                 }
             }
+
+            let d_k_mem = crate::gpu_forward::reshape_from_per_head(&d_k_ph, 1, s, nh, hd);
+            let d_v_mem = crate::gpu_forward::reshape_from_per_head(&d_v_ph, 1, s, nh, hd);
+            let d_q_mem = crate::gpu_forward::reshape_from_per_head(&d_q_ph, 1, s, nh, hd);
+
             accumulate_projection_grads(
                 level_params, embedded,
                 k_mem, v_mem, q_mem, alpha, Some(theta), Some(eta),
@@ -827,8 +1051,57 @@ pub(crate) fn gpu_memory_backward(
         }
         GpuMemoryCache::HebbianCkpt { k_mem, v_mem, q_mem, alpha, m_checkpoints, checkpoint_interval, k_norms, q_norms } => {
             let c = *checkpoint_interval;
-            let (d_k_mem, d_v_mem, d_q_mem, d_alpha) =
-                hebbian_backward_checkpointed(k_mem, v_mem, q_mem, alpha, m_checkpoints, d_y, s, d, c);
+            let d_y_ph = crate::gpu_forward::reshape_to_per_head(d_y, 1, s, nh, hd);
+            let k_mem_ph = crate::gpu_forward::reshape_to_per_head(k_mem, 1, s, nh, hd);
+            let v_mem_ph = crate::gpu_forward::reshape_to_per_head(v_mem, 1, s, nh, hd);
+            let q_mem_ph = crate::gpu_forward::reshape_to_per_head(q_mem, 1, s, nh, hd);
+            let alpha_ph = crate::gpu_forward::broadcast_gates(alpha, 1, s, nh);
+
+            let num_ckpt = crate::gpu_forward::checkpoint_count(s, c);
+            let d_k_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s * hd);
+            let d_v_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s * hd);
+            let d_q_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s * hd);
+            let d_alpha_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s);
+
+            for h in 0..nh {
+                let off_shd = h * s * hd;
+                let off_s = h * s;
+                let off_ckpt = h * num_ckpt * dd_mem;
+                unsafe {
+                    let k_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(k_mem_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
+                    let v_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(v_mem_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
+                    let q_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(q_mem_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
+                    let a_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(alpha_ph.as_ptr().add(off_s) as *mut f32, s);
+                    let m_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(m_checkpoints.as_ptr().add(off_ckpt) as *mut f32, num_ckpt * dd_mem);
+                    let dy_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(d_y_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
+
+                    let (dk, dv, dq, da) = hebbian_backward_checkpointed(
+                        &k_h, &v_h, &q_h, &a_h, &m_h, &dy_h, s, hd, c,
+                    );
+                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        d_k_ph.ptr().add(off_shd) as *mut std::ffi::c_void,
+                        dk.as_ptr() as *const std::ffi::c_void, s * hd * 4);
+                    assert_eq!(rc, 0);
+                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        d_v_ph.ptr().add(off_shd) as *mut std::ffi::c_void,
+                        dv.as_ptr() as *const std::ffi::c_void, s * hd * 4);
+                    assert_eq!(rc, 0);
+                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        d_q_ph.ptr().add(off_shd) as *mut std::ffi::c_void,
+                        dq.as_ptr() as *const std::ffi::c_void, s * hd * 4);
+                    assert_eq!(rc, 0);
+                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        d_alpha_ph.ptr().add(off_s) as *mut std::ffi::c_void,
+                        da.as_ptr() as *const std::ffi::c_void, s * 4);
+                    assert_eq!(rc, 0);
+                }
+            }
+
+            let d_alpha = crate::gpu_forward::sum_gates_across_heads(&d_alpha_ph, 1, s, nh);
+            let d_k_mem = crate::gpu_forward::reshape_from_per_head(&d_k_ph, 1, s, nh, hd);
+            let d_v_mem = crate::gpu_forward::reshape_from_per_head(&d_v_ph, 1, s, nh, hd);
+            let d_q_mem = crate::gpu_forward::reshape_from_per_head(&d_q_ph, 1, s, nh, hd);
+
             accumulate_projection_grads(
                 level_params, embedded,
                 k_mem, v_mem, q_mem, alpha, None, None,
@@ -840,23 +1113,33 @@ pub(crate) fn gpu_memory_backward(
         }
         // ── DGD: same structure as Delta (uses delta_backward kernels) ──
         GpuMemoryCache::DGD { k_mem, v_mem, q_mem, alpha, theta, m_states, k_norms, q_norms } => {
-            let mut d_k_mem = GpuBuf::zeros(bsd);
-            let mut d_v_mem = GpuBuf::zeros(bsd);
-            let mut d_q_mem = GpuBuf::zeros(bsd);
-            let mut d_alpha = GpuBuf::zeros(bs_s);
-            let mut d_theta = GpuBuf::zeros(bs_s);
-            let mut d_m_initial = GpuBuf::zeros(dd);
+            // Spec 45: per-head backward (DGD uses delta backward kernels)
+            let d_y_ph = crate::gpu_forward::reshape_to_per_head(d_y, batch_size, s, nh, hd);
+            let k_mem_ph = crate::gpu_forward::reshape_to_per_head(k_mem, batch_size, s, nh, hd);
+            let v_mem_ph = crate::gpu_forward::reshape_to_per_head(v_mem, batch_size, s, nh, hd);
+            let q_mem_ph = crate::gpu_forward::reshape_to_per_head(q_mem, batch_size, s, nh, hd);
+            let alpha_ph = crate::gpu_forward::broadcast_gates(alpha, batch_size, s, nh);
+            let theta_ph = crate::gpu_forward::broadcast_gates(theta, batch_size, s, nh);
+
+            let mut d_k_ph = GpuBuf::zeros(bs_mem_d);
+            let mut d_v_ph = GpuBuf::zeros(bs_mem_d);
+            let mut d_q_ph = GpuBuf::zeros(bs_mem_d);
+            let mut d_alpha_ph = GpuBuf::zeros(bs_mem_s);
+            let mut d_theta_ph = GpuBuf::zeros(bs_mem_s);
+            let mut d_m_initial = GpuBuf::zeros(dd_mem);
 
             crate::dispatch::delta_backward_dd(
-                k_mem, v_mem, q_mem, alpha, theta,
-                m_states, d_y,
-                &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
-                &mut d_alpha, &mut d_theta, &mut d_m_initial,
-                s, d, batch_size,
+                &k_mem_ph, &v_mem_ph, &q_mem_ph, &alpha_ph, &theta_ph,
+                m_states, &d_y_ph,
+                &mut d_k_ph, &mut d_v_ph, &mut d_q_ph,
+                &mut d_alpha_ph, &mut d_theta_ph, &mut d_m_initial,
+                s, hd, bs_mem,
                 cfg.error_clip_for_level(level),
             );
 
-            // CS-39 straight-through: zero d_alpha where alpha was clamped.
+            let d_alpha = crate::gpu_forward::sum_gates_across_heads(&d_alpha_ph, batch_size, s, nh);
+            let d_theta = crate::gpu_forward::sum_gates_across_heads(&d_theta_ph, batch_size, s, nh);
+
             let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
             let alpha_ceil  = cfg.alpha_ceil.get(level).copied().unwrap_or(1.0);
             if alpha_floor > 0.0 || alpha_ceil < 1.0 {
@@ -866,8 +1149,6 @@ pub(crate) fn gpu_memory_backward(
                     );
                 }
             }
-
-            // CS-39 straight-through: zero d_theta where theta was clamped.
             let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
             let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
             if theta_floor > 0.0 || theta_ceil < f32::MAX {
@@ -877,6 +1158,10 @@ pub(crate) fn gpu_memory_backward(
                     );
                 }
             }
+
+            let d_k_mem = crate::gpu_forward::reshape_from_per_head(&d_k_ph, batch_size, s, nh, hd);
+            let d_v_mem = crate::gpu_forward::reshape_from_per_head(&d_v_ph, batch_size, s, nh, hd);
+            let d_q_mem = crate::gpu_forward::reshape_from_per_head(&d_q_ph, batch_size, s, nh, hd);
 
             accumulate_projection_grads(
                 level_params, embedded,
@@ -889,9 +1174,64 @@ pub(crate) fn gpu_memory_backward(
         }
         GpuMemoryCache::DGDCkpt { k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, checkpoint_interval, k_norms, q_norms } => {
             let c = *checkpoint_interval;
-            let (d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta) =
-                delta_backward_checkpointed(k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, d_y, s, d, c, cfg.error_clip_for_level(level));
-            // CS-39 straight-through: zero d_alpha where alpha was clamped.
+            // Spec 45: per-head — loop over nh heads
+            let d_y_ph = crate::gpu_forward::reshape_to_per_head(d_y, 1, s, nh, hd);
+            let k_mem_ph = crate::gpu_forward::reshape_to_per_head(k_mem, 1, s, nh, hd);
+            let v_mem_ph = crate::gpu_forward::reshape_to_per_head(v_mem, 1, s, nh, hd);
+            let q_mem_ph = crate::gpu_forward::reshape_to_per_head(q_mem, 1, s, nh, hd);
+            let alpha_ph = crate::gpu_forward::broadcast_gates(alpha, 1, s, nh);
+            let theta_ph = crate::gpu_forward::broadcast_gates(theta, 1, s, nh);
+
+            let num_ckpt = crate::gpu_forward::checkpoint_count(s, c);
+            let d_k_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s * hd);
+            let d_v_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s * hd);
+            let d_q_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s * hd);
+            let d_alpha_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s);
+            let d_theta_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s);
+
+            for h in 0..nh {
+                let off_shd = h * s * hd;
+                let off_s = h * s;
+                let off_ckpt = h * num_ckpt * dd_mem;
+                unsafe {
+                    let k_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(k_mem_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
+                    let v_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(v_mem_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
+                    let q_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(q_mem_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
+                    let a_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(alpha_ph.as_ptr().add(off_s) as *mut f32, s);
+                    let t_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(theta_ph.as_ptr().add(off_s) as *mut f32, s);
+                    let m_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(m_checkpoints.as_ptr().add(off_ckpt) as *mut f32, num_ckpt * dd_mem);
+                    let dy_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(d_y_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
+
+                    let (dk, dv, dq, da, dt) = delta_backward_checkpointed(
+                        &k_h, &v_h, &q_h, &a_h, &t_h, &m_h, &dy_h,
+                        s, hd, c, cfg.error_clip_for_level(level),
+                    );
+                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        d_k_ph.ptr().add(off_shd) as *mut std::ffi::c_void,
+                        dk.as_ptr() as *const std::ffi::c_void, s * hd * 4);
+                    assert_eq!(rc, 0);
+                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        d_v_ph.ptr().add(off_shd) as *mut std::ffi::c_void,
+                        dv.as_ptr() as *const std::ffi::c_void, s * hd * 4);
+                    assert_eq!(rc, 0);
+                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        d_q_ph.ptr().add(off_shd) as *mut std::ffi::c_void,
+                        dq.as_ptr() as *const std::ffi::c_void, s * hd * 4);
+                    assert_eq!(rc, 0);
+                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        d_alpha_ph.ptr().add(off_s) as *mut std::ffi::c_void,
+                        da.as_ptr() as *const std::ffi::c_void, s * 4);
+                    assert_eq!(rc, 0);
+                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        d_theta_ph.ptr().add(off_s) as *mut std::ffi::c_void,
+                        dt.as_ptr() as *const std::ffi::c_void, s * 4);
+                    assert_eq!(rc, 0);
+                }
+            }
+
+            let d_alpha = crate::gpu_forward::sum_gates_across_heads(&d_alpha_ph, 1, s, nh);
+            let d_theta = crate::gpu_forward::sum_gates_across_heads(&d_theta_ph, 1, s, nh);
+
             let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
             let alpha_ceil  = cfg.alpha_ceil.get(level).copied().unwrap_or(1.0);
             if alpha_floor > 0.0 || alpha_ceil < 1.0 {
@@ -901,7 +1241,6 @@ pub(crate) fn gpu_memory_backward(
                     );
                 }
             }
-            // CS-39 straight-through: zero d_theta where theta was clamped.
             let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
             let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
             if theta_floor > 0.0 || theta_ceil < f32::MAX {
@@ -911,6 +1250,11 @@ pub(crate) fn gpu_memory_backward(
                     );
                 }
             }
+
+            let d_k_mem = crate::gpu_forward::reshape_from_per_head(&d_k_ph, 1, s, nh, hd);
+            let d_v_mem = crate::gpu_forward::reshape_from_per_head(&d_v_ph, 1, s, nh, hd);
+            let d_q_mem = crate::gpu_forward::reshape_from_per_head(&d_q_ph, 1, s, nh, hd);
+
             accumulate_projection_grads(
                 level_params, embedded,
                 k_mem, v_mem, q_mem, alpha, Some(theta), None,
