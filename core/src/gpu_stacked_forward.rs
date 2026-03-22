@@ -37,8 +37,8 @@ static DEBUG_CMS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
 #[cfg(feature = "cuda")]
 use std::sync::Mutex;
 #[cfg(feature = "cuda")]
-static LAST_CMS_PATTERN: std::sync::LazyLock<Mutex<Vec<bool>>> =
-    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+static LAST_CMS_PATTERN: std::sync::LazyLock<Mutex<(Vec<bool>, usize)>> =
+    std::sync::LazyLock::new(|| Mutex::new((Vec::new(), 0)));
 
 // ══════════════════════════════════════════════════════════════════════
 // GpuStackedBlockCache — per-block forward activations
@@ -324,22 +324,27 @@ pub fn gpu_stacked_forward(
             .collect();
         let is_chained = matches!(cfg.hope_variant, HopeVariant::Chained | HopeVariant::Sequential);
 
-        // Debug: log CMS dispatch only when the active-level pattern changes
+        // Debug: log CMS dispatch only when the active-level pattern changes.
+        // Suppress output when global_step regresses (e.g. coherence probe resets
+        // the Conductor to step 0 — that's a separate inference context, not training).
         if *DEBUG_CMS && b == 0 {
             let current: Vec<bool> = (0..cfg.k).map(|l| {
                 pulse.active_levels[l] || matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp)
             }).collect();
+            let step = pulse.global_step;
             let changed = {
-                let prev = LAST_CMS_PATTERN.lock().unwrap();
-                *prev != current
+                let guard = LAST_CMS_PATTERN.lock().unwrap();
+                let (ref prev_pattern, prev_step) = *guard;
+                // Only print if step advances AND pattern changed
+                step >= prev_step && *prev_pattern != current
             };
             if changed {
                 eprintln!("[CMS] step={} k={} level_seq_lens={:?} active={:?}",
-                    pulse.global_step, cfg.k, level_seq_lens,
+                    step, cfg.k, level_seq_lens,
                     current.iter().enumerate()
                         .map(|(l, &a)| format!("L{}:{}", l, if a { "fwd" } else { "ro" }))
                         .collect::<Vec<_>>().join(" "));
-                *LAST_CMS_PATTERN.lock().unwrap() = current;
+                *LAST_CMS_PATTERN.lock().unwrap() = (current, step);
             }
         }
 
@@ -653,6 +658,8 @@ pub struct StackedDecodeWorkspace {
     pub ln_final_rstd: GpuBuf<f32>,
     /// Logits [vocab_size] on GPU.
     pub logits_gpu: GpuBuf<f32>,
+    /// Inter-block residual stream [d] — avoids per-token cudaMalloc.
+    pub residual: GpuBuf<f32>,
 }
 
 /// Per-block buffers for single-token decode.
@@ -675,6 +682,8 @@ pub struct BlockDecodeBuffers {
     pub y_combined: GpuBuf<f32>,      // [d]
     pub gate: GpuBuf<f32>,            // [d]
     pub gated_out: GpuBuf<f32>,       // [d]
+    pub residual_out: GpuBuf<f32>,    // [d] — output residual (avoids per-token cudaMalloc)
+    pub chain_h: GpuBuf<f32>,         // [d] — scratch for chained CMS level input
 }
 
 #[cfg(feature = "cuda")]
@@ -699,6 +708,8 @@ impl StackedDecodeWorkspace {
             y_combined: GpuBuf::zeros(d),
             gate: GpuBuf::zeros(d),
             gated_out: GpuBuf::zeros(d),
+            residual_out: GpuBuf::zeros(d),
+            chain_h: GpuBuf::zeros(d),
         }).collect();
 
         StackedDecodeWorkspace {
@@ -708,6 +719,7 @@ impl StackedDecodeWorkspace {
             ln_final_mean: GpuBuf::zeros(1),
             ln_final_rstd: GpuBuf::zeros(1),
             logits_gpu: GpuBuf::zeros(v),
+            residual: GpuBuf::zeros(d),
         }
     }
 }
@@ -748,9 +760,11 @@ pub fn gpu_stacked_prefill(
     // Extract K/V projections from each block's cache into KV caches.
     // block_caches[b].k_f32 is [seq_len, d] — exactly what the cache needs.
     kv_caches.clear();
+    let window = cfg.swa.window_size;
+    let kv_capacity = std::cmp::max(s + 1024, window + 1024);
     for bc in &cache.block_caches {
         let mut kv = crate::gpu_forward::GpuKVCache::new(
-            s + 1024,  // capacity: seq_len + room for decode tokens
+            kv_capacity,  // capacity: max(seq_len, window_size) + room for decode tokens
             d,
             s,  // scratch for prefill-sized append
         );
@@ -811,13 +825,13 @@ pub fn gpu_stacked_decode_token(
         assert_eq!(rc, 0);
     }
 
-    // Gather embedding for 1 token
-    let mut residual = GpuBuf::<f32>::zeros(d);
+    // Gather embedding for 1 token into workspace residual (no allocation)
+    ws.residual.zero();
     unsafe {
         crate::cuda_ffi::embedding_gather_cuda(
             params.w_embed.as_ptr(),
             ws.d_input.ptr() as *const i32,
-            residual.ptr(),
+            ws.residual.ptr(),
             1, d_i32,
         );
     }
@@ -832,12 +846,12 @@ pub fn gpu_stacked_decode_token(
         let bws = &mut ws.per_block[b];
 
         // Save block input for residual
-        let block_input_ptr = residual.as_ptr();
+        let block_input_ptr = ws.residual.as_ptr();
 
         // ── LN_attn ────────────────────────────────────────────────
         unsafe {
             crate::cuda_ffi::layer_norm_forward_cuda(
-                residual.as_ptr(),
+                ws.residual.as_ptr(),
                 block.ln_attn_gamma.as_ptr(),
                 block.ln_attn_beta.as_ptr(),
                 bws.ln_attn_out.ptr(), bws.ln_attn_mean.ptr(), bws.ln_attn_rstd.ptr(),
@@ -888,25 +902,32 @@ pub fn gpu_stacked_decode_token(
         }
 
         // ── CMS memory per level (s=1, no pooling) ─────────────────
+        // Note: at s=1, gpu_memory_forward and gpu_tnt_forward produce identical
+        // results (TNT chunkwise with C=1 chunk of 1 token = standard memory update).
+        // Using gpu_memory_forward unconditionally is CS-10 compliant.
         let mut y_per_level: Vec<GpuBuf<f32>> = Vec::with_capacity(cfg.k);
 
         if is_chained {
-            // Chain mode: each level processes previous level's output
-            let mut h = bws.ln_mem_out.clone_buf();
+            // Chain mode: each level processes previous level's output.
+            // Copy ln_mem_out into workspace chain_h to avoid clone allocation.
+            bws.chain_h.zero();
+            unsafe {
+                crate::cuda_ffi::saxpy_cuda(1.0, bws.ln_mem_out.as_ptr(), bws.chain_h.ptr(), d_i32);
+            }
             for level in 0..cfg.k {
                 let effective_active = pulse.active_levels[level]
                     || matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp);
 
                 if effective_active {
                     let (y_level, _mem_cache) = gpu_memory_forward(
-                        &block.levels[level], cfg, &h,
+                        &block.levels[level], cfg, &bws.chain_h,
                         &mut block_ctx.memory[level],
                         1, d, level, 1,
                     );
                     y_per_level.push(y_level);
                 } else {
                     let y_level = gpu_memory_read_only(
-                        &block.levels[level], &h,
+                        &block.levels[level], &bws.chain_h,
                         &block_ctx.memory[level],
                         1, d, nh, hd,
                     );
@@ -914,7 +935,10 @@ pub fn gpu_stacked_decode_token(
                 }
                 // Chain: next level's input is this level's output
                 if level < cfg.k - 1 {
-                    h = y_per_level[level].clone_buf();
+                    bws.chain_h.zero();
+                    unsafe {
+                        crate::cuda_ffi::saxpy_cuda(1.0, y_per_level[level].as_ptr(), bws.chain_h.ptr(), d_i32);
+                    }
                 }
             }
         } else {
@@ -967,19 +991,23 @@ pub fn gpu_stacked_decode_token(
             crate::cuda_ffi::elemwise_mul_cuda(bws.attn_proj.as_ptr(), bws.gate.as_ptr(), bws.gated_out.ptr(), d_i32);
         }
 
-        // ── Residual skip 2 ────────────────────────────────────────
-        let new_residual = GpuBuf::<f32>::zeros(d);
+        // ── Residual skip 2 (write into workspace buffer, then swap) ─
+        bws.residual_out.zero();
         unsafe {
-            crate::cuda_ffi::saxpy_cuda(1.0, block_input_ptr, new_residual.ptr(), d_i32);
-            crate::cuda_ffi::saxpy_cuda(1.0, bws.gated_out.as_ptr(), new_residual.ptr(), d_i32);
+            crate::cuda_ffi::saxpy_cuda(1.0, block_input_ptr, bws.residual_out.ptr(), d_i32);
+            crate::cuda_ffi::saxpy_cuda(1.0, bws.gated_out.as_ptr(), bws.residual_out.ptr(), d_i32);
         }
-        residual = new_residual;
+        // Copy block output into ws.residual for next block's input
+        ws.residual.zero();
+        unsafe {
+            crate::cuda_ffi::saxpy_cuda(1.0, bws.residual_out.as_ptr(), ws.residual.ptr(), d_i32);
+        }
     }
 
     // ── Final LN ───────────────────────────────────────────────────
     unsafe {
         crate::cuda_ffi::layer_norm_forward_cuda(
-            residual.as_ptr(),
+            ws.residual.as_ptr(),
             params.ln_final_gamma.as_ptr(),
             params.ln_final_beta.as_ptr(),
             ws.ln_final_out.ptr(), ws.ln_final_mean.ptr(), ws.ln_final_rstd.ptr(),

@@ -3223,6 +3223,10 @@ impl GpuStackedModel {
         let s = self.cfg.swa.seq_len;
         let v = self.cfg.swa.vocab_size;
         let d = self.cfg.swa.d_model;
+        if self.context.batch_size != 1 {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                format!("prefill/decode_token only supports batch_size=1 (got {})", self.context.batch_size)));
+        }
         if input_ids.len() != s {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 format!("input_ids length {} != seq_len {}", input_ids.len(), s)));

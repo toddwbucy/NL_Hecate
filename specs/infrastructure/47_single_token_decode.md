@@ -131,11 +131,12 @@ For each block b in 0..n_blocks:
          - Returns y_level [1, d]
 
   10. Composition (MAG gate):
-      y_mem = weighted_sum(y_per_level) or chain output
-      y_combined = alpha_gate * y_mem + (1 - alpha_gate) * attn_out
-      (Same MAG gating as training forward)
+      y_combined = weighted_sum(y_per_level) or last chain output
+      gate = sigmoid(y_combined)
+      gated_out = attn_proj * gate
+      (Same MAG sigmoid gating as training forward — NOT a blend)
 
-  11. Residual skip 2: x_t = x_t + y_combined
+  11. Residual skip 2: x_t = block_input + gated_out
       → This becomes the input to block b+1
 
 After all blocks:
@@ -155,7 +156,7 @@ The Conductor advances per decode token. CMS levels fire at their normal frequen
 This is identical to training. No special handling needed.
 
 **Critical: at decode time, s=1 for ALL levels regardless of token reduction.**
-Token reduction (spec 46) reduces s_f = s / chunk_sizes[level]. When s=1, s_f=1 for all levels (since 1/C rounds to 1 for the minimum). No pooling/upsampling occurs during decode — each level processes the single token directly.
+Token reduction (spec 46) reduces s_f = s / chunk_sizes[level]. When s=1, integer division 1/C = 0 for C > 1, so the implementation clamps s_f = max(1, s / chunk_sizes[level]). This is a decode-specific floor: every level always processes at least 1 token. No pooling/upsampling occurs during decode — each level processes the single token directly.
 
 ### Chain Mode at Decode
 

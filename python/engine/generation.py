@@ -282,6 +282,9 @@ def generate_stacked(
 
     safe_pad = _safe_pad_token(prompt_tokens, vocab)
 
+    if max_tokens <= 0:
+        return seq
+
     try:
         # ── Prefill: process full prompt ──────────────────────────────
         ctx = list(prompt_tokens[-seq_len:])
