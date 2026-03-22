@@ -262,10 +262,15 @@ def generate_stacked(
     conductor=None,
 ) -> list[int]:
     """
-    Autoregressive generation using GpuStackedModel.forward().
+    Autoregressive generation using GpuStackedModel with prefill/decode_token.
 
-    Uses full forward pass per token (no KV cache). Slower than cached decode
-    but works with multi-block stacked models that don't have prefill/decode_token.
+    Uses single-token decode path (spec 47): one prefill call processes the full
+    prompt and populates per-block KV caches, then each subsequent token runs
+    through the O(d^2) decode path instead of O(seq_len * d^2) full forward.
+
+    The memory state M is already accumulated during prefill — decode_token reads
+    it for gating without re-running the full sequence. CS-10 compliant: same
+    forward math, just s=1.
     """
     seq = list(prompt_tokens)
     vocab = cfg.vocab_size
@@ -278,27 +283,33 @@ def generate_stacked(
     safe_pad = _safe_pad_token(prompt_tokens, vocab)
 
     try:
-        for _ in range(max_tokens):
-            # Take last seq_len tokens as context window
-            ctx = seq[-seq_len:]
-            while len(ctx) < seq_len:
-                ctx = [safe_pad, *ctx]
+        # ── Prefill: process full prompt ──────────────────────────────
+        ctx = list(prompt_tokens[-seq_len:])
+        while len(ctx) < seq_len:
+            ctx = [safe_pad, *ctx]
 
-            # Forward pass — target_ids = shifted input (dummy for loss, we want logits)
-            target = ctx[1:] + [safe_pad]
+        pulse = conductor.pulse()
+        last_logits = gpu_model.prefill(ctx, pulse)
+        conductor.advance()
+
+        # Sample first token from prefill logits
+        next_tok = _sample_token(last_logits, vocab, temperature, top_k)
+        if stop_token is not None and next_tok == stop_token:
+            return seq
+        seq.append(next_tok)
+
+        # ── Decode: one token at a time ───────────────────────────────
+        for _ in range(max_tokens - 1):
             pulse = conductor.pulse()
-            _loss, logits_flat = gpu_model.forward(ctx, target, pulse)
+            logits = gpu_model.decode_token(next_tok, pulse)
             conductor.advance()
 
-            # Extract last-position logits
-            last_logits = logits_flat[(seq_len - 1) * vocab: seq_len * vocab]
-            next_tok = _sample_token(last_logits, vocab, temperature, top_k)
-
+            next_tok = _sample_token(logits, vocab, temperature, top_k)
             if stop_token is not None and next_tok == stop_token:
                 break
-
             seq.append(next_tok)
     finally:
+        gpu_model.reset_cache()
         gpu_model.reset_context()
 
     return seq
@@ -345,7 +356,7 @@ def generate(
         )
         return seq
 
-    # Stacked models use forward()-based generation
+    # Stacked models use prefill/decode_token path (spec 47)
     if gpu_model is not None and is_stacked:
         return generate_stacked(
             gpu_model, cfg, prompt_tokens, max_tokens,

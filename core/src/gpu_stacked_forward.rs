@@ -634,6 +634,370 @@ pub fn gpu_stacked_forward(
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// Stacked decode workspace — pre-allocated GPU buffers for single-token decode
+// ══════════════════════════════════════════════════════════════════════
+
+/// Pre-allocated GPU workspace for `gpu_stacked_decode_token`.
+/// Created once at prefill, reused for every decode call (zero cudaMalloc per token).
+///
+/// Spec: specs/infrastructure/47_single_token_decode.md
+#[cfg(feature = "cuda")]
+pub struct StackedDecodeWorkspace {
+    /// Token ID upload buffer [1].
+    pub d_input: GpuBuf<f32>,
+    /// Per-block decode scratch (one per block). Reused each call.
+    pub per_block: Vec<BlockDecodeBuffers>,
+    /// Final LN output [1, d].
+    pub ln_final_out: GpuBuf<f32>,
+    pub ln_final_mean: GpuBuf<f32>,
+    pub ln_final_rstd: GpuBuf<f32>,
+    /// Logits [vocab_size] on GPU.
+    pub logits_gpu: GpuBuf<f32>,
+}
+
+/// Per-block buffers for single-token decode.
+#[cfg(feature = "cuda")]
+pub struct BlockDecodeBuffers {
+    pub ln_attn_out: GpuBuf<f32>,     // [d]
+    pub ln_attn_mean: GpuBuf<f32>,    // [1]
+    pub ln_attn_rstd: GpuBuf<f32>,    // [1]
+    pub q_f32: GpuBuf<f32>,           // [d]
+    pub k_f32: GpuBuf<f32>,           // [d]
+    pub v_f32: GpuBuf<f32>,           // [d]
+    pub q_bf16: GpuBuf<u16>,          // [d]
+    pub attn_out_bf16: GpuBuf<u16>,   // [d]
+    pub attn_out_f32: GpuBuf<f32>,    // [d]
+    pub attn_proj: GpuBuf<f32>,       // [d]
+    pub residual_after_attn: GpuBuf<f32>, // [d]
+    pub ln_mem_out: GpuBuf<f32>,      // [d]
+    pub ln_mem_mean: GpuBuf<f32>,     // [1]
+    pub ln_mem_rstd: GpuBuf<f32>,     // [1]
+    pub y_combined: GpuBuf<f32>,      // [d]
+    pub gate: GpuBuf<f32>,            // [d]
+    pub gated_out: GpuBuf<f32>,       // [d]
+}
+
+#[cfg(feature = "cuda")]
+impl StackedDecodeWorkspace {
+    /// Allocate all workspace buffers once. `n_blocks` determines per-block count.
+    pub fn new(n_blocks: usize, d: usize, v: usize) -> Self {
+        let per_block = (0..n_blocks).map(|_| BlockDecodeBuffers {
+            ln_attn_out: GpuBuf::zeros(d),
+            ln_attn_mean: GpuBuf::zeros(1),
+            ln_attn_rstd: GpuBuf::zeros(1),
+            q_f32: GpuBuf::zeros(d),
+            k_f32: GpuBuf::zeros(d),
+            v_f32: GpuBuf::zeros(d),
+            q_bf16: GpuBuf::<u16>::zeros(d),
+            attn_out_bf16: GpuBuf::<u16>::zeros(d),
+            attn_out_f32: GpuBuf::zeros(d),
+            attn_proj: GpuBuf::zeros(d),
+            residual_after_attn: GpuBuf::zeros(d),
+            ln_mem_out: GpuBuf::zeros(d),
+            ln_mem_mean: GpuBuf::zeros(1),
+            ln_mem_rstd: GpuBuf::zeros(1),
+            y_combined: GpuBuf::zeros(d),
+            gate: GpuBuf::zeros(d),
+            gated_out: GpuBuf::zeros(d),
+        }).collect();
+
+        StackedDecodeWorkspace {
+            d_input: GpuBuf::<f32>::new(1),
+            per_block,
+            ln_final_out: GpuBuf::zeros(d),
+            ln_final_mean: GpuBuf::zeros(1),
+            ln_final_rstd: GpuBuf::zeros(1),
+            logits_gpu: GpuBuf::zeros(v),
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// gpu_stacked_prefill — process full prompt, populate KV caches
+// ══════════════════════════════════════════════════════════════════════
+
+/// Prefill: run full stacked forward on prompt tokens, populate per-block KV caches,
+/// return last-position logits [vocab_size].
+///
+/// This reuses `gpu_stacked_forward` for the math, then extracts K/V projections
+/// from the cache to fill per-block KV caches for decode.
+///
+/// Spec: specs/infrastructure/47_single_token_decode.md
+#[cfg(feature = "cuda")]
+pub fn gpu_stacked_prefill(
+    params: &GpuStackedParams,
+    cfg: &MAGConfig,
+    input_ids: &[usize],
+    pulse: &Pulse,
+    context: &mut GpuStackedContext,
+    kv_caches: &mut Vec<crate::gpu_forward::GpuKVCache>,
+    profiler: &mut Option<GpuProfiler>,
+) -> Vec<f32> {
+    let s = cfg.swa.seq_len;
+    let d = cfg.swa.d_model;
+    let v = cfg.swa.vocab_size;
+    let n_blocks = params.n_blocks();
+
+    // Use dummy targets (we don't need loss, just logits + KV caches)
+    let dummy_targets: Vec<usize> = input_ids.iter().skip(1).chain(std::iter::once(&0)).cloned().collect();
+
+    let (_loss, cache) = gpu_stacked_forward(
+        params, cfg, input_ids, &dummy_targets, pulse, context, profiler,
+    );
+
+    // Extract K/V projections from each block's cache into KV caches.
+    // block_caches[b].k_f32 is [seq_len, d] — exactly what the cache needs.
+    kv_caches.clear();
+    for bc in &cache.block_caches {
+        let mut kv = crate::gpu_forward::GpuKVCache::new(
+            s + 1024,  // capacity: seq_len + room for decode tokens
+            d,
+            s,  // scratch for prefill-sized append
+        );
+        kv.append_f32(&bc.k_f32, &bc.v_f32, s);
+        kv_caches.push(kv);
+    }
+
+    // Extract last-position logits
+    let last_offset = (s - 1) * v;
+    let mut logits = vec![0.0f32; v];
+    let mut all_logits = vec![0.0f32; s * v];
+    cache.logits.copy_to_host(&mut all_logits);
+    logits.copy_from_slice(&all_logits[last_offset..last_offset + v]);
+    logits
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// gpu_stacked_decode_token — decode one token using KV caches + M state
+// ══════════════════════════════════════════════════════════════════════
+
+/// Decode one token through all stacked blocks. Returns logits [vocab_size].
+///
+/// Per-token path:
+/// 1. Embed 1 token
+/// 2. Per block: LN → QKV → append KV cache → SWA single-token → memory(s=1) → MAG gate → residual
+/// 3. Final LN → unembed → logits
+///
+/// Spec: specs/infrastructure/47_single_token_decode.md
+#[cfg(feature = "cuda")]
+pub fn gpu_stacked_decode_token(
+    params: &GpuStackedParams,
+    cfg: &MAGConfig,
+    token_id: usize,
+    pulse: &Pulse,
+    context: &mut GpuStackedContext,
+    kv_caches: &mut [crate::gpu_forward::GpuKVCache],
+    ws: &mut StackedDecodeWorkspace,
+) -> Vec<f32> {
+    let d = cfg.swa.d_model;
+    let v = cfg.swa.vocab_size;
+    let nh = cfg.swa.num_heads;
+    let hd = cfg.swa.head_dim;
+    let window_size = cfg.swa.window_size;
+    let n_blocks = params.n_blocks();
+    let d_i32 = d as i32;
+
+    assert!(token_id < v, "token_id {} >= vocab_size {}", token_id, v);
+    assert_eq!(kv_caches.len(), n_blocks, "need one KV cache per block");
+
+    // ── Embed 1 token ──────────────────────────────────────────────
+    let input_i32 = [token_id as i32];
+    unsafe {
+        let rc = crate::gpu_forward::gpu_buf_memcpy_h2d(
+            ws.d_input.ptr() as *mut std::ffi::c_void,
+            input_i32.as_ptr() as *const std::ffi::c_void,
+            4,
+        );
+        assert_eq!(rc, 0);
+    }
+
+    // Gather embedding for 1 token
+    let mut residual = GpuBuf::<f32>::zeros(d);
+    unsafe {
+        crate::cuda_ffi::embedding_gather_cuda(
+            params.w_embed.as_ptr(),
+            ws.d_input.ptr() as *const i32,
+            residual.ptr(),
+            1, d_i32,
+        );
+    }
+
+    let is_chained = matches!(cfg.hope_variant, HopeVariant::Chained | HopeVariant::Sequential);
+
+    // ── Per-block forward ──────────────────────────────────────────
+    for b in 0..n_blocks {
+        let block = &params.blocks[b];
+        let block_ctx = &mut context.blocks[b];
+        let kv = &mut kv_caches[b];
+        let bws = &mut ws.per_block[b];
+
+        // Save block input for residual
+        let block_input_ptr = residual.as_ptr();
+
+        // ── LN_attn ────────────────────────────────────────────────
+        unsafe {
+            crate::cuda_ffi::layer_norm_forward_cuda(
+                residual.as_ptr(),
+                block.ln_attn_gamma.as_ptr(),
+                block.ln_attn_beta.as_ptr(),
+                bws.ln_attn_out.ptr(), bws.ln_attn_mean.ptr(), bws.ln_attn_rstd.ptr(),
+                1, d_i32, 1e-5,
+            );
+        }
+
+        // ── QKV projections [1,d] @ [d,d]^T ───────────────────────
+        crate::dispatch::cublas_matmul_transb_dd(&bws.ln_attn_out, &block.w_q, &mut bws.q_f32, 1, d, d, 0.0);
+        crate::dispatch::cublas_matmul_transb_dd(&bws.ln_attn_out, &block.w_k, &mut bws.k_f32, 1, d, d, 0.0);
+        crate::dispatch::cublas_matmul_transb_dd(&bws.ln_attn_out, &block.w_v, &mut bws.v_f32, 1, d, d, 0.0);
+
+        // ── Append K,V to cache ────────────────────────────────────
+        kv.append_f32(&bws.k_f32, &bws.v_f32, 1);
+
+        // ── SWA single-token attention ─────────────────────────────
+        unsafe {
+            crate::cuda_ffi::f32_to_bf16_cuda(bws.q_f32.as_ptr(), bws.q_bf16.ptr(), d_i32);
+        }
+        crate::dispatch::swa_single_token_dd(
+            &bws.q_bf16, &kv.k_cache_bf16, &kv.v_cache_bf16,
+            &mut bws.attn_out_bf16,
+            kv.len, nh, hd, window_size,
+        );
+        unsafe {
+            crate::cuda_ffi::bf16_to_f32_cuda(bws.attn_out_bf16.as_ptr(), bws.attn_out_f32.ptr(), d_i32);
+        }
+
+        // ── Output projection: attn_proj = attn_out @ W_O^T ───────
+        crate::dispatch::cublas_matmul_transb_dd(&bws.attn_out_f32, &block.w_o, &mut bws.attn_proj, 1, d, d, 0.0);
+
+        // ── Residual skip 1 ────────────────────────────────────────
+        bws.residual_after_attn.zero();
+        unsafe {
+            crate::cuda_ffi::saxpy_cuda(1.0, block_input_ptr, bws.residual_after_attn.ptr(), d_i32);
+            crate::cuda_ffi::saxpy_cuda(1.0, bws.attn_proj.as_ptr(), bws.residual_after_attn.ptr(), d_i32);
+        }
+
+        // ── LN_mem ─────────────────────────────────────────────────
+        unsafe {
+            crate::cuda_ffi::layer_norm_forward_cuda(
+                bws.residual_after_attn.as_ptr(),
+                block.ln_mem_gamma.as_ptr(),
+                block.ln_mem_beta.as_ptr(),
+                bws.ln_mem_out.ptr(), bws.ln_mem_mean.ptr(), bws.ln_mem_rstd.ptr(),
+                1, d_i32, 1e-5,
+            );
+        }
+
+        // ── CMS memory per level (s=1, no pooling) ─────────────────
+        let mut y_per_level: Vec<GpuBuf<f32>> = Vec::with_capacity(cfg.k);
+
+        if is_chained {
+            // Chain mode: each level processes previous level's output
+            let mut h = bws.ln_mem_out.clone_buf();
+            for level in 0..cfg.k {
+                let effective_active = pulse.active_levels[level]
+                    || matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp);
+
+                if effective_active {
+                    let (y_level, _mem_cache) = gpu_memory_forward(
+                        &block.levels[level], cfg, &h,
+                        &mut block_ctx.memory[level],
+                        1, d, level, 1,
+                    );
+                    y_per_level.push(y_level);
+                } else {
+                    let y_level = gpu_memory_read_only(
+                        &block.levels[level], &h,
+                        &block_ctx.memory[level],
+                        1, d, nh, hd,
+                    );
+                    y_per_level.push(y_level);
+                }
+                // Chain: next level's input is this level's output
+                if level < cfg.k - 1 {
+                    h = y_per_level[level].clone_buf();
+                }
+            }
+        } else {
+            // Independent mode: all levels process ln_mem_out
+            for level in 0..cfg.k {
+                let effective_active = pulse.active_levels[level]
+                    || matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp);
+
+                if effective_active {
+                    let (y_level, _mem_cache) = gpu_memory_forward(
+                        &block.levels[level], cfg, &bws.ln_mem_out,
+                        &mut block_ctx.memory[level],
+                        1, d, level, 1,
+                    );
+                    y_per_level.push(y_level);
+                } else {
+                    let y_level = gpu_memory_read_only(
+                        &block.levels[level], &bws.ln_mem_out,
+                        &block_ctx.memory[level],
+                        1, d, nh, hd,
+                    );
+                    y_per_level.push(y_level);
+                }
+            }
+        }
+
+        // ── Level aggregation ──────────────────────────────────────
+        if is_chained {
+            // Chain: use last level output directly
+            bws.y_combined.zero();
+            unsafe {
+                crate::cuda_ffi::saxpy_cuda(1.0, y_per_level.last().unwrap().as_ptr(), bws.y_combined.ptr(), d_i32);
+            }
+        } else {
+            // Learnable weighted sum
+            let mut alpha_host = vec![0.0f32; cfg.k];
+            block.alpha_mem.slice(0, cfg.k).copy_to_host(&mut alpha_host);
+            let alpha_weights = crate::stacked_model::host_softmax(&alpha_host);
+            bws.y_combined.zero();
+            for (l, y_level) in y_per_level.iter().enumerate() {
+                unsafe {
+                    crate::cuda_ffi::saxpy_cuda(alpha_weights[l], y_level.as_ptr(), bws.y_combined.ptr(), d_i32);
+                }
+            }
+        }
+
+        // ── MAG sigmoid gating ─────────────────────────────────────
+        unsafe {
+            crate::cuda_ffi::sigmoid_cuda(bws.y_combined.as_ptr(), bws.gate.ptr(), d_i32);
+            crate::cuda_ffi::elemwise_mul_cuda(bws.attn_proj.as_ptr(), bws.gate.as_ptr(), bws.gated_out.ptr(), d_i32);
+        }
+
+        // ── Residual skip 2 ────────────────────────────────────────
+        let new_residual = GpuBuf::<f32>::zeros(d);
+        unsafe {
+            crate::cuda_ffi::saxpy_cuda(1.0, block_input_ptr, new_residual.ptr(), d_i32);
+            crate::cuda_ffi::saxpy_cuda(1.0, bws.gated_out.as_ptr(), new_residual.ptr(), d_i32);
+        }
+        residual = new_residual;
+    }
+
+    // ── Final LN ───────────────────────────────────────────────────
+    unsafe {
+        crate::cuda_ffi::layer_norm_forward_cuda(
+            residual.as_ptr(),
+            params.ln_final_gamma.as_ptr(),
+            params.ln_final_beta.as_ptr(),
+            ws.ln_final_out.ptr(), ws.ln_final_mean.ptr(), ws.ln_final_rstd.ptr(),
+            1, d_i32, 1e-5,
+        );
+    }
+
+    // ── Unembed ────────────────────────────────────────────────────
+    crate::dispatch::cublas_matmul_dd(&ws.ln_final_out, &params.w_unembed, &mut ws.logits_gpu, 1, d, v, 0.0);
+    crate::dispatch::cuda_sync();
+
+    // Download logits
+    let mut logits = vec![0.0f32; v];
+    ws.logits_gpu.copy_to_host(&mut logits);
+    logits
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // GpuBuf clone helper
 // ══════════════════════════════════════════════════════════════════════
 
