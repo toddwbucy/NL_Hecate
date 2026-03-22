@@ -51,6 +51,52 @@ def _safetensors_path(path_str: str) -> str:
 _NUMPY_LOADER_FORMATS = frozenset({"sharegpt", "dolmino", "smollm"})
 
 
+def _print_step_profile(profile: dict, step: int):
+    """Console heatmap output for per-step GPU profiling (spec 38)."""
+    total = profile.get("total_ms", 0.0)
+    tps = profile.get("tok_per_s", 0.0)
+    print(f"\n  [profile] step={step}  total={total:.2f}ms  ({tps:.0f} tok/s)")
+    print("  " + "─" * 54)
+
+    # Top components
+    bar_width = 22
+    for c in profile.get("top_components", [])[:12]:
+        name = c["name"]
+        ms = c["ms"]
+        pct = c["pct"]
+        filled = int(round(pct / 100 * bar_width))
+        bar = "█" * filled + "░" * (bar_width - filled)
+        blk = f"[b{c['block']}]" if c.get("block") is not None else ""
+        lvl = f"L{c['level']}" if c.get("level") is not None else ""
+        tag = f" {blk}{lvl}" if blk or lvl else ""
+        print(f"  {name:<18s} {ms:6.2f}ms {pct:5.1f}%  {bar}{tag}")
+
+    # Remainder
+    shown = sum(c["ms"] for c in profile.get("top_components", [])[:12])
+    rest = total - shown
+    if rest > 0.01 and total > 0:
+        rest_pct = rest / total * 100
+        n_rest = max(0, len(profile.get("top_components", [])) - 12)
+        print(f"  {'...':<18s} {rest:6.2f}ms {rest_pct:5.1f}%  ({n_rest} regions)")
+
+    print("  " + "─" * 54)
+
+    # By category
+    print("  By category:")
+    by_cat = profile.get("by_category", {})
+    for name, info in sorted(by_cat.items(), key=lambda x: -x[1]["ms"]):
+        print(f"    {name:<18s} {info['ms']:6.2f}ms {info['pct']:5.1f}%")
+
+    # Per-block
+    per_block = profile.get("per_block", [])
+    if per_block:
+        print("  Per block:")
+        for bt in per_block:
+            print(f"    block {bt['block']}: fwd={bt['fwd_ms']:.2f}ms  "
+                  f"bwd={bt['bwd_ms']:.2f}ms  opt={bt['opt_ms']:.2f}ms")
+    print()
+
+
 def run_build(bcfg: BuildConfig):
     """Execute the full build loop. All state managed internally."""
 
@@ -1053,6 +1099,15 @@ def run_build(bcfg: BuildConfig):
         ) if len(pulse.active_levels) > 2 else False
         need_gnorms = log_this or slow_level_fires
 
+        # ── Spec 38: enable profiling for this step if configured ────────
+        _do_profile = (bcfg.profile_step > 0
+                       and step % bcfg.profile_step == 0
+                       and gpu_model is not None
+                       and is_stacked
+                       and hasattr(gpu_model, "enable_profiling"))
+        if _do_profile:
+            gpu_model.enable_profiling()
+
         if gpu_model is not None and use_m3:
             if is_stacked:
                 effective_freeze = bcfg.freeze_embed
@@ -1198,6 +1253,14 @@ def run_build(bcfg: BuildConfig):
             else:
                 nl_hecate.mag_apply_weight_gradients(params, grads, current_lr)
                 error_buffers.apply_for_active(params, pulse, current_lr)
+
+        # ── Spec 38: collect and print profile ─────────────────────────
+        if _do_profile:
+            profile = gpu_model.collect_profile(bcfg.seq_len)
+            _print_step_profile(profile, step)
+            if jsonl:
+                jsonl.log(event="step_profile", step=step, **profile)
+            gpu_model.disable_profiling()
 
         if math.isnan(loss) or math.isinf(loss):
             print(f"  step {step:5d}  loss={loss} — ABORTING (NaN/Inf detected)")
@@ -1522,15 +1585,31 @@ def run_build(bcfg: BuildConfig):
                              and gpu_model is not None
                              and tokenizer is not None
                              and not is_stacked)
-            if bcfg.coher_sample and not can_coherence:
+            # Stacked models: basic coherence samples only (no learning probes)
+            can_stacked_coherence = (bcfg.coher_sample
+                                     and gpu_model is not None
+                                     and tokenizer is not None
+                                     and is_stacked)
+            if bcfg.coher_sample and not can_coherence and not can_stacked_coherence:
                 skip_reasons = []
                 if gpu_model is None:
                     skip_reasons.append("no GPU model")
                 if tokenizer is None:
                     skip_reasons.append("no tokenizer (byte-level)")
-                if is_stacked:
-                    skip_reasons.append("stacked model")
                 print(f"    [coherence skipped: {', '.join(skip_reasons)}]")
+            if can_stacked_coherence:
+                try:
+                    samples = eval_coherence_samples(
+                        gpu_model, cfg, max_tokens=30, tokenizer=tokenizer)
+                    print(f"    [coherence] stacked inference samples:")
+                    for prompt, gen in samples:
+                        preview = gen[:80].replace("\n", "\\n")
+                        print(f"      \"{prompt}\" → \"{preview}\"")
+                    if jsonl:
+                        jsonl.log(event="coherence_sample", step=step,
+                                  mode="stacked", n_prompts=len(samples))
+                except Exception as e:
+                    print(f"    [stacked coherence failed: {e}]")
             if can_coherence:
                 # Learning probes (CS-10: model learns during forward)
                 snapshot = None

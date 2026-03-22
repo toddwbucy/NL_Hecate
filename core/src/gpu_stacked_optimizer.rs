@@ -15,6 +15,10 @@ use crate::gpu_stacked_backward::GpuStackedGrads;
 use crate::gpu_optimizer::adamw_one;
 #[cfg(feature = "cuda")]
 use crate::conductor::Pulse;
+#[cfg(feature = "cuda")]
+use crate::gpu_profiler::GpuProfiler;
+#[cfg(feature = "cuda")]
+use crate::{prof_start, prof_stop};
 
 // ══════════════════════════════════════════════════════════════════════
 // Moment buffer structs
@@ -385,6 +389,7 @@ pub fn gpu_stacked_adamw_update(
     weight_decay: f32,
     max_grad_norm: f32,
     freeze_embed: bool,
+    profiler: &mut Option<GpuProfiler>,
 ) -> f32 {
     state.step += 1;
     let t = state.step as f32;
@@ -392,6 +397,7 @@ pub fn gpu_stacked_adamw_update(
     let bc2_inv = 1.0 / (1.0 - beta2.powf(t));
 
     // Gradient clipping (exclude frozen embed grads from norm to avoid over-clipping)
+    prof_start!(profiler, "grad_clip", GradClip, None, None);
     let grad_norm = if max_grad_norm > 0.0 {
         let norm = gpu_stacked_grad_norm_ex(grads, state, freeze_embed);
         if norm > max_grad_norm {
@@ -402,8 +408,10 @@ pub fn gpu_stacked_adamw_update(
     } else {
         0.0
     };
+    prof_stop!(profiler);
 
     // ── Shared params (always active, unless frozen) ──────────────────
+    prof_start!(profiler, "opt_shared", Optimizer, None, None);
     if !freeze_embed {
         adamw_one(&mut params.w_embed, &grads.d_w_embed,
                   &mut state.m_embed, &mut state.v_embed,
@@ -418,12 +426,14 @@ pub fn gpu_stacked_adamw_update(
     adamw_one(&mut params.ln_final_beta, &grads.d_ln_final_beta,
               &mut state.m_ln_final_beta, &mut state.v_ln_final_beta,
               lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
+    prof_stop!(profiler);
 
     // ── Per-block params ───────────────────────────────────────────────
     for (b, (bp, bg)) in params.blocks.iter_mut().zip(grads.blocks.iter()).enumerate() {
         let mb = &mut state.blocks[b];
 
         // SWA projections (always active)
+        prof_start!(profiler, "opt_swa", Optimizer, Some(b), None);
         adamw_one(&mut bp.w_q, &bg.d_w_q, &mut mb.m_q, &mut mb.v_q,
                   lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
         adamw_one(&mut bp.w_k, &bg.d_w_k, &mut mb.m_k, &mut mb.v_k,
@@ -432,8 +442,10 @@ pub fn gpu_stacked_adamw_update(
                   lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
         adamw_one(&mut bp.w_o, &bg.d_w_o, &mut mb.m_o, &mut mb.v_o,
                   lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
+        prof_stop!(profiler);
 
         // LayerNorms
+        prof_start!(profiler, "opt_ln", Optimizer, Some(b), None);
         adamw_one(&mut bp.ln_attn_gamma, &bg.d_ln_attn_gamma,
                   &mut mb.m_ln_attn_gamma, &mut mb.v_ln_attn_gamma,
                   lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
@@ -446,6 +458,7 @@ pub fn gpu_stacked_adamw_update(
         adamw_one(&mut bp.ln_mem_beta, &bg.d_ln_mem_beta,
                   &mut mb.m_ln_mem_beta, &mut mb.v_ln_mem_beta,
                   lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
+        prof_stop!(profiler);
 
         // alpha_mem: learnable level aggregation weights (host-side AdamW)
         // Spec: specs/infrastructure/21_stacked_alpha_aggregation.md
@@ -469,6 +482,7 @@ pub fn gpu_stacked_adamw_update(
             if i >= pulse.active_levels.len() || !pulse.active_levels[i] {
                 continue;
             }
+            prof_start!(profiler, "opt_memory", Optimizer, Some(b), Some(i));
             let ml = &mut mb.levels[i];
             ml.level_step += 1;
             let lt = ml.level_step as f32;
@@ -500,6 +514,7 @@ pub fn gpu_stacked_adamw_update(
                       lr, beta1, beta2, eps, lbc1_inv, lbc2_inv, weight_decay);
             adamw_one(&mut lp.b_eta, &lg.d_b_eta, &mut ml.m_b_eta, &mut ml.v_b_eta,
                       lr, beta1, beta2, eps, lbc1_inv, lbc2_inv, weight_decay);
+            prof_stop!(profiler);
         }
     }
 
@@ -792,6 +807,7 @@ pub fn gpu_stacked_m3_update(
     max_grad_norm: f32,
     d: usize,
     freeze_embed: bool,
+    profiler: &mut Option<GpuProfiler>,
 ) -> f32 {
     state.step += 1;
     let cfg = &state.config;
@@ -799,6 +815,7 @@ pub fn gpu_stacked_m3_update(
     let bc2 = 1.0 - cfg.beta2.powi(state.step as i32);
 
     // ── Gradient clipping ─────────────────────────────────────────────
+    prof_start!(profiler, "grad_clip", GradClip, None, None);
     let grad_norm = if max_grad_norm > 0.0 {
         let norm = gpu_stacked_m3_grad_norm(grads, &mut state.norm_scratch, &mut state.norm_host, freeze_embed);
         if norm > max_grad_norm {
@@ -809,6 +826,7 @@ pub fn gpu_stacked_m3_update(
     } else {
         0.0
     };
+    prof_stop!(profiler);
 
     let ns_iters = cfg.ns_iterations;
     let m2_scale = -lr * cfg.alpha;
@@ -829,6 +847,7 @@ pub fn gpu_stacked_m3_update(
     }
 
     // ── Shared params (always active, unless frozen) ──────────────────
+    prof_start!(profiler, "opt_shared", Optimizer, None, None);
     if !freeze_embed {
         m3_ema_one(&mut state.m1_embed, &mut state.m2_embed, &mut state.v_embed, &grads.d_w_embed,
                    cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
@@ -847,6 +866,7 @@ pub fn gpu_stacked_m3_update(
                     lr, cfg.alpha, cfg.eps, bc2);
     m3_apply_1d_one(&mut params.ln_final_beta, &state.m1_ln_final_beta, &state.m2_ln_final_beta, &state.v_ln_final_beta,
                     lr, cfg.alpha, cfg.eps, bc2);
+    prof_stop!(profiler);
 
     // ── Per-block params ──────────────────────────────────────────────
     for (b, bg) in grads.blocks.iter().enumerate() {
@@ -854,6 +874,7 @@ pub fn gpu_stacked_m3_update(
         let mb = &mut state.blocks[b];
 
         // 2D SWA projections: EMA + NS apply
+        prof_start!(profiler, "opt_swa", Optimizer, Some(b), None);
         m3_ema_one(&mut mb.m1_q, &mut mb.m2_q, &mut mb.v_q, &bg.d_w_q,
                    cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
         m3_ema_one(&mut mb.m1_k, &mut mb.m2_k, &mut mb.v_k, &bg.d_w_k,
@@ -862,13 +883,17 @@ pub fn gpu_stacked_m3_update(
                    cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
         m3_ema_one(&mut mb.m1_o, &mut mb.m2_o, &mut mb.v_o, &bg.d_w_o,
                    cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+        prof_stop!(profiler);
 
+        prof_start!(profiler, "opt_ns", OptimizerNS, Some(b), None);
         ns_2d!(bp.w_q, mb.m1_q, mb.m2_q, d, d);
         ns_2d!(bp.w_k, mb.m1_k, mb.m2_k, d, d);
         ns_2d!(bp.w_v, mb.m1_v, mb.m2_v, d, d);
         ns_2d!(bp.w_o, mb.m1_o, mb.m2_o, d, d);
+        prof_stop!(profiler);
 
         // 1D LayerNorms: EMA + 1D apply
+        prof_start!(profiler, "opt_ln", Optimizer, Some(b), None);
         m3_ema_one(&mut mb.m1_ln_attn_gamma, &mut mb.m2_ln_attn_gamma, &mut mb.v_ln_attn_gamma, &bg.d_ln_attn_gamma,
                    cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
         m3_ema_one(&mut mb.m1_ln_attn_beta, &mut mb.m2_ln_attn_beta, &mut mb.v_ln_attn_beta, &bg.d_ln_attn_beta,
@@ -886,6 +911,7 @@ pub fn gpu_stacked_m3_update(
                         lr, cfg.alpha, cfg.eps, bc2);
         m3_apply_1d_one(&mut bp.ln_mem_beta, &mb.m1_ln_mem_beta, &mb.m2_ln_mem_beta, &mb.v_ln_mem_beta,
                         lr, cfg.alpha, cfg.eps, bc2);
+        prof_stop!(profiler);
 
         // alpha_mem: host-side 1D M3 (same pattern as AdamW host-side, but with 3 moments)
         {
@@ -919,6 +945,7 @@ pub fn gpu_stacked_m3_update(
             let level_bc2 = 1.0 - cfg.beta2.powi(ml.level_step as i32);
 
             // 2D level params: EMA
+            prof_start!(profiler, "opt_memory", Optimizer, Some(b), Some(i));
             m3_ema_one(&mut ml.m1_w_k_mem, &mut ml.m2_w_k_mem, &mut ml.v_w_k_mem, &lg.d_w_k_mem,
                        cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
             m3_ema_one(&mut ml.m1_w_v_mem, &mut ml.m2_w_v_mem, &mut ml.v_w_v_mem, &lg.d_w_v_mem,
@@ -958,11 +985,14 @@ pub fn gpu_stacked_m3_update(
                             lr, cfg.alpha, cfg.eps, level_bc2);
             m3_apply_1d_one(&mut lp.b_eta, &ml.m1_b_eta, &ml.m2_b_eta, &ml.v_b_eta,
                             lr, cfg.alpha, cfg.eps, level_bc2);
+            prof_stop!(profiler);
 
             // Apply 2D level params via NS
+            prof_start!(profiler, "opt_ns", OptimizerNS, Some(b), Some(i));
             ns_2d!(lp.w_k_mem, ml.m1_w_k_mem, ml.m2_w_k_mem, d, d);
             ns_2d!(lp.w_v_mem, ml.m1_w_v_mem, ml.m2_w_v_mem, d, d);
             ns_2d!(lp.w_q_mem, ml.m1_w_q_mem, ml.m2_w_q_mem, d, d);
+            prof_stop!(profiler);
         }
     }
 

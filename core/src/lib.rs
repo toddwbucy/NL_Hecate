@@ -63,6 +63,8 @@ pub mod gpu_stacked_backward;
 pub mod gpu_optimizer;
 #[cfg(feature = "cuda")]
 pub mod gpu_stacked_optimizer;
+#[cfg(feature = "cuda")]
+pub mod gpu_profiler;
 pub mod dynamic_freq;
 pub mod conductor;
 pub mod context_stream;

@@ -2837,6 +2837,8 @@ struct GpuStackedModel {
     last_block_gnorms: Vec<f32>,
     /// Per-block L0-only gradient norms from the most recent step_adamw call (spec 23).
     last_l0_block_gnorms: Vec<f32>,
+    /// GPU profiler for per-step heatmap (spec 38). None when disabled.
+    profiler: Option<nl_hecate_core::gpu_profiler::GpuProfiler>,
 }
 
 #[cfg(feature = "cuda")]
@@ -2872,6 +2874,7 @@ impl GpuStackedModel {
             memory_reset,
             last_block_gnorms: Vec::new(),
             last_l0_block_gnorms: Vec::new(),
+            profiler: None,
         })
     }
 
@@ -2919,6 +2922,7 @@ impl GpuStackedModel {
             memory_reset,
             last_block_gnorms: Vec::new(),
             last_l0_block_gnorms: Vec::new(),
+            profiler: None,
         })
     }
 
@@ -2951,7 +2955,7 @@ impl GpuStackedModel {
 
         let (loss, cache) = nl_hecate_core::gpu_stacked_forward::gpu_stacked_forward(
             &self.params, &self.cfg, &input_ids, &target_ids,
-            &pulse.inner, &mut self.context,
+            &pulse.inner, &mut self.context, &mut self.profiler,
         );
 
         // Copy logits from GPU to host
@@ -2999,15 +3003,18 @@ impl GpuStackedModel {
             }
         }
 
+        // Start profiler step timer (no-op if profiling disabled)
+        if let Some(ref prof) = self.profiler { prof.step_start(); }
+
         // Forward
         let (loss, cache) = nl_hecate_core::gpu_stacked_forward::gpu_stacked_forward(
             &self.params, &self.cfg, &input_ids, &target_ids,
-            &pulse.inner, &mut self.context,
+            &pulse.inner, &mut self.context, &mut self.profiler,
         );
 
         // Backward
         let mut grads = nl_hecate_core::gpu_stacked_backward::gpu_stacked_backward(
-            &self.params, &self.cfg, &cache,
+            &self.params, &self.cfg, &cache, &mut self.profiler,
         );
 
         // Lazy-init AdamW state
@@ -3033,8 +3040,11 @@ impl GpuStackedModel {
             &mut self.params, &mut grads, state,
             &pulse.inner,
             lr, beta1, beta2, eps, weight_decay, max_grad_norm,
-            freeze_embed,
+            freeze_embed, &mut self.profiler,
         );
+
+        // Stop profiler step timer (no-op if profiling disabled)
+        if let Some(ref prof) = self.profiler { prof.step_stop(); }
 
         // Weight tying: sync w_unembed^T → w_embed (same as single-block path).
         // Without this, shared input/output embeddings diverge during training.
@@ -3116,15 +3126,18 @@ impl GpuStackedModel {
                 "M3 state not initialized — call init_m3() before step_m3()"));
         }
 
+        // Start profiler step timer (no-op if profiling disabled)
+        if let Some(ref prof) = self.profiler { prof.step_start(); }
+
         // Forward
         let (loss, cache) = nl_hecate_core::gpu_stacked_forward::gpu_stacked_forward(
             &self.params, &self.cfg, &input_ids, &target_ids,
-            &pulse.inner, &mut self.context,
+            &pulse.inner, &mut self.context, &mut self.profiler,
         );
 
         // Backward
         let mut grads = nl_hecate_core::gpu_stacked_backward::gpu_stacked_backward(
-            &self.params, &self.cfg, &cache,
+            &self.params, &self.cfg, &cache, &mut self.profiler,
         );
 
         // M3 update (state guaranteed Some by guard above)
@@ -3133,7 +3146,11 @@ impl GpuStackedModel {
         let grad_norm = nl_hecate_core::gpu_stacked_optimizer::gpu_stacked_m3_update(
             &mut self.params, &mut grads, state,
             &pulse.inner, lr, max_grad_norm, d, freeze_embed,
+            &mut self.profiler,
         );
+
+        // Stop profiler step timer (no-op if profiling disabled)
+        if let Some(ref prof) = self.profiler { prof.step_stop(); }
 
         // Weight tying: sync w_unembed^T → w_embed
         nl_hecate_core::gpu_stacked_optimizer::gpu_stacked_sync_embed_weights(
@@ -3370,6 +3387,82 @@ impl GpuStackedModel {
         Ok(dict.into())
     }
 
+    /// Enable profiling for the next step. Creates a GpuProfiler that wraps
+    /// cudaEvent pairs around every pipeline region (spec 38).
+    fn enable_profiling(&mut self) {
+        self.profiler = Some(nl_hecate_core::gpu_profiler::GpuProfiler::new(true));
+    }
+
+    /// Disable profiling and drop the GpuProfiler (frees cudaEvents).
+    fn disable_profiling(&mut self) {
+        self.profiler = None;
+    }
+
+    /// Whether profiling is currently enabled.
+    fn is_profiling(&self) -> bool {
+        self.profiler.is_some()
+    }
+
+    /// Collect the step profile after a profiled step completes.
+    /// Returns a Python dict with total_ms, tok/s, by_category, top components, per_block.
+    /// Resets the profiler for the next step.
+    fn collect_profile(&mut self, py: pyo3::Python<'_>, seq_len: usize) -> PyResult<pyo3::PyObject> {
+        let prof = match self.profiler.as_mut() {
+            Some(p) => p,
+            None => return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "profiling not enabled — call enable_profiling() first")),
+        };
+
+        let profile = prof.collect(self.n_blocks);
+        prof.reset();
+
+        let dict = pyo3::types::PyDict::new(py);
+        dict.set_item("total_ms", profile.total_ms)?;
+        let toks_per_sec = if profile.total_ms > 0.0 {
+            seq_len as f32 / (profile.total_ms / 1000.0)
+        } else { 0.0 };
+        dict.set_item("tok_per_s", toks_per_sec)?;
+
+        // by_category: {name: {ms, pct}}
+        let cat_dict = pyo3::types::PyDict::new(py);
+        for ct in &profile.by_category {
+            let entry = pyo3::types::PyDict::new(py);
+            entry.set_item("ms", ct.ms)?;
+            entry.set_item("pct", ct.pct)?;
+            cat_dict.set_item(ct.category.as_str(), entry)?;
+        }
+        dict.set_item("by_category", cat_dict)?;
+
+        // top components: [{name, block, level, ms, pct}]
+        let top: Vec<&nl_hecate_core::gpu_profiler::ComponentTiming> =
+            profile.components.iter().take(20).collect();
+        let top_list = pyo3::types::PyList::empty(py);
+        for c in &top {
+            let entry = pyo3::types::PyDict::new(py);
+            entry.set_item("name", &c.name)?;
+            entry.set_item("block", c.block_idx)?;
+            entry.set_item("level", c.level_idx)?;
+            entry.set_item("ms", c.ms)?;
+            entry.set_item("pct", c.pct)?;
+            top_list.append(entry)?;
+        }
+        dict.set_item("top_components", top_list)?;
+
+        // per_block: [{block, fwd_ms, bwd_ms, opt_ms}]
+        let block_list = pyo3::types::PyList::empty(py);
+        for bt in &profile.per_block {
+            let entry = pyo3::types::PyDict::new(py);
+            entry.set_item("block", bt.block_idx)?;
+            entry.set_item("fwd_ms", bt.fwd_ms)?;
+            entry.set_item("bwd_ms", bt.bwd_ms)?;
+            entry.set_item("opt_ms", bt.opt_ms)?;
+            block_list.append(entry)?;
+        }
+        dict.set_item("per_block", block_list)?;
+
+        Ok(dict.into())
+    }
+
     /// GPU-resident stacked tape summary -- per-(block, level) gradient diagnostics.
     ///
     /// Runs one GPU forward+backward (no optimizer step) and captures per-level
@@ -3412,9 +3505,10 @@ impl GpuStackedModel {
         let saved_ctx = self.context.deep_clone();
 
         // Forward (modifies context -- will be restored)
+        let mut no_prof: Option<nl_hecate_core::gpu_profiler::GpuProfiler> = None;
         let (loss, cache) = nl_hecate_core::gpu_stacked_forward::gpu_stacked_forward(
             &self.params, &self.cfg, &input_ids, &target_ids,
-            &pulse.inner, &mut self.context,
+            &pulse.inner, &mut self.context, &mut no_prof,
         );
 
         // Capture post-forward M norms for shard M-diff (spec 28).
@@ -3460,7 +3554,7 @@ impl GpuStackedModel {
 
         // Backward (collect level_output_gnorms)
         let grads = nl_hecate_core::gpu_stacked_backward::gpu_stacked_backward(
-            &self.params, &self.cfg, &cache,
+            &self.params, &self.cfg, &cache, &mut no_prof,
         );
 
         // Restore context

@@ -20,6 +20,10 @@ use crate::conductor::Pulse;
 use crate::parallel::ParallelStrategy;
 #[cfg(feature = "cuda")]
 use crate::gpu_forward::{GpuMemoryCache, gpu_memory_forward, gpu_memory_read_only, gpu_tnt_forward};
+#[cfg(feature = "cuda")]
+use crate::gpu_profiler::GpuProfiler;
+#[cfg(feature = "cuda")]
+use crate::{prof_start, prof_stop};
 
 // ══════════════════════════════════════════════════════════════════════
 // GpuStackedBlockCache — per-block forward activations
@@ -114,6 +118,7 @@ pub fn gpu_stacked_forward(
     target_ids: &[usize],
     pulse: &Pulse,
     context: &mut GpuStackedContext,
+    profiler: &mut Option<GpuProfiler>,
 ) -> (f32, GpuStackedCache) {
     let s = cfg.swa.seq_len;
     let d = cfg.swa.d_model;
@@ -167,6 +172,7 @@ pub fn gpu_stacked_forward(
     }
 
     // ── Stage 1: Embedding gather (shared) ─────────────────────────────
+    prof_start!(profiler, "embed_gather", Embedding, None, None);
     let embedded = GpuBuf::<f32>::zeros(total);
     unsafe {
         crate::cuda_ffi::embedding_gather_cuda(
@@ -176,6 +182,7 @@ pub fn gpu_stacked_forward(
             tokens_i32, d_i32,
         );
     }
+    prof_stop!(profiler);
 
     // ── Stage 2: Per-block forward ─────────────────────────────────────
     // The residual stream starts as the embedding output.
@@ -195,6 +202,7 @@ pub fn gpu_stacked_forward(
         let block_input = residual_stream.clone_buf();
 
         // ── LN_attn on residual stream ─────────────────────────────
+        prof_start!(profiler, "ln_attn_fwd", LayerNorm, Some(b), None);
         let ln_attn_out = GpuBuf::<f32>::zeros(total);
         let ln_attn_mean = GpuBuf::<f32>::zeros(n_tokens);
         let ln_attn_rstd = GpuBuf::<f32>::zeros(n_tokens);
@@ -207,16 +215,20 @@ pub fn gpu_stacked_forward(
                 n_tokens as i32, d_i32, 1e-5,
             );
         }
+        prof_stop!(profiler);
 
         // ── QKV projections ────────────────────────────────────────
+        prof_start!(profiler, "qkv_proj_fwd", Projection, Some(b), None);
         let mut q_f32 = GpuBuf::zeros(total);
         let mut k_f32 = GpuBuf::zeros(total);
         let mut v_f32 = GpuBuf::zeros(total);
         crate::dispatch::cublas_matmul_transb_dd(&ln_attn_out, &block.w_q, &mut q_f32, n_tokens, d, d, 0.0);
         crate::dispatch::cublas_matmul_transb_dd(&ln_attn_out, &block.w_k, &mut k_f32, n_tokens, d, d, 0.0);
         crate::dispatch::cublas_matmul_transb_dd(&ln_attn_out, &block.w_v, &mut v_f32, n_tokens, d, d, 0.0);
+        prof_stop!(profiler);
 
         // ── SWA attention (bf16) ───────────────────────────────────
+        prof_start!(profiler, "f32_to_bf16", Precision, Some(b), None);
         let aw_total = bs * nh * s * ws;
         let q_bf16 = GpuBuf::<u16>::zeros(total);
         let k_bf16 = GpuBuf::<u16>::zeros(total);
@@ -229,31 +241,41 @@ pub fn gpu_stacked_forward(
             crate::cuda_ffi::f32_to_bf16_cuda(k_f32.as_ptr(), k_bf16.ptr(), total_i32);
             crate::cuda_ffi::f32_to_bf16_cuda(v_f32.as_ptr(), v_bf16.ptr(), total_i32);
         }
+        prof_stop!(profiler);
 
+        prof_start!(profiler, "swa_fwd", Attention, Some(b), None);
         crate::dispatch::swa_forward_dd(
             &q_bf16, &k_bf16, &v_bf16,
             &mut attn_out_bf16, &mut attn_weights_bf16,
             s, nh, hd, ws, bs,
         );
+        prof_stop!(profiler);
 
+        prof_start!(profiler, "bf16_to_f32", Precision, Some(b), None);
         let attn_out = GpuBuf::<f32>::zeros(total);
         unsafe {
             crate::cuda_ffi::bf16_to_f32_cuda(attn_out_bf16.as_ptr(), attn_out.ptr(), total_i32);
         }
+        prof_stop!(profiler);
 
         // ── Output projection: attn_proj = attn_out @ W_O^T ─────────
         // Spec: specs/infrastructure/18_stacked_w_o_output_projection.md
+        prof_start!(profiler, "out_proj_fwd", Projection, Some(b), None);
         let mut attn_proj = GpuBuf::<f32>::zeros(total);
         crate::dispatch::cublas_matmul_transb_dd(&attn_out, &block.w_o, &mut attn_proj, n_tokens, d, d, 0.0);
+        prof_stop!(profiler);
 
         // ── Residual skip 1: residual_after_attn = block_input + attn_proj ──
+        prof_start!(profiler, "residual_1", Residual, Some(b), None);
         let residual_after_attn = GpuBuf::<f32>::zeros(total);
         unsafe {
             crate::cuda_ffi::saxpy_cuda(1.0, block_input.as_ptr(), residual_after_attn.ptr(), total_i32);
             crate::cuda_ffi::saxpy_cuda(1.0, attn_proj.as_ptr(), residual_after_attn.ptr(), total_i32);
         }
+        prof_stop!(profiler);
 
         // ── LN_mem on residual_after_attn ──────────────────────────
+        prof_start!(profiler, "ln_mem_fwd", LayerNorm, Some(b), None);
         let ln_mem_out = GpuBuf::<f32>::zeros(total);
         let ln_mem_mean = GpuBuf::<f32>::zeros(n_tokens);
         let ln_mem_rstd = GpuBuf::<f32>::zeros(n_tokens);
@@ -266,6 +288,7 @@ pub fn gpu_stacked_forward(
                 n_tokens as i32, d_i32, 1e-5,
             );
         }
+        prof_stop!(profiler);
 
         // ── Memory branch per level ────────────────────────────────
         let mut memory_caches = Vec::with_capacity(cfg.k);
@@ -281,6 +304,7 @@ pub fn gpu_stacked_forward(
                 let effective_active = pulse.active_levels[level]
                     || matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp);
 
+                prof_start!(profiler, "memory_fwd", MemoryForward, Some(b), Some(level));
                 if effective_active {
                     if is_tnt
                         && bs == 1
@@ -313,6 +337,7 @@ pub fn gpu_stacked_forward(
                     y_per_level.push(y_level);
                     memory_caches.push(None);
                 }
+                prof_stop!(profiler);
                 // Chain: next level's input is this level's output
                 if level < cfg.k - 1 {
                     h = y_per_level[level].clone_buf();
@@ -324,6 +349,7 @@ pub fn gpu_stacked_forward(
                 let effective_active = pulse.active_levels[level]
                     || matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp);
 
+                prof_start!(profiler, "memory_fwd", MemoryForward, Some(b), Some(level));
                 if effective_active {
                     if is_tnt
                         && bs == 1
@@ -355,10 +381,12 @@ pub fn gpu_stacked_forward(
                     y_per_level.push(y_level);
                     memory_caches.push(None);
                 }
+                prof_stop!(profiler);
             }
         }
 
         // ── Level aggregation ────────────────────────────────────────
+        prof_start!(profiler, "level_agg", Composition, Some(b), None);
         let alpha_weights;
         let y_combined;
 
@@ -382,23 +410,29 @@ pub fn gpu_stacked_forward(
             }
         }
 
+        prof_stop!(profiler);
+
         // ── MAG sigmoid gating: gate = σ(y_combined), gated_out = attn_proj * gate ──
         // Spec: specs/infrastructure/20_stacked_mag_sigmoid_gating.md
         // Titans eq-028: o = y ⊙ σ(M(x̃))
+        prof_start!(profiler, "mag_gate", Composition, Some(b), None);
         let gate = GpuBuf::<f32>::zeros(total);
         let gated_out = GpuBuf::<f32>::zeros(total);
         unsafe {
             crate::cuda_ffi::sigmoid_cuda(y_combined.as_ptr(), gate.ptr(), total_i32);
             crate::cuda_ffi::elemwise_mul_cuda(attn_proj.as_ptr(), gate.as_ptr(), gated_out.ptr(), total_i32);
         }
+        prof_stop!(profiler);
 
         // ── Residual: residual_out = block_input + gated_out ──
+        prof_start!(profiler, "residual_2", Residual, Some(b), None);
         let new_residual = GpuBuf::<f32>::zeros(total);
         unsafe {
             crate::cuda_ffi::saxpy_cuda(1.0, block_input.as_ptr(), new_residual.ptr(), total_i32);
             crate::cuda_ffi::saxpy_cuda(1.0, gated_out.as_ptr(), new_residual.ptr(), total_i32);
         }
         residual_stream = new_residual;
+        prof_stop!(profiler);
 
         block_caches.push(GpuStackedBlockCache {
             block_input,
@@ -419,6 +453,7 @@ pub fn gpu_stacked_forward(
     }
 
     // ── Stage 3: Final LayerNorm (shared) ──────────────────────────────
+    prof_start!(profiler, "ln_final_fwd", LayerNorm, None, None);
     let ln_final_out = GpuBuf::<f32>::zeros(total);
     let ln_final_mean = GpuBuf::<f32>::zeros(n_tokens);
     let ln_final_rstd = GpuBuf::<f32>::zeros(n_tokens);
@@ -431,12 +466,16 @@ pub fn gpu_stacked_forward(
             n_tokens as i32, d_i32, 1e-5,
         );
     }
+    prof_stop!(profiler);
 
     // ── Stage 4: Unembed (shared w_unembed) ───────────────────────────
+    prof_start!(profiler, "unembed_fwd", Projection, None, None);
     let mut logits = GpuBuf::<f32>::zeros(n_tokens * v);
     crate::dispatch::cublas_matmul_dd(&ln_final_out, &params.w_unembed, &mut logits, n_tokens, d, v, 0.0);
+    prof_stop!(profiler);
 
     // ── Stage 5: Cross-entropy loss ───────────────────────────────────
+    prof_start!(profiler, "cross_entropy_fwd", Loss, None, None);
     let loss_gpu = GpuBuf::<f32>::zeros(1);
     unsafe {
         crate::cuda_ffi::cross_entropy_forward_cuda(
@@ -446,6 +485,7 @@ pub fn gpu_stacked_forward(
             tokens_i32, v_i32,
         );
     }
+    prof_stop!(profiler);
     crate::dispatch::cuda_sync();
 
     let mut loss_host = [0.0f32; 1];

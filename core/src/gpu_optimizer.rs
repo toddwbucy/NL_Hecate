@@ -918,7 +918,7 @@ pub(crate) fn gpu_frob_norm(buf: &GpuBuf<f32>, scratch: &mut GpuBuf<f32>, host: 
     assert_eq!(err, 0, "frob_norm_sq_cuda failed: {}", err);
     crate::dispatch::cuda_sync();
     let nb = num_blocks as usize;
-    scratch.copy_to_host(&mut host[..nb]);
+    scratch.slice(0, nb).copy_to_host(&mut host[..nb]);
     host[..nb].iter().sum::<f32>().sqrt()
 }
 
@@ -966,7 +966,9 @@ pub(crate) fn m3_ns_apply(
             );
         }
     } else {
-        ns_work.copy_from_device(m);
+        // ns_work may be larger than m (shared scratch buffer); copy only the
+        // first n elements to avoid the length-match assertion.
+        ns_work.slice_mut(0, n).copy_from_device(m);
     }
     let err = unsafe { crate::cuda_ffi::scale_buf_cuda(ns_work.ptr(), 1.0 / frob, n as i32) };
     assert_eq!(err, 0);

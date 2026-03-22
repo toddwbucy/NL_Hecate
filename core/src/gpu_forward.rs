@@ -1244,16 +1244,26 @@ pub(crate) fn gpu_memory_forward(
     match (eff_ckpt, cfg.memory_rule) {
         // ── Full-trajectory / chunkwise paths (checkpoint_interval=None) ──
         (None, MemoryRuleKind::DeltaRule) if is_proxy => {
-            // Spec 43: chunkwise forward (frozen-M₀). chunk_size=s → single chunk.
-            let chunk_size = s;
+            // Spec 43/44: chunkwise forward (frozen-M₀). chunk_size from CMS frequency.
+            let chunk_size = cfg.chunk_sizes.get(level).copied().unwrap_or(s);
             let num_chunks = (s + chunk_size - 1) / chunk_size;
             let mut m_chunk_states = GpuBuf::zeros(bs * (num_chunks + 1) * dd);
             let mut y = GpuBuf::zeros(bs * s * d);
-            crate::dispatch::delta_chunkwise_forward_dd(
-                &k_mem, &v_mem, &q_mem, &alpha, &theta,
-                &m_initial_slice, &mut m_chunk_states, &mut y,
-                s, d, bs, chunk_size, cfg.error_clip_for_level(level),
-            );
+            if chunk_size > 1 {
+                // Spec 44: batched cuBLAS Phase 1
+                crate::dispatch::delta_chunkwise_forward_batched_dd(
+                    &k_mem, &v_mem, &q_mem, &alpha, &theta,
+                    &m_initial_slice, &mut m_chunk_states, &mut y,
+                    s, d, bs, chunk_size, cfg.error_clip_for_level(level),
+                );
+            } else {
+                // chunk_size=1 (L0): monolithic kernel (cuBLAS overhead dominates)
+                crate::dispatch::delta_chunkwise_forward_dd(
+                    &k_mem, &v_mem, &q_mem, &alpha, &theta,
+                    &m_initial_slice, &mut m_chunk_states, &mut y,
+                    s, d, bs, chunk_size, cfg.error_clip_for_level(level),
+                );
+            }
             crate::dispatch::cuda_sync();
             copy_final_m_batch(&m_chunk_states, context_m, num_chunks, dd, bs);
             for b in 0..bs {
@@ -1288,21 +1298,31 @@ pub(crate) fn gpu_memory_forward(
             (y, GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states, k_norms, q_norms, proxy: false })
         }
         (None, MemoryRuleKind::TitansLMM) if is_proxy => {
-            // Spec 43: chunkwise forward (frozen-M₀). chunk_size=s → single chunk.
+            // Spec 43/44: chunkwise forward (frozen-M₀). chunk_size from CMS frequency.
             let eta = compute_eta(level_params, &k_mem, &v_mem, bs * s, d);
             let batch_s_initial = GpuBuf::zeros(bs * dd);
             let s_initial_slice = batch_s_initial.slice(0, bs * dd);
-            let chunk_size = s;
+            let chunk_size = cfg.chunk_sizes.get(level).copied().unwrap_or(s);
             let num_chunks = (s + chunk_size - 1) / chunk_size;
             let mut m_chunk_states = GpuBuf::zeros(bs * (num_chunks + 1) * dd);
             let mut s_chunk_states = GpuBuf::zeros(bs * (num_chunks + 1) * dd);
             let mut y = GpuBuf::zeros(bs * s * d);
-            crate::dispatch::titans_chunkwise_forward_dd(
-                &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
-                &m_initial_slice, &s_initial_slice,
-                &mut m_chunk_states, &mut s_chunk_states, &mut y,
-                s, d, bs, chunk_size, cfg.error_clip_for_level(level),
-            );
+            if chunk_size > 1 {
+                // Spec 44: batched cuBLAS Phase 1
+                crate::dispatch::titans_chunkwise_forward_batched_dd(
+                    &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
+                    &m_initial_slice, &s_initial_slice,
+                    &mut m_chunk_states, &mut s_chunk_states, &mut y,
+                    s, d, bs, chunk_size, cfg.error_clip_for_level(level),
+                );
+            } else {
+                crate::dispatch::titans_chunkwise_forward_dd(
+                    &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
+                    &m_initial_slice, &s_initial_slice,
+                    &mut m_chunk_states, &mut s_chunk_states, &mut y,
+                    s, d, bs, chunk_size, cfg.error_clip_for_level(level),
+                );
+            }
             crate::dispatch::cuda_sync();
             copy_final_m_batch(&m_chunk_states, context_m, num_chunks, dd, bs);
             for b in 0..bs {

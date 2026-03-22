@@ -185,6 +185,21 @@ impl<T: GpuElement> GpuBuf<T> {
         }
     }
 
+    /// Copy `count` elements from a device pointer into this buffer at offset 0.
+    /// Caller must ensure `src` points to at least `count` valid device elements
+    /// and `count <= self.len`.
+    pub unsafe fn copy_from_device_ptr(&self, src: *const T, count: usize) {
+        assert!(count <= self.len, "copy_from_device_ptr: count({count}) > len({})", self.len);
+        let bytes = count * T::byte_size();
+        let rc = cudaMemcpy(
+            self.ptr as *mut std::ffi::c_void,
+            src as *const std::ffi::c_void,
+            bytes,
+            CUDA_MEMCPY_DEVICE_TO_DEVICE,
+        );
+        assert_eq!(rc, 0, "cudaMemcpy D2D (from_device_ptr) failed: error code {rc}");
+    }
+
     /// Deep-copy this buffer into a new owned allocation (device-to-device).
     pub fn dup(&self) -> GpuBuf<T> {
         let new = GpuBuf::new(self.len);
@@ -292,6 +307,22 @@ impl<T: GpuElement> GpuSliceMut<T> {
         let bytes = self.len * T::byte_size();
         let rc = unsafe { cudaMemset(self.ptr as *mut std::ffi::c_void, 0, bytes) };
         assert_eq!(rc, 0, "cudaMemset (slice_mut) failed: error code {rc}");
+    }
+
+    /// Copy from a GpuBuf (device-to-device). Lengths must match.
+    pub fn copy_from_device(&self, src: &GpuBuf<T>) {
+        assert_eq!(src.len(), self.len,
+            "GpuSliceMut::copy_from_device: length mismatch ({} vs {})", self.len, src.len());
+        let bytes = self.len * T::byte_size();
+        let rc = unsafe {
+            cudaMemcpy(
+                self.ptr as *mut std::ffi::c_void,
+                src.as_ptr() as *const std::ffi::c_void,
+                bytes,
+                CUDA_MEMCPY_DEVICE_TO_DEVICE,
+            )
+        };
+        assert_eq!(rc, 0, "cudaMemcpy D2D (slice_mut) failed: error code {rc}");
     }
 }
 

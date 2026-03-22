@@ -371,6 +371,58 @@ extern "C" {
         seq_len: i32, d: i32, batch_size: i32, chunk_size: i32, error_clip: f32,
     );
 
+    // ── Spec 44: Phase 2 kernels + error_subtract_clip ─────────────────
+
+    /// Batch error subtract + L2 clip: pred[i] -= v[i], then clip per row.
+    pub(crate) fn error_subtract_clip_f32_cuda(
+        predictions: *mut f32, v: *const f32,
+        total_rows: i32, d: i32, error_clip: f32,
+    );
+
+    /// Delta Phase 2 forward: sequential M recurrence + readout for one chunk.
+    pub(crate) fn delta_phase2_forward_f32_cuda(
+        k_mem: *const f32, q_mem: *const f32,
+        alpha: *const f32, theta: *const f32,
+        errors: *const f32, m_work: *mut f32,
+        m_chunk_states: *mut f32, y: *mut f32,
+        seq_len: i32, d: i32, batch_size: i32, chunk_size: i32, chunk_idx: i32,
+    );
+
+    /// Titans Phase 2 forward: sequential M+S recurrence + readout for one chunk.
+    pub(crate) fn titans_phase2_forward_f32_cuda(
+        k_mem: *const f32, q_mem: *const f32,
+        alpha: *const f32, theta: *const f32, eta: *const f32,
+        errors: *const f32, m_work: *mut f32, s_work: *mut f32,
+        m_chunk_states: *mut f32, s_chunk_states: *mut f32, y: *mut f32,
+        seq_len: i32, d: i32, batch_size: i32, chunk_size: i32, chunk_idx: i32,
+    );
+
+    /// Delta Phase 2 backward: reverse token loop for one chunk.
+    pub(crate) fn delta_phase2_backward_f32_cuda(
+        k_mem: *const f32, q_mem: *const f32,
+        alpha: *const f32, theta: *const f32,
+        errors: *const f32, m_chunk_states: *const f32,
+        d_y: *const f32,
+        d_k_mem: *mut f32, d_v_mem: *mut f32, d_q_mem: *mut f32,
+        d_alpha: *mut f32, d_theta: *mut f32,
+        d_M: *mut f32, d_M0: *mut f32, m_recompute: *mut f32,
+        seq_len: i32, d: i32, batch_size: i32, chunk_size: i32, chunk_idx: i32,
+    );
+
+    /// Titans Phase 2 backward: reverse token loop for one chunk.
+    pub(crate) fn titans_phase2_backward_f32_cuda(
+        k_mem: *const f32, q_mem: *const f32,
+        alpha: *const f32, theta: *const f32, eta: *const f32,
+        errors: *const f32,
+        m_chunk_states: *const f32, s_chunk_states: *const f32,
+        d_y: *const f32,
+        d_k_mem: *mut f32, d_v_mem: *mut f32, d_q_mem: *mut f32,
+        d_alpha: *mut f32, d_theta: *mut f32, d_eta: *mut f32,
+        d_M: *mut f32, d_S: *mut f32, d_M0: *mut f32,
+        m_recompute: *mut f32, s_recompute: *mut f32,
+        seq_len: i32, d: i32, batch_size: i32, chunk_size: i32, chunk_idx: i32,
+    );
+
     // ── Broadcast fill (spec 27) ───────────────────────────────────────
 
     /// Fill dst[b*n_slots*dd + t*dd + i] = src[b*dd + i] for all (b,t,i).

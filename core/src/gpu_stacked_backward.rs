@@ -18,6 +18,10 @@ use crate::gpu_stacked_forward::{GpuStackedCache, GpuBufClone};
 use crate::gpu_backward::{GpuLevelGrads, gpu_memory_backward, gpu_memory_read_only_backward, gpu_matmul_transa_dd};
 #[cfg(feature = "cuda")]
 use crate::model::{MAGConfig, MemoryRuleKind, HopeVariant};
+#[cfg(feature = "cuda")]
+use crate::gpu_profiler::GpuProfiler;
+#[cfg(feature = "cuda")]
+use crate::{prof_start, prof_stop};
 
 // ══════════════════════════════════════════════════════════════════════
 // GpuStackedBlockGrads — per-block gradient buffers
@@ -82,6 +86,7 @@ pub fn gpu_stacked_backward(
     params: &GpuStackedParams,
     cfg: &MAGConfig,
     cache: &GpuStackedCache,
+    profiler: &mut Option<GpuProfiler>,
 ) -> GpuStackedGrads {
     let s = cache.s;
     let d = cache.d;
@@ -105,6 +110,7 @@ pub fn gpu_stacked_backward(
     let d_ln_final_beta = GpuBuf::zeros(d);
 
     // ── Cross-entropy backward ─────────────────────────────────────────
+    prof_start!(profiler, "cross_entropy_bwd", Loss, None, None);
     let d_logits = GpuBuf::zeros(bsv);
     let valid_count = cache.target_ids_i32.iter()
         .filter(|&&t| t >= 0 && (t as usize) < v)
@@ -119,8 +125,10 @@ pub fn gpu_stacked_backward(
             1.0 / count,
         );
     }
+    prof_stop!(profiler);
 
     // ── Unembed backward ───────────────────────────────────────────────
+    prof_start!(profiler, "unembed_bwd", Projection, None, None);
     let mut d_ln_final_out = GpuBuf::zeros(bsd);
     crate::dispatch::cublas_matmul_transb_dd(
         &d_logits, &params.w_unembed, &mut d_ln_final_out, n_tokens, v, d, 0.0,
@@ -129,11 +137,13 @@ pub fn gpu_stacked_backward(
         &cache.ln_final_out, &d_logits, &mut d_w_unembed,
         d, n_tokens, v,
     );
+    prof_stop!(profiler);
 
     // ── Final LN backward ──────────────────────────────────────────────
     // The last block's output (residual_stream) went through ln_final.
     // Reconstruct: residual_out = block_input + gated_out
     //   where gated_out = attn_proj * gate (MAG sigmoid gating)
+    prof_start!(profiler, "ln_final_bwd", LayerNorm, None, None);
     let last_block_cache = &cache.block_caches[n_blocks - 1];
     let residual_stream_final = GpuBuf::zeros(bsd);
     let gated_out_last = GpuBuf::zeros(bsd);
@@ -160,6 +170,7 @@ pub fn gpu_stacked_backward(
             n_tokens as i32, d as i32,
         );
     }
+    prof_stop!(profiler);
 
     // ── Per-block backward (reverse order) ─────────────────────────────
     let mut block_grads = Vec::with_capacity(n_blocks);
@@ -193,6 +204,7 @@ pub fn gpu_stacked_backward(
 
         // d_gated_out = d_residual_stream (from output residual skip)
         // Gating backward: gated_out = attn_proj * gate
+        prof_start!(profiler, "mag_gate_bwd", Composition, Some(b), None);
         let d_attn_proj = GpuBuf::zeros(bsd);
         let d_gate = GpuBuf::zeros(bsd);
         unsafe {
@@ -209,6 +221,7 @@ pub fn gpu_stacked_backward(
                 d_gate.as_ptr(), bc.gate.as_ptr(), d_y_combined.ptr(), bsd_i32,
             );
         }
+        prof_stop!(profiler);
 
         let is_chained = matches!(cfg.hope_variant, HopeVariant::Chained | HopeVariant::Sequential);
 
@@ -264,6 +277,7 @@ pub fn gpu_stacked_backward(
 
                 // Dispatch based on forward's cached mode (memory_caches[level].is_some()),
                 // not pulse.active_levels, to match SwiGluMlp promotion logic.
+                prof_start!(profiler, "memory_bwd", MemoryBackward, Some(b), Some(level));
                 if let Some(ref mem_cache) = bc.memory_caches[level] {
                     let d_emb_level = gpu_memory_backward(
                         &block.levels[level], cfg, mem_cache,
@@ -282,6 +296,7 @@ pub fn gpu_stacked_backward(
                     );
                     d_upstream = d_emb_level;
                 }
+                prof_stop!(profiler);
             }
 
             // d_upstream is now d_ln_mem_out
@@ -324,6 +339,7 @@ pub fn gpu_stacked_backward(
                 }
 
                 // Dispatch based on forward's cached mode (memory_caches.is_some())
+                prof_start!(profiler, "memory_bwd", MemoryBackward, Some(b), Some(level));
                 if let Some(ref mem_cache) = bc.memory_caches[level] {
                     let d_emb_level = gpu_memory_backward(
                         &block.levels[level], cfg, mem_cache,
@@ -345,10 +361,12 @@ pub fn gpu_stacked_backward(
                         crate::cuda_ffi::saxpy_cuda(1.0, d_emb_level.as_ptr(), d_mem_input.ptr(), bsd_i32);
                     }
                 }
+                prof_stop!(profiler);
             }
         }
 
         // ── LN_mem backward ────────────────────────────────────────
+        prof_start!(profiler, "ln_mem_bwd", LayerNorm, Some(b), None);
         let d_residual_after_attn = GpuBuf::zeros(bsd);
         unsafe {
             crate::cuda_ffi::layer_norm_backward_cuda(
@@ -363,6 +381,7 @@ pub fn gpu_stacked_backward(
                 n_tokens as i32, d as i32,
             );
         }
+        prof_stop!(profiler);
 
         // ── Residual skip 1 backward ───────────────────────────────
         // residual_after_attn = block_input + attn_proj
@@ -377,6 +396,7 @@ pub fn gpu_stacked_backward(
         // d_attn_out = d_attn_proj @ W_O
         // d_w_o = d_attn_proj^T @ attn_out
         // Spec: specs/infrastructure/18_stacked_w_o_output_projection.md
+        prof_start!(profiler, "out_proj_bwd", Projection, Some(b), None);
         let mut d_attn_out = GpuBuf::zeros(bsd);
         crate::dispatch::cublas_matmul_dd(
             &d_attn_proj, &block.w_o, &mut d_attn_out,
@@ -386,8 +406,10 @@ pub fn gpu_stacked_backward(
             &d_attn_proj, &bc.attn_out, &mut d_w_o,
             d, n_tokens, d,
         );
+        prof_stop!(profiler);
 
         // ── SWA backward ───────────────────────────────────────────
+        prof_start!(profiler, "swa_bwd", Attention, Some(b), None);
         let mut d_q = GpuBuf::zeros(bsd);
         let mut d_k = GpuBuf::zeros(bsd);
         let mut d_v = GpuBuf::zeros(bsd);
@@ -398,8 +420,10 @@ pub fn gpu_stacked_backward(
             &mut d_q, &mut d_k, &mut d_v,
             s, nh, hd, ws, bs,
         );
+        prof_stop!(profiler);
 
         // ── QKV projection backward ───────────────────────────────
+        prof_start!(profiler, "qkv_proj_bwd", Projection, Some(b), None);
         let mut d_qkv_source = GpuBuf::zeros(bsd);
         crate::dispatch::cublas_matmul_acc_dd(&d_q, &block.w_q, &mut d_qkv_source, n_tokens, d, d);
         crate::dispatch::cublas_matmul_acc_dd(&d_k, &block.w_k, &mut d_qkv_source, n_tokens, d, d);
@@ -408,8 +432,10 @@ pub fn gpu_stacked_backward(
         gpu_matmul_transa_dd(&d_q, &bc.ln_attn_out, &mut d_w_q, d, n_tokens, d);
         gpu_matmul_transa_dd(&d_k, &bc.ln_attn_out, &mut d_w_k, d, n_tokens, d);
         gpu_matmul_transa_dd(&d_v, &bc.ln_attn_out, &mut d_w_v, d, n_tokens, d);
+        prof_stop!(profiler);
 
         // ── LN_attn backward ──────────────────────────────────────
+        prof_start!(profiler, "ln_attn_bwd", LayerNorm, Some(b), None);
         let d_block_input = GpuBuf::zeros(bsd);
         unsafe {
             crate::cuda_ffi::layer_norm_backward_cuda(
@@ -424,6 +450,7 @@ pub fn gpu_stacked_backward(
                 n_tokens as i32, d as i32,
             );
         }
+        prof_stop!(profiler);
         // block_input is used in two places:
         //   1. residual_out = block_input + gated_out  → d_block_input += d_residual_stream
         //   2. residual_after_attn = block_input + attn_proj → d_block_input += d_residual_after_attn
@@ -447,6 +474,7 @@ pub fn gpu_stacked_backward(
 
     // ── Embedding scatter-add ──────────────────────────────────────────
     // d_residual_stream is now d_embedded (gradient w.r.t. embedding output)
+    prof_start!(profiler, "embed_scatter", Embedding, None, None);
     unsafe {
         crate::cuda_ffi::embedding_scatter_add_cuda(
             d_residual_stream.as_ptr(),
@@ -455,6 +483,7 @@ pub fn gpu_stacked_backward(
             n_tokens as i32, d as i32,
         );
     }
+    prof_stop!(profiler);
 
     crate::dispatch::cuda_sync();
 

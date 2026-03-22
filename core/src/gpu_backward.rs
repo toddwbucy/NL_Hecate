@@ -621,14 +621,26 @@ pub(crate) fn gpu_memory_backward(
             let mut d_theta = GpuBuf::zeros(bs_s);
             let mut d_m_initial = GpuBuf::zeros(dd);
 
-            crate::dispatch::delta_chunkwise_backward_dd(
-                k_mem, v_mem, q_mem, alpha, theta,
-                m_chunk_states, d_y,
-                &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
-                &mut d_alpha, &mut d_theta, &mut d_m_initial,
-                s, d, batch_size, *chunk_size,
-                cfg.error_clip_for_level(level),
-            );
+            if *chunk_size > 1 {
+                // Spec 44: batched cuBLAS backward
+                crate::dispatch::delta_chunkwise_backward_batched_dd(
+                    k_mem, v_mem, q_mem, alpha, theta,
+                    m_chunk_states, d_y,
+                    &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
+                    &mut d_alpha, &mut d_theta, &mut d_m_initial,
+                    s, d, batch_size, *chunk_size,
+                    cfg.error_clip_for_level(level),
+                );
+            } else {
+                crate::dispatch::delta_chunkwise_backward_dd(
+                    k_mem, v_mem, q_mem, alpha, theta,
+                    m_chunk_states, d_y,
+                    &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
+                    &mut d_alpha, &mut d_theta, &mut d_m_initial,
+                    s, d, batch_size, *chunk_size,
+                    cfg.error_clip_for_level(level),
+                );
+            }
 
             let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
             let alpha_ceil  = cfg.alpha_ceil.get(level).copied().unwrap_or(1.0);
@@ -668,15 +680,28 @@ pub(crate) fn gpu_memory_backward(
             let mut d_m_initial = GpuBuf::zeros(dd);
             let mut d_s_initial = GpuBuf::zeros(dd);
 
-            crate::dispatch::titans_chunkwise_backward_dd(
-                k_mem, v_mem, q_mem, alpha, theta, eta,
-                m_chunk_states, s_chunk_states, d_y,
-                &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
-                &mut d_alpha, &mut d_theta, &mut d_eta,
-                &mut d_m_initial, &mut d_s_initial,
-                s, d, batch_size, *chunk_size,
-                cfg.error_clip_for_level(level),
-            );
+            if *chunk_size > 1 {
+                // Spec 44: batched cuBLAS backward
+                crate::dispatch::titans_chunkwise_backward_batched_dd(
+                    k_mem, v_mem, q_mem, alpha, theta, eta,
+                    m_chunk_states, s_chunk_states, d_y,
+                    &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
+                    &mut d_alpha, &mut d_theta, &mut d_eta,
+                    &mut d_m_initial, &mut d_s_initial,
+                    s, d, batch_size, *chunk_size,
+                    cfg.error_clip_for_level(level),
+                );
+            } else {
+                crate::dispatch::titans_chunkwise_backward_dd(
+                    k_mem, v_mem, q_mem, alpha, theta, eta,
+                    m_chunk_states, s_chunk_states, d_y,
+                    &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
+                    &mut d_alpha, &mut d_theta, &mut d_eta,
+                    &mut d_m_initial, &mut d_s_initial,
+                    s, d, batch_size, *chunk_size,
+                    cfg.error_clip_for_level(level),
+                );
+            }
 
             let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
             let alpha_ceil  = cfg.alpha_ceil.get(level).copied().unwrap_or(1.0);

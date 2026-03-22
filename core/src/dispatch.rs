@@ -191,6 +191,13 @@ extern "C" {
         beta: *const f32,
         c: *mut f32, ldc: i32,
     ) -> i32;
+    fn cublasSaxpy_v2(
+        handle: *mut std::ffi::c_void,
+        n: i32,
+        alpha: *const f32,
+        x: *const f32, incx: i32,
+        y: *mut f32, incy: i32,
+    ) -> i32;
 }
 
 /// Thread-safe wrapper for cuBLAS handle (raw pointer).
@@ -2166,6 +2173,359 @@ pub fn titans_chunkwise_backward_dd(
             d_m_initial.ptr(), d_s_initial.ptr(),
             seq_len as i32, d as i32, batch_size as i32, chunk_size as i32, error_clip,
         );
+    }
+}
+
+// ── Spec 44: Batched cuBLAS Phase 1 orchestration ─────────────────────
+
+/// Delta chunkwise forward with batched cuBLAS Phase 1.
+/// Per-chunk loop: cuBLAS GEMM for predictions, error_subtract_clip, Phase 2 kernel.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn delta_chunkwise_forward_batched_dd(
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>,
+    m_initial: &GpuSlice<f32>,
+    m_chunk_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
+    seq_len: usize, d: usize, batch_size: usize, chunk_size: usize, error_clip: f32,
+) {
+    let dd = d * d;
+    let num_chunks = (seq_len + chunk_size - 1) / chunk_size;
+
+    // Allocate persistent workspaces
+    let m_work = GpuBuf::<f32>::zeros(batch_size * dd);
+    let predictions = GpuBuf::<f32>::zeros(batch_size * chunk_size * d);
+
+    // Initialize m_work from m_initial
+    unsafe { m_work.copy_from_device_ptr(m_initial.as_ptr(), batch_size * dd); }
+
+    for c in 0..num_chunks {
+        let t_start = c * chunk_size;
+        let t_end = std::cmp::min(t_start + chunk_size, seq_len);
+        let c_len = t_end - t_start;
+
+        // Phase 1: cuBLAS GEMM per batch element
+        // predictions[b, c_len, d] = K_chunk[b, c_len, d] @ M₀ᵀ[b, d, d]
+        for b in 0..batch_size {
+            let k_offset = b * seq_len * d + t_start * d;
+            let m_offset = b * dd;
+            let pred_offset = b * chunk_size * d;
+
+            let alpha_val: f32 = 1.0;
+            let beta_val: f32 = 0.0;
+            unsafe {
+                cublasSgemm_v2(
+                    cublas_handle(),
+                    CUBLAS_OP_T, CUBLAS_OP_N,
+                    d as i32, c_len as i32, d as i32,
+                    &alpha_val,
+                    m_work.as_ptr().add(m_offset), d as i32,
+                    k_mem.as_ptr().add(k_offset), d as i32,
+                    &beta_val,
+                    predictions.ptr().add(pred_offset), d as i32,
+                );
+            }
+        }
+
+        // Error subtract + clip: predictions -= V_chunk, then L2 clip
+        for b in 0..batch_size {
+            let v_offset = b * seq_len * d + t_start * d;
+            let pred_offset = b * chunk_size * d;
+            unsafe {
+                crate::cuda_ffi::error_subtract_clip_f32_cuda(
+                    predictions.ptr().add(pred_offset),
+                    v_mem.as_ptr().add(v_offset),
+                    c_len as i32, d as i32, error_clip,
+                );
+            }
+        }
+
+        // Phase 2: sequential recurrence + readout + boundary store
+        unsafe {
+            crate::cuda_ffi::delta_phase2_forward_f32_cuda(
+                k_mem.as_ptr(), q_mem.as_ptr(),
+                alpha.as_ptr(), theta.as_ptr(),
+                predictions.as_ptr(), m_work.ptr(),
+                m_chunk_states.ptr(), y.ptr(),
+                seq_len as i32, d as i32, batch_size as i32,
+                chunk_size as i32, c as i32,
+            );
+        }
+    }
+}
+
+/// Titans chunkwise forward with batched cuBLAS Phase 1.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn titans_chunkwise_forward_batched_dd(
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>, eta: &GpuBuf<f32>,
+    m_initial: &GpuSlice<f32>, s_initial: &GpuSlice<f32>,
+    m_chunk_states: &mut GpuBuf<f32>, s_chunk_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
+    seq_len: usize, d: usize, batch_size: usize, chunk_size: usize, error_clip: f32,
+) {
+    let dd = d * d;
+    let num_chunks = (seq_len + chunk_size - 1) / chunk_size;
+
+    let m_work = GpuBuf::<f32>::zeros(batch_size * dd);
+    let s_work = GpuBuf::<f32>::zeros(batch_size * dd);
+    let predictions = GpuBuf::<f32>::zeros(batch_size * chunk_size * d);
+
+    // Initialize m_work from m_initial, s_work from s_initial
+    unsafe {
+        m_work.copy_from_device_ptr(m_initial.as_ptr(), batch_size * dd);
+        s_work.copy_from_device_ptr(s_initial.as_ptr(), batch_size * dd);
+    }
+
+    for c in 0..num_chunks {
+        let t_start = c * chunk_size;
+        let t_end = std::cmp::min(t_start + chunk_size, seq_len);
+        let c_len = t_end - t_start;
+
+        // Phase 1: cuBLAS GEMM per batch element
+        for b in 0..batch_size {
+            let k_offset = b * seq_len * d + t_start * d;
+            let m_offset = b * dd;
+            let pred_offset = b * chunk_size * d;
+
+            let alpha_val: f32 = 1.0;
+            let beta_val: f32 = 0.0;
+            unsafe {
+                cublasSgemm_v2(
+                    cublas_handle(),
+                    CUBLAS_OP_T, CUBLAS_OP_N,
+                    d as i32, c_len as i32, d as i32,
+                    &alpha_val,
+                    m_work.as_ptr().add(m_offset), d as i32,
+                    k_mem.as_ptr().add(k_offset), d as i32,
+                    &beta_val,
+                    predictions.ptr().add(pred_offset), d as i32,
+                );
+            }
+        }
+
+        // Error subtract + clip
+        for b in 0..batch_size {
+            let v_offset = b * seq_len * d + t_start * d;
+            let pred_offset = b * chunk_size * d;
+            unsafe {
+                crate::cuda_ffi::error_subtract_clip_f32_cuda(
+                    predictions.ptr().add(pred_offset),
+                    v_mem.as_ptr().add(v_offset),
+                    c_len as i32, d as i32, error_clip,
+                );
+            }
+        }
+
+        // Phase 2: sequential recurrence + readout + boundary store
+        unsafe {
+            crate::cuda_ffi::titans_phase2_forward_f32_cuda(
+                k_mem.as_ptr(), q_mem.as_ptr(),
+                alpha.as_ptr(), theta.as_ptr(), eta.as_ptr(),
+                predictions.as_ptr(), m_work.ptr(), s_work.ptr(),
+                m_chunk_states.ptr(), s_chunk_states.ptr(), y.ptr(),
+                seq_len as i32, d as i32, batch_size as i32,
+                chunk_size as i32, c as i32,
+            );
+        }
+    }
+}
+
+/// Delta chunkwise backward with batched cuBLAS Phase 1 error recompute.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn delta_chunkwise_backward_batched_dd(
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>,
+    m_chunk_states: &GpuBuf<f32>, d_y: &GpuBuf<f32>,
+    d_k_mem: &mut GpuBuf<f32>, d_v_mem: &mut GpuBuf<f32>, d_q_mem: &mut GpuBuf<f32>,
+    d_alpha: &mut GpuBuf<f32>, d_theta: &mut GpuBuf<f32>, d_m_initial: &mut GpuBuf<f32>,
+    seq_len: usize, d: usize, batch_size: usize, chunk_size: usize, error_clip: f32,
+) {
+    let dd = d * d;
+    let num_chunks = (seq_len + chunk_size - 1) / chunk_size;
+
+    // Allocate workspaces
+    let d_M = GpuBuf::<f32>::zeros(batch_size * dd);
+    let d_M0 = GpuBuf::<f32>::zeros(batch_size * dd);
+    let m_recompute = GpuBuf::<f32>::zeros(batch_size * (chunk_size + 1) * dd);
+    let errors = GpuBuf::<f32>::zeros(batch_size * chunk_size * d);
+
+    // Process chunks in reverse
+    for c in (0..num_chunks).rev() {
+        let t_start = c * chunk_size;
+        let t_end = std::cmp::min(t_start + chunk_size, seq_len);
+        let c_len = t_end - t_start;
+
+        // Phase 1: recompute errors via cuBLAS GEMM
+        for b in 0..batch_size {
+            let k_offset = b * seq_len * d + t_start * d;
+            let m_cs_offset = b * (num_chunks + 1) * dd + c * dd;
+            let err_offset = b * chunk_size * d;
+
+            let alpha_val: f32 = 1.0;
+            let beta_val: f32 = 0.0;
+            unsafe {
+                cublasSgemm_v2(
+                    cublas_handle(),
+                    CUBLAS_OP_T, CUBLAS_OP_N,
+                    d as i32, c_len as i32, d as i32,
+                    &alpha_val,
+                    m_chunk_states.as_ptr().add(m_cs_offset), d as i32,
+                    k_mem.as_ptr().add(k_offset), d as i32,
+                    &beta_val,
+                    errors.ptr().add(err_offset), d as i32,
+                );
+            }
+        }
+
+        // Error subtract + clip
+        for b in 0..batch_size {
+            let v_offset = b * seq_len * d + t_start * d;
+            let err_offset = b * chunk_size * d;
+            unsafe {
+                crate::cuda_ffi::error_subtract_clip_f32_cuda(
+                    errors.ptr().add(err_offset),
+                    v_mem.as_ptr().add(v_offset),
+                    c_len as i32, d as i32, error_clip,
+                );
+            }
+        }
+
+        // Phase 2 backward
+        unsafe {
+            crate::cuda_ffi::delta_phase2_backward_f32_cuda(
+                k_mem.as_ptr(), q_mem.as_ptr(),
+                alpha.as_ptr(), theta.as_ptr(),
+                errors.as_ptr(), m_chunk_states.as_ptr(),
+                d_y.as_ptr(),
+                d_k_mem.ptr(), d_v_mem.ptr(), d_q_mem.ptr(),
+                d_alpha.ptr(), d_theta.ptr(),
+                d_M.ptr(), d_M0.ptr(), m_recompute.ptr(),
+                seq_len as i32, d as i32, batch_size as i32,
+                chunk_size as i32, c as i32,
+            );
+        }
+    }
+
+    // d_M holds per-batch gradients w.r.t. m_initial — need to sum across batch.
+    // The monolithic kernel does this via atomicAdd. We need the same behavior.
+    // Zero d_m_initial first, then accumulate each batch element.
+    d_m_initial.zero();
+    for b in 0..batch_size {
+        // d_m_initial[i] += d_M[b*dd + i]
+        let d_m_slice = d_M.slice(b * dd, dd);
+        // Accumulate using cuBLAS saxpy: y = alpha*x + y
+        let alpha_one: f32 = 1.0;
+        unsafe {
+            cublasSaxpy_v2(
+                cublas_handle(),
+                dd as i32,
+                &alpha_one,
+                d_m_slice.as_ptr(), 1,
+                d_m_initial.ptr(), 1,
+            );
+        }
+    }
+}
+
+/// Titans chunkwise backward with batched cuBLAS Phase 1 error recompute.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn titans_chunkwise_backward_batched_dd(
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>, eta: &GpuBuf<f32>,
+    m_chunk_states: &GpuBuf<f32>, s_chunk_states: &GpuBuf<f32>, d_y: &GpuBuf<f32>,
+    d_k_mem: &mut GpuBuf<f32>, d_v_mem: &mut GpuBuf<f32>, d_q_mem: &mut GpuBuf<f32>,
+    d_alpha: &mut GpuBuf<f32>, d_theta: &mut GpuBuf<f32>, d_eta: &mut GpuBuf<f32>,
+    d_m_initial: &mut GpuBuf<f32>, d_s_initial: &mut GpuBuf<f32>,
+    seq_len: usize, d: usize, batch_size: usize, chunk_size: usize, error_clip: f32,
+) {
+    let dd = d * d;
+    let num_chunks = (seq_len + chunk_size - 1) / chunk_size;
+
+    let d_M = GpuBuf::<f32>::zeros(batch_size * dd);
+    let d_S = GpuBuf::<f32>::zeros(batch_size * dd);
+    let d_M0 = GpuBuf::<f32>::zeros(batch_size * dd);
+    let m_recompute = GpuBuf::<f32>::zeros(batch_size * (chunk_size + 1) * dd);
+    let s_recompute = GpuBuf::<f32>::zeros(batch_size * (chunk_size + 1) * dd);
+    let errors = GpuBuf::<f32>::zeros(batch_size * chunk_size * d);
+
+    for c in (0..num_chunks).rev() {
+        let t_start = c * chunk_size;
+        let t_end = std::cmp::min(t_start + chunk_size, seq_len);
+        let c_len = t_end - t_start;
+
+        // Phase 1: recompute errors via cuBLAS
+        for b in 0..batch_size {
+            let k_offset = b * seq_len * d + t_start * d;
+            let m_cs_offset = b * (num_chunks + 1) * dd + c * dd;
+            let err_offset = b * chunk_size * d;
+
+            let alpha_val: f32 = 1.0;
+            let beta_val: f32 = 0.0;
+            unsafe {
+                cublasSgemm_v2(
+                    cublas_handle(),
+                    CUBLAS_OP_T, CUBLAS_OP_N,
+                    d as i32, c_len as i32, d as i32,
+                    &alpha_val,
+                    m_chunk_states.as_ptr().add(m_cs_offset), d as i32,
+                    k_mem.as_ptr().add(k_offset), d as i32,
+                    &beta_val,
+                    errors.ptr().add(err_offset), d as i32,
+                );
+            }
+        }
+
+        // Error subtract + clip
+        for b in 0..batch_size {
+            let v_offset = b * seq_len * d + t_start * d;
+            let err_offset = b * chunk_size * d;
+            unsafe {
+                crate::cuda_ffi::error_subtract_clip_f32_cuda(
+                    errors.ptr().add(err_offset),
+                    v_mem.as_ptr().add(v_offset),
+                    c_len as i32, d as i32, error_clip,
+                );
+            }
+        }
+
+        // Phase 2 backward
+        unsafe {
+            crate::cuda_ffi::titans_phase2_backward_f32_cuda(
+                k_mem.as_ptr(), q_mem.as_ptr(),
+                alpha.as_ptr(), theta.as_ptr(), eta.as_ptr(),
+                errors.as_ptr(),
+                m_chunk_states.as_ptr(), s_chunk_states.as_ptr(),
+                d_y.as_ptr(),
+                d_k_mem.ptr(), d_v_mem.ptr(), d_q_mem.ptr(),
+                d_alpha.ptr(), d_theta.ptr(), d_eta.ptr(),
+                d_M.ptr(), d_S.ptr(), d_M0.ptr(),
+                m_recompute.ptr(), s_recompute.ptr(),
+                seq_len as i32, d as i32, batch_size as i32,
+                chunk_size as i32, c as i32,
+            );
+        }
+    }
+
+    // Accumulate per-batch gradients into d_m_initial, d_s_initial
+    d_m_initial.zero();
+    d_s_initial.zero();
+    for b in 0..batch_size {
+        let alpha_one: f32 = 1.0;
+        unsafe {
+            cublasSaxpy_v2(
+                cublas_handle(), dd as i32, &alpha_one,
+                d_M.as_ptr().add(b * dd), 1,
+                d_m_initial.ptr(), 1,
+            );
+            cublasSaxpy_v2(
+                cublas_handle(), dd as i32, &alpha_one,
+                d_S.as_ptr().add(b * dd), 1,
+                d_s_initial.ptr(), 1,
+            );
+        }
     }
 }
 

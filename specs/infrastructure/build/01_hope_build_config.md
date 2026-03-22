@@ -50,6 +50,19 @@ Three areas where Python cannot reach existing Rust primitives:
 
 -- Gap 3: No reference HOPE config
 --   No configs/hope_Nm.json file exists to demonstrate the full configuration.
+
+-- Gap 4: BuildConfig missing MIRAS MLP fields
+--   MONETA/YAAD require: d_hidden, lp_p, lq_q, lambda_2, sign_sharpness,
+--   huber_delta (YAAD), lambda_local (YAAD).
+--   PyO3 MAGConfig already accepts these as optional kwargs with defaults:
+--     d_hidden=0, lp_p=2.0, sign_sharpness=10.0, lq_q=2.0, lambda_2=0.0
+--   But BuildConfig does not expose them, so loop.py never passes them
+--   to the MAGConfig constructor. Result: MONETA gets d_hidden=0 (broken MLP).
+--   See: python/src/lib.rs MAGConfig.__init__() kwargs,
+--        python/engine/config.py BuildConfig fields,
+--        python/engine/loop.py MAGConfig() construction at line ~602.
+--   Source: MIRAS (2504.13173) Eqs 24-26, Table 2.
+--   Cross-ref: specs/infrastructure/cuda/07_mlp_memory_kernels.md
 ```
 
 ## PyO3 MAGConfig Extension
@@ -96,6 +109,37 @@ momentum_kind: str = "none"                -- "none" or "ema"
 momentum_d_hidden: int = 0                 -- momentum MLP hidden dim
 
 -- All defaults match Phase 1 (existing behavior).
+
+-- MIRAS MLP fields (Gap 4)
+d_hidden: int = 0                          -- MLP hidden dim (0 = matrix rule, >0 = MLP)
+lp_p: float = 2.0                         -- l_p exponent (MONETA: 3.0 recommended)
+sign_sharpness: float = 10.0              -- smooth sign: tanh(a*e) sharpness
+lq_q: float = 2.0                         -- L_q retention exponent (MONETA: 4.0)
+lambda_2: float = 0.0                     -- global L2 retention strength (MONETA/YAAD: 0.01)
+huber_delta: float = 1.0                  -- Huber threshold (YAAD only)
+lambda_local: float = 0.0                 -- local retention strength (YAAD only)
+
+-- Defaults preserve backward compatibility:
+--   d_hidden=0 → matrix memory (Titans/Delta/Hebbian behavior)
+--   lp_p=2.0, lq_q=2.0 → standard L2 (no effect on matrix rules)
+--   lambda_2=0.0 → no global retention (existing behavior)
+--   huber_delta=1.0, lambda_local=0.0 → inactive for non-YAAD rules
+
+-- Validation:
+--   if memory_rule in ("moneta", "yaad", "memora") and d_hidden == 0:
+--     raise ValueError("MLP rules require d_hidden > 0")
+--   if memory_rule == "yaad" and lambda_local <= 0:
+--     warn("YAAD without lambda_local has no local retention — equivalent to MONETA with Huber")
+
+-- MAGConfig construction threading (loop.py ~602):
+--   cfg = nl_hecate.MAGConfig(
+--       ...,
+--       d_hidden=bcfg.d_hidden,
+--       lp_p=bcfg.lp_p,
+--       sign_sharpness=bcfg.sign_sharpness,
+--       lq_q=bcfg.lq_q,
+--       lambda_2=bcfg.lambda_2,
+--   )
 ```
 
 ## Config JSON Schema
