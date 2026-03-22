@@ -2842,6 +2842,10 @@ struct GpuStackedModel {
     last_l0_block_gnorms: Vec<f32>,
     /// GPU profiler for per-step heatmap (spec 38). None when disabled.
     profiler: Option<nl_hecate_core::gpu_profiler::GpuProfiler>,
+    /// Per-block KV caches for single-token decode (spec 47).
+    kv_caches: Option<Vec<nl_hecate_core::gpu_forward::GpuKVCache>>,
+    /// Pre-allocated workspace for single-token decode (spec 47).
+    decode_workspace: Option<nl_hecate_core::gpu_stacked_forward::StackedDecodeWorkspace>,
 }
 
 #[cfg(feature = "cuda")]
@@ -2878,6 +2882,8 @@ impl GpuStackedModel {
             last_block_gnorms: Vec::new(),
             last_l0_block_gnorms: Vec::new(),
             profiler: None,
+            kv_caches: None,
+            decode_workspace: None,
         })
     }
 
@@ -2926,6 +2932,8 @@ impl GpuStackedModel {
             last_block_gnorms: Vec::new(),
             last_l0_block_gnorms: Vec::new(),
             profiler: None,
+            kv_caches: None,
+            decode_workspace: None,
         })
     }
 
@@ -3206,6 +3214,67 @@ impl GpuStackedModel {
     /// Reset all memory across all blocks.
     fn reset_context(&mut self) {
         self.context.reset();
+    }
+
+    /// Prefill: process full prompt through all blocks, populate per-block KV caches,
+    /// return last-position logits [vocab_size]. Call once before decode_token loop.
+    /// Spec: specs/infrastructure/47_single_token_decode.md
+    fn prefill(&mut self, input_ids: Vec<usize>, pulse: &Pulse) -> PyResult<Vec<f32>> {
+        let s = self.cfg.swa.seq_len;
+        let v = self.cfg.swa.vocab_size;
+        let d = self.cfg.swa.d_model;
+        if self.context.batch_size != 1 {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                format!("prefill/decode_token only supports batch_size=1 (got {})", self.context.batch_size)));
+        }
+        if input_ids.len() != s {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("input_ids length {} != seq_len {}", input_ids.len(), s)));
+        }
+        if let Some(&max_id) = input_ids.iter().max() {
+            if max_id >= v {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("input_ids contains {} >= vocab_size {}", max_id, v)));
+            }
+        }
+        let mut kv_caches = Vec::new();
+        let logits = nl_hecate_core::gpu_stacked_forward::gpu_stacked_prefill(
+            &self.params, &self.cfg, &input_ids,
+            &pulse.inner, &mut self.context, &mut kv_caches, &mut self.profiler,
+        );
+        self.kv_caches = Some(kv_caches);
+        self.decode_workspace = Some(
+            nl_hecate_core::gpu_stacked_forward::StackedDecodeWorkspace::new(self.n_blocks, d, v),
+        );
+        Ok(logits)
+    }
+
+    /// Decode one token using per-block KV caches + M state. Returns logits [vocab_size].
+    /// Must call prefill() first. O(d^2) per token, not O(seq_len * d^2).
+    /// Spec: specs/infrastructure/47_single_token_decode.md
+    fn decode_token(&mut self, token_id: usize, pulse: &Pulse) -> PyResult<Vec<f32>> {
+        let v = self.cfg.swa.vocab_size;
+        if token_id >= v {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("token_id {} >= vocab_size {}", token_id, v)));
+        }
+        let kv_caches = self.kv_caches.as_mut().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("KV caches not initialized — call prefill() first")
+        })?;
+        let workspace = self.decode_workspace.as_mut().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("Decode workspace not initialized — call prefill() first")
+        })?;
+        let logits = nl_hecate_core::gpu_stacked_forward::gpu_stacked_decode_token(
+            &self.params, &self.cfg, token_id,
+            &pulse.inner, &mut self.context, kv_caches, workspace,
+        );
+        Ok(logits)
+    }
+
+    /// Clear KV caches and decode workspace. Call between generation sequences.
+    fn reset_cache(&mut self) {
+        self.kv_caches = None;
+        self.decode_workspace = None;
     }
 
     /// Per-(block, level) M norm deltas from the most recent step (spec 28).
