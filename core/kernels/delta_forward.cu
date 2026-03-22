@@ -87,19 +87,22 @@ __global__ void delta_forward_kernel(
     const float* __restrict__ m_initial,  // [batch_size, d*d]
     float* __restrict__ m_states,         // [batch_size, (seq_len+1)*d*d]
     float* __restrict__ y,                // [batch_size, seq_len, d]
-    int seq_len, int d, float error_clip)
+    int seq_len, int d, int input_stride, int m_stride,
+    float error_clip)
 {
     int b = blockIdx.x;   // batch index
     int tid = threadIdx.x;
     int dd = d * d;
 
     // Offset all pointers to this batch element's slice
-    k_mem    += b * seq_len * d;
-    v_mem    += b * seq_len * d;
-    q_mem    += b * seq_len * d;
-    alpha    += b * seq_len;
-    theta    += b * seq_len;
-    m_initial += b * dd;
+    // input_stride separates heads in input buffers (= seq_len for normal, full_s for replay)
+    // m_stride separates heads in m_initial (= dd for normal, num_ckpt*dd for replay)
+    k_mem    += b * input_stride * d;
+    v_mem    += b * input_stride * d;
+    q_mem    += b * input_stride * d;
+    alpha    += b * input_stride;
+    theta    += b * input_stride;
+    m_initial += b * m_stride;
     m_states  += b * (seq_len + 1) * dd;
     y         += b * seq_len * d;
 
@@ -410,7 +413,8 @@ extern "C" void delta_forward_f32_cuda(
     const float* k_mem, const float* v_mem, const float* q_mem,
     const float* alpha, const float* theta, const float* m_initial,
     float* m_states, float* y,
-    int seq_len, int d, int batch_size, float error_clip)
+    int seq_len, int d, int batch_size,
+    int input_stride, int m_stride, float error_clip)
 {
     if (d <= 0 || 8 * d * (int)sizeof(float) > 163840) {
         fprintf(stderr, "delta_forward_f32_cuda: d=%d out of range (must be 1..=5120).\n", d);
@@ -445,6 +449,6 @@ extern "C" void delta_forward_f32_cuda(
 
     delta_forward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_initial,
-        m_states, y, seq_len, d, error_clip);
+        m_states, y, seq_len, d, input_stride, m_stride, error_clip);
     check_cuda_launch("delta_forward_kernel", d, smem_bytes);
 }

@@ -1490,7 +1490,8 @@ fn cuda_delta_forward(
             dev_km.ptr, dev_vm.ptr, dev_qm.ptr,
             dev_alpha.ptr, dev_theta.ptr, dev_minit.ptr,
             dev_mstates.ptr, dev_y.ptr,
-            seq_len as i32, d as i32, 1, error_clip,
+            seq_len as i32, d as i32, 1,
+            seq_len as i32, (d * d) as i32, error_clip,
         );
         let rc = cudaDeviceSynchronize();
         assert_eq!(rc, 0, "cudaDeviceSynchronize failed after delta forward (error {rc})");
@@ -1597,7 +1598,8 @@ fn cuda_titans_forward(
             dev_alpha.ptr, dev_theta.ptr, dev_eta.ptr,
             dev_minit.ptr, dev_sinit.ptr,
             dev_mstates.ptr, dev_sstates.ptr, dev_y.ptr,
-            seq_len as i32, d as i32, 1, error_clip,
+            seq_len as i32, d as i32, 1,
+            seq_len as i32, (d * d) as i32, error_clip,
         );
         let rc = cudaDeviceSynchronize();
         assert_eq!(rc, 0, "cudaDeviceSynchronize failed after titans forward (error {rc})");
@@ -1710,7 +1712,8 @@ fn cuda_hebbian_forward(
             dev_km.ptr, dev_vm.ptr, dev_qm.ptr,
             dev_alpha.ptr, dev_minit.ptr,
             dev_mstates.ptr, dev_y.ptr,
-            seq_len as i32, d as i32,
+            seq_len as i32, d as i32, 1,
+            seq_len as i32, (d * d) as i32,
         );
         let rc = cudaDeviceSynchronize();
         assert_eq!(rc, 0, "cudaDeviceSynchronize failed after hebbian forward (error {rc})");
@@ -1804,7 +1807,8 @@ fn cuda_dgd_forward(
             dev_km.ptr, dev_vm.ptr, dev_qm.ptr,
             dev_alpha.ptr, dev_theta.ptr, dev_minit.ptr,
             dev_mstates.ptr, dev_y.ptr,
-            seq_len as i32, d as i32, error_clip,
+            seq_len as i32, d as i32, 1,
+            seq_len as i32, (d * d) as i32, error_clip,
         );
         let rc = cudaDeviceSynchronize();
         assert_eq!(rc, 0, "cudaDeviceSynchronize failed after dgd forward (error {rc})");
@@ -2001,7 +2005,8 @@ pub fn delta_forward_dd(
     alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>,
     m_initial: &GpuSlice<f32>,
     m_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
-    seq_len: usize, d: usize, batch_size: usize, error_clip: f32,
+    seq_len: usize, d: usize, batch_size: usize,
+    input_stride: usize, m_stride: usize, error_clip: f32,
 ) {
     unsafe {
         crate::cuda_ffi::delta_forward_f32_cuda(
@@ -2009,7 +2014,8 @@ pub fn delta_forward_dd(
             alpha.as_ptr(), theta.as_ptr(),
             m_initial.as_ptr(),
             m_states.ptr(), y.ptr(),
-            seq_len as i32, d as i32, batch_size as i32, error_clip,
+            seq_len as i32, d as i32, batch_size as i32,
+            input_stride as i32, m_stride as i32, error_clip,
         );
     }
 }
@@ -2043,7 +2049,8 @@ pub fn titans_forward_dd(
     alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>, eta: &GpuBuf<f32>,
     m_initial: &GpuSlice<f32>, s_initial: &GpuSlice<f32>,
     m_states: &mut GpuBuf<f32>, s_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
-    seq_len: usize, d: usize, batch_size: usize, error_clip: f32,
+    seq_len: usize, d: usize, batch_size: usize,
+    input_stride: usize, m_stride: usize, error_clip: f32,
 ) {
     unsafe {
         crate::cuda_ffi::titans_forward_f32_cuda(
@@ -2051,7 +2058,8 @@ pub fn titans_forward_dd(
             alpha.as_ptr(), theta.as_ptr(), eta.as_ptr(),
             m_initial.as_ptr(), s_initial.as_ptr(),
             m_states.ptr(), s_states.ptr(), y.ptr(),
-            seq_len as i32, d as i32, batch_size as i32, error_clip,
+            seq_len as i32, d as i32, batch_size as i32,
+            input_stride as i32, m_stride as i32, error_clip,
         );
     }
 }
@@ -2599,14 +2607,16 @@ pub fn hebbian_forward_dd(
     alpha: &GpuBuf<f32>,
     m_initial: &GpuSlice<f32>,
     m_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
-    seq_len: usize, d: usize,
+    seq_len: usize, d: usize, batch_size: usize,
+    input_stride: usize, m_stride: usize,
 ) {
     unsafe {
         crate::cuda_ffi::hebbian_forward_f32_cuda(
             k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
             alpha.as_ptr(), m_initial.as_ptr(),
             m_states.ptr(), y.ptr(),
-            seq_len as i32, d as i32,
+            seq_len as i32, d as i32, batch_size as i32,
+            input_stride as i32, m_stride as i32,
         );
     }
 }
@@ -2639,7 +2649,8 @@ pub fn dgd_forward_dd(
     alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>,
     m_initial: &GpuSlice<f32>,
     m_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
-    seq_len: usize, d: usize, error_clip: f32,
+    seq_len: usize, d: usize, batch_size: usize,
+    input_stride: usize, m_stride: usize, error_clip: f32,
 ) {
     unsafe {
         crate::cuda_ffi::dgd_forward_f32_cuda(
@@ -2647,7 +2658,8 @@ pub fn dgd_forward_dd(
             alpha.as_ptr(), theta.as_ptr(),
             m_initial.as_ptr(),
             m_states.ptr(), y.ptr(),
-            seq_len as i32, d as i32, error_clip,
+            seq_len as i32, d as i32, batch_size as i32,
+            input_stride as i32, m_stride as i32, error_clip,
         );
     }
 }

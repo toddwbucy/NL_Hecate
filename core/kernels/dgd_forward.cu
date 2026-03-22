@@ -76,18 +76,30 @@ static inline void check_cuda_alloc(const char* tag, cudaError_t err) {
 }
 
 __global__ void dgd_forward_kernel(
-    const float* __restrict__ k_mem,      // [seq_len, d]
-    const float* __restrict__ v_mem,      // [seq_len, d]
-    const float* __restrict__ q_mem,      // [seq_len, d]
-    const float* __restrict__ alpha,      // [seq_len]
-    const float* __restrict__ theta,      // [seq_len]
-    const float* __restrict__ m_initial,  // [d*d]
-    float* __restrict__ m_states,         // [(seq_len+1)*d*d]
-    float* __restrict__ y,                // [seq_len, d]
-    int seq_len, int d, float error_clip)
+    const float* __restrict__ k_mem,      // [batch_size, seq_len, d]
+    const float* __restrict__ v_mem,      // [batch_size, seq_len, d]
+    const float* __restrict__ q_mem,      // [batch_size, seq_len, d]
+    const float* __restrict__ alpha,      // [batch_size, seq_len]
+    const float* __restrict__ theta,      // [batch_size, seq_len]
+    const float* __restrict__ m_initial,  // [batch_size, d*d]
+    float* __restrict__ m_states,         // [batch_size, (seq_len+1)*d*d]
+    float* __restrict__ y,                // [batch_size, seq_len, d]
+    int seq_len, int d, int input_stride, int m_stride,
+    float error_clip)
 {
+    int b = blockIdx.x;   // batch index
     int tid = threadIdx.x;
     int dd = d * d;
+
+    // Offset all pointers to this batch element's slice
+    k_mem     += b * input_stride * d;
+    v_mem     += b * input_stride * d;
+    q_mem     += b * input_stride * d;
+    alpha     += b * input_stride;
+    theta     += b * input_stride;
+    m_initial += b * m_stride;
+    m_states  += b * (seq_len + 1) * dd;
+    y         += b * seq_len * d;
 
     // ── Shared memory layout ──
     // Pre-Ampere: prediction[d] + error[d] = 2*d floats
@@ -480,7 +492,8 @@ extern "C" void dgd_forward_f32_cuda(
     const float* k_mem, const float* v_mem, const float* q_mem,
     const float* alpha, const float* theta, const float* m_initial,
     float* m_states, float* y,
-    int seq_len, int d, float error_clip)
+    int seq_len, int d, int batch_size,
+    int input_stride, int m_stride, float error_clip)
 {
     if (d <= 0 || 8 * d * (int)sizeof(float) > 163840) {
         fprintf(stderr, "dgd_forward_f32_cuda: d=%d out of range (must be 1..=5120).\n", d);
@@ -489,7 +502,7 @@ extern "C" void dgd_forward_f32_cuda(
     int dd = d * d;
     int block_size = (dd < 1024) ? dd : 1024;
 
-    dim3 grid(1);
+    dim3 grid(batch_size);
     dim3 block(block_size);
 
     // Shared memory layout:
@@ -504,7 +517,7 @@ extern "C" void dgd_forward_f32_cuda(
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
     dgd_forward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_initial,
-        m_states, y, seq_len, d, error_clip);
+        m_states, y, seq_len, d, input_stride, m_stride, error_clip);
     check_cuda_launch("dgd_forward_kernel", d, smem_bytes);
 }
 

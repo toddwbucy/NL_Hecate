@@ -1368,7 +1368,7 @@ pub(crate) fn gpu_memory_forward(
             crate::dispatch::delta_forward_dd(
                 &k_mem_ph, &v_mem_ph, &q_mem_ph, &alpha_ph, &theta_ph,
                 &m_initial_slice, &mut m_states, &mut y_ph, s, hd, bs_mem,
-                cfg.error_clip_for_level(level),
+                s, dd_mem, cfg.error_clip_for_level(level),
             );
             crate::dispatch::cuda_sync();
             copy_final_m_batch(&m_states, context_m, s, dd_mem, bs_mem);
@@ -1437,7 +1437,7 @@ pub(crate) fn gpu_memory_forward(
                 &k_mem_ph, &v_mem_ph, &q_mem_ph, &alpha_ph, &theta_ph, &eta_ph,
                 &m_initial_slice, &s_initial_slice,
                 &mut m_states, &mut s_states, &mut y_ph, s, hd, bs_mem,
-                cfg.error_clip_for_level(level),
+                s, dd_mem, cfg.error_clip_for_level(level),
             );
             crate::dispatch::cuda_sync();
             // Copy per-head final M back to context_m
@@ -1457,23 +1457,14 @@ pub(crate) fn gpu_memory_forward(
         }
         (None, MemoryRuleKind::HebbianRule) => {
             assert_eq!(bs, 1, "Hebbian GPU forward with batch_size > 1 is not supported");
-            // Spec 45: per-head memory — loop over nh heads (hebbian dispatch is single-batch)
-            let m_states: GpuBuf<f32> = GpuBuf::zeros(bs_mem * (s + 1) * dd_mem);
-            let y_ph: GpuBuf<f32> = GpuBuf::zeros(bs_mem * s * hd);
-            for h in 0..nh {
-                unsafe {
-                    crate::cuda_ffi::hebbian_forward_f32_cuda(
-                        k_mem_ph.as_ptr().add(h * s * hd),
-                        v_mem_ph.as_ptr().add(h * s * hd),
-                        q_mem_ph.as_ptr().add(h * s * hd),
-                        alpha_ph.as_ptr().add(h * s),
-                        m_initial_slice.as_ptr().add(h * dd_mem),
-                        m_states.ptr().add(h * (s + 1) * dd_mem),
-                        y_ph.ptr().add(h * s * hd),
-                        s as i32, hd_i32,
-                    );
-                }
-            }
+            // Spec 45: per-head memory, Spec 09: batched forward dispatch
+            let mut m_states = GpuBuf::zeros(bs_mem * (s + 1) * dd_mem);
+            let mut y_ph = GpuBuf::zeros(bs_mem * s * hd);
+            crate::dispatch::hebbian_forward_dd(
+                &k_mem_ph, &v_mem_ph, &q_mem_ph, &alpha_ph,
+                &m_initial_slice, &mut m_states, &mut y_ph,
+                s, hd, bs_mem, s, dd_mem,
+            );
             crate::dispatch::cuda_sync();
             copy_final_m_batch(&m_states, context_m, s, dd_mem, bs_mem);
             for bh in 0..bs_mem {
@@ -1971,7 +1962,7 @@ pub(crate) fn gpu_tnt_forward(
                     &alpha_b, &theta_b, &eta_b,
                     &m_initial_slice, &s_initial_slice,
                     &mut m_states, &mut s_states, &mut y_local, cl, d, n_batch,
-                    cfg.error_clip_for_level(level),
+                    cl, dd, cfg.error_clip_for_level(level),
                 );
 
                 if is_proxy {
@@ -2020,7 +2011,7 @@ pub(crate) fn gpu_tnt_forward(
                     &k_mem_b, &v_mem_b, &q_mem_b,
                     &alpha_b, &theta_b,
                     &m_initial_slice, &mut m_states, &mut y_local, cl, d, n_batch,
-                    cfg.error_clip_for_level(level),
+                    cl, dd, cfg.error_clip_for_level(level),
                 );
 
                 if is_proxy {
@@ -3328,7 +3319,7 @@ mod fused_tests {
         crate::dispatch::delta_forward_dd(
             &k_unf, &v_unf, &q_unf, &alpha_unf, &theta_unf,
             &m_init_buf.slice(0, bs * dd),
-            &mut m_states_unf, &mut y_unf, s, d, bs, error_clip,
+            &mut m_states_unf, &mut y_unf, s, d, bs, s, d * d, error_clip,
         );
         crate::dispatch::cuda_sync();
 
@@ -3482,7 +3473,7 @@ mod fused_tests {
             &k_unf, &v_unf, &q_unf, &alpha_unf, &theta_unf, &eta_unf,
             &m_init_buf.slice(0, bs * dd), &s_init_buf.slice(0, bs * dd),
             &mut m_states_unf, &mut s_states_unf, &mut y_unf,
-            s, d, bs, error_clip,
+            s, d, bs, s, d * d, error_clip,
         );
         crate::dispatch::cuda_sync();
 
@@ -3941,7 +3932,7 @@ mod chunkwise_tests {
         let mut y_pt = GpuBuf::zeros(bs * s * d);
         crate::dispatch::delta_forward_dd(
             &k_gpu, &v_gpu, &q_gpu, &alpha_gpu, &theta_gpu,
-            &m_init_slice, &mut m_states_pt, &mut y_pt, s, d, bs, error_clip,
+            &m_init_slice, &mut m_states_pt, &mut y_pt, s, d, bs, s, d * d, error_clip,
         );
         crate::dispatch::cuda_sync();
 
@@ -4014,7 +4005,8 @@ mod chunkwise_tests {
         crate::dispatch::titans_forward_dd(
             &k_gpu, &v_gpu, &q_gpu, &alpha_gpu, &theta_gpu, &eta_gpu,
             &m_init_slice, &s_init_slice,
-            &mut m_states_pt, &mut s_states_pt, &mut y_pt, s, d, bs, error_clip,
+            &mut m_states_pt, &mut s_states_pt, &mut y_pt, s, d, bs,
+            s, d * d, error_clip,
         );
         crate::dispatch::cuda_sync();
 
@@ -4336,7 +4328,7 @@ mod chunkwise_tests {
         let mut y_pt = GpuBuf::zeros(bs * s * d);
         crate::dispatch::delta_forward_dd(
             &k_gpu, &v_gpu, &q_gpu, &alpha_gpu, &theta_gpu,
-            &m_init_slice, &mut m_states_pt, &mut y_pt, s, d, bs, error_clip,
+            &m_init_slice, &mut m_states_pt, &mut y_pt, s, d, bs, s, d * d, error_clip,
         );
         crate::dispatch::cuda_sync();
 

@@ -92,6 +92,8 @@ extern "C" {
         seq_len: i32,
         d: i32,
         batch_size: i32,
+        input_stride: i32,
+        m_stride: i32,
         error_clip: f32,
     );
 
@@ -140,6 +142,8 @@ extern "C" {
         seq_len: i32,
         d: i32,
         batch_size: i32,
+        input_stride: i32,
+        m_stride: i32,
         error_clip: f32,
     );
 
@@ -184,6 +188,9 @@ extern "C" {
         y: *mut f32,
         seq_len: i32,
         d: i32,
+        batch_size: i32,
+        input_stride: i32,
+        m_stride: i32,
     );
 
     /// CUDA HebbianRule backward inner loop (all f32).
@@ -285,6 +292,9 @@ extern "C" {
         y: *mut f32,
         seq_len: i32,
         d: i32,
+        batch_size: i32,
+        input_stride: i32,
+        m_stride: i32,
         error_clip: f32,
     );
 
