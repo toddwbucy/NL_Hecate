@@ -1634,8 +1634,8 @@ fn delta_backward_checkpointed(
 
     // Pre-allocate scratch buffers — batched [bs, (max_seg+1), dd]
     let max_seg = c.min(s);
-    let local_m_states = GpuBuf::zeros(bs * (max_seg + 1) * dd);
-    let local_y = GpuBuf::zeros(bs * max_seg * d);
+    let local_m_states: GpuBuf<f32> = GpuBuf::zeros(bs * (max_seg + 1) * dd);
+    let local_y: GpuBuf<f32> = GpuBuf::zeros(bs * max_seg * d);
     let mut seg_d_m_out = GpuBuf::zeros(bs * dd);
 
     // Process segments in reverse
@@ -1723,9 +1723,9 @@ fn titans_backward_checkpointed(
     let d_s_seed = GpuBuf::zeros(bs * dd);
 
     let max_seg = c.min(s);
-    let local_m_states = GpuBuf::zeros(bs * (max_seg + 1) * dd);
-    let local_s_states = GpuBuf::zeros(bs * (max_seg + 1) * dd);
-    let local_y = GpuBuf::zeros(bs * max_seg * d);
+    let local_m_states: GpuBuf<f32> = GpuBuf::zeros(bs * (max_seg + 1) * dd);
+    let local_s_states: GpuBuf<f32> = GpuBuf::zeros(bs * (max_seg + 1) * dd);
+    let local_y: GpuBuf<f32> = GpuBuf::zeros(bs * max_seg * d);
     let mut seg_d_m_out = GpuBuf::zeros(bs * dd);
     let mut seg_d_s_out = GpuBuf::zeros(bs * dd);
 
@@ -1811,8 +1811,8 @@ fn hebbian_backward_checkpointed(
     let d_m_seed = GpuBuf::zeros(bs * dd);
 
     let max_seg = c.min(s);
-    let local_m_states = GpuBuf::zeros(bs * (max_seg + 1) * dd);
-    let local_y = GpuBuf::zeros(bs * max_seg * d);
+    let local_m_states: GpuBuf<f32> = GpuBuf::zeros(bs * (max_seg + 1) * dd);
+    let local_y: GpuBuf<f32> = GpuBuf::zeros(bs * max_seg * d);
     let mut seg_d_m_out = GpuBuf::zeros(bs * dd);
 
     for &(t_start, t_end, ckpt_idx) in segments.iter().rev() {
