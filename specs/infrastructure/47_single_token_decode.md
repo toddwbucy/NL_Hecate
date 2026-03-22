@@ -228,7 +228,7 @@ pub fn gpu_stacked_prefill(
     input_ids: &[usize],
     pulse: &Pulse,
     context: &mut GpuStackedContext,
-    kv_caches: &mut [GpuKVCache],     // one per block, pre-allocated
+    kv_caches: &mut Vec<GpuKVCache>,   // populated by prefill, one per block
     profiler: &mut Option<GpuProfiler>,
 ) -> Vec<f32>  // last-position logits [vocab_size]
 ```
