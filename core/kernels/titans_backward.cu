@@ -348,31 +348,56 @@ __global__ void titans_backward_kernel(
 
 __launch_bounds__(1024, 1)
 __global__ void titans_backward_segment_kernel(
-    const float* __restrict__ k_mem,
+    const float* __restrict__ k_mem,      // [batch_size, seq_len, d]
     const float* __restrict__ v_mem,
     const float* __restrict__ q_mem,
-    const float* __restrict__ alpha,
+    const float* __restrict__ alpha,      // [batch_size, seq_len]
     const float* __restrict__ theta,
     const float* __restrict__ eta,
-    const float* __restrict__ m_states,
-    const float* __restrict__ s_states,
+    const float* __restrict__ m_states,   // [batch_size, (seg_len+1)*d*d]
+    const float* __restrict__ s_states,   // [batch_size, (seg_len+1)*d*d]
     const float* __restrict__ d_y,
-    const float* __restrict__ d_m_seed,
-    const float* __restrict__ d_s_seed,
+    const float* __restrict__ d_m_seed,   // [batch_size, d*d]
+    const float* __restrict__ d_s_seed,   // [batch_size, d*d]
     float* __restrict__ d_k_mem,
     float* __restrict__ d_v_mem,
     float* __restrict__ d_q_mem,
     float* __restrict__ d_alpha,
     float* __restrict__ d_theta,
     float* __restrict__ d_eta,
-    float* __restrict__ d_m_out,
-    float* __restrict__ d_s_out,
-    float* __restrict__ d_M,              // [d*d] — gradient accumulator in global memory
-    float* __restrict__ d_S,              // [d*d] — gradient accumulator in global memory
-    int t_start, int t_end, int d, float error_clip)
+    float* __restrict__ d_m_out,          // [batch_size, d*d]
+    float* __restrict__ d_s_out,          // [batch_size, d*d]
+    float* __restrict__ d_M,              // [batch_size, d*d] — gradient accumulator in global memory
+    float* __restrict__ d_S,              // [batch_size, d*d] — gradient accumulator in global memory
+    int t_start, int t_end, int d, int seq_len, float error_clip)
 {
+    int b = blockIdx.x;   // batch (head) index
     int tid = threadIdx.x;
     int dd = d * d;
+    int seg_len = t_end - t_start;
+
+    // Offset all pointers to this batch element's slice
+    k_mem      += b * seq_len * d;
+    v_mem      += b * seq_len * d;
+    q_mem      += b * seq_len * d;
+    alpha      += b * seq_len;
+    theta      += b * seq_len;
+    eta        += b * seq_len;
+    m_states   += b * (seg_len + 1) * dd;
+    s_states   += b * (seg_len + 1) * dd;
+    d_y        += b * seq_len * d;
+    d_m_seed   += b * dd;
+    d_s_seed   += b * dd;
+    d_k_mem    += b * seq_len * d;
+    d_v_mem    += b * seq_len * d;
+    d_q_mem    += b * seq_len * d;
+    d_alpha    += b * seq_len;
+    d_theta    += b * seq_len;
+    d_eta      += b * seq_len;
+    d_m_out    += b * dd;
+    d_s_out    += b * dd;
+    d_M        += b * dd;
+    d_S        += b * dd;
 
     extern __shared__ float smem[];
     float* prediction = smem;
@@ -547,7 +572,8 @@ extern "C" void titans_backward_segment_f32_cuda(
     float* d_k_mem, float* d_v_mem, float* d_q_mem,
     float* d_alpha, float* d_theta, float* d_eta,
     float* d_m_out, float* d_s_out,
-    int t_start, int t_end, int d, float error_clip)
+    int t_start, int t_end, int d, int batch_size, int seq_len,
+    float error_clip)
 {
     if (d <= 0) {
         fprintf(stderr, "titans_backward_segment_f32_cuda: d=%d must be > 0.\n", d);
@@ -563,7 +589,7 @@ extern "C" void titans_backward_segment_f32_cuda(
     if (rounded > 1024) rounded >>= 1;
     block_size = rounded;
 
-    dim3 grid(1);
+    dim3 grid(batch_size);
     dim3 block(block_size);
 
     // Shared memory: prediction[d] + error[d] + d_error[d] + reduce_buf[block_size]
@@ -580,13 +606,13 @@ extern "C" void titans_backward_segment_f32_cuda(
                      cudaFuncSetAttribute(titans_backward_segment_kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
 
-    // Allocate d_M and d_S workspaces
+    // Allocate per-batch d_M and d_S workspaces
     float* d_M_work = nullptr;
     float* d_S_work = nullptr;
     check_cuda_alloc("titans_backward_segment: cudaMalloc d_M_work",
-                     cudaMalloc(&d_M_work, dd * sizeof(float)));
+                     cudaMalloc(&d_M_work, (long long)batch_size * dd * sizeof(float)));
     check_cuda_alloc("titans_backward_segment: cudaMalloc d_S_work",
-                     cudaMalloc(&d_S_work, dd * sizeof(float)));
+                     cudaMalloc(&d_S_work, (long long)batch_size * dd * sizeof(float)));
 
     titans_backward_segment_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, eta,
@@ -595,7 +621,7 @@ extern "C" void titans_backward_segment_f32_cuda(
         d_k_mem, d_v_mem, d_q_mem,
         d_alpha, d_theta, d_eta,
         d_m_out, d_s_out,
-        d_M_work, d_S_work, t_start, t_end, d, error_clip);
+        d_M_work, d_S_work, t_start, t_end, d, seq_len, error_clip);
     check_cuda_launch("titans_backward_segment_kernel", d, smem_bytes);
 
     check_cuda_alloc("titans_backward_segment: cudaDeviceSynchronize",

@@ -240,7 +240,8 @@ extern "C" {
         d_m_seed: *const f32,
         d_k_mem: *mut f32, d_v_mem: *mut f32, d_q_mem: *mut f32,
         d_alpha: *mut f32, d_theta: *mut f32, d_m_out: *mut f32,
-        t_start: i32, t_end: i32, d: i32, error_clip: f32,
+        t_start: i32, t_end: i32, d: i32, batch_size: i32, seq_len: i32,
+        error_clip: f32,
     );
 
     /// TitansLMM segment backward — operates on [t_start, t_end) with d_m_seed/d_s_seed.
@@ -252,7 +253,8 @@ extern "C" {
         d_k_mem: *mut f32, d_v_mem: *mut f32, d_q_mem: *mut f32,
         d_alpha: *mut f32, d_theta: *mut f32, d_eta: *mut f32,
         d_m_out: *mut f32, d_s_out: *mut f32,
-        t_start: i32, t_end: i32, d: i32, error_clip: f32,
+        t_start: i32, t_end: i32, d: i32, batch_size: i32, seq_len: i32,
+        error_clip: f32,
     );
 
     /// HebbianRule segment backward — operates on [t_start, t_end) with d_m_seed.
@@ -262,7 +264,7 @@ extern "C" {
         d_m_seed: *const f32,
         d_k_mem: *mut f32, d_v_mem: *mut f32, d_q_mem: *mut f32,
         d_alpha: *mut f32, d_m_out: *mut f32,
-        t_start: i32, t_end: i32, d: i32,
+        t_start: i32, t_end: i32, d: i32, batch_size: i32, seq_len: i32,
     );
 
     // ── DGD (Delta Gradient Descent) memory kernels (all f32) ────────
@@ -322,7 +324,8 @@ extern "C" {
         d_m_seed: *const f32,
         d_k_mem: *mut f32, d_v_mem: *mut f32, d_q_mem: *mut f32,
         d_alpha: *mut f32, d_theta: *mut f32, d_m_out: *mut f32,
-        t_start: i32, t_end: i32, d: i32, error_clip: f32,
+        t_start: i32, t_end: i32, d: i32, batch_size: i32, seq_len: i32,
+        error_clip: f32,
     );
 
     // ── Chunkwise kernels (spec 43 — frozen-M₀) ──────────────────────
