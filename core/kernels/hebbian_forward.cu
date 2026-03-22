@@ -70,10 +70,20 @@ __global__ void hebbian_forward_kernel(
     const float* __restrict__ m_initial,
     float* __restrict__ m_states,
     float* __restrict__ y,
-    int seq_len, int d)
+    int seq_len, int d, int input_stride, int m_stride)
 {
+    int b = blockIdx.x;   // batch index
     int tid = threadIdx.x;
     int dd = d * d;
+
+    // Offset all pointers to this batch element's slice
+    k_mem     += b * input_stride * d;
+    v_mem     += b * input_stride * d;
+    q_mem     += b * input_stride * d;
+    alpha     += b * input_stride;
+    m_initial += b * m_stride;
+    m_states  += b * (seq_len + 1) * dd;
+    y         += b * seq_len * d;
 
     // ── Shared memory layout ──
     // Pre-Ampere: no shared memory needed
@@ -320,7 +330,8 @@ extern "C" void hebbian_forward_f32_cuda(
     const float* k_mem, const float* v_mem, const float* q_mem,
     const float* alpha, const float* m_initial,
     float* m_states, float* y,
-    int seq_len, int d)
+    int seq_len, int d, int batch_size,
+    int input_stride, int m_stride)
 {
     if (d <= 0 || 6 * d * (int)sizeof(float) > 163840) {
         fprintf(stderr, "hebbian_forward_f32_cuda: d=%d out of range (must be 1..=6826).\n", d);
@@ -338,7 +349,7 @@ extern "C" void hebbian_forward_f32_cuda(
     int dd = d * d;
     int block_size = (dd < 1024) ? dd : 1024;
 
-    dim3 grid(1);
+    dim3 grid(batch_size);
     dim3 block(block_size);
 
     // Shared memory layout:
@@ -354,6 +365,6 @@ extern "C" void hebbian_forward_f32_cuda(
 
     hebbian_forward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, m_initial,
-        m_states, y, seq_len, d);
+        m_states, y, seq_len, d, input_stride, m_stride);
     check_cuda_launch("hebbian_forward_kernel", d, smem_bytes);
 }

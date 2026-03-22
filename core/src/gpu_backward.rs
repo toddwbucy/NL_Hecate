@@ -1642,30 +1642,25 @@ fn delta_backward_checkpointed(
     for &(t_start, t_end, ckpt_idx) in segments.iter().rev() {
         let seg_len = t_end - t_start;
 
-        // 1. Replay forward per head (sequential — forward kernel doesn't support
-        //    batch_stride != seq_len, and it's cheap relative to backward)
+        // 1. Replay forward — batched across all heads in one kernel launch.
+        //    input_stride=s so the kernel skips s tokens between heads (the full
+        //    sequence stride), m_stride=num_ckpt*dd so each head picks its
+        //    checkpoint from the interleaved [bs, num_ckpt, dd] layout.
         local_m_states.zero();
         local_y.zero();
-        for h in 0..bs {
-            let off_sd = h * s * d;
-            let off_s = h * s;
-            let off_ckpt = h * num_ckpt * dd;
-            let off_local_m = h * (seg_len + 1) * dd;
-            let off_local_y = h * seg_len * d;
-            unsafe {
-                crate::cuda_ffi::delta_forward_f32_cuda(
-                    k_mem.as_ptr().add(off_sd + t_start * d),
-                    v_mem.as_ptr().add(off_sd + t_start * d),
-                    q_mem.as_ptr().add(off_sd + t_start * d),
-                    alpha.as_ptr().add(off_s + t_start),
-                    theta.as_ptr().add(off_s + t_start),
-                    m_checkpoints.as_ptr().add(off_ckpt + ckpt_idx * dd),
-                    local_m_states.ptr().add(off_local_m),
-                    local_y.ptr().add(off_local_y),
-                    seg_len as i32, d as i32, 1,
-                    error_clip,
-                );
-            }
+        unsafe {
+            crate::cuda_ffi::delta_forward_f32_cuda(
+                k_mem.as_ptr().add(t_start * d),
+                v_mem.as_ptr().add(t_start * d),
+                q_mem.as_ptr().add(t_start * d),
+                alpha.as_ptr().add(t_start),
+                theta.as_ptr().add(t_start),
+                m_checkpoints.as_ptr().add(ckpt_idx * dd),
+                local_m_states.ptr(),
+                local_y.ptr(),
+                seg_len as i32, d as i32, bs as i32,
+                s as i32, (num_ckpt * dd) as i32, error_clip,
+            );
         }
         crate::dispatch::cuda_sync();
 
@@ -1732,33 +1727,27 @@ fn titans_backward_checkpointed(
     for &(t_start, t_end, ckpt_idx) in segments.iter().rev() {
         let seg_len = t_end - t_start;
 
-        // 1. Replay forward per head (sequential)
+        // 1. Replay forward — batched across all heads in one kernel launch.
+        //    input_stride=s, m_stride=num_ckpt*dd (same stride separation as delta).
         local_m_states.zero();
         local_s_states.zero();
         local_y.zero();
-        for h in 0..bs {
-            let off_sd = h * s * d;
-            let off_s = h * s;
-            let off_ckpt = h * num_ckpt * dd;
-            let off_local_m = h * (seg_len + 1) * dd;
-            let off_local_y = h * seg_len * d;
-            unsafe {
-                crate::cuda_ffi::titans_forward_f32_cuda(
-                    k_mem.as_ptr().add(off_sd + t_start * d),
-                    v_mem.as_ptr().add(off_sd + t_start * d),
-                    q_mem.as_ptr().add(off_sd + t_start * d),
-                    alpha.as_ptr().add(off_s + t_start),
-                    theta.as_ptr().add(off_s + t_start),
-                    eta.as_ptr().add(off_s + t_start),
-                    m_checkpoints.as_ptr().add(off_ckpt + ckpt_idx * dd),
-                    s_checkpoints.as_ptr().add(off_ckpt + ckpt_idx * dd),
-                    local_m_states.ptr().add(off_local_m),
-                    local_s_states.ptr().add(off_local_m),
-                    local_y.ptr().add(off_local_y),
-                    seg_len as i32, d as i32, 1,
-                    error_clip,
-                );
-            }
+        unsafe {
+            crate::cuda_ffi::titans_forward_f32_cuda(
+                k_mem.as_ptr().add(t_start * d),
+                v_mem.as_ptr().add(t_start * d),
+                q_mem.as_ptr().add(t_start * d),
+                alpha.as_ptr().add(t_start),
+                theta.as_ptr().add(t_start),
+                eta.as_ptr().add(t_start),
+                m_checkpoints.as_ptr().add(ckpt_idx * dd),
+                s_checkpoints.as_ptr().add(ckpt_idx * dd),
+                local_m_states.ptr(),
+                local_s_states.ptr(),
+                local_y.ptr(),
+                seg_len as i32, d as i32, bs as i32,
+                s as i32, (num_ckpt * dd) as i32, error_clip,
+            );
         }
         crate::dispatch::cuda_sync();
 
@@ -1818,27 +1807,22 @@ fn hebbian_backward_checkpointed(
     for &(t_start, t_end, ckpt_idx) in segments.iter().rev() {
         let seg_len = t_end - t_start;
 
-        // 1. Replay forward per head (sequential — hebbian forward has no batch_size)
+        // 1. Replay forward — batched across all heads in one kernel launch.
+        //    input_stride=s, m_stride=num_ckpt*dd (same stride separation as delta).
         local_m_states.zero();
         local_y.zero();
-        for h in 0..bs {
-            let off_sd = h * s * d;
-            let off_s = h * s;
-            let off_ckpt = h * num_ckpt * dd;
-            let off_local_m = h * (seg_len + 1) * dd;
-            let off_local_y = h * seg_len * d;
-            unsafe {
-                crate::cuda_ffi::hebbian_forward_f32_cuda(
-                    k_mem.as_ptr().add(off_sd + t_start * d),
-                    v_mem.as_ptr().add(off_sd + t_start * d),
-                    q_mem.as_ptr().add(off_sd + t_start * d),
-                    alpha.as_ptr().add(off_s + t_start),
-                    m_checkpoints.as_ptr().add(off_ckpt + ckpt_idx * dd),
-                    local_m_states.ptr().add(off_local_m),
-                    local_y.ptr().add(off_local_y),
-                    seg_len as i32, d as i32,
-                );
-            }
+        unsafe {
+            crate::cuda_ffi::hebbian_forward_f32_cuda(
+                k_mem.as_ptr().add(t_start * d),
+                v_mem.as_ptr().add(t_start * d),
+                q_mem.as_ptr().add(t_start * d),
+                alpha.as_ptr().add(t_start),
+                m_checkpoints.as_ptr().add(ckpt_idx * dd),
+                local_m_states.ptr(),
+                local_y.ptr(),
+                seg_len as i32, d as i32, bs as i32,
+                s as i32, (num_ckpt * dd) as i32,
+            );
         }
         crate::dispatch::cuda_sync();
 
