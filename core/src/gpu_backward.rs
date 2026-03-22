@@ -859,6 +859,7 @@ pub(crate) fn gpu_memory_backward(
         // Spec 45: per-head — loop over nh heads, call single-batch helper per head
         GpuMemoryCache::DeltaCkpt { k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, checkpoint_interval, k_norms, q_norms } => {
             let c = *checkpoint_interval;
+            // Reshape to per-head layout: [nh, s, hd]
             let d_y_ph = crate::gpu_forward::reshape_to_per_head(d_y, 1, s, nh, hd);
             let k_mem_ph = crate::gpu_forward::reshape_to_per_head(k_mem, 1, s, nh, hd);
             let v_mem_ph = crate::gpu_forward::reshape_to_per_head(v_mem, 1, s, nh, hd);
@@ -866,53 +867,12 @@ pub(crate) fn gpu_memory_backward(
             let alpha_ph = crate::gpu_forward::broadcast_gates(alpha, 1, s, nh);
             let theta_ph = crate::gpu_forward::broadcast_gates(theta, 1, s, nh);
 
-            let num_ckpt = crate::gpu_forward::checkpoint_count(s, c);
-            let d_k_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s * hd);
-            let d_v_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s * hd);
-            let d_q_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s * hd);
-            let d_alpha_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s);
-            let d_theta_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s);
-
-            for h in 0..nh {
-                let off_shd = h * s * hd;
-                let off_s = h * s;
-                let off_ckpt = h * num_ckpt * dd_mem;
-                unsafe {
-                    let k_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(k_mem_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
-                    let v_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(v_mem_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
-                    let q_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(q_mem_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
-                    let a_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(alpha_ph.as_ptr().add(off_s) as *mut f32, s);
-                    let t_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(theta_ph.as_ptr().add(off_s) as *mut f32, s);
-                    let m_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(m_checkpoints.as_ptr().add(off_ckpt) as *mut f32, num_ckpt * dd_mem);
-                    let dy_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(d_y_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
-
-                    let (dk, dv, dq, da, dt) = delta_backward_checkpointed(
-                        &k_h, &v_h, &q_h, &a_h, &t_h, &m_h, &dy_h,
-                        s, hd, c, cfg.error_clip_for_level(level),
-                    );
-                    // Copy results into contiguous per-head buffers
-                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
-                        d_k_ph.ptr().add(off_shd) as *mut std::ffi::c_void,
-                        dk.as_ptr() as *const std::ffi::c_void, s * hd * 4);
-                    assert_eq!(rc, 0);
-                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
-                        d_v_ph.ptr().add(off_shd) as *mut std::ffi::c_void,
-                        dv.as_ptr() as *const std::ffi::c_void, s * hd * 4);
-                    assert_eq!(rc, 0);
-                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
-                        d_q_ph.ptr().add(off_shd) as *mut std::ffi::c_void,
-                        dq.as_ptr() as *const std::ffi::c_void, s * hd * 4);
-                    assert_eq!(rc, 0);
-                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
-                        d_alpha_ph.ptr().add(off_s) as *mut std::ffi::c_void,
-                        da.as_ptr() as *const std::ffi::c_void, s * 4);
-                    assert_eq!(rc, 0);
-                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
-                        d_theta_ph.ptr().add(off_s) as *mut std::ffi::c_void,
-                        dt.as_ptr() as *const std::ffi::c_void, s * 4);
-                    assert_eq!(rc, 0);
-                }
-            }
+            // Single batched call — all heads processed together
+            let (d_k_ph, d_v_ph, d_q_ph, d_alpha_ph, d_theta_ph) = delta_backward_checkpointed(
+                &k_mem_ph, &v_mem_ph, &q_mem_ph, &alpha_ph, &theta_ph,
+                m_checkpoints, &d_y_ph,
+                s, hd, c, nh, cfg.error_clip_for_level(level),
+            );
 
             let d_alpha = crate::gpu_forward::sum_gates_across_heads(&d_alpha_ph, 1, s, nh);
             let d_theta = crate::gpu_forward::sum_gates_across_heads(&d_theta_ph, 1, s, nh);
@@ -959,59 +919,12 @@ pub(crate) fn gpu_memory_backward(
             let theta_ph = crate::gpu_forward::broadcast_gates(theta, 1, s, nh);
             let eta_ph = crate::gpu_forward::broadcast_gates(eta, 1, s, nh);
 
-            let num_ckpt = crate::gpu_forward::checkpoint_count(s, c);
-            let d_k_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s * hd);
-            let d_v_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s * hd);
-            let d_q_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s * hd);
-            let d_alpha_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s);
-            let d_theta_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s);
-            let d_eta_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s);
-
-            for h in 0..nh {
-                let off_shd = h * s * hd;
-                let off_s = h * s;
-                let off_ckpt = h * num_ckpt * dd_mem;
-                unsafe {
-                    let k_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(k_mem_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
-                    let v_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(v_mem_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
-                    let q_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(q_mem_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
-                    let a_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(alpha_ph.as_ptr().add(off_s) as *mut f32, s);
-                    let t_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(theta_ph.as_ptr().add(off_s) as *mut f32, s);
-                    let e_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(eta_ph.as_ptr().add(off_s) as *mut f32, s);
-                    let m_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(m_checkpoints.as_ptr().add(off_ckpt) as *mut f32, num_ckpt * dd_mem);
-                    let s_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(s_checkpoints.as_ptr().add(off_ckpt) as *mut f32, num_ckpt * dd_mem);
-                    let dy_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(d_y_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
-
-                    let (dk, dv, dq, da, dt, de) = titans_backward_checkpointed(
-                        &k_h, &v_h, &q_h, &a_h, &t_h, &e_h, &m_h, &s_h, &dy_h,
-                        s, hd, c, cfg.error_clip_for_level(level),
-                    );
-                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
-                        d_k_ph.ptr().add(off_shd) as *mut std::ffi::c_void,
-                        dk.as_ptr() as *const std::ffi::c_void, s * hd * 4);
-                    assert_eq!(rc, 0);
-                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
-                        d_v_ph.ptr().add(off_shd) as *mut std::ffi::c_void,
-                        dv.as_ptr() as *const std::ffi::c_void, s * hd * 4);
-                    assert_eq!(rc, 0);
-                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
-                        d_q_ph.ptr().add(off_shd) as *mut std::ffi::c_void,
-                        dq.as_ptr() as *const std::ffi::c_void, s * hd * 4);
-                    assert_eq!(rc, 0);
-                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
-                        d_alpha_ph.ptr().add(off_s) as *mut std::ffi::c_void,
-                        da.as_ptr() as *const std::ffi::c_void, s * 4);
-                    assert_eq!(rc, 0);
-                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
-                        d_theta_ph.ptr().add(off_s) as *mut std::ffi::c_void,
-                        dt.as_ptr() as *const std::ffi::c_void, s * 4);
-                    assert_eq!(rc, 0);
-                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
-                        d_eta_ph.ptr().add(off_s) as *mut std::ffi::c_void,
-                        de.as_ptr() as *const std::ffi::c_void, s * 4);
-                    assert_eq!(rc, 0);
-                }
-            }
+            // Single batched call — all heads processed together
+            let (d_k_ph, d_v_ph, d_q_ph, d_alpha_ph, d_theta_ph, d_eta_ph) = titans_backward_checkpointed(
+                &k_mem_ph, &v_mem_ph, &q_mem_ph, &alpha_ph, &theta_ph, &eta_ph,
+                m_checkpoints, s_checkpoints, &d_y_ph,
+                s, hd, c, nh, cfg.error_clip_for_level(level),
+            );
 
             let d_alpha = crate::gpu_forward::sum_gates_across_heads(&d_alpha_ph, 1, s, nh);
             let d_theta = crate::gpu_forward::sum_gates_across_heads(&d_theta_ph, 1, s, nh);
@@ -1057,45 +970,12 @@ pub(crate) fn gpu_memory_backward(
             let q_mem_ph = crate::gpu_forward::reshape_to_per_head(q_mem, 1, s, nh, hd);
             let alpha_ph = crate::gpu_forward::broadcast_gates(alpha, 1, s, nh);
 
-            let num_ckpt = crate::gpu_forward::checkpoint_count(s, c);
-            let d_k_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s * hd);
-            let d_v_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s * hd);
-            let d_q_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s * hd);
-            let d_alpha_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s);
-
-            for h in 0..nh {
-                let off_shd = h * s * hd;
-                let off_s = h * s;
-                let off_ckpt = h * num_ckpt * dd_mem;
-                unsafe {
-                    let k_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(k_mem_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
-                    let v_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(v_mem_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
-                    let q_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(q_mem_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
-                    let a_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(alpha_ph.as_ptr().add(off_s) as *mut f32, s);
-                    let m_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(m_checkpoints.as_ptr().add(off_ckpt) as *mut f32, num_ckpt * dd_mem);
-                    let dy_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(d_y_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
-
-                    let (dk, dv, dq, da) = hebbian_backward_checkpointed(
-                        &k_h, &v_h, &q_h, &a_h, &m_h, &dy_h, s, hd, c,
-                    );
-                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
-                        d_k_ph.ptr().add(off_shd) as *mut std::ffi::c_void,
-                        dk.as_ptr() as *const std::ffi::c_void, s * hd * 4);
-                    assert_eq!(rc, 0);
-                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
-                        d_v_ph.ptr().add(off_shd) as *mut std::ffi::c_void,
-                        dv.as_ptr() as *const std::ffi::c_void, s * hd * 4);
-                    assert_eq!(rc, 0);
-                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
-                        d_q_ph.ptr().add(off_shd) as *mut std::ffi::c_void,
-                        dq.as_ptr() as *const std::ffi::c_void, s * hd * 4);
-                    assert_eq!(rc, 0);
-                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
-                        d_alpha_ph.ptr().add(off_s) as *mut std::ffi::c_void,
-                        da.as_ptr() as *const std::ffi::c_void, s * 4);
-                    assert_eq!(rc, 0);
-                }
-            }
+            // Single batched call — all heads processed together
+            let (d_k_ph, d_v_ph, d_q_ph, d_alpha_ph) = hebbian_backward_checkpointed(
+                &k_mem_ph, &v_mem_ph, &q_mem_ph, &alpha_ph,
+                m_checkpoints, &d_y_ph,
+                s, hd, c, nh,
+            );
 
             let d_alpha = crate::gpu_forward::sum_gates_across_heads(&d_alpha_ph, 1, s, nh);
             let d_k_mem = crate::gpu_forward::reshape_from_per_head(&d_k_ph, 1, s, nh, hd);
@@ -1174,7 +1054,6 @@ pub(crate) fn gpu_memory_backward(
         }
         GpuMemoryCache::DGDCkpt { k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, checkpoint_interval, k_norms, q_norms } => {
             let c = *checkpoint_interval;
-            // Spec 45: per-head — loop over nh heads
             let d_y_ph = crate::gpu_forward::reshape_to_per_head(d_y, 1, s, nh, hd);
             let k_mem_ph = crate::gpu_forward::reshape_to_per_head(k_mem, 1, s, nh, hd);
             let v_mem_ph = crate::gpu_forward::reshape_to_per_head(v_mem, 1, s, nh, hd);
@@ -1182,52 +1061,12 @@ pub(crate) fn gpu_memory_backward(
             let alpha_ph = crate::gpu_forward::broadcast_gates(alpha, 1, s, nh);
             let theta_ph = crate::gpu_forward::broadcast_gates(theta, 1, s, nh);
 
-            let num_ckpt = crate::gpu_forward::checkpoint_count(s, c);
-            let d_k_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s * hd);
-            let d_v_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s * hd);
-            let d_q_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s * hd);
-            let d_alpha_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s);
-            let d_theta_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s);
-
-            for h in 0..nh {
-                let off_shd = h * s * hd;
-                let off_s = h * s;
-                let off_ckpt = h * num_ckpt * dd_mem;
-                unsafe {
-                    let k_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(k_mem_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
-                    let v_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(v_mem_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
-                    let q_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(q_mem_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
-                    let a_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(alpha_ph.as_ptr().add(off_s) as *mut f32, s);
-                    let t_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(theta_ph.as_ptr().add(off_s) as *mut f32, s);
-                    let m_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(m_checkpoints.as_ptr().add(off_ckpt) as *mut f32, num_ckpt * dd_mem);
-                    let dy_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(d_y_ph.as_ptr().add(off_shd) as *mut f32, s * hd);
-
-                    let (dk, dv, dq, da, dt) = delta_backward_checkpointed(
-                        &k_h, &v_h, &q_h, &a_h, &t_h, &m_h, &dy_h,
-                        s, hd, c, cfg.error_clip_for_level(level),
-                    );
-                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
-                        d_k_ph.ptr().add(off_shd) as *mut std::ffi::c_void,
-                        dk.as_ptr() as *const std::ffi::c_void, s * hd * 4);
-                    assert_eq!(rc, 0);
-                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
-                        d_v_ph.ptr().add(off_shd) as *mut std::ffi::c_void,
-                        dv.as_ptr() as *const std::ffi::c_void, s * hd * 4);
-                    assert_eq!(rc, 0);
-                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
-                        d_q_ph.ptr().add(off_shd) as *mut std::ffi::c_void,
-                        dq.as_ptr() as *const std::ffi::c_void, s * hd * 4);
-                    assert_eq!(rc, 0);
-                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
-                        d_alpha_ph.ptr().add(off_s) as *mut std::ffi::c_void,
-                        da.as_ptr() as *const std::ffi::c_void, s * 4);
-                    assert_eq!(rc, 0);
-                    let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
-                        d_theta_ph.ptr().add(off_s) as *mut std::ffi::c_void,
-                        dt.as_ptr() as *const std::ffi::c_void, s * 4);
-                    assert_eq!(rc, 0);
-                }
-            }
+            // Single batched call — DGD reuses delta backward kernels
+            let (d_k_ph, d_v_ph, d_q_ph, d_alpha_ph, d_theta_ph) = delta_backward_checkpointed(
+                &k_mem_ph, &v_mem_ph, &q_mem_ph, &alpha_ph, &theta_ph,
+                m_checkpoints, &d_y_ph,
+                s, hd, c, nh, cfg.error_clip_for_level(level),
+            );
 
             let d_alpha = crate::gpu_forward::sum_gates_across_heads(&d_alpha_ph, 1, s, nh);
             let d_theta = crate::gpu_forward::sum_gates_across_heads(&d_theta_ph, 1, s, nh);
@@ -1757,63 +1596,80 @@ fn segment_boundaries(seq_len: usize, c: usize) -> Vec<(usize, usize, usize)> {
     segments
 }
 
-/// Delta Rule checkpointed backward.
+/// Delta Rule checkpointed backward — batched across heads.
+///
+/// All inputs are in per-head layout: `[bs, s, d]` for k/v/q/d_y,
+/// `[bs, s]` for alpha/theta, `[bs, num_ckpt, dd]` for m_checkpoints.
+/// Forward replay runs sequentially per head; segment backward is batched.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 fn delta_backward_checkpointed(
     k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
     alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>,
     m_checkpoints: &GpuBuf<f32>, d_y: &GpuBuf<f32>,
-    s: usize, d: usize, c: usize, error_clip: f32,
+    s: usize, d: usize, c: usize, bs: usize, error_clip: f32,
 ) -> (GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>) {
     let dd = d * d;
-    let sd = s * d;
     let segments = segment_boundaries(s, c);
+    let num_ckpt = crate::gpu_forward::checkpoint_count(s, c);
 
-    // Accumulation buffers (full sequence)
-    let mut d_k_mem = GpuBuf::zeros(sd);
-    let mut d_v_mem = GpuBuf::zeros(sd);
-    let mut d_q_mem = GpuBuf::zeros(sd);
-    let mut d_alpha = GpuBuf::zeros(s);
-    let mut d_theta = GpuBuf::zeros(s);
+    // Validate input buffer sizes against expected flattened layout
+    debug_assert!(k_mem.len() >= bs * s * d, "k_mem too small: {} < {}", k_mem.len(), bs * s * d);
+    debug_assert!(v_mem.len() >= bs * s * d, "v_mem too small: {} < {}", v_mem.len(), bs * s * d);
+    debug_assert!(q_mem.len() >= bs * s * d, "q_mem too small: {} < {}", q_mem.len(), bs * s * d);
+    debug_assert!(alpha.len() >= bs * s, "alpha too small: {} < {}", alpha.len(), bs * s);
+    debug_assert!(theta.len() >= bs * s, "theta too small: {} < {}", theta.len(), bs * s);
+    debug_assert!(d_y.len() >= bs * s * d, "d_y too small: {} < {}", d_y.len(), bs * s * d);
+    debug_assert!(m_checkpoints.len() >= bs * num_ckpt * dd, "m_checkpoints too small: {} < {}", m_checkpoints.len(), bs * num_ckpt * dd);
 
-    // d_M seed: starts as zeros for the last segment
-    let d_m_seed = GpuBuf::zeros(dd);
+    // Accumulation buffers — batched [bs, s, d] / [bs, s]
+    let mut d_k_mem = GpuBuf::zeros(bs * s * d);
+    let mut d_v_mem = GpuBuf::zeros(bs * s * d);
+    let mut d_q_mem = GpuBuf::zeros(bs * s * d);
+    let mut d_alpha = GpuBuf::zeros(bs * s);
+    let mut d_theta = GpuBuf::zeros(bs * s);
 
-    // Pre-allocate scratch buffers sized for max segment (CS-42: no per-segment cudaMalloc)
+    // d_M seed: [bs, dd] — starts as zeros for the last segment
+    let d_m_seed = GpuBuf::zeros(bs * dd);
+
+    // Pre-allocate scratch buffers — batched [bs, (max_seg+1), dd]
     let max_seg = c.min(s);
-    let local_m_states = GpuBuf::zeros((max_seg + 1) * dd);
-    let local_y = GpuBuf::zeros(max_seg * d);
-    let mut seg_d_m_out = GpuBuf::zeros(dd);
+    let local_m_states = GpuBuf::zeros(bs * (max_seg + 1) * dd);
+    let local_y = GpuBuf::zeros(bs * max_seg * d);
+    let mut seg_d_m_out = GpuBuf::zeros(bs * dd);
 
     // Process segments in reverse
     for &(t_start, t_end, ckpt_idx) in segments.iter().rev() {
         let seg_len = t_end - t_start;
 
-        // 1. Replay forward from checkpoint to reconstruct local m_states
-        let ckpt_m = m_checkpoints.slice(ckpt_idx * dd, dd);
+        // 1. Replay forward per head (sequential — forward kernel doesn't support
+        //    batch_stride != seq_len, and it's cheap relative to backward)
         local_m_states.zero();
         local_y.zero();
-
-        // Replay forward: pass offset pointers into full-sequence buffers.
-        // Works because the forward kernel is purely sequential.
-        unsafe {
-            crate::cuda_ffi::delta_forward_f32_cuda(
-                (k_mem.as_ptr()).add(t_start * d),
-                (v_mem.as_ptr()).add(t_start * d),
-                (q_mem.as_ptr()).add(t_start * d),
-                (alpha.as_ptr()).add(t_start),
-                (theta.as_ptr()).add(t_start),
-                ckpt_m.as_ptr(),
-                local_m_states.ptr(),
-                local_y.ptr(),
-                seg_len as i32, d as i32, 1, // batch_size=1 (checkpointed paths are always bs=1)
-                error_clip,
-            );
+        for h in 0..bs {
+            let off_sd = h * s * d;
+            let off_s = h * s;
+            let off_ckpt = h * num_ckpt * dd;
+            let off_local_m = h * (seg_len + 1) * dd;
+            let off_local_y = h * seg_len * d;
+            unsafe {
+                crate::cuda_ffi::delta_forward_f32_cuda(
+                    k_mem.as_ptr().add(off_sd + t_start * d),
+                    v_mem.as_ptr().add(off_sd + t_start * d),
+                    q_mem.as_ptr().add(off_sd + t_start * d),
+                    alpha.as_ptr().add(off_s + t_start),
+                    theta.as_ptr().add(off_s + t_start),
+                    m_checkpoints.as_ptr().add(off_ckpt + ckpt_idx * dd),
+                    local_m_states.ptr().add(off_local_m),
+                    local_y.ptr().add(off_local_y),
+                    seg_len as i32, d as i32, 1,
+                    error_clip,
+                );
+            }
         }
         crate::dispatch::cuda_sync();
 
-        // 2. Segment backward with d_m_seed
+        // 2. Segment backward — batched across all heads
         seg_d_m_out.zero();
         crate::dispatch::delta_backward_dd_segment(
             k_mem, v_mem, q_mem, alpha, theta,
@@ -1821,18 +1677,18 @@ fn delta_backward_checkpointed(
             &d_m_seed,
             &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
             &mut d_alpha, &mut d_theta, &mut seg_d_m_out,
-            t_start, t_end, d, error_clip,
+            t_start, t_end, d, bs, s, error_clip,
         );
         crate::dispatch::cuda_sync();
 
-        // 3. Propagate d_M seed to earlier segment
+        // 3. Propagate d_M seed to earlier segment (contiguous copy for all heads)
         d_m_seed.copy_from_device(&seg_d_m_out);
     }
 
     (d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta)
 }
 
-/// Titans checkpointed backward.
+/// Titans checkpointed backward — batched across heads.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 fn titans_backward_checkpointed(
@@ -1840,59 +1696,73 @@ fn titans_backward_checkpointed(
     alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>, eta: &GpuBuf<f32>,
     m_checkpoints: &GpuBuf<f32>, s_checkpoints: &GpuBuf<f32>,
     d_y: &GpuBuf<f32>,
-    s: usize, d: usize, c: usize, error_clip: f32,
+    s: usize, d: usize, c: usize, bs: usize, error_clip: f32,
 ) -> (GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>) {
     let dd = d * d;
-    let sd = s * d;
     let segments = segment_boundaries(s, c);
+    let num_ckpt = crate::gpu_forward::checkpoint_count(s, c);
 
-    let mut d_k_mem = GpuBuf::zeros(sd);
-    let mut d_v_mem = GpuBuf::zeros(sd);
-    let mut d_q_mem = GpuBuf::zeros(sd);
-    let mut d_alpha = GpuBuf::zeros(s);
-    let mut d_theta = GpuBuf::zeros(s);
-    let mut d_eta = GpuBuf::zeros(s);
-    let d_m_seed = GpuBuf::zeros(dd);
-    let d_s_seed = GpuBuf::zeros(dd);
+    // Validate input buffer sizes
+    debug_assert!(k_mem.len() >= bs * s * d, "k_mem too small: {} < {}", k_mem.len(), bs * s * d);
+    debug_assert!(v_mem.len() >= bs * s * d, "v_mem too small: {} < {}", v_mem.len(), bs * s * d);
+    debug_assert!(q_mem.len() >= bs * s * d, "q_mem too small: {} < {}", q_mem.len(), bs * s * d);
+    debug_assert!(alpha.len() >= bs * s, "alpha too small: {} < {}", alpha.len(), bs * s);
+    debug_assert!(theta.len() >= bs * s, "theta too small: {} < {}", theta.len(), bs * s);
+    debug_assert!(eta.len() >= bs * s, "eta too small: {} < {}", eta.len(), bs * s);
+    debug_assert!(d_y.len() >= bs * s * d, "d_y too small: {} < {}", d_y.len(), bs * s * d);
+    debug_assert!(m_checkpoints.len() >= bs * num_ckpt * dd, "m_checkpoints too small: {} < {}", m_checkpoints.len(), bs * num_ckpt * dd);
+    debug_assert!(s_checkpoints.len() >= bs * num_ckpt * dd, "s_checkpoints too small: {} < {}", s_checkpoints.len(), bs * num_ckpt * dd);
 
-    // Pre-allocate scratch buffers sized for max segment (CS-42: no per-segment cudaMalloc)
+    let mut d_k_mem = GpuBuf::zeros(bs * s * d);
+    let mut d_v_mem = GpuBuf::zeros(bs * s * d);
+    let mut d_q_mem = GpuBuf::zeros(bs * s * d);
+    let mut d_alpha = GpuBuf::zeros(bs * s);
+    let mut d_theta = GpuBuf::zeros(bs * s);
+    let mut d_eta = GpuBuf::zeros(bs * s);
+    let d_m_seed = GpuBuf::zeros(bs * dd);
+    let d_s_seed = GpuBuf::zeros(bs * dd);
+
     let max_seg = c.min(s);
-    let local_m_states = GpuBuf::zeros((max_seg + 1) * dd);
-    let local_s_states = GpuBuf::zeros((max_seg + 1) * dd);
-    let local_y = GpuBuf::zeros(max_seg * d);
-    let mut seg_d_m_out = GpuBuf::zeros(dd);
-    let mut seg_d_s_out = GpuBuf::zeros(dd);
+    let local_m_states = GpuBuf::zeros(bs * (max_seg + 1) * dd);
+    let local_s_states = GpuBuf::zeros(bs * (max_seg + 1) * dd);
+    let local_y = GpuBuf::zeros(bs * max_seg * d);
+    let mut seg_d_m_out = GpuBuf::zeros(bs * dd);
+    let mut seg_d_s_out = GpuBuf::zeros(bs * dd);
 
     for &(t_start, t_end, ckpt_idx) in segments.iter().rev() {
         let seg_len = t_end - t_start;
 
-        // Replay forward
-        let ckpt_m = m_checkpoints.slice(ckpt_idx * dd, dd);
-        let ckpt_s = s_checkpoints.slice(ckpt_idx * dd, dd);
+        // 1. Replay forward per head (sequential)
         local_m_states.zero();
         local_s_states.zero();
         local_y.zero();
-
-        unsafe {
-            crate::cuda_ffi::titans_forward_f32_cuda(
-                (k_mem.as_ptr()).add(t_start * d),
-                (v_mem.as_ptr()).add(t_start * d),
-                (q_mem.as_ptr()).add(t_start * d),
-                (alpha.as_ptr()).add(t_start),
-                (theta.as_ptr()).add(t_start),
-                (eta.as_ptr()).add(t_start),
-                ckpt_m.as_ptr(),
-                ckpt_s.as_ptr(),
-                local_m_states.ptr(),
-                local_s_states.ptr(),
-                local_y.ptr(),
-                seg_len as i32, d as i32, 1, // batch_size=1 (checkpointed paths are always bs=1)
-                error_clip,
-            );
+        for h in 0..bs {
+            let off_sd = h * s * d;
+            let off_s = h * s;
+            let off_ckpt = h * num_ckpt * dd;
+            let off_local_m = h * (seg_len + 1) * dd;
+            let off_local_y = h * seg_len * d;
+            unsafe {
+                crate::cuda_ffi::titans_forward_f32_cuda(
+                    k_mem.as_ptr().add(off_sd + t_start * d),
+                    v_mem.as_ptr().add(off_sd + t_start * d),
+                    q_mem.as_ptr().add(off_sd + t_start * d),
+                    alpha.as_ptr().add(off_s + t_start),
+                    theta.as_ptr().add(off_s + t_start),
+                    eta.as_ptr().add(off_s + t_start),
+                    m_checkpoints.as_ptr().add(off_ckpt + ckpt_idx * dd),
+                    s_checkpoints.as_ptr().add(off_ckpt + ckpt_idx * dd),
+                    local_m_states.ptr().add(off_local_m),
+                    local_s_states.ptr().add(off_local_m),
+                    local_y.ptr().add(off_local_y),
+                    seg_len as i32, d as i32, 1,
+                    error_clip,
+                );
+            }
         }
         crate::dispatch::cuda_sync();
 
-        // Segment backward
+        // 2. Segment backward — batched across all heads
         seg_d_m_out.zero();
         seg_d_s_out.zero();
         crate::dispatch::titans_backward_dd_segment(
@@ -1902,7 +1772,7 @@ fn titans_backward_checkpointed(
             &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
             &mut d_alpha, &mut d_theta, &mut d_eta,
             &mut seg_d_m_out, &mut seg_d_s_out,
-            t_start, t_end, d, error_clip,
+            t_start, t_end, d, bs, s, error_clip,
         );
         crate::dispatch::cuda_sync();
 
@@ -1913,54 +1783,66 @@ fn titans_backward_checkpointed(
     (d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta, d_eta)
 }
 
-/// Hebbian checkpointed backward.
+/// Hebbian checkpointed backward — batched across heads.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 fn hebbian_backward_checkpointed(
     k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
     alpha: &GpuBuf<f32>,
     m_checkpoints: &GpuBuf<f32>, d_y: &GpuBuf<f32>,
-    s: usize, d: usize, c: usize,
+    s: usize, d: usize, c: usize, bs: usize,
 ) -> (GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>) {
     let dd = d * d;
-    let sd = s * d;
     let segments = segment_boundaries(s, c);
+    let num_ckpt = crate::gpu_forward::checkpoint_count(s, c);
 
-    let mut d_k_mem = GpuBuf::zeros(sd);
-    let mut d_v_mem = GpuBuf::zeros(sd);
-    let mut d_q_mem = GpuBuf::zeros(sd);
-    let mut d_alpha = GpuBuf::zeros(s);
-    let d_m_seed = GpuBuf::zeros(dd);
+    // Validate input buffer sizes
+    debug_assert!(k_mem.len() >= bs * s * d, "k_mem too small: {} < {}", k_mem.len(), bs * s * d);
+    debug_assert!(v_mem.len() >= bs * s * d, "v_mem too small: {} < {}", v_mem.len(), bs * s * d);
+    debug_assert!(q_mem.len() >= bs * s * d, "q_mem too small: {} < {}", q_mem.len(), bs * s * d);
+    debug_assert!(alpha.len() >= bs * s, "alpha too small: {} < {}", alpha.len(), bs * s);
+    debug_assert!(d_y.len() >= bs * s * d, "d_y too small: {} < {}", d_y.len(), bs * s * d);
+    debug_assert!(m_checkpoints.len() >= bs * num_ckpt * dd, "m_checkpoints too small: {} < {}", m_checkpoints.len(), bs * num_ckpt * dd);
 
-    // Pre-allocate scratch buffers sized for max segment (CS-42: no per-segment cudaMalloc)
+    let mut d_k_mem = GpuBuf::zeros(bs * s * d);
+    let mut d_v_mem = GpuBuf::zeros(bs * s * d);
+    let mut d_q_mem = GpuBuf::zeros(bs * s * d);
+    let mut d_alpha = GpuBuf::zeros(bs * s);
+    let d_m_seed = GpuBuf::zeros(bs * dd);
+
     let max_seg = c.min(s);
-    let local_m_states = GpuBuf::zeros((max_seg + 1) * dd);
-    let local_y = GpuBuf::zeros(max_seg * d);
-    let mut seg_d_m_out = GpuBuf::zeros(dd);
+    let local_m_states = GpuBuf::zeros(bs * (max_seg + 1) * dd);
+    let local_y = GpuBuf::zeros(bs * max_seg * d);
+    let mut seg_d_m_out = GpuBuf::zeros(bs * dd);
 
     for &(t_start, t_end, ckpt_idx) in segments.iter().rev() {
         let seg_len = t_end - t_start;
 
-        // Replay forward
-        let ckpt_m = m_checkpoints.slice(ckpt_idx * dd, dd);
+        // 1. Replay forward per head (sequential — hebbian forward has no batch_size)
         local_m_states.zero();
         local_y.zero();
-
-        unsafe {
-            crate::cuda_ffi::hebbian_forward_f32_cuda(
-                (k_mem.as_ptr()).add(t_start * d),
-                (v_mem.as_ptr()).add(t_start * d),
-                (q_mem.as_ptr()).add(t_start * d),
-                (alpha.as_ptr()).add(t_start),
-                ckpt_m.as_ptr(),
-                local_m_states.ptr(),
-                local_y.ptr(),
-                seg_len as i32, d as i32,
-            );
+        for h in 0..bs {
+            let off_sd = h * s * d;
+            let off_s = h * s;
+            let off_ckpt = h * num_ckpt * dd;
+            let off_local_m = h * (seg_len + 1) * dd;
+            let off_local_y = h * seg_len * d;
+            unsafe {
+                crate::cuda_ffi::hebbian_forward_f32_cuda(
+                    k_mem.as_ptr().add(off_sd + t_start * d),
+                    v_mem.as_ptr().add(off_sd + t_start * d),
+                    q_mem.as_ptr().add(off_sd + t_start * d),
+                    alpha.as_ptr().add(off_s + t_start),
+                    m_checkpoints.as_ptr().add(off_ckpt + ckpt_idx * dd),
+                    local_m_states.ptr().add(off_local_m),
+                    local_y.ptr().add(off_local_y),
+                    seg_len as i32, d as i32,
+                );
+            }
         }
         crate::dispatch::cuda_sync();
 
-        // Segment backward
+        // 2. Segment backward — batched across all heads
         seg_d_m_out.zero();
         crate::dispatch::hebbian_backward_dd_segment(
             k_mem, v_mem, q_mem, alpha,
@@ -1968,7 +1850,7 @@ fn hebbian_backward_checkpointed(
             &d_m_seed,
             &mut d_k_mem, &mut d_v_mem, &mut d_q_mem,
             &mut d_alpha, &mut seg_d_m_out,
-            t_start, t_end, d,
+            t_start, t_end, d, bs, s,
         );
         crate::dispatch::cuda_sync();
 

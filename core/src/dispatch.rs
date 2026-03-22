@@ -2767,11 +2767,14 @@ pub fn delta_backward_dd_segment(
     d_m_seed: &GpuBuf<f32>,
     d_k_mem: &mut GpuBuf<f32>, d_v_mem: &mut GpuBuf<f32>, d_q_mem: &mut GpuBuf<f32>,
     d_alpha: &mut GpuBuf<f32>, d_theta: &mut GpuBuf<f32>, d_m_out: &mut GpuBuf<f32>,
-    t_start: usize, t_end: usize, d: usize, error_clip: f32,
+    t_start: usize, t_end: usize, d: usize, batch_size: usize, seq_len: usize,
+    error_clip: f32,
 ) {
     debug_assert!(t_start < t_end, "segment t_start={t_start} must be < t_end={t_end}");
+    debug_assert!(t_end <= seq_len, "segment t_end={t_end} must be <= seq_len={seq_len}");
     debug_assert!(d > 0, "d must be > 0");
-    debug_assert!(d_m_seed.len() >= d * d, "d_m_seed too small");
+    debug_assert!(d_m_seed.len() >= batch_size * d * d, "d_m_seed too small");
+    debug_assert!(d_m_out.len() >= batch_size * d * d, "d_m_out too small");
     unsafe {
         crate::cuda_ffi::delta_backward_segment_f32_cuda(
             k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
@@ -2780,7 +2783,8 @@ pub fn delta_backward_dd_segment(
             d_m_seed.as_ptr(),
             d_k_mem.ptr(), d_v_mem.ptr(), d_q_mem.ptr(),
             d_alpha.ptr(), d_theta.ptr(), d_m_out.ptr(),
-            t_start as i32, t_end as i32, d as i32, error_clip,
+            t_start as i32, t_end as i32, d as i32,
+            batch_size as i32, seq_len as i32, error_clip,
         );
     }
 }
@@ -2796,11 +2800,16 @@ pub fn titans_backward_dd_segment(
     d_k_mem: &mut GpuBuf<f32>, d_v_mem: &mut GpuBuf<f32>, d_q_mem: &mut GpuBuf<f32>,
     d_alpha: &mut GpuBuf<f32>, d_theta: &mut GpuBuf<f32>, d_eta: &mut GpuBuf<f32>,
     d_m_out: &mut GpuBuf<f32>, d_s_out: &mut GpuBuf<f32>,
-    t_start: usize, t_end: usize, d: usize, error_clip: f32,
+    t_start: usize, t_end: usize, d: usize, batch_size: usize, seq_len: usize,
+    error_clip: f32,
 ) {
     debug_assert!(t_start < t_end, "segment t_start={t_start} must be < t_end={t_end}");
+    debug_assert!(t_end <= seq_len, "segment t_end={t_end} must be <= seq_len={seq_len}");
     debug_assert!(d > 0, "d must be > 0");
-    debug_assert!(d_m_seed.len() >= d * d, "d_m_seed too small");
+    debug_assert!(d_m_seed.len() >= batch_size * d * d, "d_m_seed too small");
+    debug_assert!(d_m_out.len() >= batch_size * d * d, "d_m_out too small");
+    debug_assert!(d_s_seed.len() >= batch_size * d * d, "d_s_seed too small");
+    debug_assert!(d_s_out.len() >= batch_size * d * d, "d_s_out too small");
     unsafe {
         crate::cuda_ffi::titans_backward_segment_f32_cuda(
             k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
@@ -2810,7 +2819,8 @@ pub fn titans_backward_dd_segment(
             d_k_mem.ptr(), d_v_mem.ptr(), d_q_mem.ptr(),
             d_alpha.ptr(), d_theta.ptr(), d_eta.ptr(),
             d_m_out.ptr(), d_s_out.ptr(),
-            t_start as i32, t_end as i32, d as i32, error_clip,
+            t_start as i32, t_end as i32, d as i32,
+            batch_size as i32, seq_len as i32, error_clip,
         );
     }
 }
@@ -2823,11 +2833,13 @@ pub fn hebbian_backward_dd_segment(
     d_m_seed: &GpuBuf<f32>,
     d_k_mem: &mut GpuBuf<f32>, d_v_mem: &mut GpuBuf<f32>, d_q_mem: &mut GpuBuf<f32>,
     d_alpha: &mut GpuBuf<f32>, d_m_out: &mut GpuBuf<f32>,
-    t_start: usize, t_end: usize, d: usize,
+    t_start: usize, t_end: usize, d: usize, batch_size: usize, seq_len: usize,
 ) {
     debug_assert!(t_start < t_end, "segment t_start={t_start} must be < t_end={t_end}");
+    debug_assert!(t_end <= seq_len, "segment t_end={t_end} must be <= seq_len={seq_len}");
     debug_assert!(d > 0, "d must be > 0");
-    debug_assert!(d_m_seed.len() >= d * d, "d_m_seed too small");
+    debug_assert!(d_m_seed.len() >= batch_size * d * d, "d_m_seed too small");
+    debug_assert!(d_m_out.len() >= batch_size * d * d, "d_m_out too small");
     unsafe {
         crate::cuda_ffi::hebbian_backward_segment_f32_cuda(
             k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
@@ -2836,6 +2848,7 @@ pub fn hebbian_backward_dd_segment(
             d_k_mem.ptr(), d_v_mem.ptr(), d_q_mem.ptr(),
             d_alpha.ptr(), d_m_out.ptr(),
             t_start as i32, t_end as i32, d as i32,
+            batch_size as i32, seq_len as i32,
         );
     }
 }
@@ -2850,11 +2863,14 @@ pub fn dgd_backward_dd_segment(
     d_m_seed: &GpuBuf<f32>,
     d_k_mem: &mut GpuBuf<f32>, d_v_mem: &mut GpuBuf<f32>, d_q_mem: &mut GpuBuf<f32>,
     d_alpha: &mut GpuBuf<f32>, d_theta: &mut GpuBuf<f32>, d_m_out: &mut GpuBuf<f32>,
-    t_start: usize, t_end: usize, d: usize, error_clip: f32,
+    t_start: usize, t_end: usize, d: usize, batch_size: usize, seq_len: usize,
+    error_clip: f32,
 ) {
     debug_assert!(t_start < t_end, "segment t_start={t_start} must be < t_end={t_end}");
+    debug_assert!(t_end <= seq_len, "segment t_end={t_end} must be <= seq_len={seq_len}");
     debug_assert!(d > 0, "d must be > 0");
-    debug_assert!(d_m_seed.len() >= d * d, "d_m_seed too small");
+    debug_assert!(d_m_seed.len() >= batch_size * d * d, "d_m_seed too small");
+    debug_assert!(d_m_out.len() >= batch_size * d * d, "d_m_out too small");
     unsafe {
         crate::cuda_ffi::dgd_backward_segment_f32_cuda(
             k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
@@ -2863,7 +2879,8 @@ pub fn dgd_backward_dd_segment(
             d_m_seed.as_ptr(),
             d_k_mem.ptr(), d_v_mem.ptr(), d_q_mem.ptr(),
             d_alpha.ptr(), d_theta.ptr(), d_m_out.ptr(),
-            t_start as i32, t_end as i32, d as i32, error_clip,
+            t_start as i32, t_end as i32, d as i32,
+            batch_size as i32, seq_len as i32, error_clip,
         );
     }
 }

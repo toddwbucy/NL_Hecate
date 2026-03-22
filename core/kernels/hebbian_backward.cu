@@ -286,23 +286,40 @@ __global__ void hebbian_backward_kernel(
 // ══════════════════════════════════════════════════════════════════════
 
 __global__ void hebbian_backward_segment_kernel(
-    const float* __restrict__ k_mem,
+    const float* __restrict__ k_mem,      // [batch_size, seq_len, d]
     const float* __restrict__ v_mem,
     const float* __restrict__ q_mem,
-    const float* __restrict__ alpha,
-    const float* __restrict__ m_states,
+    const float* __restrict__ alpha,      // [batch_size, seq_len]
+    const float* __restrict__ m_states,   // [batch_size, (seg_len+1)*d*d]
     const float* __restrict__ d_y,
-    const float* __restrict__ d_m_seed,
+    const float* __restrict__ d_m_seed,   // [batch_size, d*d]
     float* __restrict__ d_k_mem,
     float* __restrict__ d_v_mem,
     float* __restrict__ d_q_mem,
     float* __restrict__ d_alpha,
-    float* __restrict__ d_m_out,
-    float* __restrict__ d_M,              // [d*d] — gradient accumulator in global memory
-    int t_start, int t_end, int d)
+    float* __restrict__ d_m_out,          // [batch_size, d*d]
+    float* __restrict__ d_M,              // [batch_size, d*d] — gradient accumulator in global memory
+    int t_start, int t_end, int d, int seq_len)
 {
+    int b = blockIdx.x;   // batch (head) index
     int tid = threadIdx.x;
     int dd = d * d;
+    int seg_len = t_end - t_start;
+
+    // Offset all pointers to this batch element's slice
+    k_mem      += b * seq_len * d;
+    v_mem      += b * seq_len * d;
+    q_mem      += b * seq_len * d;
+    alpha      += b * seq_len;
+    m_states   += b * (seg_len + 1) * dd;
+    d_y        += b * seq_len * d;
+    d_m_seed   += b * dd;
+    d_k_mem    += b * seq_len * d;
+    d_v_mem    += b * seq_len * d;
+    d_q_mem    += b * seq_len * d;
+    d_alpha    += b * seq_len;
+    d_m_out    += b * dd;
+    d_M        += b * dd;
 
     extern __shared__ float smem[];
     float* reduce_buf = smem;
@@ -394,7 +411,7 @@ extern "C" void hebbian_backward_segment_f32_cuda(
     const float* d_m_seed,
     float* d_k_mem, float* d_v_mem, float* d_q_mem,
     float* d_alpha, float* d_m_out,
-    int t_start, int t_end, int d)
+    int t_start, int t_end, int d, int batch_size, int seq_len)
 {
     if (d <= 0) {
         fprintf(stderr, "hebbian_backward_segment_f32_cuda: d=%d must be > 0.\n", d);
@@ -408,7 +425,7 @@ extern "C" void hebbian_backward_segment_f32_cuda(
     if (rounded > 1024) rounded = 1024;
     block_size = rounded;
 
-    dim3 grid(1);
+    dim3 grid(batch_size);
     dim3 block(block_size);
 
     // Segment kernel uses only reduce_buf[block_size], no cp.async.
@@ -422,13 +439,13 @@ extern "C" void hebbian_backward_segment_f32_cuda(
 
     float* d_M_work = nullptr;
     check_cuda_alloc("hebbian_backward_segment: cudaMalloc d_M_work",
-                     cudaMalloc(&d_M_work, dd * sizeof(float)));
+                     cudaMalloc(&d_M_work, (long long)batch_size * dd * sizeof(float)));
 
     hebbian_backward_segment_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, m_states, d_y,
         d_m_seed,
         d_k_mem, d_v_mem, d_q_mem, d_alpha, d_m_out,
-        d_M_work, t_start, t_end, d);
+        d_M_work, t_start, t_end, d, seq_len);
     check_cuda_launch("hebbian_backward_segment_kernel", d, smem_bytes);
 
     check_cuda_alloc("hebbian_backward_segment: cudaDeviceSynchronize",
