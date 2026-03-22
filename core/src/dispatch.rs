@@ -1998,6 +1998,27 @@ pub fn swa_backward_dd(
     }
 }
 
+/// Validate stride parameters for batched forward kernels.
+/// Uses debug_assert (internal API — callers are all in this crate).
+#[cfg(feature = "cuda")]
+#[inline]
+fn check_forward_strides(
+    seq_len: usize, d: usize, batch_size: usize,
+    input_stride: usize, m_stride: usize,
+) {
+    debug_assert!(batch_size > 0, "batch_size must be > 0");
+    debug_assert!(input_stride >= seq_len,
+        "input_stride ({input_stride}) must be >= seq_len ({seq_len})");
+    let dd = d * d;
+    debug_assert!(m_stride >= dd,
+        "m_stride ({m_stride}) must be >= d*d ({dd})");
+    debug_assert!(seq_len <= i32::MAX as usize, "seq_len exceeds i32");
+    debug_assert!(d <= i32::MAX as usize, "d exceeds i32");
+    debug_assert!(batch_size <= i32::MAX as usize, "batch_size exceeds i32");
+    debug_assert!(input_stride <= i32::MAX as usize, "input_stride exceeds i32");
+    debug_assert!(m_stride <= i32::MAX as usize, "m_stride exceeds i32");
+}
+
 /// Delta forward on device buffers.
 #[cfg(feature = "cuda")]
 pub fn delta_forward_dd(
@@ -2008,6 +2029,7 @@ pub fn delta_forward_dd(
     seq_len: usize, d: usize, batch_size: usize,
     input_stride: usize, m_stride: usize, error_clip: f32,
 ) {
+    check_forward_strides(seq_len, d, batch_size, input_stride, m_stride);
     unsafe {
         crate::cuda_ffi::delta_forward_f32_cuda(
             k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
@@ -2052,6 +2074,7 @@ pub fn titans_forward_dd(
     seq_len: usize, d: usize, batch_size: usize,
     input_stride: usize, m_stride: usize, error_clip: f32,
 ) {
+    check_forward_strides(seq_len, d, batch_size, input_stride, m_stride);
     unsafe {
         crate::cuda_ffi::titans_forward_f32_cuda(
             k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
@@ -2610,6 +2633,7 @@ pub fn hebbian_forward_dd(
     seq_len: usize, d: usize, batch_size: usize,
     input_stride: usize, m_stride: usize,
 ) {
+    check_forward_strides(seq_len, d, batch_size, input_stride, m_stride);
     unsafe {
         crate::cuda_ffi::hebbian_forward_f32_cuda(
             k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
@@ -2652,6 +2676,7 @@ pub fn dgd_forward_dd(
     seq_len: usize, d: usize, batch_size: usize,
     input_stride: usize, m_stride: usize, error_clip: f32,
 ) {
+    check_forward_strides(seq_len, d, batch_size, input_stride, m_stride);
     unsafe {
         crate::cuda_ffi::dgd_forward_f32_cuda(
             k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
