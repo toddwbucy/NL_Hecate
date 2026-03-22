@@ -1,5 +1,5 @@
 {
-    "description": "k=4 chain d=768 12-head 6-block on SmolLM corpus. H100 hardware ablation.",
+    "description": "k=4 chain d=768 12-head 6-block on Dolmino. H100 per-head memory benchmark.",
     "model": {
         "d_model": 768,
         "num_heads": 12,
@@ -15,9 +15,7 @@
         "error_clip": [0.0, 0.0, 0.0, 0.0],
         "residual": true,
         "n_blocks": 6,
-        "parallel_strategy": "tnt_hierarchical",
-        "tnt_global_chunk_size": 64,
-        "tnt_local_chunk_size": 8,
+        "parallel_strategy": "none",
         "memory_reset": "periodic",
         "tape_multiplier": 1,
         "tape_strategies": ["exact", "proxy", "proxy", "proxy"]
@@ -35,17 +33,19 @@
         "theta_ceil": [1.0, 1.0, 1.0, 1.0],
         "batch_size": 1,
         "log_every": 8,
+        "eval_every": 1000,
         "save_every": 5120,
+        "tape_every": 1000,
         "tape_device": "gpu",
         "profile_step": 1024,
         "gpu": true,
         "seed": 42,
-        "run_dir": "runs/k4_chain_smollm_d768_6b_h100",
-        "save_path": "runs/k4_chain_smollm_d768_6b_h100/checkpoints/model.safetensors",
-        "log_file": "runs/k4_chain_smollm_d768_6b_h100/metrics.jsonl"
+        "run_dir": "runs/k4_chain_dolmino_d768_6b_h100",
+        "save_path": "runs/k4_chain_dolmino_d768_6b_h100/checkpoints/model.safetensors",
+        "log_file": "runs/k4_chain_dolmino_d768_6b_h100/metrics.jsonl"
     },
     "data": {
-        "path": "/workspace/NL_Hecate/python/data/smollm_corpus",
-        "format": "smollm"
+        "path": "data/dolmino_100b",
+        "format": "dolmino"
     }
 }
