@@ -1613,6 +1613,15 @@ fn delta_backward_checkpointed(
     let segments = segment_boundaries(s, c);
     let num_ckpt = crate::gpu_forward::checkpoint_count(s, c);
 
+    // Validate input buffer sizes against expected flattened layout
+    debug_assert!(k_mem.len() >= bs * s * d, "k_mem too small: {} < {}", k_mem.len(), bs * s * d);
+    debug_assert!(v_mem.len() >= bs * s * d, "v_mem too small: {} < {}", v_mem.len(), bs * s * d);
+    debug_assert!(q_mem.len() >= bs * s * d, "q_mem too small: {} < {}", q_mem.len(), bs * s * d);
+    debug_assert!(alpha.len() >= bs * s, "alpha too small: {} < {}", alpha.len(), bs * s);
+    debug_assert!(theta.len() >= bs * s, "theta too small: {} < {}", theta.len(), bs * s);
+    debug_assert!(d_y.len() >= bs * s * d, "d_y too small: {} < {}", d_y.len(), bs * s * d);
+    debug_assert!(m_checkpoints.len() >= bs * num_ckpt * dd, "m_checkpoints too small: {} < {}", m_checkpoints.len(), bs * num_ckpt * dd);
+
     // Accumulation buffers — batched [bs, s, d] / [bs, s]
     let mut d_k_mem = GpuBuf::zeros(bs * s * d);
     let mut d_v_mem = GpuBuf::zeros(bs * s * d);
@@ -1692,6 +1701,17 @@ fn titans_backward_checkpointed(
     let dd = d * d;
     let segments = segment_boundaries(s, c);
     let num_ckpt = crate::gpu_forward::checkpoint_count(s, c);
+
+    // Validate input buffer sizes
+    debug_assert!(k_mem.len() >= bs * s * d, "k_mem too small: {} < {}", k_mem.len(), bs * s * d);
+    debug_assert!(v_mem.len() >= bs * s * d, "v_mem too small: {} < {}", v_mem.len(), bs * s * d);
+    debug_assert!(q_mem.len() >= bs * s * d, "q_mem too small: {} < {}", q_mem.len(), bs * s * d);
+    debug_assert!(alpha.len() >= bs * s, "alpha too small: {} < {}", alpha.len(), bs * s);
+    debug_assert!(theta.len() >= bs * s, "theta too small: {} < {}", theta.len(), bs * s);
+    debug_assert!(eta.len() >= bs * s, "eta too small: {} < {}", eta.len(), bs * s);
+    debug_assert!(d_y.len() >= bs * s * d, "d_y too small: {} < {}", d_y.len(), bs * s * d);
+    debug_assert!(m_checkpoints.len() >= bs * num_ckpt * dd, "m_checkpoints too small: {} < {}", m_checkpoints.len(), bs * num_ckpt * dd);
+    debug_assert!(s_checkpoints.len() >= bs * num_ckpt * dd, "s_checkpoints too small: {} < {}", s_checkpoints.len(), bs * num_ckpt * dd);
 
     let mut d_k_mem = GpuBuf::zeros(bs * s * d);
     let mut d_v_mem = GpuBuf::zeros(bs * s * d);
@@ -1775,6 +1795,14 @@ fn hebbian_backward_checkpointed(
     let dd = d * d;
     let segments = segment_boundaries(s, c);
     let num_ckpt = crate::gpu_forward::checkpoint_count(s, c);
+
+    // Validate input buffer sizes
+    debug_assert!(k_mem.len() >= bs * s * d, "k_mem too small: {} < {}", k_mem.len(), bs * s * d);
+    debug_assert!(v_mem.len() >= bs * s * d, "v_mem too small: {} < {}", v_mem.len(), bs * s * d);
+    debug_assert!(q_mem.len() >= bs * s * d, "q_mem too small: {} < {}", q_mem.len(), bs * s * d);
+    debug_assert!(alpha.len() >= bs * s, "alpha too small: {} < {}", alpha.len(), bs * s);
+    debug_assert!(d_y.len() >= bs * s * d, "d_y too small: {} < {}", d_y.len(), bs * s * d);
+    debug_assert!(m_checkpoints.len() >= bs * num_ckpt * dd, "m_checkpoints too small: {} < {}", m_checkpoints.len(), bs * num_ckpt * dd);
 
     let mut d_k_mem = GpuBuf::zeros(bs * s * d);
     let mut d_v_mem = GpuBuf::zeros(bs * s * d);
