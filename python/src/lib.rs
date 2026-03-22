@@ -2737,7 +2737,7 @@ impl GpuModel {
             // Compute DGD delta norm from forward cache (spec 16)
             let delta_norm = cache.memory_caches[level]
                 .as_ref()
-                .map(|mc| mc.dgd_delta_norm(s, d, bs))
+                .map(|mc| mc.dgd_delta_norm(s, d, bs, self.cfg.swa.num_heads))
                 .unwrap_or(0.0);
             ldict.set_item("dgd_delta_norm", delta_norm)?;
             // Theta (inner-loop learning rate) distribution
@@ -3536,7 +3536,7 @@ impl GpuStackedModel {
             let mut block_eta = Vec::with_capacity(k);
             for level in 0..k {
                 if let Some(ref mem_cache) = block_cache.memory_caches[level] {
-                    block_deltas.push(mem_cache.dgd_delta_norm(s, d, bs));
+                    block_deltas.push(mem_cache.dgd_delta_norm(s, d, bs, self.cfg.swa.num_heads));
                     let tc = self.cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
                     block_theta.push(mem_cache.theta_stats(tc));
                     let af = self.cfg.alpha_floor.get(level).copied().unwrap_or(0.0);

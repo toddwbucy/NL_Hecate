@@ -296,7 +296,12 @@ impl GpuMemoryCache {
     ///
     /// Source: HOPE (2512.24695) Eq 88 — error = M@k - v
     /// Spec:   specs/infrastructure/16_dgd_delta_norm_gpu.md
-    pub fn dgd_delta_norm(&self, s: usize, d: usize, batch_size: usize) -> f32 {
+    pub fn dgd_delta_norm(&self, s: usize, d: usize, batch_size: usize, num_heads: usize) -> f32 {
+        if num_heads > 1 {
+            // Diagnostic assumes monolithic d×d M state; per-head layout (nh × hd × hd)
+            // is not supported. Return 0.0 so callers see a safe sentinel.
+            return 0.0;
+        }
         if s == 0 {
             return 0.0; // No tokens processed, no error to measure
         }
@@ -377,7 +382,7 @@ impl GpuMemoryCache {
                 for shard_cache in shard_inner_caches.iter() {
                     // Pass batch_size=1 — inner caches use n_batch (local chunk count)
                     // as their batch dim, but we only need slot 0's diagnostic.
-                    let delta = shard_cache.dgd_delta_norm(shard_s, d, 1);
+                    let delta = shard_cache.dgd_delta_norm(shard_s, d, 1, num_heads);
                     if delta > max_delta {
                         max_delta = delta;
                     }
@@ -766,7 +771,7 @@ pub fn gpu_cms_forward(
     let bitmask = pulse_to_bitmask(pulse, cfg.k);
 
     // ── CUDA Graph capture phase (one-time at warmup_steps) ────────────
-    if context.cuda_graph.should_capture() && context.forward_scratch.is_some() {
+    if context.cuda_graph.should_capture() && context.forward_scratch.is_some() && cfg.swa.num_heads == 1 {
         // Check that the memory rule is supported for graph capture.
         let is_tnt_mode = cfg.parallel.as_ref()
             .map(|p| p.strategy == ParallelStrategy::TNTHierarchical)
@@ -794,7 +799,7 @@ pub fn gpu_cms_forward(
     }
 
     // ── CUDA Graph replay path ─────────────────────────────────────────
-    if context.cuda_graph.should_replay(bitmask) {
+    if context.cuda_graph.should_replay(bitmask) && cfg.swa.num_heads == 1 {
         if let Some(loss) = gpu_cms_replay(params, cfg, &input_ids_i32, &target_ids_i32,
                                             pulse, context, bitmask, bs) {
             return loss;
@@ -972,7 +977,7 @@ pub fn gpu_cms_forward(
             let y_level = gpu_memory_read_only(
                 &params.levels[level], mem_input,
                 &context.memory[level],
-                bs * s, d,
+                bs * s, d, nh, hd,
             );
             y_per_level.push(y_level);
             memory_caches.push(None);
@@ -1804,6 +1809,7 @@ pub(crate) fn gpu_tnt_forward(
     // TNT operates on single sequences (batch_size=1 at the outer level).
     // The inner batch dimension is n_locals (N parallel local memories).
     assert_eq!(batch_size, 1, "TNT GPU forward requires batch_size=1 (TNT uses inner batch for N local memories)");
+    assert!(cfg.swa.num_heads == 1, "TNT GPU forward does not support per-head memory (num_heads > 1)");
     assert!(
         matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM | MemoryRuleKind::DeltaRule),
         "TNT GPU forward only supports TitansLMM and DeltaRule, got {:?}", cfg.memory_rule,
@@ -2710,26 +2716,54 @@ pub fn checkpoint_count(seq_len: usize, c: usize) -> usize {
 
 
 /// Frozen level: read-only y = M @ q_mem (all on GPU).
+///
+/// For monolithic (nh=1): single cuBLAS matmul Y = Q @ M^T.
+/// For per-head (nh>1): transpose Q to per-head layout, matmul per head, transpose back.
+/// `s` is total tokens (batch_size * seq_len from caller).
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_memory_read_only(
     level_params: &crate::gpu_params::GpuMemoryLevelParams,
     embedded: &GpuBuf<f32>,
-    context_m: &GpuBuf<f32>,   // [d*d] — read only
+    context_m: &GpuBuf<f32>,   // [mem_dd] — read only (d*d for nh=1, nh*hd*hd for nh>1)
     s: usize,
     d: usize,
+    num_heads: usize,
+    head_dim: usize,
 ) -> GpuBuf<f32> {
-    // q_mem = embedded @ W_q_mem^T
+    // q_mem = embedded @ W_q_mem^T  →  [s, d]
     let mut q_mem = GpuBuf::zeros(s * d);
     crate::dispatch::cublas_matmul_transb_dd(embedded, &level_params.w_q_mem, &mut q_mem, s, d, d, 0.0);
 
-    // y = M @ q_mem for each token (M is [d, d], q_mem[t] is [d])
-    // Batch: y[s, d] = q_mem[s, d] @ M^T (since y[t] = M @ q[t])
-    // Actually: y_t = M @ q_t. In matrix form: Y^T = M @ Q^T, so Y = Q @ M^T
-    let mut y = GpuBuf::zeros(s * d);
-    // M is [d,d], Q is [s,d]. Y[s,d] = Q[s,d] @ M^T[d,d]
-    // Use matmul_transb_dd: C = A @ B^T where B is [n,k] = M is [d,d]
-    crate::dispatch::cublas_matmul_transb_dd(&q_mem, context_m, &mut y, s, d, d, 0.0);
-    y
+    if num_heads == 1 {
+        // Monolithic: Y[s,d] = Q[s,d] @ M[d,d]^T
+        let mut y = GpuBuf::zeros(s * d);
+        crate::dispatch::cublas_matmul_transb_dd(&q_mem, context_m, &mut y, s, d, d, 0.0);
+        y
+    } else {
+        // Per-head: reshape Q → [nh, s, hd], matmul per head, reshape back.
+        // Use batch_size=1 since s is already total_tokens and frozen M is shared.
+        let q_ph = reshape_to_per_head(&q_mem, 1, s, num_heads, head_dim);
+        let y_ph = GpuBuf::<f32>::zeros(num_heads * s * head_dim);
+        let dd_mem = head_dim * head_dim;
+        for h in 0..num_heads {
+            let off_q = h * s * head_dim;
+            let off_m = h * dd_mem;
+            let off_y = h * s * head_dim;
+            unsafe {
+                let q_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(
+                    q_ph.as_ptr().add(off_q) as *mut f32, s * head_dim);
+                let m_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(
+                    context_m.as_ptr().add(off_m) as *mut f32, dd_mem);
+                let mut y_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(
+                    y_ph.ptr().add(off_y) as *mut f32, s * head_dim);
+                // Y_h[s, hd] = Q_h[s, hd] @ M_h[hd, hd]^T
+                crate::dispatch::cublas_matmul_transb_dd(
+                    &q_h, &m_h, &mut y_h, s, head_dim, head_dim, 0.0);
+            }
+        }
+        let y = reshape_from_per_head(&y_ph, 1, s, num_heads, head_dim);
+        y
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -2951,7 +2985,7 @@ pub fn gpu_prefill_forward(
             let y_level = gpu_memory_read_only(
                 &params.levels[level], &embedded,
                 &context.memory[level],
-                s, d,
+                s, d, cfg.swa.num_heads, cfg.swa.head_dim,
             );
             y_per_level.push(y_level);
             }
@@ -3144,7 +3178,7 @@ pub fn gpu_single_token_forward(
             let y_level = gpu_memory_read_only(
                 &params.levels[level], &ws.embedded,
                 &context.memory[level],
-                1, d,
+                1, d, cfg.swa.num_heads, cfg.swa.head_dim,
             );
             y_per_level.push(y_level);
             }
