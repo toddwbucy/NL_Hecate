@@ -26,6 +26,21 @@ use crate::gpu_profiler::GpuProfiler;
 use crate::{prof_start, prof_stop};
 
 // ══════════════════════════════════════════════════════════════════════
+// Debug: set HECATE_DEBUG_CMS=1 to log CMS dispatch on pattern changes
+// ══════════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "cuda")]
+static DEBUG_CMS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    std::env::var("HECATE_DEBUG_CMS").map(|v| v == "1").unwrap_or(false)
+});
+
+#[cfg(feature = "cuda")]
+use std::sync::Mutex;
+#[cfg(feature = "cuda")]
+static LAST_CMS_PATTERN: std::sync::LazyLock<Mutex<Vec<bool>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+// ══════════════════════════════════════════════════════════════════════
 // GpuStackedBlockCache — per-block forward activations
 // ══════════════════════════════════════════════════════════════════════
 
@@ -307,8 +322,26 @@ pub fn gpu_stacked_forward(
                 s / c
             })
             .collect();
-
         let is_chained = matches!(cfg.hope_variant, HopeVariant::Chained | HopeVariant::Sequential);
+
+        // Debug: log CMS dispatch only when the active-level pattern changes
+        if *DEBUG_CMS && b == 0 {
+            let current: Vec<bool> = (0..cfg.k).map(|l| {
+                pulse.active_levels[l] || matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp)
+            }).collect();
+            let changed = {
+                let prev = LAST_CMS_PATTERN.lock().unwrap();
+                *prev != current
+            };
+            if changed {
+                eprintln!("[CMS] step={} k={} level_seq_lens={:?} active={:?}",
+                    pulse.global_step, cfg.k, level_seq_lens,
+                    current.iter().enumerate()
+                        .map(|(l, &a)| format!("L{}:{}", l, if a { "fwd" } else { "ro" }))
+                        .collect::<Vec<_>>().join(" "));
+                *LAST_CMS_PATTERN.lock().unwrap() = current;
+            }
+        }
 
         if is_chained {
             // HOPE Eq 70 / Eq 97: Chain CMS — each level processes previous level's output.
@@ -341,6 +374,7 @@ pub fn gpu_stacked_forward(
                 if effective_active {
                     if is_tnt
                         && bs == 1
+                        && cfg.swa.num_heads == 1  // TNT doesn't support per-head memory
                         && matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM | MemoryRuleKind::DeltaRule)
                     {
                         let parallel_cfg = cfg.parallel.as_ref().unwrap();
@@ -404,6 +438,7 @@ pub fn gpu_stacked_forward(
                 if effective_active {
                     if is_tnt
                         && bs == 1
+                        && cfg.swa.num_heads == 1  // TNT doesn't support per-head memory
                         && matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM | MemoryRuleKind::DeltaRule)
                     {
                         let parallel_cfg = cfg.parallel.as_ref().unwrap();

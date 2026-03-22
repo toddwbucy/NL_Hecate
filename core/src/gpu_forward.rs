@@ -945,6 +945,7 @@ pub fn gpu_cms_forward(
         if effective_active {
             if is_tnt
                 && bs == 1
+                && cfg.swa.num_heads == 1  // TNT doesn't support per-head memory
                 && matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM | MemoryRuleKind::DeltaRule)
             {
                 // TNT path: shard-parallel memory processing via gpu_tnt_forward.

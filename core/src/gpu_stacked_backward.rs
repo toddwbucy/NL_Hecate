@@ -233,10 +233,11 @@ pub fn gpu_stacked_backward(
 
         // Helper: compute L2 norm of a GPU buffer using grad_norm_sq_cuda
         let compute_gnorm = |buf: &GpuBuf<f32>, scratch: &GpuBuf<f32>| -> f32 {
+            let buf_len = buf.len() as i32;
             let mut num_blocks_out: i32 = 0;
             let err = unsafe {
                 crate::cuda_ffi::grad_norm_sq_cuda(
-                    buf.as_ptr(), scratch.ptr(), bsd as i32, &mut num_blocks_out,
+                    buf.as_ptr(), scratch.ptr(), buf_len, &mut num_blocks_out,
                 )
             };
             assert_eq!(err, 0, "grad_norm_sq_cuda failed");
