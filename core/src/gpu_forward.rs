@@ -296,7 +296,12 @@ impl GpuMemoryCache {
     ///
     /// Source: HOPE (2512.24695) Eq 88 — error = M@k - v
     /// Spec:   specs/infrastructure/16_dgd_delta_norm_gpu.md
-    pub fn dgd_delta_norm(&self, s: usize, d: usize, batch_size: usize) -> f32 {
+    pub fn dgd_delta_norm(&self, s: usize, d: usize, batch_size: usize, num_heads: usize) -> f32 {
+        if num_heads > 1 {
+            // Diagnostic assumes monolithic d×d M state; per-head layout (nh × hd × hd)
+            // is not supported. Return 0.0 so callers see a safe sentinel.
+            return 0.0;
+        }
         if s == 0 {
             return 0.0; // No tokens processed, no error to measure
         }
@@ -377,7 +382,7 @@ impl GpuMemoryCache {
                 for shard_cache in shard_inner_caches.iter() {
                     // Pass batch_size=1 — inner caches use n_batch (local chunk count)
                     // as their batch dim, but we only need slot 0's diagnostic.
-                    let delta = shard_cache.dgd_delta_norm(shard_s, d, 1);
+                    let delta = shard_cache.dgd_delta_norm(shard_s, d, 1, num_heads);
                     if delta > max_delta {
                         max_delta = delta;
                     }
@@ -766,7 +771,7 @@ pub fn gpu_cms_forward(
     let bitmask = pulse_to_bitmask(pulse, cfg.k);
 
     // ── CUDA Graph capture phase (one-time at warmup_steps) ────────────
-    if context.cuda_graph.should_capture() && context.forward_scratch.is_some() {
+    if context.cuda_graph.should_capture() && context.forward_scratch.is_some() && cfg.swa.num_heads == 1 {
         // Check that the memory rule is supported for graph capture.
         let is_tnt_mode = cfg.parallel.as_ref()
             .map(|p| p.strategy == ParallelStrategy::TNTHierarchical)
@@ -794,7 +799,7 @@ pub fn gpu_cms_forward(
     }
 
     // ── CUDA Graph replay path ─────────────────────────────────────────
-    if context.cuda_graph.should_replay(bitmask) {
+    if context.cuda_graph.should_replay(bitmask) && cfg.swa.num_heads == 1 {
         if let Some(loss) = gpu_cms_replay(params, cfg, &input_ids_i32, &target_ids_i32,
                                             pulse, context, bitmask, bs) {
             return loss;
@@ -972,7 +977,7 @@ pub fn gpu_cms_forward(
             let y_level = gpu_memory_read_only(
                 &params.levels[level], mem_input,
                 &context.memory[level],
-                bs * s, d,
+                bs * s, d, nh, hd,
             );
             y_per_level.push(y_level);
             memory_caches.push(None);
@@ -1083,24 +1088,87 @@ pub fn gpu_cms_forward(
 // Memory forward helpers (GPU-resident)
 // ══════════════════════════════════════════════════════════════════════
 
+/// Transpose [bs, s, nh*hd] → [bs*nh, s, hd] on GPU.
+/// Spec 45: converts d_model-layout projections to per-head layout for memory kernels.
+#[cfg(feature = "cuda")]
+pub(crate) fn reshape_to_per_head(buf: &GpuBuf<f32>, bs: usize, s: usize, nh: usize, hd: usize) -> GpuBuf<f32> {
+    let out = GpuBuf::zeros(bs * nh * s * hd);
+    unsafe {
+        crate::cuda_ffi::transpose_heads_f32_cuda(
+            buf.as_ptr(), out.ptr(),
+            bs as i32, s as i32, nh as i32, hd as i32, 1,
+        );
+    }
+    out
+}
+
+/// Transpose [bs*nh, s, hd] → [bs, s, nh*hd] on GPU.
+/// Spec 45: converts per-head memory output back to d_model layout.
+#[cfg(feature = "cuda")]
+pub(crate) fn reshape_from_per_head(buf: &GpuBuf<f32>, bs: usize, s: usize, nh: usize, hd: usize) -> GpuBuf<f32> {
+    let out = GpuBuf::zeros(bs * s * nh * hd);
+    unsafe {
+        crate::cuda_ffi::transpose_heads_f32_cuda(
+            buf.as_ptr(), out.ptr(),
+            bs as i32, s as i32, nh as i32, hd as i32, 0,
+        );
+    }
+    out
+}
+
+/// Broadcast [bs, s] → [bs*nh, s] by repeating gate values across heads.
+/// Spec 45: gates are position-level signals, same across all heads.
+#[cfg(feature = "cuda")]
+pub(crate) fn broadcast_gates(buf: &GpuBuf<f32>, bs: usize, s: usize, nh: usize) -> GpuBuf<f32> {
+    let out = GpuBuf::zeros(bs * nh * s);
+    unsafe {
+        crate::cuda_ffi::broadcast_heads_f32_cuda(
+            buf.as_ptr(), out.ptr(),
+            bs as i32, s as i32, nh as i32,
+        );
+    }
+    out
+}
+
+/// Sum [bs*nh, s] → [bs, s] across heads (backward of broadcast_gates).
+/// Spec 45: reduces per-head gate gradients back to position-level.
+#[cfg(feature = "cuda")]
+pub(crate) fn sum_gates_across_heads(buf: &GpuBuf<f32>, bs: usize, s: usize, nh: usize) -> GpuBuf<f32> {
+    let out = GpuBuf::zeros(bs * s);
+    unsafe {
+        crate::cuda_ffi::sum_heads_f32_cuda(
+            buf.as_ptr(), out.ptr(),
+            bs as i32, s as i32, nh as i32,
+        );
+    }
+    out
+}
+
 /// Compute memory projections + gates + inner loop for an active level, all on GPU.
 ///
 /// `embedded` has shape [batch_size * s, d] (flat batch).
-/// `context_m` is the carry-forward M state [d*d] — broadcast to all batch elements,
+/// `context_m` is the carry-forward M state — broadcast to all batch elements,
 /// then element-0's final M is written back after the forward pass.
+///
+/// Spec 45: When num_heads > 1, memory operates in per-head mode:
+///   - M is num_heads × (head_dim × head_dim) instead of 1 × (d × d)
+///   - Kernel grid = batch_size × num_heads (one SM per head)
+///   - 12× less computation, 12× more SM utilization at d=768/12h
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_memory_forward(
     level_params: &crate::gpu_params::GpuMemoryLevelParams,
     cfg: &MAGConfig,
     embedded: &GpuBuf<f32>,
-    context_m: &mut GpuBuf<f32>,   // [d*d] — carry-forward, updated with elem-0's final M
+    context_m: &mut GpuBuf<f32>,   // carry-forward M state, updated with final M
     s: usize,
     d: usize,
     level: usize,
     batch_size: usize,
 ) -> (GpuBuf<f32>, GpuMemoryCache) {
     let bs = batch_size;
-    let dd = d * d;
+    let dd = d * d;  // d_model × d_model (used by fused path + DGD)
+    let nh = cfg.swa.num_heads;
+    let hd = cfg.swa.head_dim;
     let tokens_i32 = i32::try_from(bs * s).expect("bs*s exceeds i32::MAX");
     let d_i32      = i32::try_from(d).expect("d_model exceeds i32::MAX");
 
@@ -1113,8 +1181,15 @@ pub(crate) fn gpu_memory_forward(
     crate::dispatch::cublas_matmul_transb_dd(embedded, &level_params.w_v_mem, &mut v_mem, bs * s, d, d, 0.0);
     crate::dispatch::cublas_matmul_transb_dd(embedded, &level_params.w_q_mem, &mut q_mem, bs * s, d, d, 0.0);
 
-    // context_m is [bs * dd] — slot b's initial M occupies offset b*dd.
-    let m_initial_slice = context_m.slice(0, bs * dd);
+    // ── Spec 45: Per-head dimensions for memory kernels ──────────────
+    // Memory M is nh × (hd × hd) instead of 1 × (d × d).
+    // dd_mem = per-head matrix size, bs_mem = batch folded with heads.
+    let dd_mem = hd * hd;
+    let bs_mem = bs * nh;
+    let hd_i32 = i32::try_from(hd).expect("head_dim exceeds i32::MAX");
+
+    // context_m is [bs_mem * dd_mem] — slot (b*nh+h)'s initial M_h at offset (b*nh+h)*dd_mem.
+    let m_initial_slice = context_m.slice(0, bs_mem * dd_mem);
     let m_norm_max = cfg.max_m_norm(level);
     let eff_ckpt = cfg.effective_checkpoint_interval(level);
     let is_proxy = cfg.tape_strategy_for_level(level) == LevelTapeStrategy::Proxy;
@@ -1126,12 +1201,13 @@ pub(crate) fn gpu_memory_forward(
     let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
 
     // ── Spec 39: Fused forward path ──────────────────────────────────
-    // For full-trajectory (no checkpoint_interval) DeltaRule and TitansLMM,
-    // fuse L2-normalize + gate compute + gate clamp + memory recurrence
-    // into a single kernel. Eliminates 4-5 separate kernel launches.
-    // Spec 43: proxy levels use chunkwise kernels (frozen-M₀) — skip fused path.
+    // Fused kernels compute gates internally at d_model resolution —
+    // incompatible with per-head memory (Spec 45). Disable fused path
+    // when num_heads > 1; the unfused path handles per-head transpose.
+    // TODO: re-fuse with per-head gate computation for nh > 1.
     let use_fused = eff_ckpt.is_none()
         && !is_proxy
+        && nh == 1  // Spec 45: skip fused when per-head is active
         && matches!(cfg.memory_rule, MemoryRuleKind::DeltaRule | MemoryRuleKind::TitansLMM);
 
     if use_fused {
@@ -1241,138 +1317,174 @@ pub(crate) fn gpu_memory_forward(
         }
     }
 
+    // ── Spec 45: Transpose to per-head layout ────────────────────────
+    // k/v/q: [bs, s, d] → [bs*nh, s, hd]  (per-head recurrence)
+    // gates:  [bs, s]   → [bs*nh, s]       (broadcast across heads)
+    // k_norms/q_norms stay in d_model layout for backward L2 norm undo.
+    let k_mem_ph = reshape_to_per_head(&k_mem, bs, s, nh, hd);
+    let v_mem_ph = reshape_to_per_head(&v_mem, bs, s, nh, hd);
+    let q_mem_ph = reshape_to_per_head(&q_mem, bs, s, nh, hd);
+    let alpha_ph = broadcast_gates(&alpha, bs, s, nh);
+    let theta_ph = broadcast_gates(&theta, bs, s, nh);
+
     match (eff_ckpt, cfg.memory_rule) {
         // ── Full-trajectory / chunkwise paths (checkpoint_interval=None) ──
         (None, MemoryRuleKind::DeltaRule) if is_proxy => {
-            // Spec 43/44: chunkwise forward (frozen-M₀). chunk_size from CMS frequency.
+            // Spec 43/44: chunkwise forward (frozen-M₀). Spec 45: per-head.
             let chunk_size = cfg.chunk_sizes.get(level).copied().unwrap_or(s);
             let num_chunks = (s + chunk_size - 1) / chunk_size;
-            let mut m_chunk_states = GpuBuf::zeros(bs * (num_chunks + 1) * dd);
-            let mut y = GpuBuf::zeros(bs * s * d);
+            let mut m_chunk_states = GpuBuf::zeros(bs_mem * (num_chunks + 1) * dd_mem);
+            let mut y_ph = GpuBuf::zeros(bs_mem * s * hd);
             if chunk_size > 1 {
-                // Spec 44: batched cuBLAS Phase 1
                 crate::dispatch::delta_chunkwise_forward_batched_dd(
-                    &k_mem, &v_mem, &q_mem, &alpha, &theta,
-                    &m_initial_slice, &mut m_chunk_states, &mut y,
-                    s, d, bs, chunk_size, cfg.error_clip_for_level(level),
+                    &k_mem_ph, &v_mem_ph, &q_mem_ph, &alpha_ph, &theta_ph,
+                    &m_initial_slice, &mut m_chunk_states, &mut y_ph,
+                    s, hd, bs_mem, chunk_size, cfg.error_clip_for_level(level),
                 );
             } else {
-                // chunk_size=1 (L0): monolithic kernel (cuBLAS overhead dominates)
                 crate::dispatch::delta_chunkwise_forward_dd(
-                    &k_mem, &v_mem, &q_mem, &alpha, &theta,
-                    &m_initial_slice, &mut m_chunk_states, &mut y,
-                    s, d, bs, chunk_size, cfg.error_clip_for_level(level),
+                    &k_mem_ph, &v_mem_ph, &q_mem_ph, &alpha_ph, &theta_ph,
+                    &m_initial_slice, &mut m_chunk_states, &mut y_ph,
+                    s, hd, bs_mem, chunk_size, cfg.error_clip_for_level(level),
                 );
             }
             crate::dispatch::cuda_sync();
-            copy_final_m_batch(&m_chunk_states, context_m, num_chunks, dd, bs);
-            for b in 0..bs {
+            copy_final_m_batch(&m_chunk_states, context_m, num_chunks, dd_mem, bs_mem);
+            for bh in 0..bs_mem {
                 unsafe {
                     crate::cuda_ffi::m_norm_clamp_f32_cuda(
-                        (context_m.ptr() as *mut u8).add(b * dd * 4) as *mut f32,
-                        d_i32, m_norm_max,
+                        (context_m.ptr() as *mut u8).add(bh * dd_mem * 4) as *mut f32,
+                        hd_i32, m_norm_max,
                     );
                 }
             }
+            let y = reshape_from_per_head(&y_ph, batch_size, s, nh, hd);
             (y, GpuMemoryCache::DeltaChunkwise { k_mem, v_mem, q_mem, alpha, theta, m_chunk_states, k_norms, q_norms, chunk_size, num_chunks })
         }
         (None, MemoryRuleKind::DeltaRule) => {
-            // Exact: full per-token trajectory
-            let mut m_states = GpuBuf::zeros(bs * (s + 1) * dd);
-            let mut y = GpuBuf::zeros(bs * s * d);
+            // Exact: full per-token trajectory (Spec 45: per-head)
+            let mut m_states = GpuBuf::zeros(bs_mem * (s + 1) * dd_mem);
+            let mut y_ph = GpuBuf::zeros(bs_mem * s * hd);
             crate::dispatch::delta_forward_dd(
-                &k_mem, &v_mem, &q_mem, &alpha, &theta,
-                &m_initial_slice, &mut m_states, &mut y, s, d, bs,
+                &k_mem_ph, &v_mem_ph, &q_mem_ph, &alpha_ph, &theta_ph,
+                &m_initial_slice, &mut m_states, &mut y_ph, s, hd, bs_mem,
                 cfg.error_clip_for_level(level),
             );
             crate::dispatch::cuda_sync();
-            copy_final_m_batch(&m_states, context_m, s, dd, bs);
-            for b in 0..bs {
+            copy_final_m_batch(&m_states, context_m, s, dd_mem, bs_mem);
+            for bh in 0..bs_mem {
                 unsafe {
                     crate::cuda_ffi::m_norm_clamp_f32_cuda(
-                        (context_m.ptr() as *mut u8).add(b * dd * 4) as *mut f32,
-                        d_i32, m_norm_max,
+                        (context_m.ptr() as *mut u8).add(bh * dd_mem * 4) as *mut f32,
+                        hd_i32, m_norm_max,
                     );
                 }
             }
+            let y = reshape_from_per_head(&y_ph, batch_size, s, nh, hd);
             (y, GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states, k_norms, q_norms, proxy: false })
         }
         (None, MemoryRuleKind::TitansLMM) if is_proxy => {
-            // Spec 43/44: chunkwise forward (frozen-M₀). chunk_size from CMS frequency.
-            let eta = compute_eta(level_params, &k_mem, &v_mem, bs * s, d);
-            let batch_s_initial = GpuBuf::zeros(bs * dd);
-            let s_initial_slice = batch_s_initial.slice(0, bs * dd);
+            // Spec 43/44: chunkwise forward (frozen-M₀). Spec 45: per-head.
+            let eta_dm = compute_eta(level_params, &k_mem, &v_mem, bs * s, d);
+            let eta_ph = broadcast_gates(&eta_dm, bs, s, nh);
+            let batch_s_initial = GpuBuf::zeros(bs_mem * dd_mem);
+            let s_initial_slice = batch_s_initial.slice(0, bs_mem * dd_mem);
             let chunk_size = cfg.chunk_sizes.get(level).copied().unwrap_or(s);
             let num_chunks = (s + chunk_size - 1) / chunk_size;
-            let mut m_chunk_states = GpuBuf::zeros(bs * (num_chunks + 1) * dd);
-            let mut s_chunk_states = GpuBuf::zeros(bs * (num_chunks + 1) * dd);
-            let mut y = GpuBuf::zeros(bs * s * d);
+            let mut m_chunk_states = GpuBuf::zeros(bs_mem * (num_chunks + 1) * dd_mem);
+            let mut s_chunk_states = GpuBuf::zeros(bs_mem * (num_chunks + 1) * dd_mem);
+            let mut y_ph = GpuBuf::zeros(bs_mem * s * hd);
             if chunk_size > 1 {
-                // Spec 44: batched cuBLAS Phase 1
                 crate::dispatch::titans_chunkwise_forward_batched_dd(
-                    &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
+                    &k_mem_ph, &v_mem_ph, &q_mem_ph, &alpha_ph, &theta_ph, &eta_ph,
                     &m_initial_slice, &s_initial_slice,
-                    &mut m_chunk_states, &mut s_chunk_states, &mut y,
-                    s, d, bs, chunk_size, cfg.error_clip_for_level(level),
+                    &mut m_chunk_states, &mut s_chunk_states, &mut y_ph,
+                    s, hd, bs_mem, chunk_size, cfg.error_clip_for_level(level),
                 );
             } else {
                 crate::dispatch::titans_chunkwise_forward_dd(
-                    &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
+                    &k_mem_ph, &v_mem_ph, &q_mem_ph, &alpha_ph, &theta_ph, &eta_ph,
                     &m_initial_slice, &s_initial_slice,
-                    &mut m_chunk_states, &mut s_chunk_states, &mut y,
-                    s, d, bs, chunk_size, cfg.error_clip_for_level(level),
+                    &mut m_chunk_states, &mut s_chunk_states, &mut y_ph,
+                    s, hd, bs_mem, chunk_size, cfg.error_clip_for_level(level),
                 );
             }
             crate::dispatch::cuda_sync();
-            copy_final_m_batch(&m_chunk_states, context_m, num_chunks, dd, bs);
-            for b in 0..bs {
+            copy_final_m_batch(&m_chunk_states, context_m, num_chunks, dd_mem, bs_mem);
+            for bh in 0..bs_mem {
                 unsafe {
                     crate::cuda_ffi::m_norm_clamp_f32_cuda(
-                        (context_m.ptr() as *mut u8).add(b * dd * 4) as *mut f32,
-                        d_i32, m_norm_max,
+                        (context_m.ptr() as *mut u8).add(bh * dd_mem * 4) as *mut f32,
+                        hd_i32, m_norm_max,
                     );
                 }
             }
-            (y, GpuMemoryCache::TitansChunkwise { k_mem, v_mem, q_mem, alpha, theta, eta, m_chunk_states, s_chunk_states, k_norms, q_norms, chunk_size, num_chunks })
+            let y = reshape_from_per_head(&y_ph, batch_size, s, nh, hd);
+            (y, GpuMemoryCache::TitansChunkwise { k_mem, v_mem, q_mem, alpha, theta, eta: eta_dm, m_chunk_states, s_chunk_states, k_norms, q_norms, chunk_size, num_chunks })
         }
         (None, MemoryRuleKind::TitansLMM) => {
             // Exact: full per-token trajectory
-            let eta = compute_eta(level_params, &k_mem, &v_mem, bs * s, d);
-            let batch_s_initial = GpuBuf::zeros(bs * dd);
-            let s_initial_slice = batch_s_initial.slice(0, bs * dd);
-            let mut m_states = GpuBuf::zeros(bs * (s + 1) * dd);
-            let mut s_states = GpuBuf::zeros(bs * (s + 1) * dd);
-            let mut y = GpuBuf::zeros(bs * s * d);
+            // Spec 45: eta computed at d_model resolution, then broadcast to per-head
+            let eta_dm = compute_eta(level_params, &k_mem, &v_mem, bs * s, d);
+            let eta_ph = broadcast_gates(&eta_dm, bs, s, nh);
+            // Per-head: allocate with hd×hd matrices, bs*nh batch elements
+            let batch_s_initial = GpuBuf::zeros(bs_mem * dd_mem);
+            let s_initial_slice = batch_s_initial.slice(0, bs_mem * dd_mem);
+            let mut m_states = GpuBuf::zeros(bs_mem * (s + 1) * dd_mem);
+            let mut s_states = GpuBuf::zeros(bs_mem * (s + 1) * dd_mem);
+            let mut y_ph = GpuBuf::zeros(bs_mem * s * hd);
             crate::dispatch::titans_forward_dd(
-                &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
+                &k_mem_ph, &v_mem_ph, &q_mem_ph, &alpha_ph, &theta_ph, &eta_ph,
                 &m_initial_slice, &s_initial_slice,
-                &mut m_states, &mut s_states, &mut y, s, d, bs,
+                &mut m_states, &mut s_states, &mut y_ph, s, hd, bs_mem,
                 cfg.error_clip_for_level(level),
             );
             crate::dispatch::cuda_sync();
-            copy_final_m_batch(&m_states, context_m, s, dd, bs);
-            for b in 0..bs {
+            // Copy per-head final M back to context_m
+            copy_final_m_batch(&m_states, context_m, s, dd_mem, bs_mem);
+            for bh in 0..bs_mem {
                 unsafe {
                     crate::cuda_ffi::m_norm_clamp_f32_cuda(
-                        (context_m.ptr() as *mut u8).add(b * dd * 4) as *mut f32,
-                        d_i32, m_norm_max,
+                        (context_m.ptr() as *mut u8).add(bh * dd_mem * 4) as *mut f32,
+                        hd_i32, m_norm_max,
                     );
                 }
             }
-            (y, GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states, s_states, k_norms, q_norms, proxy: false })
+            // Transpose y from [bs*nh, s, hd] → [bs, s, d]
+            let y = reshape_from_per_head(&y_ph, batch_size, s, nh, hd);
+            // Cache: store d_model k/v/q (for projection grads) + per-head m/s_states
+            (y, GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta: eta_dm, m_states, s_states, k_norms, q_norms, proxy: false })
         }
         (None, MemoryRuleKind::HebbianRule) => {
             assert_eq!(bs, 1, "Hebbian GPU forward with batch_size > 1 is not supported");
-            let mut m_states = GpuBuf::zeros(bs * (s + 1) * dd);
-            let mut y = GpuBuf::zeros(bs * s * d);
-            crate::dispatch::hebbian_forward_dd(
-                &k_mem, &v_mem, &q_mem, &alpha,
-                &m_initial_slice, &mut m_states, &mut y, s, d,
-            );
+            // Spec 45: per-head memory — loop over nh heads (hebbian dispatch is single-batch)
+            let m_states: GpuBuf<f32> = GpuBuf::zeros(bs_mem * (s + 1) * dd_mem);
+            let y_ph: GpuBuf<f32> = GpuBuf::zeros(bs_mem * s * hd);
+            for h in 0..nh {
+                unsafe {
+                    crate::cuda_ffi::hebbian_forward_f32_cuda(
+                        k_mem_ph.as_ptr().add(h * s * hd),
+                        v_mem_ph.as_ptr().add(h * s * hd),
+                        q_mem_ph.as_ptr().add(h * s * hd),
+                        alpha_ph.as_ptr().add(h * s),
+                        m_initial_slice.as_ptr().add(h * dd_mem),
+                        m_states.ptr().add(h * (s + 1) * dd_mem),
+                        y_ph.ptr().add(h * s * hd),
+                        s as i32, hd_i32,
+                    );
+                }
+            }
             crate::dispatch::cuda_sync();
-            // Hebbian is bs=1 only (asserted above), single slot copy.
-            copy_final_m_batch(&m_states, context_m, s, dd, 1);
-            unsafe { crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d_i32, m_norm_max); }
+            copy_final_m_batch(&m_states, context_m, s, dd_mem, bs_mem);
+            for bh in 0..bs_mem {
+                unsafe {
+                    crate::cuda_ffi::m_norm_clamp_f32_cuda(
+                        (context_m.ptr() as *mut u8).add(bh * dd_mem * 4) as *mut f32,
+                        hd_i32, m_norm_max,
+                    );
+                }
+            }
+            let y = reshape_from_per_head(&y_ph, batch_size, s, nh, hd);
             (y, GpuMemoryCache::Hebbian { k_mem, v_mem, q_mem, alpha, m_states, k_norms, q_norms })
         }
         // ── Checkpointed paths (checkpoint_interval=Some(c)) ──
@@ -1380,53 +1492,134 @@ pub(crate) fn gpu_memory_forward(
         // do not use checkpoint_interval, so this combination never occurs in practice.
         (Some(c), MemoryRuleKind::DeltaRule) => {
             assert_eq!(bs, 1, "checkpoint_interval with batch_size>1 not supported");
-            let m_initial = context_m.slice(0, dd);
+            // Spec 45: per-head — loop over nh heads (ckpt dispatch is single-batch)
             let num_ckpt = checkpoint_count(s, c);
-            let mut m_checkpoints = GpuBuf::zeros(num_ckpt * dd);
-            let mut y = GpuBuf::zeros(s * d);
-            crate::dispatch::delta_forward_dd_ckpt(
-                &k_mem, &v_mem, &q_mem, &alpha, &theta,
-                &m_initial, &mut m_checkpoints, &mut y, s, d, c,
-                cfg.error_clip_for_level(level),
-            );
+            let m_checkpoints: GpuBuf<f32> = GpuBuf::zeros(nh * num_ckpt * dd_mem);
+            let y_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s * hd);
+            let error_clip = cfg.error_clip_for_level(level);
+            for h in 0..nh {
+                unsafe {
+                    crate::cuda_ffi::delta_forward_ckpt_f32_cuda(
+                        k_mem_ph.as_ptr().add(h * s * hd),
+                        v_mem_ph.as_ptr().add(h * s * hd),
+                        q_mem_ph.as_ptr().add(h * s * hd),
+                        alpha_ph.as_ptr().add(h * s),
+                        theta_ph.as_ptr().add(h * s),
+                        m_initial_slice.as_ptr().add(h * dd_mem),
+                        m_checkpoints.ptr().add(h * num_ckpt * dd_mem),
+                        y_ph.ptr().add(h * s * hd),
+                        s as i32, hd_i32, c as i32, error_clip,
+                    );
+                }
+            }
             crate::dispatch::cuda_sync();
-            copy_final_m(&m_checkpoints, context_m, (num_ckpt - 1) * dd, dd);
-            unsafe { crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d_i32, m_norm_max); }
+            // Copy final checkpoint for each head to context_m
+            for h in 0..nh {
+                let src_offset = h * num_ckpt * dd_mem + (num_ckpt - 1) * dd_mem;
+                let dst_offset = h * dd_mem;
+                unsafe {
+                    let rc = gpu_buf_memcpy_d2d(
+                        (context_m.ptr() as *mut u8).add(dst_offset * 4) as *mut std::ffi::c_void,
+                        m_checkpoints.as_ptr().add(src_offset) as *const std::ffi::c_void,
+                        dd_mem * 4,
+                    );
+                    assert_eq!(rc, 0, "copy final ckpt failed for head {h}");
+                    crate::cuda_ffi::m_norm_clamp_f32_cuda(
+                        (context_m.ptr() as *mut u8).add(dst_offset * 4) as *mut f32,
+                        hd_i32, m_norm_max,
+                    );
+                }
+            }
+            let y = reshape_from_per_head(&y_ph, batch_size, s, nh, hd);
             (y, GpuMemoryCache::DeltaCkpt { k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, checkpoint_interval: c, k_norms, q_norms })
         }
         (Some(c), MemoryRuleKind::TitansLMM) => {
             assert_eq!(bs, 1, "checkpoint_interval with batch_size>1 not supported");
-            let m_initial = context_m.slice(0, dd);
-            let eta = compute_eta(level_params, &k_mem, &v_mem, s, d);
-            let s_initial_buf = GpuBuf::zeros(dd);
+            // Spec 45: per-head — loop over nh heads (ckpt dispatch is single-batch)
+            let eta_dm = compute_eta(level_params, &k_mem, &v_mem, s, d);
+            let eta_ph = broadcast_gates(&eta_dm, bs, s, nh);
             let num_ckpt = checkpoint_count(s, c);
-            let mut m_checkpoints = GpuBuf::zeros(num_ckpt * dd);
-            let mut s_checkpoints = GpuBuf::zeros(num_ckpt * dd);
-            let mut y = GpuBuf::zeros(s * d);
-            crate::dispatch::titans_forward_dd_ckpt(
-                &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
-                &m_initial, &s_initial_buf.slice(0, dd),
-                &mut m_checkpoints, &mut s_checkpoints, &mut y, s, d, c,
-                cfg.error_clip_for_level(level),
-            );
+            let m_checkpoints: GpuBuf<f32> = GpuBuf::zeros(nh * num_ckpt * dd_mem);
+            let s_checkpoints: GpuBuf<f32> = GpuBuf::zeros(nh * num_ckpt * dd_mem);
+            let y_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s * hd);
+            let s_initial_buf: GpuBuf<f32> = GpuBuf::zeros(dd_mem);
+            let error_clip = cfg.error_clip_for_level(level);
+            for h in 0..nh {
+                unsafe {
+                    crate::cuda_ffi::titans_forward_ckpt_f32_cuda(
+                        k_mem_ph.as_ptr().add(h * s * hd),
+                        v_mem_ph.as_ptr().add(h * s * hd),
+                        q_mem_ph.as_ptr().add(h * s * hd),
+                        alpha_ph.as_ptr().add(h * s),
+                        theta_ph.as_ptr().add(h * s),
+                        eta_ph.as_ptr().add(h * s),
+                        m_initial_slice.as_ptr().add(h * dd_mem),
+                        s_initial_buf.as_ptr(),  // zeros for each head
+                        m_checkpoints.ptr().add(h * num_ckpt * dd_mem),
+                        s_checkpoints.ptr().add(h * num_ckpt * dd_mem),
+                        y_ph.ptr().add(h * s * hd),
+                        s as i32, hd_i32, c as i32, error_clip,
+                    );
+                }
+            }
             crate::dispatch::cuda_sync();
-            copy_final_m(&m_checkpoints, context_m, (num_ckpt - 1) * dd, dd);
-            unsafe { crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d_i32, m_norm_max); }
-            (y, GpuMemoryCache::TitansCkpt { k_mem, v_mem, q_mem, alpha, theta, eta, m_checkpoints, s_checkpoints, checkpoint_interval: c, k_norms, q_norms })
+            for h in 0..nh {
+                let src_offset = h * num_ckpt * dd_mem + (num_ckpt - 1) * dd_mem;
+                let dst_offset = h * dd_mem;
+                unsafe {
+                    let rc = gpu_buf_memcpy_d2d(
+                        (context_m.ptr() as *mut u8).add(dst_offset * 4) as *mut std::ffi::c_void,
+                        m_checkpoints.as_ptr().add(src_offset) as *const std::ffi::c_void,
+                        dd_mem * 4,
+                    );
+                    assert_eq!(rc, 0, "copy final ckpt failed for head {h}");
+                    crate::cuda_ffi::m_norm_clamp_f32_cuda(
+                        (context_m.ptr() as *mut u8).add(dst_offset * 4) as *mut f32,
+                        hd_i32, m_norm_max,
+                    );
+                }
+            }
+            let y = reshape_from_per_head(&y_ph, batch_size, s, nh, hd);
+            (y, GpuMemoryCache::TitansCkpt { k_mem, v_mem, q_mem, alpha, theta, eta: eta_dm, m_checkpoints, s_checkpoints, checkpoint_interval: c, k_norms, q_norms })
         }
         (Some(c), MemoryRuleKind::HebbianRule) => {
             assert_eq!(bs, 1, "checkpoint_interval with batch_size>1 not supported");
-            let m_initial = context_m.slice(0, dd);
+            // Spec 45: per-head — loop over nh heads (ckpt dispatch is single-batch)
             let num_ckpt = checkpoint_count(s, c);
-            let mut m_checkpoints = GpuBuf::zeros(num_ckpt * dd);
-            let mut y = GpuBuf::zeros(s * d);
-            crate::dispatch::hebbian_forward_dd_ckpt(
-                &k_mem, &v_mem, &q_mem, &alpha,
-                &m_initial, &mut m_checkpoints, &mut y, s, d, c,
-            );
+            let m_checkpoints: GpuBuf<f32> = GpuBuf::zeros(nh * num_ckpt * dd_mem);
+            let y_ph: GpuBuf<f32> = GpuBuf::zeros(nh * s * hd);
+            for h in 0..nh {
+                unsafe {
+                    crate::cuda_ffi::hebbian_forward_ckpt_f32_cuda(
+                        k_mem_ph.as_ptr().add(h * s * hd),
+                        v_mem_ph.as_ptr().add(h * s * hd),
+                        q_mem_ph.as_ptr().add(h * s * hd),
+                        alpha_ph.as_ptr().add(h * s),
+                        m_initial_slice.as_ptr().add(h * dd_mem),
+                        m_checkpoints.ptr().add(h * num_ckpt * dd_mem),
+                        y_ph.ptr().add(h * s * hd),
+                        s as i32, hd_i32, c as i32,
+                    );
+                }
+            }
             crate::dispatch::cuda_sync();
-            copy_final_m(&m_checkpoints, context_m, (num_ckpt - 1) * dd, dd);
-            unsafe { crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d_i32, m_norm_max); }
+            for h in 0..nh {
+                let src_offset = h * num_ckpt * dd_mem + (num_ckpt - 1) * dd_mem;
+                let dst_offset = h * dd_mem;
+                unsafe {
+                    let rc = gpu_buf_memcpy_d2d(
+                        (context_m.ptr() as *mut u8).add(dst_offset * 4) as *mut std::ffi::c_void,
+                        m_checkpoints.as_ptr().add(src_offset) as *const std::ffi::c_void,
+                        dd_mem * 4,
+                    );
+                    assert_eq!(rc, 0, "copy final ckpt failed for head {h}");
+                    crate::cuda_ffi::m_norm_clamp_f32_cuda(
+                        (context_m.ptr() as *mut u8).add(dst_offset * 4) as *mut f32,
+                        hd_i32, m_norm_max,
+                    );
+                }
+            }
+            let y = reshape_from_per_head(&y_ph, batch_size, s, nh, hd);
             (y, GpuMemoryCache::HebbianCkpt { k_mem, v_mem, q_mem, alpha, m_checkpoints, checkpoint_interval: c, k_norms, q_norms })
         }
         // ── SwiGLU: stateless MLP, no M state, no m_norm_clamp ──────────
@@ -1616,6 +1809,7 @@ pub(crate) fn gpu_tnt_forward(
     // TNT operates on single sequences (batch_size=1 at the outer level).
     // The inner batch dimension is n_locals (N parallel local memories).
     assert_eq!(batch_size, 1, "TNT GPU forward requires batch_size=1 (TNT uses inner batch for N local memories)");
+    assert!(cfg.swa.num_heads == 1, "TNT GPU forward does not support per-head memory (num_heads > 1)");
     assert!(
         matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM | MemoryRuleKind::DeltaRule),
         "TNT GPU forward only supports TitansLMM and DeltaRule, got {:?}", cfg.memory_rule,
@@ -2522,26 +2716,54 @@ pub fn checkpoint_count(seq_len: usize, c: usize) -> usize {
 
 
 /// Frozen level: read-only y = M @ q_mem (all on GPU).
+///
+/// For monolithic (nh=1): single cuBLAS matmul Y = Q @ M^T.
+/// For per-head (nh>1): transpose Q to per-head layout, matmul per head, transpose back.
+/// `s` is total tokens (batch_size * seq_len from caller).
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_memory_read_only(
     level_params: &crate::gpu_params::GpuMemoryLevelParams,
     embedded: &GpuBuf<f32>,
-    context_m: &GpuBuf<f32>,   // [d*d] — read only
+    context_m: &GpuBuf<f32>,   // [mem_dd] — read only (d*d for nh=1, nh*hd*hd for nh>1)
     s: usize,
     d: usize,
+    num_heads: usize,
+    head_dim: usize,
 ) -> GpuBuf<f32> {
-    // q_mem = embedded @ W_q_mem^T
+    // q_mem = embedded @ W_q_mem^T  →  [s, d]
     let mut q_mem = GpuBuf::zeros(s * d);
     crate::dispatch::cublas_matmul_transb_dd(embedded, &level_params.w_q_mem, &mut q_mem, s, d, d, 0.0);
 
-    // y = M @ q_mem for each token (M is [d, d], q_mem[t] is [d])
-    // Batch: y[s, d] = q_mem[s, d] @ M^T (since y[t] = M @ q[t])
-    // Actually: y_t = M @ q_t. In matrix form: Y^T = M @ Q^T, so Y = Q @ M^T
-    let mut y = GpuBuf::zeros(s * d);
-    // M is [d,d], Q is [s,d]. Y[s,d] = Q[s,d] @ M^T[d,d]
-    // Use matmul_transb_dd: C = A @ B^T where B is [n,k] = M is [d,d]
-    crate::dispatch::cublas_matmul_transb_dd(&q_mem, context_m, &mut y, s, d, d, 0.0);
-    y
+    if num_heads == 1 {
+        // Monolithic: Y[s,d] = Q[s,d] @ M[d,d]^T
+        let mut y = GpuBuf::zeros(s * d);
+        crate::dispatch::cublas_matmul_transb_dd(&q_mem, context_m, &mut y, s, d, d, 0.0);
+        y
+    } else {
+        // Per-head: reshape Q → [nh, s, hd], matmul per head, reshape back.
+        // Use batch_size=1 since s is already total_tokens and frozen M is shared.
+        let q_ph = reshape_to_per_head(&q_mem, 1, s, num_heads, head_dim);
+        let y_ph = GpuBuf::<f32>::zeros(num_heads * s * head_dim);
+        let dd_mem = head_dim * head_dim;
+        for h in 0..num_heads {
+            let off_q = h * s * head_dim;
+            let off_m = h * dd_mem;
+            let off_y = h * s * head_dim;
+            unsafe {
+                let q_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(
+                    q_ph.as_ptr().add(off_q) as *mut f32, s * head_dim);
+                let m_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(
+                    context_m.as_ptr().add(off_m) as *mut f32, dd_mem);
+                let mut y_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(
+                    y_ph.ptr().add(off_y) as *mut f32, s * head_dim);
+                // Y_h[s, hd] = Q_h[s, hd] @ M_h[hd, hd]^T
+                crate::dispatch::cublas_matmul_transb_dd(
+                    &q_h, &m_h, &mut y_h, s, head_dim, head_dim, 0.0);
+            }
+        }
+        let y = reshape_from_per_head(&y_ph, 1, s, num_heads, head_dim);
+        y
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -2763,7 +2985,7 @@ pub fn gpu_prefill_forward(
             let y_level = gpu_memory_read_only(
                 &params.levels[level], &embedded,
                 &context.memory[level],
-                s, d,
+                s, d, cfg.swa.num_heads, cfg.swa.head_dim,
             );
             y_per_level.push(y_level);
             }
@@ -2956,7 +3178,7 @@ pub fn gpu_single_token_forward(
             let y_level = gpu_memory_read_only(
                 &params.levels[level], &ws.embedded,
                 &context.memory[level],
-                1, d,
+                1, d, cfg.swa.num_heads, cfg.swa.head_dim,
             );
             y_per_level.push(y_level);
             }

@@ -2505,7 +2505,10 @@ impl GpuModel {
                 ctx.inner.memory.len(), ctx.inner.d, self.cfg.k, self.cfg.swa.d_model
             )));
         }
-        let mut new_ctx = nl_hecate_core::gpu_params::GpuContextState::from_host_context(&ctx.inner, self.context.batch_size);
+        let mut new_ctx = nl_hecate_core::gpu_params::GpuContextState::from_host_context(
+            &ctx.inner, self.context.batch_size,
+            self.cfg.swa.num_heads, self.cfg.swa.head_dim,
+        );
         // Preserve CUDA graph capture state across host-context restore.
         // from_host_context creates CudaGraphStore::new(0) (disabled), so move the live
         // store + scratch from the old context and call invalidate() to re-enter warmup.
@@ -2734,7 +2737,7 @@ impl GpuModel {
             // Compute DGD delta norm from forward cache (spec 16)
             let delta_norm = cache.memory_caches[level]
                 .as_ref()
-                .map(|mc| mc.dgd_delta_norm(s, d, bs))
+                .map(|mc| mc.dgd_delta_norm(s, d, bs, self.cfg.swa.num_heads))
                 .unwrap_or(0.0);
             ldict.set_item("dgd_delta_norm", delta_norm)?;
             // Theta (inner-loop learning rate) distribution
@@ -3533,7 +3536,7 @@ impl GpuStackedModel {
             let mut block_eta = Vec::with_capacity(k);
             for level in 0..k {
                 if let Some(ref mem_cache) = block_cache.memory_caches[level] {
-                    block_deltas.push(mem_cache.dgd_delta_norm(s, d, bs));
+                    block_deltas.push(mem_cache.dgd_delta_norm(s, d, bs, self.cfg.swa.num_heads));
                     let tc = self.cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
                     block_theta.push(mem_cache.theta_stats(tc));
                     let af = self.cfg.alpha_floor.get(level).copied().unwrap_or(0.0);

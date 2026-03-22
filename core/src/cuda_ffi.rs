@@ -897,4 +897,30 @@ extern "C" {
         batch_size: i32,
         error_clip: f32,
     );
+
+    // ── Per-head memory transpose/broadcast (Spec 45) ────────────────
+
+    /// Transpose [bs, s, nh*hd] → [bs*nh, s, hd] (forward=1) or reverse (forward=0).
+    /// Zero-copy layout conversion for per-head memory kernels.
+    pub(crate) fn transpose_heads_f32_cuda(
+        input: *const f32,
+        output: *mut f32,
+        bs: i32, s: i32, nh: i32, hd: i32,
+        forward: i32,
+    );
+
+    /// Broadcast [bs, s] → [bs*nh, s] by repeating each batch's gate values nh times.
+    pub(crate) fn broadcast_heads_f32_cuda(
+        input: *const f32,
+        output: *mut f32,
+        bs: i32, s: i32, nh: i32,
+    );
+
+    /// Sum [bs*nh, s] → [bs, s] across heads (backward of broadcast_heads).
+    /// Spec 45: reduces per-head gate gradients back to position-level.
+    pub(crate) fn sum_heads_f32_cuda(
+        input: *const f32,
+        output: *mut f32,
+        bs: i32, s: i32, nh: i32,
+    );
 }

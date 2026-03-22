@@ -332,7 +332,7 @@ pub fn gpu_stacked_forward(
                     let y_level = gpu_memory_read_only(
                         &block.levels[level], &h,
                         &block_ctx.memory[level],
-                        n_tokens, d,
+                        n_tokens, d, cfg.swa.num_heads, cfg.swa.head_dim,
                     );
                     y_per_level.push(y_level);
                     memory_caches.push(None);
@@ -376,7 +376,7 @@ pub fn gpu_stacked_forward(
                     let y_level = gpu_memory_read_only(
                         &block.levels[level], &ln_mem_out,
                         &block_ctx.memory[level],
-                        n_tokens, d,
+                        n_tokens, d, cfg.swa.num_heads, cfg.swa.head_dim,
                     );
                     y_per_level.push(y_level);
                     memory_caches.push(None);
