@@ -926,4 +926,33 @@ extern "C" {
         output: *mut f32,
         bs: i32, s: i32, nh: i32,
     );
+
+    // ── Pool/upsample operations (Spec 46: CMS token reduction) ─────────
+
+    /// Mean-pool C consecutive d-dimensional vectors into their average.
+    /// x: [bs*s, d] → out: [bs*(s/C), d]
+    pub(crate) fn mean_pool_1d_f32_cuda(
+        x: *const f32, out: *mut f32,
+        bs: i32, s: i32, d: i32, C: i32,
+    );
+
+    /// Repeat each vector C times: x: [bs*(s/C), d] → out: [bs*s, d]
+    pub(crate) fn repeat_upsample_1d_f32_cuda(
+        x: *const f32, out: *mut f32,
+        bs: i32, s: i32, d: i32, C: i32,
+    );
+
+    /// Backward of mean_pool: broadcast gradient / C.
+    /// d_out: [bs*(s/C), d] → d_x: [bs*s, d] (accumulated)
+    pub(crate) fn mean_pool_1d_backward_f32_cuda(
+        d_out: *const f32, d_x: *mut f32,
+        bs: i32, s: i32, d: i32, C: i32,
+    );
+
+    /// Backward of repeat_upsample: sum groups of C.
+    /// d_out: [bs*s, d] → d_x: [bs*(s/C), d]
+    pub(crate) fn repeat_upsample_1d_backward_f32_cuda(
+        d_out: *const f32, d_x: *mut f32,
+        bs: i32, s: i32, d: i32, C: i32,
+    );
 }

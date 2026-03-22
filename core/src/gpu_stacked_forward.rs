@@ -54,6 +54,9 @@ pub struct GpuStackedBlockCache {
     // Memory branch
     pub memory_caches: Vec<Option<GpuMemoryCache>>,
     pub y_per_level: Vec<GpuBuf<f32>>,
+    /// Per-level seq_len after CMS token reduction (Spec 46).
+    /// s_f[level] = s / chunk_sizes[level]. For chunk_sizes=[1,8,64,512]: [512,64,8,1].
+    pub level_seq_lens: Vec<usize>,
     pub y_combined: GpuBuf<f32>,      // [bs*s, d]
     // MAG gating
     pub attn_proj: GpuBuf<f32>,       // [bs*s, d] — attn_out @ W_O^T
@@ -294,15 +297,45 @@ pub fn gpu_stacked_forward(
         let mut memory_caches = Vec::with_capacity(cfg.k);
         let mut y_per_level = Vec::with_capacity(cfg.k);
 
+        // Spec 46: per-level token reduction via CMS frequency hierarchy.
+        // Level f processes s_f = s / chunk_sizes[f] tokens.
+        let level_seq_lens: Vec<usize> = (0..cfg.k)
+            .map(|level| {
+                let c = cfg.chunk_sizes.get(level).copied().unwrap_or(1);
+                debug_assert!(c >= 1 && s % c == 0,
+                    "seq_len ({s}) must be divisible by chunk_sizes[{level}] ({c})");
+                s / c
+            })
+            .collect();
+
         let is_chained = matches!(cfg.hope_variant, HopeVariant::Chained | HopeVariant::Sequential);
 
         if is_chained {
             // HOPE Eq 70 / Eq 97: Chain CMS — each level processes previous level's output.
             // Spec: specs/infrastructure/35_chain_cms_gpu.md
+            // Spec 46: each level also reduces token count via mean pooling.
             let mut h = ln_mem_out.clone_buf();
+            let mut h_seq_len = s;  // current resolution of h
             for level in 0..cfg.k {
+                let s_f = level_seq_lens[level];
                 let effective_active = pulse.active_levels[level]
                     || matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp);
+
+                // Spec 46: pool h down to this level's resolution if needed.
+                // In chain mode, pool factor is relative to current h resolution.
+                let level_input = if h_seq_len > s_f {
+                    let pool_factor = h_seq_len / s_f;
+                    let mut pooled = GpuBuf::zeros(bs * s_f * d);
+                    unsafe {
+                        crate::cuda_ffi::mean_pool_1d_f32_cuda(
+                            h.as_ptr(), pooled.ptr(),
+                            bs as i32, h_seq_len as i32, d as i32, pool_factor as i32,
+                        );
+                    }
+                    pooled
+                } else {
+                    h.clone_buf()
+                };
 
                 prof_start!(profiler, "memory_fwd", MemoryForward, Some(b), Some(level));
                 if effective_active {
@@ -312,17 +345,17 @@ pub fn gpu_stacked_forward(
                     {
                         let parallel_cfg = cfg.parallel.as_ref().unwrap();
                         let (y_level, mem_cache) = gpu_tnt_forward(
-                            &block.levels[level], cfg, &h,
+                            &block.levels[level], cfg, &level_input,
                             &mut block_ctx.memory[level],
-                            s, d, level, bs, parallel_cfg,
+                            s_f, d, level, bs, parallel_cfg,
                         );
                         y_per_level.push(y_level);
                         memory_caches.push(Some(mem_cache));
                     } else {
                         let (y_level, mem_cache) = gpu_memory_forward(
-                            &block.levels[level], cfg, &h,
+                            &block.levels[level], cfg, &level_input,
                             &mut block_ctx.memory[level],
-                            s, d, level, bs,
+                            s_f, d, level, bs,
                         );
                         y_per_level.push(y_level);
                         memory_caches.push(Some(mem_cache));
@@ -330,24 +363,42 @@ pub fn gpu_stacked_forward(
                 } else {
                     // Frozen: identity pass-through, read-only M@q
                     let y_level = gpu_memory_read_only(
-                        &block.levels[level], &h,
+                        &block.levels[level], &level_input,
                         &block_ctx.memory[level],
-                        n_tokens, d, cfg.swa.num_heads, cfg.swa.head_dim,
+                        bs * s_f, d, cfg.swa.num_heads, cfg.swa.head_dim,
                     );
                     y_per_level.push(y_level);
                     memory_caches.push(None);
                 }
                 prof_stop!(profiler);
-                // Chain: next level's input is this level's output
+                // Chain: next level's input is this level's output (at reduced resolution)
                 if level < cfg.k - 1 {
                     h = y_per_level[level].clone_buf();
+                    h_seq_len = s_f;
                 }
             }
         } else {
             // FreqGated/Independent: all levels process same ln_mem_out
+            // Spec 46: each level pools ln_mem_out to its own resolution
             for level in 0..cfg.k {
+                let s_f = level_seq_lens[level];
+                let c = cfg.chunk_sizes.get(level).copied().unwrap_or(1);
                 let effective_active = pulse.active_levels[level]
                     || matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp);
+
+                // Spec 46: pool input down to this level's resolution
+                let level_input = if c > 1 {
+                    let mut pooled = GpuBuf::zeros(bs * s_f * d);
+                    unsafe {
+                        crate::cuda_ffi::mean_pool_1d_f32_cuda(
+                            ln_mem_out.as_ptr(), pooled.ptr(),
+                            bs as i32, s as i32, d as i32, c as i32,
+                        );
+                    }
+                    pooled
+                } else {
+                    ln_mem_out.clone_buf()
+                };
 
                 prof_start!(profiler, "memory_fwd", MemoryForward, Some(b), Some(level));
                 if effective_active {
@@ -357,31 +408,48 @@ pub fn gpu_stacked_forward(
                     {
                         let parallel_cfg = cfg.parallel.as_ref().unwrap();
                         let (y_level, mem_cache) = gpu_tnt_forward(
-                            &block.levels[level], cfg, &ln_mem_out,
+                            &block.levels[level], cfg, &level_input,
                             &mut block_ctx.memory[level],
-                            s, d, level, bs, parallel_cfg,
+                            s_f, d, level, bs, parallel_cfg,
                         );
                         y_per_level.push(y_level);
                         memory_caches.push(Some(mem_cache));
                     } else {
                         let (y_level, mem_cache) = gpu_memory_forward(
-                            &block.levels[level], cfg, &ln_mem_out,
+                            &block.levels[level], cfg, &level_input,
                             &mut block_ctx.memory[level],
-                            s, d, level, bs,
+                            s_f, d, level, bs,
                         );
                         y_per_level.push(y_level);
                         memory_caches.push(Some(mem_cache));
                     }
                 } else {
                     let y_level = gpu_memory_read_only(
-                        &block.levels[level], &ln_mem_out,
+                        &block.levels[level], &level_input,
                         &block_ctx.memory[level],
-                        n_tokens, d, cfg.swa.num_heads, cfg.swa.head_dim,
+                        bs * s_f, d, cfg.swa.num_heads, cfg.swa.head_dim,
                     );
                     y_per_level.push(y_level);
                     memory_caches.push(None);
                 }
                 prof_stop!(profiler);
+            }
+
+            // Spec 46: upsample reduced-resolution outputs back to full seq_len
+            // for aggregation. y_per_level[l] is [bs*s_f, d]; needs [bs*s, d].
+            for level in 0..cfg.k {
+                let c = cfg.chunk_sizes.get(level).copied().unwrap_or(1);
+                if c > 1 {
+                    let s_f = level_seq_lens[level];
+                    let mut upsampled = GpuBuf::zeros(bs * s * d);
+                    unsafe {
+                        crate::cuda_ffi::repeat_upsample_1d_f32_cuda(
+                            y_per_level[level].as_ptr(), upsampled.ptr(),
+                            bs as i32, s as i32, d as i32, c as i32,
+                        );
+                    }
+                    y_per_level[level] = upsampled;
+                }
             }
         }
 
@@ -393,8 +461,23 @@ pub fn gpu_stacked_forward(
         if is_chained {
             // Chain CMS: y_combined = y_per_level[k-1] directly (no weighted sum)
             // Spec 35: alpha_mem aggregation weights are NOT used in chain mode
+            // Spec 46: last level output may be at reduced resolution — upsample to [bs*s, d]
             alpha_weights = vec![0.0f32; cfg.k];
-            y_combined = y_per_level.last().unwrap().clone_buf();
+            let last_level = cfg.k - 1;
+            let last_c = cfg.chunk_sizes.get(last_level).copied().unwrap_or(1);
+            let last_y = y_per_level.last().unwrap();
+            if last_c > 1 {
+                let mut upsampled = GpuBuf::zeros(bs * s * d);
+                unsafe {
+                    crate::cuda_ffi::repeat_upsample_1d_f32_cuda(
+                        last_y.as_ptr(), upsampled.ptr(),
+                        bs as i32, s as i32, d as i32, last_c as i32,
+                    );
+                }
+                y_combined = upsampled;
+            } else {
+                y_combined = last_y.clone_buf();
+            };
         } else {
             // Learnable level aggregation: weights = softmax(alpha_mem)
             // Spec: specs/infrastructure/21_stacked_alpha_aggregation.md
@@ -444,6 +527,7 @@ pub fn gpu_stacked_forward(
             ln_mem_out, ln_mem_mean, ln_mem_rstd,
             memory_caches,
             y_per_level,
+            level_seq_lens,
             y_combined,
             attn_proj,
             gate,
