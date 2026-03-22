@@ -79,7 +79,7 @@ The prefill is the existing forward path with two additions:
 1. Allocate and fill per-block KV caches from the K/V projections
 2. Skip the loss computation (we only need logits from the last position)
 
-```
+```text
 Prefill output:
   - context.memory[block][level] = M state after processing full prompt
   - kv_caches[block] = last window_size K/V pairs from SWA
@@ -213,7 +213,8 @@ pub fn gpu_stacked_decode_token(
     token_id: usize,
     pulse: &Pulse,
     context: &mut GpuStackedContext,
-    kv_caches: &mut [GpuKVCache],     // one per block
+    kv_caches: &mut [GpuKVCache],              // one per block
+    ws: &mut StackedDecodeWorkspace,            // pre-allocated GPU buffers
 ) -> Vec<f32>  // logits [vocab_size]
 ```
 
