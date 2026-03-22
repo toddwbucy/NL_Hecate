@@ -301,6 +301,11 @@ class BuildConfig:
         if len(self.chunk_sizes) != self.k:
             raise ValueError(
                 f"chunk_sizes length {len(self.chunk_sizes)} must match k={self.k}")
+        # Spec 46: seq_len must be divisible by every chunk_size for token reduction
+        for i, cs in enumerate(self.chunk_sizes):
+            if self.seq_len % cs != 0:
+                raise ValueError(
+                    f"seq_len ({self.seq_len}) must be divisible by chunk_sizes[{i}] ({cs})")
         if self.projection_kind not in ("static", "adaptive"):
             raise ValueError(
                 f"projection_kind must be 'static' or 'adaptive', got '{self.projection_kind}'")

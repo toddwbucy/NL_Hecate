@@ -254,20 +254,56 @@ pub fn gpu_stacked_backward(
         if is_chained {
             // ── Chain CMS backward (HOPE Eq 70/97) ──────────────────
             // Spec: specs/infrastructure/35_chain_cms_gpu.md
+            // Spec 46: per-level token reduction — backward through pool/upsample.
             // No alpha_mem in chain mode — gradient flows serially through levels.
             d_alpha_mem = vec![0.0f32; cfg.k];
 
-            // d_y_combined IS d_y for level k-1 (no weighted sum)
-            let mut d_upstream = d_y_combined.clone_buf();
+            // d_y_combined is at full resolution [bs*s, d].
+            // Spec 46: backward of the final upsample (chain output → full res)
+            let last_level = cfg.k - 1;
+            let last_c = cfg.chunk_sizes.get(last_level).copied().unwrap_or(1);
+            let last_s_f = bc.level_seq_lens[last_level];
+            let mut d_upstream = if last_c > 1 {
+                // Backward of repeat_upsample: sum groups of C
+                let mut d_reduced = GpuBuf::zeros(bs * last_s_f * d);
+                unsafe {
+                    crate::cuda_ffi::repeat_upsample_1d_backward_f32_cuda(
+                        d_y_combined.as_ptr(), d_reduced.ptr(),
+                        bs as i32, s as i32, d as i32, last_c as i32,
+                    );
+                }
+                d_reduced
+            } else {
+                d_y_combined.clone_buf()
+            };
 
             // Reverse chain: k-1 → 0
             for level in (0..cfg.k).rev() {
-                // In chain mode, each level's input is the previous level's output
-                // Level 0's input is ln_mem_out
+                let s_f = bc.level_seq_lens[level];
+
+                // In chain mode, each level's input is the previous level's output,
+                // pooled down to this level's resolution. Level 0's input is ln_mem_out.
+                // Spec 46: reconstruct the pooled input for projection gradient computation.
+                let level_input_buf;
                 let level_input = if level == 0 {
+                    // L0 input was ln_mem_out [bs*s, d] (no pooling for L0 with chunk_size=1)
                     &bc.ln_mem_out
                 } else {
-                    &bc.y_per_level[level - 1]
+                    let prev_s_f = bc.level_seq_lens[level - 1];
+                    if prev_s_f > s_f {
+                        // Reconstruct pooled input: pool y_per_level[level-1] to s_f
+                        let pool_factor = prev_s_f / s_f;
+                        level_input_buf = GpuBuf::zeros(bs * s_f * d);
+                        unsafe {
+                            crate::cuda_ffi::mean_pool_1d_f32_cuda(
+                                bc.y_per_level[level - 1].as_ptr(), level_input_buf.ptr(),
+                                bs as i32, prev_s_f as i32, d as i32, pool_factor as i32,
+                            );
+                        }
+                        &level_input_buf
+                    } else {
+                        &bc.y_per_level[level - 1]
+                    }
                 };
 
                 // Record per-level gnorm of the actual gradient entering this level
@@ -283,7 +319,7 @@ pub fn gpu_stacked_backward(
                         &block.levels[level], cfg, mem_cache,
                         &d_upstream, level_input,
                         &mut level_grads[level],
-                        s, d, level, bs,
+                        s_f, d, level, bs,
                     );
                     d_upstream = d_emb_level;
                 } else {
@@ -292,14 +328,32 @@ pub fn gpu_stacked_backward(
                         &block.levels[level], &bc.y_per_level[level],
                         &d_upstream, level_input,
                         &mut level_grads[level],
-                        s, d, bs,
+                        s_f, d, bs,
                     );
                     d_upstream = d_emb_level;
                 }
                 prof_stop!(profiler);
+
+                // Spec 46: backward through pool between this level and previous.
+                // In chain mode, forward pooled the prev level's output to get this level's input.
+                if level > 0 {
+                    let prev_s_f = bc.level_seq_lens[level - 1];
+                    if prev_s_f > s_f {
+                        // Backward of mean_pool: broadcast gradient / pool_factor
+                        let pool_factor = prev_s_f / s_f;
+                        let mut d_expanded = GpuBuf::zeros(bs * prev_s_f * d);
+                        unsafe {
+                            crate::cuda_ffi::mean_pool_1d_backward_f32_cuda(
+                                d_upstream.as_ptr(), d_expanded.ptr(),
+                                bs as i32, prev_s_f as i32, d as i32, pool_factor as i32,
+                            );
+                        }
+                        d_upstream = d_expanded;
+                    }
+                }
             }
 
-            // d_upstream is now d_ln_mem_out
+            // d_upstream is now d_ln_mem_out (at full resolution [bs*s, d])
             d_mem_input = d_upstream;
         } else {
             // ── Independent/FreqGated aggregation backward ──────────
@@ -331,34 +385,88 @@ pub fn gpu_stacked_backward(
                 .collect();
 
             // Each level receives d_y_level[l] = w[l] * d_y_combined
+            // Spec 46: d_y_combined is at full resolution [bs*s, d].
+            // For levels with chunk_size > 1, backward goes through upsample then pool.
             d_mem_input = GpuBuf::zeros(bsd);
             for level in 0..cfg.k {
-                let d_y_level = GpuBuf::zeros(bsd);
+                let c = cfg.chunk_sizes.get(level).copied().unwrap_or(1);
+                let s_f = bc.level_seq_lens[level];
+
+                let d_y_level_full = GpuBuf::zeros(bsd);
                 unsafe {
-                    crate::cuda_ffi::saxpy_cuda(w[level], d_y_combined.as_ptr(), d_y_level.ptr(), bsd_i32);
+                    crate::cuda_ffi::saxpy_cuda(w[level], d_y_combined.as_ptr(), d_y_level_full.ptr(), bsd_i32);
                 }
+
+                // Spec 46: backward through upsample (sum groups of C)
+                let d_y_level = if c > 1 {
+                    let mut d_reduced = GpuBuf::zeros(bs * s_f * d);
+                    unsafe {
+                        crate::cuda_ffi::repeat_upsample_1d_backward_f32_cuda(
+                            d_y_level_full.as_ptr(), d_reduced.ptr(),
+                            bs as i32, s as i32, d as i32, c as i32,
+                        );
+                    }
+                    d_reduced
+                } else {
+                    d_y_level_full
+                };
+
+                // Spec 46: the level_input for backward was the pooled ln_mem_out.
+                // Forward pooled ln_mem_out from [bs*s, d] to [bs*s_f, d] for this level.
+                // We reconstruct the pooled input here for the backward projection gradients.
+                let level_input = if c > 1 {
+                    let mut pooled = GpuBuf::zeros(bs * s_f * d);
+                    unsafe {
+                        crate::cuda_ffi::mean_pool_1d_f32_cuda(
+                            bc.ln_mem_out.as_ptr(), pooled.ptr(),
+                            bs as i32, s as i32, d as i32, c as i32,
+                        );
+                    }
+                    pooled
+                } else {
+                    bc.ln_mem_out.clone_buf()
+                };
 
                 // Dispatch based on forward's cached mode (memory_caches.is_some())
                 prof_start!(profiler, "memory_bwd", MemoryBackward, Some(b), Some(level));
                 if let Some(ref mem_cache) = bc.memory_caches[level] {
                     let d_emb_level = gpu_memory_backward(
                         &block.levels[level], cfg, mem_cache,
-                        &d_y_level, &bc.ln_mem_out,
+                        &d_y_level, &level_input,
                         &mut level_grads[level],
-                        s, d, level, bs,
+                        s_f, d, level, bs,
                     );
-                    unsafe {
-                        crate::cuda_ffi::saxpy_cuda(1.0, d_emb_level.as_ptr(), d_mem_input.ptr(), bsd_i32);
+                    // Spec 46: backward through mean_pool — broadcast gradient / C
+                    if c > 1 {
+                        unsafe {
+                            crate::cuda_ffi::mean_pool_1d_backward_f32_cuda(
+                                d_emb_level.as_ptr(), d_mem_input.ptr(),
+                                bs as i32, s as i32, d as i32, c as i32,
+                            );
+                        }
+                    } else {
+                        unsafe {
+                            crate::cuda_ffi::saxpy_cuda(1.0, d_emb_level.as_ptr(), d_mem_input.ptr(), bsd_i32);
+                        }
                     }
                 } else {
                     let d_emb_level = gpu_memory_read_only_backward(
                         &block.levels[level], &bc.y_per_level[level],
-                        &d_y_level, &bc.ln_mem_out,
+                        &d_y_level, &level_input,
                         &mut level_grads[level],
-                        s, d, bs,
+                        s_f, d, bs,
                     );
-                    unsafe {
-                        crate::cuda_ffi::saxpy_cuda(1.0, d_emb_level.as_ptr(), d_mem_input.ptr(), bsd_i32);
+                    if c > 1 {
+                        unsafe {
+                            crate::cuda_ffi::mean_pool_1d_backward_f32_cuda(
+                                d_emb_level.as_ptr(), d_mem_input.ptr(),
+                                bs as i32, s as i32, d as i32, c as i32,
+                            );
+                        }
+                    } else {
+                        unsafe {
+                            crate::cuda_ffi::saxpy_cuda(1.0, d_emb_level.as_ptr(), d_mem_input.ptr(), bsd_i32);
+                        }
                     }
                 }
                 prof_stop!(profiler);
