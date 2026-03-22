@@ -219,12 +219,12 @@ L2 should see 64/8 = 8 tokens (pool factor = chunk_sizes[2]/chunk_sizes[1] = 8).
 L3's chunk_size is 512. L2 outputs 8 tokens, L3 sees 8/8 = 1 token.
 
 In chain mode, the pool factor between level f and f+1 is:
-```
+```text
 pool_factor = chunk_sizes[f+1] / chunk_sizes[f]
 ```
 
 In independent mode, the pool factor is always relative to the raw input:
-```
+```text
 pool_factor = chunk_sizes[f]   (pool from s down to s/chunk_sizes[f])
 ```
 
