@@ -1543,8 +1543,7 @@ def run_build(bcfg: BuildConfig):
             tape_device = getattr(bcfg, "tape_device", "off")
             if (tape_device != "off"
                     and gpu_model is not None
-                    and input_ids is not None and target_ids is not None
-                    and max(target_ids) < bcfg.vocab_size):
+                    and input_ids is not None and target_ids is not None):
                 try:
                     if is_stacked and tape_device == "cpu":
                         if not hasattr(gpu_model, "cpu_stacked_tape_summary"):
