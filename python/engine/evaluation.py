@@ -352,7 +352,6 @@ def print_tape_summary(tape_summary: dict, step: int) -> None:
         )
         # Append m_norm to level line if present
         if "m_norm" in lvl:
-            import math
             mn = lvl["m_norm"]
             line += f"  m_norm={'NaN' if (isinstance(mn, float) and math.isnan(mn)) else f'{mn:.1f}'}"
         # Frozen flag
@@ -360,7 +359,6 @@ def print_tape_summary(tape_summary: dict, step: int) -> None:
             line += "  FROZEN"
         # Frequency gate (learned schedule only — NaN for Fixed)
         if "freq_gate_value" in lvl:
-            import math
             fgv = lvl["freq_gate_value"]
             if isinstance(fgv, float) and not math.isnan(fgv):
                 line += f"  freq_gate={fgv:.4f}"

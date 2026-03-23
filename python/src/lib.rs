@@ -2713,6 +2713,9 @@ impl GpuModel {
             &self.params, &self.cfg, &cache, true,
         );
 
+        // Capture post-forward M norms before restoring context
+        let post_ctx = self.context.to_host(self.cfg.k);
+
         // Restore context (diagnostic must not modify state)
         self.context.upload_memory(&saved_ctx);
 
@@ -2743,9 +2746,9 @@ impl GpuModel {
                 .map(|mc| mc.dgd_delta_norm(s, d, bs, self.cfg.swa.num_heads))
                 .unwrap_or(0.0);
             ldict.set_item("dgd_delta_norm", delta_norm)?;
-            // m_norm from saved context state
-            let m_norm = if level < saved_ctx.memory.len() {
-                saved_ctx.memory[level].iter().map(|x| x * x).sum::<f32>().sqrt()
+            // m_norm from post-forward context (final carried memory)
+            let m_norm = if level < post_ctx.memory.len() {
+                post_ctx.memory[level].iter().map(|x| x * x).sum::<f32>().sqrt()
             } else {
                 f32::NAN
             };

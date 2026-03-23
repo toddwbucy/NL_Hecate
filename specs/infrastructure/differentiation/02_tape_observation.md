@@ -347,7 +347,7 @@ fn test_unified_matches_stacked() {
 
 ## 7. Dependency Graph
 
-```
+```text
 Phase 2 (alloc_named) → Phase 3 (unified extract + LevelSummary) → Phase 4 (PyO3)
 ```
 

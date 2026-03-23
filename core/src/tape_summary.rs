@@ -56,16 +56,11 @@ pub struct TapeSummary {
     pub levels: Vec<LevelSummary>,
 }
 
-/// Candidate role names for the primary state buffer, tried in order.
-/// The first match wins. Covers all 9 adapter families.
-const STATE_ROLES: &[&str] = &[
-    obs::M_STATES,   // DeltaRule, TitansLMM, Hebbian, AtlasOmega
-    obs::W1_STATES,  // Moneta, YAAD, MEMORA (MLP rules)
-    obs::S_STATES,   // LatticeOSR
-    obs::SK_STATES,  // Trellis
-];
-
 /// Extract a single `LevelSummary` from the tape for level `lev`.
+///
+/// `final_memory`: the carried memory state from `context.memory[lev]` (or
+/// `context[block][lev]` for stacked models) AFTER `traced_*_forward()` returns.
+/// Used for `m_norm`. Pass `None` if unavailable → `m_norm = NaN`.
 ///
 /// `gate_values`: per-level sigmoid outputs from learned frequency gate.
 /// Pass `None` for Fixed schedule → `freq_gate_value = NaN`.
@@ -74,6 +69,7 @@ fn extract_level(
     all_blocks: &[(usize, OpaqueKey, Option<usize>, Option<usize>)],
     lev: usize,
     block_filter: Option<usize>,
+    final_memory: Option<&[f32]>,
     gate_values: Option<&[f32]>,
 ) -> LevelSummary {
     let level_blocks: Vec<(usize, String)> = all_blocks.iter()
@@ -90,23 +86,24 @@ fn extract_level(
 
     let block_count = level_blocks.len();
 
-    let (opaque_key_str, output_grad_norm, dgd_delta_norm, m_norm, is_frozen) =
+    let (opaque_key_str, output_grad_norm, dgd_delta_norm, is_frozen) =
         if let Some((last_idx, last_key)) = level_blocks.last() {
             let gnorm = tape.opaque_output_grad_norm(*last_idx).unwrap_or(0.0);
             let dgd_norm = tape
                 .get_saved_by_role(*last_idx, obs::DGD_DELTA)
                 .map(|buf| buf.iter().map(|x| x * x).sum::<f32>().sqrt())
                 .unwrap_or(0.0);
-            // m_norm: try each state role in priority order
-            let mn = STATE_ROLES.iter()
-                .find_map(|role| tape.get_saved_by_role(*last_idx, role))
-                .map(|buf| buf.iter().map(|x| x * x).sum::<f32>().sqrt())
-                .unwrap_or(f32::NAN);
             let frozen = last_key.starts_with("Frozen");
-            (last_key.clone(), gnorm, dgd_norm, mn, frozen)
+            (last_key.clone(), gnorm, dgd_norm, frozen)
         } else {
-            (String::from("None"), 0.0, 0.0, f32::NAN, false)
+            (String::from("None"), 0.0, 0.0, false)
         };
+
+    // m_norm: Frobenius norm of the final carried memory (from context, not
+    // the full per-timestep trace stored on the tape).
+    let m_norm = final_memory
+        .map(|mem| mem.iter().map(|x| x * x).sum::<f32>().sqrt())
+        .unwrap_or(f32::NAN);
 
     let freq_gate_value = gate_values
         .and_then(|gv| gv.get(lev).copied())
@@ -149,7 +146,10 @@ pub fn extract_tape_summary(
         let gate_values = cache.freq_cache.as_ref().map(|fc| fc.gate_values.as_slice());
 
         let levels: Vec<LevelSummary> = (0..cfg.k)
-            .map(|lev| extract_level(tape, &all_blocks, lev, None, gate_values))
+            .map(|lev| {
+                let final_mem = context.memory.get(lev).map(|v| v.as_slice());
+                extract_level(tape, &all_blocks, lev, None, final_mem, gate_values)
+            })
             .collect();
 
         TapeSummary { loss, total_blocks, levels }
@@ -218,7 +218,10 @@ pub fn extract_stacked_tape_summary(
         let mut blocks = Vec::with_capacity(n_blocks);
         for b in 0..n_blocks {
             let levels: Vec<BlockLevelSummary> = (0..cfg.k).map(|lev| {
-                let ls = extract_level(tape, &all_ops, lev, Some(b), None);
+                let final_mem = context.get(b)
+                    .and_then(|block_ctx| block_ctx.get(lev))
+                    .map(|v| v.as_slice());
+                let ls = extract_level(tape, &all_ops, lev, Some(b), final_mem, None);
                 BlockLevelSummary {
                     block: b,
                     level: ls.level,
