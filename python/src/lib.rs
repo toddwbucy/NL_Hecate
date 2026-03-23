@@ -1938,6 +1938,166 @@ fn extend_stacked_clone(
     Ok(dict.into_any().unbind())
 }
 
+// ── Tape Summary Helpers (spec 49: consolidate 4 near-duplicate methods) ──
+
+/// Validate input_ids/target_ids for tape summary calls.
+#[cfg(feature = "cuda")]
+fn validate_tape_inputs(s: usize, v: usize, input_ids: &[usize], target_ids: &[usize]) -> PyResult<()> {
+    if s == 0 {
+        return Err(PyValueError::new_err("seq_len must be > 0"));
+    }
+    if input_ids.is_empty() || input_ids.len() % s != 0 || target_ids.len() != input_ids.len() {
+        return Err(PyValueError::new_err(format!(
+            "input/target length must be batch_size * seq_len {} (got {})", s, input_ids.len()
+        )));
+    }
+    if let Some(&max_id) = input_ids.iter().max() {
+        if max_id >= v {
+            return Err(PyValueError::new_err(format!(
+                "input_ids contains {} >= vocab_size {}", max_id, v
+            )));
+        }
+    }
+    // target_ids may contain sentinel values >= vocab_size for masked/padded
+    // positions (BPE batching). The cross-entropy loss ignores these positions,
+    // so we only validate input_ids against vocab_size.
+    Ok(())
+}
+
+/// Set the 8 core per-level fields shared by all tape summary methods.
+#[cfg(feature = "cuda")]
+fn set_core_level_fields(
+    ldict: &pyo3::Bound<'_, PyDict>,
+    level: usize,
+    opaque_key: &str,
+    block_count: usize,
+    output_grad_norm: f32,
+    dgd_delta_norm: f32,
+    m_norm: f32,
+    freq_gate_value: f32,
+    is_frozen: bool,
+    head_m_norms: &[f32],
+) -> PyResult<()> {
+    ldict.set_item("level", level)?;
+    ldict.set_item("opaque_key", opaque_key)?;
+    ldict.set_item("block_count", block_count)?;
+    ldict.set_item("output_grad_norm", output_grad_norm)?;
+    ldict.set_item("dgd_delta_norm", dgd_delta_norm)?;
+    ldict.set_item("m_norm", m_norm)?;
+    ldict.set_item("freq_gate_value", freq_gate_value)?;
+    ldict.set_item("is_frozen", is_frozen)?;
+    ldict.set_item("head_m_norms", head_m_norms)?;
+    Ok(())
+}
+
+/// Build a PyDict for ThetaStats (inner-loop learning rate distribution).
+#[cfg(feature = "cuda")]
+fn make_theta_stats_dict<'py>(
+    py: Python<'py>,
+    ts: &nl_hecate_core::gpu_forward::ThetaStats,
+) -> PyResult<pyo3::Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("count", ts.count)?;
+    d.set_item("min", ts.min)?;
+    d.set_item("max", ts.max)?;
+    d.set_item("mean", ts.mean)?;
+    d.set_item("median", ts.median)?;
+    d.set_item("p95", ts.p95)?;
+    d.set_item("p99", ts.p99)?;
+    d.set_item("frac_at_ceil", ts.frac_at_ceil)?;
+    Ok(d)
+}
+
+/// Build a PyDict for GateStats (alpha/eta gate distribution).
+#[cfg(feature = "cuda")]
+fn make_gate_stats_dict<'py>(
+    py: Python<'py>,
+    gs: &nl_hecate_core::gpu_forward::GateStats,
+    frac_key: &str,
+) -> PyResult<pyo3::Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("count", gs.count)?;
+    d.set_item("min", gs.min)?;
+    d.set_item("max", gs.max)?;
+    d.set_item("mean", gs.mean)?;
+    d.set_item("median", gs.median)?;
+    d.set_item("p95", gs.p95)?;
+    d.set_item("p99", gs.p99)?;
+    d.set_item(frac_key, gs.frac_at_bound)?;
+    Ok(d)
+}
+
+/// Build a PyDict for aggregated gate stats across stacked blocks.
+/// Uses p99_max (max of per-block p99) instead of true combined p99.
+#[cfg(feature = "cuda")]
+fn make_aggregated_stats_dict<'py>(
+    py: Python<'py>,
+    count: usize,
+    min: f32,
+    max: f32,
+    mean: f32,
+    p99_max: f32,
+    frac: f32,
+    frac_key: &str,
+) -> PyResult<pyo3::Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("count", count)?;
+    d.set_item("min", min)?;
+    d.set_item("max", max)?;
+    d.set_item("mean", mean)?;
+    d.set_item("p99_max", p99_max)?;
+    d.set_item(frac_key, frac)?;
+    Ok(d)
+}
+
+/// Aggregate gate stats across stacked blocks for one level.
+///
+/// Extracts (count, min, max, mean, p99, frac) from each block's stats using
+/// the provided closure, then builds an aggregated dict with weighted mean,
+/// min-of-mins, max-of-maxes, and max-of-p99s.
+#[cfg(feature = "cuda")]
+fn aggregate_gate_stats<T, F>(
+    py: Python<'_>,
+    ldict: &pyo3::Bound<'_, PyDict>,
+    stats_grid: &[Vec<Option<T>>],
+    level: usize,
+    n_blocks: usize,
+    extract: F,
+    key: &str,
+    frac_key: &str,
+) -> PyResult<()>
+where
+    F: Fn(&T) -> (usize, f32, f32, f32, f32, f32),
+{
+    let mut total_count = 0usize;
+    let mut total_min = f32::MAX;
+    let mut total_max = f32::MIN;
+    let mut weighted_sum = 0.0f32;
+    let mut max_p99 = 0.0f32;
+    let mut frac_sum = 0.0f32;
+    let mut found = false;
+    for bi in 0..n_blocks {
+        if let Some(ref s) = stats_grid[bi][level] {
+            let (count, min, max, mean, p99, frac) = extract(s);
+            found = true;
+            total_count += count;
+            if min < total_min { total_min = min; }
+            if max > total_max { total_max = max; }
+            weighted_sum += mean * count as f32;
+            if p99 > max_p99 { max_p99 = p99; }
+            frac_sum += frac * count as f32;
+        }
+    }
+    if found && total_count > 0 {
+        ldict.set_item(key, make_aggregated_stats_dict(
+            py, total_count, total_min, total_max,
+            weighted_sum / total_count as f32, max_p99,
+            frac_sum / total_count as f32, frac_key,
+        )?)?;
+    }
+    Ok(())
+}
+
 // ── GPU-Resident Model ───────────────────────────────────────────────
 
 /// GPU-resident model: all parameters live on GPU.
@@ -2611,33 +2771,7 @@ impl GpuModel {
         pulse: &Pulse,
         py: Python<'_>,
     ) -> PyResult<PyObject> {
-        let s = self.cfg.swa.seq_len;
-        let v = self.cfg.swa.vocab_size;
-        if s == 0 {
-            return Err(PyValueError::new_err("seq_len must be > 0"));
-        }
-        if input_ids.is_empty() || input_ids.len() % s != 0
-            || target_ids.len() != input_ids.len()
-        {
-            return Err(PyValueError::new_err(format!(
-                "input/target length must be batch_size * seq_len {} (got {})",
-                s, input_ids.len()
-            )));
-        }
-        if let Some(&max_id) = input_ids.iter().max() {
-            if max_id >= v {
-                return Err(PyValueError::new_err(format!(
-                    "input_ids contains {} >= vocab_size {}", max_id, v
-                )));
-            }
-        }
-        if let Some(&max_id) = target_ids.iter().max() {
-            if max_id >= v {
-                return Err(PyValueError::new_err(format!(
-                    "target_ids contains {} >= vocab_size {}", max_id, v
-                )));
-            }
-        }
+        validate_tape_inputs(self.cfg.swa.seq_len, self.cfg.swa.vocab_size, &input_ids, &target_ids)?;
 
         // The traced forward runs on CPU — pull host copies of params and context.
         // Context state is read-only here: the tape diagnostic does not update
@@ -2646,12 +2780,7 @@ impl GpuModel {
         let mut host_ctx = self.context.to_host(self.cfg.k);
 
         let summary = nl_hecate_core::tape_summary::extract_tape_summary(
-            &host_params,
-            &self.cfg,
-            &input_ids,
-            &target_ids,
-            &pulse.inner,
-            &mut host_ctx,
+            &host_params, &self.cfg, &input_ids, &target_ids, &pulse.inner, &mut host_ctx,
         );
 
         let dict = PyDict::new(py);
@@ -2661,15 +2790,11 @@ impl GpuModel {
         let levels_list = pyo3::types::PyList::empty(py);
         for lvl in &summary.levels {
             let ldict = PyDict::new(py);
-            ldict.set_item("level", lvl.level)?;
-            ldict.set_item("opaque_key", &lvl.opaque_key)?;
-            ldict.set_item("block_count", lvl.block_count)?;
-            ldict.set_item("output_grad_norm", lvl.output_grad_norm)?;
-            ldict.set_item("dgd_delta_norm", lvl.dgd_delta_norm)?;
-            ldict.set_item("m_norm", lvl.m_norm)?;
-            ldict.set_item("freq_gate_value", lvl.freq_gate_value)?;
-            ldict.set_item("is_frozen", lvl.is_frozen)?;
-            ldict.set_item("head_m_norms", &lvl.head_m_norms)?;
+            set_core_level_fields(
+                &ldict, lvl.level, &lvl.opaque_key, lvl.block_count,
+                lvl.output_grad_norm, lvl.dgd_delta_norm, lvl.m_norm,
+                lvl.freq_gate_value, lvl.is_frozen, &lvl.head_m_norms,
+            )?;
             levels_list.append(ldict)?;
         }
         dict.set_item("levels", levels_list)?;
@@ -2694,65 +2819,30 @@ impl GpuModel {
         py: Python<'_>,
     ) -> PyResult<PyObject> {
         let s = self.cfg.swa.seq_len;
-        let v = self.cfg.swa.vocab_size;
-        if s == 0 {
-            return Err(PyValueError::new_err("seq_len must be > 0"));
-        }
-        if input_ids.is_empty() || input_ids.len() % s != 0
-            || target_ids.len() != input_ids.len()
-        {
-            return Err(PyValueError::new_err(format!(
-                "input/target length must be batch_size * seq_len {} (got {})",
-                s, input_ids.len()
-            )));
-        }
-        if let Some(&max_id) = input_ids.iter().max() {
-            if max_id >= v {
-                return Err(PyValueError::new_err(format!(
-                    "input_ids contains {} >= vocab_size {}", max_id, v
-                )));
-            }
-        }
-        if let Some(&max_id) = target_ids.iter().max() {
-            if max_id >= v {
-                return Err(PyValueError::new_err(format!(
-                    "target_ids contains {} >= vocab_size {}", max_id, v
-                )));
-            }
-        }
+        validate_tape_inputs(s, self.cfg.swa.vocab_size, &input_ids, &target_ids)?;
 
-        // Batched context save/restore only handles slot 0 — reject batch_size > 1
         if self.context.batch_size > 1 {
             return Err(PyValueError::new_err(
                 "gpu_tape_forward_summary currently requires batch_size == 1"
             ));
         }
 
-        // Save context to host (lightweight: k * d*d * 4 bytes)
         let saved_ctx = self.context.to_host(self.cfg.k);
 
-        // GPU forward (modifies context M states)
         let (loss, cache) = nl_hecate_core::gpu_forward::gpu_cms_forward(
             &self.params, &self.cfg, &input_ids, &target_ids,
             &pulse.inner, &mut self.context,
         );
-
-        // GPU backward (populates level_output_gnorms)
         let grads = nl_hecate_core::gpu_backward::gpu_cms_backward(
             &self.params, &self.cfg, &cache, true,
         );
 
-        // Capture post-forward M norms before restoring context
         let post_ctx = self.context.to_host(self.cfg.k);
-
-        // Restore context (diagnostic must not modify state)
         self.context.upload_memory(&saved_ctx);
 
-        // Build same dict schema as tape_forward_summary
         let rule_name = format!("{:?}", self.cfg.memory_rule);
         let dict = PyDict::new(py);
         dict.set_item("loss", loss)?;
-
         let active_count: usize = (0..self.cfg.k)
             .filter(|&l| pulse.inner.active_levels[l])
             .count();
@@ -2763,28 +2853,14 @@ impl GpuModel {
         let levels_list = pyo3::types::PyList::empty(py);
         for level in 0..self.cfg.k {
             let ldict = PyDict::new(py);
-            ldict.set_item("level", level)?;
-            ldict.set_item("opaque_key", &rule_name)?;
-            ldict.set_item("block_count",
-                if pulse.inner.active_levels[level] { 1usize } else { 0usize })?;
-            ldict.set_item("output_grad_norm",
-                grads.level_output_gnorms[level])?;
-            // Compute DGD delta norm from forward cache (spec 16)
-            let delta_norm = cache.memory_caches[level]
-                .as_ref()
+            let delta_norm = cache.memory_caches[level].as_ref()
                 .map(|mc| mc.dgd_delta_norm(s, d, bs, self.cfg.swa.num_heads))
                 .unwrap_or(0.0);
-            ldict.set_item("dgd_delta_norm", delta_norm)?;
-            // m_norm from post-forward context (final carried memory)
             let m_norm = if level < post_ctx.memory.len() {
                 post_ctx.memory[level].iter().map(|x| x * x).sum::<f32>().sqrt()
             } else {
                 f32::NAN
             };
-            ldict.set_item("m_norm", m_norm)?;
-            // freq_gate_value: GPU path does not yet capture gate values
-            ldict.set_item("freq_gate_value", f32::NAN)?;
-            ldict.set_item("is_frozen", !pulse.inner.active_levels[level])?;
             // Per-head M norms from post-forward context (packed tile layout)
             let head_norms: Vec<f32> = if level < post_ctx.memory.len() {
                 let mem = &post_ctx.memory[level];
@@ -2799,21 +2875,16 @@ impl GpuModel {
                     }).collect()
                 } else { Vec::new() }
             } else { Vec::new() };
-            ldict.set_item("head_m_norms", &head_norms)?;
-            // Theta (inner-loop learning rate) distribution
+            set_core_level_fields(
+                &ldict, level, &rule_name,
+                if pulse.inner.active_levels[level] { 1 } else { 0 },
+                grads.level_output_gnorms[level], delta_norm, m_norm,
+                f32::NAN, !pulse.inner.active_levels[level], &head_norms,
+            )?;
             if let Some(ref mc) = cache.memory_caches[level] {
                 let tc = self.cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
                 if let Some(ts) = mc.theta_stats(tc) {
-                    let tdict = PyDict::new(py);
-                    tdict.set_item("count", ts.count)?;
-                    tdict.set_item("min", ts.min)?;
-                    tdict.set_item("max", ts.max)?;
-                    tdict.set_item("mean", ts.mean)?;
-                    tdict.set_item("median", ts.median)?;
-                    tdict.set_item("p95", ts.p95)?;
-                    tdict.set_item("p99", ts.p99)?;
-                    tdict.set_item("frac_at_ceil", ts.frac_at_ceil)?;
-                    ldict.set_item("theta", tdict)?;
+                    ldict.set_item("theta", make_theta_stats_dict(py, &ts)?)?;
                 }
             }
             levels_list.append(ldict)?;
@@ -3408,68 +3479,38 @@ impl GpuStackedModel {
         pulse: &Pulse,
         py: Python<'_>,
     ) -> PyResult<PyObject> {
-        let s = self.cfg.swa.seq_len;
-        let v = self.cfg.swa.vocab_size;
         let d = self.cfg.swa.d_model;
         let k = self.cfg.k;
-        if s == 0 {
-            return Err(pyo3::exceptions::PyValueError::new_err("seq_len must be > 0"));
-        }
-        if input_ids.is_empty() || input_ids.len() % s != 0 || target_ids.len() != input_ids.len() {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("input/target length must be batch_size * seq_len {} (got {})", s, input_ids.len())));
-        }
-        if let Some(&max_id) = input_ids.iter().max() {
-            if max_id >= v {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    format!("input_ids contains {} >= vocab_size {}", max_id, v)));
-            }
-        }
-        if let Some(&max_id) = target_ids.iter().max() {
-            if max_id >= v {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    format!("target_ids contains {} >= vocab_size {}", max_id, v)));
-            }
-        }
+        validate_tape_inputs(self.cfg.swa.seq_len, self.cfg.swa.vocab_size, &input_ids, &target_ids)?;
 
-        // Download params and context to host for CPU traced forward.
-        let host_params = self.params.to_host(d, v, k);
+        let host_params = self.params.to_host(d, self.cfg.swa.vocab_size, k);
         let mut host_ctx: Vec<Vec<Vec<f32>>> = self.context.blocks.iter()
-            .map(|gpu_ctx| {
-                let ctx_state = gpu_ctx.to_host(k);
-                ctx_state.memory
-            })
+            .map(|gpu_ctx| gpu_ctx.to_host(k).memory)
             .collect();
 
         let summary = nl_hecate_core::tape_summary::extract_stacked_tape_summary(
             &host_params, &self.cfg, &input_ids, &target_ids, &pulse.inner, &mut host_ctx,
         );
 
-        // Build Python dict — same schema as gpu_stacked_tape_summary.
-        let dict = pyo3::types::PyDict::new(py);
+        let dict = PyDict::new(py);
         dict.set_item("loss", summary.loss)?;
         dict.set_item("n_blocks", summary.n_blocks)?;
 
-        // Per-block breakdown
         let blocks_list = pyo3::types::PyList::empty(py);
         let mut agg_gnorms = vec![0.0f32; k];
         let mut agg_deltas = vec![0.0f32; k];
 
         for block_sum in &summary.blocks {
-            let bdict = pyo3::types::PyDict::new(py);
+            let bdict = PyDict::new(py);
             bdict.set_item("block_index", block_sum.block)?;
             let levels_list = pyo3::types::PyList::empty(py);
             for lvl in &block_sum.levels {
-                let ldict = pyo3::types::PyDict::new(py);
-                ldict.set_item("level", lvl.level)?;
-                ldict.set_item("opaque_key", &lvl.opaque_key)?;
-                ldict.set_item("block_count", lvl.block_count)?;
-                ldict.set_item("output_grad_norm", lvl.output_grad_norm)?;
-                ldict.set_item("dgd_delta_norm", lvl.dgd_delta_norm)?;
-                ldict.set_item("m_norm", lvl.m_norm)?;
-                ldict.set_item("freq_gate_value", lvl.freq_gate_value)?;
-                ldict.set_item("is_frozen", lvl.is_frozen)?;
-                ldict.set_item("head_m_norms", &lvl.head_m_norms)?;
+                let ldict = PyDict::new(py);
+                set_core_level_fields(
+                    &ldict, lvl.level, &lvl.opaque_key, lvl.block_count,
+                    lvl.output_grad_norm, lvl.dgd_delta_norm, lvl.m_norm,
+                    lvl.freq_gate_value, lvl.is_frozen, &lvl.head_m_norms,
+                )?;
                 levels_list.append(ldict)?;
                 if lvl.output_grad_norm > agg_gnorms[lvl.level] {
                     agg_gnorms[lvl.level] = lvl.output_grad_norm;
@@ -3484,33 +3525,25 @@ impl GpuStackedModel {
         dict.set_item("blocks", blocks_list)?;
 
         // Aggregated levels (backward compat with print_tape_summary)
+        let rule_name = format!("{:?}", self.cfg.memory_rule);
         let mut total_active = 0usize;
         let agg_levels_list = pyo3::types::PyList::empty(py);
         for level in 0..k {
-            let ldict = pyo3::types::PyDict::new(py);
-            ldict.set_item("level", level)?;
-            let rule_name = format!("{:?}", self.cfg.memory_rule);
-            ldict.set_item("opaque_key", &rule_name)?;
+            let ldict = PyDict::new(py);
             let active = pulse.inner.active_levels[level];
-            let bc = if active { self.n_blocks } else { 0usize };
+            let bc = if active { self.n_blocks } else { 0 };
             if active { total_active += self.n_blocks; }
-            ldict.set_item("block_count", bc)?;
-            ldict.set_item("output_grad_norm", agg_gnorms[level])?;
-            ldict.set_item("dgd_delta_norm", agg_deltas[level])?;
-            // Aggregate m_norm: max across blocks for this level
             let max_mnorm = host_ctx.iter().map(|block_ctx| {
                 if level < block_ctx.len() {
                     block_ctx[level].iter().map(|x| x * x).sum::<f32>().sqrt()
-                } else {
-                    0.0
-                }
+                } else { 0.0 }
             }).fold(0.0f32, f32::max);
-            ldict.set_item("m_norm", max_mnorm)?;
-            ldict.set_item("freq_gate_value", f32::NAN)?;
-            ldict.set_item("is_frozen", !active)?;
             // Aggregate head_m_norms: empty at aggregate level (per-head data on block dicts)
             let empty_heads: Vec<f32> = Vec::new();
-            ldict.set_item("head_m_norms", &empty_heads)?;
+            set_core_level_fields(
+                &ldict, level, &rule_name, bc, agg_gnorms[level], agg_deltas[level],
+                max_mnorm, f32::NAN, !active, &empty_heads,
+            )?;
             agg_levels_list.append(ldict)?;
         }
         dict.set_item("levels", agg_levels_list)?;
@@ -3608,51 +3641,29 @@ impl GpuStackedModel {
         py: Python<'_>,
     ) -> PyResult<PyObject> {
         let s = self.cfg.swa.seq_len;
-        let v = self.cfg.swa.vocab_size;
-        if s == 0 {
-            return Err(pyo3::exceptions::PyValueError::new_err("seq_len must be > 0"));
-        }
-        if input_ids.is_empty() || input_ids.len() % s != 0 || target_ids.len() != input_ids.len() {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("input/target length must be batch_size * seq_len {} (got {})", s, input_ids.len())));
-        }
+        validate_tape_inputs(s, self.cfg.swa.vocab_size, &input_ids, &target_ids)?;
         let bs = input_ids.len() / s;
         if bs != self.context.batch_size {
-            return Err(pyo3::exceptions::PyValueError::new_err(
+            return Err(PyValueError::new_err(
                 format!("batch mismatch: input has {} samples but context allocated for batch_size={}",
                         bs, self.context.batch_size)));
         }
-        if let Some(&max_id) = input_ids.iter().max() {
-            if max_id >= v {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    format!("input_ids contains {} >= vocab_size {}", max_id, v)));
-            }
-        }
 
-        // Capture M state norms from current context (before diagnostic forward)
         let k = self.cfg.k;
+        let d = self.cfg.swa.d_model;
         let m_norms = self.context.memory_norms();
-
-        // Save context (deep clone -- D2D copy for each block's memory)
         let saved_ctx = self.context.deep_clone();
 
-        // Forward (modifies context -- will be restored)
         let mut no_prof: Option<nl_hecate_core::gpu_profiler::GpuProfiler> = None;
         let (loss, cache) = nl_hecate_core::gpu_stacked_forward::gpu_stacked_forward(
             &self.params, &self.cfg, &input_ids, &target_ids,
             &pulse.inner, &mut self.context, &mut no_prof,
         );
-
-        // Capture post-forward M norms for shard M-diff (spec 28).
         let m_norms_post = self.context.memory_norms();
         // Per-head M norms (spec 50).
         let head_norms_post = self.context.memory_norms_per_head();
 
-        // Extract DGD delta norms from cache BEFORE backward consumes it.
-        // Per-(block, level) ||M_final @ k_last - v_last||_2
-        // Source: HOPE Eq 88, spec 16_dgd_delta_norm_gpu.md
-        let d = self.cfg.swa.d_model;
-        let bs = input_ids.len() / s;
+        // Extract DGD delta norms + gate stats from cache BEFORE backward consumes it
         let mut delta_norms: Vec<Vec<f32>> = Vec::with_capacity(self.n_blocks);
         let mut theta_stats_grid: Vec<Vec<Option<nl_hecate_core::gpu_forward::ThetaStats>>> =
             Vec::with_capacity(self.n_blocks);
@@ -3686,109 +3697,67 @@ impl GpuStackedModel {
             eta_stats_grid.push(block_eta);
         }
 
-        // Backward (collect level_output_gnorms)
         let grads = nl_hecate_core::gpu_stacked_backward::gpu_stacked_backward(
             &self.params, &self.cfg, &cache, &mut no_prof,
         );
-
-        // Restore context
         self.context = saved_ctx;
 
-        // Build Python dict
-        let dict = pyo3::types::PyDict::new(py);
+        let dict = PyDict::new(py);
         dict.set_item("loss", loss)?;
         dict.set_item("n_blocks", self.n_blocks)?;
 
         let rule_name = format!("{:?}", self.cfg.memory_rule);
-
-        // Pre-compute dormancy status once (avoid re-allocating in hot loop)
         let dormancy_status = self.context.dormancy_status();
         let dormancy_below = &self.context.dormancy_below_count;
 
         // Per-block breakdown
         let blocks_list = pyo3::types::PyList::empty(py);
-        let mut agg_gnorms = vec![0.0f32; k]; // max gnorm per level across blocks
+        let mut agg_gnorms = vec![0.0f32; k];
 
         for (bi, bg) in grads.blocks.iter().enumerate() {
-            let bdict = pyo3::types::PyDict::new(py);
+            let bdict = PyDict::new(py);
             bdict.set_item("block_index", bi)?;
 
             let levels_list = pyo3::types::PyList::empty(py);
             for level in 0..k {
-                let ldict = pyo3::types::PyDict::new(py);
-                ldict.set_item("level", level)?;
-                ldict.set_item("opaque_key", &rule_name)?;
+                let ldict = PyDict::new(py);
                 let active = pulse.inner.active_levels[level];
-                ldict.set_item("block_count", if active { 1usize } else { 0usize })?;
                 let gnorm = bg.level_output_gnorms[level];
-                ldict.set_item("output_grad_norm", gnorm)?;
-                ldict.set_item("dgd_delta_norm", delta_norms[bi][level])?;
-                ldict.set_item("m_norm", m_norms_post[bi][level])?;
-                ldict.set_item("freq_gate_value", f32::NAN)?;
-                ldict.set_item("is_frozen", !active)?;
                 // Per-head M norms (spec 50)
                 let empty_head_norms: Vec<f32> = Vec::new();
                 let head_norms: &Vec<f32> = head_norms_post.get(bi)
                     .and_then(|bl| bl.get(level))
                     .unwrap_or(&empty_head_norms);
-                ldict.set_item("head_m_norms", head_norms)?;
-                // Shard M-diff: ||M_post - M_pre||_F proxy (spec 28)
+                set_core_level_fields(
+                    &ldict, level, &rule_name,
+                    if active { 1 } else { 0 },
+                    gnorm, delta_norms[bi][level], m_norms_post[bi][level],
+                    f32::NAN, !active, head_norms,
+                )?;
+                // Shard M-diff (spec 28)
                 let m_diff_abs = (m_norms_post[bi][level] - m_norms[bi][level]).abs();
                 let m_diff_rel = if m_norms[bi][level] > 1e-8 {
                     m_diff_abs / m_norms[bi][level]
-                } else {
-                    0.0
-                };
+                } else { 0.0 };
                 ldict.set_item("m_shard_diff", m_diff_abs)?;
                 ldict.set_item("m_shard_diff_relative", m_diff_rel)?;
-                // Dormancy status from live tracking (hoisted above loop)
+                // Dormancy
                 if bi < dormancy_status.len() && level < dormancy_status[bi].len() {
                     ldict.set_item("dormancy_status", &dormancy_status[bi][level])?;
                     ldict.set_item("dormancy_below_count", dormancy_below[bi][level])?;
                 }
-                // Alpha (retention/forgetting gate) distribution
+                // Gate stats
                 if let Some(ref as_) = alpha_stats_grid[bi][level] {
-                    let adict = pyo3::types::PyDict::new(py);
-                    adict.set_item("count", as_.count)?;
-                    adict.set_item("min", as_.min)?;
-                    adict.set_item("max", as_.max)?;
-                    adict.set_item("mean", as_.mean)?;
-                    adict.set_item("median", as_.median)?;
-                    adict.set_item("p95", as_.p95)?;
-                    adict.set_item("p99", as_.p99)?;
-                    adict.set_item("frac_at_floor", as_.frac_at_bound)?;
-                    ldict.set_item("alpha", adict)?;
+                    ldict.set_item("alpha", make_gate_stats_dict(py, as_, "frac_at_floor")?)?;
                 }
-                // Theta (inner-loop learning rate) distribution
                 if let Some(ref ts) = theta_stats_grid[bi][level] {
-                    let tdict = pyo3::types::PyDict::new(py);
-                    tdict.set_item("count", ts.count)?;
-                    tdict.set_item("min", ts.min)?;
-                    tdict.set_item("max", ts.max)?;
-                    tdict.set_item("mean", ts.mean)?;
-                    tdict.set_item("median", ts.median)?;
-                    tdict.set_item("p95", ts.p95)?;
-                    tdict.set_item("p99", ts.p99)?;
-                    tdict.set_item("frac_at_ceil", ts.frac_at_ceil)?;
-                    ldict.set_item("theta", tdict)?;
+                    ldict.set_item("theta", make_theta_stats_dict(py, ts)?)?;
                 }
-                // Eta (momentum gate) distribution — Titans only
                 if let Some(ref es) = eta_stats_grid[bi][level] {
-                    let edict = pyo3::types::PyDict::new(py);
-                    edict.set_item("count", es.count)?;
-                    edict.set_item("min", es.min)?;
-                    edict.set_item("max", es.max)?;
-                    edict.set_item("mean", es.mean)?;
-                    edict.set_item("median", es.median)?;
-                    edict.set_item("p95", es.p95)?;
-                    edict.set_item("p99", es.p99)?;
-                    ldict.set_item("eta", edict)?;
+                    ldict.set_item("eta", make_gate_stats_dict(py, es, "frac_at_bound")?)?;
                 }
                 levels_list.append(ldict)?;
-
-                if gnorm > agg_gnorms[level] {
-                    agg_gnorms[level] = gnorm;
-                }
+                if gnorm > agg_gnorms[level] { agg_gnorms[level] = gnorm; }
             }
             bdict.set_item("levels", levels_list)?;
             blocks_list.append(bdict)?;
@@ -3799,140 +3768,49 @@ impl GpuStackedModel {
         let mut total_active = 0usize;
         let agg_levels_list = pyo3::types::PyList::empty(py);
         for level in 0..k {
-            let ldict = pyo3::types::PyDict::new(py);
-            ldict.set_item("level", level)?;
-            ldict.set_item("opaque_key", &rule_name)?;
+            let ldict = PyDict::new(py);
             let active = pulse.inner.active_levels[level];
-            // For stacked models, block_count reflects how many blocks fired this level
-            let bc = if active { self.n_blocks } else { 0usize };
+            let bc = if active { self.n_blocks } else { 0 };
             if active { total_active += self.n_blocks; }
-            ldict.set_item("block_count", bc)?;
-            ldict.set_item("output_grad_norm", agg_gnorms[level])?;
-            // Aggregate delta norm: max across blocks for this level
             let max_delta = delta_norms.iter().map(|bd| bd[level]).fold(0.0f32, f32::max);
-            ldict.set_item("dgd_delta_norm", max_delta)?;
-            // Aggregate m_norm: max across blocks for this level
             let max_mnorm = m_norms_post.iter().map(|bn| bn[level]).fold(0.0f32, f32::max);
-            ldict.set_item("m_norm", max_mnorm)?;
-            ldict.set_item("freq_gate_value", f32::NAN)?;
-            ldict.set_item("is_frozen", !active)?;
-            // Aggregate head_m_norms: empty at aggregate level (per-head data on block dicts)
             let empty_heads: Vec<f32> = Vec::new();
-            ldict.set_item("head_m_norms", &empty_heads)?;
-            // Aggregate shard M-diff: max across blocks (spec 28)
-            {
-                let max_diff_abs = (0..self.n_blocks).map(|bi| {
-                    (m_norms_post[bi][level] - m_norms[bi][level]).abs()
-                }).fold(0.0f32, f32::max);
-                let max_diff_rel = (0..self.n_blocks).map(|bi| {
-                    let pre = m_norms[bi][level];
-                    if pre > 1e-8 {
-                        (m_norms_post[bi][level] - pre).abs() / pre
-                    } else { 0.0 }
-                }).fold(0.0f32, f32::max);
-                ldict.set_item("m_shard_diff", max_diff_abs)?;
-                ldict.set_item("m_shard_diff_relative", max_diff_rel)?;
-                // Worst dormancy status across blocks (reuses hoisted dormancy_status)
-                let mut worst_rank = 0u8;
-                for bi in 0..self.n_blocks {
-                    if bi < dormancy_status.len() && level < dormancy_status[bi].len() {
-                        let rank = match dormancy_status[bi][level].as_str() {
-                            "dormant" => 2, "warning" => 1, _ => 0,
-                        };
-                        if rank > worst_rank { worst_rank = rank; }
-                    }
-                }
-                let worst_str = match worst_rank { 2 => "dormant", 1 => "warning", _ => "active" };
-                ldict.set_item("dormancy_status", worst_str)?;
-            }
-            // Aggregate theta stats across blocks: weighted mean, min of mins, max of maxes
-            let mut agg_count = 0usize;
-            let mut agg_min = f32::MAX;
-            let mut agg_max = f32::MIN;
-            let mut agg_sum = 0.0f32;
-            let mut agg_p99 = 0.0f32;
-            let mut agg_frac_sum = 0.0f32;
-            let mut has_theta = false;
+            set_core_level_fields(
+                &ldict, level, &rule_name, bc, agg_gnorms[level], max_delta,
+                max_mnorm, f32::NAN, !active, &empty_heads,
+            )?;
+            // Aggregate shard M-diff (spec 28)
+            let max_diff_abs = (0..self.n_blocks).map(|bi| {
+                (m_norms_post[bi][level] - m_norms[bi][level]).abs()
+            }).fold(0.0f32, f32::max);
+            let max_diff_rel = (0..self.n_blocks).map(|bi| {
+                let pre = m_norms[bi][level];
+                if pre > 1e-8 { (m_norms_post[bi][level] - pre).abs() / pre } else { 0.0 }
+            }).fold(0.0f32, f32::max);
+            ldict.set_item("m_shard_diff", max_diff_abs)?;
+            ldict.set_item("m_shard_diff_relative", max_diff_rel)?;
+            // Worst dormancy
+            let mut worst_rank = 0u8;
             for bi in 0..self.n_blocks {
-                if let Some(ref ts) = theta_stats_grid[bi][level] {
-                    has_theta = true;
-                    agg_count += ts.count;
-                    if ts.min < agg_min { agg_min = ts.min; }
-                    if ts.max > agg_max { agg_max = ts.max; }
-                    agg_sum += ts.mean * ts.count as f32;
-                    if ts.p99 > agg_p99 { agg_p99 = ts.p99; }
-                    agg_frac_sum += ts.frac_at_ceil * ts.count as f32;
+                if bi < dormancy_status.len() && level < dormancy_status[bi].len() {
+                    let rank = match dormancy_status[bi][level].as_str() {
+                        "dormant" => 2, "warning" => 1, _ => 0,
+                    };
+                    if rank > worst_rank { worst_rank = rank; }
                 }
             }
-            if has_theta && agg_count > 0 {
-                let tdict = pyo3::types::PyDict::new(py);
-                tdict.set_item("count", agg_count)?;
-                tdict.set_item("min", agg_min)?;
-                tdict.set_item("max", agg_max)?;
-                tdict.set_item("mean", agg_sum / agg_count as f32)?;
-                tdict.set_item("p99_max", agg_p99)?;  // max(per-block p99), not true combined p99
-                tdict.set_item("frac_at_ceil", agg_frac_sum / agg_count as f32)?;
-                ldict.set_item("theta", tdict)?;
-            }
-            // Aggregate alpha stats across blocks (same pattern as theta)
-            {
-                let mut a_count = 0usize;
-                let mut a_min = f32::MAX;
-                let mut a_max = f32::MIN;
-                let mut a_sum = 0.0f32;
-                let mut a_p99 = 0.0f32;
-                let mut a_frac_sum = 0.0f32;
-                let mut has_alpha = false;
-                for bi in 0..self.n_blocks {
-                    if let Some(ref as_) = alpha_stats_grid[bi][level] {
-                        has_alpha = true;
-                        a_count += as_.count;
-                        if as_.min < a_min { a_min = as_.min; }
-                        if as_.max > a_max { a_max = as_.max; }
-                        a_sum += as_.mean * as_.count as f32;
-                        if as_.p99 > a_p99 { a_p99 = as_.p99; }
-                        a_frac_sum += as_.frac_at_bound * as_.count as f32;
-                    }
-                }
-                if has_alpha && a_count > 0 {
-                    let adict = pyo3::types::PyDict::new(py);
-                    adict.set_item("count", a_count)?;
-                    adict.set_item("min", a_min)?;
-                    adict.set_item("max", a_max)?;
-                    adict.set_item("mean", a_sum / a_count as f32)?;
-                    adict.set_item("p99_max", a_p99)?;
-                    adict.set_item("frac_at_floor", a_frac_sum / a_count as f32)?;
-                    ldict.set_item("alpha", adict)?;
-                }
-            }
-            // Aggregate eta stats across blocks (Titans only)
-            {
-                let mut e_count = 0usize;
-                let mut e_min = f32::MAX;
-                let mut e_max = f32::MIN;
-                let mut e_sum = 0.0f32;
-                let mut e_p99 = 0.0f32;
-                let mut has_eta = false;
-                for bi in 0..self.n_blocks {
-                    if let Some(ref es) = eta_stats_grid[bi][level] {
-                        has_eta = true;
-                        e_count += es.count;
-                        if es.min < e_min { e_min = es.min; }
-                        if es.max > e_max { e_max = es.max; }
-                        e_sum += es.mean * es.count as f32;
-                        if es.p99 > e_p99 { e_p99 = es.p99; }
-                    }
-                }
-                if has_eta && e_count > 0 {
-                    let edict = pyo3::types::PyDict::new(py);
-                    edict.set_item("count", e_count)?;
-                    edict.set_item("min", e_min)?;
-                    edict.set_item("max", e_max)?;
-                    edict.set_item("mean", e_sum / e_count as f32)?;
-                    edict.set_item("p99_max", e_p99)?;
-                    ldict.set_item("eta", edict)?;
-                }
-            }
+            ldict.set_item("dormancy_status",
+                match worst_rank { 2 => "dormant", 1 => "warning", _ => "active" })?;
+            // Aggregate gate stats across blocks
+            aggregate_gate_stats(py, &ldict, &theta_stats_grid, level, self.n_blocks,
+                |ts| (ts.count, ts.min, ts.max, ts.mean, ts.p99, ts.frac_at_ceil),
+                "theta", "frac_at_ceil")?;
+            aggregate_gate_stats(py, &ldict, &alpha_stats_grid, level, self.n_blocks,
+                |gs| (gs.count, gs.min, gs.max, gs.mean, gs.p99, gs.frac_at_bound),
+                "alpha", "frac_at_floor")?;
+            aggregate_gate_stats(py, &ldict, &eta_stats_grid, level, self.n_blocks,
+                |gs| (gs.count, gs.min, gs.max, gs.mean, gs.p99, gs.frac_at_bound),
+                "eta", "frac_at_bound")?;
             agg_levels_list.append(ldict)?;
         }
         dict.set_item("levels", agg_levels_list)?;

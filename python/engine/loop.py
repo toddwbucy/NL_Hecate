@@ -921,6 +921,19 @@ def run_build(bcfg: BuildConfig):
 
     # Spec 32: window-local val removed (coherence samples use build stream)
 
+    # Spec 49: CMS tape accumulator — cross-step level metric collection.
+    # Accumulates tape summary data, flushes as .cms.json sidecar at checkpoints.
+    _cms_tape = None
+    _cms_last_flush_step = resume_step
+    if bcfg.save_every > 0 and getattr(bcfg, "tape_device", "off") != "off":
+        from engine.cms_tape import CmsTape
+        _cms_tape = CmsTape(
+            k=bcfg.k,
+            n_blocks=getattr(bcfg, "n_blocks", 1),
+            num_heads=bcfg.num_heads,
+            chunk_sizes=getattr(bcfg, "chunk_sizes", None),
+        )
+
     losses = []
     t_start = time.perf_counter()
     t_window_start = t_start
@@ -1530,8 +1543,7 @@ def run_build(bcfg: BuildConfig):
             tape_device = getattr(bcfg, "tape_device", "off")
             if (tape_device != "off"
                     and gpu_model is not None
-                    and input_ids is not None and target_ids is not None
-                    and max(target_ids) < bcfg.vocab_size):
+                    and input_ids is not None and target_ids is not None):
                 try:
                     if is_stacked and tape_device == "cpu":
                         if not hasattr(gpu_model, "cpu_stacked_tape_summary"):
@@ -1571,6 +1583,16 @@ def run_build(bcfg: BuildConfig):
                         print_tape_summary(tape_sum, step)
                         if jsonl:
                             jsonl.log(event="tape_summary", step=step, **tape_sum)
+                        # Spec 49: accumulate for .cms.json sidecar
+                        if _cms_tape is not None:
+                            _cms_tape.record(tape_sum, step)
+
+            # Spec 49: flush CMS tape sidecar AFTER recording this step's tape_sum.
+            # Must run after tape diagnostic (section 3) so this checkpoint's data is included.
+            if _cms_tape is not None and len(_cms_tape) > 0:
+                from engine.cms_tape import CmsTape
+                CmsTape.write_sidecar(ckpt_path, _cms_tape.flush(_cms_last_flush_step, step))
+                _cms_last_flush_step = step
 
             # ── 4. Level metrics + fire counts ─────────────────────────
             if gpu_model is not None and hasattr(gpu_model, "gate_biases"):
@@ -1936,6 +1958,21 @@ def run_build(bcfg: BuildConfig):
                 level3_prev_fires = 0
                 level3_prev_active = 0
 
+            # Spec 49: rebuild CmsTape for new k/chunk_sizes after promotion
+            if _cms_tape is not None:
+                from engine.cms_tape import CmsTape
+                # Flush old tape before rebuilding (preserve pre-promotion data)
+                if len(_cms_tape) > 0:
+                    CmsTape.write_sidecar(promo_ckpt, _cms_tape.flush(_cms_last_flush_step, step))
+                # Reset flush step unconditionally so new tape's intervals start fresh
+                _cms_last_flush_step = step
+                _cms_tape = CmsTape(
+                    k=new_k,
+                    n_blocks=getattr(bcfg, "n_blocks", 1),
+                    num_heads=bcfg.num_heads,
+                    chunk_sizes=new_chunks,
+                )
+
             if active_loader is not None:
                 cursor = active_loader.cursor()
                 cur_pos = cursor["position"]
@@ -1984,6 +2021,12 @@ def run_build(bcfg: BuildConfig):
             jsonl.log(event="level3_summary",
                       total_fires=level3_total_fires,
                       active_fires=level3_active_fires)
+
+    # Spec 49: flush any remaining CMS tape data to the final checkpoint sidecar
+    if _cms_tape is not None and len(_cms_tape) > 0:
+        from engine.cms_tape import CmsTape
+        final_ckpt_for_cms = _safetensors_path(bcfg.save_path)
+        CmsTape.write_sidecar(final_ckpt_for_cms, _cms_tape.flush(_cms_last_flush_step, end_step - 1))
 
     # ── Final checkpoint ──────────────────────────────────────────────
     final_path = _safetensors_path(bcfg.save_path)
