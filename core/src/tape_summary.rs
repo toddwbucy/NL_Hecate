@@ -97,6 +97,10 @@ fn per_head_m_norms(m: &[f32], d: usize, num_heads: usize) -> Vec<f32> {
 ///
 /// `num_heads`: number of attention heads for per-head M norm decomposition.
 /// Pass 1 to skip per-head norms.
+///
+/// `d_model`: model dimension (d = num_heads * head_dim). Used to verify that
+/// `final_memory` has the expected square-M layout (d*d elements) before
+/// attempting per-head decomposition.
 fn extract_level(
     tape: &Tape,
     all_blocks: &[(usize, OpaqueKey, Option<usize>, Option<usize>)],
@@ -105,6 +109,7 @@ fn extract_level(
     final_memory: Option<&[f32]>,
     gate_values: Option<&[f32]>,
     num_heads: usize,
+    d_model: usize,
 ) -> LevelSummary {
     let level_blocks: Vec<(usize, String)> = all_blocks.iter()
         .filter_map(|&(idx, key, lvl, blk)| {
@@ -140,15 +145,10 @@ fn extract_level(
         .unwrap_or(f32::NAN);
 
     // Per-head M norms: decompose d×d M into num_heads diagonal blocks.
+    // Only valid when final_memory has exactly d_model*d_model elements (square M).
     let head_m_norms = final_memory
-        .map(|mem| {
-            let d = (mem.len() as f64).sqrt() as usize;
-            if d * d == mem.len() {
-                per_head_m_norms(mem, d, num_heads)
-            } else {
-                Vec::new()
-            }
-        })
+        .filter(|mem| d_model > 0 && mem.len() == d_model * d_model)
+        .map(|mem| per_head_m_norms(mem, d_model, num_heads))
         .unwrap_or_default();
 
     let freq_gate_value = gate_values
@@ -196,7 +196,7 @@ pub fn extract_tape_summary(
             .map(|lev| {
                 let final_mem = context.memory.get(lev).map(|v| v.as_slice());
                 extract_level(tape, &all_blocks, lev, None, final_mem, gate_values,
-                              cfg.swa.num_heads)
+                              cfg.swa.num_heads, cfg.swa.d_model)
             })
             .collect();
 
@@ -272,7 +272,7 @@ pub fn extract_stacked_tape_summary(
                     .and_then(|block_ctx| block_ctx.get(lev))
                     .map(|v| v.as_slice());
                 let ls = extract_level(tape, &all_ops, lev, Some(b), final_mem, None,
-                                       cfg.swa.num_heads);
+                                       cfg.swa.num_heads, cfg.swa.d_model);
                 BlockLevelSummary {
                     block: b,
                     level: ls.level,

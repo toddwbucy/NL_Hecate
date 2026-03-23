@@ -29,25 +29,28 @@ CONTRACT
               - GPU path gains `memory_norms_per_head()` returning
                 Vec<Vec<Vec<f32>>> — [n_blocks][k][num_heads].
               - PyO3 tape summary dicts include "head_m_norms": [float, ...].
-              - CmsTape accumulator uses l0_per_head_sample_rate to subsample
-                per-head data independently of aggregate sampling.
               - Existing aggregate m_norm unchanged — head norms are additive.
               - Zero overhead when head_m_norms is not queried (Vec is empty
                 for k=1 or when num_heads=1).
+              - CmsTape per-head accumulation via l0_per_head_sample_rate is
+                DEFERRED to spec 49 (task_a1fafb), which is blocked on this spec.
 
   Cost:       - CPU tape path: num_heads Frobenius norms per level per diagnostic
                 call. Each norm is O(head_dim²) — negligible vs forward pass.
-              - GPU path: one kernel launch per (block, level) with num_heads
-                independent reductions. O(d²/num_heads) per head.
-              - Sidecar size: +num_heads floats per level per recorded step.
-                At num_heads=16, k=4, 1024 L0 samples: +256KB (~10% increase
-                over aggregate-only budget).
+              - GPU path: D2H copy of mem_dd = num_heads × head_dim² floats per
+                level, then CPU-side per-tile Frobenius norm reduction. No GPU
+                kernel launch — host reduction is sufficient at diagnostic cadence.
+              - Sidecar size (when spec 49 lands): +num_heads floats per level
+                per recorded step. At num_heads=16, k=4, 1024 L0 samples: +256KB
+                (~10% increase over aggregate-only budget).
 
-  Trade-off:  - Per-head decomposition assumes block-diagonal M structure:
-                head h's memory lives in the [h*hd, (h+1)*hd] × [h*hd, (h+1)*hd]
-                submatrix. This is correct for the current Delta/Titans/Hebbian
-                rules which use per-head k_mem/v_mem projections. Cross-head
-                interactions (off-diagonal blocks) are not captured.
+  Trade-off:  - Two memory layouts coexist:
+                  CPU tape path: M is [d × d] row-major. Per-head decomposition
+                    extracts diagonal sub-blocks [h*hd..(h+1)*hd]².
+                  GPU path: M is packed per-head tiles at h*hd*hd offset, each
+                    tile contiguous [hd × hd]. Per-head norm is a simple slice.
+                Both layouts give equivalent per-head norms when cross-head
+                coupling is zero (true for Delta/Titans/Hebbian rules).
               - MLP-based rules (MONETA/YAAD/MEMORA) have non-square M
                 (w1: [d,4d], w2: [4d,d]). Per-head decomposition of MLP
                 weights is less meaningful — head_m_norms is empty for these
@@ -150,7 +153,7 @@ fn per_head_m_norms(m: &[f32], d: usize, num_heads: usize) -> Vec<f32> {
 }
 ```
 
-The function signature of `extract_level()` gains `num_heads: usize`:
+The function signature of `extract_level()` gains `num_heads` and `d_model`:
 
 ```rust
 fn extract_level(
@@ -161,12 +164,13 @@ fn extract_level(
     final_memory: Option<&[f32]>,
     gate_values: Option<&[f32]>,
     num_heads: usize,        // NEW
+    d_model: usize,          // NEW — validates square-M layout
 ) -> LevelSummary
 ```
 
-When `final_memory` is `Some` and has exactly `d*d` elements where
-`d % num_heads == 0` and `num_heads > 1`, compute per-head norms. Otherwise
-`head_m_norms` is empty (graceful degradation for MLP rules or `num_heads=1`).
+Per-head norms are computed only when `final_memory.len() == d_model * d_model`
+and `num_heads > 1`. Otherwise `head_m_norms` is empty (graceful degradation
+for MLP rules, non-square M, or `num_heads=1`).
 
 ### 2.2 Per-Head Norms on GPU
 
@@ -177,17 +181,16 @@ Add alongside existing `memory_norms()`:
 ```rust
 /// Compute per-(block, level, head) Frobenius norms of M sub-matrices on GPU.
 /// Returns [n_blocks][k][num_heads].
+/// GPU layout: packed per-head tiles, head h at offset h*hd*hd.
 pub fn memory_norms_per_head(&self) -> Vec<Vec<Vec<f32>>> {
-    // For each M buffer: copy to host, call per_head_m_norms()
-    // CPU-side computation is acceptable — this runs at diagnostic cadence,
-    // not on the hot path.
+    // D2H copy of slot-0 (mem_dd floats), then per-tile Frobenius norm.
+    // Each tile is contiguous [hd × hd] — simple slice reduction.
 }
 ```
 
-**Why CPU-side**: Per-head norm decomposition requires non-contiguous memory
-access (diagonal blocks of a row-major matrix). A custom CUDA kernel would
-need strided reductions. Since this runs at eval cadence (not training hot
-path), D2H copy + CPU reduction is simpler and sufficient.
+**Why CPU-side**: GPU memory uses packed per-head tiles (`mem_dd = num_heads *
+head_dim²`), so each tile is contiguous — a simple slice reduction on the host
+after D2H copy. No custom CUDA kernel needed. Runs at eval cadence only.
 
 ### 2.3 PyO3 Surface
 
@@ -220,9 +223,15 @@ from the tape summary dict when present.
 
 ---
 
-## 3. Memory Layout
+## 3. Memory Layouts
 
-M is stored row-major as `[d × d]` where `d = num_heads × head_dim`:
+Two M layouts coexist. Per-head norm extraction handles both.
+
+### 3.1 CPU Tape Path: Row-Major `[d × d]`
+
+M is stored row-major as `[d × d]` where `d = num_heads × head_dim`.
+Per-head norms extract **diagonal blocks** at `rows [h*hd..(h+1)*hd],
+cols [h*hd..(h+1)*hd]`:
 
 ```text
          col 0..hd    col hd..2hd   col 2hd..3hd  ...  col (H-1)hd..d
@@ -232,22 +241,26 @@ row hd   │  hd×hd   │             │              │   │              �
          ├──────────┼─────────────┼──────────────┼───┤              │
 row hd   │cross 1→0 │   Head 1    │  cross 1→2   │   │              │
   ..     │          │   hd×hd     │              │   │              │
-row 2hd  │          │             │              │   │              │
-         ├──────────┼─────────────┼──────────────┼───┤              │
-         │  ...     │    ...      │    ...       │   │     ...      │
-         ├──────────┼─────────────┼──────────────┼───┼──────────────┤
-row      │cross H→0 │  cross H→1  │    ...       │   │   Head H-1   │
-(H-1)hd  │          │             │              │   │   hd×hd      │
-  ..d    └──────────┴─────────────┴──────────────┴───┴──────────────┘
+         └──────────┴─────────────┴──────────────┴───┴──────────────┘
 ```
-
-Per-head norms extract only the **diagonal blocks** (Head 0, Head 1, ...,
-Head H-1). Cross-head blocks are ignored — they represent inter-head
-coupling that is typically near-zero for the Delta/Titans update rules
-(which use per-head k/v projections).
 
 **Invariant:** `sum(head_norm_h² for h in 0..H) ≤ m_norm²`. Equality holds
 only when all cross-head blocks are zero.
+
+### 3.2 GPU Path: Packed Per-Head Tiles
+
+GPU stores M as `mem_dd = num_heads × head_dim²` contiguous tiles:
+
+```text
+offset 0          hd²          2·hd²              (H-1)·hd²    H·hd²
+┌─────────────┬─────────────┬─────────────┬───┬─────────────┐
+│   Head 0    │   Head 1    │   Head 2    │...│  Head H-1   │
+│  hd×hd flat │  hd×hd flat │  hd×hd flat │   │  hd×hd flat │
+└─────────────┴─────────────┴─────────────┴───┴─────────────┘
+```
+
+Per-head norm is a simple contiguous slice reduction: `||buf[h*hd²..
+(h+1)*hd²]||_F`. No cross-head coupling exists in this layout.
 
 ---
 

@@ -2540,31 +2540,28 @@ impl GpuModel {
         norms
     }
 
-    /// Compute per-head Frobenius norms of block-diagonal M sub-matrices on GPU.
+    /// Compute per-head Frobenius norms of M sub-matrices on GPU.
     /// Returns Vec<Vec<f32>> of shape [k][num_heads]. Empty inner Vec for
     /// MLP rules (non-square M) or num_heads <= 1.
+    ///
+    /// GPU memory layout: packed per-head tiles, head h at offset h*hd*hd.
     fn memory_norms_per_head(&self) -> Vec<Vec<f32>> {
-        let d = self.context.d;
-        let dd = d * d;
-        let nh = self.cfg.swa.num_heads;
+        let nh = self.context.num_heads;
+        let hd = self.context.head_dim;
+        let mem_dd = self.context.mem_dd(); // nh * hd * hd
         let mut result = Vec::with_capacity(self.context.memory.len());
         for gpu_mem in &self.context.memory {
-            if nh <= 1 || dd == 0 || gpu_mem.len() < dd || d % nh != 0 {
+            if nh <= 1 || mem_dd == 0 || gpu_mem.len() < mem_dd {
                 result.push(Vec::new());
                 continue;
             }
-            let mut buf = vec![0.0f32; dd];
-            gpu_mem.slice(0, dd).copy_to_host(&mut buf);
-            let hd = d / nh;
+            let mut buf = vec![0.0f32; mem_dd];
+            gpu_mem.slice(0, mem_dd).copy_to_host(&mut buf);
+            let tile_size = hd * hd;
             let norms: Vec<f32> = (0..nh).map(|h| {
-                let rs = h * hd;
-                let cs = h * hd;
-                let mut sq = 0.0f32;
-                for r in 0..hd {
-                    let off = (rs + r) * d + cs;
-                    for c in 0..hd { let v = buf[off + c]; sq += v * v; }
-                }
-                sq.sqrt()
+                let start = h * tile_size;
+                buf[start..start + tile_size].iter()
+                    .map(|v| v * v).sum::<f32>().sqrt()
             }).collect();
             result.push(norms);
         }
@@ -2788,22 +2785,17 @@ impl GpuModel {
             // freq_gate_value: GPU path does not yet capture gate values
             ldict.set_item("freq_gate_value", f32::NAN)?;
             ldict.set_item("is_frozen", !pulse.inner.active_levels[level])?;
-            // Per-head M norms from post-forward context
+            // Per-head M norms from post-forward context (packed tile layout)
             let head_norms: Vec<f32> = if level < post_ctx.memory.len() {
                 let mem = &post_ctx.memory[level];
-                let d = self.cfg.swa.d_model;
-                let nh = self.cfg.swa.num_heads;
-                if nh > 1 && mem.len() == d * d && d % nh == 0 {
-                    let hd = d / nh;
+                let nh = self.context.num_heads;
+                let hd = self.context.head_dim;
+                let tile_size = hd * hd;
+                if nh > 1 && mem.len() == nh * tile_size {
                     (0..nh).map(|h| {
-                        let rs = h * hd;
-                        let cs = h * hd;
-                        let mut sq = 0.0f32;
-                        for r in 0..hd {
-                            let off = (rs + r) * d + cs;
-                            for c in 0..hd { let v = mem[off + c]; sq += v * v; }
-                        }
-                        sq.sqrt()
+                        let start = h * tile_size;
+                        mem[start..start + tile_size].iter()
+                            .map(|v| v * v).sum::<f32>().sqrt()
                     }).collect()
                 } else { Vec::new() }
             } else { Vec::new() };
@@ -2938,6 +2930,7 @@ impl GpuStackedModel {
         let gpu_params = nl_hecate_core::gpu_params::GpuStackedParams::from_host(&host_params);
         let gpu_context = nl_hecate_core::gpu_params::GpuStackedContext::new(
             n_blocks, cfg.inner.k, cfg.inner.swa.d_model, batch_size,
+            Some(&cfg.inner),
         );
         Ok(GpuStackedModel {
             params: gpu_params,
@@ -2988,6 +2981,7 @@ impl GpuStackedModel {
         let gpu_params = nl_hecate_core::gpu_params::GpuStackedParams::from_host(&host_params);
         let gpu_context = nl_hecate_core::gpu_params::GpuStackedContext::new(
             n_blocks, cfg.inner.k, cfg.inner.swa.d_model, batch_size,
+            Some(&cfg.inner),
         );
         Ok(GpuStackedModel {
             params: gpu_params,

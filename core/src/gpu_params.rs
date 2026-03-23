@@ -609,9 +609,15 @@ pub struct GpuStackedContext {
 impl GpuStackedContext {
     /// Initialize zero M matrices for all blocks x levels.
     /// No CUDA graph support for stacked forward (standard dispatch only).
-    pub fn new(n_blocks: usize, k: usize, d: usize, batch_size: usize) -> Self {
+    ///
+    /// When `cfg` is provided, per-head memory layout is inherited
+    /// (num_heads × head_dim² tiles). Pass `None` for monolithic d×d.
+    pub fn new(
+        n_blocks: usize, k: usize, d: usize, batch_size: usize,
+        cfg: Option<&crate::model::MAGConfig>,
+    ) -> Self {
         let blocks = (0..n_blocks)
-            .map(|_| GpuContextState::new(k, d, batch_size, None, 0))
+            .map(|_| GpuContextState::new(k, d, batch_size, cfg, 0))
             .collect();
         GpuStackedContext {
             blocks, d, batch_size, n_blocks,
@@ -677,39 +683,29 @@ impl GpuStackedContext {
     /// Returns `Vec<Vec<Vec<f32>>>` — [n_blocks][k][num_heads].
     /// Empty inner Vec for levels with non-square M (MLP rules) or num_heads <= 1.
     ///
-    /// CPU-side computation: D2H copy + diagonal-block Frobenius norm.
-    /// Acceptable at diagnostic cadence (not training hot path).
+    /// GPU memory layout: packed per-head tiles, head h at offset `h * hd * hd`,
+    /// each tile is `hd × hd` contiguous. D2H copy of slot 0, then per-tile norm.
     pub fn memory_norms_per_head(&self) -> Vec<Vec<Vec<f32>>> {
-        let d = self.d;
-        let nh = self.num_heads;
-        let slot_size = d * d;
         let mut result = Vec::with_capacity(self.blocks.len());
         for ctx in &self.blocks {
+            let nh = ctx.num_heads;
+            let hd = ctx.head_dim;
+            let mem_dd = ctx.mem_dd(); // nh * hd * hd
             let mut block_head_norms = Vec::with_capacity(ctx.memory.len());
             for buf in &ctx.memory {
-                if nh <= 1 || slot_size == 0 || buf.len() < slot_size {
+                if nh <= 1 || mem_dd == 0 || buf.len() < mem_dd {
                     block_head_norms.push(Vec::new());
                     continue;
                 }
-                // D2H copy of slot 0 (first batch element)
-                let n = slot_size.min(buf.len());
-                let mut host = vec![0.0f32; n];
-                buf.slice(0, n).copy_to_host(&mut host);
-                // Per-head diagonal block norms
-                if d % nh != 0 {
-                    block_head_norms.push(Vec::new());
-                    continue;
-                }
-                let hd = d / nh;
+                // D2H copy of slot 0 (first batch element): mem_dd floats
+                let mut host = vec![0.0f32; mem_dd];
+                buf.slice(0, mem_dd).copy_to_host(&mut host);
+                // Packed layout: head h is at host[h*hd*hd .. (h+1)*hd*hd]
+                let tile_size = hd * hd;
                 let norms: Vec<f32> = (0..nh).map(|h| {
-                    let rs = h * hd;
-                    let cs = h * hd;
-                    let mut sq = 0.0f32;
-                    for r in 0..hd {
-                        let off = (rs + r) * d + cs;
-                        for c in 0..hd { let v = host[off + c]; sq += v * v; }
-                    }
-                    sq.sqrt()
+                    let start = h * tile_size;
+                    host[start..start + tile_size].iter()
+                        .map(|v| v * v).sum::<f32>().sqrt()
                 }).collect();
                 block_head_norms.push(norms);
             }
