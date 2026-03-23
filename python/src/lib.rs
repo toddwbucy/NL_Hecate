@@ -1958,13 +1958,9 @@ fn validate_tape_inputs(s: usize, v: usize, input_ids: &[usize], target_ids: &[u
             )));
         }
     }
-    if let Some(&max_id) = target_ids.iter().max() {
-        if max_id >= v {
-            return Err(PyValueError::new_err(format!(
-                "target_ids contains {} >= vocab_size {}", max_id, v
-            )));
-        }
-    }
+    // target_ids may contain sentinel values >= vocab_size for masked/padded
+    // positions (BPE batching). The cross-entropy loss ignores these positions,
+    // so we only validate input_ids against vocab_size.
     Ok(())
 }
 

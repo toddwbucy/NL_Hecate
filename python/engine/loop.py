@@ -1965,7 +1965,8 @@ def run_build(bcfg: BuildConfig):
                 # Flush old tape before rebuilding (preserve pre-promotion data)
                 if len(_cms_tape) > 0:
                     CmsTape.write_sidecar(promo_ckpt, _cms_tape.flush(_cms_last_flush_step, step))
-                    _cms_last_flush_step = step
+                # Reset flush step unconditionally so new tape's intervals start fresh
+                _cms_last_flush_step = step
                 _cms_tape = CmsTape(
                     k=new_k,
                     n_blocks=getattr(bcfg, "n_blocks", 1),
@@ -2021,6 +2022,12 @@ def run_build(bcfg: BuildConfig):
             jsonl.log(event="level3_summary",
                       total_fires=level3_total_fires,
                       active_fires=level3_active_fires)
+
+    # Spec 49: flush any remaining CMS tape data to the final checkpoint sidecar
+    if _cms_tape is not None and len(_cms_tape) > 0:
+        from engine.cms_tape import CmsTape
+        final_ckpt_for_cms = _safetensors_path(bcfg.save_path)
+        CmsTape.write_sidecar(final_ckpt_for_cms, _cms_tape.flush(_cms_last_flush_step, end_step - 1))
 
     # ── Final checkpoint ──────────────────────────────────────────────
     final_path = _safetensors_path(bcfg.save_path)
