@@ -1094,15 +1094,15 @@ impl OpaqueVjp for DeltaRule {
         // cache.error is the DGD self-modification delta (M@k - v, HOPE Eq. 88) — named for
         // post-backward observation via get_saved_by_role(op_idx, obs::DGD_DELTA).
         let mut cache_ids: Vec<BufId> = vec![
-            tape.alloc(cache.m_states, vec![]),
-            tape.alloc(cache.k_mem, vec![]),
-            tape.alloc(cache.v_mem, vec![]),
+            tape.alloc_named(cache.m_states, vec![], crate::tape::obs::M_STATES, level),
+            tape.alloc_named(cache.k_mem, vec![], crate::tape::obs::K_MEM, level),
+            tape.alloc_named(cache.v_mem, vec![], crate::tape::obs::V_MEM, level),
             tape.alloc(cache.q_mem, vec![]),
             tape.alloc(cache.concat_kv, vec![]),
             tape.alloc(cache.alpha_pre, vec![]),
-            tape.alloc(cache.alpha, vec![]),
+            tape.alloc_named(cache.alpha, vec![], crate::tape::obs::ALPHA, level),
             tape.alloc(cache.theta_pre, vec![]),
-            tape.alloc(cache.theta, vec![]),
+            tape.alloc_named(cache.theta, vec![], crate::tape::obs::THETA, level),
             tape.alloc_named(cache.error, vec![], crate::tape::obs::DGD_DELTA, level),
             tape.alloc(cache.grad_outer, vec![]),
             tape.alloc(cache.y, vec![]),
@@ -1165,19 +1165,19 @@ impl OpaqueVjp for TitansLMM {
         let (y, cache) = self.step(level_params, embedded, seq_len, d, initial_m);
 
         let mut cache_ids: Vec<BufId> = vec![
-            tape.alloc(cache.m_states, vec![]),
-            tape.alloc(cache.s_states, vec![]),
-            tape.alloc(cache.k_mem, vec![]),
-            tape.alloc(cache.v_mem, vec![]),
+            tape.alloc_named(cache.m_states, vec![], crate::tape::obs::M_STATES, level),
+            tape.alloc_named(cache.s_states, vec![], crate::tape::obs::S_STATES, level),
+            tape.alloc_named(cache.k_mem, vec![], crate::tape::obs::K_MEM, level),
+            tape.alloc_named(cache.v_mem, vec![], crate::tape::obs::V_MEM, level),
             tape.alloc(cache.q_mem, vec![]),
             tape.alloc(cache.concat_kv, vec![]),
             tape.alloc(cache.alpha_pre, vec![]),
-            tape.alloc(cache.alpha, vec![]),
+            tape.alloc_named(cache.alpha, vec![], crate::tape::obs::ALPHA, level),
             tape.alloc(cache.theta_pre, vec![]),
-            tape.alloc(cache.theta, vec![]),
+            tape.alloc_named(cache.theta, vec![], crate::tape::obs::THETA, level),
             tape.alloc(cache.eta_pre, vec![]),
             tape.alloc(cache.eta, vec![]),
-            tape.alloc(cache.error, vec![]),
+            tape.alloc_named(cache.error, vec![], crate::tape::obs::ERROR, level),
             tape.alloc(cache.grad_outer, vec![]),
             tape.alloc(cache.y, vec![]),
             tape.alloc(cache.k_mem_norms, vec![]),  // saved[18]: L2 norms for k
@@ -1229,13 +1229,13 @@ impl OpaqueVjp for HebbianRule {
         let (y, cache) = self.step(level_params, embedded, seq_len, d, initial_m);
 
         let cache_ids: Vec<BufId> = vec![
-            tape.alloc(cache.m_states, vec![]),
-            tape.alloc(cache.k_mem, vec![]),
-            tape.alloc(cache.v_mem, vec![]),
+            tape.alloc_named(cache.m_states, vec![], crate::tape::obs::M_STATES, level),
+            tape.alloc_named(cache.k_mem, vec![], crate::tape::obs::K_MEM, level),
+            tape.alloc_named(cache.v_mem, vec![], crate::tape::obs::V_MEM, level),
             tape.alloc(cache.q_mem, vec![]),
             tape.alloc(cache.concat_kv, vec![]),
             tape.alloc(cache.alpha_pre, vec![]),
-            tape.alloc(cache.alpha, vec![]),
+            tape.alloc_named(cache.alpha, vec![], crate::tape::obs::ALPHA, level),
             tape.alloc(cache.y, vec![]),
         ];
 
@@ -1268,20 +1268,20 @@ impl OpaqueVjp for Moneta {
         let (y, cache) = self.step(level_params, embedded, seq_len, d, initial_m);
 
         let mut cache_ids: Vec<BufId> = vec![
-            tape.alloc(cache.w1_states, vec![]),
-            tape.alloc(cache.w2_states, vec![]),
-            tape.alloc(cache.k_mem, vec![]),
-            tape.alloc(cache.v_mem, vec![]),
+            tape.alloc_named(cache.w1_states, vec![], crate::tape::obs::W1_STATES, level),
+            tape.alloc_named(cache.w2_states, vec![], crate::tape::obs::W2_STATES, level),
+            tape.alloc_named(cache.k_mem, vec![], crate::tape::obs::K_MEM, level),
+            tape.alloc_named(cache.v_mem, vec![], crate::tape::obs::V_MEM, level),
             tape.alloc(cache.q_mem, vec![]),
             tape.alloc(cache.concat_kv, vec![]),
             tape.alloc(cache.alpha_pre, vec![]),
-            tape.alloc(cache.alpha, vec![]),
+            tape.alloc_named(cache.alpha, vec![], crate::tape::obs::ALPHA, level),
             tape.alloc(cache.theta_pre, vec![]),
-            tape.alloc(cache.theta, vec![]),
+            tape.alloc_named(cache.theta, vec![], crate::tape::obs::THETA, level),
             tape.alloc(cache.pre_act, vec![]),
             tape.alloc(cache.hidden, vec![]),
             tape.alloc(cache.prediction, vec![]),
-            tape.alloc(cache.error, vec![]),
+            tape.alloc_named(cache.error, vec![], crate::tape::obs::ERROR, level),
             tape.alloc(cache.y, vec![]),
         ];
         // Save a1/a2 accumulator states when L_q > 2 (needed for backward)
@@ -1318,22 +1318,22 @@ impl OpaqueVjp for YAAD {
         let (y, cache) = self.step(level_params, embedded, seq_len, d, initial_m);
 
         let cache_ids: Vec<BufId> = vec![
-            tape.alloc(cache.w1_states, vec![]),
-            tape.alloc(cache.w2_states, vec![]),
+            tape.alloc_named(cache.w1_states, vec![], crate::tape::obs::W1_STATES, level),
+            tape.alloc_named(cache.w2_states, vec![], crate::tape::obs::W2_STATES, level),
             tape.alloc(cache.w1_boundary, vec![]),
             tape.alloc(cache.w2_boundary, vec![]),
-            tape.alloc(cache.k_mem, vec![]),
-            tape.alloc(cache.v_mem, vec![]),
+            tape.alloc_named(cache.k_mem, vec![], crate::tape::obs::K_MEM, level),
+            tape.alloc_named(cache.v_mem, vec![], crate::tape::obs::V_MEM, level),
             tape.alloc(cache.q_mem, vec![]),
             tape.alloc(cache.concat_kv, vec![]),
             tape.alloc(cache.alpha_pre, vec![]),
-            tape.alloc(cache.alpha, vec![]),
+            tape.alloc_named(cache.alpha, vec![], crate::tape::obs::ALPHA, level),
             tape.alloc(cache.theta_pre, vec![]),
-            tape.alloc(cache.theta, vec![]),
+            tape.alloc_named(cache.theta, vec![], crate::tape::obs::THETA, level),
             tape.alloc(cache.pre_act, vec![]),
             tape.alloc(cache.hidden, vec![]),
             tape.alloc(cache.prediction, vec![]),
-            tape.alloc(cache.error, vec![]),
+            tape.alloc_named(cache.error, vec![], crate::tape::obs::ERROR, level),
             tape.alloc(cache.y, vec![]),
         ];
 
@@ -1365,20 +1365,20 @@ impl OpaqueVjp for MEMORA {
         let (y, cache) = self.step(level_params, embedded, seq_len, d, initial_m);
 
         let cache_ids: Vec<BufId> = vec![
-            tape.alloc(cache.w1_states, vec![]),
-            tape.alloc(cache.w2_states, vec![]),
-            tape.alloc(cache.k_mem, vec![]),
-            tape.alloc(cache.v_mem, vec![]),
+            tape.alloc_named(cache.w1_states, vec![], crate::tape::obs::W1_STATES, level),
+            tape.alloc_named(cache.w2_states, vec![], crate::tape::obs::W2_STATES, level),
+            tape.alloc_named(cache.k_mem, vec![], crate::tape::obs::K_MEM, level),
+            tape.alloc_named(cache.v_mem, vec![], crate::tape::obs::V_MEM, level),
             tape.alloc(cache.q_mem, vec![]),
             tape.alloc(cache.concat_kv, vec![]),
             tape.alloc(cache.alpha_pre, vec![]),
-            tape.alloc(cache.alpha, vec![]),
+            tape.alloc_named(cache.alpha, vec![], crate::tape::obs::ALPHA, level),
             tape.alloc(cache.theta_pre, vec![]),
-            tape.alloc(cache.theta, vec![]),
+            tape.alloc_named(cache.theta, vec![], crate::tape::obs::THETA, level),
             tape.alloc(cache.pre_act, vec![]),
             tape.alloc(cache.hidden, vec![]),
             tape.alloc(cache.prediction, vec![]),
-            tape.alloc(cache.error, vec![]),
+            tape.alloc_named(cache.error, vec![], crate::tape::obs::ERROR, level),
             tape.alloc(cache.y, vec![]),
             tape.alloc(cache.log_w1_prev, vec![]),
             tape.alloc(cache.log_w2_prev, vec![]),
@@ -1417,13 +1417,13 @@ impl OpaqueVjp for LatticeOSR {
         let (y, cache) = self.step(level_params, embedded, seq_len, d, initial_m);
 
         let cache_ids: Vec<BufId> = vec![
-            tape.alloc(cache.s_states, vec![]),
-            tape.alloc(cache.k_mem, vec![]),
-            tape.alloc(cache.v_mem, vec![]),
+            tape.alloc_named(cache.s_states, vec![], crate::tape::obs::S_STATES, level),
+            tape.alloc_named(cache.k_mem, vec![], crate::tape::obs::K_MEM, level),
+            tape.alloc_named(cache.v_mem, vec![], crate::tape::obs::V_MEM, level),
             tape.alloc(cache.q_mem, vec![]),
             tape.alloc(cache.concat_kv, vec![]),
             tape.alloc(cache.alpha_pre, vec![]),
-            tape.alloc(cache.alpha, vec![]),
+            tape.alloc_named(cache.alpha, vec![], crate::tape::obs::ALPHA, level),
             tape.alloc(cache.scores, vec![]),
             tape.alloc(cache.slot_gates, vec![]),
             tape.alloc(cache.read_weights, vec![]),
@@ -1459,18 +1459,18 @@ impl OpaqueVjp for Trellis {
         let (y, cache) = self.step(level_params, embedded, seq_len, d, initial_m);
 
         let cache_ids: Vec<BufId> = vec![
-            tape.alloc(cache.sk_states, vec![]),
-            tape.alloc(cache.sv_states, vec![]),
-            tape.alloc(cache.k_mem, vec![]),
-            tape.alloc(cache.v_mem, vec![]),
+            tape.alloc_named(cache.sk_states, vec![], crate::tape::obs::SK_STATES, level),
+            tape.alloc_named(cache.sv_states, vec![], crate::tape::obs::SV_STATES, level),
+            tape.alloc_named(cache.k_mem, vec![], crate::tape::obs::K_MEM, level),
+            tape.alloc_named(cache.v_mem, vec![], crate::tape::obs::V_MEM, level),
             tape.alloc(cache.q_mem, vec![]),
             tape.alloc(cache.concat_kv, vec![]),
             tape.alloc(cache.alpha_pre, vec![]),
-            tape.alloc(cache.alpha, vec![]),
+            tape.alloc_named(cache.alpha, vec![], crate::tape::obs::ALPHA, level),
             tape.alloc(cache.theta_pre, vec![]),
-            tape.alloc(cache.theta, vec![]),
+            tape.alloc_named(cache.theta, vec![], crate::tape::obs::THETA, level),
             tape.alloc(cache.pred_k, vec![]),
-            tape.alloc(cache.error_k, vec![]),
+            tape.alloc_named(cache.error_k, vec![], crate::tape::obs::ERROR_K, level),
             tape.alloc(cache.compressed_k_pre, vec![]),
             tape.alloc(cache.compressed_k, vec![]),
             tape.alloc(cache.compressed_k_silu, vec![]),
@@ -1480,7 +1480,7 @@ impl OpaqueVjp for Trellis {
             tape.alloc(cache.read_compressed_q_silu, vec![]),
             tape.alloc(cache.read_compressed_q_silu_norm, vec![]),
             tape.alloc(cache.pred_v, vec![]),
-            tape.alloc(cache.error_v, vec![]),
+            tape.alloc_named(cache.error_v, vec![], crate::tape::obs::ERROR_V, level),
         ];
 
         // Save conv1d cache if active
@@ -1510,16 +1510,16 @@ impl OpaqueVjp for AtlasOmega {
         let (y, cache) = self.step(level_params, embedded, seq_len, d, initial_m);
 
         let cache_ids: Vec<BufId> = vec![
-            tape.alloc(cache.m_states, vec![]),
-            tape.alloc(cache.s_states, vec![]),
-            tape.alloc(cache.k_mem, vec![]),
-            tape.alloc(cache.v_mem, vec![]),
+            tape.alloc_named(cache.m_states, vec![], crate::tape::obs::M_STATES, level),
+            tape.alloc_named(cache.s_states, vec![], crate::tape::obs::S_STATES, level),
+            tape.alloc_named(cache.k_mem, vec![], crate::tape::obs::K_MEM, level),
+            tape.alloc_named(cache.v_mem, vec![], crate::tape::obs::V_MEM, level),
             tape.alloc(cache.q_mem, vec![]),
             tape.alloc(cache.concat_kv, vec![]),
             tape.alloc(cache.alpha_pre, vec![]),
-            tape.alloc(cache.alpha, vec![]),
+            tape.alloc_named(cache.alpha, vec![], crate::tape::obs::ALPHA, level),
             tape.alloc(cache.theta_pre, vec![]),
-            tape.alloc(cache.theta, vec![]),
+            tape.alloc_named(cache.theta, vec![], crate::tape::obs::THETA, level),
             tape.alloc(cache.eta_pre, vec![]),
             tape.alloc(cache.eta, vec![]),
             tape.alloc(cache.silu_kv, vec![]),

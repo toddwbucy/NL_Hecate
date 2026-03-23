@@ -77,6 +77,20 @@ pub mod obs {
     pub const EMBEDDED:     &str = "embedded";
     /// Flattened MemoryLevelParams for this opaque block.
     pub const LEVEL_PARAMS: &str = "level_params";
+    /// Momentum accumulator S states (Titans, AtlasOmega).
+    pub const S_STATES:     &str = "s_states";
+    /// MLP layer-1 weight states (Moneta, YAAD, MEMORA).
+    pub const W1_STATES:    &str = "w1_states";
+    /// MLP layer-2 weight states (Moneta, YAAD, MEMORA).
+    pub const W2_STATES:    &str = "w2_states";
+    /// Trellis key compression states S_k.
+    pub const SK_STATES:    &str = "sk_states";
+    /// Trellis value compression states S_v.
+    pub const SV_STATES:    &str = "sv_states";
+    /// Trellis key prediction error.
+    pub const ERROR_K:      &str = "error_k";
+    /// Trellis value prediction error.
+    pub const ERROR_V:      &str = "error_v";
 }
 
 // ── Opaque VJP system ────────────────────────────────────────────────
