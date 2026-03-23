@@ -1,426 +1,366 @@
-# Tape Observation Infrastructure — Native Interpretability Layer
+# Tape Observation Infrastructure — Native Interpretability Layer (v2)
 
 ```text
 CONTRACT
-  Purpose:    Extend the Wengert tape with named observation slots that expose
-              per-level gradient flow, the DGD self-modification delta, and
-              saved-buffer semantics — without disrupting backward correctness
-              or imposing overhead when disabled. This is interpretability
-              designed into the AD infrastructure, not bolted on afterwards.
-  Expects:    core/src/tape.rs — TapeBuf, TapeOp::Opaque, OpaqueKey, with_tape()
-              — all implemented and passing Class 1-3 tests per 01_wengert_tape.md.
-              All 8 memory rules registered as opaque VJP blocks.
-              OpaqueKey::DGD already registered in the tape.
-              CMS k=4 forward records one TapeOp::Opaque per level call site
-              (the level call site already passes through record_on_tape()).
+  Purpose:    Close four remaining gaps in the Wengert tape observation surface
+              so that every CMS level's memory state, retention dynamics, and
+              freeze status are queryable post-backward — without disrupting
+              backward correctness or imposing overhead when disabled.
+  Expects:    core/src/tape.rs — TapeBuf (with role/level fields), TapeOp::Opaque
+              (with level: Option<usize>, block_index: Option<usize>),
+              alloc_named(), obs::* constants, and the full query API
+              (find_opaque_ops, find_opaque_at_level, get_saved_by_role,
+              enumerate_opaque_blocks, opaque_output_grad_norm) — all implemented
+              and passing existing tests.
+              All 9 memory rules + 9 frozen variants registered as opaque VJP blocks.
+              DeltaRule adapter already uses alloc_named for obs::DGD_DELTA.
+              tape_summary.rs provides extract_tape_summary and
+              extract_stacked_tape_summary with LevelSummary containing
+              level, opaque_key, block_count, output_grad_norm, dgd_delta_norm.
   Guarantees: All existing tape tests continue to pass unmodified.
-              Observation slots add zero runtime overhead when not queried
-              (metadata lives on TapeBuf, which is already allocated).
-              Per-level observability: each CMS level records a distinct
-              (OpaqueKey, level) pair — making it addressable by level index.
-              DGD delta (M@k - v error before application) is saved as a named
-              buffer in the DGD opaque block's saved array.
-              Query API is post-backward only — no hot-path allocation.
-  Cost:       SavedBufferMetadata: two Option fields added to TapeBuf — 16 bytes
-              per buffer, zero compute overhead.
-              Per-level key: one additional usize field on TapeOp::Opaque —
-              8 bytes per op, zero compute overhead.
-              DGD delta buffer: already computed inside step() — saving it adds
-              one arena allocation (d² f32s, ~1MB at d=512). Negligible.
-              Query API: O(ops) linear scan, called post-backward, never on hot path.
-  Trade-off:  Named metadata on tape buffers is a weak form of provenance
-              (string role tag, not a typed enum). Sufficient for observation;
-              not a general tensor naming system.
-              Per-level keys require the call site to pass level: usize into
-              record_on_tape() — a one-line change per rule adapter.
-              DGD delta exposure means the DGD adapter must save the error
-              buffer explicitly rather than computing it inline and discarding it.
+              After migration, get_saved_by_role() returns data for all 9 adapters
+              (not just DeltaRule) — at minimum obs::M_STATES and obs::ERROR.
+              LevelSummary gains m_norm, freq_gate_value, is_frozen fields.
+              Single parameterized extract function eliminates code duplication.
+              Zero overhead when observation fields are not queried.
+  Cost:       alloc → alloc_named: zero compute overhead (metadata-only change).
+              m_norm computation: one L2 norm per level per diagnostic call.
+              freq_gate_value: one sigmoid read per level per diagnostic call.
+              is_frozen: one OpaqueKey pattern match per level (zero cost).
+              Unified extract: code reduction, no performance change.
+  Trade-off:  Named metadata on tape buffers uses string role tags, not typed enums.
+              Sufficient for observation; not a general tensor naming system.
+              freq_gate_value is NaN for Fixed schedules — callers must check.
+              m_norm requires Phase 2 (alloc_named) to land before it can be
+              populated — strict phase ordering.
   Position:   specs/infrastructure/differentiation/02_tape_observation.md
   Source:     HOPE (2512.24695) Eq. 88 (practical DGD update) for delta definition.
               HOPE (2512.24695) Eq. 97 (CMS chain) for per-level structure.
-              task_4acd05 exploration_note (2026-02-26) for gap analysis.
+              Titans (2501.00663) Eq. 13 (forgetting gate) for alpha/theta semantics.
               CS-40 (opt-in AD), CS-42 (all intermediates stored),
               CS-47 (no in-place mutation of tracked tensors).
 ```
 
 ---
 
-## 1. Problem: Three Gaps in the Current Tape
+## 0. Status of Original Spec (v1)
 
-The Wengert tape records the computation graph with full fidelity. However
-three structural gaps prevent native observation of the quantities that make
-NL interpretable:
+The original v1 spec (2026-02-26) identified three gaps:
 
-### Gap 1 — Saved buffers have no semantic names
+1. **Saved buffers have no semantic names** → **SHIPPED.** `TapeBuf.role`, `TapeBuf.level`,
+   `alloc_named()`, and `obs::*` constants are implemented in `tape.rs`.
+2. **CMS levels produce indistinguishable opaque ops** → **SHIPPED.** `TapeOp::Opaque` has
+   `level: Option<usize>` and `block_index: Option<usize>`. `record_on_tape()` accepts level.
+3. **DGD delta never saved** → **SHIPPED.** DeltaRule adapter saves `cache.error` via
+   `alloc_named(..., obs::DGD_DELTA, level)`.
 
-Every `TapeOp::Opaque` block saves tensors in a positional `Vec<BufId>`:
+All v1 query API methods are implemented and tested: `find_opaque_ops`, `find_opaque_at_level`,
+`get_saved_by_role`, `enumerate_opaque_blocks`, `opaque_output_grad_norm`.
 
-```rust
-Opaque { key, inputs, outputs, saved: vec![buf_0, buf_1, buf_2] }
-//                                         ^       ^       ^
-//                                    embedded  params   cache_flat
-//                         (which is which requires reading the adapter source)
-```
-
-`saved[2]` might be `m_states`, `k_mem`, or `error` depending on which rule
-registered this block. There is no metadata. A query like "show me the M state
-after level 1 at step t" requires knowing the adapter's positional convention.
-
-### Gap 2 — All CMS levels produce a single indistinguishable `TapeOp::Opaque`
-
-At k=4, `cms_forward()` calls `record_on_tape()` four times — one per level.
-All four produce `TapeOp::Opaque { key: OpaqueKey::DeltaRule, ... }`. The tape
-has no way to distinguish Level 0 from Level 3 without tracing call order, which
-is fragile and breaks if level ordering changes.
-
-### Gap 3 — The DGD self-modification delta is never a named intermediate
-
-Inside `step()`, the DGD adapter computes:
-
-```rust
-let error = matmul(m_prev, k) - v;   // M @ k - v  ← this IS the delta (HOPE Eq. 88)
-let delta_m = outer(error, k);       // error ⊗ k
-let m_new = m_prev * (I - eta * outer(k, k)) - eta * delta_m;
-```
-
-The `error` tensor — the self-modification signal — is computed, used, and
-discarded. It is never saved to the tape arena. Observing the DGD delta
-requires re-running the forward pass with extra instrumentation.
+**This v2 revision addresses four new gaps revealed by a graph-informed codebase survey
+(5,368 rust-analyzer symbols, 10,948 edges).**
 
 ---
 
-## 2. Solution: Three Minimal, Additive Changes
+## 1. Problem: Four Remaining Gaps
 
-None of these changes modify the backward pass or existing VJP rules. They are
-pure metadata additions and one saved-buffer registration.
+### Gap A — 8 of 9 adapters use `alloc()` instead of `alloc_named()`
 
-### 2.1 `SavedBufferMetadata` — named roles on tape buffers
+The infrastructure for named buffers exists, but only the DeltaRule adapter uses it (one
+`alloc_named` call for `obs::DGD_DELTA`). The other 8 active adapters — TitansLMM, Hebbian,
+Moneta, YAAD, MEMORA, LatticeOSR, Trellis, AtlasOmega — allocate all saved buffers via
+plain `alloc()`. This means:
 
-Add two optional fields to `TapeBuf`:
+- `get_saved_by_role(op_idx, obs::M_STATES)` returns `None` for 8 out of 9 rules
+- `get_saved_by_role(op_idx, obs::ERROR)` returns `None` for 7 out of 8 rules that have an error buffer
+- `get_saved_by_role(op_idx, obs::ALPHA)` returns `None` for all rules with learned decay
 
-```rust
-pub struct TapeBuf {
-    pub data: Vec<f32>,
-    pub shape: Vec<usize>,
-    pub is_param: bool,
-    // ── observation metadata (new fields) ──
-    /// Semantic role of this buffer within its opaque block.
-    /// Examples: "m_states", "error", "k_mem", "dgd_delta", "alpha", "theta".
-    /// None for unnamed intermediates (standard ops, unnamed saved tensors).
-    pub role: Option<&'static str>,
-    /// CMS level index (0..k-1) this buffer belongs to.
-    /// None for buffers that are not level-specific.
-    pub level: Option<usize>,
-}
-```
+The query API works correctly — it simply has no named data to find.
 
-All existing allocations default `role: None, level: None` — no behavioral
-change. Named buffers are allocated via a new `alloc_named` method:
+### Gap B — `tape_summary.rs` duplicates extraction logic
 
-```rust
-impl Tape {
-    /// Allocate a named buffer. role and level are observation metadata only.
-    pub fn alloc_named(
-        &mut self,
-        data: Vec<f32>,
-        shape: Vec<usize>,
-        role: &'static str,
-        level: Option<usize>,
-    ) -> BufId {
-        let id = self.bufs.len();
-        self.bufs.push(TapeBuf { data, shape, is_param: false,
-                                  role: Some(role), level });
-        self.grad_accum.push(None);
-        id
-    }
-}
-```
+`extract_tape_summary()` (single-block) and `extract_stacked_tape_summary()` (multi-block)
+are near-identical functions that both:
 
-### 2.2 Per-level observability — `level` field on `TapeOp::Opaque`
+1. Call `with_tape` → `register_opaque_vjps`
+2. Run a traced forward (CMS or stacked)
+3. Call `tape.backward(loss_id)`
+4. Iterate levels × blocks, querying `enumerate_opaque_blocks`, `opaque_output_grad_norm`,
+   and `get_saved_by_role(_, obs::DGD_DELTA)`
 
-Add a `level: Option<usize>` field to `TapeOp::Opaque`:
+The only structural difference is the stacked variant adds a block-index loop.
+Code duplication: ~90 lines of near-identical query/assembly logic.
 
-```rust
-Opaque {
-    key: OpaqueKey,
-    inputs: Vec<BufId>,
-    outputs: Vec<BufId>,
-    saved: Vec<BufId>,
-    level: Option<usize>,   // ← new field; None for non-CMS blocks (SWA, DGD)
-},
-```
+### Gap C — Frequency gate values not in `LevelSummary`
 
-The `record_opaque` method gains a `level` parameter with a default:
+`traced_cms_forward()` records `w_freq`/`b_freq` tape ops for learned frequency gates,
+and gradients flow correctly. But `LevelSummary` does not expose the gate's sigmoid output.
+For Fixed schedules, levels are either active or inactive (binary); for Learned schedules,
+the gate value (0.0–1.0) carries information about how strongly the model wants to fire
+that level — a key interpretability signal invisible to the summary.
 
-```rust
-pub fn record_opaque(
-    &mut self,
-    key: OpaqueKey,
-    inputs: Vec<BufId>,
-    outputs: Vec<BufId>,
-    saved: Vec<BufId>,
-    level: Option<usize>,   // ← new; pass Some(l) from per-level call sites
-) {
-    ...
-    self.record(TapeOp::Opaque { key, inputs, outputs, saved, level });
-}
-```
+### Gap D — Frozen-level M staleness invisible
 
-Every existing call site passes `None` (backward compatible). The CMS adapter
-in `traced_forward.rs` passes `Some(level_idx)`:
-
-```rust
-// In traced_cms_forward(), for each level l in 0..k:
-rule.record_on_tape(tape, &level_params, embedded, seq_len, d, initial_m,
-                    Some(l));   // ← the one-line change per call site
-```
-
-`record_on_tape()` in the `OpaqueVjp` trait gains a `level: Option<usize>`
-parameter, which it forwards to `record_opaque`.
-
-### 2.3 DGD delta as named intermediate
-
-The DGD backward adapter already receives the `error` tensor in its `saved`
-array (required for its VJP). The only change is to allocate it via
-`alloc_named` instead of `alloc`:
-
-```rust
-// In DGD's record_on_tape():
-let error = matmul(&m_prev, &k) - &v;   // M @ k - v  (HOPE Eq. 88)
-let error_buf = tape.alloc_named(
-    error.clone(),
-    vec![d],
-    "dgd_delta",
-    level,   // propagated from record_on_tape parameter
-);
-// error_buf is added to saved[] as before — backward adapter is unchanged
-```
-
-The backward adapter's positional convention does not change: `saved[N]` is
-still `error`. The new metadata is carried alongside — the adapter is not aware
-of it.
+Frozen levels (read-only M) use `FrozenDeltaRule`, `FrozenTitansLMM`, etc. — they compute
+M @ q_t but never update M. The current `LevelSummary` has no way to distinguish a frozen
+level from an active level that simply didn't fire. Additionally, frozen levels have no
+M-norm signal (since M doesn't change, its staleness is invisible). Without these signals,
+training diagnostics cannot detect when a frozen level's M has become stale relative to the
+data distribution.
 
 ---
 
-## 3. Query API
+## 2. Solution: Four Targeted Changes
 
-Post-backward queries. These are never called during forward or backward —
-no hot-path impact. All O(ops) scans through `self.ops`.
+### 2.1 Adapter `alloc_named` Migration
+
+**File:** `core/src/opaque_adapters.rs`
+
+Convert key saved buffers from `alloc()` to `alloc_named()` across all 8 remaining adapters.
+The `level` parameter is already available in every `record_on_tape()` signature.
+
+**Buffers to name per adapter:**
+
+| Buffer | Constant | Adapters |
+|--------|----------|----------|
+| `cache.m_states` | `obs::M_STATES` | DeltaRule, TitansLMM, Hebbian, Trellis, AtlasOmega |
+| `cache.s_states` | `obs::S_STATES` | TitansLMM, AtlasOmega (momentum) |
+| `cache.k_mem` | `obs::K_MEM` | TitansLMM, Hebbian, Moneta, YAAD, MEMORA, LatticeOSR, Trellis |
+| `cache.v_mem` | `obs::V_MEM` | TitansLMM, Hebbian, Moneta, YAAD, MEMORA, LatticeOSR, Trellis |
+| `cache.alpha` | `obs::ALPHA` | All rules with learned decay |
+| `cache.theta` | `obs::THETA` | TitansLMM, Moneta, YAAD, MEMORA, Trellis, AtlasOmega |
+| `cache.error` | `obs::ERROR` | TitansLMM, Moneta, YAAD, MEMORA, LatticeOSR, Trellis |
+| `cache.w1_states` | `obs::W1_STATES` | Moneta, YAAD, MEMORA (MLP rules) |
+| `cache.w2_states` | `obs::W2_STATES` | Moneta, YAAD, MEMORA (MLP rules) |
+
+New constants to add to `obs::*` module: `S_STATES`, `W1_STATES`, `W2_STATES`.
+
+**Critical invariant:** Positional index in the `saved` Vec must NOT change. Backward
+adapters read by position (`saved[0]`, `saved[1]`, ...). `alloc_named` only adds metadata
+to the `TapeBuf` struct — the backward function never sees it.
+
+**Change pattern (mechanical, per adapter):**
+```rust
+// Before:
+tape.alloc(cache.m_states, vec![])
+// After:
+tape.alloc_named(cache.m_states, vec![], obs::M_STATES, level)
+```
+
+### 2.2 Unified Extract Implementation
+
+**File:** `core/src/tape_summary.rs`
+
+Extract the shared query/assembly logic into a single `extract_tape_summary_impl()`
+that is parameterized by `n_blocks`:
 
 ```rust
-impl Tape {
-    /// All opaque ops matching key (any level).
-    pub fn find_opaque_ops(&self, key: OpaqueKey) -> Vec<usize> {
-        self.ops.iter().enumerate()
-            .filter_map(|(i, op)| match op {
-                TapeOp::Opaque { key: k, .. } if *k == key => Some(i),
-                _ => None,
-            })
-            .collect()
-    }
+fn extract_tape_summary_impl(
+    tape: &Tape,
+    loss: f32,
+    k: usize,
+    n_blocks: usize,  // 1 for single-block, N for stacked
+) -> (f32, usize, Vec<Vec<LevelSummary>>)
+```
 
-    /// All opaque ops matching key at a specific CMS level.
-    pub fn find_opaque_at_level(&self, key: OpaqueKey, level: usize) -> Vec<usize> {
-        self.ops.iter().enumerate()
-            .filter_map(|(i, op)| match op {
-                TapeOp::Opaque { key: k, level: Some(l), .. }
-                    if *k == key && *l == level => Some(i),
-                _ => None,
-            })
-            .collect()
-    }
+The existing public functions become thin wrappers:
 
-    /// Get the saved buffer with the given role from an opaque op.
-    /// Returns None if the op is not Opaque or no saved buffer has that role.
-    pub fn get_saved_by_role(&self, op_idx: usize, role: &str) -> Option<&[f32]> {
-        match self.ops.get(op_idx)? {
-            TapeOp::Opaque { saved, .. } => {
-                saved.iter().find_map(|&id| {
-                    if self.bufs[id].role.map_or(false, |r| r == role) {
-                        Some(self.bufs[id].data.as_slice())
-                    } else {
-                        None
-                    }
-                })
-            }
-            _ => None,
-        }
-    }
+```rust
+pub fn extract_tape_summary(...) -> TapeSummary {
+    // ... setup + traced_cms_forward + backward ...
+    let (loss, total, levels) = extract_tape_summary_impl(tape, loss, cfg.k, 1);
+    TapeSummary { loss, total_blocks: total, levels: levels[0].clone() }
+}
 
-    /// Enumerate all opaque blocks: (op_idx, key, level).
-    pub fn enumerate_opaque_blocks(&self) -> Vec<(usize, OpaqueKey, Option<usize>)> {
-        self.ops.iter().enumerate()
-            .filter_map(|(i, op)| match op {
-                TapeOp::Opaque { key, level, .. } => Some((i, *key, *level)),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Get the gradient norm for an opaque block's first output.
-    /// Useful for level-boundary gradient flow measurement after backward().
-    pub fn opaque_output_grad_norm(&self, op_idx: usize) -> Option<f32> {
-        match self.ops.get(op_idx)? {
-            TapeOp::Opaque { outputs, .. } => {
-                let out_id = *outputs.first()?;
-                let grad = self.grad_accum[out_id].as_deref()?;
-                let norm: f32 = grad.iter().map(|x| x * x).sum::<f32>().sqrt();
-                Some(norm)
-            }
-            _ => None,
-        }
-    }
+pub fn extract_stacked_tape_summary(...) -> StackedTapeSummary {
+    // ... setup + traced_stacked_forward + backward ...
+    let (loss, total, block_levels) = extract_tape_summary_impl(tape, loss, cfg.k, n_blocks);
+    // ... wrap into StackedTapeSummary ...
 }
 ```
+
+This eliminates ~90 lines of duplicated level-iteration and query logic.
+
+### 2.3 Frequency Gate Value in `LevelSummary`
+
+**File:** `core/src/tape_summary.rs`
+
+Add `freq_gate_value: f32` to `LevelSummary`:
+
+```rust
+pub struct LevelSummary {
+    // ... existing fields ...
+    /// Sigmoid output of the learned frequency gate (0.0–1.0).
+    /// NaN if the schedule is Fixed (gate does not exist for this level).
+    pub freq_gate_value: f32,
+}
+```
+
+Population: inside the unified extract, after backward, query the tape for the frequency
+gate sigmoid op at each level. The gate is recorded in `traced_cms_forward()` as a
+`traced_sigmoid` op on the `pre = dot(mean, w_freq) + b_freq` chain. The sigmoid output
+BufId is accessible via the `TracedParamIds.freq_gate_ids` returned by `traced_cms_forward`.
+
+For Fixed schedules: set to `f32::NAN` (the sigmoid op does not exist).
+
+### 2.4 Frozen Flag and M-Norm in `LevelSummary`
+
+**File:** `core/src/tape_summary.rs`
+
+Add two fields:
+
+```rust
+pub struct LevelSummary {
+    // ... existing fields ...
+    /// L2 (Frobenius) norm of the M state saved in this level's opaque block.
+    /// 0.0 if no obs::M_STATES role is present (requires alloc_named migration).
+    pub m_norm: f32,
+    /// True if this level's OpaqueKey is a Frozen* variant (read-only M).
+    pub is_frozen: bool,
+}
+```
+
+**m_norm:** Query `get_saved_by_role(op_idx, obs::M_STATES)` post-backward. Compute
+L2 norm. This field is the primary staleness indicator — when a frozen level's `m_norm`
+stays constant across checkpoints while `output_grad_norm` changes, M is stale.
+
+**is_frozen:** Check if the `OpaqueKey` debug string starts with "Frozen" (or match
+against the `Frozen*` variants directly). Zero compute cost.
+
+**Dependency:** `m_norm` requires Gap A (alloc_named migration) to be completed first.
+Before migration, `get_saved_by_role` returns `None` for most adapters and `m_norm` will
+be 0.0.
 
 ---
 
-## 4. Named Roles — Canonical List
+## 3. Existing Infrastructure (Unchanged)
 
-The following role strings are the canonical saved-buffer names across all adapters.
-String constants are defined in `tape.rs` to avoid typos:
-
-```rust
-pub mod obs {
-    pub const M_STATES:    &str = "m_states";
-    pub const ERROR:       &str = "error";       // L2 loss error (for most rules)
-    pub const DGD_DELTA:   &str = "dgd_delta";   // DGD: M@k - v  (HOPE Eq. 88)
-    pub const K_MEM:       &str = "k_mem";       // key memory projection
-    pub const V_MEM:       &str = "v_mem";       // value memory projection
-    pub const ALPHA:       &str = "alpha";       // learned decay gate output
-    pub const THETA:       &str = "theta";       // softplus-gated learning rate
-    pub const EMBEDDED:    &str = "embedded";    // input token embedding
-    pub const LEVEL_PARAMS:&str = "level_params";// flattened MemoryLevelParams
-}
-```
-
-Rules allocate their key saved buffers via `alloc_named` using these constants.
-Unnamed saved buffers (temporary intermediates not needed for observation)
-continue using `alloc`.
-
----
-
-## 5. Observation Points per Component
-
-### 5.1 Level-boundary gradient norms (already partially shipped via PR #149)
-
-With per-level `Opaque` keys, gradient norm at each level boundary is directly
-queryable post-backward — no additional instrumentation needed:
-
-```rust
-// After tape.backward(loss_id):
-for level in 0..k {
-    let ops = tape.find_opaque_at_level(OpaqueKey::DeltaRule, level);
-    for op_idx in ops {
-        let norm = tape.opaque_output_grad_norm(op_idx);
-        println!("Level {level} output grad norm: {norm:?}");
-    }
-}
-```
-
-### 5.2 DGD self-modification delta
-
-```rust
-// After tape.backward(loss_id):
-let dgd_ops = tape.find_opaque_ops(OpaqueKey::DGD);
-for op_idx in dgd_ops {
-    if let Some(delta) = tape.get_saved_by_role(op_idx, obs::DGD_DELTA) {
-        let norm: f32 = delta.iter().map(|x| x * x).sum::<f32>().sqrt();
-        println!("DGD delta norm (HOPE Eq. 88): {norm:.6}");
-    }
-}
-```
-
-### 5.3 M state readout at any level
-
-```rust
-// Forward value of M for level l, after tape.backward():
-let ops = tape.find_opaque_at_level(OpaqueKey::DeltaRule, 2);
-if let Some(op_idx) = ops.first() {
-    if let Some(m) = tape.get_saved_by_role(*op_idx, obs::M_STATES) {
-        // m is flat [d*d] — reshape as needed
-        println!("Level 2 M state has {} elements", m.len());
-    }
-}
-```
-
-### 5.4 Per-level error buffer (frozen levels)
-
-Frozen-level ops use `OpaqueKey::FrozenDeltaRule` (or equivalent frozen variant).
-Their `saved` array records `M_FROZEN` and `Q_T`, which flow into ErrorBuffer
-accumulation. Per-level keys make it possible to distinguish Level 1 frozen
-accumulation from Level 3.
-
----
-
-## 6. What This Does NOT Change
+These components are complete and require no modification:
 
 | Component | Status |
 |---|---|
-| Backward VJP rules | Unchanged — metadata is read-only |
+| `TapeBuf.role`, `TapeBuf.level` fields | Shipped |
+| `alloc_named()` method | Shipped |
+| `obs::*` constants (M_STATES, ERROR, DGD_DELTA, K_MEM, V_MEM, ALPHA, THETA, EMBEDDED, LEVEL_PARAMS) | Shipped |
+| `TapeOp::Opaque { level, block_index }` | Shipped |
+| `record_opaque()` with level parameter | Shipped |
+| `OpaqueVjp::record_on_tape()` with level parameter | Shipped |
+| Query API (5 methods) | Shipped |
+| DeltaRule `alloc_named` for DGD_DELTA | Shipped |
+| Backward VJP rules | Unchanged |
 | `with_tape()` entry point | Unchanged |
-| `OpaqueBackwardFn` signature | Unchanged — adapters use positional saved[] as before |
-| All existing test classes (1-3) | Unchanged — no behavioral difference |
 | GPU path (`gpu_cms_backward`) | Unaffected — tape is CPU/Rust-path only |
-| `MemoryRule` trait | Unchanged |
-| `OpaqueVjp::record_on_tape` callers | `level` parameter added with `None` default — backward compatible |
 
 ---
 
-## 7. Files to Create/Modify
+## 4. Implementation Phases
 
-| File | Change |
-|---|---|
-| `core/src/tape.rs` | Add `role`/`level` to `TapeBuf`; `alloc_named()`; `level` on `TapeOp::Opaque`; `record_opaque()` level param; `obs::*` constants; query API methods |
-| `core/src/opaque_adapters.rs` | DGD adapter: save `error` via `alloc_named(..., obs::DGD_DELTA, level)`; other adapters: rename key saved buffers to `alloc_named` |
-| `core/src/traced_forward.rs` | Pass `Some(level_idx)` to `record_on_tape()` at each CMS level call site |
-| `core/src/tape.rs` (OpaqueVjp trait) | Add `level: Option<usize>` to `record_on_tape()` signature |
+### Phase 2: Adapter `alloc_named` Migration (~2 hours)
 
-No new files required. All changes are additive to existing files.
+**File:** `core/src/opaque_adapters.rs`
+
+Mechanical conversion: 8 adapters × ~3-10 key buffers each. Add `obs::S_STATES`,
+`obs::W1_STATES`, `obs::W2_STATES` constants to `tape.rs`.
+
+**Tests:** 8 new tests — one per adapter verifying `get_saved_by_role(op_idx, obs::M_STATES)`
+(or equivalent primary buffer) returns data after traced forward+backward.
+
+**Risk:** Zero — metadata-only, backward adapters read by position.
+
+### Phase 3: Unified Extract + LevelSummary Extensions (~2 hours)
+
+**File:** `core/src/tape_summary.rs`
+
+a. Extract shared logic into `extract_tape_summary_impl`
+b. Add `m_norm`, `freq_gate_value`, `is_frozen` to `LevelSummary`
+c. Populate new fields in the unified extract
+
+**Tests:** 3 new — `test_m_norm_from_named_buffer`, `test_frozen_level_flag`,
+`test_unified_matches_stacked`.
+
+### Phase 4: PyO3 Surface (~1.5 hours)
+
+**Files:** `python/src/lib.rs`, `python/engine/evaluation.py`
+
+Surface new `LevelSummary` fields in all tape summary PyO3 methods. Update
+`print_tape_summary` display. Additive only — no API breakage.
+
+**Deferred to Spec 49:** PyO3 method consolidation (4 → 1) and unified live GPU
+observation API (7 scattered methods → 1).
 
 ---
 
-## 8. Testing
+## 5. Files to Modify
 
-### Test Class 4: Observation Correctness
+| File | Phase | Change |
+|------|-------|--------|
+| `core/src/tape.rs` | 2 | Add `obs::S_STATES`, `obs::W1_STATES`, `obs::W2_STATES` constants |
+| `core/src/opaque_adapters.rs` | 2 | 8 adapters: `alloc` → `alloc_named` for key saved buffers |
+| `core/src/tape_summary.rs` | 3 | Unified extract + LevelSummary fields |
+| `python/src/lib.rs` | 4 | Surface new fields in PyO3 dicts |
+| `python/engine/evaluation.py` | 4 | Display new fields |
+
+No new files required.
+
+---
+
+## 6. Testing
+
+### Phase 2 Tests: Named Buffer Queries (8 tests)
+
+One test per adapter verifying that after a traced forward+backward pass,
+`get_saved_by_role()` returns non-empty data for the adapter's primary saved buffer.
 
 ```rust
-// Verify that named saved buffers contain the correct values.
-
 #[test]
-fn test_dgd_delta_is_l2_error() {
-    // Run DGD forward with tape.
-    // After backward, get_saved_by_role(op_idx, DGD_DELTA) must equal M@k - v.
-    let (m_prev, k_vec, v_vec) = random_dgd_inputs(d=16);
-    let expected_delta: Vec<f32> = matmul_ref(&m_prev, &k_vec)
-        .iter().zip(&v_vec).map(|(a, b)| a - b).collect();
-
-    let tape_delta = /* ... run DGD through tape, read role ... */;
-    assert_allclose!(tape_delta, expected_delta, atol=1e-6,
-        "DGD delta in tape != M@k - v (HOPE Eq. 88)");
-}
-
-#[test]
-fn test_per_level_keys_distinct() {
-    // k=4, all levels active. After forward, enumerate_opaque_blocks()
-    // must return 4 entries with level = Some(0), Some(1), Some(2), Some(3).
-    let blocks = tape.enumerate_opaque_blocks();
-    let memory_blocks: Vec<_> = blocks.iter()
-        .filter(|(_, key, _)| *key == OpaqueKey::DeltaRule)
-        .collect();
-    assert_eq!(memory_blocks.len(), 4);
-    for (expected_level, (_, _, level)) in memory_blocks.iter().enumerate() {
-        assert_eq!(*level, Some(expected_level));
-    }
-}
-
-#[test]
-fn test_grad_norm_query_post_backward() {
-    // After backward, opaque_output_grad_norm() must return a finite positive value
-    // for active levels and near-zero for frozen levels (no update gradient).
-    // Verifies that gradient flow is observable at level boundaries.
+fn test_titans_lmm_named_buffers() {
+    // Run TitansLMM through tape with alloc_named
+    // Verify: get_saved_by_role(op_idx, obs::M_STATES) is Some
+    // Verify: get_saved_by_role(op_idx, obs::ALPHA) is Some
+    // Verify: get_saved_by_role(op_idx, obs::THETA) is Some
 }
 ```
+
+### Phase 3 Tests: LevelSummary Extensions (3 tests)
+
+```rust
+#[test]
+fn test_m_norm_from_named_buffer() {
+    // After extract, LevelSummary.m_norm > 0.0 for active levels
+    // (requires Phase 2 migration to have landed)
+}
+
+#[test]
+fn test_frozen_level_flag() {
+    // Configure one frozen level, extract summary
+    // Verify: is_frozen == true for frozen level, false for active levels
+}
+
+#[test]
+fn test_unified_matches_stacked() {
+    // Single-block stacked model must produce identical LevelSummary
+    // as non-stacked extract on same inputs
+}
+```
+
+---
+
+## 7. Dependency Graph
+
+```text
+Phase 2 (alloc_named) → Phase 3 (unified extract + LevelSummary) → Phase 4 (PyO3)
+```
+
+Phase 2 must land before Phase 3 because `m_norm` depends on named M_STATES buffers.
+Phase 3 must land before Phase 4 because PyO3 exposes the extended LevelSummary.
+
+---
+
+## 8. Risk to Running Experiments
+
+**Zero.** All changes affect the tape observation path, which is activated only during
+eval via `tape_forward_summary` calls. The hot training loop (`forward` + `step_adamw`)
+is completely untouched. GPU0 and GPU1 jobs continue undisturbed.
 
 ---
 
@@ -429,17 +369,18 @@ fn test_grad_norm_query_post_backward() {
 ```json
 {
   "_key": "tape-observation",
-  "title": "Tape Observation Infrastructure — Native Interpretability Layer",
+  "title": "Tape Observation Infrastructure — Native Interpretability Layer (v2)",
   "category": "infrastructure",
-  "version": "0.4.0",
+  "version": "0.4.0-v2",
   "path": "specs/infrastructure/differentiation/02_tape_observation.md",
-  "purpose": "Named observation slots on the Wengert tape: per-level VJP keys, SavedBufferMetadata, DGD delta exposure, and post-backward query API",
-  "paper_source": ["2512.24695"],
+  "purpose": "Close 4 remaining observation gaps: adapter alloc_named migration (8 rules), unified extract, freq_gate_value + is_frozen + m_norm in LevelSummary",
+  "paper_source": ["2512.24695", "2501.00663"],
   "traced_to_equations": [
     "hope_equations/eq-088-practical-dgd-update",
-    "hope_equations/eq-097-hope-cms-chain"
+    "hope_equations/eq-097-hope-cms-chain",
+    "titans_equations/eq-013-forgetting-gate"
   ],
   "traced_to_axioms": [],
-  "status": "v0.4.0"
+  "status": "v0.4.0-v2"
 }
 ```

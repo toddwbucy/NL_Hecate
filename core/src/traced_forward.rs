@@ -695,17 +695,18 @@ fn traced_active_level(
             let extra_meta = [crate::moneta::bias_to_f32(rule.bias), rule.sign_sharpness, rule.theta_floor, rule.theta_ceil, fm_kind_f32, fm_sigma];
             let (meta_id, lp_saved, emb_saved) =
                 alloc_common_saved(tape, level_params, embedded, s, d, &extra_meta);
+            let lev = Some(level);
             let cache_ids = vec![
-                tape.alloc(cache.m_states.clone(), vec![]),
-                tape.alloc(cache.k_mem.clone(), vec![]),
-                tape.alloc(cache.v_mem.clone(), vec![]),
+                tape.alloc_named(cache.m_states.clone(), vec![], crate::tape::obs::M_STATES, lev),
+                tape.alloc_named(cache.k_mem.clone(), vec![], crate::tape::obs::K_MEM, lev),
+                tape.alloc_named(cache.v_mem.clone(), vec![], crate::tape::obs::V_MEM, lev),
                 tape.alloc(cache.q_mem.clone(), vec![]),
                 tape.alloc(cache.concat_kv.clone(), vec![]),
                 tape.alloc(cache.alpha_pre.clone(), vec![]),
-                tape.alloc(cache.alpha.clone(), vec![]),
+                tape.alloc_named(cache.alpha.clone(), vec![], crate::tape::obs::ALPHA, lev),
                 tape.alloc(cache.theta_pre.clone(), vec![]),
-                tape.alloc(cache.theta.clone(), vec![]),
-                tape.alloc(cache.error.clone(), vec![]),
+                tape.alloc_named(cache.theta.clone(), vec![], crate::tape::obs::THETA, lev),
+                tape.alloc_named(cache.error.clone(), vec![], crate::tape::obs::DGD_DELTA, lev),
                 tape.alloc(cache.grad_outer.clone(), vec![]),
                 tape.alloc(cache.y.clone(), vec![]),
             ];
@@ -759,20 +760,21 @@ fn traced_active_level(
             let extra_meta = [crate::moneta::bias_to_f32(rule.bias), rule.sign_sharpness, mk_f32, rule.theta_floor, rule.theta_ceil, fm_kind_f32, fm_sigma];
             let (meta_id, lp_saved, emb_saved) =
                 alloc_common_saved(tape, level_params, embedded, s, d, &extra_meta);
+            let lev = Some(level);
             let mut cache_ids = vec![
-                tape.alloc(cache.m_states.clone(), vec![]),
-                tape.alloc(cache.s_states.clone(), vec![]),
-                tape.alloc(cache.k_mem.clone(), vec![]),
-                tape.alloc(cache.v_mem.clone(), vec![]),
+                tape.alloc_named(cache.m_states.clone(), vec![], crate::tape::obs::M_STATES, lev),
+                tape.alloc_named(cache.s_states.clone(), vec![], crate::tape::obs::S_STATES, lev),
+                tape.alloc_named(cache.k_mem.clone(), vec![], crate::tape::obs::K_MEM, lev),
+                tape.alloc_named(cache.v_mem.clone(), vec![], crate::tape::obs::V_MEM, lev),
                 tape.alloc(cache.q_mem.clone(), vec![]),
                 tape.alloc(cache.concat_kv.clone(), vec![]),
                 tape.alloc(cache.alpha_pre.clone(), vec![]),
-                tape.alloc(cache.alpha.clone(), vec![]),
+                tape.alloc_named(cache.alpha.clone(), vec![], crate::tape::obs::ALPHA, lev),
                 tape.alloc(cache.theta_pre.clone(), vec![]),
-                tape.alloc(cache.theta.clone(), vec![]),
+                tape.alloc_named(cache.theta.clone(), vec![], crate::tape::obs::THETA, lev),
                 tape.alloc(cache.eta_pre.clone(), vec![]),
                 tape.alloc(cache.eta.clone(), vec![]),
-                tape.alloc(cache.error.clone(), vec![]),
+                tape.alloc_named(cache.error.clone(), vec![], crate::tape::obs::ERROR, lev),
                 tape.alloc(cache.grad_outer.clone(), vec![]),
                 tape.alloc(cache.y.clone(), vec![]),
             ];
@@ -815,14 +817,15 @@ fn traced_active_level(
 
             let (meta_id, lp_saved, emb_saved) =
                 alloc_common_saved(tape, level_params, embedded, s, d, &[]);
+            let lev = Some(level);
             let cache_ids = vec![
-                tape.alloc(cache.m_states.clone(), vec![]),
-                tape.alloc(cache.k_mem.clone(), vec![]),
-                tape.alloc(cache.v_mem.clone(), vec![]),
+                tape.alloc_named(cache.m_states.clone(), vec![], crate::tape::obs::M_STATES, lev),
+                tape.alloc_named(cache.k_mem.clone(), vec![], crate::tape::obs::K_MEM, lev),
+                tape.alloc_named(cache.v_mem.clone(), vec![], crate::tape::obs::V_MEM, lev),
                 tape.alloc(cache.q_mem.clone(), vec![]),
                 tape.alloc(cache.concat_kv.clone(), vec![]),
                 tape.alloc(cache.alpha_pre.clone(), vec![]),
-                tape.alloc(cache.alpha.clone(), vec![]),
+                tape.alloc_named(cache.alpha.clone(), vec![], crate::tape::obs::ALPHA, lev),
                 tape.alloc(cache.y.clone(), vec![]),
             ];
             let y_id = tape.alloc(y.clone(), vec![s, d]);
@@ -857,21 +860,22 @@ fn traced_active_level(
             let extra_meta = [dh as f32, cfg.lp_p, cfg.lambda_2, cfg.sign_sharpness, cfg.lq_q, rule.theta_floor, rule.theta_ceil];
             let (meta_id, lp_saved, emb_saved) =
                 alloc_common_saved(tape, level_params, embedded, s, d, &extra_meta);
+            let lev = Some(level);
             let mut cache_ids = vec![
-                tape.alloc(cache.w1_states.clone(), vec![]),
-                tape.alloc(cache.w2_states.clone(), vec![]),
-                tape.alloc(cache.k_mem.clone(), vec![]),
-                tape.alloc(cache.v_mem.clone(), vec![]),
+                tape.alloc_named(cache.w1_states.clone(), vec![], crate::tape::obs::W1_STATES, lev),
+                tape.alloc_named(cache.w2_states.clone(), vec![], crate::tape::obs::W2_STATES, lev),
+                tape.alloc_named(cache.k_mem.clone(), vec![], crate::tape::obs::K_MEM, lev),
+                tape.alloc_named(cache.v_mem.clone(), vec![], crate::tape::obs::V_MEM, lev),
                 tape.alloc(cache.q_mem.clone(), vec![]),
                 tape.alloc(cache.concat_kv.clone(), vec![]),
                 tape.alloc(cache.alpha_pre.clone(), vec![]),
-                tape.alloc(cache.alpha.clone(), vec![]),
+                tape.alloc_named(cache.alpha.clone(), vec![], crate::tape::obs::ALPHA, lev),
                 tape.alloc(cache.theta_pre.clone(), vec![]),
-                tape.alloc(cache.theta.clone(), vec![]),
+                tape.alloc_named(cache.theta.clone(), vec![], crate::tape::obs::THETA, lev),
                 tape.alloc(cache.pre_act.clone(), vec![]),
                 tape.alloc(cache.hidden.clone(), vec![]),
                 tape.alloc(cache.prediction.clone(), vec![]),
-                tape.alloc(cache.error.clone(), vec![]),
+                tape.alloc_named(cache.error.clone(), vec![], crate::tape::obs::ERROR, lev),
                 tape.alloc(cache.y.clone(), vec![]),
             ];
             // Save a1/a2 accumulator states when L_q > 2 (needed for backward)
@@ -911,23 +915,24 @@ fn traced_active_level(
             let extra_meta = [dh as f32, cfg.delta, cfg.lambda_local, cfg.lambda_2];
             let (meta_id, lp_saved, emb_saved) =
                 alloc_common_saved(tape, level_params, embedded, s, d, &extra_meta);
+            let lev = Some(level);
             let cache_ids = vec![
-                tape.alloc(cache.w1_states.clone(), vec![]),
-                tape.alloc(cache.w2_states.clone(), vec![]),
+                tape.alloc_named(cache.w1_states.clone(), vec![], crate::tape::obs::W1_STATES, lev),
+                tape.alloc_named(cache.w2_states.clone(), vec![], crate::tape::obs::W2_STATES, lev),
                 tape.alloc(cache.w1_boundary.clone(), vec![]),
                 tape.alloc(cache.w2_boundary.clone(), vec![]),
-                tape.alloc(cache.k_mem.clone(), vec![]),
-                tape.alloc(cache.v_mem.clone(), vec![]),
+                tape.alloc_named(cache.k_mem.clone(), vec![], crate::tape::obs::K_MEM, lev),
+                tape.alloc_named(cache.v_mem.clone(), vec![], crate::tape::obs::V_MEM, lev),
                 tape.alloc(cache.q_mem.clone(), vec![]),
                 tape.alloc(cache.concat_kv.clone(), vec![]),
                 tape.alloc(cache.alpha_pre.clone(), vec![]),
-                tape.alloc(cache.alpha.clone(), vec![]),
+                tape.alloc_named(cache.alpha.clone(), vec![], crate::tape::obs::ALPHA, lev),
                 tape.alloc(cache.theta_pre.clone(), vec![]),
-                tape.alloc(cache.theta.clone(), vec![]),
+                tape.alloc_named(cache.theta.clone(), vec![], crate::tape::obs::THETA, lev),
                 tape.alloc(cache.pre_act.clone(), vec![]),
                 tape.alloc(cache.hidden.clone(), vec![]),
                 tape.alloc(cache.prediction.clone(), vec![]),
-                tape.alloc(cache.error.clone(), vec![]),
+                tape.alloc_named(cache.error.clone(), vec![], crate::tape::obs::ERROR, lev),
                 tape.alloc(cache.y.clone(), vec![]),
             ];
             let y_id = tape.alloc(y.clone(), vec![s, d]);
@@ -962,21 +967,22 @@ fn traced_active_level(
             let extra_meta = [dh as f32];
             let (meta_id, lp_saved, emb_saved) =
                 alloc_common_saved(tape, level_params, embedded, s, d, &extra_meta);
+            let lev = Some(level);
             let cache_ids = vec![
-                tape.alloc(cache.w1_states.clone(), vec![]),
-                tape.alloc(cache.w2_states.clone(), vec![]),
-                tape.alloc(cache.k_mem.clone(), vec![]),
-                tape.alloc(cache.v_mem.clone(), vec![]),
+                tape.alloc_named(cache.w1_states.clone(), vec![], crate::tape::obs::W1_STATES, lev),
+                tape.alloc_named(cache.w2_states.clone(), vec![], crate::tape::obs::W2_STATES, lev),
+                tape.alloc_named(cache.k_mem.clone(), vec![], crate::tape::obs::K_MEM, lev),
+                tape.alloc_named(cache.v_mem.clone(), vec![], crate::tape::obs::V_MEM, lev),
                 tape.alloc(cache.q_mem.clone(), vec![]),
                 tape.alloc(cache.concat_kv.clone(), vec![]),
                 tape.alloc(cache.alpha_pre.clone(), vec![]),
-                tape.alloc(cache.alpha.clone(), vec![]),
+                tape.alloc_named(cache.alpha.clone(), vec![], crate::tape::obs::ALPHA, lev),
                 tape.alloc(cache.theta_pre.clone(), vec![]),
-                tape.alloc(cache.theta.clone(), vec![]),
+                tape.alloc_named(cache.theta.clone(), vec![], crate::tape::obs::THETA, lev),
                 tape.alloc(cache.pre_act.clone(), vec![]),
                 tape.alloc(cache.hidden.clone(), vec![]),
                 tape.alloc(cache.prediction.clone(), vec![]),
-                tape.alloc(cache.error.clone(), vec![]),
+                tape.alloc_named(cache.error.clone(), vec![], crate::tape::obs::ERROR, lev),
                 tape.alloc(cache.y.clone(), vec![]),
                 tape.alloc(cache.log_w1_prev.clone(), vec![]),
                 tape.alloc(cache.log_w2_prev.clone(), vec![]),
@@ -1008,14 +1014,15 @@ fn traced_active_level(
             let extra_meta = [m as f32];
             let (meta_id, lp_saved, emb_saved) =
                 alloc_common_saved(tape, level_params, embedded, s, d, &extra_meta);
+            let lev = Some(level);
             let cache_ids = vec![
-                tape.alloc(cache.s_states.clone(), vec![]),
-                tape.alloc(cache.k_mem.clone(), vec![]),
-                tape.alloc(cache.v_mem.clone(), vec![]),
+                tape.alloc_named(cache.s_states.clone(), vec![], crate::tape::obs::S_STATES, lev),
+                tape.alloc_named(cache.k_mem.clone(), vec![], crate::tape::obs::K_MEM, lev),
+                tape.alloc_named(cache.v_mem.clone(), vec![], crate::tape::obs::V_MEM, lev),
                 tape.alloc(cache.q_mem.clone(), vec![]),
                 tape.alloc(cache.concat_kv.clone(), vec![]),
                 tape.alloc(cache.alpha_pre.clone(), vec![]),
-                tape.alloc(cache.alpha.clone(), vec![]),
+                tape.alloc_named(cache.alpha.clone(), vec![], crate::tape::obs::ALPHA, lev),
                 tape.alloc(cache.scores.clone(), vec![]),
                 tape.alloc(cache.slot_gates.clone(), vec![]),
                 tape.alloc(cache.read_weights.clone(), vec![]),
@@ -1053,19 +1060,20 @@ fn traced_active_level(
             let extra_meta = [d_k as f32, cfg.lambda_k, cfg.lambda_v, rule.theta_floor, rule.theta_ceil];
             let (meta_id, lp_saved, emb_saved) =
                 alloc_common_saved(tape, level_params, embedded, s, d, &extra_meta);
+            let lev = Some(level);
             let cache_ids = vec![
-                tape.alloc(cache.sk_states.clone(), vec![]),
-                tape.alloc(cache.sv_states.clone(), vec![]),
-                tape.alloc(cache.k_mem.clone(), vec![]),
-                tape.alloc(cache.v_mem.clone(), vec![]),
+                tape.alloc_named(cache.sk_states.clone(), vec![], crate::tape::obs::SK_STATES, lev),
+                tape.alloc_named(cache.sv_states.clone(), vec![], crate::tape::obs::SV_STATES, lev),
+                tape.alloc_named(cache.k_mem.clone(), vec![], crate::tape::obs::K_MEM, lev),
+                tape.alloc_named(cache.v_mem.clone(), vec![], crate::tape::obs::V_MEM, lev),
                 tape.alloc(cache.q_mem.clone(), vec![]),
                 tape.alloc(cache.concat_kv.clone(), vec![]),
                 tape.alloc(cache.alpha_pre.clone(), vec![]),
-                tape.alloc(cache.alpha.clone(), vec![]),
+                tape.alloc_named(cache.alpha.clone(), vec![], crate::tape::obs::ALPHA, lev),
                 tape.alloc(cache.theta_pre.clone(), vec![]),
-                tape.alloc(cache.theta.clone(), vec![]),
+                tape.alloc_named(cache.theta.clone(), vec![], crate::tape::obs::THETA, lev),
                 tape.alloc(cache.pred_k.clone(), vec![]),
-                tape.alloc(cache.error_k.clone(), vec![]),
+                tape.alloc_named(cache.error_k.clone(), vec![], crate::tape::obs::ERROR_K, lev),
                 tape.alloc(cache.compressed_k_pre.clone(), vec![]),
                 tape.alloc(cache.compressed_k.clone(), vec![]),
                 tape.alloc(cache.compressed_k_silu.clone(), vec![]),
@@ -1075,7 +1083,7 @@ fn traced_active_level(
                 tape.alloc(cache.read_compressed_q_silu.clone(), vec![]),
                 tape.alloc(cache.read_compressed_q_silu_norm.clone(), vec![]),
                 tape.alloc(cache.pred_v.clone(), vec![]),
-                tape.alloc(cache.error_v.clone(), vec![]),
+                tape.alloc_named(cache.error_v.clone(), vec![], crate::tape::obs::ERROR_V, lev),
             ];
             let y_id = tape.alloc(y.clone(), vec![s, d]);
             let mut saved = vec![meta_id, lp_saved, emb_saved];
@@ -1101,17 +1109,18 @@ fn traced_active_level(
 
             let (meta_id, lp_saved, emb_saved) =
                 alloc_common_saved(tape, level_params, embedded, s, d, &[]);
+            let lev = Some(level);
             let cache_ids = vec![
-                tape.alloc(cache.m_states.clone(), vec![]),
-                tape.alloc(cache.s_states.clone(), vec![]),
-                tape.alloc(cache.k_mem.clone(), vec![]),
-                tape.alloc(cache.v_mem.clone(), vec![]),
+                tape.alloc_named(cache.m_states.clone(), vec![], crate::tape::obs::M_STATES, lev),
+                tape.alloc_named(cache.s_states.clone(), vec![], crate::tape::obs::S_STATES, lev),
+                tape.alloc_named(cache.k_mem.clone(), vec![], crate::tape::obs::K_MEM, lev),
+                tape.alloc_named(cache.v_mem.clone(), vec![], crate::tape::obs::V_MEM, lev),
                 tape.alloc(cache.q_mem.clone(), vec![]),
                 tape.alloc(cache.concat_kv.clone(), vec![]),
                 tape.alloc(cache.alpha_pre.clone(), vec![]),
-                tape.alloc(cache.alpha.clone(), vec![]),
+                tape.alloc_named(cache.alpha.clone(), vec![], crate::tape::obs::ALPHA, lev),
                 tape.alloc(cache.theta_pre.clone(), vec![]),
-                tape.alloc(cache.theta.clone(), vec![]),
+                tape.alloc_named(cache.theta.clone(), vec![], crate::tape::obs::THETA, lev),
                 tape.alloc(cache.eta_pre.clone(), vec![]),
                 tape.alloc(cache.eta.clone(), vec![]),
                 tape.alloc(cache.silu_kv.clone(), vec![]),

@@ -12,7 +12,7 @@ use crate::model::{MAGConfig, MAGParams};
 use crate::conductor::{Pulse, ContextState};
 #[allow(unused_imports)]
 use crate::tape::OpaqueKey;
-use crate::tape::{with_tape, obs};
+use crate::tape::{Tape, with_tape, obs};
 use crate::traced_forward::traced_cms_forward;
 use crate::opaque_adapters::register_opaque_vjps;
 
@@ -34,6 +34,15 @@ pub struct LevelSummary {
     /// L2 norm of the `DGD_DELTA` saved buffer for the last opaque block at
     /// this level. 0.0 if no DGD_DELTA role is present (non-DGD rules).
     pub dgd_delta_norm: f32,
+    /// Frobenius norm of M (or equivalent state) from the named `M_STATES`/
+    /// `W1_STATES`/`S_STATES`/`SK_STATES` buffer. NaN if no named state buffer
+    /// was found (pre-Phase 2 adapters).
+    pub m_norm: f32,
+    /// Sigmoid output of the learned frequency gate for this level.
+    /// NaN if the schedule is Fixed (no learned gate).
+    pub freq_gate_value: f32,
+    /// True if this level used a Frozen* OpaqueKey variant (read-only M path).
+    pub is_frozen: bool,
 }
 
 /// Lightweight diagnostic extracted from one traced forward+backward pass.
@@ -45,6 +54,71 @@ pub struct TapeSummary {
     pub total_blocks: usize,
     /// Per-level breakdown, length == cfg.k.
     pub levels: Vec<LevelSummary>,
+}
+
+/// Extract a single `LevelSummary` from the tape for level `lev`.
+///
+/// `final_memory`: the carried memory state from `context.memory[lev]` (or
+/// `context[block][lev]` for stacked models) AFTER `traced_*_forward()` returns.
+/// Used for `m_norm`. Pass `None` if unavailable → `m_norm = NaN`.
+///
+/// `gate_values`: per-level sigmoid outputs from learned frequency gate.
+/// Pass `None` for Fixed schedule → `freq_gate_value = NaN`.
+fn extract_level(
+    tape: &Tape,
+    all_blocks: &[(usize, OpaqueKey, Option<usize>, Option<usize>)],
+    lev: usize,
+    block_filter: Option<usize>,
+    final_memory: Option<&[f32]>,
+    gate_values: Option<&[f32]>,
+) -> LevelSummary {
+    let level_blocks: Vec<(usize, String)> = all_blocks.iter()
+        .filter_map(|&(idx, key, lvl, blk)| {
+            let level_match = lvl == Some(lev);
+            let block_match = block_filter.map_or(true, |b| blk == Some(b));
+            if level_match && block_match {
+                Some((idx, format!("{:?}", key)))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let block_count = level_blocks.len();
+
+    let (opaque_key_str, output_grad_norm, dgd_delta_norm, is_frozen) =
+        if let Some((last_idx, last_key)) = level_blocks.last() {
+            let gnorm = tape.opaque_output_grad_norm(*last_idx).unwrap_or(0.0);
+            let dgd_norm = tape
+                .get_saved_by_role(*last_idx, obs::DGD_DELTA)
+                .map(|buf| buf.iter().map(|x| x * x).sum::<f32>().sqrt())
+                .unwrap_or(0.0);
+            let frozen = last_key.starts_with("Frozen");
+            (last_key.clone(), gnorm, dgd_norm, frozen)
+        } else {
+            (String::from("None"), 0.0, 0.0, false)
+        };
+
+    // m_norm: Frobenius norm of the final carried memory (from context, not
+    // the full per-timestep trace stored on the tape).
+    let m_norm = final_memory
+        .map(|mem| mem.iter().map(|x| x * x).sum::<f32>().sqrt())
+        .unwrap_or(f32::NAN);
+
+    let freq_gate_value = gate_values
+        .and_then(|gv| gv.get(lev).copied())
+        .unwrap_or(f32::NAN);
+
+    LevelSummary {
+        level: lev,
+        opaque_key: opaque_key_str,
+        block_count,
+        output_grad_norm,
+        dgd_delta_norm,
+        m_norm,
+        freq_gate_value,
+        is_frozen,
+    }
 }
 
 /// Run one traced forward+backward on `params`/`context` and return a
@@ -63,52 +137,20 @@ pub fn extract_tape_summary(
     let registry = register_opaque_vjps();
 
     with_tape(registry, |tape| {
-        // ── Forward: record every operation on the tape ───────────────────
-        let (loss, _cache, loss_id, _param_ids) =
+        let (loss, cache, loss_id, _param_ids) =
             traced_cms_forward(tape, params, cfg, input_ids, target_ids, pulse, context);
-
-        // ── Backward: seed loss gradient = 1.0, replay in reverse ─────────
         tape.backward(loss_id);
 
-        // ── Extract per-level data ────────────────────────────────────────
         let all_blocks = tape.enumerate_opaque_blocks();
         let total_blocks = all_blocks.len();
+        let gate_values = cache.freq_cache.as_ref().map(|fc| fc.gate_values.as_slice());
 
-        let mut levels: Vec<LevelSummary> = Vec::with_capacity(cfg.k);
-        for lev in 0..cfg.k {
-            // Collect all blocks at this level in forward order.
-            let level_blocks: Vec<(usize, String)> = all_blocks.iter()
-                .filter_map(|&(idx, key, lvl, _block_idx)| {
-                    if lvl == Some(lev) {
-                        Some((idx, format!("{:?}", key)))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            let block_count = level_blocks.len();
-
-            let (opaque_key_str, output_grad_norm, dgd_delta_norm) =
-                if let Some((last_idx, last_key)) = level_blocks.last() {
-                    let gnorm = tape.opaque_output_grad_norm(*last_idx).unwrap_or(0.0);
-                    let dgd_norm = tape
-                        .get_saved_by_role(*last_idx, obs::DGD_DELTA)
-                        .map(|buf| buf.iter().map(|x| x * x).sum::<f32>().sqrt())
-                        .unwrap_or(0.0);
-                    (last_key.clone(), gnorm, dgd_norm)
-                } else {
-                    (String::from("None"), 0.0, 0.0)
-                };
-
-            levels.push(LevelSummary {
-                level: lev,
-                opaque_key: opaque_key_str,
-                block_count,
-                output_grad_norm,
-                dgd_delta_norm,
-            });
-        }
+        let levels: Vec<LevelSummary> = (0..cfg.k)
+            .map(|lev| {
+                let final_mem = context.memory.get(lev).map(|v| v.as_slice());
+                extract_level(tape, &all_blocks, lev, None, final_mem, gate_values)
+            })
+            .collect();
 
         TapeSummary { loss, total_blocks, levels }
     })
@@ -128,6 +170,9 @@ pub struct BlockLevelSummary {
     pub block_count: usize,
     pub output_grad_norm: f32,
     pub dgd_delta_norm: f32,
+    pub m_norm: f32,
+    pub freq_gate_value: f32,
+    pub is_frozen: bool,
 }
 
 /// Per-block summary aggregated across levels.
@@ -164,48 +209,31 @@ pub fn extract_stacked_tape_summary(
     with_tape(registry, |tape| {
         let (loss, loss_id, _param_ids) =
             traced_stacked_forward(tape, params, cfg, input_ids, target_ids, pulse, context);
-
         tape.backward(loss_id);
 
         let all_ops = tape.enumerate_opaque_blocks();
         let total_blocks = all_ops.len();
 
+        // Stacked models don't use learned frequency gates — always NaN.
         let mut blocks = Vec::with_capacity(n_blocks);
         for b in 0..n_blocks {
-            let mut levels = Vec::with_capacity(cfg.k);
-            for lev in 0..cfg.k {
-                let level_blocks: Vec<(usize, String)> = all_ops.iter()
-                    .filter_map(|&(idx, key, lvl, blk)| {
-                        if lvl == Some(lev) && blk == Some(b) {
-                            Some((idx, format!("{:?}", key)))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-
-                let block_count = level_blocks.len();
-                let (opaque_key_str, output_grad_norm, dgd_delta_norm) =
-                    if let Some((last_idx, last_key)) = level_blocks.last() {
-                        let gnorm = tape.opaque_output_grad_norm(*last_idx).unwrap_or(0.0);
-                        let dgd_norm = tape
-                            .get_saved_by_role(*last_idx, obs::DGD_DELTA)
-                            .map(|buf| buf.iter().map(|x| x * x).sum::<f32>().sqrt())
-                            .unwrap_or(0.0);
-                        (last_key.clone(), gnorm, dgd_norm)
-                    } else {
-                        (String::from("None"), 0.0, 0.0)
-                    };
-
-                levels.push(BlockLevelSummary {
+            let levels: Vec<BlockLevelSummary> = (0..cfg.k).map(|lev| {
+                let final_mem = context.get(b)
+                    .and_then(|block_ctx| block_ctx.get(lev))
+                    .map(|v| v.as_slice());
+                let ls = extract_level(tape, &all_ops, lev, Some(b), final_mem, None);
+                BlockLevelSummary {
                     block: b,
-                    level: lev,
-                    opaque_key: opaque_key_str,
-                    block_count,
-                    output_grad_norm,
-                    dgd_delta_norm,
-                });
-            }
+                    level: ls.level,
+                    opaque_key: ls.opaque_key,
+                    block_count: ls.block_count,
+                    output_grad_norm: ls.output_grad_norm,
+                    dgd_delta_norm: ls.dgd_delta_norm,
+                    m_norm: ls.m_norm,
+                    freq_gate_value: ls.freq_gate_value,
+                    is_frozen: ls.is_frozen,
+                }
+            }).collect();
             blocks.push(BlockTapeSummary { block: b, levels });
         }
 
@@ -306,5 +334,211 @@ mod tests {
         );
         assert!(summary.loss.is_finite() && summary.loss > 0.0,
             "loss must be finite and positive (got {})", summary.loss);
+    }
+
+    // ── Phase 2: Named buffer observation tests ──────────────────────
+    //
+    // Each test verifies that after a traced forward+backward pass,
+    // get_saved_by_role() returns non-empty data for the adapter's key
+    // saved buffers (spec 48 Gap A closure).
+
+    use crate::model::MemoryRuleKind;
+    use crate::tape::obs;
+
+    /// Helper: create a MAGConfig with a specific memory rule for named buffer tests.
+    fn test_config_for_rule(rule: MemoryRuleKind) -> MAGConfig {
+        let mut cfg = MAGConfig::test_config();
+        cfg.memory_rule = rule;
+        cfg.retention = crate::retention::default_retention(rule);
+        // MLP rules need d_hidden > 0
+        match rule {
+            MemoryRuleKind::Moneta | MemoryRuleKind::YAAD | MemoryRuleKind::MEMORA => {
+                cfg.d_hidden = cfg.swa.d_model;
+            }
+            MemoryRuleKind::LatticeOSR => {
+                cfg.m_slots = 4;
+            }
+            MemoryRuleKind::Trellis => {
+                cfg.d_compress = cfg.swa.d_model;
+            }
+            _ => {}
+        }
+        cfg
+    }
+
+    /// Run a traced forward+backward for a given rule and verify named buffers.
+    fn assert_named_buffers(rule: MemoryRuleKind, expected_roles: &[&str]) {
+        let cfg = test_config_for_rule(rule);
+        let params = MAGParams::init(&cfg, 42);
+        let mut ctx = match rule {
+            MemoryRuleKind::Moneta | MemoryRuleKind::YAAD | MemoryRuleKind::MEMORA => {
+                let d = cfg.swa.d_model;
+                ContextState::new_with_memory_size(cfg.k, d, cfg.d_hidden * d + d * cfg.d_hidden)
+            }
+            MemoryRuleKind::LatticeOSR => {
+                ContextState::new_with_memory_size(cfg.k, cfg.swa.d_model, cfg.m_slots * cfg.swa.d_model)
+            }
+            MemoryRuleKind::Trellis => {
+                let d = cfg.swa.d_model;
+                ContextState::new_with_memory_size(cfg.k, d, 2 * cfg.d_compress * d)
+            }
+            _ => ContextState::new(cfg.k, cfg.swa.d_model),
+        };
+        let conductor = Conductor::new(cfg.k, cfg.chunk_sizes.clone());
+        let pulse = conductor.pulse();
+        let (input_ids, target_ids) = make_ids(cfg.swa.seq_len, cfg.swa.vocab_size);
+
+        let registry = register_opaque_vjps();
+        with_tape(registry, |tape| {
+            let (_, _cache, loss_id, _param_ids) =
+                traced_cms_forward(tape, &params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx);
+            tape.backward(loss_id);
+
+            // Find the memory rule opaque block(s) — exclude SWA
+            let all_blocks = tape.enumerate_opaque_blocks();
+            let rule_blocks: Vec<_> = all_blocks.iter()
+                .filter(|&&(_, key, _, _)| {
+                    !matches!(key, crate::tape::OpaqueKey::SWA | crate::tape::OpaqueKey::SwiGluMlp)
+                })
+                .collect();
+            assert!(!rule_blocks.is_empty(),
+                "{:?}: no memory rule opaque blocks found", rule);
+
+            let &(op_idx, _, _, _) = rule_blocks[0];
+            for &role in expected_roles {
+                let data = tape.get_saved_by_role(op_idx, role);
+                assert!(data.is_some(),
+                    "{:?}: get_saved_by_role({}, {:?}) returned None", rule, op_idx, role);
+                assert!(!data.unwrap().is_empty(),
+                    "{:?}: get_saved_by_role({}, {:?}) returned empty slice", rule, op_idx, role);
+            }
+        });
+    }
+
+    #[test]
+    fn test_named_buffers_delta_rule() {
+        assert_named_buffers(MemoryRuleKind::DeltaRule,
+            &[obs::M_STATES, obs::K_MEM, obs::V_MEM, obs::ALPHA, obs::THETA, obs::DGD_DELTA]);
+    }
+
+    #[test]
+    fn test_named_buffers_titans_lmm() {
+        assert_named_buffers(MemoryRuleKind::TitansLMM,
+            &[obs::M_STATES, obs::S_STATES, obs::K_MEM, obs::V_MEM, obs::ALPHA, obs::THETA, obs::ERROR]);
+    }
+
+    #[test]
+    fn test_named_buffers_hebbian() {
+        assert_named_buffers(MemoryRuleKind::HebbianRule,
+            &[obs::M_STATES, obs::K_MEM, obs::V_MEM, obs::ALPHA]);
+    }
+
+    #[test]
+    fn test_named_buffers_moneta() {
+        assert_named_buffers(MemoryRuleKind::Moneta,
+            &[obs::W1_STATES, obs::W2_STATES, obs::K_MEM, obs::V_MEM, obs::ALPHA, obs::THETA, obs::ERROR]);
+    }
+
+    #[test]
+    fn test_named_buffers_yaad() {
+        assert_named_buffers(MemoryRuleKind::YAAD,
+            &[obs::W1_STATES, obs::W2_STATES, obs::K_MEM, obs::V_MEM, obs::ALPHA, obs::THETA, obs::ERROR]);
+    }
+
+    #[test]
+    fn test_named_buffers_memora() {
+        assert_named_buffers(MemoryRuleKind::MEMORA,
+            &[obs::W1_STATES, obs::W2_STATES, obs::K_MEM, obs::V_MEM, obs::ALPHA, obs::THETA, obs::ERROR]);
+    }
+
+    #[test]
+    fn test_named_buffers_lattice_osr() {
+        assert_named_buffers(MemoryRuleKind::LatticeOSR,
+            &[obs::S_STATES, obs::K_MEM, obs::V_MEM, obs::ALPHA]);
+    }
+
+    #[test]
+    fn test_named_buffers_trellis() {
+        assert_named_buffers(MemoryRuleKind::Trellis,
+            &[obs::SK_STATES, obs::SV_STATES, obs::K_MEM, obs::V_MEM, obs::ALPHA, obs::THETA, obs::ERROR_K, obs::ERROR_V]);
+    }
+
+    #[test]
+    fn test_named_buffers_atlas_omega() {
+        assert_named_buffers(MemoryRuleKind::AtlasOmega,
+            &[obs::M_STATES, obs::S_STATES, obs::K_MEM, obs::V_MEM, obs::ALPHA, obs::THETA]);
+    }
+
+    // ── Phase 3 tests: new LevelSummary fields ──────────────────────
+
+    #[test]
+    fn test_m_norm_from_named_buffer() {
+        // DeltaRule saves M_STATES via alloc_named → m_norm should be finite and > 0
+        let cfg = MAGConfig::test_config(); // default = DeltaRule
+        let params = MAGParams::init(&cfg, 42);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let conductor = Conductor::new(cfg.k, cfg.chunk_sizes.clone());
+        let pulse = conductor.pulse();
+        let (input_ids, target_ids) = make_ids(cfg.swa.seq_len, cfg.swa.vocab_size);
+
+        let summary = extract_tape_summary(
+            &params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx,
+        );
+        // Level 0 always fires — should have a finite m_norm
+        let lev0 = &summary.levels[0];
+        assert!(lev0.m_norm.is_finite(), "m_norm should be finite, got {}", lev0.m_norm);
+        assert!(lev0.m_norm > 0.0, "m_norm should be > 0 after a forward pass, got {}", lev0.m_norm);
+    }
+
+    #[test]
+    fn test_frozen_level_flag() {
+        // k=2 at step 1: level 1 (chunk_size=8) is frozen (does not fire).
+        // The traced forward should record a Frozen* opaque key.
+        let cfg = MAGConfig::test_config_k2();
+        let params = MAGParams::init(&cfg, 42);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let conductor = Conductor::new(cfg.k, cfg.chunk_sizes.clone());
+
+        // Step 0: both levels fire → advance context so level 1 has nonzero M
+        let pulse0 = conductor.pulse();
+        let (input_ids, target_ids) = make_ids(cfg.swa.seq_len, cfg.swa.vocab_size);
+        let _ = extract_tape_summary(
+            &params, &cfg, &input_ids, &target_ids, &pulse0, &mut ctx,
+        );
+
+        // Advance conductor to step 1: level 1 should be frozen (8 does not divide 1)
+        let mut conductor = Conductor::new(cfg.k, cfg.chunk_sizes.clone());
+        conductor.advance();
+        let pulse1 = conductor.pulse();
+
+        // Level 1 should not be active at step 1
+        assert!(!pulse1.active_levels[1],
+            "Level 1 should be inactive at step 1 (chunk_size=8)");
+
+        let summary = extract_tape_summary(
+            &params, &cfg, &input_ids, &target_ids, &pulse1, &mut ctx,
+        );
+        let lev1 = &summary.levels[1];
+        assert!(lev1.is_frozen, "Level 1 should be frozen at step 1");
+    }
+
+    #[test]
+    fn test_freq_gate_nan_for_fixed_schedule() {
+        // Fixed schedule (default): freq_gate_value should be NaN
+        let cfg = MAGConfig::test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let conductor = Conductor::new(cfg.k, cfg.chunk_sizes.clone());
+        let pulse = conductor.pulse();
+        let (input_ids, target_ids) = make_ids(cfg.swa.seq_len, cfg.swa.vocab_size);
+
+        let summary = extract_tape_summary(
+            &params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx,
+        );
+        for lev in &summary.levels {
+            assert!(lev.freq_gate_value.is_nan(),
+                "freq_gate_value should be NaN for Fixed schedule, got {} at level {}",
+                lev.freq_gate_value, lev.level);
+        }
     }
 }

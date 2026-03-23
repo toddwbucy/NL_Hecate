@@ -2638,6 +2638,9 @@ impl GpuModel {
             ldict.set_item("block_count", lvl.block_count)?;
             ldict.set_item("output_grad_norm", lvl.output_grad_norm)?;
             ldict.set_item("dgd_delta_norm", lvl.dgd_delta_norm)?;
+            ldict.set_item("m_norm", lvl.m_norm)?;
+            ldict.set_item("freq_gate_value", lvl.freq_gate_value)?;
+            ldict.set_item("is_frozen", lvl.is_frozen)?;
             levels_list.append(ldict)?;
         }
         dict.set_item("levels", levels_list)?;
@@ -2710,6 +2713,9 @@ impl GpuModel {
             &self.params, &self.cfg, &cache, true,
         );
 
+        // Capture post-forward M norms before restoring context
+        let post_ctx = self.context.to_host(self.cfg.k);
+
         // Restore context (diagnostic must not modify state)
         self.context.upload_memory(&saved_ctx);
 
@@ -2740,6 +2746,16 @@ impl GpuModel {
                 .map(|mc| mc.dgd_delta_norm(s, d, bs, self.cfg.swa.num_heads))
                 .unwrap_or(0.0);
             ldict.set_item("dgd_delta_norm", delta_norm)?;
+            // m_norm from post-forward context (final carried memory)
+            let m_norm = if level < post_ctx.memory.len() {
+                post_ctx.memory[level].iter().map(|x| x * x).sum::<f32>().sqrt()
+            } else {
+                f32::NAN
+            };
+            ldict.set_item("m_norm", m_norm)?;
+            // freq_gate_value: GPU path does not yet capture gate values
+            ldict.set_item("freq_gate_value", f32::NAN)?;
+            ldict.set_item("is_frozen", !pulse.inner.active_levels[level])?;
             // Theta (inner-loop learning rate) distribution
             if let Some(ref mc) = cache.memory_caches[level] {
                 let tc = self.cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
@@ -3404,17 +3420,9 @@ impl GpuStackedModel {
                 ldict.set_item("block_count", lvl.block_count)?;
                 ldict.set_item("output_grad_norm", lvl.output_grad_norm)?;
                 ldict.set_item("dgd_delta_norm", lvl.dgd_delta_norm)?;
-                // m_norm from host context (Frobenius norm of M)
-                let m_norm = if lvl.level < host_ctx[block_sum.block].len() {
-                    let m = &host_ctx[block_sum.block][lvl.level];
-                    m.iter().map(|x| x * x).sum::<f32>().sqrt()
-                } else {
-                    0.0
-                };
-                ldict.set_item("m_norm", m_norm)?;
-                // alpha/theta/eta: CPU path does not extract gate buffers
-                // from the tape yet. Keys omitted — print_tape_summary
-                // handles missing keys with conditional checks.
+                ldict.set_item("m_norm", lvl.m_norm)?;
+                ldict.set_item("freq_gate_value", lvl.freq_gate_value)?;
+                ldict.set_item("is_frozen", lvl.is_frozen)?;
                 levels_list.append(ldict)?;
                 if lvl.output_grad_norm > agg_gnorms[lvl.level] {
                     agg_gnorms[lvl.level] = lvl.output_grad_norm;
@@ -3451,6 +3459,8 @@ impl GpuStackedModel {
                 }
             }).fold(0.0f32, f32::max);
             ldict.set_item("m_norm", max_mnorm)?;
+            ldict.set_item("freq_gate_value", f32::NAN)?;
+            ldict.set_item("is_frozen", !active)?;
             agg_levels_list.append(ldict)?;
         }
         dict.set_item("levels", agg_levels_list)?;
@@ -3661,7 +3671,9 @@ impl GpuStackedModel {
                 let gnorm = bg.level_output_gnorms[level];
                 ldict.set_item("output_grad_norm", gnorm)?;
                 ldict.set_item("dgd_delta_norm", delta_norms[bi][level])?;
-                ldict.set_item("m_norm", m_norms[bi][level])?;
+                ldict.set_item("m_norm", m_norms_post[bi][level])?;
+                ldict.set_item("freq_gate_value", f32::NAN)?;
+                ldict.set_item("is_frozen", !active)?;
                 // Shard M-diff: ||M_post - M_pre||_F proxy (spec 28)
                 let m_diff_abs = (m_norms_post[bi][level] - m_norms[bi][level]).abs();
                 let m_diff_rel = if m_norms[bi][level] > 1e-8 {
@@ -3742,8 +3754,10 @@ impl GpuStackedModel {
             let max_delta = delta_norms.iter().map(|bd| bd[level]).fold(0.0f32, f32::max);
             ldict.set_item("dgd_delta_norm", max_delta)?;
             // Aggregate m_norm: max across blocks for this level
-            let max_mnorm = m_norms.iter().map(|bn| bn[level]).fold(0.0f32, f32::max);
+            let max_mnorm = m_norms_post.iter().map(|bn| bn[level]).fold(0.0f32, f32::max);
             ldict.set_item("m_norm", max_mnorm)?;
+            ldict.set_item("freq_gate_value", f32::NAN)?;
+            ldict.set_item("is_frozen", !active)?;
             // Aggregate shard M-diff: max across blocks (spec 28)
             {
                 let max_diff_abs = (0..self.n_blocks).map(|bi| {
