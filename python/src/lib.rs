@@ -3671,7 +3671,7 @@ impl GpuStackedModel {
                 let gnorm = bg.level_output_gnorms[level];
                 ldict.set_item("output_grad_norm", gnorm)?;
                 ldict.set_item("dgd_delta_norm", delta_norms[bi][level])?;
-                ldict.set_item("m_norm", m_norms[bi][level])?;
+                ldict.set_item("m_norm", m_norms_post[bi][level])?;
                 ldict.set_item("freq_gate_value", f32::NAN)?;
                 ldict.set_item("is_frozen", !active)?;
                 // Shard M-diff: ||M_post - M_pre||_F proxy (spec 28)
@@ -3754,7 +3754,7 @@ impl GpuStackedModel {
             let max_delta = delta_norms.iter().map(|bd| bd[level]).fold(0.0f32, f32::max);
             ldict.set_item("dgd_delta_norm", max_delta)?;
             // Aggregate m_norm: max across blocks for this level
-            let max_mnorm = m_norms.iter().map(|bn| bn[level]).fold(0.0f32, f32::max);
+            let max_mnorm = m_norms_post.iter().map(|bn| bn[level]).fold(0.0f32, f32::max);
             ldict.set_item("m_norm", max_mnorm)?;
             ldict.set_item("freq_gate_value", f32::NAN)?;
             ldict.set_item("is_frozen", !active)?;
