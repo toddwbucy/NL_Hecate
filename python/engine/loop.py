@@ -921,6 +921,19 @@ def run_build(bcfg: BuildConfig):
 
     # Spec 32: window-local val removed (coherence samples use build stream)
 
+    # Spec 49: CMS tape accumulator — cross-step level metric collection.
+    # Accumulates tape summary data, flushes as .cms.json sidecar at checkpoints.
+    _cms_tape = None
+    _cms_last_flush_step = resume_step
+    if bcfg.save_every > 0 and getattr(bcfg, "tape_device", "off") != "off":
+        from engine.cms_tape import CmsTape
+        _cms_tape = CmsTape(
+            k=bcfg.k,
+            n_blocks=getattr(bcfg, "n_blocks", 1),
+            num_heads=bcfg.num_heads,
+            chunk_sizes=getattr(bcfg, "chunk_sizes", None),
+        )
+
     losses = []
     t_start = time.perf_counter()
     t_window_start = t_start
@@ -1454,6 +1467,11 @@ def run_build(bcfg: BuildConfig):
                     cursor_data["level_start_cursor"] = _level_start_cursor
                     sidecar.write_text(json.dumps(cursor_data, indent=2))
                 print(f"  [checkpoint saved: {ckpt_path}]")
+                # Spec 49: flush CMS tape sidecar
+                if _cms_tape is not None and len(_cms_tape) > 0:
+                    from engine.cms_tape import CmsTape
+                    CmsTape.write_sidecar(ckpt_path, _cms_tape.flush(_cms_last_flush_step, step))
+                    _cms_last_flush_step = step
             elif not is_stacked:
                 if gpu_model is not None:
                     params = gpu_model.to_host_params()
@@ -1475,6 +1493,11 @@ def run_build(bcfg: BuildConfig):
                     cursor_data["level_start_cursor"] = _level_start_cursor
                     sidecar.write_text(json.dumps(cursor_data, indent=2))
                 print(f"  [checkpoint saved: {ckpt_path}]")
+                # Spec 49: flush CMS tape sidecar
+                if _cms_tape is not None and len(_cms_tape) > 0:
+                    from engine.cms_tape import CmsTape
+                    CmsTape.write_sidecar(ckpt_path, _cms_tape.flush(_cms_last_flush_step, step))
+                    _cms_last_flush_step = step
 
                 # Per-level parameter drift (||M_t||_F vs ||M_0||_F)
                 if jsonl and gpu_model is not None and hasattr(gpu_model, "memory_norms"):
@@ -1571,6 +1594,9 @@ def run_build(bcfg: BuildConfig):
                         print_tape_summary(tape_sum, step)
                         if jsonl:
                             jsonl.log(event="tape_summary", step=step, **tape_sum)
+                        # Spec 49: accumulate for .cms.json sidecar
+                        if _cms_tape is not None:
+                            _cms_tape.record(tape_sum, step)
 
             # ── 4. Level metrics + fire counts ─────────────────────────
             if gpu_model is not None and hasattr(gpu_model, "gate_biases"):
