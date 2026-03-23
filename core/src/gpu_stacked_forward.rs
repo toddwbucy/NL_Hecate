@@ -379,7 +379,7 @@ pub fn gpu_stacked_forward(
                 if effective_active {
                     if is_tnt
                         && bs == 1
-                        && cfg.swa.num_heads == 1  // TNT doesn't support per-head memory
+                        // Spec 51: TNT now supports per-head memory (num_heads > 1)
                         && matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM | MemoryRuleKind::DeltaRule)
                     {
                         let parallel_cfg = cfg.parallel.as_ref().unwrap();
@@ -443,7 +443,7 @@ pub fn gpu_stacked_forward(
                 if effective_active {
                     if is_tnt
                         && bs == 1
-                        && cfg.swa.num_heads == 1  // TNT doesn't support per-head memory
+                        // Spec 51: TNT now supports per-head memory (num_heads > 1)
                         && matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM | MemoryRuleKind::DeltaRule)
                     {
                         let parallel_cfg = cfg.parallel.as_ref().unwrap();

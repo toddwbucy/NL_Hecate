@@ -945,7 +945,6 @@ pub fn gpu_cms_forward(
         if effective_active {
             if is_tnt
                 && bs == 1
-                && cfg.swa.num_heads == 1  // TNT doesn't support per-head memory
                 && matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM | MemoryRuleKind::DeltaRule)
             {
                 // TNT path: shard-parallel memory processing via gpu_tnt_forward.
@@ -1801,13 +1800,19 @@ pub(crate) fn gpu_tnt_forward(
     // TNT operates on single sequences (batch_size=1 at the outer level).
     // The inner batch dimension is n_locals (N parallel local memories).
     assert_eq!(batch_size, 1, "TNT GPU forward requires batch_size=1 (TNT uses inner batch for N local memories)");
-    assert!(cfg.swa.num_heads == 1, "TNT GPU forward does not support per-head memory (num_heads > 1)");
     assert!(
         matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM | MemoryRuleKind::DeltaRule),
         "TNT GPU forward only supports TitansLMM and DeltaRule, got {:?}", cfg.memory_rule,
     );
 
-    let dd = d * d;
+    // ── Spec 51: Per-head dimensions for TNT memory kernels ──────────
+    // Same pattern as gpu_memory_forward (Spec 45): fold heads into batch.
+    let nh = cfg.swa.num_heads;
+    let hd = d / nh;
+    let dd_mem = hd * hd;
+    let bs_mem = batch_size * nh;  // bs=1 for TNT, so bs_mem = nh
+    let hd_i32 = i32::try_from(hd).expect("head_dim exceeds i32::MAX");
+
     let cg = parallel_cfg.tnt_global_chunk_size;
     let cl = parallel_cfg.tnt_local_chunk_size;
     assert!(cl <= cg && cl >= 1 && cg >= 1);
@@ -1836,8 +1841,21 @@ pub(crate) fn gpu_tnt_forward(
         let n_batch = (shard_len + cl - 1) / cl;
 
         // Step 1: Broadcast global M → N copies for local memories
-        let mut m_broadcast = GpuBuf::<f32>::zeros(n_batch * dd);
-        crate::dispatch::tnt_broadcast_m_dd(context_m, &mut m_broadcast, n_batch, d);
+        // Spec 51: per-head broadcast — context_m is [nh * dd_mem], broadcast each
+        // head's M to n_batch copies → [nh * n_batch * dd_mem] = [nh*n_batch, dd_mem]
+        let mut m_broadcast = GpuBuf::<f32>::zeros(bs_mem * n_batch * dd_mem);
+        for h in 0..bs_mem {
+            for b in 0..n_batch {
+                unsafe {
+                    let rc = gpu_buf_memcpy_d2d(
+                        (m_broadcast.ptr() as *mut u8).add((h * n_batch + b) * dd_mem * 4) as *mut std::ffi::c_void,
+                        (context_m.as_ptr() as *const u8).add(h * dd_mem * 4) as *const std::ffi::c_void,
+                        dd_mem * 4,
+                    );
+                    assert_eq!(rc, 0, "TNT per-head M broadcast D2D memcpy failed (rc={rc})");
+                }
+            }
+        }
 
         // Step 2: Compute memory projections for the shard's tokens
         let shard_embedded_slice = embedded.slice(shard_start * d, shard_len * d);
@@ -1870,9 +1888,23 @@ pub(crate) fn gpu_tnt_forward(
             crate::cuda_ffi::l2_normalize_rows_f32_cuda(q_mem.ptr(), shard_q_norms.ptr(), shard_tokens_i32, d_i32, 1e-8);
         }
 
-        // Step 3: Compute gates for shard tokens
+        // Step 3: Compute ALL gates for shard tokens in d-space (before per-head reshape)
         let alpha = GpuBuf::zeros(shard_len);
         let theta = GpuBuf::zeros(shard_len);
+        // Pre-compute eta for Titans (needs d-space k/v, must happen before reshape)
+        let eta_opt = if matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM) {
+            let eta = GpuBuf::zeros(shard_len);
+            unsafe {
+                crate::cuda_ffi::gate_compute_cuda(
+                    k_mem.as_ptr(), v_mem.as_ptr(), level_params.w_eta.as_ptr(),
+                    level_params.b_eta.as_ptr(), eta.ptr(),
+                    shard_tokens_i32, d_i32, 0,
+                );
+            }
+            Some(eta)
+        } else {
+            None
+        };
         unsafe {
             crate::cuda_ffi::gate_compute_cuda(
                 k_mem.as_ptr(), v_mem.as_ptr(), level_params.w_alpha.as_ptr(),
@@ -1896,99 +1928,122 @@ pub(crate) fn gpu_tnt_forward(
             }
         }
 
-        // Step 4: Pad to [n_batch, cl, d] layout for batched kernel
-        // Tokens within a shard are already in sequential local-chunk order.
-        // Pad the last local chunk to cl tokens with zeros if needed.
+        // ── Spec 51: Per-head reshape (same pattern as gpu_memory_forward) ──
+        // k/v/q: [1, shard_len, d] → [nh, shard_len, hd]
+        // gates:  [1, shard_len]   → [nh, shard_len]
+        let k_mem_ph = reshape_to_per_head(&k_mem, 1, shard_len, nh, hd);
+        let v_mem_ph = reshape_to_per_head(&v_mem, 1, shard_len, nh, hd);
+        let q_mem_ph = reshape_to_per_head(&q_mem, 1, shard_len, nh, hd);
+        let alpha_ph = broadcast_gates(&alpha, 1, shard_len, nh);
+        let theta_ph = broadcast_gates(&theta, 1, shard_len, nh);
+        let eta_ph = eta_opt.map(|e| broadcast_gates(&e, 1, shard_len, nh));
+
+        // Step 4: Pad to [bs_mem * n_batch, cl, hd] layout for batched kernel
+        // Per-head data: [nh, shard_len, hd] padded to [nh, padded_len, hd] = [nh*n_batch, cl, hd]
         let padded_len = n_batch * cl;
-        let (k_mem_b, v_mem_b, q_mem_b, alpha_b, theta_b) = if shard_len == padded_len {
-            // No padding needed — exact fit
-            (k_mem, v_mem, q_mem, alpha, theta)
+        let ph_padded_elems = bs_mem * padded_len; // nh * padded_len
+        let (k_mem_b, v_mem_b, q_mem_b, alpha_b, theta_b, eta_b_opt) = if shard_len == padded_len {
+            (k_mem_ph, v_mem_ph, q_mem_ph, alpha_ph, theta_ph, eta_ph)
         } else {
-            // Pad with zeros (allocate padded buffers, copy actual data)
-            let kp = GpuBuf::zeros(padded_len * d);
-            let vp = GpuBuf::zeros(padded_len * d);
-            let qp = GpuBuf::zeros(padded_len * d);
-            let ap = GpuBuf::zeros(padded_len);
-            let tp = GpuBuf::zeros(padded_len);
+            let kp = GpuBuf::zeros(ph_padded_elems * hd);
+            let vp = GpuBuf::zeros(ph_padded_elems * hd);
+            let qp = GpuBuf::zeros(ph_padded_elems * hd);
+            let ap = GpuBuf::zeros(ph_padded_elems);
+            let tp = GpuBuf::zeros(ph_padded_elems);
+            let ep = eta_ph.as_ref().map(|_| GpuBuf::zeros(ph_padded_elems));
             unsafe {
-                let rc = gpu_buf_memcpy_d2d(kp.ptr() as *mut _, k_mem.as_ptr() as *const _, shard_len * d * 4);
-                assert_eq!(rc, 0, "TNT pad copy kp failed (rc={rc})");
-                let rc = gpu_buf_memcpy_d2d(vp.ptr() as *mut _, v_mem.as_ptr() as *const _, shard_len * d * 4);
-                assert_eq!(rc, 0, "TNT pad copy vp failed (rc={rc})");
-                let rc = gpu_buf_memcpy_d2d(qp.ptr() as *mut _, q_mem.as_ptr() as *const _, shard_len * d * 4);
-                assert_eq!(rc, 0, "TNT pad copy qp failed (rc={rc})");
-                let rc = gpu_buf_memcpy_d2d(ap.ptr() as *mut _, alpha.as_ptr() as *const _, shard_len * 4);
-                assert_eq!(rc, 0, "TNT pad copy alpha failed (rc={rc})");
-                let rc = gpu_buf_memcpy_d2d(tp.ptr() as *mut _, theta.as_ptr() as *const _, shard_len * 4);
-                assert_eq!(rc, 0, "TNT pad copy theta failed (rc={rc})");
+                // Per-head layout: each head's shard_len tokens are contiguous.
+                // Pad each head's block from shard_len to padded_len.
+                for h in 0..bs_mem {
+                    let src_off = h * shard_len;
+                    let dst_off = h * padded_len;
+                    let rc = gpu_buf_memcpy_d2d(
+                        (kp.ptr() as *mut u8).add(dst_off * hd * 4) as *mut _,
+                        (k_mem_ph.as_ptr() as *const u8).add(src_off * hd * 4) as *const _,
+                        shard_len * hd * 4,
+                    );
+                    assert_eq!(rc, 0, "TNT pad copy kp failed (rc={rc})");
+                    let rc = gpu_buf_memcpy_d2d(
+                        (vp.ptr() as *mut u8).add(dst_off * hd * 4) as *mut _,
+                        (v_mem_ph.as_ptr() as *const u8).add(src_off * hd * 4) as *const _,
+                        shard_len * hd * 4,
+                    );
+                    assert_eq!(rc, 0, "TNT pad copy vp failed (rc={rc})");
+                    let rc = gpu_buf_memcpy_d2d(
+                        (qp.ptr() as *mut u8).add(dst_off * hd * 4) as *mut _,
+                        (q_mem_ph.as_ptr() as *const u8).add(src_off * hd * 4) as *const _,
+                        shard_len * hd * 4,
+                    );
+                    assert_eq!(rc, 0, "TNT pad copy qp failed (rc={rc})");
+                    let rc = gpu_buf_memcpy_d2d(
+                        (ap.ptr() as *mut u8).add(dst_off * 4) as *mut _,
+                        (alpha_ph.as_ptr() as *const u8).add(src_off * 4) as *const _,
+                        shard_len * 4,
+                    );
+                    assert_eq!(rc, 0, "TNT pad copy alpha failed (rc={rc})");
+                    let rc = gpu_buf_memcpy_d2d(
+                        (tp.ptr() as *mut u8).add(dst_off * 4) as *mut _,
+                        (theta_ph.as_ptr() as *const u8).add(src_off * 4) as *const _,
+                        shard_len * 4,
+                    );
+                    assert_eq!(rc, 0, "TNT pad copy theta failed (rc={rc})");
+                    if let Some(ref eta_src) = eta_ph {
+                        let ep_ref = ep.as_ref().unwrap();
+                        let rc = gpu_buf_memcpy_d2d(
+                            (ep_ref.ptr() as *mut u8).add(dst_off * 4) as *mut _,
+                            (eta_src.as_ptr() as *const u8).add(src_off * 4) as *const _,
+                            shard_len * 4,
+                        );
+                        assert_eq!(rc, 0, "TNT pad copy eta failed (rc={rc})");
+                    }
+                }
             }
-            (kp, vp, qp, ap, tp)
+            (kp, vp, qp, ap, tp, ep)
         };
 
-        // Step 5: Run the batched memory kernel with batch_size=n_batch, seq_len=cl
-        let m_initial_slice = m_broadcast.slice(0, n_batch * dd);
-        let mut y_local = GpuBuf::zeros(padded_len * d);
+        // Step 5: Run the batched memory kernel
+        // Spec 51: batch = n_batch * nh (heads folded into batch), dim = hd, dd = dd_mem
+        let kernel_batch = n_batch * bs_mem;  // n_batch * nh
+        let m_initial_slice = m_broadcast.slice(0, kernel_batch * dd_mem);
+        let mut y_local = GpuBuf::zeros(ph_padded_elems * hd);  // [nh*padded_len, hd]
 
         let is_proxy = cfg.tape_strategy_for_level(level) == LevelTapeStrategy::Proxy;
 
         let inner_cache = match cfg.memory_rule {
             MemoryRuleKind::TitansLMM => {
-                // Compute eta gate for shard tokens (unpadded first, then pad)
-                let eta = GpuBuf::zeros(shard_len);
-                unsafe {
-                    crate::cuda_ffi::gate_compute_cuda(
-                        k_mem_b.as_ptr(), v_mem_b.as_ptr(), level_params.w_eta.as_ptr(),
-                        level_params.b_eta.as_ptr(), eta.ptr(),
-                        shard_tokens_i32, d_i32, 0,
-                    );
-                }
-                let eta_b = if shard_len == padded_len {
-                    eta
-                } else {
-                    let ep = GpuBuf::zeros(padded_len);
-                    unsafe {
-                        let rc = gpu_buf_memcpy_d2d(ep.ptr() as *mut _, eta.as_ptr() as *const _, shard_len * 4);
-                        assert_eq!(rc, 0, "TNT pad copy eta failed (rc={rc})");
-                    }
-                    ep
-                };
+                let eta_b = eta_b_opt.expect("eta must be pre-computed for TitansLMM");
 
-                let s_initial_buf = GpuBuf::zeros(n_batch * dd);
-                let s_initial_slice = s_initial_buf.slice(0, n_batch * dd);
-                // Spec 27: full trajectory for exact levels, full for forward then extract final for proxy
-                let mut m_states = GpuBuf::zeros(n_batch * (cl + 1) * dd);
-                let mut s_states = GpuBuf::zeros(n_batch * (cl + 1) * dd);
+                let s_initial_buf = GpuBuf::zeros(kernel_batch * dd_mem);
+                let s_initial_slice = s_initial_buf.slice(0, kernel_batch * dd_mem);
+                let mut m_states = GpuBuf::zeros(kernel_batch * (cl + 1) * dd_mem);
+                let mut s_states = GpuBuf::zeros(kernel_batch * (cl + 1) * dd_mem);
                 crate::dispatch::titans_forward_dd(
                     &k_mem_b, &v_mem_b, &q_mem_b,
                     &alpha_b, &theta_b, &eta_b,
                     &m_initial_slice, &s_initial_slice,
-                    &mut m_states, &mut s_states, &mut y_local, cl, d, n_batch,
-                    cl, dd, cfg.error_clip_for_level(level),
+                    &mut m_states, &mut s_states, &mut y_local, cl, hd, kernel_batch,
+                    cl, dd_mem, cfg.error_clip_for_level(level),
                 );
 
                 if is_proxy {
-                    // Spec 27 proxy: extract M_final and S_final, discard full trajectory.
-                    // M_final is at offset cl*dd per batch element (last timestep of trajectory).
-                    let m_final = GpuBuf::zeros(n_batch * dd);
-                    let s_final = GpuBuf::zeros(n_batch * dd);
-                    for b in 0..n_batch {
+                    let m_final = GpuBuf::zeros(kernel_batch * dd_mem);
+                    let s_final = GpuBuf::zeros(kernel_batch * dd_mem);
+                    for b in 0..kernel_batch {
                         unsafe {
                             let rc = gpu_buf_memcpy_d2d(
-                                (m_final.ptr() as *mut u8).add(b * dd * 4) as *mut _,
-                                (m_states.as_ptr() as *const u8).add((b * (cl + 1) + cl) * dd * 4) as *const _,
-                                dd * 4,
+                                (m_final.ptr() as *mut u8).add(b * dd_mem * 4) as *mut _,
+                                (m_states.as_ptr() as *const u8).add((b * (cl + 1) + cl) * dd_mem * 4) as *const _,
+                                dd_mem * 4,
                             );
                             assert_eq!(rc, 0, "TNT proxy M_final copy failed");
                             let rc = gpu_buf_memcpy_d2d(
-                                (s_final.ptr() as *mut u8).add(b * dd * 4) as *mut _,
-                                (s_states.as_ptr() as *const u8).add((b * (cl + 1) + cl) * dd * 4) as *const _,
-                                dd * 4,
+                                (s_final.ptr() as *mut u8).add(b * dd_mem * 4) as *mut _,
+                                (s_states.as_ptr() as *const u8).add((b * (cl + 1) + cl) * dd_mem * 4) as *const _,
+                                dd_mem * 4,
                             );
                             assert_eq!(rc, 0, "TNT proxy S_final copy failed");
                         }
                     }
-                    // Return Titans cache with m_states/s_states containing only finals.
-                    // Backward will detect proxy via cfg.tape_strategy_for_level().
                     GpuMemoryCache::Titans {
                         k_mem: k_mem_b, v_mem: v_mem_b, q_mem: q_mem_b,
                         alpha: alpha_b, theta: theta_b, eta: eta_b,
@@ -2007,23 +2062,22 @@ pub(crate) fn gpu_tnt_forward(
                 }
             }
             MemoryRuleKind::DeltaRule => {
-                let mut m_states = GpuBuf::zeros(n_batch * (cl + 1) * dd);
+                let mut m_states = GpuBuf::zeros(kernel_batch * (cl + 1) * dd_mem);
                 crate::dispatch::delta_forward_dd(
                     &k_mem_b, &v_mem_b, &q_mem_b,
                     &alpha_b, &theta_b,
-                    &m_initial_slice, &mut m_states, &mut y_local, cl, d, n_batch,
-                    cl, dd, cfg.error_clip_for_level(level),
+                    &m_initial_slice, &mut m_states, &mut y_local, cl, hd, kernel_batch,
+                    cl, dd_mem, cfg.error_clip_for_level(level),
                 );
 
                 if is_proxy {
-                    // Spec 27 proxy: extract M_final only, discard full trajectory.
-                    let m_final = GpuBuf::zeros(n_batch * dd);
-                    for b in 0..n_batch {
+                    let m_final = GpuBuf::zeros(kernel_batch * dd_mem);
+                    for b in 0..kernel_batch {
                         unsafe {
                             let rc = gpu_buf_memcpy_d2d(
-                                (m_final.ptr() as *mut u8).add(b * dd * 4) as *mut _,
-                                (m_states.as_ptr() as *const u8).add((b * (cl + 1) + cl) * dd * 4) as *const _,
-                                dd * 4,
+                                (m_final.ptr() as *mut u8).add(b * dd_mem * 4) as *mut _,
+                                (m_states.as_ptr() as *const u8).add((b * (cl + 1) + cl) * dd_mem * 4) as *const _,
+                                dd_mem * 4,
                             );
                             assert_eq!(rc, 0, "TNT proxy M_final copy failed");
                         }
@@ -2048,41 +2102,77 @@ pub(crate) fn gpu_tnt_forward(
 
         crate::dispatch::cuda_sync();
 
-        // Step 6: Copy unpadded local outputs to full output buffer
-        // y_local is [n_batch, cl, d] batched layout — we need [shard_len, d]
-        // Since batched layout is contiguous and matches the sequential order,
-        // just copy the first shard_len*d elements.
+        // Step 6: Reshape per-head output back to d-space and copy to y_full
+        // y_local is [nh*n_batch, cl, hd] → reshape to [padded_len, d] then copy shard_len*d
+        let y_dm = reshape_from_per_head(&y_local, 1, padded_len, nh, hd);
         unsafe {
             let rc = gpu_buf_memcpy_d2d(
                 (y_full.ptr() as *mut u8).add(shard_start * d * 4) as *mut std::ffi::c_void,
-                y_local.as_ptr() as *const std::ffi::c_void,
+                y_dm.as_ptr() as *const std::ffi::c_void,
                 shard_len * d * 4,
             );
             assert_eq!(rc, 0, "TNT y_full D2D memcpy failed (rc={rc})");
         }
 
-        // Step 7: Compute shard summary (mean-pooling on GPU)
-        // Use the unpadded shard output for summary
-        let shard_y = GpuBuf::<f32>::zeros(shard_len * d);
-        unsafe {
-            let rc = gpu_buf_memcpy_d2d(
-                shard_y.ptr() as *mut std::ffi::c_void,
-                y_local.as_ptr() as *const std::ffi::c_void,
-                shard_len * d * 4,
-            );
-            assert_eq!(rc, 0, "TNT shard_y D2D memcpy failed (rc={rc})");
-        }
-        let mut k_sum = GpuBuf::<f32>::zeros(d);
+        // Step 7: Per-head shard summary (mean-pooling per head on GPU)
+        // Spec 51: compute [nh, hd] summaries, stored as [nh*hd] = [d] for backward compat.
+        // Each head h's unpadded output is at y_local[h*padded_len*hd .. h*padded_len*hd + shard_len*hd].
+        #[allow(unused_mut)]
+        let mut k_sum = GpuBuf::<f32>::zeros(d);  // [nh * hd] = [d]
+        #[allow(unused_mut)]
         let mut v_sum = GpuBuf::<f32>::zeros(d);
-        crate::dispatch::tnt_shard_summary_mean_dd(&shard_y, &mut k_sum, &mut v_sum, shard_len, d);
+        for h in 0..bs_mem {
+            let h_y = GpuBuf::<f32>::zeros(shard_len * hd);
+            unsafe {
+                let rc = gpu_buf_memcpy_d2d(
+                    h_y.ptr() as *mut std::ffi::c_void,
+                    (y_local.as_ptr() as *const u8).add(h * padded_len * hd * 4) as *const std::ffi::c_void,
+                    shard_len * hd * 4,
+                );
+                assert_eq!(rc, 0, "TNT per-head summary copy failed (rc={rc})");
+            }
+            // Mean-pool head h's output into k_sum[h*hd..(h+1)*hd] and v_sum[h*hd..(h+1)*hd]
+            let mut k_h = GpuBuf::<f32>::zeros(hd);
+            let mut v_h = GpuBuf::<f32>::zeros(hd);
+            crate::dispatch::tnt_shard_summary_mean_dd(&h_y, &mut k_h, &mut v_h, shard_len, hd);
+            unsafe {
+                let rc = gpu_buf_memcpy_d2d(
+                    (k_sum.ptr() as *mut u8).add(h * hd * 4) as *mut _,
+                    k_h.as_ptr() as *const _,
+                    hd * 4,
+                );
+                assert_eq!(rc, 0, "TNT k_sum copy failed");
+                let rc = gpu_buf_memcpy_d2d(
+                    (v_sum.ptr() as *mut u8).add(h * hd * 4) as *mut _,
+                    v_h.as_ptr() as *const _,
+                    hd * 4,
+                );
+                assert_eq!(rc, 0, "TNT v_sum copy failed");
+            }
+        }
 
-        // Step 8: Update global M via outer product
-        crate::dispatch::tnt_global_update_dd(context_m, &k_sum, &v_sum, d, 0.95);
+        // Step 8: Per-head global M update via outer product
+        // Spec 51: each head's M_h updated independently with head-specific k_sum_h, v_sum_h
+        for h in 0..bs_mem {
+            unsafe {
+                crate::cuda_ffi::tnt_global_update_f32_cuda(
+                    (context_m.ptr() as *mut u8).add(h * dd_mem * 4) as *mut f32,
+                    (k_sum.as_ptr() as *const u8).add(h * hd * 4) as *const f32,
+                    (v_sum.as_ptr() as *const u8).add(h * hd * 4) as *const f32,
+                    hd_i32, 0.95,
+                );
+            }
+        }
         crate::dispatch::cuda_sync();
 
-        // Apply m_norm_clamp to global M after update
-        unsafe {
-            crate::cuda_ffi::m_norm_clamp_f32_cuda(context_m.ptr(), d_i32, m_norm_max);
+        // Apply m_norm_clamp per head
+        for h in 0..bs_mem {
+            unsafe {
+                crate::cuda_ffi::m_norm_clamp_f32_cuda(
+                    (context_m.ptr() as *mut u8).add(h * dd_mem * 4) as *mut f32,
+                    hd_i32, m_norm_max,
+                );
+            }
         }
 
         // Save caches for backward — inner caches are cycle-scoped,
