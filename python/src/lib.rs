@@ -2540,6 +2540,34 @@ impl GpuModel {
         norms
     }
 
+    /// Compute per-head Frobenius norms of M sub-matrices on GPU.
+    /// Returns Vec<Vec<f32>> of shape [k][num_heads]. Empty inner Vec for
+    /// MLP rules (non-square M) or num_heads <= 1.
+    ///
+    /// GPU memory layout: packed per-head tiles, head h at offset h*hd*hd.
+    fn memory_norms_per_head(&self) -> Vec<Vec<f32>> {
+        let nh = self.context.num_heads;
+        let hd = self.context.head_dim;
+        let mem_dd = self.context.mem_dd(); // nh * hd * hd
+        let mut result = Vec::with_capacity(self.context.memory.len());
+        for gpu_mem in &self.context.memory {
+            if nh <= 1 || mem_dd == 0 || gpu_mem.len() < mem_dd {
+                result.push(Vec::new());
+                continue;
+            }
+            let mut buf = vec![0.0f32; mem_dd];
+            gpu_mem.slice(0, mem_dd).copy_to_host(&mut buf);
+            let tile_size = hd * hd;
+            let norms: Vec<f32> = (0..nh).map(|h| {
+                let start = h * tile_size;
+                buf[start..start + tile_size].iter()
+                    .map(|v| v * v).sum::<f32>().sqrt()
+            }).collect();
+            result.push(norms);
+        }
+        result
+    }
+
     /// Read gate biases from GPU: returns Vec of (b_alpha, b_theta, b_eta) per level.
     /// Small D2H transfer: 3 floats per level. Used for monitoring gate behavior.
     fn gate_biases(&self) -> Vec<(f32, f32, f32)> {
@@ -2641,6 +2669,7 @@ impl GpuModel {
             ldict.set_item("m_norm", lvl.m_norm)?;
             ldict.set_item("freq_gate_value", lvl.freq_gate_value)?;
             ldict.set_item("is_frozen", lvl.is_frozen)?;
+            ldict.set_item("head_m_norms", &lvl.head_m_norms)?;
             levels_list.append(ldict)?;
         }
         dict.set_item("levels", levels_list)?;
@@ -2756,6 +2785,21 @@ impl GpuModel {
             // freq_gate_value: GPU path does not yet capture gate values
             ldict.set_item("freq_gate_value", f32::NAN)?;
             ldict.set_item("is_frozen", !pulse.inner.active_levels[level])?;
+            // Per-head M norms from post-forward context (packed tile layout)
+            let head_norms: Vec<f32> = if level < post_ctx.memory.len() {
+                let mem = &post_ctx.memory[level];
+                let nh = self.context.num_heads;
+                let hd = self.context.head_dim;
+                let tile_size = hd * hd;
+                if nh > 1 && mem.len() == nh * tile_size {
+                    (0..nh).map(|h| {
+                        let start = h * tile_size;
+                        mem[start..start + tile_size].iter()
+                            .map(|v| v * v).sum::<f32>().sqrt()
+                    }).collect()
+                } else { Vec::new() }
+            } else { Vec::new() };
+            ldict.set_item("head_m_norms", &head_norms)?;
             // Theta (inner-loop learning rate) distribution
             if let Some(ref mc) = cache.memory_caches[level] {
                 let tc = self.cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
@@ -2886,6 +2930,7 @@ impl GpuStackedModel {
         let gpu_params = nl_hecate_core::gpu_params::GpuStackedParams::from_host(&host_params);
         let gpu_context = nl_hecate_core::gpu_params::GpuStackedContext::new(
             n_blocks, cfg.inner.k, cfg.inner.swa.d_model, batch_size,
+            Some(&cfg.inner),
         );
         Ok(GpuStackedModel {
             params: gpu_params,
@@ -2936,6 +2981,7 @@ impl GpuStackedModel {
         let gpu_params = nl_hecate_core::gpu_params::GpuStackedParams::from_host(&host_params);
         let gpu_context = nl_hecate_core::gpu_params::GpuStackedContext::new(
             n_blocks, cfg.inner.k, cfg.inner.swa.d_model, batch_size,
+            Some(&cfg.inner),
         );
         Ok(GpuStackedModel {
             params: gpu_params,
@@ -3423,6 +3469,7 @@ impl GpuStackedModel {
                 ldict.set_item("m_norm", lvl.m_norm)?;
                 ldict.set_item("freq_gate_value", lvl.freq_gate_value)?;
                 ldict.set_item("is_frozen", lvl.is_frozen)?;
+                ldict.set_item("head_m_norms", &lvl.head_m_norms)?;
                 levels_list.append(ldict)?;
                 if lvl.output_grad_norm > agg_gnorms[lvl.level] {
                     agg_gnorms[lvl.level] = lvl.output_grad_norm;
@@ -3461,6 +3508,9 @@ impl GpuStackedModel {
             ldict.set_item("m_norm", max_mnorm)?;
             ldict.set_item("freq_gate_value", f32::NAN)?;
             ldict.set_item("is_frozen", !active)?;
+            // Aggregate head_m_norms: empty at aggregate level (per-head data on block dicts)
+            let empty_heads: Vec<f32> = Vec::new();
+            ldict.set_item("head_m_norms", &empty_heads)?;
             agg_levels_list.append(ldict)?;
         }
         dict.set_item("levels", agg_levels_list)?;
@@ -3595,6 +3645,8 @@ impl GpuStackedModel {
 
         // Capture post-forward M norms for shard M-diff (spec 28).
         let m_norms_post = self.context.memory_norms();
+        // Per-head M norms (spec 50).
+        let head_norms_post = self.context.memory_norms_per_head();
 
         // Extract DGD delta norms from cache BEFORE backward consumes it.
         // Per-(block, level) ||M_final @ k_last - v_last||_2
@@ -3674,6 +3726,12 @@ impl GpuStackedModel {
                 ldict.set_item("m_norm", m_norms_post[bi][level])?;
                 ldict.set_item("freq_gate_value", f32::NAN)?;
                 ldict.set_item("is_frozen", !active)?;
+                // Per-head M norms (spec 50)
+                let empty_head_norms: Vec<f32> = Vec::new();
+                let head_norms: &Vec<f32> = head_norms_post.get(bi)
+                    .and_then(|bl| bl.get(level))
+                    .unwrap_or(&empty_head_norms);
+                ldict.set_item("head_m_norms", head_norms)?;
                 // Shard M-diff: ||M_post - M_pre||_F proxy (spec 28)
                 let m_diff_abs = (m_norms_post[bi][level] - m_norms[bi][level]).abs();
                 let m_diff_rel = if m_norms[bi][level] > 1e-8 {
@@ -3758,6 +3816,9 @@ impl GpuStackedModel {
             ldict.set_item("m_norm", max_mnorm)?;
             ldict.set_item("freq_gate_value", f32::NAN)?;
             ldict.set_item("is_frozen", !active)?;
+            // Aggregate head_m_norms: empty at aggregate level (per-head data on block dicts)
+            let empty_heads: Vec<f32> = Vec::new();
+            ldict.set_item("head_m_norms", &empty_heads)?;
             // Aggregate shard M-diff: max across blocks (spec 28)
             {
                 let max_diff_abs = (0..self.n_blocks).map(|bi| {
