@@ -467,7 +467,7 @@ pub(crate) fn gpu_memory_backward(
     level: usize,
     batch_size: usize,
 ) -> GpuBuf<f32> {
-    let dd = d * d;
+    let _dd = d * d;
     let _bsd = batch_size * s * d;
     let bs_s = batch_size * s;
 
@@ -1104,6 +1104,8 @@ pub(crate) fn gpu_memory_backward(
             )
         }
         // ── TNT: reverse shard loop with batched inner backward ──────
+        // Spec 51: per-head memory support — inner kernels use hd/kernel_batch,
+        // then reshape back to d-space for L2 backward, gate backward, and projection grads.
         GpuMemoryCache::TNT {
             shard_inner_caches, k_summaries, v_summaries,
             global_chunk_size, local_chunk_size,
@@ -1115,63 +1117,107 @@ pub(crate) fn gpu_memory_backward(
             let n_total = *total_shards;
             let first_ret = *first_retained_shard;
             let n_retained = shard_inner_caches.len();
-            // Spec 25 invariants: retained window and summary vectors must be consistent.
             assert!(n_total > 0, "TNT backward: total_shards must be > 0");
             assert!(first_ret < n_total, "TNT backward: first_retained_shard ({first_ret}) >= total_shards ({n_total})");
             assert_eq!(n_retained, n_total - first_ret, "TNT backward: cache count ({n_retained}) != total_shards - first_retained ({} - {first_ret})", n_total);
             assert_eq!(k_summaries.len(), n_total, "TNT backward: k_summaries.len() ({}) != total_shards ({n_total})", k_summaries.len());
             assert_eq!(v_summaries.len(), n_total, "TNT backward: v_summaries.len() ({}) != total_shards ({n_total})", v_summaries.len());
 
-            // Accumulators for projection weight grads across all shards
+            let _hd_i32 = i32::try_from(hd).expect("head_dim exceeds i32::MAX");
+
+            // Accumulators for projection weight grads across all shards (d-space)
             let d_k_mem_total = GpuBuf::<f32>::zeros(s * d);
             let d_v_mem_total = GpuBuf::<f32>::zeros(s * d);
             let d_q_mem_total = GpuBuf::<f32>::zeros(s * d);
 
-            // Reverse shard iteration: propagate d_m through global updates.
-            // Global M backward runs over ALL shards (summaries are retained for all).
-            // Inner backward only runs for retained shards (gradient truncation for evicted ones).
-            let mut d_m_carry = GpuBuf::zeros(dd);
+            // Spec 51: d_m_carry is per-head [nh * dd_mem]
+            let mut d_m_carry = GpuBuf::<f32>::zeros(bs_mem * dd_mem);
 
             for shard_idx in (0..n_total).rev() {
                 let shard_start = shard_idx * cg;
                 let shard_end = (shard_start + cg).min(s);
                 let shard_len = shard_end - shard_start;
                 let n_batch = (shard_len + cl - 1) / cl;
+                let kernel_batch = n_batch * bs_mem;
 
-                // Step 1: Backward through global M update (runs for ALL shards —
-                // summaries are retained even for evicted shards).
-                // Forward: m_new = alpha * m_old + v_sum ⊗ k_sum
-                // d_m_new = d_m_carry (gradient from subsequent shards)
-                let mut d_m_old = GpuBuf::zeros(dd);
-                let mut d_k_sum = GpuBuf::zeros(d);
-                let mut d_v_sum = GpuBuf::zeros(d);
-                crate::dispatch::tnt_global_update_backward_dd(
-                    &d_m_carry, &k_summaries[shard_idx], &v_summaries[shard_idx],
-                    &mut d_m_old, &mut d_k_sum, &mut d_v_sum, d, 0.95,
-                );
+                // Step 1: Per-head global M update backward
+                // k_summaries/v_summaries are [d] = [nh*hd] (per-head concatenated)
+                let d_m_old = GpuBuf::<f32>::zeros(bs_mem * dd_mem);
+                let d_k_sum = GpuBuf::<f32>::zeros(d);  // [nh*hd]
+                let d_v_sum = GpuBuf::<f32>::zeros(d);
+                for h in 0..bs_mem {
+                    let mut d_m_old_h = GpuBuf::<f32>::zeros(dd_mem);
+                    let mut d_k_sum_h = GpuBuf::<f32>::zeros(hd);
+                    let mut d_v_sum_h = GpuBuf::<f32>::zeros(hd);
+                    // Extract head h's carry gradient and summaries
+                    let d_m_carry_h = GpuBuf::<f32>::zeros(dd_mem);
+                    let k_sum_h = GpuBuf::<f32>::zeros(hd);
+                    let v_sum_h = GpuBuf::<f32>::zeros(hd);
+                    unsafe {
+                        let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                            d_m_carry_h.ptr() as *mut _, (d_m_carry.as_ptr() as *const u8).add(h * dd_mem * 4) as *const _, dd_mem * 4);
+                        assert_eq!(rc, 0, "TNT backward: d_m_carry_h extract failed (rc={rc})");
+                        let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                            k_sum_h.ptr() as *mut _, (k_summaries[shard_idx].as_ptr() as *const u8).add(h * hd * 4) as *const _, hd * 4);
+                        assert_eq!(rc, 0, "TNT backward: k_sum_h extract failed (rc={rc})");
+                        let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                            v_sum_h.ptr() as *mut _, (v_summaries[shard_idx].as_ptr() as *const u8).add(h * hd * 4) as *const _, hd * 4);
+                        assert_eq!(rc, 0, "TNT backward: v_sum_h extract failed (rc={rc})");
+                    }
+                    crate::dispatch::tnt_global_update_backward_dd(
+                        &d_m_carry_h, &k_sum_h, &v_sum_h,
+                        &mut d_m_old_h, &mut d_k_sum_h, &mut d_v_sum_h, hd, 0.95,
+                    );
+                    unsafe {
+                        let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                            (d_m_old.ptr() as *mut u8).add(h * dd_mem * 4) as *mut _, d_m_old_h.as_ptr() as *const _, dd_mem * 4);
+                        assert_eq!(rc, 0, "TNT backward: d_m_old_h scatter failed (rc={rc})");
+                        let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                            (d_k_sum.ptr() as *mut u8).add(h * hd * 4) as *mut _, d_k_sum_h.as_ptr() as *const _, hd * 4);
+                        assert_eq!(rc, 0, "TNT backward: d_k_sum_h scatter failed (rc={rc})");
+                        let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                            (d_v_sum.ptr() as *mut u8).add(h * hd * 4) as *mut _, d_v_sum_h.as_ptr() as *const _, hd * 4);
+                        assert_eq!(rc, 0, "TNT backward: d_v_sum_h scatter failed (rc={rc})");
+                    }
+                }
 
-                // Spec 25: check if this shard's inner cache was retained.
-                // Evicted shards (shard_idx < first_ret) only contribute global M gradients.
-                // Inner backward (projection/gate grads, local M grads) is truncated.
                 if shard_idx < first_ret {
-                    // Gradient truncation: only global M backward for evicted shards.
-                    // Still propagate d_m_carry so the global chain rule is complete.
                     d_m_carry = d_m_old;
                     continue;
                 }
 
-                // Map absolute shard_idx to the retained cache index.
                 let cache_idx = shard_idx - first_ret;
 
-                // Step 2: Backward through shard summary mean
-                let mut d_local_y_global = GpuBuf::zeros(shard_len * d);
-                crate::dispatch::tnt_shard_summary_mean_backward_dd(
-                    &d_k_sum, &d_v_sum, &mut d_local_y_global, shard_len, d,
-                );
+                // Step 2: Per-head shard summary backward → d_local_y per-head [nh, shard_len, hd]
+                let d_local_y_ph = GpuBuf::<f32>::zeros(bs_mem * shard_len * hd);
+                for h in 0..bs_mem {
+                    let d_k_sum_h = GpuBuf::<f32>::zeros(hd);
+                    let d_v_sum_h = GpuBuf::<f32>::zeros(hd);
+                    unsafe {
+                        let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                            d_k_sum_h.ptr() as *mut _, (d_k_sum.as_ptr() as *const u8).add(h * hd * 4) as *const _, hd * 4);
+                        assert_eq!(rc, 0, "TNT backward: d_k_sum_h summary extract failed (rc={rc})");
+                        let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                            d_v_sum_h.ptr() as *mut _, (d_v_sum.as_ptr() as *const u8).add(h * hd * 4) as *const _, hd * 4);
+                        assert_eq!(rc, 0, "TNT backward: d_v_sum_h summary extract failed (rc={rc})");
+                    }
+                    let mut d_local_y_h = GpuBuf::<f32>::zeros(shard_len * hd);
+                    crate::dispatch::tnt_shard_summary_mean_backward_dd(
+                        &d_k_sum_h, &d_v_sum_h, &mut d_local_y_h, shard_len, hd,
+                    );
+                    unsafe {
+                        let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                            (d_local_y_ph.ptr() as *mut u8).add(h * shard_len * hd * 4) as *mut _,
+                            d_local_y_h.as_ptr() as *const _, shard_len * hd * 4);
+                        assert_eq!(rc, 0, "TNT backward: d_local_y_h scatter failed (rc={rc})");
+                    }
+                }
+                // Reshape per-head d_local_y to d-space for combining with upstream d_y
+                let d_local_y_global = crate::gpu_forward::reshape_from_per_head(&d_local_y_ph, 1, shard_len, nh, hd);
 
-                // Step 3: Combine upstream d_y with d_local_y from global path
+                // Step 3: Combine upstream d_y (d-space) with d_local_y (d-space)
                 let d_y_shard_slice = d_y.slice(shard_start * d, shard_len * d);
-                let d_y_upstream_shard = GpuBuf::zeros(shard_len * d);
+                let d_y_upstream_shard = GpuBuf::<f32>::zeros(shard_len * d);
                 unsafe {
                     let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
                         d_y_upstream_shard.ptr() as *mut std::ffi::c_void,
@@ -1180,48 +1226,52 @@ pub(crate) fn gpu_memory_backward(
                     );
                     assert_eq!(rc, 0, "TNT backward: d_y upstream copy failed (rc={rc})");
                 }
-                let mut d_y_combined = GpuBuf::zeros(shard_len * d);
+                let mut d_y_combined = GpuBuf::<f32>::zeros(shard_len * d);
                 crate::dispatch::tnt_combine_gradients_dd(
                     &d_y_upstream_shard, &d_local_y_global,
                     &mut d_y_combined, shard_len * d,
                 );
 
-                // Step 4: Pad d_y_combined to [n_batch, cl, d] layout if needed
+                // Spec 51: reshape combined d_y to per-head for inner backward
+                let d_y_combined_ph = crate::gpu_forward::reshape_to_per_head(&d_y_combined, 1, shard_len, nh, hd);
+
+                // Step 4: Pad d_y_combined per-head to [nh*n_batch, cl, hd]
                 let padded_len = n_batch * cl;
+                let ph_padded_elems = bs_mem * padded_len;
                 let d_y_padded = if shard_len == padded_len {
-                    d_y_combined
+                    d_y_combined_ph
                 } else {
-                    let dp = GpuBuf::zeros(padded_len * d);
+                    let dp = GpuBuf::<f32>::zeros(ph_padded_elems * hd);
                     unsafe {
-                        let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
-                            dp.ptr() as *mut std::ffi::c_void,
-                            d_y_combined.as_ptr() as *const std::ffi::c_void,
-                            shard_len * d * 4,
-                        );
-                        assert_eq!(rc, 0, "TNT backward: d_y padding copy failed (rc={rc})");
+                        for h in 0..bs_mem {
+                            let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                                (dp.ptr() as *mut u8).add(h * padded_len * hd * 4) as *mut _,
+                                (d_y_combined_ph.as_ptr() as *const u8).add(h * shard_len * hd * 4) as *const _,
+                                shard_len * hd * 4,
+                            );
+                            assert_eq!(rc, 0, "TNT backward: d_y padding copy failed (rc={rc})");
+                        }
                     }
                     dp
                 };
 
-                // Step 5: Run inner backward kernel (Titans/Delta with batch_size=n_batch)
+                // Step 5: Inner backward kernel (per-head: kernel_batch = n_batch*nh, d = hd)
                 let inner_cache = &shard_inner_caches[cache_idx];
-                let shard_tokens = padded_len;
-                let mut d_k_shard = GpuBuf::zeros(shard_tokens * d);
-                let mut d_v_shard = GpuBuf::zeros(shard_tokens * d);
-                let mut d_q_shard = GpuBuf::zeros(shard_tokens * d);
-                let mut d_alpha_shard = GpuBuf::zeros(shard_tokens);
-                let mut d_theta_shard = GpuBuf::zeros(shard_tokens);
-                let mut d_eta_shard = GpuBuf::zeros(shard_tokens);
+                let shard_tokens = ph_padded_elems;  // nh * padded_len
+                let mut d_k_shard = GpuBuf::<f32>::zeros(shard_tokens * hd);
+                let mut d_v_shard = GpuBuf::<f32>::zeros(shard_tokens * hd);
+                let mut d_q_shard = GpuBuf::<f32>::zeros(shard_tokens * hd);
+                let mut d_alpha_shard = GpuBuf::<f32>::zeros(shard_tokens);
+                let mut d_theta_shard = GpuBuf::<f32>::zeros(shard_tokens);
+                let mut d_eta_shard = GpuBuf::<f32>::zeros(shard_tokens);
                 let has_eta = matches!(inner_cache, GpuMemoryCache::Titans { .. });
 
-                let (shard_k_norms, shard_q_norms, shard_k_mem, shard_q_mem) = match inner_cache {
-                    GpuMemoryCache::Titans { k_mem, q_mem, k_norms, q_norms, .. } => (k_norms, q_norms, k_mem, q_mem),
-                    GpuMemoryCache::Delta { k_mem, q_mem, k_norms, q_norms, .. } => (k_norms, q_norms, k_mem, q_mem),
+                let (shard_k_norms, shard_q_norms) = match inner_cache {
+                    GpuMemoryCache::Titans { k_norms, q_norms, .. } => (k_norms, q_norms),
+                    GpuMemoryCache::Delta { k_norms, q_norms, .. } => (k_norms, q_norms),
                     _ => unreachable!("TNT inner cache must be Titans or Delta"),
                 };
 
-                // Spec 27: derive proxy from the cache's layout flag (ground truth set at
-                // construction), not from cfg — the cache knows its own shape.
                 let is_proxy = match inner_cache {
                     GpuMemoryCache::Titans { proxy, .. } | GpuMemoryCache::Delta { proxy, .. } => *proxy,
                     _ => false,
@@ -1229,32 +1279,27 @@ pub(crate) fn gpu_memory_backward(
 
                 match inner_cache {
                     GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states, s_states, .. } => {
-                        let mut d_m_initial = GpuBuf::zeros(n_batch * dd);
-                        let mut d_s_initial = GpuBuf::zeros(n_batch * dd);
+                        let mut d_m_initial = GpuBuf::<f32>::zeros(kernel_batch * dd_mem);
+                        let mut d_s_initial = GpuBuf::<f32>::zeros(kernel_batch * dd_mem);
 
                         let (m_for_bw, s_for_bw) = if is_proxy {
-                            // Broadcast M_final/S_final into [(cl+1)*dd] per batch element
-                            // using a single CUDA kernel launch instead of nested host-driven copies.
-                            let m_bcast = GpuBuf::zeros(n_batch * (cl + 1) * dd);
-                            let s_bcast = GpuBuf::zeros(n_batch * (cl + 1) * dd);
+                            let m_bcast = GpuBuf::<f32>::zeros(kernel_batch * (cl + 1) * dd_mem);
+                            let s_bcast = GpuBuf::<f32>::zeros(kernel_batch * (cl + 1) * dd_mem);
                             unsafe {
-                                let dd_i32 = i32::try_from(dd).expect("dd overflows i32");
+                                let dd_i32 = i32::try_from(dd_mem).expect("dd_mem overflows i32");
                                 let slots_i32 = i32::try_from(cl + 1).expect("cl+1 overflows i32");
-                                let nb_i32 = i32::try_from(n_batch).expect("n_batch overflows i32");
+                                let nb_i32 = i32::try_from(kernel_batch).expect("kernel_batch overflows i32");
                                 let rc = crate::cuda_ffi::broadcast_fill_f32_cuda(
-                                    m_bcast.ptr(), m_states.as_ptr(),
-                                    dd_i32, slots_i32, nb_i32,
+                                    m_bcast.ptr(), m_states.as_ptr(), dd_i32, slots_i32, nb_i32,
                                 );
                                 assert_eq!(rc, 0, "broadcast_fill M failed (rc={rc})");
                                 let rc = crate::cuda_ffi::broadcast_fill_f32_cuda(
-                                    s_bcast.ptr(), s_states.as_ptr(),
-                                    dd_i32, slots_i32, nb_i32,
+                                    s_bcast.ptr(), s_states.as_ptr(), dd_i32, slots_i32, nb_i32,
                                 );
                                 assert_eq!(rc, 0, "broadcast_fill S failed (rc={rc})");
                             }
                             (m_bcast, s_bcast)
                         } else {
-                            // Exact: use stored trajectory directly (zero-copy reference via dup)
                             (m_states.dup(), s_states.dup())
                         };
 
@@ -1264,32 +1309,33 @@ pub(crate) fn gpu_memory_backward(
                             &mut d_k_shard, &mut d_v_shard, &mut d_q_shard,
                             &mut d_alpha_shard, &mut d_theta_shard, &mut d_eta_shard,
                             &mut d_m_initial, &mut d_s_initial,
-                            cl, d, n_batch,
+                            cl, hd, kernel_batch,
                             cfg.error_clip_for_level(level),
                         );
 
                         if !is_proxy {
-                            // Only propagate d_m_initial for exact levels — proxy has no M chain
-                            for b in 0..n_batch {
+                            for b in 0..kernel_batch {
                                 unsafe {
                                     crate::cuda_ffi::saxpy_cuda(
-                                        1.0, d_m_initial.as_ptr().add(b * dd), d_m_old.ptr(), dd as i32,
+                                        1.0, d_m_initial.as_ptr().add(b * dd_mem),
+                                        (d_m_old.ptr() as *mut u8).add((b / n_batch) * dd_mem * 4) as *mut f32,
+                                        dd_mem as i32,
                                     );
                                 }
                             }
                         }
                     }
                     GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states, .. } => {
-                        let mut d_m_initial = GpuBuf::zeros(n_batch * dd);
+                        let mut d_m_initial = GpuBuf::<f32>::zeros(kernel_batch * dd_mem);
 
                         let m_for_bw = if is_proxy {
-                            let m_bcast = GpuBuf::zeros(n_batch * (cl + 1) * dd);
+                            let m_bcast = GpuBuf::<f32>::zeros(kernel_batch * (cl + 1) * dd_mem);
                             unsafe {
                                 let rc = crate::cuda_ffi::broadcast_fill_f32_cuda(
                                     m_bcast.ptr(), m_states.as_ptr(),
-                                    i32::try_from(dd).expect("dd overflows i32"),
+                                    i32::try_from(dd_mem).expect("dd_mem overflows i32"),
                                     i32::try_from(cl + 1).expect("cl+1 overflows i32"),
-                                    i32::try_from(n_batch).expect("n_batch overflows i32"),
+                                    i32::try_from(kernel_batch).expect("kernel_batch overflows i32"),
                                 );
                                 assert_eq!(rc, 0, "broadcast_fill M failed (rc={rc})");
                             }
@@ -1303,15 +1349,17 @@ pub(crate) fn gpu_memory_backward(
                             &m_for_bw, &d_y_padded,
                             &mut d_k_shard, &mut d_v_shard, &mut d_q_shard,
                             &mut d_alpha_shard, &mut d_theta_shard, &mut d_m_initial,
-                            cl, d, n_batch,
+                            cl, hd, kernel_batch,
                             cfg.error_clip_for_level(level),
                         );
 
                         if !is_proxy {
-                            for b in 0..n_batch {
+                            for b in 0..kernel_batch {
                                 unsafe {
                                     crate::cuda_ffi::saxpy_cuda(
-                                        1.0, d_m_initial.as_ptr().add(b * dd), d_m_old.ptr(), dd as i32,
+                                        1.0, d_m_initial.as_ptr().add(b * dd_mem),
+                                        (d_m_old.ptr() as *mut u8).add((b / n_batch) * dd_mem * 4) as *mut f32,
+                                        dd_mem as i32,
                                     );
                                 }
                             }
@@ -1320,7 +1368,7 @@ pub(crate) fn gpu_memory_backward(
                     _ => unreachable!("TNT inner cache must be Titans or Delta"),
                 }
 
-                // CS-39 straight-through: zero d_alpha where alpha was clamped.
+                // CS-39 straight-through: clamp masks on per-head gate data (element-wise, works)
                 let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
                 let alpha_ceil  = cfg.alpha_ceil.get(level).copied().unwrap_or(1.0);
                 if alpha_floor > 0.0 || alpha_ceil < 1.0 {
@@ -1332,8 +1380,6 @@ pub(crate) fn gpu_memory_backward(
                         }
                     }
                 }
-
-                // CS-39 straight-through: zero d_theta where theta was clamped
                 let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
                 let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
                 if theta_floor > 0.0 || theta_ceil < f32::MAX {
@@ -1346,75 +1392,122 @@ pub(crate) fn gpu_memory_backward(
                     }
                 }
 
-                // Step 5b: L2 normalization backward for k/q per shard.
+                // Spec 51: reshape per-head grads back to d-space for L2 backward + gate backward
+                let d_k_shard_dm = crate::gpu_forward::reshape_from_per_head(&d_k_shard, 1, padded_len, nh, hd);
+                let d_v_shard_dm = crate::gpu_forward::reshape_from_per_head(&d_v_shard, 1, padded_len, nh, hd);
+                let d_q_shard_dm = crate::gpu_forward::reshape_from_per_head(&d_q_shard, 1, padded_len, nh, hd);
+                let d_alpha_shard_dm = crate::gpu_forward::sum_gates_across_heads(&d_alpha_shard, 1, padded_len, nh);
+                let d_theta_shard_dm = crate::gpu_forward::sum_gates_across_heads(&d_theta_shard, 1, padded_len, nh);
+                let d_eta_shard_dm = if has_eta {
+                    crate::gpu_forward::sum_gates_across_heads(&d_eta_shard, 1, padded_len, nh)
+                } else {
+                    GpuBuf::<f32>::zeros(padded_len)
+                };
+
+                // Reshape cached per-head k_mem/v_mem/q_mem back to d-space for gate backward + L2 backward
+                let (cache_k_mem_dm, cache_v_mem_dm, cache_q_mem_dm, cache_alpha_dm, cache_theta_dm, cache_eta_dm) = match inner_cache {
+                    GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, .. } => {
+                        let k_dm = crate::gpu_forward::reshape_from_per_head(k_mem, 1, padded_len, nh, hd);
+                        let v_dm = crate::gpu_forward::reshape_from_per_head(v_mem, 1, padded_len, nh, hd);
+                        let q_dm = crate::gpu_forward::reshape_from_per_head(q_mem, 1, padded_len, nh, hd);
+                        // Extract head 0's gates (all heads have same value per position)
+                        let a_dm = GpuBuf::<f32>::zeros(padded_len);
+                        let t_dm = GpuBuf::<f32>::zeros(padded_len);
+                        let e_dm = GpuBuf::<f32>::zeros(padded_len);
+                        unsafe {
+                            let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(a_dm.ptr() as *mut _, alpha.as_ptr() as *const _, padded_len * 4);
+                            assert_eq!(rc, 0, "TNT backward: alpha gate extract failed (rc={rc})");
+                            let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(t_dm.ptr() as *mut _, theta.as_ptr() as *const _, padded_len * 4);
+                            assert_eq!(rc, 0, "TNT backward: theta gate extract failed (rc={rc})");
+                            let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(e_dm.ptr() as *mut _, eta.as_ptr() as *const _, padded_len * 4);
+                            assert_eq!(rc, 0, "TNT backward: eta gate extract failed (rc={rc})");
+                        }
+                        (k_dm, v_dm, q_dm, a_dm, t_dm, Some(e_dm))
+                    }
+                    GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, .. } => {
+                        let k_dm = crate::gpu_forward::reshape_from_per_head(k_mem, 1, padded_len, nh, hd);
+                        let v_dm = crate::gpu_forward::reshape_from_per_head(v_mem, 1, padded_len, nh, hd);
+                        let q_dm = crate::gpu_forward::reshape_from_per_head(q_mem, 1, padded_len, nh, hd);
+                        let a_dm = GpuBuf::<f32>::zeros(padded_len);
+                        let t_dm = GpuBuf::<f32>::zeros(padded_len);
+                        unsafe {
+                            let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(a_dm.ptr() as *mut _, alpha.as_ptr() as *const _, padded_len * 4);
+                            assert_eq!(rc, 0, "TNT backward: alpha gate extract failed (rc={rc})");
+                            let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(t_dm.ptr() as *mut _, theta.as_ptr() as *const _, padded_len * 4);
+                            assert_eq!(rc, 0, "TNT backward: theta gate extract failed (rc={rc})");
+                        }
+                        (k_dm, v_dm, q_dm, a_dm, t_dm, None)
+                    }
+                    _ => unreachable!(),
+                };
+
+                // Step 5b: L2 normalization backward for k/q (d-space, using d-space norms)
+                let d_k_shard_final;
+                let d_q_shard_final;
                 {
-                    let d_k_raw = GpuBuf::zeros(shard_tokens * d);
-                    let d_q_raw = GpuBuf::zeros(shard_tokens * d);
+                    let d_k_raw = GpuBuf::<f32>::zeros(padded_len * d);
+                    let d_q_raw = GpuBuf::<f32>::zeros(padded_len * d);
                     unsafe {
                         crate::cuda_ffi::l2_normalize_backward_f32_cuda(
-                            d_k_shard.as_ptr(), shard_k_mem.as_ptr(), shard_k_norms.as_ptr(),
-                            d_k_raw.ptr(), shard_tokens as i32, d as i32, 1e-8,
+                            d_k_shard_dm.as_ptr(), cache_k_mem_dm.as_ptr(), shard_k_norms.as_ptr(),
+                            d_k_raw.ptr(), padded_len as i32, d as i32, 1e-8,
                         );
                         crate::cuda_ffi::l2_normalize_backward_f32_cuda(
-                            d_q_shard.as_ptr(), shard_q_mem.as_ptr(), shard_q_norms.as_ptr(),
-                            d_q_raw.ptr(), shard_tokens as i32, d as i32, 1e-8,
+                            d_q_shard_dm.as_ptr(), cache_q_mem_dm.as_ptr(), shard_q_norms.as_ptr(),
+                            d_q_raw.ptr(), padded_len as i32, d as i32, 1e-8,
                         );
                     }
-                    d_k_shard = d_k_raw;
-                    d_q_shard = d_q_raw;
+                    d_k_shard_final = d_k_raw;
+                    d_q_shard_final = d_q_raw;
                 }
 
-                // Step 6: Accumulate unpadded shard gradients into full-sequence totals.
+                // Step 6: Accumulate unpadded shard gradients into full-sequence totals (d-space)
                 unsafe {
                     crate::cuda_ffi::saxpy_cuda(
-                        1.0, d_k_shard.as_ptr(), d_k_mem_total.ptr().add(shard_start * d),
+                        1.0, d_k_shard_final.as_ptr(), d_k_mem_total.ptr().add(shard_start * d),
                         (shard_len * d) as i32,
                     );
                     crate::cuda_ffi::saxpy_cuda(
-                        1.0, d_v_shard.as_ptr(), d_v_mem_total.ptr().add(shard_start * d),
+                        1.0, d_v_shard_dm.as_ptr(), d_v_mem_total.ptr().add(shard_start * d),
                         (shard_len * d) as i32,
                     );
                     crate::cuda_ffi::saxpy_cuda(
-                        1.0, d_q_shard.as_ptr(), d_q_mem_total.ptr().add(shard_start * d),
+                        1.0, d_q_shard_final.as_ptr(), d_q_mem_total.ptr().add(shard_start * d),
                         (shard_len * d) as i32,
                     );
                 }
 
-                // Step 7: Gate backward per shard → temp buffers → accumulate into level_grads.
+                // Step 7: Gate backward (d-space)
                 {
-                    let mut tmp_dw_alpha = GpuBuf::zeros(2 * d);
-                    let mut tmp_db_alpha = GpuBuf::zeros(1);
-                    let mut tmp_dw_theta = GpuBuf::zeros(2 * d);
-                    let mut tmp_db_theta = GpuBuf::zeros(1);
-                    let mut tmp_dw_eta   = GpuBuf::zeros(2 * d);
-                    let mut tmp_db_eta   = GpuBuf::zeros(1);
+                    let mut tmp_dw_alpha = GpuBuf::<f32>::zeros(2 * d);
+                    let mut tmp_db_alpha = GpuBuf::<f32>::zeros(1);
+                    let mut tmp_dw_theta = GpuBuf::<f32>::zeros(2 * d);
+                    let mut tmp_db_theta = GpuBuf::<f32>::zeros(1);
+                    let mut tmp_dw_eta   = GpuBuf::<f32>::zeros(2 * d);
+                    let mut tmp_db_eta   = GpuBuf::<f32>::zeros(1);
 
-                    match inner_cache {
-                        GpuMemoryCache::Titans { k_mem, v_mem, alpha, theta, eta, .. } => {
-                            crate::dispatch::gate_backward_dd(
-                                &d_alpha_shard, alpha,
-                                Some(&d_theta_shard), Some(theta),
-                                Some(&d_eta_shard), Some(eta),
-                                k_mem, v_mem,
-                                &mut tmp_dw_alpha, &mut tmp_db_alpha,
-                                &mut tmp_dw_theta, &mut tmp_db_theta,
-                                &mut tmp_dw_eta,   &mut tmp_db_eta,
-                                shard_tokens, d,
-                            );
-                        }
-                        GpuMemoryCache::Delta { k_mem, v_mem, alpha, theta, .. } => {
-                            crate::dispatch::gate_backward_dd(
-                                &d_alpha_shard, alpha,
-                                Some(&d_theta_shard), Some(theta),
-                                None, None,
-                                k_mem, v_mem,
-                                &mut tmp_dw_alpha, &mut tmp_db_alpha,
-                                &mut tmp_dw_theta, &mut tmp_db_theta,
-                                &mut tmp_dw_eta,   &mut tmp_db_eta,
-                                shard_tokens, d,
-                            );
-                        }
-                        _ => unreachable!(),
+                    if let Some(ref eta_dm) = cache_eta_dm {
+                        crate::dispatch::gate_backward_dd(
+                            &d_alpha_shard_dm, &cache_alpha_dm,
+                            Some(&d_theta_shard_dm), Some(&cache_theta_dm),
+                            Some(&d_eta_shard_dm), Some(eta_dm),
+                            &cache_k_mem_dm, &cache_v_mem_dm,
+                            &mut tmp_dw_alpha, &mut tmp_db_alpha,
+                            &mut tmp_dw_theta, &mut tmp_db_theta,
+                            &mut tmp_dw_eta,   &mut tmp_db_eta,
+                            padded_len, d,
+                        );
+                    } else {
+                        crate::dispatch::gate_backward_dd(
+                            &d_alpha_shard_dm, &cache_alpha_dm,
+                            Some(&d_theta_shard_dm), Some(&cache_theta_dm),
+                            None, None,
+                            &cache_k_mem_dm, &cache_v_mem_dm,
+                            &mut tmp_dw_alpha, &mut tmp_db_alpha,
+                            &mut tmp_dw_theta, &mut tmp_db_theta,
+                            &mut tmp_dw_eta,   &mut tmp_db_eta,
+                            padded_len, d,
+                        );
                     }
 
                     unsafe {
@@ -1439,7 +1532,7 @@ pub(crate) fn gpu_memory_backward(
             gpu_matmul_transa_dd(&d_q_mem_total, embedded, &mut level_grads.d_w_q_mem, d, s, d);
 
             // d_embedded from memory projections: d_emb = d_k @ W_k + d_v @ W_v + d_q @ W_q
-            let mut d_embedded = GpuBuf::zeros(s * d);
+            let mut d_embedded = GpuBuf::<f32>::zeros(s * d);
             crate::dispatch::cublas_matmul_acc_dd(&d_k_mem_total, &level_params.w_k_mem, &mut d_embedded, s, d, d);
             crate::dispatch::cublas_matmul_acc_dd(&d_v_mem_total, &level_params.w_v_mem, &mut d_embedded, s, d, d);
             crate::dispatch::cublas_matmul_acc_dd(&d_q_mem_total, &level_params.w_q_mem, &mut d_embedded, s, d, d);
