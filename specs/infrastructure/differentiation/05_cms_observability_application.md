@@ -397,7 +397,7 @@ The `cms_tape()` method is added to `PyGpuModel` as a thin Python-side method
 In `loop.py`, after model and config are set up:
 
 ```python
-from nl_hecate.cms_tape import CmsTape
+from engine.cms_tape import CmsTape
 
 cms_tape = None
 if bcfg.tape_device != "off" and bcfg.save_every > 0:

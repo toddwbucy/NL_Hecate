@@ -1964,7 +1964,7 @@ def run_build(bcfg: BuildConfig):
                 from engine.cms_tape import CmsTape
                 # Flush old tape before rebuilding (preserve pre-promotion data)
                 if len(_cms_tape) > 0:
-                    CmsTape.write_sidecar(ckpt_path, _cms_tape.flush(_cms_last_flush_step, step))
+                    CmsTape.write_sidecar(promo_ckpt, _cms_tape.flush(_cms_last_flush_step, step))
                     _cms_last_flush_step = step
                 _cms_tape = CmsTape(
                     k=new_k,
