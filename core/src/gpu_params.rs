@@ -648,8 +648,8 @@ impl GpuStackedContext {
     /// Returns `Vec<Vec<f32>>` -- outer len = n_blocks, inner len = k.
     pub fn memory_norms(&self) -> Vec<Vec<f32>> {
         let mut result = Vec::with_capacity(self.n_blocks);
-        let slot_size = self.d * self.d; // one M matrix = d*d f32s
         for ctx in &self.blocks {
+            let slot_size = ctx.mem_dd(); // per-head: nh * hd * hd; monolithic: d * d
             let mut block_norms = Vec::with_capacity(ctx.memory.len());
             for buf in &ctx.memory {
                 if buf.len() == 0 || slot_size == 0 {

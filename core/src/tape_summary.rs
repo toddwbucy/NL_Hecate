@@ -101,6 +101,10 @@ fn per_head_m_norms(m: &[f32], d: usize, num_heads: usize) -> Vec<f32> {
 /// `d_model`: model dimension (d = num_heads * head_dim). Used to verify that
 /// `final_memory` has the expected square-M layout (d*d elements) before
 /// attempting per-head decomposition.
+///
+/// `has_square_m`: whether the memory rule stores M as a square [d×d] matrix.
+/// MLP-based rules (Moneta/YAAD/MEMORA/SwiGluMlp) have non-square M —
+/// per-head decomposition is skipped regardless of buffer size.
 fn extract_level(
     tape: &Tape,
     all_blocks: &[(usize, OpaqueKey, Option<usize>, Option<usize>)],
@@ -110,6 +114,7 @@ fn extract_level(
     gate_values: Option<&[f32]>,
     num_heads: usize,
     d_model: usize,
+    has_square_m: bool,
 ) -> LevelSummary {
     let level_blocks: Vec<(usize, String)> = all_blocks.iter()
         .filter_map(|&(idx, key, lvl, blk)| {
@@ -145,9 +150,9 @@ fn extract_level(
         .unwrap_or(f32::NAN);
 
     // Per-head M norms: decompose d×d M into num_heads diagonal blocks.
-    // Only valid when final_memory has exactly d_model*d_model elements (square M).
+    // Requires: (1) rule has square M, (2) buffer is exactly d_model² elements.
     let head_m_norms = final_memory
-        .filter(|mem| d_model > 0 && mem.len() == d_model * d_model)
+        .filter(|mem| has_square_m && d_model > 0 && mem.len() == d_model * d_model)
         .map(|mem| per_head_m_norms(mem, d_model, num_heads))
         .unwrap_or_default();
 
@@ -196,7 +201,8 @@ pub fn extract_tape_summary(
             .map(|lev| {
                 let final_mem = context.memory.get(lev).map(|v| v.as_slice());
                 extract_level(tape, &all_blocks, lev, None, final_mem, gate_values,
-                              cfg.swa.num_heads, cfg.swa.d_model)
+                              cfg.swa.num_heads, cfg.swa.d_model,
+                              cfg.memory_rule.has_square_m())
             })
             .collect();
 
@@ -272,7 +278,8 @@ pub fn extract_stacked_tape_summary(
                     .and_then(|block_ctx| block_ctx.get(lev))
                     .map(|v| v.as_slice());
                 let ls = extract_level(tape, &all_ops, lev, Some(b), final_mem, None,
-                                       cfg.swa.num_heads, cfg.swa.d_model);
+                                       cfg.swa.num_heads, cfg.swa.d_model,
+                                       cfg.memory_rule.has_square_m());
                 BlockLevelSummary {
                     block: b,
                     level: ls.level,
@@ -688,5 +695,20 @@ mod tests {
         assert!(per_head_m_norms(&[], 0, 4).is_empty());
         // non-square M → empty
         assert!(per_head_m_norms(&[1.0; 6], 2, 2).is_empty());
+    }
+
+    #[test]
+    fn test_head_norms_empty_for_non_square_rule_with_matching_len() {
+        // Regression: a non-square rule whose buffer happens to have d_model²
+        // elements must NOT get per-head norms. The has_square_m gate prevents
+        // misinterpretation of non-square M buffers.
+        use crate::model::MemoryRuleKind;
+        assert!(!MemoryRuleKind::Moneta.has_square_m());
+        assert!(!MemoryRuleKind::YAAD.has_square_m());
+        assert!(!MemoryRuleKind::MEMORA.has_square_m());
+        assert!(!MemoryRuleKind::SwiGluMlp.has_square_m());
+        assert!(MemoryRuleKind::DeltaRule.has_square_m());
+        assert!(MemoryRuleKind::TitansLMM.has_square_m());
+        assert!(MemoryRuleKind::HebbianRule.has_square_m());
     }
 }

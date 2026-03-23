@@ -104,6 +104,21 @@ pub enum MemoryRuleKind {
     SwiGluMlp,
 }
 
+impl MemoryRuleKind {
+    /// Whether this rule's M state is a square [d × d] matrix suitable for
+    /// per-head diagonal-block decomposition. MLP-based rules (Moneta, YAAD,
+    /// MEMORA) store non-square w1/w2 weights; SwiGluMlp has no inner-loop M.
+    pub fn has_square_m(&self) -> bool {
+        match self {
+            MemoryRuleKind::Moneta
+            | MemoryRuleKind::YAAD
+            | MemoryRuleKind::MEMORA
+            | MemoryRuleKind::SwiGluMlp => false,
+            _ => true,
+        }
+    }
+}
+
 /// MIRAS Knob 2: Attentional bias (loss function for memory updates).
 ///
 /// Selects the objective that drives the inner-loop memory gradient.

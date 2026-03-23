@@ -24,14 +24,19 @@ CONTRACT
               - python/engine/cms_tape.py — CmsTape accumulator with
                 l0_per_head_sample_rate parameter (currently dead, spec 49).
 
-  Guarantees: - LevelSummary gains `head_m_norms: Vec<f32>` (length = num_heads).
+  Guarantees: - LevelSummary gains `head_m_norms: Vec<f32>` (length = num_heads)
+                when MemoryRuleKind::has_square_m() is true, num_heads > 1,
+                and final_memory has d_model² elements. Empty Vec otherwise.
               - BlockLevelSummary gains `head_m_norms: Vec<f32>` (same).
               - GPU path gains `memory_norms_per_head()` returning
-                Vec<Vec<Vec<f32>>> — [n_blocks][k][num_heads].
+                Vec<Vec<Vec<f32>>> — [n_blocks][k][num_heads]. Empty inner Vec
+                for non-square rules or num_heads <= 1.
               - PyO3 tape summary dicts include "head_m_norms": [float, ...].
-              - Existing aggregate m_norm unchanged — head norms are additive.
-              - Zero overhead when head_m_norms is not queried (Vec is empty
-                for k=1 or when num_heads=1).
+              - Existing aggregate m_norm unchanged — head norms satisfy
+                sum(head_m_norms_i²) ≤ m_norm² (equality when cross-head
+                coupling is zero, which holds for Delta/Titans/Hebbian rules).
+              - Zero overhead when head_m_norms is not populated (Vec is empty
+                for non-square rules, k=1, or num_heads=1).
               - CmsTape per-head accumulation via l0_per_head_sample_rate is
                 DEFERRED to spec 49 (task_a1fafb), which is blocked on this spec.
 
@@ -165,12 +170,15 @@ fn extract_level(
     gate_values: Option<&[f32]>,
     num_heads: usize,        // NEW
     d_model: usize,          // NEW — validates square-M layout
+    has_square_m: bool,      // NEW — from MemoryRuleKind::has_square_m()
 ) -> LevelSummary
 ```
 
-Per-head norms are computed only when `final_memory.len() == d_model * d_model`
-and `num_heads > 1`. Otherwise `head_m_norms` is empty (graceful degradation
-for MLP rules, non-square M, or `num_heads=1`).
+Per-head norms are computed only when `has_square_m` is true,
+`final_memory.len() == d_model * d_model`, and `num_heads > 1`. Otherwise
+`head_m_norms` is empty (graceful degradation for MLP rules, non-square M,
+or `num_heads=1`). The `has_square_m` gate is derived from the memory rule
+kind — MLP-based rules (Moneta/YAAD/MEMORA/SwiGluMlp) return false.
 
 ### 2.2 Per-Head Norms on GPU
 
@@ -273,8 +281,10 @@ Per-head norm is a simple contiguous slice reduction: `||buf[h*hd²..
 | `head_m_norms: Vec<f32>` on `LevelSummary` | `tape_summary.rs` | Additive field |
 | `head_m_norms: Vec<f32>` on `BlockLevelSummary` | `tape_summary.rs` | Additive field |
 | `per_head_m_norms()` helper function | `tape_summary.rs` | New function |
-| `num_heads` parameter on `extract_level()` | `tape_summary.rs` | Signature change |
+| `num_heads`, `d_model`, `has_square_m` on `extract_level()` | `tape_summary.rs` | Signature change |
+| `MemoryRuleKind::has_square_m()` method | `model.rs` | New method |
 | `memory_norms_per_head()` method | `gpu_params.rs` | New method |
+| `memory_norms()` uses `ctx.mem_dd()` not `d*d` | `gpu_params.rs` | Bug fix |
 | `head_m_norms` in PyO3 tape summary dicts | `lib.rs` | Additive field |
 
 ### Out of scope (deferred)
