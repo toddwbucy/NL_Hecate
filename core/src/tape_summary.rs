@@ -43,6 +43,10 @@ pub struct LevelSummary {
     pub freq_gate_value: f32,
     /// True if this level used a Frozen* OpaqueKey variant (read-only M path).
     pub is_frozen: bool,
+    /// Per-head Frobenius norms of the block-diagonal M sub-matrices.
+    /// Length = num_heads for square-M rules (Delta, Titans, Hebbian, etc.).
+    /// Empty for MLP-based rules (non-square M) or when num_heads <= 1.
+    pub head_m_norms: Vec<f32>,
 }
 
 /// Lightweight diagnostic extracted from one traced forward+backward pass.
@@ -56,6 +60,32 @@ pub struct TapeSummary {
     pub levels: Vec<LevelSummary>,
 }
 
+/// Compute per-head Frobenius norms from a block-diagonal M matrix.
+///
+/// M is `[d × d]` row-major where `d = num_heads * head_dim`. Head `h` owns
+/// the diagonal sub-block at rows `[h*hd..(h+1)*hd]`, cols `[h*hd..(h+1)*hd]`.
+/// Returns `Vec<f32>` of length `num_heads`, or empty if decomposition is
+/// not applicable (non-square M, num_heads <= 1, d not divisible by num_heads).
+fn per_head_m_norms(m: &[f32], d: usize, num_heads: usize) -> Vec<f32> {
+    if num_heads <= 1 || d == 0 || m.len() != d * d || d % num_heads != 0 {
+        return Vec::new();
+    }
+    let head_dim = d / num_heads;
+    (0..num_heads).map(|h| {
+        let row_start = h * head_dim;
+        let col_start = h * head_dim;
+        let mut sum_sq = 0.0f32;
+        for r in 0..head_dim {
+            let row_off = (row_start + r) * d + col_start;
+            for c in 0..head_dim {
+                let val = m[row_off + c];
+                sum_sq += val * val;
+            }
+        }
+        sum_sq.sqrt()
+    }).collect()
+}
+
 /// Extract a single `LevelSummary` from the tape for level `lev`.
 ///
 /// `final_memory`: the carried memory state from `context.memory[lev]` (or
@@ -64,6 +94,9 @@ pub struct TapeSummary {
 ///
 /// `gate_values`: per-level sigmoid outputs from learned frequency gate.
 /// Pass `None` for Fixed schedule → `freq_gate_value = NaN`.
+///
+/// `num_heads`: number of attention heads for per-head M norm decomposition.
+/// Pass 1 to skip per-head norms.
 fn extract_level(
     tape: &Tape,
     all_blocks: &[(usize, OpaqueKey, Option<usize>, Option<usize>)],
@@ -71,6 +104,7 @@ fn extract_level(
     block_filter: Option<usize>,
     final_memory: Option<&[f32]>,
     gate_values: Option<&[f32]>,
+    num_heads: usize,
 ) -> LevelSummary {
     let level_blocks: Vec<(usize, String)> = all_blocks.iter()
         .filter_map(|&(idx, key, lvl, blk)| {
@@ -105,6 +139,18 @@ fn extract_level(
         .map(|mem| mem.iter().map(|x| x * x).sum::<f32>().sqrt())
         .unwrap_or(f32::NAN);
 
+    // Per-head M norms: decompose d×d M into num_heads diagonal blocks.
+    let head_m_norms = final_memory
+        .map(|mem| {
+            let d = (mem.len() as f64).sqrt() as usize;
+            if d * d == mem.len() {
+                per_head_m_norms(mem, d, num_heads)
+            } else {
+                Vec::new()
+            }
+        })
+        .unwrap_or_default();
+
     let freq_gate_value = gate_values
         .and_then(|gv| gv.get(lev).copied())
         .unwrap_or(f32::NAN);
@@ -118,6 +164,7 @@ fn extract_level(
         m_norm,
         freq_gate_value,
         is_frozen,
+        head_m_norms,
     }
 }
 
@@ -148,7 +195,8 @@ pub fn extract_tape_summary(
         let levels: Vec<LevelSummary> = (0..cfg.k)
             .map(|lev| {
                 let final_mem = context.memory.get(lev).map(|v| v.as_slice());
-                extract_level(tape, &all_blocks, lev, None, final_mem, gate_values)
+                extract_level(tape, &all_blocks, lev, None, final_mem, gate_values,
+                              cfg.swa.num_heads)
             })
             .collect();
 
@@ -173,6 +221,8 @@ pub struct BlockLevelSummary {
     pub m_norm: f32,
     pub freq_gate_value: f32,
     pub is_frozen: bool,
+    /// Per-head Frobenius norms (same semantics as `LevelSummary.head_m_norms`).
+    pub head_m_norms: Vec<f32>,
 }
 
 /// Per-block summary aggregated across levels.
@@ -221,7 +271,8 @@ pub fn extract_stacked_tape_summary(
                 let final_mem = context.get(b)
                     .and_then(|block_ctx| block_ctx.get(lev))
                     .map(|v| v.as_slice());
-                let ls = extract_level(tape, &all_ops, lev, Some(b), final_mem, None);
+                let ls = extract_level(tape, &all_ops, lev, Some(b), final_mem, None,
+                                       cfg.swa.num_heads);
                 BlockLevelSummary {
                     block: b,
                     level: ls.level,
@@ -232,6 +283,7 @@ pub fn extract_stacked_tape_summary(
                     m_norm: ls.m_norm,
                     freq_gate_value: ls.freq_gate_value,
                     is_frozen: ls.is_frozen,
+                    head_m_norms: ls.head_m_norms,
                 }
             }).collect();
             blocks.push(BlockTapeSummary { block: b, levels });
@@ -540,5 +592,101 @@ mod tests {
                 "freq_gate_value should be NaN for Fixed schedule, got {} at level {}",
                 lev.freq_gate_value, lev.level);
         }
+    }
+
+    // ── Phase 4: Per-head observation tests (spec 50) ────────────────
+
+    #[test]
+    fn test_head_norms_length_matches_num_heads() {
+        // DeltaRule with d=64, num_heads=4 → head_m_norms.len() == 4
+        let cfg = MAGConfig::test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let conductor = Conductor::new(cfg.k, cfg.chunk_sizes.clone());
+        let pulse = conductor.pulse();
+        let (input_ids, target_ids) = make_ids(cfg.swa.seq_len, cfg.swa.vocab_size);
+
+        let summary = extract_tape_summary(
+            &params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx,
+        );
+        let lev0 = &summary.levels[0];
+        assert_eq!(lev0.head_m_norms.len(), cfg.swa.num_heads,
+            "head_m_norms length should be num_heads={}, got {}",
+            cfg.swa.num_heads, lev0.head_m_norms.len());
+    }
+
+    #[test]
+    fn test_head_norms_consistent_with_aggregate() {
+        // Sum of squared head norms <= m_norm² (equality when cross-head blocks are zero)
+        let cfg = MAGConfig::test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let mut ctx = ContextState::new(cfg.k, cfg.swa.d_model);
+        let conductor = Conductor::new(cfg.k, cfg.chunk_sizes.clone());
+        let pulse = conductor.pulse();
+        let (input_ids, target_ids) = make_ids(cfg.swa.seq_len, cfg.swa.vocab_size);
+
+        let summary = extract_tape_summary(
+            &params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx,
+        );
+        let lev0 = &summary.levels[0];
+        let head_sq_sum: f32 = lev0.head_m_norms.iter().map(|n| n * n).sum();
+        let agg_sq = lev0.m_norm * lev0.m_norm;
+        assert!(head_sq_sum <= agg_sq + 1e-4,
+            "sum(head_norm²) = {} should be <= m_norm² = {} (diff = {})",
+            head_sq_sum, agg_sq, head_sq_sum - agg_sq);
+    }
+
+    #[test]
+    fn test_head_norms_empty_for_mlp_rules() {
+        // MLP rules (MONETA) have non-square M → head_m_norms should be empty
+        let cfg = test_config_for_rule(MemoryRuleKind::Moneta);
+        let params = MAGParams::init(&cfg, 42);
+        let d = cfg.swa.d_model;
+        let mut ctx = ContextState::new_with_memory_size(
+            cfg.k, d, cfg.d_hidden * d + d * cfg.d_hidden);
+        let conductor = Conductor::new(cfg.k, cfg.chunk_sizes.clone());
+        let pulse = conductor.pulse();
+        let (input_ids, target_ids) = make_ids(cfg.swa.seq_len, cfg.swa.vocab_size);
+
+        let summary = extract_tape_summary(
+            &params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx,
+        );
+        let lev0 = &summary.levels[0];
+        assert!(lev0.head_m_norms.is_empty(),
+            "MLP rules should have empty head_m_norms, got {:?}", lev0.head_m_norms);
+    }
+
+    #[test]
+    fn test_head_norms_uniform_for_identity_m() {
+        // If we seed M as scaled identity, all head norms should be equal
+        let cfg = MAGConfig::test_config();
+        let d = cfg.swa.d_model;
+        let num_heads = cfg.swa.num_heads;
+        let head_dim = cfg.swa.head_dim;
+
+        // Build a scaled identity matrix
+        let mut m = vec![0.0f32; d * d];
+        for i in 0..d {
+            m[i * d + i] = 1.0;
+        }
+
+        let norms = per_head_m_norms(&m, d, num_heads);
+        assert_eq!(norms.len(), num_heads);
+        // Each head's diagonal block of identity has norm sqrt(head_dim)
+        let expected = (head_dim as f32).sqrt();
+        for (h, &n) in norms.iter().enumerate() {
+            assert!((n - expected).abs() < 1e-5,
+                "head {} norm = {}, expected {}", h, n, expected);
+        }
+    }
+
+    #[test]
+    fn test_per_head_m_norms_helper_edge_cases() {
+        // num_heads=1 → empty (no decomposition needed)
+        assert!(per_head_m_norms(&[1.0; 4], 2, 1).is_empty());
+        // empty M → empty
+        assert!(per_head_m_norms(&[], 0, 4).is_empty());
+        // non-square M → empty
+        assert!(per_head_m_norms(&[1.0; 6], 2, 2).is_empty());
     }
 }

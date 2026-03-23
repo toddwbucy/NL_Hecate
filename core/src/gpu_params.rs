@@ -673,6 +673,51 @@ impl GpuStackedContext {
         result
     }
 
+    /// Compute per-(block, level, head) Frobenius norms of M sub-matrices.
+    /// Returns `Vec<Vec<Vec<f32>>>` — [n_blocks][k][num_heads].
+    /// Empty inner Vec for levels with non-square M (MLP rules) or num_heads <= 1.
+    ///
+    /// CPU-side computation: D2H copy + diagonal-block Frobenius norm.
+    /// Acceptable at diagnostic cadence (not training hot path).
+    pub fn memory_norms_per_head(&self) -> Vec<Vec<Vec<f32>>> {
+        let d = self.d;
+        let nh = self.num_heads;
+        let slot_size = d * d;
+        let mut result = Vec::with_capacity(self.blocks.len());
+        for ctx in &self.blocks {
+            let mut block_head_norms = Vec::with_capacity(ctx.memory.len());
+            for buf in &ctx.memory {
+                if nh <= 1 || slot_size == 0 || buf.len() < slot_size {
+                    block_head_norms.push(Vec::new());
+                    continue;
+                }
+                // D2H copy of slot 0 (first batch element)
+                let n = slot_size.min(buf.len());
+                let mut host = vec![0.0f32; n];
+                buf.slice(0, n).copy_to_host(&mut host);
+                // Per-head diagonal block norms
+                if d % nh != 0 {
+                    block_head_norms.push(Vec::new());
+                    continue;
+                }
+                let hd = d / nh;
+                let norms: Vec<f32> = (0..nh).map(|h| {
+                    let rs = h * hd;
+                    let cs = h * hd;
+                    let mut sq = 0.0f32;
+                    for r in 0..hd {
+                        let off = (rs + r) * d + cs;
+                        for c in 0..hd { let v = host[off + c]; sq += v * v; }
+                    }
+                    sq.sqrt()
+                }).collect();
+                block_head_norms.push(norms);
+            }
+            result.push(block_head_norms);
+        }
+        result
+    }
+
     /// Update M-norm tracking after a forward pass (spec 28 dormancy sentinel).
     /// Computes current M norms, diffs against prev, updates dormancy counters.
     pub fn update_m_norm_tracking(&mut self) {
