@@ -1812,6 +1812,11 @@ pub(crate) fn gpu_tnt_forward(
     let dd_mem = hd * hd;
     let bs_mem = batch_size * nh;  // bs=1 for TNT, so bs_mem = nh
     let hd_i32 = i32::try_from(hd).expect("head_dim exceeds i32::MAX");
+    assert!(
+        context_m.len() >= bs_mem * dd_mem,
+        "context_m layout mismatch: expected >= {} (bs_mem={} * dd_mem={}), got {}",
+        bs_mem * dd_mem, bs_mem, dd_mem, context_m.len(),
+    );
 
     let cg = parallel_cfg.tnt_global_chunk_size;
     let cl = parallel_cfg.tnt_local_chunk_size;

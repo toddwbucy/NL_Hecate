@@ -1395,11 +1395,12 @@ pub(crate) fn gpu_memory_backward(
                     GpuBuf::<f32>::zeros(padded_len)
                 };
 
-                // Reshape cached per-head k_mem/v_mem back to d-space for gate backward
-                let (cache_k_mem_dm, cache_v_mem_dm, cache_alpha_dm, cache_theta_dm, cache_eta_dm) = match inner_cache {
-                    GpuMemoryCache::Titans { k_mem, v_mem, alpha, theta, eta, .. } => {
+                // Reshape cached per-head k_mem/v_mem/q_mem back to d-space for gate backward + L2 backward
+                let (cache_k_mem_dm, cache_v_mem_dm, cache_q_mem_dm, cache_alpha_dm, cache_theta_dm, cache_eta_dm) = match inner_cache {
+                    GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, .. } => {
                         let k_dm = crate::gpu_forward::reshape_from_per_head(k_mem, 1, padded_len, nh, hd);
                         let v_dm = crate::gpu_forward::reshape_from_per_head(v_mem, 1, padded_len, nh, hd);
+                        let q_dm = crate::gpu_forward::reshape_from_per_head(q_mem, 1, padded_len, nh, hd);
                         // Extract head 0's gates (all heads have same value per position)
                         let a_dm = GpuBuf::<f32>::zeros(padded_len);
                         let t_dm = GpuBuf::<f32>::zeros(padded_len);
@@ -1409,18 +1410,19 @@ pub(crate) fn gpu_memory_backward(
                             crate::gpu_forward::gpu_buf_memcpy_d2d(t_dm.ptr() as *mut _, theta.as_ptr() as *const _, padded_len * 4);
                             crate::gpu_forward::gpu_buf_memcpy_d2d(e_dm.ptr() as *mut _, eta.as_ptr() as *const _, padded_len * 4);
                         }
-                        (k_dm, v_dm, a_dm, t_dm, Some(e_dm))
+                        (k_dm, v_dm, q_dm, a_dm, t_dm, Some(e_dm))
                     }
-                    GpuMemoryCache::Delta { k_mem, v_mem, alpha, theta, .. } => {
+                    GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, .. } => {
                         let k_dm = crate::gpu_forward::reshape_from_per_head(k_mem, 1, padded_len, nh, hd);
                         let v_dm = crate::gpu_forward::reshape_from_per_head(v_mem, 1, padded_len, nh, hd);
+                        let q_dm = crate::gpu_forward::reshape_from_per_head(q_mem, 1, padded_len, nh, hd);
                         let a_dm = GpuBuf::<f32>::zeros(padded_len);
                         let t_dm = GpuBuf::<f32>::zeros(padded_len);
                         unsafe {
                             crate::gpu_forward::gpu_buf_memcpy_d2d(a_dm.ptr() as *mut _, alpha.as_ptr() as *const _, padded_len * 4);
                             crate::gpu_forward::gpu_buf_memcpy_d2d(t_dm.ptr() as *mut _, theta.as_ptr() as *const _, padded_len * 4);
                         }
-                        (k_dm, v_dm, a_dm, t_dm, None)
+                        (k_dm, v_dm, q_dm, a_dm, t_dm, None)
                     }
                     _ => unreachable!(),
                 };
@@ -1437,7 +1439,7 @@ pub(crate) fn gpu_memory_backward(
                             d_k_raw.ptr(), padded_len as i32, d as i32, 1e-8,
                         );
                         crate::cuda_ffi::l2_normalize_backward_f32_cuda(
-                            d_q_shard_dm.as_ptr(), cache_k_mem_dm.as_ptr(), shard_q_norms.as_ptr(),
+                            d_q_shard_dm.as_ptr(), cache_q_mem_dm.as_ptr(), shard_q_norms.as_ptr(),
                             d_q_raw.ptr(), padded_len as i32, d as i32, 1e-8,
                         );
                     }
