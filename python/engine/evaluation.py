@@ -352,7 +352,18 @@ def print_tape_summary(tape_summary: dict, step: int) -> None:
         )
         # Append m_norm to level line if present
         if "m_norm" in lvl:
-            line += f"  m_norm={lvl['m_norm']:.1f}"
+            import math
+            mn = lvl["m_norm"]
+            line += f"  m_norm={'NaN' if (isinstance(mn, float) and math.isnan(mn)) else f'{mn:.1f}'}"
+        # Frozen flag
+        if lvl.get("is_frozen", False):
+            line += "  FROZEN"
+        # Frequency gate (learned schedule only — NaN for Fixed)
+        if "freq_gate_value" in lvl:
+            import math
+            fgv = lvl["freq_gate_value"]
+            if isinstance(fgv, float) and not math.isnan(fgv):
+                line += f"  freq_gate={fgv:.4f}"
         # Shard M-diff (spec 28): proxy-compatible level differentiation metric
         if "m_shard_diff" in lvl:
             line += f"  \u0394M={lvl['m_shard_diff']:.4f}"
