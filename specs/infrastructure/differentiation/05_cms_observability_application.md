@@ -434,7 +434,7 @@ if cms_tape is not None and len(cms_tape) > 0:
 ### 5.4 New File
 
 ```
-python/nl_hecate/cms_tape.py    # CmsTape class (~150 lines)
+python/engine/cms_tape.py    # CmsTape class (~150 lines)
 ```
 
 This is the only new file. All other changes are edits to existing files.
@@ -446,7 +446,7 @@ This is the only new file. All other changes are edits to existing files.
 | File | Phase | Change |
 |------|-------|--------|
 | `python/src/lib.rs` | 1 | Extract `LevelMetrics`, `GateStats`, `build_tape_summary_dict()`. Refactor 4 methods. ~200 line net reduction. |
-| `python/nl_hecate/cms_tape.py` | 2 | **NEW.** CmsTape class. ~150 lines. |
+| `python/engine/cms_tape.py` | 2 | **NEW.** CmsTape class. ~240 lines. |
 | `python/engine/loop.py` | 2 | Init CmsTape, record at tape diagnostic, flush at checkpoint. ~15 lines added. |
 
 Files **NOT** modified:

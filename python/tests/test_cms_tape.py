@@ -192,7 +192,38 @@ class TestCmsTapeStacked:
         for bi in range(4):
             block = level0["blocks"][bi]
             assert block["block_index"] == bi
+
+    def test_stacked_probe_includes_blocks(self):
+        tape = CmsTape(k=2, n_blocks=4, l0_sample_rate=1.0)
+        tape.record(_make_tape_summary(0, k=2, n_blocks=4), 0)
+        tape.record(_make_tape_summary(8, k=2, n_blocks=4), 8)
+
+        snapshot = tape.probe()
+        for lev in range(2):
+            level_data = snapshot["levels"][lev]
+            assert "blocks" in level_data
+            assert len(level_data["blocks"]) == 4
+            for bi in range(4):
+                block = level_data["blocks"][bi]
+                assert block["block_index"] == bi
+                assert len(block["m_norm"]) == 2
             assert len(block["m_norm"]) == 2  # 2 recorded steps
+
+
+class TestCmsTapeValidation:
+    """Constructor validates sample rate parameters."""
+
+    def test_zero_sample_rate_rejected(self):
+        with pytest.raises(ValueError, match="l0_sample_rate"):
+            CmsTape(k=2, l0_sample_rate=0.0)
+
+    def test_negative_sample_rate_rejected(self):
+        with pytest.raises(ValueError, match="l0_sample_rate"):
+            CmsTape(k=2, l0_sample_rate=-0.5)
+
+    def test_per_head_sample_rate_validated(self):
+        with pytest.raises(ValueError, match="l0_per_head_sample_rate"):
+            CmsTape(k=2, l0_per_head_sample_rate=0.0)
 
 
 class TestCmsTapeNanHandling:

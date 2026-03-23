@@ -53,6 +53,13 @@ class CmsTape:
         l0_sample_rate: float = 0.125,
         l0_per_head_sample_rate: float = 0.0625,
     ):
+        if not (0 < l0_sample_rate <= 1.0):
+            raise ValueError(
+                f"l0_sample_rate must be in (0, 1], got {l0_sample_rate}")
+        if not (0 < l0_per_head_sample_rate <= 1.0):
+            raise ValueError(
+                f"l0_per_head_sample_rate must be in (0, 1], got {l0_per_head_sample_rate}")
+
         self.k = k
         self.n_blocks = n_blocks
         self.num_heads = num_heads
@@ -61,7 +68,7 @@ class CmsTape:
         self.l0_per_head_sample_rate = l0_per_head_sample_rate
 
         # Compute L0 sampling period (deterministic modular, not random)
-        self._l0_period = max(1, round(1.0 / l0_sample_rate)) if l0_sample_rate < 1.0 else 1
+        self._l0_period = 1 if l0_sample_rate == 1.0 else max(1, round(1.0 / l0_sample_rate))
 
         # Per-level accumulators: parallel arrays
         self._levels: list[dict[str, list]] = []
@@ -204,6 +211,14 @@ class CmsTape:
                 level_out[f] = list(acc[f])
             for f in _LEVEL_BOOL_FIELDS:
                 level_out[f] = list(acc[f])
+            if self.n_blocks > 1 and "blocks" in acc:
+                blocks_out = []
+                for bi in range(self.n_blocks):
+                    block_data = {"block_index": bi}
+                    for f in _BLOCK_FIELDS:
+                        block_data[f] = list(acc["blocks"][bi][f])
+                    blocks_out.append(block_data)
+                level_out["blocks"] = blocks_out
             result["levels"].append(level_out)
         return result
 
