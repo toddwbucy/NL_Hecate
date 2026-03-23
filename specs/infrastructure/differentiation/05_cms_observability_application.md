@@ -253,6 +253,9 @@ Per level, the accumulator stores parallel arrays (one entry per recorded step):
     "dgd_delta_norm": [float],   # ‖M@k - v‖_2
     "freq_gate_value": [float],  # sigmoid output (NaN for Fixed)
     "is_frozen": [bool],         # frozen flag
+    # Per-head norms (spec 50): separate step index due to different L0 rate
+    "head_steps": [int],         # step indices for per-head samples
+    "head_m_norms": [[float]],   # [sampled_steps][num_heads] Frobenius norms
     # Per-block (stacked models):
     "blocks": [
         {
@@ -263,6 +266,7 @@ Per level, the accumulator stores parallel arrays (one entry per recorded step):
             "m_shard_diff": [float],
             "alpha_mean": [float],
             "theta_mean": [float],
+            "head_m_norms": [[float]],  # [sampled_steps][num_heads]
         }
     ]
 }

@@ -67,8 +67,10 @@ class CmsTape:
         self.l0_sample_rate = l0_sample_rate
         self.l0_per_head_sample_rate = l0_per_head_sample_rate
 
-        # Compute L0 sampling period (deterministic modular, not random)
+        # Compute L0 sampling periods (deterministic modular, not random)
         self._l0_period = 1 if l0_sample_rate == 1.0 else max(1, round(1.0 / l0_sample_rate))
+        self._l0_per_head_period = (1 if l0_per_head_sample_rate == 1.0
+                                    else max(1, round(1.0 / l0_per_head_sample_rate)))
 
         # Per-level accumulators: parallel arrays
         self._levels: list[dict[str, list]] = []
@@ -78,10 +80,15 @@ class CmsTape:
                 level_data[f] = []
             for f in _LEVEL_BOOL_FIELDS:
                 level_data[f] = []
+            # Per-head norms: separate step index (different sampling rate for L0)
+            level_data["head_steps"] = []
+            level_data["head_m_norms"] = []
             # Per-block arrays (only populated for stacked models)
             if n_blocks > 1:
                 level_data["blocks"] = [
-                    {f: [] for f in _BLOCK_FIELDS} for _ in range(n_blocks)
+                    {**{f: [] for f in _BLOCK_FIELDS},
+                     "head_m_norms": []}
+                    for _ in range(n_blocks)
                 ]
             self._levels.append(level_data)
 
@@ -114,6 +121,16 @@ class CmsTape:
             for f in _LEVEL_BOOL_FIELDS:
                 acc[f].append(lvl_dict.get(f, False))
 
+            # Per-head norms: separate sampling gate for L0
+            head_norms = lvl_dict.get("head_m_norms", [])
+            if head_norms:
+                record_head = True
+                if level_idx == 0 and self._l0_per_head_period > 1:
+                    record_head = (step % self._l0_per_head_period == 0)
+                if record_head:
+                    acc["head_steps"].append(step)
+                    acc["head_m_norms"].append(list(head_norms))
+
         # Per-block data (stacked models)
         if blocks and self.n_blocks > 1:
             for block_dict in blocks:
@@ -138,6 +155,14 @@ class CmsTape:
                             block_acc[f].append(theta["mean"] if theta else None)
                         else:
                             block_acc[f].append(blvl.get(f))
+                    # Per-head norms at block level (same sampling gate as aggregate)
+                    blk_head = blvl.get("head_m_norms", [])
+                    if blk_head:
+                        record_head = True
+                        if level_idx == 0 and self._l0_per_head_period > 1:
+                            record_head = (step % self._l0_per_head_period == 0)
+                        if record_head:
+                            block_acc["head_m_norms"].append(list(blk_head))
 
         self._count += 1
 
@@ -170,6 +195,9 @@ class CmsTape:
                 level_out[f] = acc[f]
             for f in _LEVEL_BOOL_FIELDS:
                 level_out[f] = acc[f]
+            if acc["head_m_norms"]:
+                level_out["head_steps"] = acc["head_steps"]
+                level_out["head_m_norms"] = acc["head_m_norms"]
 
             if self.n_blocks > 1 and "blocks" in acc:
                 blocks_out = []
@@ -177,6 +205,8 @@ class CmsTape:
                     block_data = {"block_index": bi}
                     for f in _BLOCK_FIELDS:
                         block_data[f] = acc["blocks"][bi][f]
+                    if acc["blocks"][bi]["head_m_norms"]:
+                        block_data["head_m_norms"] = acc["blocks"][bi]["head_m_norms"]
                     blocks_out.append(block_data)
                 level_out["blocks"] = blocks_out
 
@@ -211,12 +241,18 @@ class CmsTape:
                 level_out[f] = list(acc[f])
             for f in _LEVEL_BOOL_FIELDS:
                 level_out[f] = list(acc[f])
+            if acc["head_m_norms"]:
+                level_out["head_steps"] = list(acc["head_steps"])
+                level_out["head_m_norms"] = [list(h) for h in acc["head_m_norms"]]
             if self.n_blocks > 1 and "blocks" in acc:
                 blocks_out = []
                 for bi in range(self.n_blocks):
                     block_data = {"block_index": bi}
                     for f in _BLOCK_FIELDS:
                         block_data[f] = list(acc["blocks"][bi][f])
+                    if acc["blocks"][bi]["head_m_norms"]:
+                        block_data["head_m_norms"] = [
+                            list(h) for h in acc["blocks"][bi]["head_m_norms"]]
                     blocks_out.append(block_data)
                 level_out["blocks"] = blocks_out
             result["levels"].append(level_out)
@@ -235,10 +271,13 @@ class CmsTape:
                 acc[f] = []
             for f in _LEVEL_BOOL_FIELDS:
                 acc[f] = []
+            acc["head_steps"] = []
+            acc["head_m_norms"] = []
             if self.n_blocks > 1 and "blocks" in acc:
                 for bi in range(self.n_blocks):
                     for f in _BLOCK_FIELDS:
                         acc["blocks"][bi][f] = []
+                    acc["blocks"][bi]["head_m_norms"] = []
         self._count = 0
 
     @staticmethod

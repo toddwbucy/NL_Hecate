@@ -19,13 +19,18 @@ if str(_pkg_root) not in sys.path:
 from engine.cms_tape import CmsTape
 
 
-def _make_tape_summary(step: int, k: int = 4, n_blocks: int = 1, active_levels: list | None = None) -> dict:
-    """Build a synthetic tape summary dict."""
+def _make_tape_summary(step: int, k: int = 4, n_blocks: int = 1,
+                       active_levels: list | None = None,
+                       num_heads: int = 0) -> dict:
+    """Build a synthetic tape summary dict.
+
+    num_heads > 0 adds head_m_norms to each level/block dict.
+    """
     if active_levels is None:
         active_levels = [True] * k
     levels = []
     for lev in range(k):
-        levels.append({
+        lvl_dict = {
             "level": lev,
             "opaque_key": "DeltaRule",
             "block_count": 1 if active_levels[lev] else 0,
@@ -34,7 +39,11 @@ def _make_tape_summary(step: int, k: int = 4, n_blocks: int = 1, active_levels: 
             "m_norm": 10.0 + lev * 2.0 + step * 0.01,
             "freq_gate_value": 0.95 if lev > 0 else float("nan"),
             "is_frozen": not active_levels[lev],
-        })
+        }
+        if num_heads > 0:
+            lvl_dict["head_m_norms"] = [1.0 + h * 0.1 + lev * 0.5
+                                         for h in range(num_heads)]
+        levels.append(lvl_dict)
     result = {"loss": 3.0 - step * 0.001, "total_blocks": sum(active_levels), "levels": levels}
 
     if n_blocks > 1:
@@ -42,7 +51,7 @@ def _make_tape_summary(step: int, k: int = 4, n_blocks: int = 1, active_levels: 
         for bi in range(n_blocks):
             block_levels = []
             for lev in range(k):
-                block_levels.append({
+                blvl = {
                     "level": lev,
                     "m_norm": 10.0 + lev + bi * 0.5,
                     "output_grad_norm": 0.1 * (lev + 1),
@@ -50,7 +59,11 @@ def _make_tape_summary(step: int, k: int = 4, n_blocks: int = 1, active_levels: 
                     "m_shard_diff": 0.01 * bi,
                     "alpha": {"mean": 0.9, "p99": 0.95} if lev < 2 else None,
                     "theta": {"mean": 0.01, "p99": 0.05} if lev < 2 else None,
-                })
+                }
+                if num_heads > 0:
+                    blvl["head_m_norms"] = [1.0 + h * 0.1 + bi * 0.2
+                                            for h in range(num_heads)]
+                block_levels.append(blvl)
             blocks.append({"block_index": bi, "levels": block_levels})
         result["blocks"] = blocks
         result["n_blocks"] = n_blocks
@@ -248,3 +261,87 @@ class TestCmsTapeNanHandling:
         # This should not raise — NaN would cause ValueError
         serialized = json.dumps(data)
         assert "NaN" not in serialized
+
+
+class TestCmsTapePerHead:
+    """Per-head M norm accumulation (spec 50 data consumed by spec 49)."""
+
+    def test_per_head_norms_recorded(self):
+        tape = CmsTape(k=2, num_heads=4, l0_sample_rate=1.0,
+                        l0_per_head_sample_rate=1.0)
+        tape.record(_make_tape_summary(0, k=2, num_heads=4), 0)
+        tape.record(_make_tape_summary(8, k=2, num_heads=4), 8)
+
+        result = tape.flush(0, 8)
+        l0 = result["levels"][0]
+        assert "head_m_norms" in l0
+        assert "head_steps" in l0
+        assert len(l0["head_m_norms"]) == 2  # 2 steps
+        assert len(l0["head_m_norms"][0]) == 4  # 4 heads
+        assert l0["head_steps"] == [0, 8]
+
+    def test_per_head_l0_sampling(self):
+        """Per-head data samples at l0_per_head_sample_rate, not l0_sample_rate."""
+        tape = CmsTape(k=2, num_heads=4,
+                        l0_sample_rate=0.5,  # every 2nd step
+                        l0_per_head_sample_rate=0.25)  # every 4th step
+        for s in range(16):
+            tape.record(_make_tape_summary(s, k=2, num_heads=4), s)
+
+        result = tape.flush(0, 16)
+        l0 = result["levels"][0]
+        # Aggregate L0: 8 samples (0,2,4,6,8,10,12,14)
+        assert l0["sampled"] == 8
+        # Per-head L0: 4 samples (0,4,8,12)
+        assert len(l0["head_m_norms"]) == 4
+        assert l0["head_steps"] == [0, 4, 8, 12]
+
+        # L1 always full density for both aggregate and per-head
+        l1 = result["levels"][1]
+        assert l1["sampled"] == 16
+        assert len(l1["head_m_norms"]) == 16
+
+    def test_per_head_absent_when_no_heads(self):
+        """Without head_m_norms in tape summary, per-head arrays stay empty."""
+        tape = CmsTape(k=2, num_heads=1, l0_sample_rate=1.0)
+        tape.record(_make_tape_summary(0, k=2, num_heads=0), 0)  # no heads
+
+        result = tape.flush(0, 0)
+        l0 = result["levels"][0]
+        assert "head_m_norms" not in l0  # empty → omitted
+
+    def test_per_head_in_probe(self):
+        tape = CmsTape(k=2, num_heads=4, l0_sample_rate=1.0,
+                        l0_per_head_sample_rate=1.0)
+        tape.record(_make_tape_summary(0, k=2, num_heads=4), 0)
+
+        snapshot = tape.probe()
+        l0 = snapshot["levels"][0]
+        assert "head_m_norms" in l0
+        assert len(l0["head_m_norms"]) == 1
+        assert len(l0["head_m_norms"][0]) == 4
+
+    def test_per_head_stacked_blocks(self):
+        tape = CmsTape(k=2, n_blocks=2, num_heads=4,
+                        l0_sample_rate=1.0, l0_per_head_sample_rate=1.0)
+        tape.record(_make_tape_summary(0, k=2, n_blocks=2, num_heads=4), 0)
+
+        result = tape.flush(0, 0)
+        l0 = result["levels"][0]
+        assert "blocks" in l0
+        for bi in range(2):
+            block = l0["blocks"][bi]
+            assert "head_m_norms" in block
+            assert len(block["head_m_norms"]) == 1
+            assert len(block["head_m_norms"][0]) == 4
+
+    def test_per_head_reset_on_flush(self):
+        tape = CmsTape(k=2, num_heads=4, l0_sample_rate=1.0,
+                        l0_per_head_sample_rate=1.0)
+        tape.record(_make_tape_summary(0, k=2, num_heads=4), 0)
+        tape.flush(0, 0)
+
+        # After flush, per-head data should be empty
+        result = tape.flush(0, 0)
+        l0 = result["levels"][0]
+        assert "head_m_norms" not in l0  # empty → omitted
