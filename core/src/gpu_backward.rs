@@ -1154,24 +1154,30 @@ pub(crate) fn gpu_memory_backward(
                     let k_sum_h = GpuBuf::<f32>::zeros(hd);
                     let v_sum_h = GpuBuf::<f32>::zeros(hd);
                     unsafe {
-                        crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
                             d_m_carry_h.ptr() as *mut _, (d_m_carry.as_ptr() as *const u8).add(h * dd_mem * 4) as *const _, dd_mem * 4);
-                        crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        assert_eq!(rc, 0, "TNT backward: d_m_carry_h extract failed (rc={rc})");
+                        let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
                             k_sum_h.ptr() as *mut _, (k_summaries[shard_idx].as_ptr() as *const u8).add(h * hd * 4) as *const _, hd * 4);
-                        crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        assert_eq!(rc, 0, "TNT backward: k_sum_h extract failed (rc={rc})");
+                        let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
                             v_sum_h.ptr() as *mut _, (v_summaries[shard_idx].as_ptr() as *const u8).add(h * hd * 4) as *const _, hd * 4);
+                        assert_eq!(rc, 0, "TNT backward: v_sum_h extract failed (rc={rc})");
                     }
                     crate::dispatch::tnt_global_update_backward_dd(
                         &d_m_carry_h, &k_sum_h, &v_sum_h,
                         &mut d_m_old_h, &mut d_k_sum_h, &mut d_v_sum_h, hd, 0.95,
                     );
                     unsafe {
-                        crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
                             (d_m_old.ptr() as *mut u8).add(h * dd_mem * 4) as *mut _, d_m_old_h.as_ptr() as *const _, dd_mem * 4);
-                        crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        assert_eq!(rc, 0, "TNT backward: d_m_old_h scatter failed (rc={rc})");
+                        let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
                             (d_k_sum.ptr() as *mut u8).add(h * hd * 4) as *mut _, d_k_sum_h.as_ptr() as *const _, hd * 4);
-                        crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        assert_eq!(rc, 0, "TNT backward: d_k_sum_h scatter failed (rc={rc})");
+                        let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
                             (d_v_sum.ptr() as *mut u8).add(h * hd * 4) as *mut _, d_v_sum_h.as_ptr() as *const _, hd * 4);
+                        assert_eq!(rc, 0, "TNT backward: d_v_sum_h scatter failed (rc={rc})");
                     }
                 }
 
@@ -1188,19 +1194,22 @@ pub(crate) fn gpu_memory_backward(
                     let d_k_sum_h = GpuBuf::<f32>::zeros(hd);
                     let d_v_sum_h = GpuBuf::<f32>::zeros(hd);
                     unsafe {
-                        crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
                             d_k_sum_h.ptr() as *mut _, (d_k_sum.as_ptr() as *const u8).add(h * hd * 4) as *const _, hd * 4);
-                        crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        assert_eq!(rc, 0, "TNT backward: d_k_sum_h summary extract failed (rc={rc})");
+                        let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
                             d_v_sum_h.ptr() as *mut _, (d_v_sum.as_ptr() as *const u8).add(h * hd * 4) as *const _, hd * 4);
+                        assert_eq!(rc, 0, "TNT backward: d_v_sum_h summary extract failed (rc={rc})");
                     }
                     let mut d_local_y_h = GpuBuf::<f32>::zeros(shard_len * hd);
                     crate::dispatch::tnt_shard_summary_mean_backward_dd(
                         &d_k_sum_h, &d_v_sum_h, &mut d_local_y_h, shard_len, hd,
                     );
                     unsafe {
-                        crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
                             (d_local_y_ph.ptr() as *mut u8).add(h * shard_len * hd * 4) as *mut _,
                             d_local_y_h.as_ptr() as *const _, shard_len * hd * 4);
+                        assert_eq!(rc, 0, "TNT backward: d_local_y_h scatter failed (rc={rc})");
                     }
                 }
                 // Reshape per-head d_local_y to d-space for combining with upstream d_y
@@ -1406,9 +1415,12 @@ pub(crate) fn gpu_memory_backward(
                         let t_dm = GpuBuf::<f32>::zeros(padded_len);
                         let e_dm = GpuBuf::<f32>::zeros(padded_len);
                         unsafe {
-                            crate::gpu_forward::gpu_buf_memcpy_d2d(a_dm.ptr() as *mut _, alpha.as_ptr() as *const _, padded_len * 4);
-                            crate::gpu_forward::gpu_buf_memcpy_d2d(t_dm.ptr() as *mut _, theta.as_ptr() as *const _, padded_len * 4);
-                            crate::gpu_forward::gpu_buf_memcpy_d2d(e_dm.ptr() as *mut _, eta.as_ptr() as *const _, padded_len * 4);
+                            let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(a_dm.ptr() as *mut _, alpha.as_ptr() as *const _, padded_len * 4);
+                            assert_eq!(rc, 0, "TNT backward: alpha gate extract failed (rc={rc})");
+                            let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(t_dm.ptr() as *mut _, theta.as_ptr() as *const _, padded_len * 4);
+                            assert_eq!(rc, 0, "TNT backward: theta gate extract failed (rc={rc})");
+                            let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(e_dm.ptr() as *mut _, eta.as_ptr() as *const _, padded_len * 4);
+                            assert_eq!(rc, 0, "TNT backward: eta gate extract failed (rc={rc})");
                         }
                         (k_dm, v_dm, q_dm, a_dm, t_dm, Some(e_dm))
                     }
@@ -1419,8 +1431,10 @@ pub(crate) fn gpu_memory_backward(
                         let a_dm = GpuBuf::<f32>::zeros(padded_len);
                         let t_dm = GpuBuf::<f32>::zeros(padded_len);
                         unsafe {
-                            crate::gpu_forward::gpu_buf_memcpy_d2d(a_dm.ptr() as *mut _, alpha.as_ptr() as *const _, padded_len * 4);
-                            crate::gpu_forward::gpu_buf_memcpy_d2d(t_dm.ptr() as *mut _, theta.as_ptr() as *const _, padded_len * 4);
+                            let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(a_dm.ptr() as *mut _, alpha.as_ptr() as *const _, padded_len * 4);
+                            assert_eq!(rc, 0, "TNT backward: alpha gate extract failed (rc={rc})");
+                            let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(t_dm.ptr() as *mut _, theta.as_ptr() as *const _, padded_len * 4);
+                            assert_eq!(rc, 0, "TNT backward: theta gate extract failed (rc={rc})");
                         }
                         (k_dm, v_dm, q_dm, a_dm, t_dm, None)
                     }
