@@ -331,7 +331,8 @@ def print_level_metrics(gpu_model, k):
         if hasattr(gpu_model, "memory_norms_per_head"):
             ph_norms = gpu_model.memory_norms_per_head()
             if lev < len(ph_norms) and ph_norms[lev]:
-                heads_str = " ".join(f"{n:.2f}" for n in ph_norms[lev])
+                fmt = lambda n: f"{n:.2e}" if 0 < n < 0.01 else f"{n:.4f}"
+                heads_str = " ".join(fmt(n) for n in ph_norms[lev])
                 line += f"  heads=[{heads_str}]"
         print(line)
 
@@ -380,7 +381,8 @@ def print_tape_summary(tape_summary: dict, step: int) -> None:
         # Per-head M norms (spec 50): head differentiation signal
         if "head_m_norms" in lvl and lvl["head_m_norms"]:
             heads = lvl["head_m_norms"]
-            heads_str = " ".join(f"{n:.2f}" for n in heads)
+            fmt = lambda n: f"{n:.2e}" if 0 < n < 0.01 else f"{n:.4f}"
+            heads_str = " ".join(fmt(n) for n in heads)
             print(f"           M_heads=[{heads_str}]")
         # Alpha (retention/forgetting gate) — before theta
         if "alpha" in lvl and lvl["alpha"] is not None:

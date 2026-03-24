@@ -1364,7 +1364,7 @@ def run_build(bcfg: BuildConfig):
                     ph = gpu_model.memory_norms_per_head()
                     if ph and any(h for h in ph):
                         log_fields["head_m_norms"] = [
-                            [round(n, 4) for n in heads] for heads in ph]
+                            [round(n, 8) for n in heads] for heads in ph]
             # Spec 23: per-block gradient norms + depth specialization CV
             if is_stacked and hasattr(gpu_model, "block_grad_norms"):
                 block_gnorms = gpu_model.block_grad_norms()
