@@ -1,6 +1,6 @@
 # TNT Per-Head Memory Support
 
-```
+```text
 CONTRACT
   Purpose:    Extend TNT hierarchical parallelism (gpu_tnt_forward/backward) to
               support per-head memory (num_heads > 1). Removes the num_heads==1
