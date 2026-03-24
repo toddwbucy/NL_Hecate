@@ -3452,14 +3452,14 @@ impl GpuStackedModel {
         self.last_l0_block_gnorms.clone()
     }
 
-    /// Compute per-level Frobenius norms of M matrices on GPU.
+    /// Return cached per-level Frobenius norms of M matrices.
+    /// These are captured by update_m_norm_tracking() BEFORE periodic reset
+    /// zeros the buffers, so they reflect the actual end-of-step M state.
     /// Returns Vec<f32> of length k (max across blocks per level).
-    /// Uses GpuStackedContext::memory_norms() which reads per-head layout correctly.
     fn memory_norms(&self) -> Vec<f32> {
-        let block_norms = self.context.memory_norms();
         let k = self.cfg.k;
         let mut level_norms = vec![0.0f32; k];
-        for bn in &block_norms {
+        for bn in &self.context.prev_m_norms {
             for (level, &norm) in bn.iter().enumerate() {
                 if level < k && norm > level_norms[level] {
                     level_norms[level] = norm;
@@ -3469,16 +3469,16 @@ impl GpuStackedModel {
         level_norms
     }
 
-    /// Compute per-head Frobenius norms of M sub-matrices on GPU.
-    /// Returns Vec<Vec<f32>> of shape [k][num_heads] (max across blocks per level).
-    /// Empty inner Vec for MLP rules or num_heads <= 1.
+    /// Return cached per-head Frobenius norms of M sub-matrices.
+    /// These are captured by update_m_norm_tracking() BEFORE periodic reset
+    /// zeros the buffers. Returns Vec<Vec<f32>> of shape [k][num_heads]
+    /// (max across blocks per level). Empty inner Vec for MLP rules or num_heads <= 1.
     fn memory_norms_per_head(&self) -> Vec<Vec<f32>> {
-        let block_head_norms = self.context.memory_norms_per_head();
         let k = self.cfg.k;
         let nh = self.cfg.swa.num_heads;
         let mut result: Vec<Vec<f32>> = (0..k).map(|_| vec![0.0f32; nh]).collect();
         let mut has_data = false;
-        for bhn in &block_head_norms {
+        for bhn in &self.context.cached_per_head_norms {
             for (level, heads) in bhn.iter().enumerate() {
                 if level < k && !heads.is_empty() {
                     has_data = true;

@@ -603,6 +603,9 @@ pub struct GpuStackedContext {
     pub dormancy_floors: Vec<f32>,
     /// Consecutive below-floor steps to trigger "dormant" status.
     pub dormancy_consecutive: usize,
+    /// Cached per-(block, level, head) M norms from pre-reset snapshot.
+    /// Populated by update_m_norm_tracking() before periodic_reset zeros the buffers.
+    pub cached_per_head_norms: Vec<Vec<Vec<f32>>>,
 }
 
 #[cfg(feature = "cuda")]
@@ -626,6 +629,7 @@ impl GpuStackedContext {
             dormancy_below_count: vec![vec![0; k]; n_blocks],
             dormancy_floors: Vec::new(),
             dormancy_consecutive: 5,
+            cached_per_head_norms: Vec::new(),
         }
     }
 
@@ -739,6 +743,9 @@ impl GpuStackedContext {
         }
 
         self.prev_m_norms = current_norms;
+        // Cache per-head norms before periodic reset zeros the buffers.
+        // PyO3 memory_norms_per_head() reads this cached snapshot.
+        self.cached_per_head_norms = self.memory_norms_per_head();
     }
 
     /// Per-(block, level) dormancy status: "active", "warning", "dormant".
@@ -817,6 +824,7 @@ impl GpuStackedContext {
             dormancy_below_count: self.dormancy_below_count.clone(),
             dormancy_floors: self.dormancy_floors.clone(),
             dormancy_consecutive: self.dormancy_consecutive,
+            cached_per_head_norms: self.cached_per_head_norms.clone(),
         }
     }
 }
