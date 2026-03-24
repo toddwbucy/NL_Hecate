@@ -1123,7 +1123,7 @@ pub(crate) fn gpu_memory_backward(
             assert_eq!(k_summaries.len(), n_total, "TNT backward: k_summaries.len() ({}) != total_shards ({n_total})", k_summaries.len());
             assert_eq!(v_summaries.len(), n_total, "TNT backward: v_summaries.len() ({}) != total_shards ({n_total})", v_summaries.len());
 
-            let _hd_i32 = i32::try_from(hd).expect("head_dim exceeds i32::MAX");
+            assert!(hd <= i32::MAX as usize, "head_dim exceeds i32::MAX");
 
             // Accumulators for projection weight grads across all shards (d-space)
             let d_k_mem_total = GpuBuf::<f32>::zeros(s * d);

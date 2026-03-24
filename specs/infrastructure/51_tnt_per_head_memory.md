@@ -44,7 +44,7 @@ Since every production config has `num_heads > 1` (12, 16, or 24), TNT is **neve
 activated**. All forward passes fall through to `gpu_memory_forward`, which processes
 the full sequence length sequentially with per-token M trajectory buffers:
 
-```
+```text
 Without TNT (current regression):
   m_states = GpuBuf::zeros(bs_mem * (s+1) * dd_mem)
   = 12 * 513 * 4096 = 25.2M floats PER LEVEL PER BLOCK
@@ -102,7 +102,7 @@ In the pre-regression code, global M was `d x d` and the global update used
 d-dimensional shard summaries. With per-head memory, M is `nh x (hd x hd)`.
 The global update must become per-head to match:
 
-```
+```text
 Per-head global update (per shard boundary):
   FOR h = 0 to nh-1:
     k_sum_h = mean(k_mem_h[shard_start..shard_end])    // [hd]
