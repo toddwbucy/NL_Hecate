@@ -96,7 +96,8 @@ def collect_shards(source_dir: Path, ingredient: str) -> list[Path]:
 
 
 def stream_documents(
-    shards: list[Path], target_chars: int, min_text_len: int
+    shards: list[Path], target_chars: int, min_text_len: int,
+    skip_docs: int = 0,
 ) -> list[str]:
     """Stream documents from shards until target_chars reached.
 
@@ -106,19 +107,36 @@ def stream_documents(
 
     Documents are accumulated as strings (not tokens) to allow a seeded
     train/val split at the document level before tokenization.
+
+    If skip_docs > 0, that many qualifying documents (passing min_text_len
+    filter) are skipped before accumulation begins. This lets volume N+1 pick
+    up exactly where volume N left off in the sorted shard stream.
     """
     docs: list[str] = []
     total_chars = 0
     total_records = 0
-    skipped = 0
+    skipped_short = 0
+    skipped_offset = 0
+    kept = 0
 
     for shard_idx, shard in enumerate(shards):
         for rec in stream_jsonl_zst(shard):
             total_records += 1
             text = rec.get("text", "")
             if not isinstance(text, str) or len(text) < min_text_len:
-                skipped += 1
+                skipped_short += 1
                 continue
+
+            kept += 1
+            if kept <= skip_docs:
+                skipped_offset += 1
+                if skipped_offset % 50_000 == 0:
+                    print(
+                        f"    skipping: {skipped_offset:,}/{skip_docs:,} docs...",
+                        end="\r",
+                    )
+                continue
+
             docs.append(text)
             total_chars += len(text)
 
@@ -133,31 +151,38 @@ def stream_documents(
         if total_chars >= target_chars:
             break
 
+    if skip_docs > 0:
+        print(f"\n  Skipped {skipped_offset:,} docs (volume offset)")
     print(
-        f"\n  Streamed {total_records:,} records → {len(docs):,} kept, "
-        f"{skipped:,} skipped (<{min_text_len} chars)"
+        f"  Streamed {total_records:,} records → {len(docs):,} kept, "
+        f"{skipped_short:,} skipped (<{min_text_len} chars)"
     )
     print(f"  Total chars: {total_chars:,}")
     return docs
 
 
 def tokenize_documents(
-    docs: list[str], tokenizer, target_tokens: int
+    docs: list[str], tokenizer, target_tokens: int, eot_id: int = 0,
+    batch_size: int = 10_000,
 ) -> tuple[list[int], list[int]]:
-    """Tokenize docs into flat token/target arrays with EOT document separators."""
+    """Tokenize docs into flat token/target arrays with EOT document separators.
+
+    Uses encode_batch for Rust-level parallelism across all available cores.
+    """
     all_tokens: list[int] = []
 
-    for i, doc in enumerate(docs):
-        ids = tokenizer.encode(doc).ids
-        all_tokens.extend(ids)
-        all_tokens.append(EOT_ID)
+    for start in range(0, len(docs), batch_size):
+        batch = docs[start:start + batch_size]
+        encoded = tokenizer.encode_batch(batch)
+        for enc in encoded:
+            all_tokens.extend(enc.ids)
+            all_tokens.append(eot_id)
 
-        if i % 10_000 == 0 and i > 0:
-            print(
-                f"    tokenized {i:,}/{len(docs):,} docs, "
-                f"{len(all_tokens):,} tokens...",
-                end="\r",
-            )
+        print(
+            f"    tokenized {min(start + batch_size, len(docs)):,}/{len(docs):,} docs, "
+            f"{len(all_tokens):,} tokens...",
+            end="\r",
+        )
         if len(all_tokens) >= target_tokens:
             break
 
@@ -227,6 +252,16 @@ def main() -> None:
             "ensures every document spans at least one full L3 CMS period."
         ),
     )
+    parser.add_argument(
+        "--skip_docs",
+        type=int,
+        default=0,
+        help=(
+            "Number of qualifying documents to skip before accumulating. "
+            "Use this to create volume N+1 by skipping the docs volume N consumed. "
+            "Example: volume 1 used 358524 docs → --skip_docs 358524 for volume 2."
+        ),
+    )
     args = parser.parse_args()
 
     if not (0.0 < args.val_ratio < 1.0):
@@ -267,7 +302,8 @@ def main() -> None:
         f"(target ≈ {args.target_tokens:,} tokens, min_text_len={args.min_text_len:,} chars)..."
     )
     t0 = time.time()
-    docs = stream_documents(shards, target_chars, args.min_text_len)
+    docs = stream_documents(shards, target_chars, args.min_text_len,
+                            skip_docs=args.skip_docs)
     print(f"  Done in {time.time() - t0:.1f}s")
 
     if len(docs) < 10:
@@ -300,20 +336,12 @@ def main() -> None:
     actual_vocab = tokenizer.get_vocab_size()
     print(f"  Vocab size: {actual_vocab:,}")
 
-    # Validate special token IDs match the hardcoded meta.json mapping and EOT_ID.
-    # If --tokenizer points to a non-NL-Hecate vocabulary these IDs will differ,
-    # which would silently corrupt the token stream and meta.json special_tokens block.
-    _expected = {"<|im_start|>": 0, "<|im_end|>": 1, "<|pad|>": 2, "<|endoftext|>": EOT_ID}
-    for token, expected_id in _expected.items():
-        actual_id = tokenizer.token_to_id(token)
-        if actual_id != expected_id:
-            print(
-                f"ERROR: Special token '{token}' has id={actual_id}, expected {expected_id}.\n"
-                "       --tokenizer must use the standard NL-Hecate 32K BPE vocabulary\n"
-                "       (data/fineweb_edu/tokenizer.json).",
-                file=sys.stderr,
-            )
-            sys.exit(1)
+    # Resolve EOT token ID from the tokenizer itself (not hardcoded).
+    eot_id = tokenizer.token_to_id("<|endoftext|>")
+    if eot_id is None:
+        print("ERROR: Tokenizer has no <|endoftext|> token.", file=sys.stderr)
+        sys.exit(1)
+    print(f"  EOT token: <|endoftext|> = {eot_id}")
 
     # ── Step 5: Tokenize ──────────────────────────────────────────────
     print(f"\nStep 5: Tokenizing (target={args.target_tokens:,} total tokens)...")
@@ -326,11 +354,11 @@ def main() -> None:
     n_val_docs = len(val_docs)
 
     print("  Train split:")
-    train_input, train_targets = tokenize_documents(train_docs, tokenizer, train_target)
+    train_input, train_targets = tokenize_documents(train_docs, tokenizer, train_target, eot_id)
     train_docs = []  # free memory
 
     print("  Val split:")
-    val_input, val_targets = tokenize_documents(val_docs, tokenizer, val_target)
+    val_input, val_targets = tokenize_documents(val_docs, tokenizer, val_target, eot_id)
     val_docs = []
 
     print(f"  Tokenized in {time.time() - t0:.1f}s")
@@ -358,10 +386,7 @@ def main() -> None:
         "vocab_size": actual_vocab,
         "tokenizer": "tokenizer.json",
         "special_tokens": {
-            "<|im_start|>": 0,
-            "<|im_end|>": 1,
-            "<|pad|>": 2,
-            "<|endoftext|>": EOT_ID,
+            "<|endoftext|>": eot_id,
         },
         "train": {
             "split": "train",
