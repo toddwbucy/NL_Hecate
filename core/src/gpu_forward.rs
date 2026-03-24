@@ -2605,6 +2605,11 @@ fn gpu_cms_replay(
     let hd = cfg.swa.head_dim;
     let ws = cfg.swa.window_size;
     let k  = cfg.k;
+    // NOTE: CUDA graph scratch (GpuLevelScratch) uses monolithic dd = d*d layout,
+    // not per-head dd_mem = nh*hd*hd. The entire CUDA graph path
+    // (gpu_memory_forward_into_scratch + gpu_cms_replay) needs a per-head audit
+    // if cuda_graph_warmup is ever enabled with num_heads > 1.
+    // Currently disabled in all configs (warmup=0).
     let dd = d * d;
 
     let fwd = context.forward_scratch.as_ref()?;
@@ -2754,6 +2759,7 @@ fn copy_final_m_batch(
 /// Used only for checkpointed paths (bs=1 only).
 #[cfg(feature = "cuda")]
 #[inline]
+#[allow(dead_code)] // Retained as single-slot variant of copy_final_m_batch
 fn copy_final_m(states: &GpuBuf<f32>, context_m: &mut GpuBuf<f32>, offset: usize, dd: usize) {
     let m_final = states.slice(offset, dd);
     unsafe {
