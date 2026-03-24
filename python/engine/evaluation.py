@@ -326,7 +326,14 @@ def print_level_metrics(gpu_model, k):
             theta = math.log1p(math.exp(bt))      # softplus -> lr gate
         eta = 1.0 / (1.0 + math.exp(-be))         # sigmoid -> momentum gate
         mnorm = mem_norms[lev] if lev < len(mem_norms) else 0.0
-        print(f"    L{lev}: \u03b1={alpha:.4f} \u03b8={theta:.6f} \u03b7={eta:.4f} \u2016M\u2016={mnorm:.4f}")
+        line = f"    L{lev}: \u03b1={alpha:.4f} \u03b8={theta:.6f} \u03b7={eta:.4f} \u2016M\u2016={mnorm:.4f}"
+        # Per-head M norms (spec 50): show head differentiation
+        if hasattr(gpu_model, "memory_norms_per_head"):
+            ph_norms = gpu_model.memory_norms_per_head()
+            if lev < len(ph_norms) and ph_norms[lev]:
+                heads_str = " ".join(f"{n:.2f}" for n in ph_norms[lev])
+                line += f"  heads=[{heads_str}]"
+        print(line)
 
 
 def print_tape_summary(tape_summary: dict, step: int) -> None:
@@ -370,6 +377,11 @@ def print_tape_summary(tape_summary: dict, step: int) -> None:
         if "dormancy_status" in lvl:
             line += f"  dormancy={lvl['dormancy_status']}"
         print(line)
+        # Per-head M norms (spec 50): head differentiation signal
+        if "head_m_norms" in lvl and lvl["head_m_norms"]:
+            heads = lvl["head_m_norms"]
+            heads_str = " ".join(f"{n:.2f}" for n in heads)
+            print(f"           M_heads=[{heads_str}]")
         # Alpha (retention/forgetting gate) — before theta
         if "alpha" in lvl and lvl["alpha"] is not None:
             a = lvl["alpha"]

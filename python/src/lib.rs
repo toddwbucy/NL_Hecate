@@ -2684,17 +2684,16 @@ impl GpuModel {
     }
 
     /// Compute Frobenius norm of per-level memory matrices on GPU.
-    /// Returns Vec<f32> of length k. D2H transfer: d*d floats per level,
-    /// but norm is computed Rust-side so Python never sees raw memory.
+    /// Returns Vec<f32> of length k. Uses mem_dd (per-head: nh*hd*hd) for correct layout.
     fn memory_norms(&self) -> Vec<f32> {
-        let d = self.context.d;
-        let dd = d * d;
+        let mem_dd = self.context.mem_dd(); // nh * hd * hd (or d * d for nh=1)
         let mut norms = Vec::with_capacity(self.context.memory.len());
         for gpu_mem in &self.context.memory {
-            // Buffer is batch_size * d * d; only element 0 is the carry-forward M.
-            let mut buf = vec![0.0f32; gpu_mem.len()];
-            gpu_mem.copy_to_host(&mut buf);
-            let norm = buf[..dd].iter().map(|x| x * x).sum::<f32>().sqrt();
+            // Buffer is batch_size * mem_dd; only slot 0 is the carry-forward M.
+            let n = mem_dd.min(gpu_mem.len());
+            let mut buf = vec![0.0f32; n];
+            gpu_mem.slice(0, n).copy_to_host(&mut buf);
+            let norm = buf.iter().map(|x| x * x).sum::<f32>().sqrt();
             norms.push(norm);
         }
         norms
@@ -3453,6 +3452,64 @@ impl GpuStackedModel {
         self.last_l0_block_gnorms.clone()
     }
 
+    /// Compute per-level Frobenius norms of M matrices on GPU.
+    /// Returns Vec<f32> of length k (max across blocks per level).
+    /// Uses GpuStackedContext::memory_norms() which reads per-head layout correctly.
+    fn memory_norms(&self) -> Vec<f32> {
+        let block_norms = self.context.memory_norms();
+        let k = self.cfg.k;
+        let mut level_norms = vec![0.0f32; k];
+        for bn in &block_norms {
+            for (level, &norm) in bn.iter().enumerate() {
+                if level < k && norm > level_norms[level] {
+                    level_norms[level] = norm;
+                }
+            }
+        }
+        level_norms
+    }
+
+    /// Compute per-head Frobenius norms of M sub-matrices on GPU.
+    /// Returns Vec<Vec<f32>> of shape [k][num_heads] (max across blocks per level).
+    /// Empty inner Vec for MLP rules or num_heads <= 1.
+    fn memory_norms_per_head(&self) -> Vec<Vec<f32>> {
+        let block_head_norms = self.context.memory_norms_per_head();
+        let k = self.cfg.k;
+        let nh = self.cfg.swa.num_heads;
+        let mut result: Vec<Vec<f32>> = (0..k).map(|_| vec![0.0f32; nh]).collect();
+        let mut has_data = false;
+        for bhn in &block_head_norms {
+            for (level, heads) in bhn.iter().enumerate() {
+                if level < k && !heads.is_empty() {
+                    has_data = true;
+                    for (h, &norm) in heads.iter().enumerate() {
+                        if h < nh && norm > result[level][h] {
+                            result[level][h] = norm;
+                        }
+                    }
+                }
+            }
+        }
+        if !has_data {
+            return (0..k).map(|_| Vec::new()).collect();
+        }
+        result
+    }
+
+    /// Read gate biases from GPU: returns Vec of (b_alpha, b_theta, b_eta) per level.
+    /// Uses block 0's parameters (all blocks share the same level params in stacked model).
+    fn gate_biases(&self) -> Vec<(f32, f32, f32)> {
+        self.params.blocks[0].levels.iter().map(|level| {
+            let mut ba = [0.0f32; 1];
+            let mut bt = [0.0f32; 1];
+            let mut be = [0.0f32; 1];
+            level.b_alpha.copy_to_host(&mut ba);
+            level.b_theta.copy_to_host(&mut bt);
+            level.b_eta.copy_to_host(&mut be);
+            (ba[0], bt[0], be[0])
+        }).collect()
+    }
+
     /// Get the current tape_multiplier value (spec 25: CMS cycles of cache to retain).
     #[getter]
     fn tape_multiplier(&self) -> usize {
@@ -3774,10 +3831,24 @@ impl GpuStackedModel {
             if active { total_active += self.n_blocks; }
             let max_delta = delta_norms.iter().map(|bd| bd[level]).fold(0.0f32, f32::max);
             let max_mnorm = m_norms_post.iter().map(|bn| bn[level]).fold(0.0f32, f32::max);
-            let empty_heads: Vec<f32> = Vec::new();
+            // Aggregate per-head M norms: max across blocks per head
+            let nh = self.cfg.swa.num_heads;
+            let agg_heads: Vec<f32> = if nh > 1 {
+                let mut agg = vec![0.0f32; nh];
+                for bhn in &head_norms_post {
+                    if let Some(heads) = bhn.get(level) {
+                        for (h, &n) in heads.iter().enumerate() {
+                            if h < nh && n > agg[h] { agg[h] = n; }
+                        }
+                    }
+                }
+                agg
+            } else {
+                Vec::new()
+            };
             set_core_level_fields(
                 &ldict, level, &rule_name, bc, agg_gnorms[level], max_delta,
-                max_mnorm, f32::NAN, !active, &empty_heads,
+                max_mnorm, f32::NAN, !active, &agg_heads,
             )?;
             // Aggregate shard M-diff (spec 28)
             let max_diff_abs = (0..self.n_blocks).map(|bi| {
