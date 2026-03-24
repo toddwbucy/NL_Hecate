@@ -231,7 +231,7 @@ of `[nh][hd]`, or flatten to `Vec<GpuBuf<f32>>` of `[nh * hd]`.
 4. **Throughput**: d=768/6b config on GPU0 — target ~1200 tok/s (vs 224 current)
 5. **VRAM**: d=768/6b should use ~8-10 GB (vs ~20 GB current)
 6. **VRAM**: d=1024/8b should fit on 49 GB A6000 (currently OOMs)
-7. **Cargo test**: All 778+ existing Rust tests pass
+7. **Cargo test**: All 1162 Rust tests pass (1170 with `--features cuda`; 3 GPU-scratch tests require live GPU)
 8. **Regression test**: Run k4_chain_smollm_d768_6b for 1024 steps, compare loss curve
 
 ## Risk Assessment
