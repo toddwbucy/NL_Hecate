@@ -42,7 +42,7 @@ def test_params_deterministic():
     assert p1.num_params() == p2.num_params()
 
 
-# ── Forward tests ─────────────────────────────────────────────────────
+# ── Forward + gradient tests (CS-10: no forward-only path) ──────────
 
 def _make_test_data(cfg):
     input_ids = list(range(cfg.seq_len))
@@ -50,47 +50,27 @@ def _make_test_data(cfg):
     return input_ids, target_ids
 
 
-def test_forward_returns_loss():
+def test_compute_gradients_returns_loss():
     cfg = nl_hecate.SWAConfig(64, 4, 16, 24, 16, 256)
     params = nl_hecate.init_params(cfg, 42)
     input_ids, target_ids = _make_test_data(cfg)
-    loss, cache = nl_hecate.forward(params, cfg, input_ids, target_ids)
+    loss, grads = nl_hecate.compute_gradients(params, cfg, input_ids, target_ids)
     assert isinstance(loss, float)
     assert math.isfinite(loss)
     assert loss > 0.0
     # Random init loss should be near ln(256) ≈ 5.55
     assert loss < 20.0
-
-
-def test_forward_deterministic():
-    cfg = nl_hecate.SWAConfig(64, 4, 16, 24, 16, 256)
-    params = nl_hecate.init_params(cfg, 42)
-    input_ids, target_ids = _make_test_data(cfg)
-    loss1, _ = nl_hecate.forward(params, cfg, input_ids, target_ids)
-    loss2, _ = nl_hecate.forward(params, cfg, input_ids, target_ids)
-    assert loss1 == loss2
-
-
-# ── Backward / gradient tests ────────────────────────────────────────
-
-def test_backward_returns_grads():
-    cfg = nl_hecate.SWAConfig(64, 4, 16, 24, 16, 256)
-    params = nl_hecate.init_params(cfg, 42)
-    input_ids, target_ids = _make_test_data(cfg)
-    _loss, cache = nl_hecate.forward(params, cfg, input_ids, target_ids)
-    grads = nl_hecate.backward(params, cfg, cache, input_ids, target_ids)
     assert isinstance(grads, nl_hecate.SWAParams)
     assert grads.num_params() == params.num_params()
 
 
-def test_compute_gradients():
+def test_compute_gradients_deterministic():
     cfg = nl_hecate.SWAConfig(64, 4, 16, 24, 16, 256)
     params = nl_hecate.init_params(cfg, 42)
     input_ids, target_ids = _make_test_data(cfg)
-    loss_cg, grads = nl_hecate.compute_gradients(params, cfg, input_ids, target_ids)
-    loss_fwd, _cache = nl_hecate.forward(params, cfg, input_ids, target_ids)
-    assert loss_cg == loss_fwd
-    assert grads.num_params() == params.num_params()
+    loss1, _ = nl_hecate.compute_gradients(params, cfg, input_ids, target_ids)
+    loss2, _ = nl_hecate.compute_gradients(params, cfg, input_ids, target_ids)
+    assert loss1 == loss2
 
 
 # ── MAG Config tests ─────────────────────────────────────────────

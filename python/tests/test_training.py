@@ -19,14 +19,14 @@ def test_sgd_training_loop():
     params = nl_hecate.init_params(cfg, 42)
     input_ids, target_ids = _make_data(cfg)
 
-    initial_loss, _ = nl_hecate.forward(params, cfg, input_ids, target_ids)
+    initial_loss, _ = nl_hecate.compute_gradients(params, cfg, input_ids, target_ids)
 
     lr = 0.01
     for _ in range(50):
         _loss, grads = nl_hecate.compute_gradients(params, cfg, input_ids, target_ids)
         nl_hecate.apply_weight_gradients(params, grads, lr)
 
-    final_loss, _ = nl_hecate.forward(params, cfg, input_ids, target_ids)
+    final_loss, _ = nl_hecate.compute_gradients(params, cfg, input_ids, target_ids)
     assert final_loss < initial_loss, (
         f"Loss should decrease: initial={initial_loss:.4f}, final={final_loss:.4f}"
     )

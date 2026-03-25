@@ -18,8 +18,6 @@ use nl_hecate_core::cms_variants::{
     BlockConfig as RustBlockConfig,
     MultiBlockConfig as RustMultiBlockConfig,
 };
-use nl_hecate_core::forward::{forward as rust_forward, ForwardCache as RustCache};
-use nl_hecate_core::backward::backward_full as rust_backward_full;
 use nl_hecate_core::gradient::compute_gradients as rust_compute_gradients;
 use nl_hecate_core::mag::{mag_forward as rust_mag_forward, MAGForwardCache as RustMAGCache};
 use nl_hecate_core::gradient::mag_compute_gradients as rust_mag_compute_gradients;
@@ -135,21 +133,6 @@ impl SWAParams {
     }
 }
 
-// ── ForwardCache ─────────────────────────────────────────────────────
-
-#[pyclass]
-struct ForwardCache {
-    inner: RustCache,
-}
-
-#[pymethods]
-impl ForwardCache {
-    /// Return logits as flat list: [seq_len * vocab_size], row-major.
-    fn get_logits(&self) -> Vec<f32> {
-        self.inner.logits.clone()
-    }
-}
-
 // ── Free functions ───────────────────────────────────────────────────
 
 #[pyfunction]
@@ -184,26 +167,6 @@ fn validate_seq_lens(cfg: &SWAConfig, input_ids: &[usize], target_ids: &[usize])
         )));
     }
     Ok(())
-}
-
-#[pyfunction]
-fn forward(params: &SWAParams, cfg: &SWAConfig, input_ids: Vec<usize>, target_ids: Vec<usize>) -> PyResult<(f32, ForwardCache)> {
-    validate_seq_lens(cfg, &input_ids, &target_ids)?;
-    let (loss, cache) = rust_forward(&params.inner, &cfg.inner, &input_ids, &target_ids);
-    Ok((loss, ForwardCache { inner: cache }))
-}
-
-#[pyfunction]
-fn backward(
-    params: &SWAParams,
-    cfg: &SWAConfig,
-    cache: &ForwardCache,
-    input_ids: Vec<usize>,
-    target_ids: Vec<usize>,
-) -> PyResult<SWAParams> {
-    validate_seq_lens(cfg, &input_ids, &target_ids)?;
-    let grads = rust_backward_full(&params.inner, &cfg.inner, &cache.inner, &input_ids, &target_ids);
-    Ok(SWAParams { inner: grads })
 }
 
 #[pyfunction]
@@ -2271,32 +2234,6 @@ impl GpuModel {
         Ok(())
     }
 
-    /// Forward-only pass: returns (loss, logits_flat).
-    /// logits_flat is [seq_len * vocab_size] in row-major order.
-    fn forward(&mut self, input_ids: Vec<usize>, target_ids: Vec<usize>,
-               pulse: &Pulse) -> PyResult<(f32, Vec<f32>)> {
-        let s = self.cfg.swa.seq_len;
-        let v = self.cfg.swa.vocab_size;
-        if input_ids.len() != s || target_ids.len() != s {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("input/target length must be seq_len {}", s)));
-        }
-        if let Some(&max_id) = input_ids.iter().max() {
-            if max_id >= v {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    format!("input_ids contains {} >= vocab_size {}", max_id, v)));
-            }
-        }
-        // target_ids not validated: kernel safely skips target >= vocab (masking)
-        let (loss, cache) = nl_hecate_core::gpu_forward::gpu_cms_forward(
-            &self.params, &self.cfg, &input_ids, &target_ids,
-            &pulse.inner, &mut self.context,
-        );
-        let mut logits = vec![0.0f32; s * v];
-        cache.logits.copy_to_host(&mut logits);
-        Ok((loss, logits))
-    }
-
     /// Full GPU build step with AdamW optimizer. Returns (loss, grad_norm).
     /// Zero PCIe traffic for weights — only input_ids, target_ids, and loss cross the bus.
     /// AdamW state is lazily created on first call.
@@ -2379,79 +2316,6 @@ impl GpuModel {
         Ok((loss, grad_norm))
     }
 
-    /// Full GPU build step with AdamW optimizer that also returns last-position logits.
-    /// Used for continuous outer-loop learning during generation (CS-10).
-    /// Returns (loss, grad_norm, last_logits) where last_logits is Vec<f32> of length vocab_size.
-    #[pyo3(signature = (input_ids, target_ids, pulse, lr, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.1, max_grad_norm=1.0))]
-    fn step_generate(&mut self, input_ids: Vec<usize>, target_ids: Vec<usize>,
-                     pulse: &Pulse, lr: f32, beta1: f32, beta2: f32,
-                     eps: f32, weight_decay: f32, max_grad_norm: f32) -> PyResult<(f32, f32, Vec<f32>)> {
-        let s = self.cfg.swa.seq_len;
-        let v = self.cfg.swa.vocab_size;
-        if s == 0 {
-            return Err(pyo3::exceptions::PyValueError::new_err("seq_len must be > 0"));
-        }
-        if input_ids.len() != s || target_ids.len() != s {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("input/target length must be seq_len {}", s)));
-        }
-        if let Some(&max_id) = input_ids.iter().max() {
-            if max_id >= v {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    format!("input_ids contains {} >= vocab_size {}", max_id, v)));
-            }
-        }
-
-        // Forward
-        let (loss, cache) = nl_hecate_core::gpu_forward::gpu_cms_forward(
-            &self.params, &self.cfg, &input_ids, &target_ids,
-            &pulse.inner, &mut self.context,
-        );
-
-        // Extract last-position logits BEFORE backward consumes cache
-        let last_logits_slice = cache.logits.slice((s - 1) * v, v);
-        let mut last_logits = vec![0.0f32; v];
-        last_logits_slice.copy_to_host(&mut last_logits);
-
-        // Backward
-        let mut grads = nl_hecate_core::gpu_backward::gpu_cms_backward(
-            &self.params, &self.cfg, &cache, false,
-        );
-
-        // Lazy-init AdamW state
-        if self.adamw_state.is_none() {
-            self.adamw_state = Some(
-                nl_hecate_core::gpu_optimizer::GpuAdamWState::from_params(&self.params)
-            );
-        }
-        let state = self.adamw_state.as_mut().unwrap();
-
-        // AdamW update (Pulse-gated, with grad clipping)
-        let grad_norm = nl_hecate_core::gpu_optimizer::gpu_adamw_update(
-            &mut self.params, &mut grads, state,
-            &pulse.inner,
-            lr, beta1, beta2, eps, weight_decay, max_grad_norm,
-        );
-
-        // Weight tying: sync w_unembed^T → w_embed
-        nl_hecate_core::gpu_backward::gpu_sync_embed_weights(
-            &mut self.params,
-            self.cfg.swa.d_model,
-            self.cfg.swa.vocab_size,
-        );
-
-        // TNT periodic reset — same policy as step_adamw (CS-32 compliant).
-        if self.memory_reset {
-            for (k, &active) in pulse.inner.active_levels.iter().enumerate() {
-                if active {
-                    self.context.periodic_reset_level(k);
-                }
-            }
-        }
-
-        Ok((loss, grad_norm, last_logits))
-    }
-
     /// Get current AdamW optimizer step count.
     #[getter]
     fn adamw_step(&self) -> u32 {
@@ -2459,7 +2323,7 @@ impl GpuModel {
     }
 
     /// Reset AdamW optimizer state (moments and step counter).
-    /// Next step_adamw/step_generate call will re-initialize from scratch.
+    /// Next step_adamw call will re-initialize from scratch.
     /// Use after learning probes to prevent corrupted moments from affecting training.
     fn reset_optimizer(&mut self) {
         self.adamw_state = None;
@@ -3067,55 +2931,6 @@ impl GpuStackedModel {
             kv_caches: None,
             decode_workspace: None,
         })
-    }
-
-    /// Forward-only pass for stacked model. Returns (loss, logits_flat).
-    /// logits_flat is [seq_len * vocab_size] in row-major order.
-    /// Does NOT run backward or update weights — safe for inference/eval.
-    fn forward(&mut self, input_ids: Vec<usize>, target_ids: Vec<usize>,
-               pulse: &Pulse) -> PyResult<(f32, Vec<f32>)> {
-        let s = self.cfg.swa.seq_len;
-        let v = self.cfg.swa.vocab_size;
-        if s == 0 {
-            return Err(pyo3::exceptions::PyValueError::new_err("seq_len must be > 0"));
-        }
-        if input_ids.is_empty() || input_ids.len() % s != 0 || target_ids.len() != input_ids.len() {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("input/target length must be batch_size * seq_len {} (got {})", s, input_ids.len())));
-        }
-        let bs = input_ids.len() / s;
-        if bs != self.context.batch_size {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("batch mismatch: input has {} samples but context allocated for batch_size={}",
-                        bs, self.context.batch_size)));
-        }
-        if let Some(&max_id) = input_ids.iter().max() {
-            if max_id >= v {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    format!("input_ids contains {} >= vocab_size {}", max_id, v)));
-            }
-        }
-
-        let (loss, cache) = nl_hecate_core::gpu_stacked_forward::gpu_stacked_forward(
-            &self.params, &self.cfg, &input_ids, &target_ids,
-            &pulse.inner, &mut self.context, &mut self.profiler,
-        );
-
-        // Copy logits from GPU to host
-        let n_logits = bs * s * v;
-        let mut logits_host = vec![0.0f32; n_logits];
-        cache.logits.copy_to_host(&mut logits_host);
-
-        // TNT periodic reset (same policy as step_adamw)
-        if self.memory_reset {
-            for (k, &active) in pulse.inner.active_levels.iter().enumerate() {
-                if active {
-                    self.context.periodic_reset_level(k);
-                }
-            }
-        }
-
-        Ok((loss, logits_host))
     }
 
     /// Full GPU build step with AdamW optimizer. Returns (loss, grad_norm).
@@ -3952,11 +3767,8 @@ fn logprob_at_position(
 fn nl_hecate(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SWAConfig>()?;
     m.add_class::<SWAParams>()?;
-    m.add_class::<ForwardCache>()?;
     m.add_function(wrap_pyfunction!(create_config, m)?)?;
     m.add_function(wrap_pyfunction!(init_params, m)?)?;
-    m.add_function(wrap_pyfunction!(forward, m)?)?;
-    m.add_function(wrap_pyfunction!(backward, m)?)?;
     m.add_function(wrap_pyfunction!(compute_gradients, m)?)?;
     m.add_function(wrap_pyfunction!(apply_weight_gradients, m)?)?;
     // MAG
