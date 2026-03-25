@@ -369,16 +369,27 @@ pub fn gpu_stacked_backward(
                 }
             }
 
+            // Spec 53: GPU-resident dot products for softmax Jacobian.
+            // Replaces ~240 MB D2H per block (at d=2048) with ~768 KB of partial sums.
             let w = &bc.alpha_weights;
-            let mut d_y_host = vec![0.0f32; bsd];
-            crate::dispatch::cuda_sync();
-            d_y_combined.slice(0, bsd).copy_to_host(&mut d_y_host);
             let mut dots = vec![0.0f64; cfg.k];
             for l in 0..cfg.k {
-                let mut y_l_host = vec![0.0f32; bsd];
-                bc.y_per_level[l].slice(0, bsd).copy_to_host(&mut y_l_host);
-                dots[l] = d_y_host.iter().zip(y_l_host.iter())
-                    .map(|(&dy, &y)| dy as f64 * y as f64).sum();
+                let mut num_blocks: i32 = 0;
+                let err = unsafe {
+                    crate::cuda_ffi::dot_product_partial_f32_cuda(
+                        d_y_combined.as_ptr(),
+                        bc.y_per_level[l].as_ptr(),
+                        gnorm_scratch.ptr(),
+                        bsd as i32,
+                        &mut num_blocks,
+                    )
+                };
+                assert_eq!(err, 0, "dot_product_partial_f32_cuda failed");
+                crate::dispatch::cuda_sync();
+                let nb = num_blocks as usize;
+                let mut host = vec![0.0f32; nb];
+                gnorm_scratch.slice(0, nb).copy_to_host(&mut host);
+                dots[l] = host.iter().map(|x| *x as f64).sum();
             }
             let weighted_dot_sum: f64 = (0..cfg.k).map(|j| w[j] as f64 * dots[j]).sum();
             d_alpha_mem = (0..cfg.k)
@@ -602,5 +613,63 @@ pub fn gpu_stacked_backward(
         d_ln_final_gamma,
         d_ln_final_beta,
         blocks: block_grads.into_iter().map(|bg| bg.unwrap()).collect(),
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Tests
+// ══════════════════════════════════════════════════════════════════════
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    use super::*;
+
+    /// Spec 53: Verify GPU partial-reduction dot product matches CPU reference.
+    #[test]
+    fn test_gpu_dot_product_matches_cpu() {
+        let sizes = [128, 256, 1000, 4096, 12_582_912 / 64]; // last = scaled-down d=2048 case
+        for n in sizes {
+            // Generate deterministic test data
+            let a_host: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.7).sin())).collect();
+            let b_host: Vec<f32> = (0..n).map(|i| ((i as f32 * 1.3).cos())).collect();
+
+            // CPU reference (f64 accumulation)
+            let cpu_dot: f64 = a_host.iter().zip(b_host.iter())
+                .map(|(&a, &b)| a as f64 * b as f64)
+                .sum();
+
+            // GPU path
+            let a_gpu = GpuBuf::from_host(&a_host);
+            let b_gpu = GpuBuf::from_host(&b_host);
+            let max_blocks = (n + 255) / 256;
+            let scratch = GpuBuf::<f32>::zeros(max_blocks);
+
+            let mut num_blocks: i32 = 0;
+            let err = unsafe {
+                crate::cuda_ffi::dot_product_partial_f32_cuda(
+                    a_gpu.as_ptr(), b_gpu.as_ptr(), scratch.ptr(),
+                    n as i32, &mut num_blocks,
+                )
+            };
+            assert_eq!(err, 0);
+            crate::dispatch::cuda_sync();
+
+            let nb = num_blocks as usize;
+            let mut partials = vec![0.0f32; nb];
+            scratch.slice(0, nb).copy_to_host(&mut partials);
+            let gpu_dot: f64 = partials.iter().map(|x| *x as f64).sum();
+
+            // Tolerance: f32 products accumulated in shared memory lose precision
+            // relative to f64 CPU reference. Allow 1e-3 relative or 1e-6 absolute.
+            let rel_err = if cpu_dot.abs() > 1e-10 {
+                (gpu_dot - cpu_dot).abs() / cpu_dot.abs()
+            } else {
+                (gpu_dot - cpu_dot).abs()
+            };
+            assert!(
+                rel_err < 1e-3,
+                "n={n}: gpu={gpu_dot:.8}, cpu={cpu_dot:.8}, rel_err={rel_err:.2e}"
+            );
+        }
     }
 }

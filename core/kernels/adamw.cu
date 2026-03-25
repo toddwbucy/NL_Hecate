@@ -125,6 +125,54 @@ cudaError_t grad_norm_sq_cuda(
     return err;
 }
 
+// ── Dot product: partial reduction per block (spec 53) ──────────────
+// Computes sum of a[i]*b[i] per block, stores in partial_sums[blockIdx.x].
+// Host sums the partials to get dot(a, b). Same pattern as grad_norm_sq.
+
+__global__ void dot_product_partial_f32_kernel(
+    const float* __restrict__ a,
+    const float* __restrict__ b,
+    float* __restrict__ partial_sums,
+    int n)
+{
+    extern __shared__ float smem[];
+
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    smem[tid] = (i < n) ? a[i] * b[i] : 0.0f;
+    __syncthreads();
+
+    // Tree reduction in shared memory
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            smem[tid] += smem[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        partial_sums[blockIdx.x] = smem[0];
+    }
+}
+
+cudaError_t dot_product_partial_f32_cuda(
+    const float* a, const float* b,
+    float* partial_sums, int n, int* out_num_blocks)
+{
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    *out_num_blocks = grid;
+    dot_product_partial_f32_kernel<<<grid, block, block * sizeof(float)>>>(
+        a, b, partial_sums, n);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "dot_product_partial_f32_cuda: kernel launch failed: %s\n",
+                cudaGetErrorString(err));
+    }
+    return err;
+}
+
 // ── Scale gradient buffer: g[i] *= scale ───────────────────────────
 // Used for gradient clipping: scale = max_norm / actual_norm.
 
