@@ -1613,11 +1613,14 @@ def run_build(bcfg: BuildConfig):
                              and gpu_model is not None
                              and tokenizer is not None
                              and not is_stacked)
-            # Stacked models: basic coherence samples only (no learning probes)
+            # Stacked models: coherence requires batch_size=1 (inference mode).
+            # During intensive training (batch>1), skip — evaluate checkpoints
+            # offline on a separate GPU via eval_checkpoint.py instead.
             can_stacked_coherence = (bcfg.coher_sample
                                      and gpu_model is not None
                                      and tokenizer is not None
-                                     and is_stacked)
+                                     and is_stacked
+                                     and bcfg.batch_size == 1)
             if bcfg.coher_sample and not can_coherence and not can_stacked_coherence:
                 skip_reasons = []
                 if gpu_model is None:
