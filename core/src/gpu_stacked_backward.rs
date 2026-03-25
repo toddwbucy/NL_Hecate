@@ -179,6 +179,15 @@ pub fn gpu_stacked_backward(
         block_grads.push(None);
     }
 
+    // Spec 54 Phase 2: scratch buffer for batched gnorm + dot product launches.
+    // Hoisted outside the block loop to avoid per-block cudaMalloc/cudaFree overhead
+    // (cudaFree is synchronous and would fence pending kernels).
+    // Chain mode: up to k gnorm launches batched. Independent: 1 gnorm + k dots.
+    let max_norm_blocks = (bsd + 255) / 256;
+    let total_scratch_slots = 1 + cfg.k; // max(k gnorms, 1 gnorm + k dots)
+    let gnorm_scratch: GpuBuf<f32> = GpuBuf::zeros(max_norm_blocks * total_scratch_slots);
+    let mut gnorm_host = vec![0.0f32; max_norm_blocks * total_scratch_slots];
+
     for b in (0..n_blocks).rev() {
         let block = &params.blocks[b];
         let bc = &cache.block_caches[b];
@@ -227,12 +236,6 @@ pub fn gpu_stacked_backward(
 
         // ── Per-level output gradient norms (tape diagnostics) ─────
         let mut block_level_gnorms = vec![0.0f32; cfg.k];
-        // Spec 54 Phase 2: scratch sized for batched gnorm + dot product launches.
-        // Chain mode: up to k gnorm launches batched. Independent: 1 gnorm + k dots.
-        let max_norm_blocks = (bsd + 255) / 256;
-        let total_scratch_slots = 1 + cfg.k; // max(k gnorms, 1 gnorm + k dots)
-        let gnorm_scratch: GpuBuf<f32> = GpuBuf::zeros(max_norm_blocks * total_scratch_slots);
-        let mut gnorm_host = vec![0.0f32; max_norm_blocks * total_scratch_slots];
 
         let d_alpha_mem: Vec<f32>;
         let d_mem_input;

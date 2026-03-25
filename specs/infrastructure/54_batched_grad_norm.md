@@ -242,7 +242,7 @@ let gnorm_scratch = GpuBuf::zeros(max_norm_blocks * total_slots);
 // Launch gnorm at offset 0
 let mut offset = 0usize;
 let mut gnorm_nb: i32 = 0;
-grad_norm_sq_cuda(d_y_combined.as_ptr(), scratch.ptr(), bsd_i32, &mut gnorm_nb);
+grad_norm_sq_cuda(d_y_combined.as_ptr(), gnorm_scratch.ptr(), bsd_i32, &mut gnorm_nb);
 offset += gnorm_nb as usize;
 
 // Launch k dot products at offset positions
@@ -250,22 +250,24 @@ let mut dot_nbs = vec![0i32; cfg.k];
 for l in 0..cfg.k {
     dot_product_partial_f32_cuda(
         d_y_combined.as_ptr(), y_per_level[l].as_ptr(),
-        scratch.ptr().add(offset), bsd_i32, &mut dot_nbs[l],
+        gnorm_scratch.ptr().add(offset), bsd_i32, &mut dot_nbs[l],
     );
     offset += dot_nbs[l] as usize;
 }
 
 // ONE sync + D2H
 cuda_sync();
-scratch.slice(0, offset).copy_to_host(&mut host[..offset]);
+gnorm_scratch.slice(0, offset).copy_to_host(&mut host[..offset]);
 
 // Accumulate gnorm from first segment
 // Accumulate dots from subsequent segments
 ```
 
-Chain mode gnorms remain per-level (1 sync each) because `d_upstream` is
-mutated between levels — the norm must capture the pre-mutation value, and
-cloning the full buffer ([bs*s, d]) to defer would cost more than the sync.
+**Chain mode** gnorms are also batched: all per-level `grad_norm_sq_cuda`
+kernels launch at offset positions in the scratch buffer during the reverse
+level loop, with ONE sync after all levels complete. Old `d_upstream` buffers
+are kept alive in a Vec to prevent `cudaFree` from forcing implicit syncs.
+This eliminates k syncs per block (e.g., k=4, 12 blocks = 48 → 12 syncs).
 
 **Scratch sizing**: `gnorm_scratch` grows from `max_norm_blocks` to
 `max_norm_blocks * (1 + k)`. At d=2048, k=4: 40,960 → 204,800 floats
@@ -279,16 +281,16 @@ cloning the full buffer ([bs*s, d]) to defer would cost more than the sync.
 | `gpu_stacked_per_block_grad_norms` | 352 | ~8 | ~8 | 344 |
 | Unnecessary fences | 4 | 0 | 0 | 4 |
 | Backward (independent: gnorm+dots) | 60 | 60 | 12 | 48 |
-| Backward (chain: gnorms) | 48 | 48 | 48 | 0 |
+| Backward (chain: gnorms) | 48 | 48 | 12 | 36 |
 | Forward (loss D2H) | 1 | 1 | 1 | 0 |
 | **Total (independent)** | **773** | **79** | **31** | **742** |
-| **Total (chain)** | **761** | **67** | **67** | **694** |
+| **Total (chain)** | **761** | **67** | **31** | **730** |
 
-Note: independent vs chain depends on `hope_variant`. Current active models
-use Chained, so Phase 2 primarily benefits future independent-mode runs.
-Chain mode already got its main wins from Phase 1.
+Both chain and independent modes now batch backward diagnostics: 1 sync
+per block for gnorm/dot launches, down from k+1 (independent) or k (chain)
+syncs per block.
 
-**96% reduction in pipeline drains (independent mode).**
+**96% reduction in pipeline drains (both modes).**
 
 ## Files to Modify
 
