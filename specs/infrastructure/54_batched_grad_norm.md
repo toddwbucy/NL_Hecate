@@ -224,25 +224,73 @@ Additionally remove these 4 unnecessary `cuda_sync()` calls:
 | O4 | gpu_stacked_optimizer.rs | 512 | After `clamp_f32_cuda` on `b_theta` — error-check only |
 | O7 | gpu_stacked_optimizer.rs | 536 | `sync_embed_weights` — transpose and gather on same stream |
 
-### 2.5 Backward gnorm batching (optional, Phase 2)
+### 2.5 Backward gnorm + dot product batching (Phase 2)
 
-The `compute_gnorm` calls in `gpu_stacked_backward.rs` (lines 234-249) add
-1 sync per block for diagnostic grad norms. These could be batched similarly,
-but they're already inside the per-block loop alongside other necessary syncs
-(spec 53 dot products). Deferring to Phase 2.
+In the independent/FreqGated aggregation backward path, each block computes:
+- 1 `compute_gnorm` call on `d_y_combined` (diagnostic per-level output gnorm)
+- k `dot_product_partial_f32_cuda` calls for softmax Jacobian (spec 53)
 
-## Sync budget after fix
+All k+1 operations read from the same-sized buffers ([bs*s, d]) and write
+partial sums. None are consumed until after all are computed. Batch them
+with offset scratch and ONE sync per block.
 
-| Source | Before | After | Eliminated |
-|--------|--------|-------|-----------|
-| `gpu_stacked_grad_norm_ex` | 356 | 1 | 355 |
-| `gpu_stacked_per_block_grad_norms` | 352 | 1 | 351 |
-| Unnecessary fences | 4 | 0 | 4 |
-| Backward (gnorm + dots) | 41 | 41 | 0 |
-| Forward (loss D2H) | 1 | 1 | 0 |
-| **Total** | **753** | **44** | **710** |
+```rust
+// Independent path: batch gnorm + k dot products, 1 sync
+let total_slots = 1 + cfg.k; // 1 gnorm + k dots
+let gnorm_scratch = GpuBuf::zeros(max_norm_blocks * total_slots);
 
-**94% reduction in pipeline drains.**
+// Launch gnorm at offset 0
+let mut offset = 0usize;
+let mut gnorm_nb: i32 = 0;
+grad_norm_sq_cuda(d_y_combined.as_ptr(), gnorm_scratch.ptr(), bsd_i32, &mut gnorm_nb);
+offset += gnorm_nb as usize;
+
+// Launch k dot products at offset positions
+let mut dot_nbs = vec![0i32; cfg.k];
+for l in 0..cfg.k {
+    dot_product_partial_f32_cuda(
+        d_y_combined.as_ptr(), y_per_level[l].as_ptr(),
+        gnorm_scratch.ptr().add(offset), bsd_i32, &mut dot_nbs[l],
+    );
+    offset += dot_nbs[l] as usize;
+}
+
+// ONE sync + D2H
+cuda_sync();
+gnorm_scratch.slice(0, offset).copy_to_host(&mut host[..offset]);
+
+// Accumulate gnorm from first segment
+// Accumulate dots from subsequent segments
+```
+
+**Chain mode** gnorms are also batched: all per-level `grad_norm_sq_cuda`
+kernels launch at offset positions in the scratch buffer during the reverse
+level loop, with ONE sync after all levels complete. Old `d_upstream` buffers
+are kept alive in a Vec to prevent `cudaFree` from forcing implicit syncs.
+This eliminates k syncs per block (e.g., k=4, 12 blocks = 48 → 12 syncs).
+
+**Scratch sizing**: `gnorm_scratch` grows from `max_norm_blocks` to
+`max_norm_blocks * (1 + k)`. At d=2048, k=4: 40,960 → 204,800 floats
+(800 KB). Negligible.
+
+## Sync budget after fix (Phase 1 + Phase 2)
+
+| Source | Original | Phase 1 | Phase 2 | Eliminated |
+|--------|----------|---------|---------|-----------|
+| `gpu_stacked_grad_norm_ex` | 356 | ~10 | ~10 | 346 |
+| `gpu_stacked_per_block_grad_norms` | 352 | ~8 | ~8 | 344 |
+| Unnecessary fences | 4 | 0 | 0 | 4 |
+| Backward (independent: gnorm+dots) | 60 | 60 | 12 | 48 |
+| Backward (chain: gnorms) | 48 | 48 | 12 | 36 |
+| Forward (loss D2H) | 1 | 1 | 1 | 0 |
+| **Total (independent)** | **773** | **79** | **31** | **742** |
+| **Total (chain)** | **761** | **67** | **31** | **730** |
+
+Both chain and independent modes now batch backward diagnostics: 1 sync
+per block for gnorm/dot launches, down from k+1 (independent) or k (chain)
+syncs per block.
+
+**96% reduction in pipeline drains (both modes).**
 
 ## Files to Modify
 

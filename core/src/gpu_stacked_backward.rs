@@ -179,6 +179,15 @@ pub fn gpu_stacked_backward(
         block_grads.push(None);
     }
 
+    // Spec 54 Phase 2: scratch buffer for batched gnorm + dot product launches.
+    // Hoisted outside the block loop to avoid per-block cudaMalloc/cudaFree overhead
+    // (cudaFree is synchronous and would fence pending kernels).
+    // Chain mode: up to k gnorm launches batched. Independent: 1 gnorm + k dots.
+    let max_norm_blocks = (bsd + 255) / 256;
+    let total_scratch_slots = 1 + cfg.k; // max(k gnorms, 1 gnorm + k dots)
+    let gnorm_scratch: GpuBuf<f32> = GpuBuf::zeros(max_norm_blocks * total_scratch_slots);
+    let mut gnorm_host = vec![0.0f32; max_norm_blocks * total_scratch_slots];
+
     for b in (0..n_blocks).rev() {
         let block = &params.blocks[b];
         let bc = &cache.block_caches[b];
@@ -227,27 +236,6 @@ pub fn gpu_stacked_backward(
 
         // ── Per-level output gradient norms (tape diagnostics) ─────
         let mut block_level_gnorms = vec![0.0f32; cfg.k];
-        // Shared scratch buffer for grad_norm_sq_cuda calls
-        let max_norm_blocks = (bsd + 255) / 256;
-        let gnorm_scratch = GpuBuf::zeros(max_norm_blocks);
-
-        // Helper: compute L2 norm of a GPU buffer using grad_norm_sq_cuda
-        let compute_gnorm = |buf: &GpuBuf<f32>, scratch: &GpuBuf<f32>| -> f32 {
-            let buf_len = buf.len() as i32;
-            let mut num_blocks_out: i32 = 0;
-            let err = unsafe {
-                crate::cuda_ffi::grad_norm_sq_cuda(
-                    buf.as_ptr(), scratch.ptr(), buf_len, &mut num_blocks_out,
-                )
-            };
-            assert_eq!(err, 0, "grad_norm_sq_cuda failed");
-            crate::dispatch::cuda_sync();
-            let nb = num_blocks_out as usize;
-            let mut host = vec![0.0f32; nb];
-            scratch.slice(0, nb).copy_to_host(&mut host);
-            let sq_sum: f64 = host.iter().map(|x| *x as f64).sum();
-            sq_sum.sqrt() as f32
-        };
 
         let d_alpha_mem: Vec<f32>;
         let d_mem_input;
@@ -278,6 +266,15 @@ pub fn gpu_stacked_backward(
                 d_y_combined.clone_buf()
             };
 
+            // Spec 54 Phase 2: batched gnorm launches for chain mode.
+            // Launch all gnorm kernels at offset positions in gnorm_scratch,
+            // then sync once after the loop. We keep old d_upstream buffers alive
+            // in `gnorm_keep_alive` so cudaFree doesn't force implicit syncs.
+            let mut gnorm_offset = 0usize;
+            // (level, seg_start, seg_end) for deferred gnorm accumulation
+            let mut gnorm_segs: Vec<(usize, usize, usize)> = Vec::new();
+            let mut gnorm_keep_alive: Vec<GpuBuf<f32>> = Vec::new();
+
             // Reverse chain: k-1 → 0
             for level in (0..cfg.k).rev() {
                 let s_f = bc.level_seq_lens[level];
@@ -307,9 +304,23 @@ pub fn gpu_stacked_backward(
                     }
                 };
 
-                // Record per-level gnorm of the actual gradient entering this level
+                // Spec 54 Phase 2: launch gnorm kernel at offset (no sync yet).
+                // d_upstream may have different lengths at different levels due to
+                // spec 46 token reduction, so use actual buffer length.
                 if bc.memory_caches[level].is_some() {
-                    block_level_gnorms[level] = compute_gnorm(&d_upstream, &gnorm_scratch);
+                    let buf_len = d_upstream.len() as i32;
+                    let mut nb: i32 = 0;
+                    let err = unsafe {
+                        crate::cuda_ffi::grad_norm_sq_cuda(
+                            d_upstream.as_ptr(),
+                            gnorm_scratch.ptr().add(gnorm_offset),
+                            buf_len, &mut nb,
+                        )
+                    };
+                    assert_eq!(err, 0, "grad_norm_sq_cuda failed");
+                    let seg_end = gnorm_offset + nb as usize;
+                    gnorm_segs.push((level, gnorm_offset, seg_end));
+                    gnorm_offset = seg_end;
                 }
 
                 // Dispatch based on forward's cached mode (memory_caches[level].is_some()),
@@ -322,7 +333,9 @@ pub fn gpu_stacked_backward(
                         &mut level_grads[level],
                         s_f, d, level, bs,
                     );
-                    d_upstream = d_emb_level;
+                    // Keep old d_upstream alive so gnorm kernel can read it
+                    let old = std::mem::replace(&mut d_upstream, d_emb_level);
+                    gnorm_keep_alive.push(old);
                 } else {
                     // Frozen level: read-only backward, gradient flows through
                     let d_emb_level = gpu_memory_read_only_backward(
@@ -331,7 +344,8 @@ pub fn gpu_stacked_backward(
                         &mut level_grads[level],
                         s_f, d, bs,
                     );
-                    d_upstream = d_emb_level;
+                    let old = std::mem::replace(&mut d_upstream, d_emb_level);
+                    gnorm_keep_alive.push(old);
                 }
                 prof_stop!(profiler);
 
@@ -349,10 +363,25 @@ pub fn gpu_stacked_backward(
                                 bs as i32, prev_s_f as i32, d as i32, pool_factor as i32,
                             );
                         }
-                        d_upstream = d_expanded;
+                        // Keep old buffer alive — cudaFree is synchronous and would
+                        // fence the batched gnorm kernels still in the stream queue.
+                        let old = std::mem::replace(&mut d_upstream, d_expanded);
+                        gnorm_keep_alive.push(old);
                     }
                 }
             }
+
+            // Spec 54 Phase 2: ONE sync + D2H for all chain gnorms
+            if gnorm_offset > 0 {
+                crate::dispatch::cuda_sync();
+                gnorm_scratch.slice(0, gnorm_offset).copy_to_host(&mut gnorm_host[..gnorm_offset]);
+                for &(level, start, end) in &gnorm_segs {
+                    let sq_sum: f64 = (start..end).map(|i| gnorm_host[i] as f64).sum();
+                    block_level_gnorms[level] = sq_sum.sqrt() as f32;
+                }
+            }
+            // Drop keep-alive buffers now that gnorm results are on host
+            drop(gnorm_keep_alive);
 
             // d_upstream is now d_ln_mem_out (at full resolution [bs*s, d])
             d_mem_input = d_upstream;
@@ -361,35 +390,62 @@ pub fn gpu_stacked_backward(
             // Forward: y_combined = Σ_l w[l] * y_level[l], w = softmax(alpha_mem)
             // Spec: specs/infrastructure/21_stacked_alpha_aggregation.md
 
-            // Compute d_y_combined norm once (same gradient for all levels in this mode)
-            let d_y_norm = compute_gnorm(&d_y_combined, &gnorm_scratch);
+            // Spec 54 Phase 2: batch gnorm + k dot products, ONE sync per block.
+            // All operations read from bsd-length buffers and write non-overlapping
+            // partial sums into gnorm_scratch at offset positions.
+            let w = &bc.alpha_weights;
+            let mut offset = 0usize;
+
+            // Slot 0: gnorm of d_y_combined (same gradient for all levels)
+            let mut gnorm_nb: i32 = 0;
+            {
+                let err = unsafe {
+                    crate::cuda_ffi::grad_norm_sq_cuda(
+                        d_y_combined.as_ptr(),
+                        gnorm_scratch.ptr().add(offset),
+                        bsd as i32, &mut gnorm_nb,
+                    )
+                };
+                assert_eq!(err, 0, "grad_norm_sq_cuda failed");
+                offset += gnorm_nb as usize;
+            }
+
+            // Slots 1..k: dot products for softmax Jacobian (spec 53)
+            let mut dot_segs: Vec<(usize, usize)> = Vec::new(); // (start, end)
+            for l in 0..cfg.k {
+                let seg_start = offset;
+                let mut nb: i32 = 0;
+                let err = unsafe {
+                    crate::cuda_ffi::dot_product_partial_f32_cuda(
+                        d_y_combined.as_ptr(),
+                        bc.y_per_level[l].as_ptr(),
+                        gnorm_scratch.ptr().add(offset),
+                        bsd as i32,
+                        &mut nb,
+                    )
+                };
+                assert_eq!(err, 0, "dot_product_partial_f32_cuda failed");
+                offset += nb as usize;
+                dot_segs.push((seg_start, offset));
+            }
+
+            // ONE sync + D2H
+            crate::dispatch::cuda_sync();
+            gnorm_scratch.slice(0, offset).copy_to_host(&mut gnorm_host[..offset]);
+
+            // Accumulate gnorm from first segment
+            let gnorm_sq: f64 = (0..gnorm_nb as usize).map(|i| gnorm_host[i] as f64).sum();
+            let d_y_norm = gnorm_sq.sqrt() as f32;
             for level in 0..cfg.k {
                 if bc.memory_caches[level].is_some() {
                     block_level_gnorms[level] = d_y_norm;
                 }
             }
 
-            // Spec 53: GPU-resident dot products for softmax Jacobian.
-            // Replaces ~240 MB D2H per block (at d=2048) with ~768 KB of partial sums.
-            let w = &bc.alpha_weights;
+            // Accumulate dots from subsequent segments
             let mut dots = vec![0.0f64; cfg.k];
-            for l in 0..cfg.k {
-                let mut num_blocks: i32 = 0;
-                let err = unsafe {
-                    crate::cuda_ffi::dot_product_partial_f32_cuda(
-                        d_y_combined.as_ptr(),
-                        bc.y_per_level[l].as_ptr(),
-                        gnorm_scratch.ptr(),
-                        bsd as i32,
-                        &mut num_blocks,
-                    )
-                };
-                assert_eq!(err, 0, "dot_product_partial_f32_cuda failed");
-                crate::dispatch::cuda_sync();
-                let nb = num_blocks as usize;
-                let mut host = vec![0.0f32; nb];
-                gnorm_scratch.slice(0, nb).copy_to_host(&mut host);
-                dots[l] = host.iter().map(|x| *x as f64).sum();
+            for (l, &(start, end)) in dot_segs.iter().enumerate() {
+                dots[l] = (start..end).map(|i| gnorm_host[i] as f64).sum();
             }
             let weighted_dot_sum: f64 = (0..cfg.k).map(|j| w[j] as f64 * dots[j]).sum();
             d_alpha_mem = (0..cfg.k)
