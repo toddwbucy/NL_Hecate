@@ -669,6 +669,14 @@ extern "C" {
         n: i32, out_num_blocks: *mut i32,
     ) -> u32;  // cudaError_t: 0 = cudaSuccess
 
+    /// Partial reduction for dot product: sum of a[i]*b[i] per block (spec 53).
+    /// Same pattern as grad_norm_sq_cuda. Writes ceil(n/256) partial sums.
+    pub(crate) fn dot_product_partial_f32_cuda(
+        a: *const f32, b: *const f32,
+        partial_sums: *mut f32,
+        n: i32, out_num_blocks: *mut i32,
+    ) -> u32;  // cudaError_t: 0 = cudaSuccess
+
     /// Scale gradient buffer in-place: g[i] *= scale.
     pub(crate) fn grad_scale_cuda(g: *mut f32, scale: f32, n: i32) -> u32;  // cudaError_t: 0 = cudaSuccess
 

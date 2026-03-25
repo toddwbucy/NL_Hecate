@@ -121,25 +121,31 @@ impl GpuStackedAdamWState {
             }
         }).collect();
 
-        // Compute max buffer length for norm scratch allocation
-        let mut max_len = params.w_embed.len()
-            .max(params.w_unembed.len())
-            .max(params.ln_final_gamma.len());
+        // Spec 54: Compute TOTAL partials across ALL gradient tensors so we can
+        // launch all grad_norm_sq_cuda kernels at different offsets, then sync once.
+        let partials_for = |len: usize| -> usize { (len + 255) / 256 };
+        let mut total_partials = 0usize;
+        total_partials += partials_for(params.w_embed.len());
+        total_partials += partials_for(params.w_unembed.len());
+        total_partials += partials_for(params.ln_final_gamma.len());
+        total_partials += partials_for(params.ln_final_beta.len());
         for bp in &params.blocks {
             for buf in [&bp.w_q, &bp.w_k, &bp.w_v, &bp.w_o,
                         &bp.ln_attn_gamma, &bp.ln_attn_beta,
                         &bp.ln_mem_gamma, &bp.ln_mem_beta] {
-                max_len = max_len.max(buf.len());
+                total_partials += partials_for(buf.len());
             }
             for lp in &bp.levels {
                 for buf in [&lp.w_k_mem, &lp.w_v_mem, &lp.w_q_mem,
                             &lp.w_alpha, &lp.b_alpha, &lp.w_theta, &lp.b_theta,
                             &lp.w_eta, &lp.b_eta] {
-                    max_len = max_len.max(buf.len());
+                    total_partials += partials_for(buf.len());
                 }
             }
         }
-        let max_partials = max_len / 256 + 1;
+        // Need 2x because both grad_norm_ex and per_block_grad_norms run sequentially
+        // reusing the same buffer. The max of the two is total_partials (same tensors).
+        let max_partials = total_partials;
 
         GpuStackedAdamWState {
             m_embed: GpuBuf::zeros(params.w_embed.len()),
@@ -165,67 +171,79 @@ impl GpuStackedAdamWState {
 /// Compute L2 norm of all stacked gradient buffers on GPU.
 /// When `skip_embed` is true, excludes d_w_embed and d_w_unembed from the norm
 /// to avoid over-clipping trainable gradients when embeddings are frozen.
+///
+/// Spec 54: Batched launch per block — all grad_norm_sq_cuda kernels within
+/// each block fire at different offsets in norm_scratch, then sync once per block.
+/// Reduces ~356 syncs to ~10 (1 shared + 8 blocks).
 #[cfg(feature = "cuda")]
 fn gpu_stacked_grad_norm_ex(grads: &GpuStackedGrads, state: &mut GpuStackedAdamWState, skip_embed: bool) -> f32 {
     let mut total_sq = 0.0f64;
+    let scratch_ptr = state.norm_scratch.ptr();
 
-    // NOTE: This accumulates partial sums with a host sync per tensor. For large
-    // n_blocks * k this becomes many round-trips. A single-kernel reduction across
-    // all gradient buffers would be faster but requires a flat buffer layout.
-    // Acceptable for shakedown builds; optimize when profiling shows it matters.
-    let mut accum = |g: &GpuBuf<f32>| {
-        let n = g.len() as i32;
-        if n == 0 { return; }
-        let mut num_blocks: i32 = 0;
-        let err = unsafe {
-            crate::cuda_ffi::grad_norm_sq_cuda(
-                g.as_ptr(), state.norm_scratch.ptr(),
-                n, &mut num_blocks,
-            )
-        };
-        assert_eq!(err, 0, "grad_norm_sq_cuda failed with cudaError_t={}", err);
-        crate::dispatch::cuda_sync();
-        let nb = num_blocks as usize;
-        state.norm_scratch.slice(0, nb).copy_to_host(&mut state.norm_host[..nb]);
-        for i in 0..nb {
-            total_sq += state.norm_host[i] as f64;
-        }
+    // ── Shared grads: 2-4 kernels, 1 sync ────────────────────────────
+    let mut offset = 0usize;
+    let shared_bufs: Vec<&GpuBuf<f32>> = if skip_embed {
+        vec![&grads.d_ln_final_gamma, &grads.d_ln_final_beta]
+    } else {
+        vec![&grads.d_w_embed, &grads.d_w_unembed,
+             &grads.d_ln_final_gamma, &grads.d_ln_final_beta]
     };
-
-    // Shared grads (skip embed/unembed when frozen)
-    if !skip_embed {
-        accum(&grads.d_w_embed);
-        accum(&grads.d_w_unembed);
+    for g in &shared_bufs {
+        let n = g.len() as i32;
+        if n == 0 { continue; }
+        let mut nb: i32 = 0;
+        let err = unsafe {
+            crate::cuda_ffi::grad_norm_sq_cuda(g.as_ptr(), scratch_ptr.add(offset), n, &mut nb)
+        };
+        assert_eq!(err, 0, "grad_norm_sq_cuda failed");
+        offset += nb as usize;
     }
-    accum(&grads.d_ln_final_gamma);
-    accum(&grads.d_ln_final_beta);
+    if offset > 0 {
+        crate::dispatch::cuda_sync();
+        state.norm_scratch.slice(0, offset).copy_to_host(&mut state.norm_host[..offset]);
+        for i in 0..offset { total_sq += state.norm_host[i] as f64; }
+    }
 
-    // Per-block grads
+    // ── Per-block grads: ~44 kernels per block, 1 sync per block ─────
     for bg in &grads.blocks {
-        accum(&bg.d_w_q);
-        accum(&bg.d_w_k);
-        accum(&bg.d_w_v);
-        accum(&bg.d_w_o);
-        accum(&bg.d_ln_attn_gamma);
-        accum(&bg.d_ln_attn_beta);
-        accum(&bg.d_ln_mem_gamma);
-        accum(&bg.d_ln_mem_beta);
-        for lg in &bg.levels {
-            accum(&lg.d_w_k_mem);
-            accum(&lg.d_w_v_mem);
-            accum(&lg.d_w_q_mem);
-            accum(&lg.d_w_alpha);
-            accum(&lg.d_b_alpha);
-            accum(&lg.d_w_theta);
-            accum(&lg.d_b_theta);
-            accum(&lg.d_w_eta);
-            accum(&lg.d_b_eta);
+        offset = 0;
+        // SWA projections + LN
+        for g in [&bg.d_w_q, &bg.d_w_k, &bg.d_w_v, &bg.d_w_o,
+                  &bg.d_ln_attn_gamma, &bg.d_ln_attn_beta,
+                  &bg.d_ln_mem_gamma, &bg.d_ln_mem_beta] {
+            let n = g.len() as i32;
+            if n == 0 { continue; }
+            let mut nb: i32 = 0;
+            let err = unsafe {
+                crate::cuda_ffi::grad_norm_sq_cuda(g.as_ptr(), scratch_ptr.add(offset), n, &mut nb)
+            };
+            assert_eq!(err, 0, "grad_norm_sq_cuda failed");
+            offset += nb as usize;
         }
-    }
-    drop(accum);
+        // Per-level memory params
+        for lg in &bg.levels {
+            for g in [&lg.d_w_k_mem, &lg.d_w_v_mem, &lg.d_w_q_mem,
+                      &lg.d_w_alpha, &lg.d_b_alpha,
+                      &lg.d_w_theta, &lg.d_b_theta,
+                      &lg.d_w_eta, &lg.d_b_eta] {
+                let n = g.len() as i32;
+                if n == 0 { continue; }
+                let mut nb: i32 = 0;
+                let err = unsafe {
+                    crate::cuda_ffi::grad_norm_sq_cuda(g.as_ptr(), scratch_ptr.add(offset), n, &mut nb)
+                };
+                assert_eq!(err, 0, "grad_norm_sq_cuda failed");
+                offset += nb as usize;
+            }
+        }
+        // One sync + D2H per block
+        if offset > 0 {
+            crate::dispatch::cuda_sync();
+            state.norm_scratch.slice(0, offset).copy_to_host(&mut state.norm_host[..offset]);
+            for i in 0..offset { total_sq += state.norm_host[i] as f64; }
+        }
 
-    // alpha_mem gradients (host-side, accumulated after closure dropped)
-    for bg in &grads.blocks {
+        // alpha_mem gradients (host-side scalars)
         for &g in &bg.d_alpha_mem {
             total_sq += (g as f64) * (g as f64);
         }
@@ -251,75 +269,93 @@ pub struct PerBlockGradNorms {
 /// values reflect the true per-block learning signal. Shared params (embed,
 /// unembed, ln_final) are excluded because they contribute equally to every
 /// block's gradient and would mask depth specialization.
+///
+/// Spec 54: Per-block batched launch — all kernels within each block fire at
+/// different offsets in norm_scratch, then sync once per block. This avoids
+/// the command-queue saturation from launching all ~352 kernels at once.
 #[cfg(feature = "cuda")]
 pub fn gpu_stacked_per_block_grad_norms(
     grads: &GpuStackedGrads,
     state: &mut GpuStackedAdamWState,
 ) -> PerBlockGradNorms {
-    let n = grads.blocks.len();
-    let mut block_norms = Vec::with_capacity(n);
-    let mut l0_block_norms = Vec::with_capacity(n);
+    let n_blk = grads.blocks.len();
+    let scratch_ptr = state.norm_scratch.ptr();
 
-    for bg in &grads.blocks {
-        let mut block_sq = 0.0f64;
-        let mut l0_sq = 0.0f64;
+    let mut block_sq = vec![0.0f64; n_blk];
+    let mut l0_sq = vec![0.0f64; n_blk];
 
-        let mut accum_to = |g: &GpuBuf<f32>, target: &mut f64| {
+    for (bi, bg) in grads.blocks.iter().enumerate() {
+        let mut offset = 0usize;
+
+        // Track level boundaries for L0 detection
+        // (start_offset, end_offset, is_l0)
+        let mut level_segs: Vec<(usize, usize, bool)> = Vec::new();
+        let swa_start = offset;
+
+        // SWA projections (aggregate only, not L0)
+        for g in [&bg.d_w_q, &bg.d_w_k, &bg.d_w_v, &bg.d_w_o,
+                  &bg.d_ln_attn_gamma, &bg.d_ln_attn_beta,
+                  &bg.d_ln_mem_gamma, &bg.d_ln_mem_beta] {
             let n = g.len() as i32;
-            if n == 0 { return; }
-            let mut num_blocks: i32 = 0;
+            if n == 0 { continue; }
+            let mut nb: i32 = 0;
             let err = unsafe {
                 crate::cuda_ffi::grad_norm_sq_cuda(
-                    g.as_ptr(), state.norm_scratch.ptr(),
-                    n, &mut num_blocks,
+                    g.as_ptr(), scratch_ptr.add(offset), n, &mut nb,
                 )
             };
-            assert_eq!(err, 0, "grad_norm_sq_cuda failed with cudaError_t={}", err);
-            crate::dispatch::cuda_sync();
-            let nb = num_blocks as usize;
-            state.norm_scratch.slice(0, nb).copy_to_host(&mut state.norm_host[..nb]);
-            for i in 0..nb {
-                *target += state.norm_host[i] as f64;
-            }
-        };
+            assert_eq!(err, 0, "grad_norm_sq_cuda failed");
+            offset += nb as usize;
+        }
+        // SWA segment: aggregate only (is_l0 = false)
+        level_segs.push((swa_start, offset, false));
 
-        // SWA projections for this block (aggregate only)
-        accum_to(&bg.d_w_q, &mut block_sq);
-        accum_to(&bg.d_w_k, &mut block_sq);
-        accum_to(&bg.d_w_v, &mut block_sq);
-        accum_to(&bg.d_w_o, &mut block_sq);
-        accum_to(&bg.d_ln_attn_gamma, &mut block_sq);
-        accum_to(&bg.d_ln_attn_beta, &mut block_sq);
-        accum_to(&bg.d_ln_mem_gamma, &mut block_sq);
-        accum_to(&bg.d_ln_mem_beta, &mut block_sq);
-
-        // All levels within this block. For L0, accumulate into both
-        // block_sq and l0_sq without redundant kernel launches.
+        // Per-level params
         for (li, lg) in bg.levels.iter().enumerate() {
-            let target = if li == 0 { &mut l0_sq } else { &mut block_sq };
-            accum_to(&lg.d_w_k_mem, target);
-            accum_to(&lg.d_w_v_mem, target);
-            accum_to(&lg.d_w_q_mem, target);
-            accum_to(&lg.d_w_alpha, target);
-            accum_to(&lg.d_b_alpha, target);
-            accum_to(&lg.d_w_theta, target);
-            accum_to(&lg.d_b_theta, target);
-            accum_to(&lg.d_w_eta, target);
-            accum_to(&lg.d_b_eta, target);
+            let lev_start = offset;
+            for g in [&lg.d_w_k_mem, &lg.d_w_v_mem, &lg.d_w_q_mem,
+                      &lg.d_w_alpha, &lg.d_b_alpha,
+                      &lg.d_w_theta, &lg.d_b_theta,
+                      &lg.d_w_eta, &lg.d_b_eta] {
+                let n = g.len() as i32;
+                if n == 0 { continue; }
+                let mut nb: i32 = 0;
+                let err = unsafe {
+                    crate::cuda_ffi::grad_norm_sq_cuda(
+                        g.as_ptr(), scratch_ptr.add(offset), n, &mut nb,
+                    )
+                };
+                assert_eq!(err, 0, "grad_norm_sq_cuda failed");
+                offset += nb as usize;
+            }
+            level_segs.push((lev_start, offset, li == 0));
         }
-        drop(accum_to);
 
-        // L0 energy is part of the aggregate
-        block_sq += l0_sq;
+        // One sync + D2H per block
+        if offset > 0 {
+            crate::dispatch::cuda_sync();
+            state.norm_scratch.slice(0, offset).copy_to_host(&mut state.norm_host[..offset]);
+        }
 
-        // alpha_mem gradients (host-side)
+        // Accumulate from segments
+        for &(start, end, is_l0) in &level_segs {
+            let partial_sum: f64 = (start..end)
+                .map(|i| state.norm_host[i] as f64)
+                .sum();
+            block_sq[bi] += partial_sum;
+            if is_l0 {
+                l0_sq[bi] += partial_sum;
+            }
+        }
+
+        // alpha_mem gradients (host-side scalars)
         for &g in &bg.d_alpha_mem {
-            block_sq += (g as f64) * (g as f64);
+            block_sq[bi] += (g as f64) * (g as f64);
         }
-
-        block_norms.push(block_sq.sqrt() as f32);
-        l0_block_norms.push(l0_sq.sqrt() as f32);
     }
+
+    let block_norms: Vec<f32> = block_sq.iter().map(|s| s.sqrt() as f32).collect();
+    let l0_block_norms: Vec<f32> = l0_sq.iter().map(|s| s.sqrt() as f32).collect();
 
     PerBlockGradNorms { block_norms, l0_block_norms }
 }
@@ -370,8 +406,8 @@ fn gpu_stacked_scale_grads_ex(grads: &mut GpuStackedGrads, scale: f32, skip_embe
             *g *= scale;
         }
     }
-
-    crate::dispatch::cuda_sync();
+    // Spec 54: removed unnecessary cuda_sync() — next op is AdamW GPU kernels
+    // on the same default stream, which guarantees ordering.
 }
 
 /// Full AdamW update for stacked model. Updates all params in-place.
@@ -509,7 +545,7 @@ pub fn gpu_stacked_adamw_update(
             unsafe {
                 crate::cuda_ffi::clamp_f32_cuda(lp.b_theta.ptr(), lp.b_theta.len() as i32, -10.0, 2.0);
             }
-            crate::dispatch::cuda_sync(); // surface any async error from clamp kernel
+            // Spec 54: removed cuda_sync() — was error-check only; next ops are on same stream.
             adamw_one(&mut lp.w_eta, &lg.d_w_eta, &mut ml.m_w_eta, &mut ml.v_w_eta,
                       lr, beta1, beta2, eps, lbc1_inv, lbc2_inv, weight_decay);
             adamw_one(&mut lp.b_eta, &lg.d_b_eta, &mut ml.m_b_eta, &mut ml.v_b_eta,
@@ -533,7 +569,7 @@ pub fn gpu_stacked_sync_embed_weights(params: &mut GpuStackedParams, d: usize, v
             vocab as i32,
         );
     }
-    crate::dispatch::cuda_sync();
+    // Spec 54: removed cuda_sync() — next op is forward pass on same stream.
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -980,7 +1016,7 @@ pub fn gpu_stacked_m3_update(
             unsafe {
                 crate::cuda_ffi::clamp_f32_cuda(lp.b_theta.ptr(), lp.b_theta.len() as i32, -10.0, 2.0);
             }
-            crate::dispatch::cuda_sync();
+            // Spec 54: removed cuda_sync() — error-check only, next ops on same stream.
             m3_apply_1d_one(&mut lp.w_eta, &ml.m1_w_eta, &ml.m2_w_eta, &ml.v_w_eta,
                             lr, cfg.alpha, cfg.eps, level_bc2);
             m3_apply_1d_one(&mut lp.b_eta, &ml.m1_b_eta, &ml.m2_b_eta, &ml.v_b_eta,
@@ -995,7 +1031,6 @@ pub fn gpu_stacked_m3_update(
             prof_stop!(profiler);
         }
     }
-
-    crate::dispatch::cuda_sync();
+    // Spec 54: removed cuda_sync() — next op is forward pass on same stream.
     grad_norm
 }
