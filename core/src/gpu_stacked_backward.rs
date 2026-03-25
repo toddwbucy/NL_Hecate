@@ -363,7 +363,10 @@ pub fn gpu_stacked_backward(
                                 bs as i32, prev_s_f as i32, d as i32, pool_factor as i32,
                             );
                         }
-                        d_upstream = d_expanded;
+                        // Keep old buffer alive — cudaFree is synchronous and would
+                        // fence the batched gnorm kernels still in the stream queue.
+                        let old = std::mem::replace(&mut d_upstream, d_expanded);
+                        gnorm_keep_alive.push(old);
                     }
                 }
             }
