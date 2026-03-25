@@ -604,8 +604,8 @@ pub fn gpu_stacked_backward(
         );
     }
     prof_stop!(profiler);
-
-    crate::dispatch::cuda_sync();
+    // Spec 54: removed cuda_sync() — grads stay on GPU, consumed by optimizer
+    // kernels on the same default stream (ordering guaranteed).
 
     GpuStackedGrads {
         d_w_embed,
