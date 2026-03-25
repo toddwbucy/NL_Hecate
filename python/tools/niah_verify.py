@@ -208,7 +208,7 @@ def _run_trial(gpu_model, cfg, sequence: list[int],
 
         # Learn from this chunk
         pulse = conductor.pulse()
-        gpu_model.step_adamw(
+        _loss, _gnorm = gpu_model.step_adamw(
             chunk_input, chunk_target, pulse, 0.0003,
             beta1=0.9, beta2=0.999, eps=1e-8,
             weight_decay=0.1, max_grad_norm=1.0,
