@@ -54,7 +54,7 @@ def test_initial_loss_matches():
     pt_weights = load_weights_from_rust(params)
 
     inp, tgt = CHUNKS[0]
-    rust_loss, _ = nl_hecate.forward(params, cfg, inp, tgt)
+    rust_loss, _ = nl_hecate.compute_gradients(params, cfg, inp, tgt)
     pt_loss = forward_pytorch(pt_weights, inp, tgt).item()
 
     denom = max(abs(rust_loss), abs(pt_loss), 1e-12)

@@ -182,10 +182,10 @@ def _run_trial(gpu_model, cfg, sequence: list[int],
     conductor = nl_hecate.Conductor(
         cfg.k, list(cfg.chunk_sizes) if hasattr(cfg, 'chunk_sizes') else [1] * cfg.k)
 
-    # Forward through the full sequence in seq_len chunks.
-    # Keep logits for the chunk containing query_answer_pos.
-    answer_logits_flat = None
-    answer_chunk_start = None
+    # Process the full sequence in seq_len chunks via step_adamw (CS-10: model
+    # learns from context). For the chunk containing the answer position, use
+    # prefill to get logits at that position.
+    answer_logits = None
     pos = 0
 
     while pos < len(sequence):
@@ -193,10 +193,8 @@ def _run_trial(gpu_model, cfg, sequence: list[int],
         chunk_len = chunk_end - pos
 
         if chunk_len < seq_len:
-            # Pad final chunk
             chunk_input = sequence[pos:chunk_end] + [sequence[-1]] * (seq_len - chunk_len)
             chunk_target = [vocab] * seq_len
-            # Fill real targets where available
             if pos + 1 < len(sequence):
                 real_targets = sequence[pos + 1:chunk_end]
                 for j, t in enumerate(real_targets):
@@ -208,28 +206,45 @@ def _run_trial(gpu_model, cfg, sequence: list[int],
             else:
                 chunk_target = sequence[pos + 1:chunk_end] + [vocab]
 
+        # Learn from this chunk
         pulse = conductor.pulse()
-        loss, logits_flat = gpu_model.forward(chunk_input, chunk_target, pulse)
+        gpu_model.step_adamw(
+            chunk_input, chunk_target, pulse, 0.0003,
+            beta1=0.9, beta2=0.999, eps=1e-8,
+            weight_decay=0.1, max_grad_norm=1.0,
+        )
         conductor.advance()
 
-        # Keep logits if this chunk contains the answer position
+        # If this chunk contains the answer position, get logits via prefill
+        # by prefilling up to answer_pos+1 so last-position logits = answer logits
         if pos <= query_answer_pos < pos + seq_len:
-            answer_logits_flat = logits_flat
-            answer_chunk_start = pos
+            pos_in_chunk = query_answer_pos - pos
+            # Build a prefill context: tokens up to and including the answer position
+            # Pad to seq_len on the left
+            prefill_ctx = list(chunk_input[:pos_in_chunk + 1])
+            safe_pad = chunk_input[0]
+            while len(prefill_ctx) < seq_len:
+                prefill_ctx = [safe_pad] + prefill_ctx
+            prefill_pulse = conductor.pulse()
+            try:
+                answer_logits = gpu_model.prefill(prefill_ctx, prefill_pulse)
+            finally:
+                gpu_model.reset_cache()
+            conductor.advance()
 
         pos = chunk_end
 
-    if answer_logits_flat is None:
+    if answer_logits is None:
         return {"pass": False, "lift": 0.0,
                 "error": f"answer_pos {query_answer_pos} not covered by any chunk "
                          f"(sequence len {len(sequence)}, seq_len {seq_len})"}
 
-    # Find the answer position within the answer chunk's logits
-    pos_in_chunk = query_answer_pos - answer_chunk_start
+    # answer_logits is a flat Vec<f32> of length vocab_size (last-position logits from prefill)
+    pos_in_chunk = 0  # logits are already at the answer position
 
     # Score the correct answer
     answer_logprob = _logprob_at_position(
-        answer_logits_flat, pos_in_chunk, answer_token_id, vocab)
+        answer_logits, pos_in_chunk, answer_token_id, vocab)
 
     if math.isnan(answer_logprob):
         return {"pass": False, "lift": 0.0,
@@ -242,7 +257,7 @@ def _run_trial(gpu_model, cfg, sequence: list[int],
         random_tokens = tokenizer.encode(random_num)
         if random_tokens:
             bp = _logprob_at_position(
-                answer_logits_flat, pos_in_chunk, random_tokens[0], vocab)
+                answer_logits, pos_in_chunk, random_tokens[0], vocab)
             if not math.isnan(bp):
                 baseline_logprobs.append(bp)
 

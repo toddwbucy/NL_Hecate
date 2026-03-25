@@ -156,9 +156,10 @@ def generate_learning(
     """
     Autoregressive generation with continuous outer-loop learning (CS-10).
 
-    Each generated token runs a full forward+backward+optimizer step on the
-    last seq_len tokens. The model's projections (W_K_mem, W_V_mem, gates)
-    update continuously — no train/eval distinction.
+    Two-path architecture: step_adamw() to learn, prefill()+decode_token() to speak.
+    The model learns from the context via step_adamw, then generates output via
+    the KV-cached decode path. No step_generate() hybrid — learn and speak are
+    separate operations.
 
     Returns (all_tokens, losses, grad_norms).
     """
@@ -172,9 +173,8 @@ def generate_learning(
         conductor = nl_hecate.Conductor(
             cfg.k, list(cfg.chunk_sizes) if hasattr(cfg, 'chunk_sizes') else [1] * cfg.k)
 
-    # Phase 1: Learn from prompt (chunked if prompt > seq_len)
+    # Phase 1: Learn from prompt via step_adamw (chunked if prompt > seq_len)
     if len(seq) > seq_len:
-        # Process full chunks where we have seq_len+1 tokens for input+target
         for start in range(0, len(seq) - seq_len, seq_len):
             chunk = seq[start:start + seq_len + 1]
             if len(chunk) < seq_len + 1:
@@ -182,9 +182,11 @@ def generate_learning(
             input_ids = chunk[:seq_len]
             target_ids = chunk[1:seq_len + 1]
             pulse = conductor.pulse()
-            loss, gnorm, _ = gpu_model.step_generate(
+            loss, gnorm = gpu_model.step_adamw(
                 input_ids, target_ids, pulse, lr,
-                beta1, beta2, eps, weight_decay, max_grad_norm,
+                beta1=beta1, beta2=beta2, eps=eps,
+                weight_decay=weight_decay,
+                max_grad_norm=max_grad_norm,
             )
             conductor.advance()
             if math.isnan(loss) or math.isinf(loss):
@@ -195,7 +197,8 @@ def generate_learning(
 
     safe_pad = _safe_pad_token(prompt_tokens, vocab)
 
-    # Phase 2: Generate tokens
+    # Phase 2: Learn from current context, then generate via prefill+decode
+    # Each iteration: step_adamw on context (learn), then prefill+decode (speak)
     for i in range(max_tokens):
         # Build context window from tail of sequence
         ctx = seq[-seq_len:] if len(seq) >= seq_len else seq[:]
@@ -207,11 +210,9 @@ def generate_learning(
 
         # Target: shifted by 1, last position masked (vocab_size = OOV, skipped by kernel)
         if len(seq) >= seq_len + 1:
-            # We have enough history: target is ctx shifted by 1
-            target_src = seq[-(seq_len - 1):]  # last (seq_len-1) tokens from sequence
-            target_ids = list(target_src) + [vocab]  # mask last position
+            target_src = seq[-(seq_len - 1):]
+            target_ids = list(target_src) + [vocab]
         else:
-            # Short sequence: mask padding positions, provide shifted targets for real tokens
             n_real = min(len(seq), seq_len)
             if n_real > 1:
                 shifted = list(seq[1:])
@@ -223,22 +224,30 @@ def generate_learning(
             else:
                 target_ids = [vocab] * seq_len
 
+        # LEARN: step_adamw on the context
         pulse = conductor.pulse()
-        loss, gnorm, last_logits = gpu_model.step_generate(
+        loss, gnorm = gpu_model.step_adamw(
             ctx, target_ids, pulse, lr,
-            beta1, beta2, eps, weight_decay, max_grad_norm,
+            beta1=beta1, beta2=beta2, eps=eps,
+            weight_decay=weight_decay,
+            max_grad_norm=max_grad_norm,
         )
         conductor.advance()
 
-        # NaN early-stop: once loss goes NaN, params are corrupted and
-        # all subsequent steps will also NaN. Break and return partial results.
         if math.isnan(loss) or math.isinf(loss):
             break
 
         losses.append(loss)
         grad_norms.append(gnorm)
 
-        # Sample next token from last-position logits
+        # SPEAK: prefill context + decode one token
+        try:
+            speak_pulse = conductor.pulse()
+            last_logits = gpu_model.prefill(ctx, speak_pulse)
+            conductor.advance()
+        finally:
+            gpu_model.reset_cache()
+
         next_tok = _sample_token(last_logits, vocab, temperature, top_k)
 
         if stop_token is not None and next_tok == stop_token:
@@ -341,14 +350,6 @@ def generate(
     Routes to the appropriate backend: learning, KV-cached GPU, or CPU.
     """
     is_stacked = hasattr(gpu_model, 'n_blocks') if gpu_model is not None else False
-
-    # Stacked models don't support learning mode (no step_generate method)
-    if gpu_model is not None and learn and is_stacked:
-        raise NotImplementedError(
-            "generate_learning is not supported with stacked (multi-block) models. "
-            "GpuStackedModel lacks step_generate(). Remove --learn or use a "
-            "single-block checkpoint."
-        )
 
     # Delegate to learning path for GPU models with --learn
     if gpu_model is not None and learn:

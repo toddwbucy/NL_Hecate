@@ -7,14 +7,14 @@ Usage:
         --data data/dolmino_100b \
         --max-tokens 50
 
-Loads a stacked checkpoint at batch_size=1 and runs step_generate (spec 52):
+Loads a stacked checkpoint at batch_size=1 and runs step_adamw (spec 52):
 forward + backward + optimizer + logit extraction in a single call. There is
 no separate "inference" mode — batch_size=1 IS inference in an NLM.
 
 Evaluations:
-  1. Held-out loss via step_generate (proper backward pass, M gets gradient feedback)
-  2. Coherence generation via step_generate (model learns from prompt, generates next tokens)
-  3. Per-head M norm snapshot (after step_generate has properly populated M)
+  1. Held-out loss via step_adamw (proper backward pass, M gets gradient feedback)
+  2. Coherence generation via step_adamw (model learns from prompt, generates next tokens)
+  3. Per-head M norm snapshot (after step_adamw has properly populated M)
   4. Gate biases
 """
 
@@ -62,7 +62,7 @@ def load_model(ckpt_path: str):
 
 def eval_loss(gpu_model, cfg, data_path: str, n_chunks: int = 20,
               offset_pct: float = 0.9, lr: float = DEFAULT_LR):
-    """Run step_generate on held-out data — the exact same path as training.
+    """Run step_adamw on held-out data — the exact same path as training.
 
     Each chunk runs forward + backward + optimizer update at batch_size=1.
     """
@@ -85,12 +85,11 @@ def eval_loss(gpu_model, cfg, data_path: str, n_chunks: int = 20,
         input_ids, target_ids = chunk
         pulse = conductor.pulse()
         try:
-            loss, g_norm, _logits = gpu_model.step_generate(
+            loss, g_norm = gpu_model.step_adamw(
                 list(input_ids), list(target_ids), pulse, lr,
                 beta1=DEFAULT_BETA1, beta2=DEFAULT_BETA2, eps=DEFAULT_EPS,
                 weight_decay=DEFAULT_WEIGHT_DECAY,
                 max_grad_norm=DEFAULT_MAX_GRAD_NORM,
-                freeze_embed=False,
             )
             losses.append(loss)
             grad_norms.append(g_norm)
@@ -121,9 +120,9 @@ def sample_token(logits: list[float], vocab: int, temperature: float = 0.7):
 def generate(gpu_model, cfg, prompt_ids: list[int],
              max_tokens: int = 50, lr: float = DEFAULT_LR,
              temperature: float = 0.7):
-    """Generate tokens via step_generate — same path as training at batch_size=1.
+    """Generate tokens via step_adamw — same path as training at batch_size=1.
 
-    Each token: build context window, call step_generate (forward + backward +
+    Each token: build context window, call step_adamw (forward + backward +
     optimizer update + logit extraction), sample next token. The model learns
     from its own output as it generates. No mode flags, no forward-only shortcut.
     """
@@ -159,19 +158,26 @@ def generate(gpu_model, cfg, prompt_ids: list[int],
 
         pulse = conductor.pulse()
 
-        # Single call: forward + backward + optimizer + logits (spec 52)
-        loss, g_norm, last_logits = gpu_model.step_generate(
+        # Learn from context via step_adamw
+        loss, g_norm = gpu_model.step_adamw(
             ctx, target_ids, pulse, lr,
             beta1=DEFAULT_BETA1, beta2=DEFAULT_BETA2, eps=DEFAULT_EPS,
             weight_decay=DEFAULT_WEIGHT_DECAY,
             max_grad_norm=DEFAULT_MAX_GRAD_NORM,
-            freeze_embed=False,
         )
         conductor.advance()
 
         if math.isnan(loss) or math.isinf(loss):
             print(f"  NaN/inf at token {i}, stopping generation")
             break
+
+        # Speak: prefill context to get logits for sampling
+        speak_pulse = conductor.pulse()
+        try:
+            last_logits = gpu_model.prefill(ctx, speak_pulse)
+        finally:
+            gpu_model.reset_cache()
+        conductor.advance()
 
         next_tok = sample_token(last_logits, vocab, temperature)
         seq.append(next_tok)
@@ -187,21 +193,21 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=50,
                         help="Max tokens to generate per coherence sample")
     parser.add_argument("--n-chunks", type=int, default=20,
-                        help="Number of step_generate chunks for loss eval")
+                        help="Number of step_adamw chunks for loss eval")
     parser.add_argument("--held-out-pct", type=float, default=0.9,
                         help="Start loss eval at this fraction of corpus (default: last 10%%)")
     parser.add_argument("--n-recall", type=int, default=3,
                         help="Number of training-data chunks for recall test")
     parser.add_argument("--lr", type=float, default=DEFAULT_LR,
-                        help="Learning rate for step_generate during eval")
+                        help="Learning rate for step_adamw during eval")
     args = parser.parse_args()
 
     ckpt = args.checkpoint
     print(f"{'=' * 60}")
-    print(f"Checkpoint Evaluation (step_generate, batch_size=1)")
+    print(f"Checkpoint Evaluation (step_adamw, batch_size=1)")
     print(f"{'=' * 60}")
     print(f"  Checkpoint: {ckpt}")
-    print(f"  Mode: step_generate (same path as training, no train/eval distinction)")
+    print(f"  Mode: step_adamw (same path as training, no train/eval distinction)")
 
     # Load model
     gpu_model, cfg, n_blocks, step = load_model(ckpt)
@@ -212,8 +218,8 @@ def main():
     print(f"  LR: {args.lr}")
     print()
 
-    # 1. Loss on held-out data via step_generate
-    print(f"── Loss via step_generate (last {(1-args.held_out_pct)*100:.0f}%%, "
+    # 1. Loss on held-out data via step_adamw
+    print(f"── Loss via step_adamw (last {(1-args.held_out_pct)*100:.0f}%%, "
           f"{args.n_chunks} chunks) ──")
     try:
         losses, gnorms = eval_loss(
@@ -239,8 +245,8 @@ def main():
         print(f"  Loss eval failed: {e}")
     print()
 
-    # 2. Per-head M norms (after step_generate has properly populated M)
-    print("── Memory State (post-step_generate) ──")
+    # 2. Per-head M norms (after step_adamw has properly populated M)
+    print("── Memory State (post-step_adamw) ──")
     try:
         m_norms = list(gpu_model.memory_norms())
         fmt = lambda n: f"{n:.2e}" if 0 < n < 0.01 else f"{n:.4f}"
@@ -279,7 +285,7 @@ def main():
 
     # 4. Recall test: feed chunks from EARLY training data (model saw these).
     # Split each chunk: first 480 tokens as context, last 32 as held-back.
-    # Run step_generate on the full chunk to get loss (should be lower than
+    # Run step_adamw on the full chunk to get loss (should be lower than
     # held-out if the model learned from this data). Then generate a continuation
     # from the 480-token prefix and compare against the actual next tokens.
     print(f"── Recall Test (training data, {args.n_recall} chunks) ──")
@@ -303,14 +309,13 @@ def main():
                 break
             input_ids, target_ids = chunk
 
-            # Step 1: Run step_generate on the FULL chunk (like training)
+            # Step 1: Run step_adamw on the FULL chunk (like training)
             pulse = recall_conductor.pulse()
-            loss, g_norm, _logits = gpu_model.step_generate(
+            loss, g_norm = gpu_model.step_adamw(
                 list(input_ids), list(target_ids), pulse, args.lr,
                 beta1=DEFAULT_BETA1, beta2=DEFAULT_BETA2, eps=DEFAULT_EPS,
                 weight_decay=DEFAULT_WEIGHT_DECAY,
                 max_grad_norm=DEFAULT_MAX_GRAD_NORM,
-                freeze_embed=False,
             )
             recall_conductor.advance()
             recall_losses.append(loss)

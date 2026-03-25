@@ -197,12 +197,16 @@ def probe_context_value(gpu_model, cfg, prompt_ids, snapshot,
 
 
 def evaluate(gpu_model, bcfg, val_stream,
-             max_chunks: int, val_doc_starts=None) -> tuple[float, float]:
-    """Run forward-only on val set. Returns (avg_loss, perplexity).
+             max_chunks: int, val_doc_starts=None,
+             lr: float = 0.0003,
+             beta1: float = 0.9, beta2: float = 0.999,
+             eps: float = 1e-8, weight_decay: float = 0.1,
+             max_grad_norm: float = 1.0) -> tuple[float, float]:
+    """Evaluate on val set via step_adamw. Returns (avg_loss, perplexity).
 
     Uses a fresh Conductor so eval doesn't corrupt training pulse state.
     Context is managed by the caller (gpu_model.reset_context() / upload_context()).
-    Same forward path as training — no mode flag (CS-10).
+    The model learns from val data — there is no eval mode (CS-10).
     Document boundary resets apply if val_doc_starts is provided.
     """
     conductor = nl_hecate.Conductor(bcfg.k, bcfg.chunk_sizes)
@@ -220,7 +224,12 @@ def evaluate(gpu_model, bcfg, val_stream,
             pulse = conductor.pulse()
 
             if gpu_model is not None:
-                loss, _ = gpu_model.forward(input_ids, target_ids, pulse)
+                loss, _gnorm = gpu_model.step_adamw(
+                    input_ids, target_ids, pulse, lr,
+                    beta1=beta1, beta2=beta2, eps=eps,
+                    weight_decay=weight_decay,
+                    max_grad_norm=max_grad_norm,
+                )
             else:
                 raise NotImplementedError("CPU eval not yet implemented for BPE")
 
@@ -245,7 +254,12 @@ def evaluate(gpu_model, bcfg, val_stream,
                 continue
 
             if gpu_model is not None:
-                loss, _ = gpu_model.forward(input_ids, target_ids, pulse)
+                loss, _gnorm = gpu_model.step_adamw(
+                    input_ids, target_ids, pulse, lr,
+                    beta1=beta1, beta2=beta2, eps=eps,
+                    weight_decay=weight_decay,
+                    max_grad_norm=max_grad_norm,
+                )
             else:
                 raise NotImplementedError("CPU byte-level eval not yet wired")
 
@@ -274,10 +288,15 @@ def evaluate(gpu_model, bcfg, val_stream,
 
 
 def evaluate_numpy(gpu_model, bcfg, tokens_np, targets_np,
-                   max_chunks: int = 10) -> tuple[float, float]:
-    """Evaluate on raw numpy arrays (for per-phase curriculum probes).
+                   max_chunks: int = 10,
+                   lr: float = 0.0003,
+                   beta1: float = 0.9, beta2: float = 0.999,
+                   eps: float = 1e-8, weight_decay: float = 0.1,
+                   max_grad_norm: float = 1.0) -> tuple[float, float]:
+    """Evaluate on raw numpy arrays via step_adamw (for per-phase curriculum probes).
 
     Creates a fresh Conductor so eval pulse doesn't corrupt training state.
+    The model learns from this data — there is no eval mode (CS-10).
     NOTE: Callers must save/restore gpu_model context externally — this
     function uses whatever context is currently on the model.
     Returns (avg_loss, perplexity).
@@ -296,7 +315,13 @@ def evaluate_numpy(gpu_model, bcfg, tokens_np, targets_np,
         raw_targets = targets_np[pos:pos + bcfg.seq_len]
         target_ids = [int(t) if t >= 0 else bcfg.vocab_size for t in raw_targets]
         pulse = conductor.pulse()
-        loss, _ = gpu_model.forward(input_ids, target_ids, pulse)
+        loss, _gnorm = gpu_model.step_adamw(
+            input_ids, target_ids, pulse, lr,
+            beta1=beta1, beta2=beta2, eps=eps,
+            weight_decay=weight_decay,
+            max_grad_norm=max_grad_norm,
+            freeze_embed=False,
+        )
         if not (math.isnan(loss) or math.isinf(loss)):
             total_loss += loss
             n_chunks += 1

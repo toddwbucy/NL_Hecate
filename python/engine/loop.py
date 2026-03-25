@@ -1509,7 +1509,7 @@ def run_build(bcfg: BuildConfig):
                         })
                     jsonl.log(event="level_param_drift", step=step, levels=drift_info)
 
-                # Checkpoint roundtrip verification
+                # Checkpoint roundtrip verification (CS-10: uses step_adamw, not forward)
                 if use_gpu:
                     v_model = None
                     try:
@@ -1525,8 +1525,18 @@ def run_build(bcfg: BuildConfig):
                         rt_ctx = gpu_model.to_host_context()
                         try:
                             v_model.upload_context(rt_ctx)
-                            train_fwd, _ = gpu_model.forward(rt_input, rt_target, pulse)
-                            verify_fwd, _ = v_model.forward(rt_input, rt_target, pulse)
+                            train_fwd, _tg = gpu_model.step_adamw(
+                                rt_input, rt_target, pulse, current_lr,
+                                beta1=bcfg.beta1, beta2=bcfg.beta2, eps=1e-8,
+                                weight_decay=bcfg.weight_decay,
+                                max_grad_norm=bcfg.max_grad_norm,
+                            )
+                            verify_fwd, _vg = v_model.step_adamw(
+                                rt_input, rt_target, pulse, current_lr,
+                                beta1=bcfg.beta1, beta2=bcfg.beta2, eps=1e-8,
+                                weight_decay=bcfg.weight_decay,
+                                max_grad_norm=bcfg.max_grad_norm,
+                            )
                         finally:
                             gpu_model.upload_context(rt_ctx)
                         delta = abs(verify_fwd - train_fwd)
