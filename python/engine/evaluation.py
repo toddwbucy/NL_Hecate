@@ -320,7 +320,6 @@ def evaluate_numpy(gpu_model, bcfg, tokens_np, targets_np,
             beta1=beta1, beta2=beta2, eps=eps,
             weight_decay=weight_decay,
             max_grad_norm=max_grad_norm,
-            freeze_embed=False,
         )
         if not (math.isnan(loss) or math.isinf(loss)):
             total_loss += loss

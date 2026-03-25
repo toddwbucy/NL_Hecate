@@ -211,7 +211,7 @@ def generate_learning(
         # Target: shifted by 1, last position masked (vocab_size = OOV, skipped by kernel)
         if len(seq) >= seq_len + 1:
             target_src = seq[-(seq_len - 1):]
-            target_ids = list(target_src) + [vocab]
+            target_ids = [*target_src, vocab]
         else:
             n_real = min(len(seq), seq_len)
             if n_real > 1:

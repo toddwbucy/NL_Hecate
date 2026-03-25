@@ -224,7 +224,7 @@ def _run_trial(gpu_model, cfg, sequence: list[int],
             prefill_ctx = list(chunk_input[:pos_in_chunk + 1])
             safe_pad = chunk_input[0]
             while len(prefill_ctx) < seq_len:
-                prefill_ctx = [safe_pad] + prefill_ctx
+                prefill_ctx = [safe_pad, *prefill_ctx]
             prefill_pulse = conductor.pulse()
             try:
                 answer_logits = gpu_model.prefill(prefill_ctx, prefill_pulse)

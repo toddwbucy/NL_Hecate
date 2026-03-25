@@ -1,6 +1,6 @@
 # Two-Path NLM Inference
 
-```
+```text
 CONTRACT
   Purpose:    Enforce the NLM's two legitimate execution paths and remove
               eval-mode artifacts. An NLM has no train/eval distinction (CS-10).
@@ -29,7 +29,7 @@ CONTRACT
 The model processes a sequence and learns from it. This is the ONLY way the model
 processes training data, validation data, user input in chat, or any other tokens.
 
-```
+```rust
 step_adamw(input_ids, target_ids, pulse, lr, ...) -> (loss, grad_norm)
 
   1. gpu_cms_forward()   — forward pass, M updates, loss computation
@@ -47,7 +47,7 @@ The model generates output tokens autoregressively. This is mechanical decoding
 of the model's current state into text. It does NOT learn — it reads from the
 KV cache built during prefill.
 
-```
+```rust
 prefill(input_ids, pulse) -> last_logits     # build KV cache from context
 decode_token(token_id, pulse) -> logits      # extend one token, return logits
 ```
@@ -137,7 +137,6 @@ loss, _gnorm = gpu_model.step_adamw(
     input_ids, target_ids, pulse, lr=eval_lr,
     beta1=0.9, beta2=0.999, eps=1e-8,
     weight_decay=0.1, max_grad_norm=1.0,
-    freeze_embed=False,
 )
 ```
 

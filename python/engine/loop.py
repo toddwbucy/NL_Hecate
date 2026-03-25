@@ -1510,6 +1510,7 @@ def run_build(bcfg: BuildConfig):
                     jsonl.log(event="level_param_drift", step=step, levels=drift_info)
 
                 # Checkpoint roundtrip verification (CS-10: uses step_adamw, not forward)
+                # Snapshot full state so the verification step doesn't pollute training.
                 if use_gpu:
                     v_model = None
                     try:
@@ -1522,7 +1523,10 @@ def run_build(bcfg: BuildConfig):
                             memory_reset=(bcfg.memory_reset == "periodic"))
                         rt_input = list(input_ids[:bcfg.seq_len])
                         rt_target = list(target_ids[:bcfg.seq_len])
+                        # Snapshot training model: context + params + optimizer
                         rt_ctx = gpu_model.to_host_context()
+                        rt_params = gpu_model.to_host_params()
+                        rt_opt = gpu_model.snapshot_optimizer()
                         try:
                             v_model.upload_context(rt_ctx)
                             train_fwd, _tg = gpu_model.step_adamw(
@@ -1538,7 +1542,11 @@ def run_build(bcfg: BuildConfig):
                                 max_grad_norm=bcfg.max_grad_norm,
                             )
                         finally:
+                            # Restore full state: context + params + optimizer
                             gpu_model.upload_context(rt_ctx)
+                            gpu_model.upload_params(rt_params)
+                            if rt_opt is not None:
+                                gpu_model.restore_optimizer(rt_opt)
                         delta = abs(verify_fwd - train_fwd)
                         if jsonl:
                             jsonl.log(event="checkpoint_roundtrip", step=step,

@@ -159,7 +159,7 @@ def generate(gpu_model, cfg, prompt_ids: list[int],
         pulse = conductor.pulse()
 
         # Learn from context via step_adamw
-        loss, g_norm = gpu_model.step_adamw(
+        loss, _g_norm = gpu_model.step_adamw(
             ctx, target_ids, pulse, lr,
             beta1=DEFAULT_BETA1, beta2=DEFAULT_BETA2, eps=DEFAULT_EPS,
             weight_decay=DEFAULT_WEIGHT_DECAY,
@@ -204,10 +204,10 @@ def main():
 
     ckpt = args.checkpoint
     print(f"{'=' * 60}")
-    print(f"Checkpoint Evaluation (step_adamw, batch_size=1)")
+    print("Checkpoint Evaluation (step_adamw, batch_size=1)")
     print(f"{'=' * 60}")
     print(f"  Checkpoint: {ckpt}")
-    print(f"  Mode: step_adamw (same path as training, no train/eval distinction)")
+    print("  Mode: step_adamw (same path as training, no train/eval distinction)")
 
     # Load model
     gpu_model, cfg, n_blocks, step = load_model(ckpt)
@@ -311,7 +311,7 @@ def main():
 
             # Step 1: Run step_adamw on the FULL chunk (like training)
             pulse = recall_conductor.pulse()
-            loss, g_norm = gpu_model.step_adamw(
+            loss, _g_norm = gpu_model.step_adamw(
                 list(input_ids), list(target_ids), pulse, args.lr,
                 beta1=DEFAULT_BETA1, beta2=DEFAULT_BETA2, eps=DEFAULT_EPS,
                 weight_decay=DEFAULT_WEIGHT_DECAY,

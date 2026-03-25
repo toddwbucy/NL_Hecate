@@ -18,8 +18,6 @@ use nl_hecate_core::cms_variants::{
     BlockConfig as RustBlockConfig,
     MultiBlockConfig as RustMultiBlockConfig,
 };
-use nl_hecate_core::forward::ForwardCache as RustCache;
-use nl_hecate_core::backward::backward_full as rust_backward_full;
 use nl_hecate_core::gradient::compute_gradients as rust_compute_gradients;
 use nl_hecate_core::mag::{mag_forward as rust_mag_forward, MAGForwardCache as RustMAGCache};
 use nl_hecate_core::gradient::mag_compute_gradients as rust_mag_compute_gradients;
@@ -135,21 +133,6 @@ impl SWAParams {
     }
 }
 
-// ── ForwardCache ─────────────────────────────────────────────────────
-
-#[pyclass]
-struct ForwardCache {
-    inner: RustCache,
-}
-
-#[pymethods]
-impl ForwardCache {
-    /// Return logits as flat list: [seq_len * vocab_size], row-major.
-    fn get_logits(&self) -> Vec<f32> {
-        self.inner.logits.clone()
-    }
-}
-
 // ── Free functions ───────────────────────────────────────────────────
 
 #[pyfunction]
@@ -184,19 +167,6 @@ fn validate_seq_lens(cfg: &SWAConfig, input_ids: &[usize], target_ids: &[usize])
         )));
     }
     Ok(())
-}
-
-#[pyfunction]
-fn backward(
-    params: &SWAParams,
-    cfg: &SWAConfig,
-    cache: &ForwardCache,
-    input_ids: Vec<usize>,
-    target_ids: Vec<usize>,
-) -> PyResult<SWAParams> {
-    validate_seq_lens(cfg, &input_ids, &target_ids)?;
-    let grads = rust_backward_full(&params.inner, &cfg.inner, &cache.inner, &input_ids, &target_ids);
-    Ok(SWAParams { inner: grads })
 }
 
 #[pyfunction]
@@ -3797,10 +3767,8 @@ fn logprob_at_position(
 fn nl_hecate(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SWAConfig>()?;
     m.add_class::<SWAParams>()?;
-    m.add_class::<ForwardCache>()?;
     m.add_function(wrap_pyfunction!(create_config, m)?)?;
     m.add_function(wrap_pyfunction!(init_params, m)?)?;
-    m.add_function(wrap_pyfunction!(backward, m)?)?;
     m.add_function(wrap_pyfunction!(compute_gradients, m)?)?;
     m.add_function(wrap_pyfunction!(apply_weight_gradients, m)?)?;
     // MAG
