@@ -2077,12 +2077,59 @@ struct GpuModel {
     m3_state: Option<nl_hecate_core::gpu_optimizer::GpuM3State>,
     kv_cache: Option<nl_hecate_core::gpu_forward::GpuKVCache>,
     decode_workspace: Option<nl_hecate_core::gpu_forward::DecodeWorkspace>,
-    /// TNT periodic reset mode. When true, context.memory[k] is zeroed after
-    /// each step where pulse.active_levels[k] is true (eq-006, 2511.07343).
-    memory_reset: bool,
+    /// Per-level reset intervals for selective periodic reset (spec 57).
+    /// Empty vec = no reset. [1,1,1,1] = spec-08 all-ones. [1,8,64,512] = gear-shifting.
+    reset_intervals: Vec<usize>,
+    /// Per-level fire counters for selective periodic reset (spec 57).
+    /// fire_counts[k] tracks fires since last reset of level k.
+    fire_counts: Vec<usize>,
     /// Per-level gradient norms from the most recent step_adamw call, computed
     /// before global gradient clipping. Empty until the first step_adamw call.
     last_level_gnorms: Vec<f32>,
+}
+
+#[cfg(feature = "cuda")]
+impl GpuModel {
+    /// Selective periodic reset (spec 57): for each active level, increment fire
+    /// counter and reset M when counter reaches the level's reset interval.
+    /// CS-32: called after observe, before next advance.
+    fn maybe_reset_levels(&mut self, pulse: &nl_hecate_core::conductor::Pulse) {
+        if self.reset_intervals.is_empty() { return; }
+        for (k, &active) in pulse.active_levels.iter().enumerate() {
+            if !active { continue; }
+            self.fire_counts[k] += 1;
+            if self.fire_counts[k] >= self.reset_intervals[k] {
+                self.context.periodic_reset_level(k);
+                self.fire_counts[k] = 0;
+            }
+        }
+    }
+
+    /// Resolve reset_intervals from memory_reset + optional explicit intervals.
+    /// memory_reset=true, intervals=None → [1,1,...,1] (spec-08 compat)
+    /// memory_reset=true, intervals=Some([1,8,64,512]) → selective (spec 57)
+    /// memory_reset=false → [] (no reset)
+    fn resolve_intervals(memory_reset: bool, intervals: Option<Vec<usize>>, k: usize) -> PyResult<Vec<usize>> {
+        if !memory_reset {
+            return Ok(Vec::new());
+        }
+        match intervals {
+            Some(v) => {
+                if v.len() != k {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        format!("reset_intervals length {} != k={}", v.len(), k)));
+                }
+                for (i, &r) in v.iter().enumerate() {
+                    if r < 1 {
+                        return Err(pyo3::exceptions::PyValueError::new_err(
+                            format!("reset_intervals[{}] must be >= 1, got {}", i, r)));
+                    }
+                }
+                Ok(v)
+            }
+            None => Ok(vec![1usize; k]),
+        }
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -2092,11 +2139,14 @@ impl GpuModel {
     /// All parameters are uploaded to GPU once. batch_size determines how many
     /// independent M-state slots are allocated in GpuContextState.
     #[new]
-    #[pyo3(signature = (cfg, seed, batch_size=1, memory_reset=false, cuda_graph_warmup=0))]
+    #[pyo3(signature = (cfg, seed, batch_size=1, memory_reset=false, cuda_graph_warmup=0, reset_intervals=None))]
     fn new(
         cfg: &MAGConfig, seed: u64, batch_size: usize,
         memory_reset: bool, cuda_graph_warmup: usize,
+        reset_intervals: Option<Vec<usize>>,
     ) -> PyResult<Self> {
+        let k = cfg.inner.k;
+        let intervals = Self::resolve_intervals(memory_reset, reset_intervals, k)?;
         let host_params = nl_hecate_core::model::MAGParams::init(&cfg.inner, seed);
         let gpu_params = nl_hecate_core::gpu_params::GpuMAGParams::from_host(&host_params);
         let gpu_context = nl_hecate_core::gpu_params::GpuContextState::new(
@@ -2111,7 +2161,8 @@ impl GpuModel {
             m3_state: None,
             kv_cache: None,
             decode_workspace: None,
-            memory_reset,
+            reset_intervals: intervals,
+            fire_counts: vec![0usize; k],
             last_level_gnorms: Vec::new(),
         })
     }
@@ -2120,11 +2171,14 @@ impl GpuModel {
     /// batch_size controls how many M-state slots are allocated for batched training.
     /// cuda_graph_warmup: steps before graph capture (0 = disabled, 100 = recommended for training).
     #[staticmethod]
-    #[pyo3(signature = (params, cfg, batch_size=1, memory_reset=false, cuda_graph_warmup=0))]
+    #[pyo3(signature = (params, cfg, batch_size=1, memory_reset=false, cuda_graph_warmup=0, reset_intervals=None))]
     fn from_params(
         params: &MAGParams, cfg: &MAGConfig,
         batch_size: usize, memory_reset: bool, cuda_graph_warmup: usize,
+        reset_intervals: Option<Vec<usize>>,
     ) -> PyResult<Self> {
+        let k = cfg.inner.k;
+        let intervals = Self::resolve_intervals(memory_reset, reset_intervals, k)?;
         let gpu_params = nl_hecate_core::gpu_params::GpuMAGParams::from_host(&params.inner);
         let gpu_context = nl_hecate_core::gpu_params::GpuContextState::new(
             cfg.inner.k, cfg.inner.swa.d_model, batch_size,
@@ -2138,7 +2192,8 @@ impl GpuModel {
             m3_state: None,
             kv_cache: None,
             decode_workspace: None,
-            memory_reset,
+            reset_intervals: intervals,
+            fire_counts: vec![0usize; k],
             last_level_gnorms: Vec::new(),
         })
     }
@@ -2302,16 +2357,9 @@ impl GpuModel {
             self.cfg.swa.vocab_size,
         );
 
-        // TNT periodic reset (2511.07343 eq-006): after observing this step's final M,
-        // reset context.memory[k] to zeros for each level that fired this step.
-        // CS-32 compliant: reset happens after the step's advance, before the next step's observe.
-        if self.memory_reset {
-            for (k, &active) in pulse.inner.active_levels.iter().enumerate() {
-                if active {
-                    self.context.periodic_reset_level(k);
-                }
-            }
-        }
+        // Selective periodic reset (spec 57, extends eq-006).
+        // CS-32 compliant: reset happens after observe, before next advance.
+        self.maybe_reset_levels(&pulse.inner);
 
         Ok((loss, grad_norm))
     }
@@ -2431,14 +2479,8 @@ impl GpuModel {
             &mut self.params, d, v,
         );
 
-        // TNT periodic reset
-        if self.memory_reset {
-            for (k, &active) in pulse.inner.active_levels.iter().enumerate() {
-                if active {
-                    self.context.periodic_reset_level(k);
-                }
-            }
-        }
+        // Selective periodic reset (spec 57, extends eq-006).
+        self.maybe_reset_levels(&pulse.inner);
 
         Ok((loss, grad_norm))
     }
@@ -2827,9 +2869,11 @@ struct GpuStackedModel {
     adamw_state: Option<nl_hecate_core::gpu_stacked_optimizer::GpuStackedAdamWState>,
     m3_state: Option<nl_hecate_core::gpu_stacked_optimizer::GpuStackedM3State>,
     n_blocks: usize,
-    /// TNT periodic reset mode. When true, context.memory[k] is zeroed after
-    /// each step where pulse.active_levels[k] is true (eq-006, 2511.07343).
-    memory_reset: bool,
+    /// Per-level reset intervals for selective periodic reset (spec 57).
+    /// Empty vec = no reset. [1,1,1,1] = spec-08 all-ones. [1,8,64,512] = gear-shifting.
+    reset_intervals: Vec<usize>,
+    /// Per-level fire counters for selective periodic reset (spec 57).
+    fire_counts: Vec<usize>,
     /// Per-block aggregate gradient norms from the most recent step_adamw call (spec 23).
     last_block_gnorms: Vec<f32>,
     /// Per-block L0-only gradient norms from the most recent step_adamw call (spec 23).
@@ -2843,14 +2887,32 @@ struct GpuStackedModel {
 }
 
 #[cfg(feature = "cuda")]
+impl GpuStackedModel {
+    /// Selective periodic reset (spec 57): for each active level, increment fire
+    /// counter and reset M when counter reaches the level's reset interval.
+    /// CS-32: called after observe, before next advance.
+    fn maybe_reset_levels(&mut self, pulse: &nl_hecate_core::conductor::Pulse) {
+        if self.reset_intervals.is_empty() { return; }
+        for (k, &active) in pulse.active_levels.iter().enumerate() {
+            if !active { continue; }
+            self.fire_counts[k] += 1;
+            if self.fire_counts[k] >= self.reset_intervals[k] {
+                self.context.periodic_reset_level(k);
+                self.fire_counts[k] = 0;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
 #[pymethods]
 impl GpuStackedModel {
     /// Create from StackedMAGParams config.
     #[new]
-    #[pyo3(signature = (cfg, n_blocks, seed, batch_size=1, memory_reset=false))]
+    #[pyo3(signature = (cfg, n_blocks, seed, batch_size=1, memory_reset=false, reset_intervals=None))]
     fn new(
         cfg: &MAGConfig, n_blocks: usize, seed: u64, batch_size: usize,
-        memory_reset: bool,
+        memory_reset: bool, reset_intervals: Option<Vec<usize>>,
     ) -> PyResult<Self> {
         if batch_size == 0 {
             return Err(pyo3::exceptions::PyValueError::new_err("batch_size must be >= 1"));
@@ -2858,6 +2920,8 @@ impl GpuStackedModel {
         if n_blocks == 0 {
             return Err(pyo3::exceptions::PyValueError::new_err("n_blocks must be >= 1"));
         }
+        let k = cfg.inner.k;
+        let intervals = GpuModel::resolve_intervals(memory_reset, reset_intervals, k)?;
         let host_params = nl_hecate_core::stacked_model::StackedMAGParams::init(
             &cfg.inner, n_blocks, seed,
         );
@@ -2873,7 +2937,8 @@ impl GpuStackedModel {
             adamw_state: None,
             m3_state: None,
             n_blocks,
-            memory_reset,
+            reset_intervals: intervals,
+            fire_counts: vec![0usize; k],
             last_block_gnorms: Vec::new(),
             last_l0_block_gnorms: Vec::new(),
             profiler: None,
@@ -2885,10 +2950,10 @@ impl GpuStackedModel {
     /// Create from serialized StackedMAGParams JSON (loaded from checkpoint).
     /// Used by load_stacked_checkpoint + extend_stacked_push_up.
     #[staticmethod]
-    #[pyo3(signature = (params_json, cfg, n_blocks, batch_size=1, memory_reset=false))]
+    #[pyo3(signature = (params_json, cfg, n_blocks, batch_size=1, memory_reset=false, reset_intervals=None))]
     fn from_params_json(
         params_json: &str, cfg: &MAGConfig, n_blocks: usize,
-        batch_size: usize, memory_reset: bool,
+        batch_size: usize, memory_reset: bool, reset_intervals: Option<Vec<usize>>,
     ) -> PyResult<Self> {
         if batch_size == 0 {
             return Err(pyo3::exceptions::PyValueError::new_err("batch_size must be >= 1"));
@@ -2896,6 +2961,8 @@ impl GpuStackedModel {
         if n_blocks == 0 {
             return Err(pyo3::exceptions::PyValueError::new_err("n_blocks must be >= 1"));
         }
+        let k = cfg.inner.k;
+        let intervals = GpuModel::resolve_intervals(memory_reset, reset_intervals, k)?;
         let host_params: nl_hecate_core::stacked_model::StackedMAGParams =
             serde_json::from_str(params_json)
                 .map_err(|e| pyo3::exceptions::PyValueError::new_err(
@@ -2924,7 +2991,8 @@ impl GpuStackedModel {
             adamw_state: None,
             m3_state: None,
             n_blocks,
-            memory_reset,
+            reset_intervals: intervals,
+            fire_counts: vec![0usize; k],
             last_block_gnorms: Vec::new(),
             last_l0_block_gnorms: Vec::new(),
             profiler: None,
@@ -3015,16 +3083,9 @@ impl GpuStackedModel {
         // Update M-norm tracking for dormancy detection (spec 28).
         self.context.update_m_norm_tracking();
 
-        // TNT periodic reset (2511.07343 eq-006): after observing this step's final M,
-        // reset context.memory[k] to zeros for each level that fired this step.
-        // CS-32 compliant: reset happens after the step's advance, before the next step's observe.
-        if self.memory_reset {
-            for (k, &active) in pulse.inner.active_levels.iter().enumerate() {
-                if active {
-                    self.context.periodic_reset_level(k);
-                }
-            }
-        }
+        // Selective periodic reset (spec 57, extends eq-006).
+        // CS-32 compliant: reset happens after observe, before next advance.
+        self.maybe_reset_levels(&pulse.inner);
 
         Ok((loss, grad_norm))
     }
@@ -3118,14 +3179,8 @@ impl GpuStackedModel {
         // Update M-norm tracking for dormancy detection (spec 28)
         self.context.update_m_norm_tracking();
 
-        // TNT periodic reset (CS-32 compliant)
-        if self.memory_reset {
-            for (k, &active) in pulse.inner.active_levels.iter().enumerate() {
-                if active {
-                    self.context.periodic_reset_level(k);
-                }
-            }
-        }
+        // Selective periodic reset (spec 57, CS-32 compliant)
+        self.maybe_reset_levels(&pulse.inner);
 
         Ok((loss, grad_norm))
     }

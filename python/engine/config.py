@@ -190,6 +190,12 @@ class BuildConfig:
     # "periodic": M resets to zeros at each CMS level fire boundary (TNT mode)
     memory_reset: str = "carry_forward"
 
+    # Selective periodic reset intervals (spec 57).
+    # None → [1,1,...,1] (spec-08: every level resets every step it fires).
+    # [1,8,64,512] → gear-shifting: level k resets every R_k fires, equalizing write budget.
+    # Ignored when memory_reset != "periodic".
+    reset_intervals: list[int] | None = None
+
     # Gate warmup protocol (specs/infrastructure/09_gate_warmup.md)
     # theta_floor_init: per-level scaffold floor at step 0; decays linearly to 0
     # gate_warmup_decay_steps: step at which theta_floor_init reaches 0 (Phase 2 end)
@@ -404,6 +410,14 @@ class BuildConfig:
         if self.memory_reset not in ("carry_forward", "periodic"):
             raise ValueError(
                 f"memory_reset must be 'carry_forward' or 'periodic', got '{self.memory_reset}'")
+        if self.reset_intervals is not None:
+            if len(self.reset_intervals) != self.k:
+                raise ValueError(
+                    f"reset_intervals length {len(self.reset_intervals)} must match k={self.k}")
+            for i, r in enumerate(self.reset_intervals):
+                if r < 1:
+                    raise ValueError(
+                        f"reset_intervals[{i}] must be >= 1, got {r}")
         if self.gate_warmup_theta_floor_init is not None:
             if self.k < 4:
                 raise ValueError(
