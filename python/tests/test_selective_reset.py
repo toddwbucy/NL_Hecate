@@ -97,14 +97,16 @@ class TestSelectiveReset:
         model.step_adamw(inp, tgt, pulse, 0.001)
         conductor.advance()
 
-        # Use memory_norms_live() for post-reset GPU M state
+        # Primary check: fire_count confirms periodic_reset_level was NOT called on L1
+        counts = model.get_fire_counts()
+        assert counts[0] == 0, f"L0 fire_count should reset to 0 (interval=1), got {counts[0]}"
+        assert counts[1] == 1, f"L1 fire_count should be 1 (not yet at interval=8), got {counts[1]}"
+
+        # Secondary check: GPU M state confirms L1 was not zeroed
         norms = model.memory_norms_live()
-        # L0 should be reset (interval=1)
         assert norms[0] < 1e-3, f"L0 should be reset, got {norms[0]}"
-        # L1 should NOT be reset (interval=8, only 1 fire).
-        # At d=32 with small gate biases, L1 M norm is tiny but non-zero.
         # periodic_reset_level() zeros M exactly to 0.0; any non-zero value
-        # confirms L1 was NOT reset.
+        # confirms L1's M was preserved through the fire.
         assert norms[1] > 0.0, f"L1 M should persist (not zeroed), got {norms[1]}"
 
     def test_l0_always_resets(self):
@@ -151,13 +153,12 @@ class TestSelectiveReset:
         # After the 8th fire (step 56), L1 should be reset
         assert l1_norms[-1][1] < 1e-3, \
             f"L1 should reset at 8th fire (step {l1_norms[-1][0]}), got norm={l1_norms[-1][1]}"
-        # Before the 8th fire, L1 should NOT be reset — norms must be >0 and non-decreasing
-        # (M accumulates writes between resets)
+        # Before the 8th fire, L1 should NOT be reset — norms must be >0
+        # (proving periodic_reset_level was not called). We do NOT assert
+        # monotonicity: M norms can fluctuate due to write/decay dynamics.
         pre_reset_norms = [n for _, n in l1_norms[:-1]]
         assert all(n > 0 for n in pre_reset_norms), \
-            f"L1 norms before boundary should all be >0, got {pre_reset_norms}"
-        assert all(pre_reset_norms[i] <= pre_reset_norms[i + 1] for i in range(len(pre_reset_norms) - 1)), \
-            f"L1 norms should be non-decreasing before boundary, got {pre_reset_norms}"
+            f"L1 norms before boundary should all be >0 (not reset), got {pre_reset_norms}"
 
 
 class TestNoReset:
