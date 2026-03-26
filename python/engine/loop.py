@@ -300,6 +300,11 @@ def run_build(bcfg: BuildConfig):
             )
             if ext_error_clip is not None and len(ext_error_clip) < target_k:
                 ext_error_clip = list(ext_error_clip) + [ext_error_clip[-1]] * (target_k - len(ext_error_clip))
+            # Extend reset_intervals to target_k if needed (spec 57)
+            ri = bcfg.reset_intervals
+            if ri is not None and len(ri) < target_k:
+                ri = list(ri) + [ri[-1]] * (target_k - len(ri))
+                bcfg.reset_intervals = ri
             # Rebuild MAGConfig with the new k (carry all other fields from loaded cfg)
             new_cfg = nl_hecate.MAGConfig(
                 d_model=cfg.d_model, num_heads=cfg.num_heads,

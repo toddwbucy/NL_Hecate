@@ -61,8 +61,8 @@ class TestBackwardCompat:
         conductor.advance()
 
         # After spec-08 reset, all levels should have M≈0
-        # memory_norms() returns flat list: [L0_norm, L1_norm, L2_norm, L3_norm]
-        norms = model.memory_norms()
+        # memory_norms_live() reads current GPU M state (post-reset)
+        norms = model.memory_norms_live()
         for i, norm in enumerate(norms):
             assert norm < 1e-3, f"L{i} expected M≈0 after all-ones reset, got {norm}"
 
@@ -89,7 +89,8 @@ class TestSelectiveReset:
         model.step_adamw(inp, tgt, pulse, 0.001)
         conductor.advance()
 
-        norms = model.memory_norms()
+        # Use memory_norms_live() for post-reset GPU M state
+        norms = model.memory_norms_live()
         # L0 should be reset (interval=1)
         assert norms[0] < 1e-3, f"L0 should be reset, got {norms[0]}"
         # L1 should NOT be reset (interval=8, only 1 fire)
@@ -108,7 +109,8 @@ class TestSelectiveReset:
             pulse = conductor.pulse()
             model.step_adamw(inp, tgt, pulse, 0.001)
             conductor.advance()
-            norms = model.memory_norms()
+            # memory_norms_live() reads post-reset GPU state
+            norms = model.memory_norms_live()
             assert norms[0] < 1e-3, f"L0 should reset every step, got norm={norms[0]} at step {step}"
 
     def test_l1_resets_at_interval_boundary(self):
@@ -127,7 +129,8 @@ class TestSelectiveReset:
             model.step_adamw(inp, tgt, pulse, 0.001)
             conductor.advance()
             if pulse.active_levels[1]:  # L1 fired
-                norms = model.memory_norms()
+                # Use live norms to see post-reset state
+                norms = model.memory_norms_live()
                 l1_norms.append((step, norms[1]))
 
         # Should have fired at steps 0,8,16,24,32,40,48,56
@@ -151,7 +154,8 @@ class TestNoReset:
         model.step_adamw(inp, tgt, pulse, 0.001)
         conductor.advance()
 
-        norms = model.memory_norms()
+        # memory_norms_live() for current M state (no reset applied)
+        norms = model.memory_norms_live()
         # Without reset, L0 M should persist (non-zero after forward)
         assert norms[0] > 0, f"Expected M > 0 without reset, got {norms[0]}"
 
@@ -196,8 +200,9 @@ class TestParity:
             loss_b, _ = model_b.step_adamw(inp, tgt, pb, 0.001)
             cond_b.advance()
 
-            norms_a = model_a.memory_norms()
-            norms_b = model_b.memory_norms()
+            # Use live norms for both — they should be identical
+            norms_a = model_a.memory_norms_live()
+            norms_b = model_b.memory_norms_live()
 
             for li in range(len(norms_a)):
                 assert abs(norms_a[li] - norms_b[li]) < 1e-3, \
@@ -249,6 +254,29 @@ class TestFireCountsAPI:
         model, cfg = _make_stacked_model(memory_reset=True, reset_intervals=[1, 8, 64, 512])
         with pytest.raises(Exception, match="fire_counts length"):
             model.set_fire_counts([0, 0])
+
+
+class TestResetContextClearsFireCounts:
+    """Verify reset_context() zeros fire_counts (finding 1, spec 57)."""
+
+    def test_reset_context_zeros_fire_counts(self):
+        """reset_context() should zero fire_counts since M is being hard-reset."""
+        model, cfg = _make_stacked_model(memory_reset=True, reset_intervals=[1, 8, 64, 512])
+        conductor = nl_hecate.Conductor(cfg.k, list(cfg.chunk_sizes))
+        inp, tgt = _random_batch(cfg)
+
+        pulse = conductor.pulse()
+        model.step_adamw(inp, tgt, pulse, 0.001)
+        conductor.advance()
+
+        # fire_counts should be non-zero for L1+ after one step
+        counts = model.get_fire_counts()
+        assert counts[1] > 0, f"L1 should have fired, got {counts[1]}"
+
+        # reset_context should zero both M and fire_counts
+        model.reset_context()
+        counts = model.get_fire_counts()
+        assert counts == [0, 0, 0, 0], f"Expected all zeros after reset_context, got {counts}"
 
 
 if __name__ == "__main__":

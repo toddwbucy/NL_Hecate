@@ -2545,8 +2545,12 @@ impl GpuModel {
 
     /// Zero all GPU memory matrices in-place (cudaMemset).
     /// Used at document boundaries to prevent stale state across documents.
+    /// Also zeros fire_counts (spec 57) since M state is being hard-reset.
     fn reset_context(&mut self) {
         self.context.reset();
+        // Fire counts track fires since last M reset — zeroing M means the
+        // counters must restart so the next reset cycle is correctly aligned.
+        self.fire_counts.iter_mut().for_each(|c| *c = 0);
     }
 
     /// Update per-level theta_floor values on the live model config.
@@ -2564,6 +2568,7 @@ impl GpuModel {
     }
 
     /// Upload context state from host (e.g., to restore after a read-only run).
+    /// Also zeros fire_counts (spec 57) since the M state is being replaced.
     fn upload_context(&mut self, ctx: &ContextState) -> PyResult<()> {
         if ctx.inner.d != self.cfg.swa.d_model || ctx.inner.memory.len() != self.cfg.k {
             return Err(PyValueError::new_err(format!(
@@ -2586,6 +2591,8 @@ impl GpuModel {
         );
         new_ctx.cuda_graph.invalidate();
         self.context = new_ctx;
+        // Fire counts must restart when M state is replaced from host.
+        self.fire_counts.iter_mut().for_each(|c| *c = 0);
         Ok(())
     }
 
@@ -3231,13 +3238,19 @@ impl GpuStackedModel {
     }
 
     /// Reset all memory across all blocks.
+    /// Also zeros fire_counts (spec 57) since M state is being hard-reset.
     fn reset_context(&mut self) {
         self.context.reset();
+        self.fire_counts.iter_mut().for_each(|c| *c = 0);
     }
 
     /// Prefill: process full prompt through all blocks, populate per-block KV caches,
     /// return last-position logits [vocab_size]. Call once before decode_token loop.
     /// Spec: specs/infrastructure/47_single_token_decode.md
+    ///
+    /// NOTE: Does NOT call maybe_reset_levels(). Selective periodic reset (spec 57)
+    /// is an optimizer-path concern (step_adamw/step_m3). Inference paths observe M
+    /// but don't own the reset cycle. CS-11: no training loop logic in memory rules.
     fn prefill(&mut self, input_ids: Vec<usize>, pulse: &Pulse) -> PyResult<Vec<f32>> {
         let s = self.cfg.swa.seq_len;
         let v = self.cfg.swa.vocab_size;
@@ -3271,6 +3284,9 @@ impl GpuStackedModel {
     /// Decode one token using per-block KV caches + M state. Returns logits [vocab_size].
     /// Must call prefill() first. O(d^2) per token, not O(seq_len * d^2).
     /// Spec: specs/infrastructure/47_single_token_decode.md
+    ///
+    /// NOTE: Does NOT call maybe_reset_levels(). See prefill() note — inference paths
+    /// don't own the reset cycle. CS-11 compliant.
     fn decode_token(&mut self, token_id: usize, pulse: &Pulse) -> PyResult<Vec<f32>> {
         let v = self.cfg.swa.vocab_size;
         if token_id >= v {
@@ -3396,6 +3412,23 @@ impl GpuStackedModel {
         }
         self.fire_counts = counts;
         Ok(())
+    }
+
+    /// Read live GPU M norms (post-reset). Unlike memory_norms() which returns
+    /// cached pre-reset values from update_m_norm_tracking(), this reads the
+    /// current GPU memory state. Use for verifying that reset actually zeroed M.
+    /// Returns Vec<f32> of length k (max across blocks per level).
+    fn memory_norms_live(&self) -> Vec<f32> {
+        let k = self.cfg.k;
+        let mut level_norms = vec![0.0f32; k];
+        for bn in self.context.memory_norms() {
+            for (level, norm) in bn.iter().enumerate() {
+                if level < k && *norm > level_norms[level] {
+                    level_norms[level] = *norm;
+                }
+            }
+        }
+        level_norms
     }
 
     /// Read gate biases from GPU: returns Vec of (b_alpha, b_theta, b_eta) per level.
