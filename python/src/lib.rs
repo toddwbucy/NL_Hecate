@@ -2633,6 +2633,23 @@ impl GpuModel {
         result
     }
 
+    /// Get per-level fire counts for selective reset (spec 57).
+    /// Returns Vec<usize> of length k. Used for checkpoint roundtrip verification.
+    fn get_fire_counts(&self) -> Vec<usize> {
+        self.fire_counts.clone()
+    }
+
+    /// Restore per-level fire counts (spec 57).
+    /// Used to undo fire_count side effects from roundtrip verification.
+    fn set_fire_counts(&mut self, counts: Vec<usize>) -> PyResult<()> {
+        if counts.len() != self.fire_counts.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("fire_counts length {} != k={}", counts.len(), self.fire_counts.len())));
+        }
+        self.fire_counts = counts;
+        Ok(())
+    }
+
     /// Read gate biases from GPU: returns Vec of (b_alpha, b_theta, b_eta) per level.
     /// Small D2H transfer: 3 floats per level. Used for monitoring gate behavior.
     fn gate_biases(&self) -> Vec<(f32, f32, f32)> {
@@ -3364,6 +3381,21 @@ impl GpuStackedModel {
             return (0..k).map(|_| Vec::new()).collect();
         }
         result
+    }
+
+    /// Get per-level fire counts for selective reset (spec 57).
+    fn get_fire_counts(&self) -> Vec<usize> {
+        self.fire_counts.clone()
+    }
+
+    /// Restore per-level fire counts (spec 57).
+    fn set_fire_counts(&mut self, counts: Vec<usize>) -> PyResult<()> {
+        if counts.len() != self.fire_counts.len() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("fire_counts length {} != k={}", counts.len(), self.fire_counts.len())));
+        }
+        self.fire_counts = counts;
+        Ok(())
     }
 
     /// Read gate biases from GPU: returns Vec of (b_alpha, b_theta, b_eta) per level.

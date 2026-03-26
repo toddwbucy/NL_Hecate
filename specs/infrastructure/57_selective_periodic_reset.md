@@ -116,47 +116,37 @@ The fire counter tracks how many times level k has fired since its last reset
 (or since build start). When the counter reaches R_k, the level resets and
 the counter returns to zero.
 
-### Conductor Changes
+### Fire Counts Ownership (Normative)
+
+**Option (b) was chosen**: fire_counts and reset_intervals live on the GPU model
+struct (GpuModel / GpuStackedModel), NOT on the Conductor. The Conductor is
+unchanged — it only provides pulse/active_levels as before.
 
 ```rust
-pub struct Conductor {
-    pub k: usize,
-    pub chunk_sizes: Vec<usize>,
-    step: usize,
-    stream: Option<Box<dyn ContextStream>>,
-    // NEW: per-level fire counters for selective reset
-    fire_counts: Vec<usize>,
-    reset_intervals: Vec<usize>,
-}
+// In GpuModel / GpuStackedModel (python/src/lib.rs):
+reset_intervals: Vec<usize>,  // empty = no reset; [1,1,1,1] = spec-08
+fire_counts: Vec<usize>,      // per-level, reset to 0 on threshold hit
 
-pub struct ConductorState {
-    pub k: usize,
-    pub chunk_sizes: Vec<usize>,
-    pub step: usize,
-    // NEW: serialized for checkpoint restore
-    pub fire_counts: Vec<usize>,
-    pub reset_intervals: Vec<usize>,
-}
-```
-
-New method on Conductor:
-
-```rust
-/// Check whether level k should reset this step.
-/// Returns true IFF level k fired AND its fire counter reached R_k.
-/// Advances the fire counter as a side effect.
-/// Must be called AFTER observe, BEFORE next advance (CS-32).
-pub fn should_reset_level(&mut self, level: usize, active: bool) -> bool {
-    if !active { return false; }
-    self.fire_counts[level] += 1;
-    if self.fire_counts[level] >= self.reset_intervals[level] {
-        self.fire_counts[level] = 0;
-        true
-    } else {
-        false
+fn maybe_reset_levels(&mut self, pulse: &Pulse) {
+    if self.reset_intervals.is_empty() { return; }
+    for (k, &active) in pulse.active_levels.iter().enumerate() {
+        if !active { continue; }
+        self.fire_counts[k] += 1;
+        if self.fire_counts[k] >= self.reset_intervals[k] {
+            self.context.periodic_reset_level(k);
+            self.fire_counts[k] = 0;
+        }
     }
 }
 ```
+
+**Checkpoint behavior**: fire_counts are transient inner-loop state. On checkpoint
+restore, they reset to zero — the model starts a fresh reset cycle. This is
+acceptable because a few extra or fewer writes before the first post-resume reset
+have negligible impact on M quality.
+
+**Roundtrip verification**: fire_counts are saved and restored around verification
+steps to prevent the verification from perturbing the live reset schedule.
 
 ### Python Config Changes
 
@@ -198,13 +188,8 @@ if self.memory_reset {
 }
 ```
 
-This requires the GpuModel / GpuStackedModel to either:
-(a) own a Conductor reference for reset decisions, or
-(b) accept reset_intervals and maintain fire_counts internally.
-
-**Option (b) is simpler** — the GPU model already has `memory_reset: bool`. Replace
-with `reset_intervals: Vec<usize>` (empty = no reset). The fire counters are k
-usizes stored alongside the model, no GPU memory needed.
+The GPU model owns the fire counters directly (option b from design phase).
+No changes to the Conductor or ConductorState.
 
 ### PyO3 Interface Changes
 

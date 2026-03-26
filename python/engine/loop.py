@@ -1537,6 +1537,9 @@ def run_build(bcfg: BuildConfig):
                         rt_opt = gpu_model.snapshot_optimizer()
                         try:
                             v_model.upload_context(rt_ctx)
+                            # Spec 57: snapshot fire_counts before verification
+                            rt_fire_counts = (gpu_model.get_fire_counts()
+                                              if hasattr(gpu_model, "get_fire_counts") else None)
                             train_fwd, _tg = gpu_model.step_adamw(
                                 rt_input, rt_target, pulse, current_lr,
                                 beta1=bcfg.beta1, beta2=bcfg.beta2, eps=1e-8,
@@ -1550,11 +1553,13 @@ def run_build(bcfg: BuildConfig):
                                 max_grad_norm=bcfg.max_grad_norm,
                             )
                         finally:
-                            # Restore full state: context + params + optimizer
+                            # Restore full state: context + params + optimizer + fire_counts
                             gpu_model.upload_context(rt_ctx)
                             gpu_model.upload_params(rt_params)
                             if rt_opt is not None:
                                 gpu_model.restore_optimizer(rt_opt)
+                            if rt_fire_counts is not None:
+                                gpu_model.set_fire_counts(rt_fire_counts)
                         delta = abs(verify_fwd - train_fwd)
                         if jsonl:
                             jsonl.log(event="checkpoint_roundtrip", step=step,
@@ -1948,9 +1953,14 @@ def run_build(bcfg: BuildConfig):
             del gpu_model
             gc.collect()
             periodic = (bcfg.memory_reset == "periodic")
+            # Spec 57: extend reset_intervals to match new k
+            ri = bcfg.reset_intervals
+            if ri is not None and len(ri) < new_k:
+                ri = list(ri) + [ri[-1]] * (new_k - len(ri))
+                bcfg.reset_intervals = ri
             gpu_model = nl_hecate.GpuModel.from_params(
                 params, cfg, batch_size=bcfg.batch_size, memory_reset=periodic,
-                reset_intervals=bcfg.reset_intervals)
+                reset_intervals=ri)
 
             # Re-init M3 optimizer on rebuilt model (from_params creates fresh m3_state=None)
             if use_m3:

@@ -204,5 +204,52 @@ class TestParity:
                     f"Step {step} L{li}: {norms_a[li]} vs {norms_b[li]}"
 
 
+class TestFireCountsAPI:
+    """Verify get/set fire_counts for roundtrip verification (spec 57)."""
+
+    def test_get_fire_counts_initial(self):
+        """Fire counts start at zero."""
+        model, cfg = _make_stacked_model(memory_reset=True, reset_intervals=[1, 8, 64, 512])
+        counts = model.get_fire_counts()
+        assert counts == [0, 0, 0, 0], f"Expected all zeros, got {counts}"
+
+    def test_fire_counts_advance(self):
+        """Fire counts advance after step_adamw."""
+        model, cfg = _make_stacked_model(memory_reset=True, reset_intervals=[1, 8, 64, 512])
+        conductor = nl_hecate.Conductor(cfg.k, list(cfg.chunk_sizes))
+        inp, tgt = _random_batch(cfg)
+
+        pulse = conductor.pulse()
+        model.step_adamw(inp, tgt, pulse, 0.001)
+        conductor.advance()
+
+        counts = model.get_fire_counts()
+        # L0 interval=1: fires and resets → back to 0
+        assert counts[0] == 0, f"L0 should reset to 0, got {counts[0]}"
+        # L1 interval=8: fires once → count=1
+        assert counts[1] == 1, f"L1 should be 1, got {counts[1]}"
+
+    def test_set_fire_counts_restores(self):
+        """set_fire_counts restores saved state."""
+        model, cfg = _make_stacked_model(memory_reset=True, reset_intervals=[1, 8, 64, 512])
+        conductor = nl_hecate.Conductor(cfg.k, list(cfg.chunk_sizes))
+        inp, tgt = _random_batch(cfg)
+
+        saved = model.get_fire_counts()
+        pulse = conductor.pulse()
+        model.step_adamw(inp, tgt, pulse, 0.001)
+        # Counts have advanced
+        assert model.get_fire_counts() != saved or saved == [0, 0, 0, 0]
+        # Restore
+        model.set_fire_counts(saved)
+        assert model.get_fire_counts() == saved
+
+    def test_set_fire_counts_wrong_length(self):
+        """Wrong length raises ValueError."""
+        model, cfg = _make_stacked_model(memory_reset=True, reset_intervals=[1, 8, 64, 512])
+        with pytest.raises(Exception, match="fire_counts length"):
+            model.set_fire_counts([0, 0])
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
