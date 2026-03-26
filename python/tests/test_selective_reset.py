@@ -93,10 +93,10 @@ class TestSelectiveReset:
         norms = model.memory_norms_live()
         # L0 should be reset (interval=1)
         assert norms[0] < 1e-3, f"L0 should be reset, got {norms[0]}"
-        # L1 should NOT be reset (interval=8, only 1 fire)
-        # L1 M may be small due to gate biases, but should differ from spec-08
-        # The key invariant: L1 M is NOT zeroed
-        print(f"After step 0 with intervals=[1,8,64,512]: norms={norms}")
+        # L1 should NOT be reset (interval=8, only 1 fire).
+        # At d=32 with random init, L1 M norm won't be exactly zero even with
+        # small gate biases — the key invariant is that it's NOT zeroed.
+        assert norms[1] > 1e-6, f"L1 M should persist (not zeroed), got {norms[1]}"
 
     def test_l0_always_resets(self):
         """L0 with interval=1 should always reset (same as spec-08 for L0)."""
@@ -193,11 +193,11 @@ class TestParity:
             inp, tgt = _random_batch(cfg_a)
 
             pa = cond_a.pulse()
-            loss_a, _ = model_a.step_adamw(inp, tgt, pa, 0.001)
+            _, _ = model_a.step_adamw(inp, tgt, pa, 0.001)
             cond_a.advance()
 
             pb = cond_b.pulse()
-            loss_b, _ = model_b.step_adamw(inp, tgt, pb, 0.001)
+            _, _ = model_b.step_adamw(inp, tgt, pb, 0.001)
             cond_b.advance()
 
             # Use live norms for both — they should be identical
@@ -235,17 +235,31 @@ class TestFireCountsAPI:
         assert counts[1] == 1, f"L1 should be 1, got {counts[1]}"
 
     def test_set_fire_counts_restores(self):
-        """set_fire_counts restores saved state."""
+        """set_fire_counts restores saved state after multiple advances."""
         model, cfg = _make_stacked_model(memory_reset=True, reset_intervals=[1, 8, 64, 512])
         conductor = nl_hecate.Conductor(cfg.k, list(cfg.chunk_sizes))
-        inp, tgt = _random_batch(cfg)
+
+        # Advance 3 steps so fire_counts are meaningfully non-zero.
+        # At step 0 all levels fire, so L1/L2/L3 counts become 1.
+        for _ in range(3):
+            inp, tgt = _random_batch(cfg)
+            pulse = conductor.pulse()
+            model.step_adamw(inp, tgt, pulse, 0.001)
+            conductor.advance()
 
         saved = model.get_fire_counts()
-        pulse = conductor.pulse()
-        model.step_adamw(inp, tgt, pulse, 0.001)
-        # Counts have advanced
-        assert model.get_fire_counts() != saved or saved == [0, 0, 0, 0]
-        # Restore
+        assert any(c > 0 for c in saved), f"Expected non-zero counts after 3 steps, got {saved}"
+
+        # Advance past step 8 (L1 fires again at step 8) to guarantee counts change.
+        # Steps 3..11 = 9 more steps; L1 fires at step 8 → count goes from 1 to 2.
+        for _ in range(9):
+            inp, tgt = _random_batch(cfg)
+            pulse = conductor.pulse()
+            model.step_adamw(inp, tgt, pulse, 0.001)
+            conductor.advance()
+        assert model.get_fire_counts() != saved, "Counts should have changed after crossing L1 fire boundary"
+
+        # Restore and verify
         model.set_fire_counts(saved)
         assert model.get_fire_counts() == saved
 
