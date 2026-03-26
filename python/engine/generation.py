@@ -258,6 +258,179 @@ def generate_learning(
     return seq, losses, grad_norms
 
 
+# ── Self-refinement: iterative learn→speak with effort tiers (spec 56) ──
+
+EFFORT_TIERS = {
+    "think": 1,
+    "think_hard": 3,
+    "think_really_hard": 8,
+    "plaid": 32,  # max cap; actual stopping via convergence
+}
+
+
+def self_refine(
+    gpu_model,
+    cfg,
+    prompt_tokens: list[int],
+    max_tokens: int = 64,
+    temperature: float = 0.8,
+    top_k: int = 0,
+    stop_token: int | None = None,
+    conductor=None,
+    effort: str = "think",
+    loss_gate: float = 8.0,
+    epsilon: float = 0.1,
+    lr: float = 0.0003,
+    beta1: float = 0.9,
+    beta2: float = 0.999,
+    eps: float = 1e-8,
+    weight_decay: float = 0.1,
+    max_grad_norm: float = 1.0,
+) -> tuple[list[int], list[float], list[int] | None]:
+    """Self-refining generation with effort tiers (spec 56).
+
+    Iterates the learn→speak loop N times. Each round:
+    1. Generate candidate tokens via prefill+decode
+    2. step_adamw on own output (learn from what it said)
+    3. Loss from step 2 = self-consistency score
+
+    The model improves across rounds — each generation benefits from
+    learning from the previous round's output. Returns the best
+    (lowest self-consistency loss) generation.
+
+    Returns (best_tokens, loss_trajectory, best_gen_tokens_only).
+    loss_trajectory has one entry per round.
+    """
+    max_rounds = EFFORT_TIERS.get(effort, 1)
+    is_plaid = effort == "plaid"
+    vocab = cfg.vocab_size
+    seq_len = cfg.seq_len
+
+    if conductor is None:
+        conductor = nl_hecate.Conductor(
+            cfg.k, list(cfg.chunk_sizes) if hasattr(cfg, 'chunk_sizes') else [1] * cfg.k)
+
+    safe_pad = _safe_pad_token(prompt_tokens, vocab)
+
+    # Phase 1: Learn from prompt (same as generate_learning)
+    prompt_seq = list(prompt_tokens)
+    if len(prompt_seq) > seq_len:
+        for start in range(0, len(prompt_seq) - seq_len, seq_len):
+            chunk = prompt_seq[start:start + seq_len + 1]
+            if len(chunk) < seq_len + 1:
+                break
+            input_ids = chunk[:seq_len]
+            target_ids = chunk[1:seq_len + 1]
+            pulse = conductor.pulse()
+            loss, _gnorm = gpu_model.step_adamw(
+                input_ids, target_ids, pulse, lr,
+                beta1=beta1, beta2=beta2, eps=eps,
+                weight_decay=weight_decay,
+                max_grad_norm=max_grad_norm,
+            )
+            conductor.advance()
+            if math.isnan(loss) or math.isinf(loss):
+                return prompt_seq, [], None
+
+    # Phase 2: Self-refinement rounds
+    best_output = None
+    best_gen = None
+    best_loss = float('inf')
+    loss_trajectory: list[float] = []
+    prev_loss = None
+
+    for round_idx in range(max_rounds):
+        # SPEAK: generate candidate from current model state
+        ctx = prompt_seq[-seq_len:]
+        pad_len = seq_len - len(ctx)
+        if pad_len > 0:
+            ctx = [safe_pad] * pad_len + ctx
+
+        try:
+            speak_pulse = conductor.pulse()
+            last_logits = gpu_model.prefill(ctx, speak_pulse)
+            conductor.advance()
+
+            gen_tokens = []
+            for _ in range(max_tokens):
+                next_tok = _sample_token(last_logits, vocab, temperature, top_k)
+                if stop_token is not None and next_tok == stop_token:
+                    break
+                gen_tokens.append(next_tok)
+                pulse = conductor.pulse()
+                last_logits = gpu_model.decode_token(next_tok, pulse)
+                conductor.advance()
+        finally:
+            gpu_model.reset_cache()
+
+        if not gen_tokens:
+            loss_trajectory.append(float('inf'))
+            continue
+
+        # LEARN: step_adamw on own output — how well does the model
+        # predict what it just said?
+        candidate = list(ctx) + gen_tokens
+        self_loss_sum = 0.0
+        self_loss_count = 0
+
+        for start in range(0, max(1, len(candidate) - 1), seq_len):
+            end = min(start + seq_len, len(candidate) - 1)
+            chunk_len = end - start
+            if chunk_len < 1:
+                break
+
+            c_input = list(candidate[start:start + chunk_len])
+            c_target = list(candidate[start + 1:start + chunk_len + 1])
+
+            # Pad to seq_len
+            while len(c_input) < seq_len:
+                c_input.insert(0, safe_pad)
+                c_target.insert(0, vocab)  # mask padding
+
+            pulse = conductor.pulse()
+            loss, _gnorm = gpu_model.step_adamw(
+                c_input, c_target, pulse, lr,
+                beta1=beta1, beta2=beta2, eps=eps,
+                weight_decay=weight_decay,
+                max_grad_norm=max_grad_norm,
+            )
+            conductor.advance()
+
+            if math.isnan(loss) or math.isinf(loss):
+                break
+            self_loss_sum += loss
+            self_loss_count += 1
+
+        if self_loss_count == 0:
+            loss_trajectory.append(float('inf'))
+            continue
+
+        avg_self_loss = self_loss_sum / self_loss_count
+        loss_trajectory.append(avg_self_loss)
+
+        # Loss gate: reject incoherent output
+        if avg_self_loss > loss_gate:
+            continue
+
+        # Track best
+        if avg_self_loss < best_loss:
+            best_loss = avg_self_loss
+            best_output = list(prompt_seq) + gen_tokens
+            best_gen = list(gen_tokens)
+
+        # Convergence check (plaid mode)
+        if is_plaid and prev_loss is not None:
+            if abs(prev_loss - avg_self_loss) < epsilon:
+                break
+        prev_loss = avg_self_loss
+
+    if best_output is None:
+        # All rounds rejected — return prompt only
+        return list(prompt_seq), loss_trajectory, None
+
+    return best_output, loss_trajectory, best_gen
+
+
 # ── Stacked model generation (GpuStackedModel.forward) ───────────
 
 def generate_stacked(

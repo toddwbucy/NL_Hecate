@@ -300,6 +300,11 @@ def run_build(bcfg: BuildConfig):
             )
             if ext_error_clip is not None and len(ext_error_clip) < target_k:
                 ext_error_clip = list(ext_error_clip) + [ext_error_clip[-1]] * (target_k - len(ext_error_clip))
+            # Extend reset_intervals to target_k if needed (spec 57)
+            ri = bcfg.reset_intervals
+            if ri is not None and len(ri) < target_k:
+                ri = list(ri) + [ri[-1]] * (target_k - len(ri))
+                bcfg.reset_intervals = ri
             # Rebuild MAGConfig with the new k (carry all other fields from loaded cfg)
             new_cfg = nl_hecate.MAGConfig(
                 d_model=cfg.d_model, num_heads=cfg.num_heads,
@@ -818,18 +823,23 @@ def run_build(bcfg: BuildConfig):
         if is_stacked:
             n_blocks = bcfg.n_blocks
             periodic = (bcfg.memory_reset == "periodic")
+            ri = bcfg.reset_intervals  # None or list[int] (spec 57)
             if _stacked_params_json is not None:
                 # Loaded from stacked checkpoint (or extended via push-up)
                 gpu_model = nl_hecate.GpuStackedModel.from_params_json(
                     _stacked_params_json, cfg, n_blocks,
-                    batch_size=bcfg.batch_size, memory_reset=periodic)
+                    batch_size=bcfg.batch_size, memory_reset=periodic,
+                    reset_intervals=ri)
             else:
                 # Fresh init
                 gpu_model = nl_hecate.GpuStackedModel(
                     cfg, n_blocks, seed=bcfg.seed if hasattr(bcfg, "seed") else 42,
-                    batch_size=bcfg.batch_size, memory_reset=periodic)
+                    batch_size=bcfg.batch_size, memory_reset=periodic,
+                    reset_intervals=ri)
             print(f"  Stacked:  {n_blocks} blocks x k={bcfg.k} CMS levels"
                   f"  ({gpu_model.total_params():,} params)")
+            if ri is not None:
+                print(f"  Reset:    selective intervals={ri} (spec 57)")
             # Spec 28: configure dormancy detection
             if bcfg.dormancy_floors is not None:
                 gpu_model.set_dormancy_config(bcfg.dormancy_floors, bcfg.dormancy_consecutive)
@@ -837,8 +847,10 @@ def run_build(bcfg: BuildConfig):
                       f"consecutive={bcfg.dormancy_consecutive}")
         else:
             periodic = (bcfg.memory_reset == "periodic")
+            ri = bcfg.reset_intervals
             gpu_model = nl_hecate.GpuModel.from_params(
-                params, cfg, batch_size=bcfg.batch_size, memory_reset=periodic)
+                params, cfg, batch_size=bcfg.batch_size, memory_reset=periodic,
+                reset_intervals=ri)
 
     error_buffers = nl_hecate.ErrorBufferList(bcfg.k, bcfg.d_model)
 
@@ -1520,7 +1532,8 @@ def run_build(bcfg: BuildConfig):
                             v_params, v_cfg, _ = nl_hecate.load_build_checkpoint(ckpt_path)
                         v_model = nl_hecate.GpuModel.from_params(
                             v_params, v_cfg, batch_size=bcfg.batch_size,
-                            memory_reset=(bcfg.memory_reset == "periodic"))
+                            memory_reset=(bcfg.memory_reset == "periodic"),
+                            reset_intervals=bcfg.reset_intervals)
                         rt_input = list(input_ids[:bcfg.seq_len])
                         rt_target = list(target_ids[:bcfg.seq_len])
                         # Snapshot training model: context + params + optimizer
@@ -1529,6 +1542,9 @@ def run_build(bcfg: BuildConfig):
                         rt_opt = gpu_model.snapshot_optimizer()
                         try:
                             v_model.upload_context(rt_ctx)
+                            # Spec 57: snapshot fire_counts before verification
+                            rt_fire_counts = (gpu_model.get_fire_counts()
+                                              if hasattr(gpu_model, "get_fire_counts") else None)
                             train_fwd, _tg = gpu_model.step_adamw(
                                 rt_input, rt_target, pulse, current_lr,
                                 beta1=bcfg.beta1, beta2=bcfg.beta2, eps=1e-8,
@@ -1542,11 +1558,13 @@ def run_build(bcfg: BuildConfig):
                                 max_grad_norm=bcfg.max_grad_norm,
                             )
                         finally:
-                            # Restore full state: context + params + optimizer
+                            # Restore full state: context + params + optimizer + fire_counts
                             gpu_model.upload_context(rt_ctx)
                             gpu_model.upload_params(rt_params)
                             if rt_opt is not None:
                                 gpu_model.restore_optimizer(rt_opt)
+                            if rt_fire_counts is not None:
+                                gpu_model.set_fire_counts(rt_fire_counts)
                         delta = abs(verify_fwd - train_fwd)
                         if jsonl:
                             jsonl.log(event="checkpoint_roundtrip", step=step,
@@ -1940,8 +1958,14 @@ def run_build(bcfg: BuildConfig):
             del gpu_model
             gc.collect()
             periodic = (bcfg.memory_reset == "periodic")
+            # Spec 57: extend reset_intervals to match new k
+            ri = bcfg.reset_intervals
+            if ri is not None and len(ri) < new_k:
+                ri = list(ri) + [ri[-1]] * (new_k - len(ri))
+                bcfg.reset_intervals = ri
             gpu_model = nl_hecate.GpuModel.from_params(
-                params, cfg, batch_size=bcfg.batch_size, memory_reset=periodic)
+                params, cfg, batch_size=bcfg.batch_size, memory_reset=periodic,
+                reset_intervals=ri)
 
             # Re-init M3 optimizer on rebuilt model (from_params creates fresh m3_state=None)
             if use_m3:
