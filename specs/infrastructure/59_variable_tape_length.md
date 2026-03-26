@@ -43,15 +43,17 @@ CONTRACT
               value — hence the sweep.
 
               With selective reset (spec 57, intervals=[1,8,64,512]):
-              | seq_len | L0 writes/step | L1 writes/step | L2 writes/step |
-              |---------|---------------|----------------|----------------|
-              | 512     | 512           | 64             | 8              |
-              | 1024    | 1024          | 128            | 16             |
-              | 2048    | 2048          | 256            | 32             |
-              | 4096    | 4096          | 512            | 64             |
+              | seq_len | L0 writes/step | L1 writes/step | L2 writes/step | L3 writes/step |
+              |---------|---------------|----------------|----------------|----------------|
+              | 512     | 512           | 64             | 8              | 1              |
+              | 1024    | 1024          | 128            | 16             | 2              |
+              | 2048    | 2048          | 256            | 32             | 4              |
+              | 4096    | 4096          | 512            | 64             | 8              |
 
               At seq_len=4096, L2 gets 64 writes/step — matching what L1 gets
               at seq_len=512. This may be the activation threshold for L2.
+              L3 remains write-starved at all sweep points (max 8 writes/step
+              at seq_len=4096), consistent with its 512-token chunk size.
 
   Position:   specs/infrastructure/59_variable_tape_length.md
   Source:     HOPE (2512.24695) §7 — CMS chain structure
