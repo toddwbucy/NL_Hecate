@@ -36,13 +36,17 @@ def _make_stacked_model(k=4, memory_reset=True, reset_intervals=None):
     ), cfg
 
 
-def _random_batch(cfg):
-    """Generate random input/target token IDs."""
-    import random
+def _random_batch(cfg, rng=None):
+    """Generate random input/target token IDs.
+    Pass a seeded random.Random instance for deterministic results.
+    """
+    if rng is None:
+        import random
+        rng = random.Random(0)
     sl = cfg.seq_len
     v = cfg.vocab_size
-    input_ids = [random.randint(0, v - 1) for _ in range(sl)]
-    target_ids = [random.randint(0, v - 1) for _ in range(sl)]
+    input_ids = [rng.randint(0, v - 1) for _ in range(sl)]
+    target_ids = [rng.randint(0, v - 1) for _ in range(sl)]
     return input_ids, target_ids
 
 
@@ -51,9 +55,11 @@ class TestBackwardCompat:
 
     def test_none_intervals_resets_every_step(self):
         """With default intervals, all levels reset every step (spec-08)."""
+        import random
+        rng = random.Random(42)
         model, cfg = _make_stacked_model(memory_reset=True, reset_intervals=None)
         conductor = nl_hecate.Conductor(cfg.k, list(cfg.chunk_sizes))
-        inp, tgt = _random_batch(cfg)
+        inp, tgt = _random_batch(cfg, rng)
 
         # Run one step
         pulse = conductor.pulse()
@@ -72,6 +78,8 @@ class TestSelectiveReset:
 
     def test_l1_persists_after_first_fire(self):
         """L1 M should persist after step 0 since fire_count(1) < interval(8)."""
+        import random
+        rng = random.Random(42)
         model, cfg = _make_stacked_model(
             memory_reset=True, reset_intervals=[1, 8, 64, 512])
         conductor = nl_hecate.Conductor(cfg.k, list(cfg.chunk_sizes))
@@ -82,7 +90,7 @@ class TestSelectiveReset:
         #   L1: fire_count→1, 1<8 → NO reset
         #   L2: fire_count→1, 1<64 → NO reset
         #   L3: fire_count→1, 1<512 → NO reset
-        inp, tgt = _random_batch(cfg)
+        inp, tgt = _random_batch(cfg, rng)
         pulse = conductor.pulse()
         # Verify all levels active at step 0
         assert all(pulse.active_levels), f"Expected all active at step 0: {pulse.active_levels}"
@@ -94,18 +102,21 @@ class TestSelectiveReset:
         # L0 should be reset (interval=1)
         assert norms[0] < 1e-3, f"L0 should be reset, got {norms[0]}"
         # L1 should NOT be reset (interval=8, only 1 fire).
-        # At d=32 with random init, L1 M norm won't be exactly zero even with
-        # small gate biases — the key invariant is that it's NOT zeroed.
-        assert norms[1] > 1e-6, f"L1 M should persist (not zeroed), got {norms[1]}"
+        # At d=32 with small gate biases, L1 M norm is tiny but non-zero.
+        # periodic_reset_level() zeros M exactly to 0.0; any non-zero value
+        # confirms L1 was NOT reset.
+        assert norms[1] > 0.0, f"L1 M should persist (not zeroed), got {norms[1]}"
 
     def test_l0_always_resets(self):
         """L0 with interval=1 should always reset (same as spec-08 for L0)."""
+        import random
+        rng = random.Random(42)
         model, cfg = _make_stacked_model(
             memory_reset=True, reset_intervals=[1, 8, 64, 512])
         conductor = nl_hecate.Conductor(cfg.k, list(cfg.chunk_sizes))
 
         for step in range(5):
-            inp, tgt = _random_batch(cfg)
+            inp, tgt = _random_batch(cfg, rng)
             pulse = conductor.pulse()
             model.step_adamw(inp, tgt, pulse, 0.001)
             conductor.advance()
@@ -115,6 +126,8 @@ class TestSelectiveReset:
 
     def test_l1_resets_at_interval_boundary(self):
         """L1 should reset after 8 fires (fire_count reaches interval=8)."""
+        import random
+        rng = random.Random(42)
         model, cfg = _make_stacked_model(
             memory_reset=True, reset_intervals=[1, 8, 64, 512])
         conductor = nl_hecate.Conductor(cfg.k, list(cfg.chunk_sizes))
@@ -124,7 +137,7 @@ class TestSelectiveReset:
         # At the 8th fire (step 56), fire_count reaches 8 → RESET
         l1_norms = []
         for step in range(64):
-            inp, tgt = _random_batch(cfg)
+            inp, tgt = _random_batch(cfg, rng)
             pulse = conductor.pulse()
             model.step_adamw(inp, tgt, pulse, 0.001)
             conductor.advance()
@@ -138,17 +151,24 @@ class TestSelectiveReset:
         # After the 8th fire (step 56), L1 should be reset
         assert l1_norms[-1][1] < 1e-3, \
             f"L1 should reset at 8th fire (step {l1_norms[-1][0]}), got norm={l1_norms[-1][1]}"
-        # Before the 8th fire, L1 should NOT be reset (norms may be small but accumulating)
-        print(f"L1 norms at each fire: {l1_norms}")
+        # Before the 8th fire, L1 should NOT be reset — norms must be >0 and non-decreasing
+        # (M accumulates writes between resets)
+        pre_reset_norms = [n for _, n in l1_norms[:-1]]
+        assert all(n > 0 for n in pre_reset_norms), \
+            f"L1 norms before boundary should all be >0, got {pre_reset_norms}"
+        assert all(pre_reset_norms[i] <= pre_reset_norms[i + 1] for i in range(len(pre_reset_norms) - 1)), \
+            f"L1 norms should be non-decreasing before boundary, got {pre_reset_norms}"
 
 
 class TestNoReset:
     """memory_reset=False → no reset regardless of intervals."""
 
     def test_no_reset_preserves_m(self):
+        import random
+        rng = random.Random(42)
         model, cfg = _make_stacked_model(memory_reset=False, reset_intervals=None)
         conductor = nl_hecate.Conductor(cfg.k, list(cfg.chunk_sizes))
-        inp, tgt = _random_batch(cfg)
+        inp, tgt = _random_batch(cfg, rng)
 
         pulse = conductor.pulse()
         model.step_adamw(inp, tgt, pulse, 0.001)
@@ -164,11 +184,11 @@ class TestValidation:
     """Bad inputs should raise ValueError."""
 
     def test_wrong_length(self):
-        with pytest.raises(Exception, match="reset_intervals length"):
+        with pytest.raises(ValueError, match="reset_intervals length"):
             _make_stacked_model(memory_reset=True, reset_intervals=[1, 8])
 
     def test_zero_interval(self):
-        with pytest.raises(Exception, match="must be >= 1"):
+        with pytest.raises(ValueError, match="must be >= 1"):
             _make_stacked_model(memory_reset=True, reset_intervals=[1, 0, 64, 512])
 
 
@@ -178,7 +198,6 @@ class TestParity:
     def test_explicit_ones_equals_none(self):
         """Explicit [1,1,1,1] should behave identically to None (all-ones default)."""
         import random
-        random.seed(123)
 
         # Model A: intervals=None (default)
         model_a, cfg_a = _make_stacked_model(memory_reset=True, reset_intervals=None)
@@ -189,8 +208,8 @@ class TestParity:
         cond_b = nl_hecate.Conductor(cfg_b.k, list(cfg_b.chunk_sizes))
 
         for step in range(10):
-            random.seed(42 + step)
-            inp, tgt = _random_batch(cfg_a)
+            rng = random.Random(42 + step)
+            inp, tgt = _random_batch(cfg_a, rng)
 
             pa = cond_a.pulse()
             _, _ = model_a.step_adamw(inp, tgt, pa, 0.001)
@@ -214,15 +233,17 @@ class TestFireCountsAPI:
 
     def test_get_fire_counts_initial(self):
         """Fire counts start at zero."""
-        model, cfg = _make_stacked_model(memory_reset=True, reset_intervals=[1, 8, 64, 512])
+        model, _cfg = _make_stacked_model(memory_reset=True, reset_intervals=[1, 8, 64, 512])
         counts = model.get_fire_counts()
         assert counts == [0, 0, 0, 0], f"Expected all zeros, got {counts}"
 
     def test_fire_counts_advance(self):
         """Fire counts advance after step_adamw."""
+        import random
+        rng = random.Random(42)
         model, cfg = _make_stacked_model(memory_reset=True, reset_intervals=[1, 8, 64, 512])
         conductor = nl_hecate.Conductor(cfg.k, list(cfg.chunk_sizes))
-        inp, tgt = _random_batch(cfg)
+        inp, tgt = _random_batch(cfg, rng)
 
         pulse = conductor.pulse()
         model.step_adamw(inp, tgt, pulse, 0.001)
@@ -236,13 +257,15 @@ class TestFireCountsAPI:
 
     def test_set_fire_counts_restores(self):
         """set_fire_counts restores saved state after multiple advances."""
+        import random
+        rng = random.Random(42)
         model, cfg = _make_stacked_model(memory_reset=True, reset_intervals=[1, 8, 64, 512])
         conductor = nl_hecate.Conductor(cfg.k, list(cfg.chunk_sizes))
 
         # Advance 3 steps so fire_counts are meaningfully non-zero.
         # At step 0 all levels fire, so L1/L2/L3 counts become 1.
         for _ in range(3):
-            inp, tgt = _random_batch(cfg)
+            inp, tgt = _random_batch(cfg, rng)
             pulse = conductor.pulse()
             model.step_adamw(inp, tgt, pulse, 0.001)
             conductor.advance()
@@ -253,7 +276,7 @@ class TestFireCountsAPI:
         # Advance past step 8 (L1 fires again at step 8) to guarantee counts change.
         # Steps 3..11 = 9 more steps; L1 fires at step 8 → count goes from 1 to 2.
         for _ in range(9):
-            inp, tgt = _random_batch(cfg)
+            inp, tgt = _random_batch(cfg, rng)
             pulse = conductor.pulse()
             model.step_adamw(inp, tgt, pulse, 0.001)
             conductor.advance()
@@ -265,8 +288,8 @@ class TestFireCountsAPI:
 
     def test_set_fire_counts_wrong_length(self):
         """Wrong length raises ValueError."""
-        model, cfg = _make_stacked_model(memory_reset=True, reset_intervals=[1, 8, 64, 512])
-        with pytest.raises(Exception, match="fire_counts length"):
+        model, _cfg = _make_stacked_model(memory_reset=True, reset_intervals=[1, 8, 64, 512])
+        with pytest.raises(ValueError, match="fire_counts length"):
             model.set_fire_counts([0, 0])
 
 
@@ -275,9 +298,11 @@ class TestResetContextClearsFireCounts:
 
     def test_reset_context_zeros_fire_counts(self):
         """reset_context() should zero fire_counts since M is being hard-reset."""
+        import random
+        rng = random.Random(42)
         model, cfg = _make_stacked_model(memory_reset=True, reset_intervals=[1, 8, 64, 512])
         conductor = nl_hecate.Conductor(cfg.k, list(cfg.chunk_sizes))
-        inp, tgt = _random_batch(cfg)
+        inp, tgt = _random_batch(cfg, rng)
 
         pulse = conductor.pulse()
         model.step_adamw(inp, tgt, pulse, 0.001)
