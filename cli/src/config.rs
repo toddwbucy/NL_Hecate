@@ -1,13 +1,16 @@
 use serde::Deserialize;
 
-/// Top-level JSON config (matches existing config file format).
+/// Top-level JSON config (spec 61: unified runtime with phase list).
 #[derive(Deserialize, Debug)]
 pub struct Config {
     #[serde(default)]
     pub description: String,
     pub model: ModelConfig,
     pub build: BuildConfig,
-    pub data: DataConfig,
+    /// Legacy single-phase data source — used when `phases` is absent.
+    pub data: Option<DataConfig>,
+    /// Ordered phase list. If absent, a single phase is synthesized from `data` + `build.steps`.
+    pub phases: Option<Vec<PhaseConfig>>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -45,22 +48,72 @@ pub struct ModelConfig {
     pub tape_strategies: Option<Vec<String>>,
 }
 
-#[derive(Deserialize, Debug)]
-pub struct BuildConfig {
-    #[serde(default = "default_optimizer")]
-    pub optimizer: String,
+/// Nested optimizer block (spec 61).
+/// Each optimizer type declares its own parameters.
+#[derive(Deserialize, Debug, Clone)]
+pub struct OptimizerConfig {
+    #[serde(rename = "type", default = "default_optimizer_type")]
+    pub optimizer_type: String,
     #[serde(default = "default_lr")]
     pub lr: f32,
+    // AdamW-specific
+    #[serde(default = "default_beta1")]
+    pub beta1: Option<f32>,
+    #[serde(default = "default_beta2")]
+    pub beta2: Option<f32>,
+    #[serde(default = "default_weight_decay")]
+    pub weight_decay: Option<f32>,
+    // Future: M3-specific
+    pub meta_lr: Option<f32>,
+    pub inner_steps: Option<usize>,
+    // Future: SGD-specific
+    pub momentum: Option<f32>,
+}
+
+impl Default for OptimizerConfig {
+    fn default() -> Self {
+        Self {
+            optimizer_type: "adamw".into(),
+            lr: 0.0003,
+            beta1: Some(0.9),
+            beta2: Some(0.999),
+            weight_decay: Some(0.1),
+            meta_lr: None,
+            inner_steps: None,
+            momentum: None,
+        }
+    }
+}
+
+impl OptimizerConfig {
+    /// AdamW beta1 (defaults to 0.9 if not set).
+    pub fn beta1(&self) -> f32 { self.beta1.unwrap_or(0.9) }
+    /// AdamW beta2 (defaults to 0.999 if not set).
+    pub fn beta2(&self) -> f32 { self.beta2.unwrap_or(0.999) }
+    /// Weight decay (defaults to 0.1 if not set).
+    pub fn weight_decay(&self) -> f32 { self.weight_decay.unwrap_or(0.1) }
+}
+
+#[derive(Deserialize, Debug)]
+pub struct BuildConfig {
+    /// Nested optimizer block. Also accepts legacy flat string via custom deserialize.
+    #[serde(default, deserialize_with = "deserialize_optimizer")]
+    pub optimizer: OptimizerConfig,
+    // Legacy flat fields — used as fallback if optimizer block doesn't set them.
+    // These exist for backward compatibility with old configs that have flat lr/beta1/etc.
+    #[serde(default)]
+    pub lr: Option<f32>,
+    #[serde(default)]
+    pub beta1: Option<f32>,
+    #[serde(default)]
+    pub beta2: Option<f32>,
+    #[serde(default)]
+    pub weight_decay: Option<f32>,
+
     #[serde(default = "default_steps")]
     pub steps: usize,
     #[serde(default)]
     pub warmup_steps: usize,
-    #[serde(default = "default_weight_decay")]
-    pub weight_decay: f32,
-    #[serde(default = "default_beta1")]
-    pub beta1: f32,
-    #[serde(default = "default_beta2")]
-    pub beta2: f32,
     #[serde(default = "default_max_grad_norm")]
     pub max_grad_norm: f32,
     pub alpha_floor: Option<Vec<f32>>,
@@ -83,7 +136,11 @@ pub struct BuildConfig {
     pub save_path: Option<String>,
     pub log_file: Option<String>,
 
-    // Flashcard
+    // CMS diagnostic sidecar (written alongside each checkpoint)
+    #[serde(default = "default_true")]
+    pub cms_sidecar: bool,
+
+    // Legacy flashcard fields (deprecated — use phases with think_rounds)
     #[serde(default)]
     pub flashcard: bool,
     #[serde(default = "default_flashcard_pct")]
@@ -94,6 +151,27 @@ pub struct BuildConfig {
     pub flashcard_gen_tokens: usize,
 }
 
+/// A single phase in the curriculum (spec 61).
+#[derive(Deserialize, Debug)]
+pub struct PhaseConfig {
+    /// Path to tokenized data directory.
+    pub data: String,
+    /// Process exactly N segments, then advance to next phase.
+    pub steps: Option<usize>,
+    /// Iterative self-refinement: learn→speak→feed back, N iterations.
+    pub think_rounds: Option<usize>,
+    /// Human-readable label (logged, not used by runtime).
+    pub label: Option<String>,
+    // Per-phase overrides (revert to build defaults after phase completes)
+    pub optimizer: Option<OptimizerConfig>,
+    pub batch_size: Option<usize>,
+    pub seq_len: Option<usize>,
+    pub save_every: Option<usize>,
+    pub log_every: Option<usize>,
+    pub max_grad_norm: Option<f32>,
+    pub warmup_steps: Option<usize>,
+}
+
 #[derive(Deserialize, Debug)]
 pub struct DataConfig {
     pub path: String,
@@ -101,7 +179,7 @@ pub struct DataConfig {
     pub format: String,
 }
 
-// Default functions
+// ── Default functions ────────────────────────────────────────────────
 fn default_window_size() -> usize { 512 }
 fn default_vocab_size() -> usize { 49152 }
 fn default_memory_rule() -> String { "titans".into() }
@@ -111,12 +189,9 @@ fn default_k() -> usize { 1 }
 fn default_true() -> bool { true }
 fn default_n_blocks() -> usize { 1 }
 fn default_tape_multiplier() -> usize { 1 }
-fn default_optimizer() -> String { "adamw_gpu_stacked".into() }
+fn default_optimizer_type() -> String { "adamw".into() }
 fn default_lr() -> f32 { 0.0003 }
 fn default_steps() -> usize { 10000 }
-fn default_weight_decay() -> f32 { 0.1 }
-fn default_beta1() -> f32 { 0.9 }
-fn default_beta2() -> f32 { 0.999 }
 fn default_max_grad_norm() -> f32 { 1.0 }
 fn default_batch_size() -> usize { 1 }
 fn default_log_every() -> usize { 8 }
@@ -127,16 +202,314 @@ fn default_flashcard_rounds() -> usize { 3 }
 fn default_flashcard_gen_tokens() -> usize { 64 }
 fn default_data_format() -> String { "dolmino".into() }
 
+// serde defaults for Option<f32> in OptimizerConfig
+fn default_beta1() -> Option<f32> { Some(0.9) }
+fn default_beta2() -> Option<f32> { Some(0.999) }
+fn default_weight_decay() -> Option<f32> { Some(0.1) }
+
+/// Custom deserializer: accept either a string (legacy) or an object (spec 61).
+fn deserialize_optimizer<'de, D>(deserializer: D) -> Result<OptimizerConfig, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OptimizerValue {
+        /// Spec 61: nested object with type + params
+        Object(OptimizerConfig),
+        /// Legacy: bare string like "adamw_gpu_stacked"
+        String(String),
+    }
+
+    match OptimizerValue::deserialize(deserializer) {
+        Ok(OptimizerValue::Object(cfg)) => Ok(cfg),
+        Ok(OptimizerValue::String(s)) => {
+            // Map legacy string to optimizer type
+            let optimizer_type = if s.contains("adamw") {
+                "adamw".into()
+            } else {
+                s
+            };
+            Ok(OptimizerConfig {
+                optimizer_type,
+                ..OptimizerConfig::default()
+            })
+        }
+        Err(e) => Err(e),
+    }
+}
+
 impl Config {
+    /// Parse config from a JSON string (used in tests).
+    pub fn from_str(text: &str) -> Result<Self, String> {
+        let mut cfg: Config = serde_json::from_str(text)
+            .map_err(|e| format!("Failed to parse config: {e}"))?;
+        Self::apply_legacy_compat(&mut cfg);
+        Ok(cfg)
+    }
+
     pub fn from_file(path: &str) -> Result<Self, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read config {path}: {e}"))?;
-        serde_json::from_str(&text)
-            .map_err(|e| format!("Failed to parse config {path}: {e}"))
+        let mut cfg: Config = serde_json::from_str(&text)
+            .map_err(|e| format!("Failed to parse config {path}: {e}"))?;
+
+        Self::apply_legacy_compat(&mut cfg);
+        Ok(cfg)
+    }
+
+    /// Apply backward-compat: promote flat build.lr/beta1/etc into the optimizer block.
+    fn apply_legacy_compat(cfg: &mut Config) {
+        if let Some(lr) = cfg.build.lr {
+            if cfg.build.optimizer.lr == 0.0003 {
+                cfg.build.optimizer.lr = lr;
+            }
+        }
+        if let Some(b1) = cfg.build.beta1 {
+            if cfg.build.optimizer.beta1 == Some(0.9) {
+                cfg.build.optimizer.beta1 = Some(b1);
+            }
+        }
+        if let Some(b2) = cfg.build.beta2 {
+            if cfg.build.optimizer.beta2 == Some(0.999) {
+                cfg.build.optimizer.beta2 = Some(b2);
+            }
+        }
+        if let Some(wd) = cfg.build.weight_decay {
+            if cfg.build.optimizer.weight_decay == Some(0.1) {
+                cfg.build.optimizer.weight_decay = Some(wd);
+            }
+        }
     }
 
     /// Effective seq_len (override takes precedence).
     pub fn seq_len(&self) -> usize {
         self.build.seq_len_override.unwrap_or(self.model.seq_len)
+    }
+
+    /// Resolve phases: if `phases` is present, use it. Otherwise, synthesize
+    /// a single phase from `data` + `build.steps`.
+    pub fn resolved_phases(&self) -> Result<Vec<ResolvedPhase>, String> {
+        if let Some(ref phases) = self.phases {
+            let mut resolved = Vec::with_capacity(phases.len());
+            for (i, phase) in phases.iter().enumerate() {
+                // Validate: exactly one of steps or think_rounds
+                match (phase.steps, phase.think_rounds) {
+                    (Some(_), Some(_)) => {
+                        return Err(format!(
+                            "Phase {i} has both `steps` and `think_rounds` — pick one"
+                        ));
+                    }
+                    (None, None) => {
+                        return Err(format!(
+                            "Phase {i} has neither `steps` nor `think_rounds`"
+                        ));
+                    }
+                    _ => {}
+                }
+                resolved.push(ResolvedPhase {
+                    data: phase.data.clone(),
+                    duration: if let Some(s) = phase.steps {
+                        PhaseDuration::Steps(s)
+                    } else {
+                        PhaseDuration::ThinkRounds(phase.think_rounds.unwrap())
+                    },
+                    label: phase.label.clone().unwrap_or_else(|| phase.data.clone()),
+                    optimizer: phase.optimizer.clone(),
+                    batch_size: phase.batch_size,
+                    seq_len: phase.seq_len,
+                    save_every: phase.save_every,
+                    log_every: phase.log_every,
+                    max_grad_norm: phase.max_grad_norm,
+                    warmup_steps: phase.warmup_steps,
+                });
+            }
+            Ok(resolved)
+        } else {
+            // Single-phase fallback from legacy config
+            let data_path = self.data.as_ref()
+                .ok_or("Config has no `phases` and no `data` — need at least one")?
+                .path.clone();
+            Ok(vec![ResolvedPhase {
+                data: data_path,
+                duration: PhaseDuration::Steps(self.build.steps),
+                label: "default".into(),
+                optimizer: None,
+                batch_size: None,
+                seq_len: None,
+                save_every: None,
+                log_every: None,
+                max_grad_norm: None,
+                warmup_steps: None,
+            }])
+        }
+    }
+}
+
+/// Resolved phase with validated duration.
+#[derive(Debug)]
+pub struct ResolvedPhase {
+    pub data: String,
+    pub duration: PhaseDuration,
+    pub label: String,
+    pub optimizer: Option<OptimizerConfig>,
+    pub batch_size: Option<usize>,
+    pub seq_len: Option<usize>,
+    pub save_every: Option<usize>,
+    pub log_every: Option<usize>,
+    pub max_grad_norm: Option<f32>,
+    pub warmup_steps: Option<usize>,
+}
+
+#[derive(Debug)]
+pub enum PhaseDuration {
+    Steps(usize),
+    ThinkRounds(usize),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_model_json() -> &'static str {
+        r#""model": {"d_model": 64, "num_heads": 2, "seq_len": 32}"#
+    }
+
+    #[test]
+    fn parse_legacy_config() {
+        let json = format!(r#"{{
+            {},
+            "build": {{
+                "optimizer": "adamw_gpu_stacked",
+                "lr": 0.001,
+                "steps": 5000,
+                "batch_size": 4
+            }},
+            "data": {{"path": "data/test", "format": "dolmino"}}
+        }}"#, minimal_model_json());
+
+        let cfg = Config::from_str(&json).unwrap();
+        assert_eq!(cfg.build.optimizer.optimizer_type, "adamw");
+        assert_eq!(cfg.build.optimizer.lr, 0.001);
+        assert!(cfg.phases.is_none());
+
+        let phases = cfg.resolved_phases().unwrap();
+        assert_eq!(phases.len(), 1);
+        assert_eq!(phases[0].data, "data/test");
+        assert!(matches!(phases[0].duration, PhaseDuration::Steps(5000)));
+    }
+
+    #[test]
+    fn parse_nested_optimizer() {
+        let json = format!(r#"{{
+            {},
+            "build": {{
+                "optimizer": {{"type": "adamw", "lr": 0.0001, "beta1": 0.95, "weight_decay": 0.05}},
+                "steps": 1000
+            }},
+            "data": {{"path": "data/test"}}
+        }}"#, minimal_model_json());
+
+        let cfg = Config::from_str(&json).unwrap();
+        assert_eq!(cfg.build.optimizer.optimizer_type, "adamw");
+        assert_eq!(cfg.build.optimizer.lr, 0.0001);
+        assert_eq!(cfg.build.optimizer.beta1(), 0.95);
+        assert_eq!(cfg.build.optimizer.weight_decay(), 0.05);
+        assert_eq!(cfg.build.optimizer.beta2(), 0.999); // default
+    }
+
+    #[test]
+    fn parse_phase_list() {
+        let json = format!(r#"{{
+            {},
+            "build": {{
+                "optimizer": {{"type": "adamw", "lr": 0.0003}},
+                "batch_size": 8,
+                "save_every": 500
+            }},
+            "phases": [
+                {{"data": "data/foundations", "steps": 1000}},
+                {{"data": "data/math", "think_rounds": 3, "label": "think-math"}},
+                {{"data": "data/foundations", "steps": 2000, "optimizer": {{"type": "adamw", "lr": 0.0001}}, "batch_size": 4}}
+            ]
+        }}"#, minimal_model_json());
+
+        let cfg = Config::from_str(&json).unwrap();
+        let phases = cfg.resolved_phases().unwrap();
+        assert_eq!(phases.len(), 3);
+
+        // Phase 0: steps
+        assert!(matches!(phases[0].duration, PhaseDuration::Steps(1000)));
+        assert!(phases[0].optimizer.is_none());
+
+        // Phase 1: think_rounds
+        assert!(matches!(phases[1].duration, PhaseDuration::ThinkRounds(3)));
+        assert_eq!(phases[1].label, "think-math");
+
+        // Phase 2: steps with overrides
+        assert!(matches!(phases[2].duration, PhaseDuration::Steps(2000)));
+        let opt = phases[2].optimizer.as_ref().unwrap();
+        assert_eq!(opt.lr, 0.0001);
+        assert_eq!(phases[2].batch_size, Some(4));
+    }
+
+    #[test]
+    fn phase_validation_both_steps_and_rounds() {
+        let json = format!(r#"{{
+            {},
+            "build": {{"optimizer": {{"type": "adamw", "lr": 0.0003}}}},
+            "phases": [
+                {{"data": "data/test", "steps": 100, "think_rounds": 3}}
+            ]
+        }}"#, minimal_model_json());
+
+        let cfg = Config::from_str(&json).unwrap();
+        let err = cfg.resolved_phases().unwrap_err();
+        assert!(err.contains("both"));
+    }
+
+    #[test]
+    fn phase_validation_neither_steps_nor_rounds() {
+        let json = format!(r#"{{
+            {},
+            "build": {{"optimizer": {{"type": "adamw", "lr": 0.0003}}}},
+            "phases": [
+                {{"data": "data/test"}}
+            ]
+        }}"#, minimal_model_json());
+
+        let cfg = Config::from_str(&json).unwrap();
+        let err = cfg.resolved_phases().unwrap_err();
+        assert!(err.contains("neither"));
+    }
+
+    #[test]
+    fn no_phases_no_data_errors() {
+        let json = format!(r#"{{
+            {},
+            "build": {{"optimizer": {{"type": "adamw", "lr": 0.0003}}}}
+        }}"#, minimal_model_json());
+
+        let cfg = Config::from_str(&json).unwrap();
+        let err = cfg.resolved_phases().unwrap_err();
+        assert!(err.contains("no `phases` and no `data`"));
+    }
+
+    #[test]
+    fn future_optimizer_type_parses() {
+        let json = format!(r#"{{
+            {},
+            "build": {{
+                "optimizer": {{"type": "m3", "lr": 0.0003, "meta_lr": 0.001, "inner_steps": 5}}
+            }},
+            "data": {{"path": "data/test"}}
+        }}"#, minimal_model_json());
+
+        let cfg = Config::from_str(&json).unwrap();
+        assert_eq!(cfg.build.optimizer.optimizer_type, "m3");
+        assert_eq!(cfg.build.optimizer.meta_lr, Some(0.001));
+        assert_eq!(cfg.build.optimizer.inner_steps, Some(5));
     }
 }

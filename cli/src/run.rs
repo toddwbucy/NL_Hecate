@@ -21,7 +21,7 @@ use nl_hecate_core::gpu_stacked_optimizer::{
     GpuStackedAdamWState, gpu_stacked_adamw_update, gpu_stacked_sync_embed_weights,
 };
 
-use crate::config::Config;
+use crate::config::{Config, OptimizerConfig, PhaseDuration};
 use crate::data::BpeTokenStream;
 use crate::log::MetricsLogger;
 
@@ -49,6 +49,12 @@ pub fn run(config_path: &str, _resume: bool) {
     let k = cfg.model.k;
     let n_blocks = cfg.model.n_blocks;
     let ws = cfg.model.window_size;
+
+    // ── Resolve phases ───────────────────────────────────────────────
+    let phases = cfg.resolved_phases().unwrap_or_else(|e| {
+        eprintln!("ERROR: {e}");
+        std::process::exit(1);
+    });
 
     // ── Resolve paths ────────────────────────────────────────────────
     let run_dir = cfg.build.run_dir.as_deref().unwrap_or("runs/default");
@@ -161,7 +167,6 @@ pub fn run(config_path: &str, _resume: bool) {
                 std::process::exit(1);
             });
 
-        // Use loaded config values but override seq_len if specified
         if cfg.build.seq_len_override.is_some() {
             mag_cfg.swa.seq_len = seq_len;
         }
@@ -183,7 +188,6 @@ pub fn run(config_path: &str, _resume: bool) {
             adamw_state = None;
         }
     } else {
-        // Fresh init
         let host_params = nl_hecate_core::stacked_model::StackedMAGParams::init(
             &mag_cfg, n_blocks, cfg.build.seed,
         );
@@ -203,29 +207,8 @@ pub fn run(config_path: &str, _resume: bool) {
         .unwrap_or_default();
     let mut fire_counts = vec![0usize; k];
 
-    // ── Data loading ─────────────────────────────────────────────────
-    eprintln!("Loading data: {}", cfg.data.path);
-    let mut loaders: Vec<BpeTokenStream> = Vec::new();
-    let bs = cfg.build.batch_size;
-
-    for b in 0..bs {
-        let mut loader = BpeTokenStream::load(&cfg.data.path).unwrap_or_else(|e| {
-            eprintln!("ERROR: {e}");
-            std::process::exit(1);
-        });
-        // Distribute slots across the corpus
-        if bs > 1 {
-            let offset = b * (loader.total_tokens / bs);
-            loader.seek(offset);
-        }
-        loaders.push(loader);
-    }
-
-    let total_tokens = loaders[0].total_tokens;
-
     // ── Conductor ────────────────────────────────────────────────────
     let mut conductor = Conductor::new(k, chunk_sizes.clone());
-    // Advance conductor to match resume step
     for _ in 0..resume_step {
         conductor.advance();
     }
@@ -242,8 +225,10 @@ pub fn run(config_path: &str, _resume: bool) {
         { gpu_params.to_host(d, v, k).num_params() }
     };
 
+    let default_opt = &cfg.build.optimizer;
+
     eprintln!("============================================================");
-    eprintln!("NL-Hecate Build");
+    eprintln!("NL-Hecate Build (spec 61: phase list)");
     eprintln!("============================================================");
     eprintln!("  Model:    d={d}, heads={nh}, seq_len={seq_len}, vocab={v}");
     eprintln!("  Memory:   rule={:?}, composition={:?}, k={k}", memory_rule, composition);
@@ -254,179 +239,237 @@ pub fn run(config_path: &str, _resume: bool) {
     if let Some(ref ec) = cfg.model.error_clip {
         eprintln!("  ErrClip:  max={ec:?}");
     }
-    eprintln!("  Data:     {} tokens ({} BPE)", fmt_num(total_tokens), cfg.data.format);
-    eprintln!("  Build:    {} steps (from step {resume_step}), lr={}", cfg.build.steps, cfg.build.lr);
-    eprintln!("  Optimizer: {} (b1={}, b2={}, wd={}, warmup={})",
-        cfg.build.optimizer, cfg.build.beta1, cfg.build.beta2,
-        cfg.build.weight_decay, cfg.build.warmup_steps);
+    eprintln!("  Optimizer: {} (lr={}, b1={}, b2={}, wd={})",
+        default_opt.optimizer_type, default_opt.lr,
+        default_opt.beta1(), default_opt.beta2(), default_opt.weight_decay());
     eprintln!("  Grad clip: max_norm={}", cfg.build.max_grad_norm);
-    eprintln!("  Checkpoint: every {} steps", cfg.build.save_every);
-    if cfg.build.flashcard {
-        eprintln!("  Flashcard: {}% × {} rounds @ {} gen tokens",
-            cfg.build.flashcard_pct, cfg.build.flashcard_rounds, cfg.build.flashcard_gen_tokens);
+    eprintln!("  Phases:   {}", phases.len());
+    for (i, phase) in phases.iter().enumerate() {
+        let dur = match &phase.duration {
+            PhaseDuration::Steps(s) => format!("{s} steps"),
+            PhaseDuration::ThinkRounds(r) => format!("{r} think_rounds"),
+        };
+        let opt_info = phase.optimizer.as_ref()
+            .map(|o| format!(" [{}@{}]", o.optimizer_type, o.lr))
+            .unwrap_or_default();
+        eprintln!("    [{i}] {}: {}{}", phase.label, dur, opt_info);
     }
-    eprintln!("  Log:      {log_file}");
-    eprintln!("============================================================");
-    eprintln!();
     eprintln!("  Stacked:  {n_blocks} blocks x k={k} CMS levels  ({} params)", fmt_num(total_params));
     if !reset_intervals.is_empty() {
         eprintln!("  Reset:    selective intervals={reset_intervals:?} (spec 57)");
     }
+    eprintln!("  Log:      {log_file}");
+    eprintln!("============================================================");
 
-    logger.log_build_start(d, nh, seq_len, k, n_blocks, cfg.build.steps, cfg.build.lr, total_params);
+    logger.log_build_start(d, nh, seq_len, k, n_blocks, cfg.build.steps, default_opt.lr, total_params);
 
-    // ── Flashcard state ──────────────────────────────────────────────
-    let mut flashcard_interval_positions: Vec<usize> = loaders.iter().map(|l| l.position).collect();
-
-    // ── Training loop ────────────────────────────────────────────────
-    let end_step = resume_step + cfg.build.steps;
+    // ── Phase loop (spec 61) ─────────────────────────────────────────
     let t_start = Instant::now();
+    let mut global_step = resume_step;
     let mut loss_first: Option<f32> = None;
     let mut loss_last: f32 = 0.0;
     let mut step_tokens: usize = 0;
+    let mut aborted = false;
 
-    for step in resume_step..end_step {
-        // ── LR schedule ──────────────────────────────────────────
-        let lr = cosine_lr(step, cfg.build.warmup_steps, end_step, cfg.build.lr);
+    for (phase_idx, phase) in phases.iter().enumerate() {
+        // Resolve per-phase overrides (fall back to build defaults)
+        let opt = phase.optimizer.as_ref().unwrap_or(default_opt);
+        let batch_size = phase.batch_size.unwrap_or(cfg.build.batch_size);
+        let phase_seq_len = phase.seq_len.unwrap_or(seq_len);
+        let save_every = phase.save_every.unwrap_or(cfg.build.save_every);
+        let log_every = phase.log_every.unwrap_or(cfg.build.log_every);
+        let max_grad_norm = phase.max_grad_norm.unwrap_or(cfg.build.max_grad_norm);
+        let warmup_steps = phase.warmup_steps.unwrap_or(cfg.build.warmup_steps);
 
-        // ── Assemble batch ───────────────────────────────────────
-        let mut all_input = Vec::with_capacity(bs * seq_len);
-        let mut all_target = Vec::with_capacity(bs * seq_len);
-        for loader in &mut loaders {
-            let (inp, tgt) = loader.next_chunk(seq_len).unwrap_or_else(|| {
-                eprintln!("ERROR: data exhausted");
-                std::process::exit(1);
-            });
-            all_input.extend_from_slice(&inp);
-            all_target.extend_from_slice(&tgt);
-        }
+        eprintln!();
+        eprintln!("── Phase {phase_idx}: {} ──", phase.label);
 
-        // ── Pulse ────────────────────────────────────────────────
-        let pulse = conductor.pulse();
+        match &phase.duration {
+            PhaseDuration::Steps(total_phase_steps) => {
+                // ── Steps mode: streaming consumption ──────────────
+                let mut loaders: Vec<BpeTokenStream> = Vec::new();
+                for b in 0..batch_size {
+                    let mut loader = BpeTokenStream::load(&phase.data).unwrap_or_else(|e| {
+                        eprintln!("ERROR: {e}");
+                        std::process::exit(1);
+                    });
+                    if batch_size > 1 {
+                        let offset = b * (loader.total_tokens / batch_size);
+                        loader.seek(offset);
+                    }
+                    loaders.push(loader);
+                }
 
-        // ── Forward + Backward + Optimizer ───────────────────────
-        #[cfg(feature = "cuda")]
-        let (loss, grad_norm) = {
-            let (loss, cache) = gpu_stacked_forward(
-                &gpu_params, &mag_cfg, &all_input, &all_target,
-                &pulse, &mut gpu_context, &mut None,
-            );
+                let total_tokens_phase = loaders[0].total_tokens;
+                eprintln!("  Data:  {} tokens, batch_size={batch_size}, seq_len={phase_seq_len}",
+                    fmt_num(total_tokens_phase));
+                eprintln!("  Opt:   {} lr={} wd={} gnorm_clip={}",
+                    opt.optimizer_type, opt.lr, opt.weight_decay(), max_grad_norm);
 
-            let mut grads = gpu_stacked_backward(
-                &gpu_params, &mag_cfg, &cache, &mut None,
-            );
+                // Compute total steps for LR schedule within this phase
+                let phase_end_step = global_step + total_phase_steps;
 
-            // Lazy-init AdamW
-            if adamw_state.is_none() {
-                adamw_state = Some(GpuStackedAdamWState::from_params(&gpu_params));
+                for phase_step in 0..*total_phase_steps {
+                    let lr = cosine_lr(phase_step, warmup_steps, *total_phase_steps, opt.lr);
+
+                    // Assemble batch
+                    let mut all_input = Vec::with_capacity(batch_size * phase_seq_len);
+                    let mut all_target = Vec::with_capacity(batch_size * phase_seq_len);
+                    for loader in &mut loaders {
+                        let (inp, tgt) = loader.next_chunk(phase_seq_len).unwrap_or_else(|| {
+                            eprintln!("ERROR: data exhausted");
+                            std::process::exit(1);
+                        });
+                        all_input.extend_from_slice(&inp);
+                        all_target.extend_from_slice(&tgt);
+                    }
+
+                    let pulse = conductor.pulse();
+
+                    // Forward + Backward + Optimizer
+                    #[cfg(feature = "cuda")]
+                    let (loss, grad_norm) = {
+                        run_step(
+                            &mut gpu_params, &mag_cfg, &mut gpu_context,
+                            &mut adamw_state,
+                            &all_input, &all_target, &pulse,
+                            opt, lr, max_grad_norm,
+                            d, v,
+                            &reset_intervals, &mut fire_counts,
+                        )
+                    };
+
+                    conductor.advance();
+                    step_tokens += batch_size * phase_seq_len;
+                    global_step += 1;
+
+                    if loss_first.is_none() { loss_first = Some(loss); }
+                    loss_last = loss;
+
+                    if loss.is_nan() || loss.is_infinite() {
+                        eprintln!("  ABORTING: NaN/Inf at step {global_step}");
+                        aborted = true;
+                        break;
+                    }
+
+                    // Logging
+                    let log_this = log_every > 0 && phase_step % log_every == 0;
+                    if log_this || phase_step == 0 {
+                        let elapsed = t_start.elapsed().as_secs_f64();
+                        let tok_s = step_tokens as f64 / elapsed;
+                        let ppl = (loss as f64).exp();
+                        let rss_mb = get_rss_mb();
+
+                        eprintln!("  step {:>6}  loss={loss:.4}  ppl={ppl:.1}  tok/s={tok_s:.0}  gnorm={grad_norm:.4}  lr={lr:.6}  rss={rss_mb}MB",
+                            global_step);
+
+                        logger.log_step(global_step, loss, grad_norm, lr, elapsed, &pulse_to_active(&pulse));
+                    }
+
+                    // Checkpoint
+                    let do_checkpoint = save_every > 0
+                        && phase_step > 0
+                        && (phase_step + 1) % save_every == 0;
+
+                    if do_checkpoint {
+                        save_checkpoint(
+                            &save_path, global_step,
+                            #[cfg(feature = "cuda")]
+                            &gpu_params,
+                            #[cfg(feature = "cuda")]
+                            &gpu_context,
+                            &mag_cfg, &conductor, &chunk_sizes,
+                            &loaders, d, v, k,
+                            &mut logger,
+                        );
+                    }
+                }
             }
-            let state = adamw_state.as_mut().unwrap();
 
-            let gnorm = gpu_stacked_adamw_update(
-                &mut gpu_params, &mut grads, state,
-                &pulse,
-                lr, cfg.build.beta1, cfg.build.beta2, 1e-8,
-                cfg.build.weight_decay, cfg.build.max_grad_norm,
-                false, // freeze_embed
-                &mut None, // profiler
-            );
-
-            // Weight tying
-            gpu_stacked_sync_embed_weights(&mut gpu_params, d, v);
-
-            // Dormancy tracking
-            gpu_context.update_m_norm_tracking();
-
-            // Selective periodic reset (spec 57)
-            maybe_reset_levels(&pulse, &reset_intervals, &mut fire_counts, &mut gpu_context);
-
-            (loss, gnorm)
-        };
-
-        // ── Advance ──────────────────────────────────────────────
-        conductor.advance();
-        step_tokens += bs * seq_len;
-
-        if loss_first.is_none() { loss_first = Some(loss); }
-        loss_last = loss;
-
-        // ── NaN check ────────────────────────────────────────────
-        if loss.is_nan() || loss.is_infinite() {
-            eprintln!("  ABORTING: NaN/Inf at step {step}");
-            break;
-        }
-
-        // ── Logging ──────────────────────────────────────────────
-        let log_this = cfg.build.log_every > 0 && step % cfg.build.log_every == 0;
-        if log_this || step == resume_step {
-            let elapsed = t_start.elapsed().as_secs_f64();
-            let tok_s = step_tokens as f64 / elapsed;
-            let ppl = (loss as f64).exp();
-            let rss_mb = get_rss_mb();
-
-            eprintln!("  step {:>6}  loss={loss:.4}  ppl={ppl:.1}  tok/s={tok_s:.0}  gnorm={grad_norm:.4}  lr={lr:.6}  rss={rss_mb}MB",
-                step);
-
-            logger.log_step(step, loss, grad_norm, lr, elapsed, &pulse_to_active(&pulse));
-        }
-
-        // ── Checkpoint ───────────────────────────────────────────
-        let do_checkpoint = cfg.build.save_every > 0
-            && step > resume_step
-            && (step + 1 - resume_step) % cfg.build.save_every == 0;
-
-        if do_checkpoint {
-            // Flashcard session before checkpoint
-            if cfg.build.flashcard {
-                #[cfg(feature = "cuda")]
-                run_flashcard(
-                    &cfg, &mag_cfg, step,
-                    &mut gpu_params, &mut gpu_context,
-                    &mut adamw_state,
-                    &mut loaders, &flashcard_interval_positions,
-                    &mut conductor,
-                    &reset_intervals, &mut fire_counts,
-                );
-                // Update interval positions for next checkpoint
-                flashcard_interval_positions = loaders.iter().map(|l| l.position).collect();
-            }
-
-            // Save checkpoint
-            let ckpt_path = save_path.replace(
-                ".safetensors",
-                &format!("_step{}.safetensors", step + 1),
-            );
-
-            #[cfg(feature = "cuda")]
-            {
-                let host_params = gpu_params.to_host(d, v, k);
-                let host_context = gpu_context.blocks[0].to_host(k);
-                let build_state = BuildResumeState {
-                    conductor: ConductorState {
-                        k,
-                        chunk_sizes: chunk_sizes.clone(),
-                        step: conductor.step(),
-                    },
-                    stream_cursor: StreamCursor {
-                        position: loaders[0].position as u64,
-                        chunk_id: 0,
-                        pulse_id: 0,
-                        rng_state: None,
-                        content_hash: 0,
-                    },
-                    context: host_context,
-                    global_step: step + 1,
-                };
-                save_stacked_safetensors(
-                    Path::new(&ckpt_path), &host_params, &mag_cfg,
-                    Some(&build_state),
-                ).unwrap_or_else(|e| {
-                    eprintln!("ERROR: checkpoint save failed: {e}");
+            PhaseDuration::ThinkRounds(rounds) => {
+                // ── Think rounds: iterative self-refinement ────────
+                // Load the data once as the initial input
+                let mut loader = BpeTokenStream::load(&phase.data).unwrap_or_else(|e| {
+                    eprintln!("ERROR: {e}");
+                    std::process::exit(1);
                 });
-            }
+                let total_tokens_phase = loader.total_tokens;
+                eprintln!("  Data:  {} tokens, {rounds} think_rounds",
+                    fmt_num(total_tokens_phase));
+                eprintln!("  Opt:   {} lr={} wd={} gnorm_clip={}",
+                    opt.optimizer_type, opt.lr, opt.weight_decay(), max_grad_norm);
 
-            eprintln!("  [checkpoint saved: {ckpt_path}]");
-            logger.log_checkpoint(step + 1, &ckpt_path);
+                // Load all data as initial input
+                let (mut input, mut target) = loader.next_chunk(phase_seq_len)
+                    .unwrap_or_else(|| {
+                        eprintln!("ERROR: data exhausted in think_rounds");
+                        std::process::exit(1);
+                    });
+
+                for round in 0..*rounds {
+                    eprintln!("  [think round {}/{}]", round + 1, rounds);
+
+                    let lr = opt.lr; // think_rounds uses constant lr (no schedule)
+                    let pulse = conductor.pulse();
+
+                    // LEARN from current input
+                    #[cfg(feature = "cuda")]
+                    let (loss, grad_norm) = {
+                        run_step(
+                            &mut gpu_params, &mag_cfg, &mut gpu_context,
+                            &mut adamw_state,
+                            &input, &target, &pulse,
+                            opt, lr, max_grad_norm,
+                            d, v,
+                            &reset_intervals, &mut fire_counts,
+                        )
+                    };
+
+                    conductor.advance();
+                    step_tokens += phase_seq_len;
+                    global_step += 1;
+
+                    if loss_first.is_none() { loss_first = Some(loss); }
+                    loss_last = loss;
+
+                    eprintln!("    loss={loss:.4}  gnorm={grad_norm:.4}");
+                    logger.log_step(global_step, loss, grad_norm, lr,
+                        t_start.elapsed().as_secs_f64(), &pulse_to_active(&pulse));
+
+                    if loss.is_nan() || loss.is_infinite() {
+                        eprintln!("  ABORTING: NaN/Inf at think round {round}");
+                        aborted = true;
+                        break;
+                    }
+
+                    // SPEAK — generate output from what was just learned
+                    // TODO: implement prefill + decode_token loop for think_rounds
+                    // For now, re-present the same data (deferred until generation is in CLI)
+                    // When generation lands:
+                    //   let logits = prefill(&input, &pulse);
+                    //   let output = decode_loop(logits, max_gen_tokens);
+                    //   input = output; target = shifted(output);
+                    eprintln!("    [speak phase: deferred — generation not yet in CLI]");
+                }
+            }
+        }
+
+        if aborted { break; }
+
+        // ── Phase boundary checkpoint ─────────────────────────────
+        eprintln!("  [phase {phase_idx} complete — checkpoint at step {global_step}]");
+        #[cfg(feature = "cuda")]
+        {
+            // Synthesize a minimal loader list for checkpoint metadata
+            let loaders_empty: Vec<BpeTokenStream> = Vec::new();
+            save_checkpoint(
+                &save_path, global_step,
+                &gpu_params,
+                &gpu_context,
+                &mag_cfg, &conductor, &chunk_sizes,
+                &loaders_empty, d, v, k,
+                &mut logger,
+            );
         }
     }
 
@@ -435,13 +478,123 @@ pub fn run(config_path: &str, _resume: bool) {
     let tok_s = step_tokens as f64 / elapsed;
     eprintln!();
     eprintln!("============================================================");
-    eprintln!("  Steps:    {} ({elapsed:.0}s)", cfg.build.steps);
+    eprintln!("  Phases:   {} complete", phases.len());
+    eprintln!("  Steps:    {global_step} ({elapsed:.0}s)");
     eprintln!("  Tok/s:    {tok_s:.0}");
     eprintln!("  Loss:     {:.4} → {loss_last:.4}", loss_first.unwrap_or(0.0));
     eprintln!("============================================================");
 
-    logger.log_build_end(cfg.build.steps, elapsed, tok_s,
+    logger.log_build_end(global_step - resume_step, elapsed, tok_s,
         loss_first.unwrap_or(0.0), loss_last);
+}
+
+// ── Extracted helpers ────────────────────────────────────────────────
+
+/// Run a single training step: forward + backward + optimizer update.
+#[cfg(feature = "cuda")]
+fn run_step(
+    gpu_params: &mut GpuStackedParams,
+    mag_cfg: &MAGConfig,
+    gpu_context: &mut GpuStackedContext,
+    adamw_state: &mut Option<GpuStackedAdamWState>,
+    input: &[usize],
+    target: &[usize],
+    pulse: &Pulse,
+    opt: &OptimizerConfig,
+    lr: f32,
+    max_grad_norm: f32,
+    d: usize,
+    v: usize,
+    reset_intervals: &[usize],
+    fire_counts: &mut [usize],
+) -> (f32, f32) {
+    let (loss, cache) = gpu_stacked_forward(
+        gpu_params, mag_cfg, input, target,
+        pulse, gpu_context, &mut None,
+    );
+
+    let mut grads = gpu_stacked_backward(
+        gpu_params, mag_cfg, &cache, &mut None,
+    );
+
+    // Lazy-init AdamW
+    if adamw_state.is_none() {
+        *adamw_state = Some(GpuStackedAdamWState::from_params(gpu_params));
+    }
+    let state = adamw_state.as_mut().unwrap();
+
+    let gnorm = gpu_stacked_adamw_update(
+        gpu_params, &mut grads, state,
+        pulse,
+        lr, opt.beta1(), opt.beta2(), 1e-8,
+        opt.weight_decay(), max_grad_norm,
+        false, // freeze_embed
+        &mut None, // profiler
+    );
+
+    // Weight tying
+    gpu_stacked_sync_embed_weights(gpu_params, d, v);
+
+    // Dormancy tracking
+    gpu_context.update_m_norm_tracking();
+
+    // Selective periodic reset (spec 57)
+    maybe_reset_levels(pulse, reset_intervals, fire_counts, gpu_context);
+
+    (loss, gnorm)
+}
+
+/// Save checkpoint with build state.
+fn save_checkpoint(
+    save_path: &str,
+    global_step: usize,
+    #[cfg(feature = "cuda")] gpu_params: &GpuStackedParams,
+    #[cfg(feature = "cuda")] gpu_context: &GpuStackedContext,
+    mag_cfg: &MAGConfig,
+    conductor: &Conductor,
+    chunk_sizes: &[usize],
+    loaders: &[BpeTokenStream],
+    d: usize,
+    v: usize,
+    k: usize,
+    logger: &mut MetricsLogger,
+) {
+    let ckpt_path = save_path.replace(
+        ".safetensors",
+        &format!("_step{global_step}.safetensors"),
+    );
+
+    #[cfg(feature = "cuda")]
+    {
+        let host_params = gpu_params.to_host(d, v, k);
+        let host_context = gpu_context.blocks[0].to_host(k);
+        let stream_position = loaders.first().map(|l| l.position as u64).unwrap_or(0);
+        let build_state = BuildResumeState {
+            conductor: ConductorState {
+                k,
+                chunk_sizes: chunk_sizes.to_vec(),
+                step: conductor.step(),
+            },
+            stream_cursor: StreamCursor {
+                position: stream_position,
+                chunk_id: 0,
+                pulse_id: 0,
+                rng_state: None,
+                content_hash: 0,
+            },
+            context: host_context,
+            global_step,
+        };
+        save_stacked_safetensors(
+            Path::new(&ckpt_path), &host_params, mag_cfg,
+            Some(&build_state),
+        ).unwrap_or_else(|e| {
+            eprintln!("ERROR: checkpoint save failed: {e}");
+        });
+    }
+
+    eprintln!("  [checkpoint saved: {ckpt_path}]");
+    logger.log_checkpoint(global_step, &ckpt_path);
 }
 
 /// Format number with comma separators.
@@ -487,7 +640,6 @@ fn maybe_reset_levels(
         fire_counts[level] += 1;
         if reset_intervals[level] > 0 && fire_counts[level] >= reset_intervals[level] {
             fire_counts[level] = 0;
-            // Zero M for this level across all blocks
             for block_ctx in &mut context.blocks {
                 if level < block_ctx.memory.len() {
                     block_ctx.memory[level].zero();
@@ -495,111 +647,6 @@ fn maybe_reset_levels(
             }
         }
     }
-}
-
-/// Run flashcard session: sample chunks from the last checkpoint interval,
-/// re-present each chunk for N rounds.
-#[cfg(feature = "cuda")]
-fn run_flashcard(
-    cfg: &Config,
-    mag_cfg: &MAGConfig,
-    step: usize,
-    gpu_params: &mut GpuStackedParams,
-    gpu_context: &mut GpuStackedContext,
-    adamw_state: &mut Option<GpuStackedAdamWState>,
-    loaders: &mut [BpeTokenStream],
-    interval_positions: &[usize],
-    conductor: &mut Conductor,
-    reset_intervals: &[usize],
-    fire_counts: &mut [usize],
-) {
-    let seq_len = mag_cfg.swa.seq_len;
-    let d = mag_cfg.swa.d_model;
-    let v = mag_cfg.swa.vocab_size;
-    let pct = cfg.build.flashcard_pct;
-    let rounds = cfg.build.flashcard_rounds;
-    let lr = cosine_lr(step, cfg.build.warmup_steps,
-        step + cfg.build.steps, cfg.build.lr); // approximate
-
-    // Build deck: sample pct% of chunks from interval [start_pos, current_pos)
-    let mut deck: Vec<(Vec<usize>, Vec<usize>)> = Vec::new();
-
-    // Use first loader for now (batch_size=1 primary path)
-    let loader = &loaders[0];
-    let start_pos = interval_positions[0];
-    let end_pos = loader.position;
-
-    if end_pos <= start_pos { return; }
-
-    let total_chunks = (end_pos - start_pos) / seq_len;
-    let n_sample = ((total_chunks as f32 * pct / 100.0).ceil() as usize).max(1);
-    let n_sample = n_sample.min(total_chunks);
-
-    // Build a temporary loader for sampling
-    let mut fc_loader = BpeTokenStream::load(&cfg.data.path).unwrap();
-    fc_loader.seek(start_pos);
-
-    // Collect all chunks in range, then sample
-    let mut all_chunks: Vec<(Vec<usize>, Vec<usize>)> = Vec::new();
-    for _ in 0..total_chunks {
-        if let Some(chunk) = fc_loader.next_chunk(seq_len) {
-            all_chunks.push(chunk);
-        }
-    }
-
-    // Simple deterministic sampling: take every N-th chunk
-    let stride = (all_chunks.len() / n_sample).max(1);
-    for (i, chunk) in all_chunks.into_iter().enumerate() {
-        if i % stride == 0 && deck.len() < n_sample {
-            deck.push(chunk);
-        }
-    }
-
-    if deck.is_empty() { return; }
-
-    eprintln!("  Flashcard deck: {} chunks available in range [{start_pos}, {end_pos})",
-        total_chunks);
-    eprintln!("  [flashcard] {} chunks × {rounds} rounds (step {})", deck.len(), step + 1);
-
-    // Create separate conductor for flashcard (doesn't affect training conductor)
-    let mut fc_conductor = Conductor::new(mag_cfg.k, mag_cfg.chunk_sizes.clone());
-
-    // Process each chunk for N rounds
-    for (input_ids, target_ids) in &deck {
-        for _round in 0..rounds {
-            let pulse = fc_conductor.pulse();
-
-            let (_, cache) = gpu_stacked_forward(
-                gpu_params, mag_cfg, input_ids, target_ids,
-                &pulse, gpu_context, &mut None,
-            );
-
-            let mut grads = gpu_stacked_backward(
-                gpu_params, mag_cfg, &cache, &mut None,
-            );
-
-            if adamw_state.is_none() {
-                *adamw_state = Some(GpuStackedAdamWState::from_params(gpu_params));
-            }
-            let state = adamw_state.as_mut().unwrap();
-
-            gpu_stacked_adamw_update(
-                gpu_params, &mut grads, state,
-                &pulse,
-                lr, cfg.build.beta1, cfg.build.beta2, 1e-8,
-                cfg.build.weight_decay, cfg.build.max_grad_norm,
-                false, &mut None,
-            );
-
-            gpu_stacked_sync_embed_weights(gpu_params, d, v);
-            gpu_context.update_m_norm_tracking();
-            maybe_reset_levels(&pulse, reset_intervals, fire_counts, gpu_context);
-
-            fc_conductor.advance();
-        }
-    }
-
-    eprintln!("  [flashcard] done: {} chunks reinforced", deck.len());
 }
 
 /// Get resident set size in MB (Linux).
