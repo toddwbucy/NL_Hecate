@@ -244,8 +244,11 @@ add new fields without touching the phase system or the rest of `build`.
 ### Per-Phase Optimizer Override
 
 A phase can override the entire optimizer block or just individual fields.
-When a phase specifies an `optimizer` object, it fully replaces the `build`
-default for that phase's duration. On phase completion, the default is restored.
+When a phase specifies an `optimizer` object, it is **merged** with the `build`
+default: any fields the phase provides override the build values, and any omitted
+fields are inherited from `build.optimizer`. This means a phase can override just
+`lr` without repeating the full optimizer block. On phase completion, the build
+defaults are restored.
 
 ```json
 "phases": [
