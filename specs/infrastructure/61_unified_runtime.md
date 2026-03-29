@@ -147,17 +147,23 @@ learns from the data, then speaks (generates output), and its output becomes
 the input for the next round. Each round builds on the model's own increasingly
 refined understanding.
 
+**Current implementation status**: The LEARN step is implemented. The SPEAK and
+REDIRECT steps require `prefill()` + `decode_token()` in the Rust CLI, which is
+pending. Until generation lands, think_rounds runs repeated LEARN steps on the
+original data — a valid but degraded mode.
+
 ```rust
+// TARGET BEHAVIOR (speak/redirect pending generation support in CLI)
 input = load(data)
 for round in 0..think_rounds {
     // LEARN — process input through step_adamw (forward + backward + optimizer)
     step_adamw(input, ...)
 
     // SPEAK — generate output from what was just learned
-    output = prefill(input) → decode_token() loop
+    output = prefill(input) → decode_token() loop    // PENDING
 
     // REDIRECT — the model's output becomes the next round's input
-    input = output
+    input = output                                     // PENDING
 }
 ```
 
@@ -308,12 +314,10 @@ for (i, phase) in config.phases.iter().enumerate() {
             // LEARN from current input
             let (loss, grad_norm) = step_optimizer(input, &opt, ...);
 
-            // SPEAK — generate output from what was just learned
-            let logits = prefill(input, pulse);
-            let output = decode_loop(logits, max_gen_tokens);
-
-            // REDIRECT — output becomes next round's input
-            input = output;
+            // SPEAK + REDIRECT (pending — requires prefill/decode_token in CLI)
+            // let logits = prefill(input, pulse);
+            // let output = decode_loop(logits, max_gen_tokens);
+            // input = output;
             global_step += 1;
         }
     }
