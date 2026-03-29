@@ -38,6 +38,10 @@ pub struct Conductor {
     pub chunk_sizes: Vec<usize>,
     step: usize,
     stream: Option<Box<dyn ContextStream>>,
+    /// Sequence length per step. When seq_len >= chunk_size for a level,
+    /// that level is always active (the forward pass handles token-level
+    /// frequency internally). Set via `set_seq_len()`.
+    seq_len: usize,
 }
 
 impl Conductor {
@@ -47,7 +51,15 @@ impl Conductor {
         for (i, &cs) in chunk_sizes.iter().enumerate() {
             assert!(cs >= 1, "chunk_sizes[{i}] must be >= 1");
         }
-        Conductor { k, chunk_sizes, step: 0, stream: None }
+        Conductor { k, chunk_sizes, step: 0, stream: None, seq_len: 0 }
+    }
+
+    /// Set the sequence length so the Conductor can determine which levels
+    /// are always active. When seq_len >= chunk_size for a level, the forward
+    /// pass processes multiple chunk boundaries internally, so the level must
+    /// fire every step.
+    pub fn set_seq_len(&mut self, seq_len: usize) {
+        self.seq_len = seq_len;
     }
 
     /// Builder: attach a ContextStream for integrated data feeding.
@@ -116,9 +128,14 @@ impl Conductor {
     }
 
     /// Generate pulse for current step.
+    ///
+    /// A level is active if:
+    /// - The step-based condition fires (step % chunk_size == 0), OR
+    /// - seq_len >= chunk_size, meaning the forward pass processes at least
+    ///   one full chunk boundary internally for this level.
     pub fn pulse(&self) -> Pulse {
         let active_levels = self.chunk_sizes.iter()
-            .map(|&cs| self.step % cs == 0)
+            .map(|&cs| self.step % cs == 0 || (self.seq_len > 0 && self.seq_len >= cs))
             .collect();
         Pulse {
             global_step: self.step,
