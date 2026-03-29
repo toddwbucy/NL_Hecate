@@ -1,12 +1,71 @@
 use std::path::Path;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::fs::File;
+
+use memmap2::Mmap;
+
+/// Threshold for mmap vs read-into-memory (500 MB).
+const MMAP_THRESHOLD: u64 = 500_000_000;
+
+/// Storage backend: either a heap-allocated Vec or a memory-mapped file.
+enum TokenStorage {
+    Vec(Vec<u32>),
+    Mmap { mmap: Mmap, offset: usize, len: usize },
+}
+
+impl TokenStorage {
+    fn len(&self) -> usize {
+        match self {
+            TokenStorage::Vec(v) => v.len(),
+            TokenStorage::Mmap { len, .. } => *len,
+        }
+    }
+
+    fn get_u32(&self, idx: usize) -> u32 {
+        match self {
+            TokenStorage::Vec(v) => v[idx],
+            TokenStorage::Mmap { mmap, offset, .. } => {
+                let byte_off = *offset + idx * 4;
+                let bytes = &mmap[byte_off..byte_off + 4];
+                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+            }
+        }
+    }
+}
+
+enum TargetStorage {
+    Vec(Vec<i32>),
+    Mmap { mmap: Mmap, offset: usize, len: usize },
+}
+
+impl TargetStorage {
+    fn len(&self) -> usize {
+        match self {
+            TargetStorage::Vec(v) => v.len(),
+            TargetStorage::Mmap { len, .. } => *len,
+        }
+    }
+
+    fn get_i32(&self, idx: usize) -> i32 {
+        match self {
+            TargetStorage::Vec(v) => v[idx],
+            TargetStorage::Mmap { mmap, offset, .. } => {
+                let byte_off = *offset + idx * 4;
+                let bytes = &mmap[byte_off..byte_off + 4];
+                i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+            }
+        }
+    }
+}
 
 /// BPE token stream that reads flat numpy arrays.
 /// Compatible with prepare_dolmino.py / prepare_gutenberg_deck.py output format.
+///
+/// For files > 500 MB, uses mmap to avoid loading the entire file into memory.
+/// The OS page cache handles paging; RSS stays near zero for large corpora.
 pub struct BpeTokenStream {
-    tokens: Vec<u32>,    // uint32 input tokens
-    targets: Vec<i32>,   // int32 target tokens (-1 = masked)
+    tokens: TokenStorage,
+    targets: TargetStorage,
     pub vocab_size: usize,
     pub position: usize,
     pub total_tokens: usize,
@@ -26,9 +85,30 @@ impl BpeTokenStream {
         let vocab_size = meta["vocab_size"].as_u64()
             .ok_or("meta.json missing vocab_size")? as usize;
 
-        // Load numpy arrays
-        let tokens = load_npy_u32(&dir.join("train_tokens.npy"))?;
-        let targets = load_npy_i32(&dir.join("train_targets.npy"))?;
+        let tokens_path = dir.join("train_tokens.npy");
+        let targets_path = dir.join("train_targets.npy");
+
+        let tokens_size = std::fs::metadata(&tokens_path)
+            .map_err(|e| format!("Failed to stat {}: {e}", tokens_path.display()))?.len();
+        let targets_size = std::fs::metadata(&targets_path)
+            .map_err(|e| format!("Failed to stat {}: {e}", targets_path.display()))?.len();
+
+        let use_mmap = tokens_size > MMAP_THRESHOLD || targets_size > MMAP_THRESHOLD;
+
+        let (tokens, targets) = if use_mmap {
+            eprintln!("  [mmap: tokens={}MB targets={}MB]",
+                tokens_size / 1_000_000, targets_size / 1_000_000);
+            let (tok_mmap, tok_offset, tok_len) = mmap_npy_u32(&tokens_path)?;
+            let (tgt_mmap, tgt_offset, tgt_len) = mmap_npy_i32(&targets_path)?;
+            (
+                TokenStorage::Mmap { mmap: tok_mmap, offset: tok_offset, len: tok_len },
+                TargetStorage::Mmap { mmap: tgt_mmap, offset: tgt_offset, len: tgt_len },
+            )
+        } else {
+            let tok_vec = load_npy_u32(&tokens_path)?;
+            let tgt_vec = load_npy_i32(&targets_path)?;
+            (TokenStorage::Vec(tok_vec), TargetStorage::Vec(tgt_vec))
+        };
 
         if tokens.len() != targets.len() {
             return Err(format!("Token/target length mismatch: {} vs {}",
@@ -48,14 +128,13 @@ impl BpeTokenStream {
             self.position = 0; // wrap
         }
 
-        let input_ids: Vec<usize> = self.tokens[self.position..self.position + seq_len]
-            .iter()
-            .map(|&t| t as usize)
+        let input_ids: Vec<usize> = (self.position..self.position + seq_len)
+            .map(|i| self.tokens.get_u32(i) as usize)
             .collect();
 
-        let target_ids: Vec<usize> = self.targets[self.position..self.position + seq_len]
-            .iter()
-            .map(|&t| {
+        let target_ids: Vec<usize> = (self.position..self.position + seq_len)
+            .map(|i| {
+                let t = self.targets.get_i32(i);
                 if t < 0 { self.vocab_size } else { t as usize }
             })
             .collect();
@@ -84,8 +163,45 @@ pub struct DataCursor {
     pub total_tokens: u64,
 }
 
+// ── Mmap loaders ─────────────────────────────────────────────────────
+
+/// Memory-map a numpy .npy u32 file. Returns (mmap, data_offset, n_elements).
+fn mmap_npy_u32(path: &Path) -> Result<(Mmap, usize, usize), String> {
+    let mut f = File::open(path)
+        .map_err(|e| format!("Failed to open {}: {e}", path.display()))?;
+    let header_len = parse_npy_header(&mut f, path)?;
+    let file_len = f.metadata()
+        .map_err(|e| format!("metadata failed: {e}"))?.len() as usize;
+    let data_bytes = file_len - header_len;
+    if data_bytes % 4 != 0 {
+        return Err(format!("{}: data section ({data_bytes} bytes) not aligned to 4-byte u32",
+            path.display()));
+    }
+    let mmap = unsafe { Mmap::map(&f) }
+        .map_err(|e| format!("mmap failed for {}: {e}", path.display()))?;
+    Ok((mmap, header_len, data_bytes / 4))
+}
+
+/// Memory-map a numpy .npy i32 file. Returns (mmap, data_offset, n_elements).
+fn mmap_npy_i32(path: &Path) -> Result<(Mmap, usize, usize), String> {
+    let mut f = File::open(path)
+        .map_err(|e| format!("Failed to open {}: {e}", path.display()))?;
+    let header_len = parse_npy_header(&mut f, path)?;
+    let file_len = f.metadata()
+        .map_err(|e| format!("metadata failed: {e}"))?.len() as usize;
+    let data_bytes = file_len - header_len;
+    if data_bytes % 4 != 0 {
+        return Err(format!("{}: data section ({data_bytes} bytes) not aligned to 4-byte i32",
+            path.display()));
+    }
+    let mmap = unsafe { Mmap::map(&f) }
+        .map_err(|e| format!("mmap failed for {}: {e}", path.display()))?;
+    Ok((mmap, header_len, data_bytes / 4))
+}
+
+// ── Vec loaders (small files) ────────────────────────────────────────
+
 /// Load a 1D numpy .npy file as Vec<u32>.
-/// Supports numpy format 1.0: magic + version + header + raw data.
 fn load_npy_u32(path: &Path) -> Result<Vec<u32>, String> {
     let mut f = File::open(path)
         .map_err(|e| format!("Failed to open {}: {e}", path.display()))?;
@@ -112,7 +228,6 @@ fn load_npy_u32(path: &Path) -> Result<Vec<u32>, String> {
     f.read_exact(&mut buf)
         .map_err(|e| format!("Read failed: {e}"))?;
 
-    // Reinterpret as u32 (little-endian, same as numpy default)
     let mut result = vec![0u32; n_elements];
     for (i, chunk) in buf.chunks_exact(4).enumerate() {
         result[i] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
