@@ -91,13 +91,22 @@ fn load_npy_u32(path: &Path) -> Result<Vec<u32>, String> {
         .map_err(|e| format!("Failed to open {}: {e}", path.display()))?;
 
     let header_len = parse_npy_header(&mut f, path)?;
-    f.seek(SeekFrom::Start(header_len as u64))
-        .map_err(|e| format!("Seek failed: {e}"))?;
 
     let file_len = f.metadata()
-        .map_err(|e| format!("metadata failed: {e}"))?.len();
-    let data_bytes = (file_len - header_len as u64) as usize;
+        .map_err(|e| format!("metadata failed: {e}"))?.len() as usize;
+    if header_len > file_len {
+        return Err(format!("{}: header_len ({header_len}) exceeds file size ({file_len})",
+            path.display()));
+    }
+    let data_bytes = file_len - header_len;
+    if data_bytes % 4 != 0 {
+        return Err(format!("{}: data section ({data_bytes} bytes) not aligned to 4-byte u32",
+            path.display()));
+    }
     let n_elements = data_bytes / 4;
+
+    f.seek(SeekFrom::Start(header_len as u64))
+        .map_err(|e| format!("Seek failed: {e}"))?;
 
     let mut buf = vec![0u8; data_bytes];
     f.read_exact(&mut buf)
@@ -117,13 +126,22 @@ fn load_npy_i32(path: &Path) -> Result<Vec<i32>, String> {
         .map_err(|e| format!("Failed to open {}: {e}", path.display()))?;
 
     let header_len = parse_npy_header(&mut f, path)?;
-    f.seek(SeekFrom::Start(header_len as u64))
-        .map_err(|e| format!("Seek failed: {e}"))?;
 
     let file_len = f.metadata()
-        .map_err(|e| format!("metadata failed: {e}"))?.len();
-    let data_bytes = (file_len - header_len as u64) as usize;
+        .map_err(|e| format!("metadata failed: {e}"))?.len() as usize;
+    if header_len > file_len {
+        return Err(format!("{}: header_len ({header_len}) exceeds file size ({file_len})",
+            path.display()));
+    }
+    let data_bytes = file_len - header_len;
+    if data_bytes % 4 != 0 {
+        return Err(format!("{}: data section ({data_bytes} bytes) not aligned to 4-byte i32",
+            path.display()));
+    }
     let n_elements = data_bytes / 4;
+
+    f.seek(SeekFrom::Start(header_len as u64))
+        .map_err(|e| format!("Seek failed: {e}"))?;
 
     let mut buf = vec![0u8; data_bytes];
     f.read_exact(&mut buf)

@@ -240,7 +240,7 @@ pub fn run(config_path: &str, _resume: bool) {
         eprintln!("  ErrClip:  max={ec:?}");
     }
     eprintln!("  Optimizer: {} (lr={}, b1={}, b2={}, wd={})",
-        default_opt.optimizer_type, default_opt.lr,
+        default_opt.optimizer_type, default_opt.lr(),
         default_opt.beta1(), default_opt.beta2(), default_opt.weight_decay());
     eprintln!("  Grad clip: max_norm={}", cfg.build.max_grad_norm);
     eprintln!("  Phases:   {}", phases.len());
@@ -250,7 +250,7 @@ pub fn run(config_path: &str, _resume: bool) {
             PhaseDuration::ThinkRounds(r) => format!("{r} think_rounds"),
         };
         let opt_info = phase.optimizer.as_ref()
-            .map(|o| format!(" [{}@{}]", o.optimizer_type, o.lr))
+            .map(|o| format!(" [{}@{}]", o.optimizer_type, o.lr()))
             .unwrap_or_default();
         eprintln!("    [{i}] {}: {}{}", phase.label, dur, opt_info);
     }
@@ -261,7 +261,7 @@ pub fn run(config_path: &str, _resume: bool) {
     eprintln!("  Log:      {log_file}");
     eprintln!("============================================================");
 
-    logger.log_build_start(d, nh, seq_len, k, n_blocks, cfg.build.steps, default_opt.lr, total_params);
+    logger.log_build_start(d, nh, seq_len, k, n_blocks, cfg.build.steps, default_opt.lr(), total_params);
 
     // ── Phase loop (spec 61) ─────────────────────────────────────────
     let t_start = Instant::now();
@@ -284,6 +284,21 @@ pub fn run(config_path: &str, _resume: bool) {
         eprintln!();
         eprintln!("── Phase {phase_idx}: {} ──", phase.label);
 
+        // Reallocate GPU context if phase overrides batch_size or seq_len
+        #[cfg(feature = "cuda")]
+        {
+            let needs_realloc = batch_size != cfg.build.batch_size
+                || phase_seq_len != seq_len;
+            if needs_realloc {
+                mag_cfg.swa.seq_len = phase_seq_len;
+                gpu_context = GpuStackedContext::new(
+                    n_blocks, k, d, batch_size, Some(&mag_cfg),
+                );
+                // AdamW state is param-sized (not batch/seq dependent), keep it
+                eprintln!("  [GPU context reallocated: batch_size={batch_size}, seq_len={phase_seq_len}]");
+            }
+        }
+
         match &phase.duration {
             PhaseDuration::Steps(total_phase_steps) => {
                 // ── Steps mode: streaming consumption ──────────────
@@ -304,13 +319,13 @@ pub fn run(config_path: &str, _resume: bool) {
                 eprintln!("  Data:  {} tokens, batch_size={batch_size}, seq_len={phase_seq_len}",
                     fmt_num(total_tokens_phase));
                 eprintln!("  Opt:   {} lr={} wd={} gnorm_clip={}",
-                    opt.optimizer_type, opt.lr, opt.weight_decay(), max_grad_norm);
+                    opt.optimizer_type, opt.lr(), opt.weight_decay(), max_grad_norm);
 
                 // Compute total steps for LR schedule within this phase
-                let phase_end_step = global_step + total_phase_steps;
+                let _phase_end_step = global_step + total_phase_steps;
 
                 for phase_step in 0..*total_phase_steps {
-                    let lr = cosine_lr(phase_step, warmup_steps, *total_phase_steps, opt.lr);
+                    let lr = cosine_lr(phase_step, warmup_steps, *total_phase_steps, opt.lr());
 
                     // Assemble batch
                     let mut all_input = Vec::with_capacity(batch_size * phase_seq_len);
@@ -397,10 +412,10 @@ pub fn run(config_path: &str, _resume: bool) {
                 eprintln!("  Data:  {} tokens, {rounds} think_rounds",
                     fmt_num(total_tokens_phase));
                 eprintln!("  Opt:   {} lr={} wd={} gnorm_clip={}",
-                    opt.optimizer_type, opt.lr, opt.weight_decay(), max_grad_norm);
+                    opt.optimizer_type, opt.lr(), opt.weight_decay(), max_grad_norm);
 
                 // Load all data as initial input
-                let (mut input, mut target) = loader.next_chunk(phase_seq_len)
+                let (mut input, target) = loader.next_chunk(phase_seq_len)
                     .unwrap_or_else(|| {
                         eprintln!("ERROR: data exhausted in think_rounds");
                         std::process::exit(1);
@@ -409,7 +424,7 @@ pub fn run(config_path: &str, _resume: bool) {
                 for round in 0..*rounds {
                     eprintln!("  [think round {}/{}]", round + 1, rounds);
 
-                    let lr = opt.lr; // think_rounds uses constant lr (no schedule)
+                    let lr = opt.lr(); // think_rounds uses constant lr (no schedule)
                     let pulse = conductor.pulse();
 
                     // LEARN from current input
@@ -455,6 +470,19 @@ pub fn run(config_path: &str, _resume: bool) {
         }
 
         if aborted { break; }
+
+        // Restore GPU context to build defaults if phase overrode them
+        #[cfg(feature = "cuda")]
+        {
+            let needs_restore = batch_size != cfg.build.batch_size
+                || phase_seq_len != seq_len;
+            if needs_restore {
+                mag_cfg.swa.seq_len = seq_len;
+                gpu_context = GpuStackedContext::new(
+                    n_blocks, k, d, cfg.build.batch_size, Some(&mag_cfg),
+                );
+            }
+        }
 
         // ── Phase boundary checkpoint ─────────────────────────────
         eprintln!("  [phase {phase_idx} complete — checkpoint at step {global_step}]");
@@ -517,20 +545,26 @@ fn run_step(
         gpu_params, mag_cfg, &cache, &mut None,
     );
 
-    // Lazy-init AdamW
-    if adamw_state.is_none() {
-        *adamw_state = Some(GpuStackedAdamWState::from_params(gpu_params));
-    }
-    let state = adamw_state.as_mut().unwrap();
-
-    let gnorm = gpu_stacked_adamw_update(
-        gpu_params, &mut grads, state,
-        pulse,
-        lr, opt.beta1(), opt.beta2(), 1e-8,
-        opt.weight_decay(), max_grad_norm,
-        false, // freeze_embed
-        &mut None, // profiler
-    );
+    // Dispatch optimizer by type
+    let gnorm = match opt.optimizer_type.as_str() {
+        "adamw" => {
+            if adamw_state.is_none() {
+                *adamw_state = Some(GpuStackedAdamWState::from_params(gpu_params));
+            }
+            let state = adamw_state.as_mut().unwrap();
+            gpu_stacked_adamw_update(
+                gpu_params, &mut grads, state,
+                pulse,
+                lr, opt.beta1(), opt.beta2(), 1e-8,
+                opt.weight_decay(), max_grad_norm,
+                false, // freeze_embed
+                &mut None, // profiler
+            )
+        }
+        other => {
+            panic!("Unsupported optimizer type: \"{other}\". Only \"adamw\" is currently implemented.");
+        }
+    };
 
     // Weight tying
     gpu_stacked_sync_embed_weights(gpu_params, d, v);
@@ -578,23 +612,26 @@ fn save_checkpoint(
             stream_cursor: StreamCursor {
                 position: stream_position,
                 chunk_id: 0,
-                pulse_id: 0,
+                pulse_id: conductor.step() as u64,
                 rng_state: None,
                 content_hash: 0,
             },
             context: host_context,
             global_step,
         };
-        save_stacked_safetensors(
+        match save_stacked_safetensors(
             Path::new(&ckpt_path), &host_params, mag_cfg,
             Some(&build_state),
-        ).unwrap_or_else(|e| {
-            eprintln!("ERROR: checkpoint save failed: {e}");
-        });
+        ) {
+            Ok(()) => {
+                eprintln!("  [checkpoint saved: {ckpt_path}]");
+                logger.log_checkpoint(global_step, &ckpt_path);
+            }
+            Err(e) => {
+                eprintln!("ERROR: checkpoint save failed: {e}");
+            }
+        }
     }
-
-    eprintln!("  [checkpoint saved: {ckpt_path}]");
-    logger.log_checkpoint(global_step, &ckpt_path);
 }
 
 /// Format number with comma separators.

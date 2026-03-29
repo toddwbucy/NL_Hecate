@@ -50,18 +50,16 @@ pub struct ModelConfig {
 
 /// Nested optimizer block (spec 61).
 /// Each optimizer type declares its own parameters.
+/// Fields are Option<T> so we can distinguish "explicitly set" from "absent" —
+/// this matters for legacy compat (only promote flat build.lr when nested lr is absent).
 #[derive(Deserialize, Debug, Clone)]
 pub struct OptimizerConfig {
     #[serde(rename = "type", default = "default_optimizer_type")]
     pub optimizer_type: String,
-    #[serde(default = "default_lr")]
-    pub lr: f32,
+    pub lr: Option<f32>,
     // AdamW-specific
-    #[serde(default = "default_beta1")]
     pub beta1: Option<f32>,
-    #[serde(default = "default_beta2")]
     pub beta2: Option<f32>,
-    #[serde(default = "default_weight_decay")]
     pub weight_decay: Option<f32>,
     // Future: M3-specific
     pub meta_lr: Option<f32>,
@@ -74,10 +72,10 @@ impl Default for OptimizerConfig {
     fn default() -> Self {
         Self {
             optimizer_type: "adamw".into(),
-            lr: 0.0003,
-            beta1: Some(0.9),
-            beta2: Some(0.999),
-            weight_decay: Some(0.1),
+            lr: None,
+            beta1: None,
+            beta2: None,
+            weight_decay: None,
             meta_lr: None,
             inner_steps: None,
             momentum: None,
@@ -86,6 +84,8 @@ impl Default for OptimizerConfig {
 }
 
 impl OptimizerConfig {
+    /// Learning rate (defaults to 0.0003 if not set).
+    pub fn lr(&self) -> f32 { self.lr.unwrap_or(0.0003) }
     /// AdamW beta1 (defaults to 0.9 if not set).
     pub fn beta1(&self) -> f32 { self.beta1.unwrap_or(0.9) }
     /// AdamW beta2 (defaults to 0.999 if not set).
@@ -202,10 +202,6 @@ fn default_flashcard_rounds() -> usize { 3 }
 fn default_flashcard_gen_tokens() -> usize { 64 }
 fn default_data_format() -> String { "dolmino".into() }
 
-// serde defaults for Option<f32> in OptimizerConfig
-fn default_beta1() -> Option<f32> { Some(0.9) }
-fn default_beta2() -> Option<f32> { Some(0.999) }
-fn default_weight_decay() -> Option<f32> { Some(0.1) }
 
 /// Custom deserializer: accept either a string (legacy) or an object (spec 61).
 fn deserialize_optimizer<'de, D>(deserializer: D) -> Result<OptimizerConfig, D::Error>
@@ -260,25 +256,26 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Apply backward-compat: promote flat build.lr/beta1/etc into the optimizer block.
+    /// Apply backward-compat: promote flat build.lr/beta1/etc into the optimizer block,
+    /// but only when the nested optimizer didn't explicitly set those fields.
     fn apply_legacy_compat(cfg: &mut Config) {
         if let Some(lr) = cfg.build.lr {
-            if cfg.build.optimizer.lr == 0.0003 {
-                cfg.build.optimizer.lr = lr;
+            if cfg.build.optimizer.lr.is_none() {
+                cfg.build.optimizer.lr = Some(lr);
             }
         }
         if let Some(b1) = cfg.build.beta1 {
-            if cfg.build.optimizer.beta1 == Some(0.9) {
+            if cfg.build.optimizer.beta1.is_none() {
                 cfg.build.optimizer.beta1 = Some(b1);
             }
         }
         if let Some(b2) = cfg.build.beta2 {
-            if cfg.build.optimizer.beta2 == Some(0.999) {
+            if cfg.build.optimizer.beta2.is_none() {
                 cfg.build.optimizer.beta2 = Some(b2);
             }
         }
         if let Some(wd) = cfg.build.weight_decay {
-            if cfg.build.optimizer.weight_decay == Some(0.1) {
+            if cfg.build.optimizer.weight_decay.is_none() {
                 cfg.build.optimizer.weight_decay = Some(wd);
             }
         }
@@ -392,7 +389,7 @@ mod tests {
 
         let cfg = Config::from_str(&json).unwrap();
         assert_eq!(cfg.build.optimizer.optimizer_type, "adamw");
-        assert_eq!(cfg.build.optimizer.lr, 0.001);
+        assert_eq!(cfg.build.optimizer.lr(), 0.001);
         assert!(cfg.phases.is_none());
 
         let phases = cfg.resolved_phases().unwrap();
@@ -414,7 +411,7 @@ mod tests {
 
         let cfg = Config::from_str(&json).unwrap();
         assert_eq!(cfg.build.optimizer.optimizer_type, "adamw");
-        assert_eq!(cfg.build.optimizer.lr, 0.0001);
+        assert_eq!(cfg.build.optimizer.lr(), 0.0001);
         assert_eq!(cfg.build.optimizer.beta1(), 0.95);
         assert_eq!(cfg.build.optimizer.weight_decay(), 0.05);
         assert_eq!(cfg.build.optimizer.beta2(), 0.999); // default
@@ -451,7 +448,7 @@ mod tests {
         // Phase 2: steps with overrides
         assert!(matches!(phases[2].duration, PhaseDuration::Steps(2000)));
         let opt = phases[2].optimizer.as_ref().unwrap();
-        assert_eq!(opt.lr, 0.0001);
+        assert_eq!(opt.lr(), 0.0001);
         assert_eq!(phases[2].batch_size, Some(4));
     }
 
@@ -495,6 +492,25 @@ mod tests {
         let cfg = Config::from_str(&json).unwrap();
         let err = cfg.resolved_phases().unwrap_err();
         assert!(err.contains("no `phases` and no `data`"));
+    }
+
+    #[test]
+    fn legacy_compat_does_not_overwrite_explicit_nested() {
+        // Edge case: nested optimizer explicitly sets lr=0.0003 (same as default),
+        // legacy flat lr=0.001 should NOT overwrite it.
+        let json = format!(r#"{{
+            {},
+            "build": {{
+                "optimizer": {{"type": "adamw", "lr": 0.0003}},
+                "lr": 0.001,
+                "steps": 1000
+            }},
+            "data": {{"path": "data/test"}}
+        }}"#, minimal_model_json());
+
+        let cfg = Config::from_str(&json).unwrap();
+        // Nested optimizer explicitly set lr=0.0003, legacy lr=0.001 should not win
+        assert_eq!(cfg.build.optimizer.lr(), 0.0003);
     }
 
     #[test]

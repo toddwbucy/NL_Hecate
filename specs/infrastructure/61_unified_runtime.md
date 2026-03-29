@@ -147,7 +147,7 @@ learns from the data, then speaks (generates output), and its output becomes
 the input for the next round. Each round builds on the model's own increasingly
 refined understanding.
 
-```
+```rust
 input = load(data)
 for round in 0..think_rounds {
     // LEARN — process input through step_adamw (forward + backward + optimizer)
