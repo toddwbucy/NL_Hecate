@@ -6,7 +6,7 @@ use nl_hecate_core::conductor::{Conductor, Pulse, ConductorState};
 use nl_hecate_core::context_stream::StreamCursor;
 use nl_hecate_core::model::{
     MAGConfig, SWAConfig, MemoryRuleKind, CompositionKind, HopeVariant,
-    LevelTapeStrategy, BuildResumeState,
+    LevelTapeStrategy, BuildResumeState, PushUpInit,
 };
 use nl_hecate_core::parallel::{ParallelConfig, ParallelStrategy};
 
@@ -229,6 +229,85 @@ pub fn run(config_path: &str, _resume: bool) {
             );
             adamw_state = None;
         }
+    }
+
+    // ── k-extension (spec 7 / spec 22) ─────────────────────────────
+    // Mutables that extend_k may modify
+    let mut k = k;
+    let mut chunk_sizes = chunk_sizes;
+
+    if let Some(target_k) = cfg.build.extend_k {
+        if cfg.build.load.is_none() {
+            eprintln!("ERROR: extend_k requires a checkpoint (set build.load)");
+            std::process::exit(1);
+        }
+        if target_k != k + 1 {
+            eprintln!("ERROR: extend_k={target_k} must be loaded_k+1={}", k + 1);
+            std::process::exit(1);
+        }
+        if !cfg.build.push_up && !cfg.build.stack_up {
+            eprintln!("ERROR: extend_k set but neither push_up nor stack_up — set one of them");
+            std::process::exit(1);
+        }
+        if cfg.build.push_up && cfg.build.stack_up {
+            eprintln!("ERROR: push_up and stack_up are mutually exclusive");
+            std::process::exit(1);
+        }
+
+        let chunk_template = [1, 8, 64, 512];
+        if target_k > chunk_template.len() {
+            eprintln!("ERROR: extend_k={target_k} exceeds max supported k={}", chunk_template.len());
+            std::process::exit(1);
+        }
+
+        let new_chunks: Vec<usize> = if cfg.build.push_up {
+            chunk_template[..target_k].to_vec()
+        } else {
+            let mut c = chunk_sizes.clone();
+            c.push(chunk_template[target_k - 1]);
+            c
+        };
+
+        // Update MAGConfig for new k
+        mag_cfg.k = target_k;
+        mag_cfg.chunk_sizes = new_chunks.clone();
+
+        // Extend per-level arrays
+        while mag_cfg.m_norm_max.len() < target_k {
+            mag_cfg.m_norm_max.push(*mag_cfg.m_norm_max.last().unwrap_or(&100.0));
+        }
+        while mag_cfg.error_clip.len() < target_k {
+            mag_cfg.error_clip.push(*mag_cfg.error_clip.last().unwrap_or(&100.0));
+        }
+
+        // Stacked checkpoints only support push_up (not stack_up) per spec 22
+        if cfg.build.stack_up {
+            eprintln!("ERROR: stacked extend_k only supports push_up (not stack_up)");
+            std::process::exit(1);
+        }
+
+        // Perform the extension
+        #[cfg(feature = "cuda")]
+        {
+            let host = gpu_params.to_host(d, v, k);
+            let init = match cfg.build.push_up_init.as_str() {
+                "clone" => PushUpInit::Clone,
+                _ => PushUpInit::Random,
+            };
+            let new_host = host.extend_push_up(&mag_cfg, cfg.build.seed, init);
+            gpu_params = GpuStackedParams::from_host(&new_host);
+            gpu_context = GpuStackedContext::new(
+                n_blocks, target_k, d, cfg.build.batch_size, Some(&mag_cfg),
+            );
+            adamw_state = None; // Fresh optimizer for new level structure
+        }
+
+        let mode = if cfg.build.push_up { "push-up" } else { "stack-up" };
+        eprintln!("  k-extension ({mode}): k={k} → k={target_k}, chunks={new_chunks:?}");
+
+        k = target_k;
+        chunk_sizes = new_chunks;
+        resume_step = 0; // New phase starts from step 0
     }
 
     // ── Reset intervals (spec 57) ────────────────────────────────────

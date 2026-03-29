@@ -164,6 +164,19 @@ pub struct BuildConfig {
     #[serde(default = "default_true")]
     pub cms_sidecar: bool,
 
+    // k-extension: promote a checkpoint from k to k+1 CMS levels
+    /// Target k (must be loaded_k + 1). Requires `load` to be set.
+    pub extend_k: Option<usize>,
+    /// Push-up: shift existing levels to slower frequencies, add fresh L0.
+    #[serde(default)]
+    pub push_up: bool,
+    /// Stack-up: keep existing levels, add new level at top (slowest frequency).
+    #[serde(default)]
+    pub stack_up: bool,
+    /// L0 initialization for push-up: "random" (Xavier) or "clone" (donor projections).
+    #[serde(default = "default_push_up_init")]
+    pub push_up_init: String,
+
     // Legacy flashcard fields (deprecated — use phases with think_rounds)
     #[serde(default)]
     pub flashcard: bool,
@@ -229,6 +242,7 @@ fn default_batch_size() -> usize { 1 }
 fn default_log_every() -> usize { 8 }
 fn default_save_every() -> usize { 1000 }
 fn default_seed() -> u64 { 42 }
+fn default_push_up_init() -> String { "random".into() }
 fn default_flashcard_pct() -> f32 { 10.0 }
 fn default_flashcard_rounds() -> usize { 3 }
 fn default_flashcard_gen_tokens() -> usize { 64 }
