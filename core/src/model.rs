@@ -2922,6 +2922,10 @@ pub struct BuildResumeState {
     pub stream_cursor: StreamCursor,
     pub context: ContextState,
     pub global_step: usize,
+    /// Per-slot stream cursors for batch>1 resume. When present, supersedes
+    /// `stream_cursor` (which remains for backward compat with batch=1 checkpoints).
+    #[serde(default)]
+    pub stream_cursors: Vec<StreamCursor>,
 }
 
 /// Declared checkpoint format (v1+). Schema-versioned with optional build-resume state.
@@ -3281,6 +3285,7 @@ mod tests {
             stream_cursor: StreamCursor { position: 100, chunk_id: 42, pulse_id: 42, rng_state: None, content_hash: 0 },
             context: ContextState::new(1, d),
             global_step: 42,
+            stream_cursors: Vec::new(),
         };
 
         let dir = std::env::temp_dir().join("hecate_test_ckpt_build");

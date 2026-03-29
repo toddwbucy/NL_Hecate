@@ -7,6 +7,7 @@
 use std::path::Path;
 
 use tokenizers::Tokenizer;
+use serde_json::json;
 
 use nl_hecate_core::checkpoint::load_stacked_safetensors;
 use nl_hecate_core::conductor::Conductor;
@@ -20,6 +21,7 @@ use nl_hecate_core::gpu_params::{GpuStackedParams, GpuStackedContext};
 #[cfg(feature = "cuda")]
 use nl_hecate_core::gpu_stacked_forward::{
     gpu_stacked_prefill, gpu_stacked_forward,
+    gpu_stacked_decode_token, StackedDecodeWorkspace,
 };
 #[cfg(feature = "cuda")]
 use nl_hecate_core::gpu_stacked_backward::gpu_stacked_backward;
@@ -31,6 +33,7 @@ use nl_hecate_core::gpu_stacked_optimizer::{
 use nl_hecate_core::gpu_forward::GpuKVCache;
 
 use crate::config::Config;
+use crate::log::MetricsLogger;
 use crate::sample::{sample_token, safe_pad_token};
 
 // Probing prompts matched to FineWeb-Edu domain (educational text)
@@ -325,6 +328,185 @@ pub fn run_probes(
         eprintln!("Probes complete.");
         eprintln!("{sep}");
     }
+}
+
+/// Run inline probes at a checkpoint during training.
+///
+/// Takes a host-side parameter snapshot (from `gpu_params.to_host()`) and allocates
+/// its own GPU state — the caller's training state is never modified.
+///
+/// Probes:
+/// 1. **Coherence samples**: Greedy generation from prompts (text quality check)
+/// 2. **Within-generation learning**: Loss should decrease as model processes its own output
+/// 3. **Cross-exposure adaptation**: Second pass on same prompt should show lower loss (NL signature)
+///
+/// Returns a JSON value with all probe results, suitable for `logger.log_probe_results()`.
+#[cfg(feature = "cuda")]
+pub fn run_inline_probes(
+    host_params: &nl_hecate_core::stacked_model::StackedMAGParams,
+    mag_cfg: &MAGConfig,
+    tokenizer_path: &str,
+    step: usize,
+    d: usize,
+    v: usize,
+    k: usize,
+    n_blocks: usize,
+    chunk_sizes: &[usize],
+    max_tokens: usize,
+    temperature: f32,
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    wd: f32,
+    max_grad_norm: f32,
+) -> serde_json::Value {
+    let tokenizer = match Tokenizer::from_file(tokenizer_path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("  [probes: tokenizer load failed: {e}]");
+            return json!({"error": format!("tokenizer: {e}")});
+        }
+    };
+
+    let seq_len = mag_cfg.swa.seq_len;
+
+    // Probe-local MAGConfig with seq_len matching training (probes use batch=1)
+    let probe_cfg = mag_cfg.clone();
+
+    eprintln!("  [probes: running checkpoint probes at step {step}]");
+    let t0 = std::time::Instant::now();
+
+    let mut coherence_results = Vec::new();
+    let mut within_gen_results = Vec::new();
+    let mut cross_exposure_results = Vec::new();
+
+    // ── Probe 1: Coherence Samples ───────────────────────────────────
+    for prompt_str in PROBE_PROMPTS {
+        let mut gpu_params = GpuStackedParams::from_host(host_params);
+        let mut gpu_context = GpuStackedContext::new(n_blocks, k, d, 1, Some(&probe_cfg));
+
+        let prompt_ids = encode_prompt(&tokenizer, prompt_str);
+        let safe_pad = safe_pad_token(&prompt_ids, v);
+        let ctx = pad_to_seq_len(&prompt_ids, seq_len, safe_pad);
+
+        let conductor = Conductor::new(k, chunk_sizes.to_vec());
+        let mut gen = Vec::new();
+        let mut full_ctx = ctx.clone();
+
+        for _ in 0..max_tokens {
+            let mut kv: Vec<GpuKVCache> = Vec::new();
+            let pulse = conductor.pulse();
+            let logits = gpu_stacked_prefill(
+                &gpu_params, &probe_cfg, &full_ctx, &pulse,
+                &mut gpu_context, &mut kv, &mut None,
+            );
+            let next_tok = sample_token(&logits, temperature, 50);
+            gen.push(next_tok);
+
+            let mut extended: Vec<usize> = prompt_ids.clone();
+            extended.extend_from_slice(&gen);
+            full_ctx = pad_to_seq_len(&extended, seq_len, safe_pad);
+        }
+
+        let gen_text = decode_tokens(&tokenizer, &gen);
+        coherence_results.push(json!({
+            "prompt": prompt_str,
+            "generation": gen_text,
+        }));
+        // gpu_params + gpu_context dropped here
+    }
+
+    // ── Probe 2: Within-Generation Learning ──────────────────────────
+    for prompt_str in PROBE_PROMPTS {
+        let mut gpu_params = GpuStackedParams::from_host(host_params);
+        let mut gpu_context = GpuStackedContext::new(n_blocks, k, d, 1, Some(&probe_cfg));
+        let mut adamw_state: Option<GpuStackedAdamWState> = None;
+
+        let prompt_ids = encode_prompt(&tokenizer, prompt_str);
+        let safe_pad = safe_pad_token(&prompt_ids, v);
+        let mut conductor = Conductor::new(k, chunk_sizes.to_vec());
+
+        let losses = generate_learning_losses(
+            &mut gpu_params, &probe_cfg, &mut gpu_context,
+            &mut adamw_state, &mut conductor,
+            &prompt_ids, seq_len, v, safe_pad, max_tokens,
+            temperature, 50,
+            lr, beta1, beta2, wd, max_grad_norm, d,
+        );
+
+        let n = losses.len();
+        let (first10, last10, slope) = if n >= 10 {
+            let f10: f32 = losses[..10].iter().sum::<f32>() / 10.0;
+            let l10: f32 = losses[n - 10..].iter().sum::<f32>() / 10.0;
+            (f10, l10, linear_slope(&losses))
+        } else {
+            let avg = avg_loss(&losses);
+            (avg, avg, 0.0)
+        };
+
+        within_gen_results.push(json!({
+            "prompt": prompt_str,
+            "tokens": n,
+            "first10_loss": first10,
+            "last10_loss": last10,
+            "slope": slope,
+        }));
+    }
+
+    // ── Probe 3: Cross-Exposure Adaptation ───────────────────────────
+    for prompt_str in PROBE_PROMPTS {
+        let mut gpu_params = GpuStackedParams::from_host(host_params);
+        let mut gpu_context = GpuStackedContext::new(n_blocks, k, d, 1, Some(&probe_cfg));
+        let mut adamw_state: Option<GpuStackedAdamWState> = None;
+
+        let prompt_ids = encode_prompt(&tokenizer, prompt_str);
+        let safe_pad = safe_pad_token(&prompt_ids, v);
+
+        // Run 1: cold start
+        let mut conductor = Conductor::new(k, chunk_sizes.to_vec());
+        let losses1 = generate_learning_losses(
+            &mut gpu_params, &probe_cfg, &mut gpu_context,
+            &mut adamw_state, &mut conductor,
+            &prompt_ids, seq_len, v, safe_pad, max_tokens,
+            temperature, 50,
+            lr, beta1, beta2, wd, max_grad_norm, d,
+        );
+        let avg1 = avg_loss(&losses1);
+
+        // Run 2: reset context but KEEP updated params
+        conductor = Conductor::new(k, chunk_sizes.to_vec());
+        gpu_context = GpuStackedContext::new(n_blocks, k, d, 1, Some(&probe_cfg));
+
+        let losses2 = generate_learning_losses(
+            &mut gpu_params, &probe_cfg, &mut gpu_context,
+            &mut adamw_state, &mut conductor,
+            &prompt_ids, seq_len, v, safe_pad, max_tokens,
+            temperature, 50,
+            lr, beta1, beta2, wd, max_grad_norm, d,
+        );
+        let avg2 = avg_loss(&losses2);
+
+        let improvement = avg1 - avg2;
+        let pct = if avg1 > 0.0 { improvement / avg1 * 100.0 } else { 0.0 };
+
+        cross_exposure_results.push(json!({
+            "prompt": prompt_str,
+            "run1_avg_loss": avg1,
+            "run2_avg_loss": avg2,
+            "improvement": improvement,
+            "improvement_pct": pct,
+        }));
+    }
+
+    let elapsed = t0.elapsed().as_secs_f64();
+    eprintln!("  [probes: complete in {elapsed:.1}s]");
+
+    json!({
+        "coherence_samples": coherence_results,
+        "within_gen_learning": within_gen_results,
+        "cross_exposure": cross_exposure_results,
+        "elapsed_secs": elapsed,
+    })
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────

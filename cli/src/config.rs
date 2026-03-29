@@ -46,6 +46,14 @@ pub struct ModelConfig {
     #[serde(default = "default_tape_multiplier")]
     pub tape_multiplier: usize,
     pub tape_strategies: Option<Vec<String>>,
+    /// Per-level M-norm delta floor for dormancy detection.
+    /// If M-norm delta stays below this threshold for `dormancy_consecutive` steps,
+    /// the level is flagged as dormant. Length k (one per CMS level).
+    pub dormancy_floor: Option<Vec<f32>>,
+    /// Number of consecutive steps below dormancy_floor before a level is flagged dormant.
+    /// Default: 0 (disabled).
+    #[serde(default)]
+    pub dormancy_consecutive: usize,
 }
 
 /// Nested optimizer block (spec 61).
@@ -155,6 +163,9 @@ pub struct BuildConfig {
     #[serde(default = "default_seed")]
     pub seed: u64,
     pub load: Option<String>,
+    /// Reset step counter to 0 when loading a checkpoint (for gear shifts).
+    #[serde(default)]
+    pub reset_step: bool,
     pub seq_len_override: Option<usize>,
     pub run_dir: Option<String>,
     pub save_path: Option<String>,
@@ -176,6 +187,21 @@ pub struct BuildConfig {
     /// L0 initialization for push-up: "random" (Xavier) or "clone" (donor projections).
     #[serde(default = "default_push_up_init")]
     pub push_up_init: String,
+
+    /// Profile every N steps (0 = disabled). Writes per-step GPU timing breakdown
+    /// to a sidecar JSONL file for heatmap visualization.
+    #[serde(default)]
+    pub profile_every: usize,
+
+    /// Path to tokenizer.json for checkpoint probes (generation + learning probes).
+    /// If set, probes run automatically at each checkpoint.
+    pub tokenizer_path: Option<String>,
+    /// Max tokens to generate per probe prompt (default: 64).
+    #[serde(default = "default_probe_max_tokens")]
+    pub probe_max_tokens: usize,
+    /// Probe sampling temperature (default: 0.8).
+    #[serde(default = "default_probe_temperature")]
+    pub probe_temperature: f32,
 
     // Legacy flashcard fields (deprecated — use phases with think_rounds)
     #[serde(default)]
@@ -243,6 +269,8 @@ fn default_log_every() -> usize { 8 }
 fn default_save_every() -> usize { 1000 }
 fn default_seed() -> u64 { 42 }
 fn default_push_up_init() -> String { "random".into() }
+fn default_probe_max_tokens() -> usize { 64 }
+fn default_probe_temperature() -> f32 { 0.8 }
 fn default_flashcard_pct() -> f32 { 10.0 }
 fn default_flashcard_rounds() -> usize { 3 }
 fn default_flashcard_gen_tokens() -> usize { 64 }

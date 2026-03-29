@@ -26,10 +26,14 @@ use nl_hecate_core::gpu_stacked_forward::{
 };
 #[cfg(feature = "cuda")]
 use nl_hecate_core::gpu_forward::GpuKVCache;
+#[cfg(feature = "cuda")]
+use nl_hecate_core::gpu_profiler::GpuProfiler;
 
 use crate::config::{Config, OptimizerConfig, PhaseDuration};
 use crate::data::BpeTokenStream;
-use crate::log::MetricsLogger;
+#[cfg(feature = "cuda")]
+use crate::eval::run_inline_probes;
+use crate::log::{MetricsLogger, CmsDiagnostics, CmsTapeLogger};
 use crate::sample::sample_token;
 
 /// Cosine annealing with linear warmup.
@@ -157,6 +161,7 @@ pub fn run(config_path: &str, _resume: bool) {
 
     // ── Load checkpoint or init ──────────────────────────────────────
     let mut resume_step: usize = 0;
+    let mut resume_cursors: Vec<StreamCursor> = Vec::new();
 
     #[cfg(feature = "cuda")]
     let (mut gpu_params, mut gpu_context, mut adamw_state);
@@ -202,6 +207,18 @@ pub fn run(config_path: &str, _resume: bool) {
 
         if let Some(bs) = &build_state {
             resume_step = bs.global_step;
+            // Restore per-slot cursors for batch>1 resume
+            if !bs.stream_cursors.is_empty() {
+                resume_cursors = bs.stream_cursors.clone();
+            } else if bs.stream_cursor.position > 0 {
+                // Backward compat: single-cursor checkpoints
+                resume_cursors = vec![bs.stream_cursor.clone()];
+            }
+        }
+        if cfg.build.reset_step {
+            eprintln!("  [reset_step: overriding checkpoint step {} → 0]", resume_step);
+            resume_step = 0;
+            resume_cursors.clear();
         }
 
         eprintln!("Loading checkpoint: {load_path}");
@@ -317,8 +334,19 @@ pub fn run(config_path: &str, _resume: bool) {
 
     // ── Conductor ────────────────────────────────────────────────────
     let mut conductor = Conductor::new(k, chunk_sizes.clone());
+    conductor.set_seq_len(seq_len);
     for _ in 0..resume_step {
         conductor.advance();
+    }
+
+    // ── Dormancy detection config ─────────────────────────────────
+    #[cfg(feature = "cuda")]
+    if let Some(ref floors) = cfg.model.dormancy_floor {
+        let consecutive = cfg.model.dormancy_consecutive;
+        if consecutive > 0 {
+            gpu_context.set_dormancy_config(floors.clone(), consecutive);
+            eprintln!("  Dormancy: floors={floors:?}, consecutive={consecutive}");
+        }
     }
 
     // ── Logger ───────────────────────────────────────────────────────
@@ -326,6 +354,43 @@ pub fn run(config_path: &str, _resume: bool) {
         eprintln!("ERROR: {e}");
         std::process::exit(1);
     });
+
+    // ── CMS tape sidecar ──────────────────────────────────────────
+    let mut cms_tape: Option<CmsTapeLogger> = if cfg.build.cms_sidecar {
+        let tape_path = format!("{}/cms_tape.jsonl", run_dir);
+        match CmsTapeLogger::new(&tape_path) {
+            Ok(t) => {
+                eprintln!("  CMS tape: {tape_path}");
+                Some(t)
+            }
+            Err(e) => {
+                eprintln!("WARNING: could not open CMS tape: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // ── Step profiler ──────────────────────────────────────────────
+    #[cfg(feature = "cuda")]
+    let profile_every = cfg.build.profile_every;
+    #[cfg(feature = "cuda")]
+    let mut profile_logger: Option<crate::log::ProfileLogger> = if profile_every > 0 {
+        let prof_path = format!("{}/step_profile.jsonl", run_dir);
+        match crate::log::ProfileLogger::new(&prof_path) {
+            Ok(pl) => {
+                eprintln!("  Profiler: every {profile_every} steps → {prof_path}");
+                Some(pl)
+            }
+            Err(e) => {
+                eprintln!("WARNING: could not open profile log: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // ── Print banner ─────────────────────────────────────────────────
     let total_params = {
@@ -402,6 +467,13 @@ pub fn run(config_path: &str, _resume: bool) {
                 gpu_context = GpuStackedContext::new(
                     n_blocks, k, d, batch_size, Some(&mag_cfg),
                 );
+                // Re-apply dormancy config after reallocation
+                if let Some(ref floors) = cfg.model.dormancy_floor {
+                    let consecutive = cfg.model.dormancy_consecutive;
+                    if consecutive > 0 {
+                        gpu_context.set_dormancy_config(floors.clone(), consecutive);
+                    }
+                }
                 // AdamW state is param-sized (not batch/seq dependent), keep it
                 eprintln!("  [GPU context reallocated: batch_size={batch_size}, seq_len={phase_seq_len}]");
             }
@@ -416,12 +488,21 @@ pub fn run(config_path: &str, _resume: bool) {
                         eprintln!("ERROR: {e}");
                         std::process::exit(1);
                     });
-                    if batch_size > 1 {
+                    // Restore from checkpoint cursors if available, else use even spacing
+                    if b < resume_cursors.len() {
+                        let pos = resume_cursors[b].position as usize;
+                        loader.seek(pos);
+                        if b == 0 {
+                            eprintln!("  [resuming {batch_size} loaders from checkpoint cursors]");
+                        }
+                    } else if batch_size > 1 {
                         let offset = b * (loader.total_tokens / batch_size);
                         loader.seek(offset);
                     }
                     loaders.push(loader);
                 }
+                // Clear resume cursors after first use (subsequent phases start fresh)
+                resume_cursors.clear();
 
                 let total_tokens_phase = loaders[0].total_tokens;
                 eprintln!("  Data:  {} tokens, batch_size={batch_size}, seq_len={phase_seq_len}",
@@ -451,7 +532,17 @@ pub fn run(config_path: &str, _resume: bool) {
 
                     // Forward + Backward + Optimizer
                     #[cfg(feature = "cuda")]
-                    let (loss, grad_norm) = {
+                    let do_profile = profile_every > 0 && phase_step > 0
+                        && phase_step % profile_every == 0;
+                    #[cfg(feature = "cuda")]
+                    let mut profiler: Option<GpuProfiler> = if do_profile {
+                        Some(GpuProfiler::new(true))
+                    } else {
+                        None
+                    };
+
+                    #[cfg(feature = "cuda")]
+                    let (loss, grad_norm, block_level_gnorms) = {
                         run_step(
                             &mut gpu_params, &mag_cfg, &mut gpu_context,
                             &mut adamw_state,
@@ -459,8 +550,38 @@ pub fn run(config_path: &str, _resume: bool) {
                             opt, lr, max_grad_norm,
                             d, v,
                             &reset_intervals, &mut fire_counts,
+                            &mut profiler,
                         )
                     };
+
+                    // Collect and log profile if active
+                    #[cfg(feature = "cuda")]
+                    if let Some(ref mut prof) = profiler {
+                        let step_profile = prof.collect(n_blocks);
+                        if let Some(ref mut pl) = profile_logger {
+                            let by_cat: Vec<serde_json::Value> = step_profile.by_category.iter()
+                                .map(|c| serde_json::json!({
+                                    "category": c.category.as_str(),
+                                    "ms": c.ms,
+                                    "pct": c.pct,
+                                }))
+                                .collect();
+                            let per_block: Vec<serde_json::Value> = step_profile.per_block.iter()
+                                .map(|b| serde_json::json!({
+                                    "block": b.block_idx,
+                                    "fwd_ms": b.fwd_ms,
+                                    "bwd_ms": b.bwd_ms,
+                                    "opt_ms": b.opt_ms,
+                                }))
+                                .collect();
+                            pl.log_profile(global_step + 1, serde_json::json!({
+                                "total_ms": step_profile.total_ms,
+                                "by_category": by_cat,
+                                "per_block": per_block,
+                            }));
+                        }
+                        prof.reset();
+                    }
 
                     conductor.advance();
                     step_tokens += batch_size * phase_seq_len;
@@ -475,6 +596,30 @@ pub fn run(config_path: &str, _resume: bool) {
                         break;
                     }
 
+                    // Collect per-level CMS diagnostics
+                    #[cfg(feature = "cuda")]
+                    let cms_diag = collect_cms_diagnostics(&gpu_context, &block_level_gnorms, k);
+
+                    // Check for dormancy transitions and log events
+                    #[cfg(feature = "cuda")]
+                    for (l, status) in cms_diag.dormancy_status.iter().enumerate() {
+                        if status != "active" {
+                            // Find the worst-case block for this level's count
+                            let max_count = gpu_context.dormancy_below_count.iter()
+                                .filter_map(|b| b.get(l))
+                                .copied()
+                                .max()
+                                .unwrap_or(0);
+                            logger.log_dormancy(global_step, 0, l, status, max_count);
+                        }
+                    }
+
+                    // CMS tape sidecar
+                    #[cfg(feature = "cuda")]
+                    if let Some(ref mut tape) = cms_tape {
+                        tape.log_step(global_step, &cms_diag);
+                    }
+
                     // Logging
                     let log_this = log_every > 0 && phase_step % log_every == 0;
                     if log_this || phase_step == 0 {
@@ -486,7 +631,13 @@ pub fn run(config_path: &str, _resume: bool) {
                         eprintln!("  step {:>6}  loss={loss:.4}  ppl={ppl:.1}  tok/s={tok_s:.0}  gnorm={grad_norm:.4}  lr={lr:.6}  rss={rss_mb}MB",
                             global_step);
 
-                        logger.log_step(global_step, loss, grad_norm, lr, elapsed, &pulse_to_active(&pulse));
+                        logger.log_step(global_step, loss, grad_norm, lr, elapsed,
+                            &pulse_to_active(&pulse), &level_firings(&pulse, phase_seq_len, &chunk_sizes),
+                            #[cfg(feature = "cuda")]
+                            Some(&cms_diag),
+                            #[cfg(not(feature = "cuda"))]
+                            None,
+                        );
                     }
 
                     // Checkpoint
@@ -505,6 +656,21 @@ pub fn run(config_path: &str, _resume: bool) {
                             &loaders, d, v, k,
                             &mut logger,
                         );
+
+                        // Run inline probes if tokenizer is configured
+                        #[cfg(feature = "cuda")]
+                        if let Some(ref tok_path) = cfg.build.tokenizer_path {
+                            let snapshot = gpu_params.to_host(d, v, k);
+                            let probe_results = run_inline_probes(
+                                &snapshot, &mag_cfg, tok_path, global_step,
+                                d, v, k, n_blocks, &chunk_sizes,
+                                cfg.build.probe_max_tokens,
+                                cfg.build.probe_temperature,
+                                opt.lr(), opt.beta1(), opt.beta2(),
+                                opt.weight_decay(), max_grad_norm,
+                            );
+                            logger.log_probe_results(global_step, probe_results);
+                        }
                     }
                 }
             }
@@ -548,7 +714,7 @@ pub fn run(config_path: &str, _resume: bool) {
 
                     // LEARN from current input
                     #[cfg(feature = "cuda")]
-                    let (loss, grad_norm) = {
+                    let (loss, grad_norm, block_level_gnorms) = {
                         run_step(
                             &mut gpu_params, &mag_cfg, &mut gpu_context,
                             &mut adamw_state,
@@ -556,6 +722,7 @@ pub fn run(config_path: &str, _resume: bool) {
                             opt, lr, max_grad_norm,
                             d, v,
                             &reset_intervals, &mut fire_counts,
+                            &mut None, // no profiling in think_rounds (too few steps)
                         )
                     };
 
@@ -566,9 +733,23 @@ pub fn run(config_path: &str, _resume: bool) {
                     if loss_first.is_none() { loss_first = Some(loss); }
                     loss_last = loss;
 
+                    #[cfg(feature = "cuda")]
+                    let cms_diag = collect_cms_diagnostics(&gpu_context, &block_level_gnorms, k);
+
+                    #[cfg(feature = "cuda")]
+                    if let Some(ref mut tape) = cms_tape {
+                        tape.log_step(global_step, &cms_diag);
+                    }
+
                     eprintln!("    loss={loss:.4}  gnorm={grad_norm:.4}");
                     logger.log_step(global_step, loss, grad_norm, lr,
-                        t_start.elapsed().as_secs_f64(), &pulse_to_active(&pulse));
+                        t_start.elapsed().as_secs_f64(), &pulse_to_active(&pulse),
+                        &level_firings(&pulse, phase_seq_len, &chunk_sizes),
+                        #[cfg(feature = "cuda")]
+                        Some(&cms_diag),
+                        #[cfg(not(feature = "cuda"))]
+                        None,
+                    );
 
                     if loss.is_nan() || loss.is_infinite() {
                         eprintln!("  ABORTING: NaN/Inf at think round {round}");
@@ -644,6 +825,13 @@ pub fn run(config_path: &str, _resume: bool) {
                 gpu_context = GpuStackedContext::new(
                     n_blocks, k, d, cfg.build.batch_size, Some(&mag_cfg),
                 );
+                // Re-apply dormancy config after restore
+                if let Some(ref floors) = cfg.model.dormancy_floor {
+                    let consecutive = cfg.model.dormancy_consecutive;
+                    if consecutive > 0 {
+                        gpu_context.set_dormancy_config(floors.clone(), consecutive);
+                    }
+                }
             }
         }
 
@@ -661,6 +849,21 @@ pub fn run(config_path: &str, _resume: bool) {
                 &loaders_empty, d, v, k,
                 &mut logger,
             );
+
+            // Run inline probes at phase boundary
+            if let Some(ref tok_path) = cfg.build.tokenizer_path {
+                let default_opt = &cfg.build.optimizer;
+                let snapshot = gpu_params.to_host(d, v, k);
+                let probe_results = run_inline_probes(
+                    &snapshot, &mag_cfg, tok_path, global_step,
+                    d, v, k, n_blocks, &chunk_sizes,
+                    cfg.build.probe_max_tokens,
+                    cfg.build.probe_temperature,
+                    default_opt.lr(), default_opt.beta1(), default_opt.beta2(),
+                    default_opt.weight_decay(), cfg.build.max_grad_norm,
+                );
+                logger.log_probe_results(global_step, probe_results);
+            }
         }
     }
 
@@ -681,7 +884,67 @@ pub fn run(config_path: &str, _resume: bool) {
 
 // ── Extracted helpers ────────────────────────────────────────────────
 
+/// Per-level gradient norms extracted from backward pass (one Vec<f32> per block).
+#[cfg(feature = "cuda")]
+type BlockLevelGnorms = Vec<Vec<f32>>;
+
+/// Build CMS diagnostics from gpu_context state and per-block gradient norms.
+/// Aggregates across blocks: gnorms and m-deltas are averaged, dormancy uses worst-case.
+#[cfg(feature = "cuda")]
+fn collect_cms_diagnostics(
+    gpu_context: &GpuStackedContext,
+    block_level_gnorms: &BlockLevelGnorms,
+    k: usize,
+) -> CmsDiagnostics {
+    let n_blocks = block_level_gnorms.len();
+    let nb = n_blocks.max(1) as f32;
+
+    // Mean per-level gnorms across blocks
+    let mut level_gnorms = vec![0.0f32; k];
+    for block_gnorms in block_level_gnorms {
+        for (l, &g) in block_gnorms.iter().enumerate() {
+            if l < k { level_gnorms[l] += g; }
+        }
+    }
+    for g in &mut level_gnorms { *g /= nb; }
+
+    // M-norms: use prev_m_norms (captured by update_m_norm_tracking before periodic reset
+    // may zero the buffers). Calling memory_norms() again here would read post-reset zeros.
+    let mut level_m_norms = vec![0.0f32; k];
+    for block_norms in &gpu_context.prev_m_norms {
+        for (l, &n) in block_norms.iter().enumerate() {
+            if l < k { level_m_norms[l] += n; }
+        }
+    }
+    for n in &mut level_m_norms { *n /= nb; }
+
+    let mut level_m_deltas = vec![0.0f32; k];
+    for block_deltas in &gpu_context.m_norm_deltas {
+        for (l, &d) in block_deltas.iter().enumerate() {
+            if l < k { level_m_deltas[l] += d; }
+        }
+    }
+    for d in &mut level_m_deltas { *d /= nb; }
+
+    // Dormancy status: worst-case across blocks per level
+    let status_per_block = gpu_context.dormancy_status();
+    let mut dormancy_status = vec!["active".to_string(); k];
+    for block_status in &status_per_block {
+        for (l, s) in block_status.iter().enumerate() {
+            if l < k {
+                // Escalate: active < warning < dormant
+                if s == "dormant" || (s == "warning" && dormancy_status[l] == "active") {
+                    dormancy_status[l] = s.clone();
+                }
+            }
+        }
+    }
+
+    CmsDiagnostics { level_gnorms, level_m_norms, level_m_deltas, dormancy_status }
+}
+
 /// Run a single training step: forward + backward + optimizer update.
+/// Returns (loss, grad_norm, per_block_level_gnorms).
 #[cfg(feature = "cuda")]
 fn run_step(
     gpu_params: &mut GpuStackedParams,
@@ -698,15 +961,23 @@ fn run_step(
     v: usize,
     reset_intervals: &[usize],
     fire_counts: &mut [usize],
-) -> (f32, f32) {
+    profiler: &mut Option<GpuProfiler>,
+) -> (f32, f32, BlockLevelGnorms) {
+    if let Some(ref mut p) = profiler { p.step_start(); }
+
     let (loss, cache) = gpu_stacked_forward(
         gpu_params, mag_cfg, input, target,
-        pulse, gpu_context, &mut None,
+        pulse, gpu_context, profiler,
     );
 
     let mut grads = gpu_stacked_backward(
-        gpu_params, mag_cfg, &cache, &mut None,
+        gpu_params, mag_cfg, &cache, profiler,
     );
+
+    // Extract per-level gradient norms before optimizer consumes grads
+    let block_level_gnorms: BlockLevelGnorms = grads.blocks.iter()
+        .map(|bg| bg.level_output_gnorms.clone())
+        .collect();
 
     // Dispatch optimizer by type
     let gnorm = match opt.optimizer_type() {
@@ -721,13 +992,15 @@ fn run_step(
                 lr, opt.beta1(), opt.beta2(), 1e-8,
                 opt.weight_decay(), max_grad_norm,
                 false, // freeze_embed
-                &mut None, // profiler
+                profiler,
             )
         }
         other => {
             panic!("Unsupported optimizer type: \"{other}\". Only \"adamw\" is currently implemented.");
         }
     };
+
+    if let Some(ref mut p) = profiler { p.step_stop(); }
 
     // Weight tying
     gpu_stacked_sync_embed_weights(gpu_params, d, v);
@@ -738,7 +1011,7 @@ fn run_step(
     // Selective periodic reset (spec 57)
     maybe_reset_levels(pulse, reset_intervals, fire_counts, gpu_context);
 
-    (loss, gnorm)
+    (loss, gnorm, block_level_gnorms)
 }
 
 /// Save checkpoint with build state.
@@ -766,6 +1039,18 @@ fn save_checkpoint(
         let host_params = gpu_params.to_host(d, v, k);
         let host_context = gpu_context.blocks[0].to_host(k);
         let stream_position = loaders.first().map(|l| l.position as u64).unwrap_or(0);
+
+        // Save all loader positions for batch>1 resume
+        let stream_cursors: Vec<StreamCursor> = loaders.iter().map(|l| {
+            StreamCursor {
+                position: l.position as u64,
+                chunk_id: 0,
+                pulse_id: conductor.step() as u64,
+                rng_state: None,
+                content_hash: 0,
+            }
+        }).collect();
+
         let build_state = BuildResumeState {
             conductor: ConductorState {
                 k,
@@ -781,6 +1066,7 @@ fn save_checkpoint(
             },
             context: host_context,
             global_step,
+            stream_cursors,
         };
         match save_stacked_safetensors(
             Path::new(&ckpt_path), &host_params, mag_cfg,
@@ -823,6 +1109,19 @@ fn default_chunk_sizes(k: usize) -> Vec<usize> {
 /// Convert Pulse to Vec<bool> for logging.
 fn pulse_to_active(pulse: &Pulse) -> Vec<bool> {
     pulse.active_levels.clone()
+}
+
+/// Compute actual per-level firing counts for this step.
+/// An active level fires seq_len / chunk_size times per step.
+fn level_firings(pulse: &Pulse, seq_len: usize, chunk_sizes: &[usize]) -> Vec<usize> {
+    pulse.active_levels.iter().enumerate().map(|(i, &active)| {
+        if active {
+            let cs = chunk_sizes.get(i).copied().unwrap_or(1);
+            seq_len / cs
+        } else {
+            0
+        }
+    }).collect()
 }
 
 /// Selective periodic reset (spec 57).
