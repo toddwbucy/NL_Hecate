@@ -4,6 +4,7 @@ mod config;
 mod data;
 mod run;
 mod log;
+mod sample;
 
 #[derive(Parser)]
 #[command(name = "nl_hecate", version, about = "NL-Hecate: Nested Learning CLI")]
