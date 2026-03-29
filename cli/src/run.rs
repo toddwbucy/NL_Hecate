@@ -167,6 +167,28 @@ pub fn run(config_path: &str, _resume: bool) {
                 std::process::exit(1);
             });
 
+        // Validate checkpoint shape matches config
+        if loaded_cfg.swa.d_model != d {
+            eprintln!("ERROR: checkpoint d_model={} but config d_model={d}", loaded_cfg.swa.d_model);
+            std::process::exit(1);
+        }
+        if loaded_cfg.swa.num_heads != nh {
+            eprintln!("ERROR: checkpoint num_heads={} but config num_heads={nh}", loaded_cfg.swa.num_heads);
+            std::process::exit(1);
+        }
+        if loaded_cfg.swa.vocab_size != v {
+            eprintln!("ERROR: checkpoint vocab_size={} but config vocab_size={v}", loaded_cfg.swa.vocab_size);
+            std::process::exit(1);
+        }
+        if loaded_cfg.k != k {
+            eprintln!("ERROR: checkpoint k={} but config k={k}", loaded_cfg.k);
+            std::process::exit(1);
+        }
+        if loaded_n_blocks != n_blocks {
+            eprintln!("ERROR: checkpoint n_blocks={loaded_n_blocks} but config n_blocks={n_blocks}");
+            std::process::exit(1);
+        }
+
         if cfg.build.seq_len_override.is_some() {
             mag_cfg.swa.seq_len = seq_len;
         }
@@ -240,7 +262,7 @@ pub fn run(config_path: &str, _resume: bool) {
         eprintln!("  ErrClip:  max={ec:?}");
     }
     eprintln!("  Optimizer: {} (lr={}, b1={}, b2={}, wd={})",
-        default_opt.optimizer_type, default_opt.lr(),
+        default_opt.optimizer_type(), default_opt.lr(),
         default_opt.beta1(), default_opt.beta2(), default_opt.weight_decay());
     eprintln!("  Grad clip: max_norm={}", cfg.build.max_grad_norm);
     eprintln!("  Phases:   {}", phases.len());
@@ -250,7 +272,7 @@ pub fn run(config_path: &str, _resume: bool) {
             PhaseDuration::ThinkRounds(r) => format!("{r} think_rounds"),
         };
         let opt_info = phase.optimizer.as_ref()
-            .map(|o| format!(" [{}@{}]", o.optimizer_type, o.lr()))
+            .map(|o| format!(" [{}@{}]", o.optimizer_type(), o.lr()))
             .unwrap_or_default();
         eprintln!("    [{i}] {}: {}{}", phase.label, dur, opt_info);
     }
@@ -319,7 +341,7 @@ pub fn run(config_path: &str, _resume: bool) {
                 eprintln!("  Data:  {} tokens, batch_size={batch_size}, seq_len={phase_seq_len}",
                     fmt_num(total_tokens_phase));
                 eprintln!("  Opt:   {} lr={} wd={} gnorm_clip={}",
-                    opt.optimizer_type, opt.lr(), opt.weight_decay(), max_grad_norm);
+                    opt.optimizer_type(), opt.lr(), opt.weight_decay(), max_grad_norm);
 
                 // Compute total steps for LR schedule within this phase
                 let _phase_end_step = global_step + total_phase_steps;
@@ -403,16 +425,27 @@ pub fn run(config_path: &str, _resume: bool) {
 
             PhaseDuration::ThinkRounds(rounds) => {
                 // ── Think rounds: iterative self-refinement ────────
+                if batch_size != 1 {
+                    eprintln!("ERROR: think_rounds requires batch_size=1 (got {batch_size}) — \
+                        generation is singleton. Add \"batch_size\": 1 to the phase.");
+                    std::process::exit(1);
+                }
+
                 // Load the data once as the initial input
                 let mut loader = BpeTokenStream::load(&phase.data).unwrap_or_else(|e| {
                     eprintln!("ERROR: {e}");
                     std::process::exit(1);
                 });
                 let total_tokens_phase = loader.total_tokens;
+                if total_tokens_phase < phase_seq_len {
+                    eprintln!("ERROR: think_rounds data has {} tokens but seq_len={phase_seq_len}",
+                        total_tokens_phase);
+                    std::process::exit(1);
+                }
                 eprintln!("  Data:  {} tokens, {rounds} think_rounds",
                     fmt_num(total_tokens_phase));
                 eprintln!("  Opt:   {} lr={} wd={} gnorm_clip={}",
-                    opt.optimizer_type, opt.lr(), opt.weight_decay(), max_grad_norm);
+                    opt.optimizer_type(), opt.lr(), opt.weight_decay(), max_grad_norm);
 
                 // Load all data as initial input
                 let (mut input, target) = loader.next_chunk(phase_seq_len)
@@ -546,7 +579,7 @@ fn run_step(
     );
 
     // Dispatch optimizer by type
-    let gnorm = match opt.optimizer_type.as_str() {
+    let gnorm = match opt.optimizer_type() {
         "adamw" => {
             if adamw_state.is_none() {
                 *adamw_state = Some(GpuStackedAdamWState::from_params(gpu_params));

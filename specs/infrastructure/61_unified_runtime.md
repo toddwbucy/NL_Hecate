@@ -95,9 +95,9 @@ duration. The runtime walks the list.
 
     "phases": [
         {"data": "data/gear1_foundations", "steps": 10000},
-        {"data": "data/math_tables",      "think_rounds": 3},
+        {"data": "data/math_tables",      "think_rounds": 3, "batch_size": 1},
         {"data": "data/gear1_foundations", "steps": 10000},
-        {"data": "data/philosophy_quotes", "think_rounds": 2, "optimizer": {"type": "adamw", "lr": 0.0001}},
+        {"data": "data/philosophy_quotes", "think_rounds": 2, "batch_size": 1, "optimizer": {"type": "adamw", "lr": 0.0001}},
         {"data": "data/gear1_foundations", "steps": 40000}
     ]
 }
@@ -173,6 +173,10 @@ the tables once, then learns from its own increasingly accurate reproduction.
 other. `steps` is for streaming large corpora (one-way). `think_rounds` is for
 focused refinement on curated material (iterative).
 
+**`think_rounds` requires `batch_size: 1`** because the speak phase (generation)
+is inherently singleton — autoregressive decoding produces one sequence at a time.
+The runtime validates this at phase entry and fails fast if violated.
+
 ### Why `think_rounds` matters
 
 The distinction is fundamental:
@@ -246,7 +250,7 @@ default for that phase's duration. On phase completion, the default is restored.
 ```json
 "phases": [
     {"data": "data/foundations", "steps": 10000},
-    {"data": "data/math_tables", "think_rounds": 3, "optimizer": {"type": "adamw", "lr": 0.0001}},
+    {"data": "data/math_tables", "think_rounds": 3, "batch_size": 1, "optimizer": {"type": "adamw", "lr": 0.0001}},
     {"data": "data/experimental", "steps": 5000, "optimizer": {"type": "m3", "meta_lr": 0.001}}
 ]
 ```
@@ -319,7 +323,7 @@ for (i, phase) in config.phases.iter().enumerate() {
 
 Key details:
 - **`global_step`** is continuous across phases — it never resets
-- **Warmup** applies to global_step, not per-phase step count
+- **Warmup** is per-phase: each phase starts its own warmup counter from zero
 - **Phase boundary = forced checkpoint** — always safe to resume from a phase transition
 - **Log file** is continuous — phase transitions appear as label entries in metrics.jsonl
 - **Overrides revert** — if phase 2 sets `lr: 0.0001`, phase 3 goes back to `build.lr`
@@ -413,9 +417,9 @@ boundary, execution begins the next phase.
     "build": { "optimizer": {"type": "adamw", "lr": 0.0003}, "batch_size": 8, "save_every": 5000 },
     "phases": [
         {"label": "foundations-warmup",  "data": "data/gear1_foundations",  "steps": 10000},
-        {"label": "think-math",          "data": "data/math_tables",       "think_rounds": 3, "optimizer": {"type": "adamw", "lr": 0.0001}},
+        {"label": "think-math",          "data": "data/math_tables",       "think_rounds": 3, "batch_size": 1, "optimizer": {"type": "adamw", "lr": 0.0001}},
         {"label": "foundations-main",    "data": "data/gear1_foundations",  "steps": 20000},
-        {"label": "think-quotes",        "data": "data/philosophy_quotes", "think_rounds": 2, "optimizer": {"type": "adamw", "lr": 0.0001}},
+        {"label": "think-quotes",        "data": "data/philosophy_quotes", "think_rounds": 2, "batch_size": 1, "optimizer": {"type": "adamw", "lr": 0.0001}},
         {"label": "foundations-final",   "data": "data/gear1_foundations",  "steps": 30000}
     ]
 }

@@ -54,8 +54,8 @@ pub struct ModelConfig {
 /// this matters for legacy compat (only promote flat build.lr when nested lr is absent).
 #[derive(Deserialize, Debug, Clone)]
 pub struct OptimizerConfig {
-    #[serde(rename = "type", default = "default_optimizer_type")]
-    pub optimizer_type: String,
+    #[serde(rename = "type")]
+    pub optimizer_type: Option<String>,
     pub lr: Option<f32>,
     // AdamW-specific
     pub beta1: Option<f32>,
@@ -68,10 +68,32 @@ pub struct OptimizerConfig {
     pub momentum: Option<f32>,
 }
 
+impl OptimizerConfig {
+    /// Resolve the optimizer type, falling back to a parent's type or "adamw".
+    pub fn optimizer_type(&self) -> &str {
+        self.optimizer_type.as_deref().unwrap_or("adamw")
+    }
+
+    /// Merge with a parent optimizer: fill in any None fields from the parent.
+    pub fn merged_with(&self, parent: &OptimizerConfig) -> OptimizerConfig {
+        OptimizerConfig {
+            optimizer_type: Some(self.optimizer_type.clone()
+                .unwrap_or_else(|| parent.optimizer_type().to_string())),
+            lr: self.lr.or(parent.lr),
+            beta1: self.beta1.or(parent.beta1),
+            beta2: self.beta2.or(parent.beta2),
+            weight_decay: self.weight_decay.or(parent.weight_decay),
+            meta_lr: self.meta_lr.or(parent.meta_lr),
+            inner_steps: self.inner_steps.or(parent.inner_steps),
+            momentum: self.momentum.or(parent.momentum),
+        }
+    }
+}
+
 impl Default for OptimizerConfig {
     fn default() -> Self {
         Self {
-            optimizer_type: "adamw".into(),
+            optimizer_type: Some("adamw".into()),
             lr: None,
             beta1: None,
             beta2: None,
@@ -93,6 +115,8 @@ impl OptimizerConfig {
     /// Weight decay (defaults to 0.1 if not set).
     pub fn weight_decay(&self) -> f32 { self.weight_decay.unwrap_or(0.1) }
 }
+// Note: Rust allows multiple impl blocks for the same type.
+// optimizer_type(), merged_with() are defined above; lr/beta1/beta2/weight_decay here.
 
 #[derive(Deserialize, Debug)]
 pub struct BuildConfig {
@@ -189,7 +213,6 @@ fn default_k() -> usize { 1 }
 fn default_true() -> bool { true }
 fn default_n_blocks() -> usize { 1 }
 fn default_tape_multiplier() -> usize { 1 }
-fn default_optimizer_type() -> String { "adamw".into() }
 fn default_lr() -> f32 { 0.0003 }
 fn default_steps() -> usize { 10000 }
 fn default_max_grad_norm() -> f32 { 1.0 }
@@ -208,8 +231,6 @@ fn deserialize_optimizer<'de, D>(deserializer: D) -> Result<OptimizerConfig, D::
 where
     D: serde::Deserializer<'de>,
 {
-    use serde::de;
-
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum OptimizerValue {
@@ -223,11 +244,11 @@ where
         Ok(OptimizerValue::Object(cfg)) => Ok(cfg),
         Ok(OptimizerValue::String(s)) => {
             // Map legacy string to optimizer type
-            let optimizer_type = if s.contains("adamw") {
+            let optimizer_type = Some(if s.contains("adamw") {
                 "adamw".into()
             } else {
                 s
-            };
+            });
             Ok(OptimizerConfig {
                 optimizer_type,
                 ..OptimizerConfig::default()
@@ -306,6 +327,10 @@ impl Config {
                     }
                     _ => {}
                 }
+                // Merge phase optimizer with build default (inherits type + unset fields)
+                let merged_optimizer = phase.optimizer.as_ref()
+                    .map(|po| po.merged_with(&self.build.optimizer));
+
                 resolved.push(ResolvedPhase {
                     data: phase.data.clone(),
                     duration: if let Some(s) = phase.steps {
@@ -314,7 +339,7 @@ impl Config {
                         PhaseDuration::ThinkRounds(phase.think_rounds.unwrap())
                     },
                     label: phase.label.clone().unwrap_or_else(|| phase.data.clone()),
-                    optimizer: phase.optimizer.clone(),
+                    optimizer: merged_optimizer,
                     batch_size: phase.batch_size,
                     seq_len: phase.seq_len,
                     save_every: phase.save_every,
@@ -388,7 +413,7 @@ mod tests {
         }}"#, minimal_model_json());
 
         let cfg = Config::from_str(&json).unwrap();
-        assert_eq!(cfg.build.optimizer.optimizer_type, "adamw");
+        assert_eq!(cfg.build.optimizer.optimizer_type(), "adamw");
         assert_eq!(cfg.build.optimizer.lr(), 0.001);
         assert!(cfg.phases.is_none());
 
@@ -410,7 +435,7 @@ mod tests {
         }}"#, minimal_model_json());
 
         let cfg = Config::from_str(&json).unwrap();
-        assert_eq!(cfg.build.optimizer.optimizer_type, "adamw");
+        assert_eq!(cfg.build.optimizer.optimizer_type(), "adamw");
         assert_eq!(cfg.build.optimizer.lr(), 0.0001);
         assert_eq!(cfg.build.optimizer.beta1(), 0.95);
         assert_eq!(cfg.build.optimizer.weight_decay(), 0.05);
@@ -514,6 +539,32 @@ mod tests {
     }
 
     #[test]
+    fn phase_optimizer_inherits_build_type() {
+        // Phase optimizer specifies only lr — should inherit type from build
+        let json = format!(r#"{{
+            {},
+            "build": {{
+                "optimizer": {{"type": "adamw", "lr": 0.0003, "weight_decay": 0.1}},
+                "batch_size": 8,
+                "save_every": 500
+            }},
+            "phases": [
+                {{"data": "data/test", "steps": 100, "optimizer": {{"lr": 0.0001}}}}
+            ]
+        }}"#, minimal_model_json());
+
+        let cfg = Config::from_str(&json).unwrap();
+        let phases = cfg.resolved_phases().unwrap();
+        let opt = phases[0].optimizer.as_ref().unwrap();
+        // Type inherited from build
+        assert_eq!(opt.optimizer_type(), "adamw");
+        // lr overridden by phase
+        assert_eq!(opt.lr(), 0.0001);
+        // weight_decay inherited from build
+        assert_eq!(opt.weight_decay(), 0.1);
+    }
+
+    #[test]
     fn future_optimizer_type_parses() {
         let json = format!(r#"{{
             {},
@@ -524,7 +575,7 @@ mod tests {
         }}"#, minimal_model_json());
 
         let cfg = Config::from_str(&json).unwrap();
-        assert_eq!(cfg.build.optimizer.optimizer_type, "m3");
+        assert_eq!(cfg.build.optimizer.optimizer_type(), "m3");
         assert_eq!(cfg.build.optimizer.meta_lr, Some(0.001));
         assert_eq!(cfg.build.optimizer.inner_steps, Some(5));
     }
