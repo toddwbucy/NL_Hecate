@@ -126,6 +126,9 @@ when the phase completes. If it's in `build`, it's overridable per phase.
 | `log_every` | int | inherit | Metrics logging interval (steps) |
 | `max_grad_norm` | float | inherit | Gradient clipping threshold |
 | `warmup_steps` | int | inherit | LR warmup (applies to steps within this phase) |
+| `max_gen_tokens` | int | seq_len | Max tokens per speak step (think_rounds only) |
+| `temperature` | float | 0.0 | Sampling temperature for speak step (0 = greedy) |
+| `top_k` | int | 0 | Top-k filtering for speak step (0 = disabled) |
 
 The rule is simple: **`build` is the default, `phase` is the override.** Anything
 you might want to change between a foundations pass and a reinforcement pass —
@@ -147,23 +150,21 @@ learns from the data, then speaks (generates output), and its output becomes
 the input for the next round. Each round builds on the model's own increasingly
 refined understanding.
 
-**Current implementation status**: The LEARN step is implemented. The SPEAK and
-REDIRECT steps require `prefill()` + `decode_token()` in the Rust CLI, which is
-pending. Until generation lands, think_rounds runs repeated LEARN steps on the
-original data — a valid but degraded mode.
+**Implementation status**: LEARN, SPEAK, and REDIRECT are all implemented.
+The speak step uses `gpu_stacked_prefill()` + `gpu_stacked_decode_token()`
+from the Rust CLI's generation infrastructure (spec 47 KV-cached decode path).
 
 ```rust
-// TARGET BEHAVIOR (speak/redirect pending generation support in CLI)
 input = load(data)
 for round in 0..think_rounds {
     // LEARN — process input through step_adamw (forward + backward + optimizer)
     step_adamw(input, ...)
 
     // SPEAK — generate output from what was just learned
-    output = prefill(input) → decode_token() loop    // PENDING
+    output = prefill(input) → decode_token() loop
 
     // REDIRECT — the model's output becomes the next round's input
-    input = output                                     // PENDING
+    input = output
 }
 ```
 

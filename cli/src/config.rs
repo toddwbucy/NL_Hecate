@@ -196,6 +196,13 @@ pub struct PhaseConfig {
     pub log_every: Option<usize>,
     pub max_grad_norm: Option<f32>,
     pub warmup_steps: Option<usize>,
+    // Generation parameters for think_rounds speak phase
+    /// Max tokens to generate per speak step (default: seq_len).
+    pub max_gen_tokens: Option<usize>,
+    /// Sampling temperature for speak step (default: 0.0 = greedy).
+    pub temperature: Option<f32>,
+    /// Top-k filtering for speak step (default: 0 = disabled).
+    pub top_k: Option<usize>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -348,6 +355,9 @@ impl Config {
                     log_every: phase.log_every,
                     max_grad_norm: phase.max_grad_norm,
                     warmup_steps: phase.warmup_steps,
+                    max_gen_tokens: phase.max_gen_tokens,
+                    temperature: phase.temperature,
+                    top_k: phase.top_k,
                 });
             }
             Ok(resolved)
@@ -367,6 +377,9 @@ impl Config {
                 log_every: None,
                 max_grad_norm: None,
                 warmup_steps: None,
+                max_gen_tokens: None,
+                temperature: None,
+                top_k: None,
             }])
         }
     }
@@ -385,6 +398,10 @@ pub struct ResolvedPhase {
     pub log_every: Option<usize>,
     pub max_grad_norm: Option<f32>,
     pub warmup_steps: Option<usize>,
+    // Generation parameters for think_rounds speak phase
+    pub max_gen_tokens: Option<usize>,
+    pub temperature: Option<f32>,
+    pub top_k: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -580,6 +597,29 @@ mod tests {
         let err = Config::from_str(&json);
         assert!(err.is_err(), "phase with d_model should fail to parse");
         assert!(err.unwrap_err().contains("unknown field"));
+    }
+
+    #[test]
+    fn think_rounds_generation_params() {
+        let json = format!(r#"{{
+            {},
+            "build": {{
+                "optimizer": {{"type": "adamw", "lr": 0.0003}},
+                "batch_size": 1
+            }},
+            "phases": [
+                {{"data": "data/math", "think_rounds": 3, "batch_size": 1,
+                  "max_gen_tokens": 128, "temperature": 0.8, "top_k": 50}}
+            ]
+        }}"#, minimal_model_json());
+
+        let cfg = Config::from_str(&json).unwrap();
+        let phases = cfg.resolved_phases().unwrap();
+        assert_eq!(phases.len(), 1);
+        assert!(matches!(phases[0].duration, PhaseDuration::ThinkRounds(3)));
+        assert_eq!(phases[0].max_gen_tokens, Some(128));
+        assert_eq!(phases[0].temperature, Some(0.8));
+        assert_eq!(phases[0].top_k, Some(50));
     }
 
     #[test]

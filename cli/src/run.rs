@@ -20,10 +20,17 @@ use nl_hecate_core::gpu_stacked_backward::gpu_stacked_backward;
 use nl_hecate_core::gpu_stacked_optimizer::{
     GpuStackedAdamWState, gpu_stacked_adamw_update, gpu_stacked_sync_embed_weights,
 };
+#[cfg(feature = "cuda")]
+use nl_hecate_core::gpu_stacked_forward::{
+    gpu_stacked_prefill, gpu_stacked_decode_token, StackedDecodeWorkspace,
+};
+#[cfg(feature = "cuda")]
+use nl_hecate_core::gpu_forward::GpuKVCache;
 
 use crate::config::{Config, OptimizerConfig, PhaseDuration};
 use crate::data::BpeTokenStream;
 use crate::log::MetricsLogger;
+use crate::sample::sample_token;
 
 /// Cosine annealing with linear warmup.
 fn cosine_lr(step: usize, warmup_steps: usize, total_steps: usize, lr_peak: f32) -> f32 {
@@ -448,7 +455,7 @@ pub fn run(config_path: &str, _resume: bool) {
                     opt.optimizer_type(), opt.lr(), opt.weight_decay(), max_grad_norm);
 
                 // Load all data as initial input
-                let (mut input, target) = loader.next_chunk(phase_seq_len)
+                let (mut input, mut target) = loader.next_chunk(phase_seq_len)
                     .unwrap_or_else(|| {
                         eprintln!("ERROR: data exhausted in think_rounds");
                         std::process::exit(1);
@@ -490,14 +497,58 @@ pub fn run(config_path: &str, _resume: bool) {
                         break;
                     }
 
-                    // SPEAK — generate output from what was just learned
-                    // TODO: implement prefill + decode_token loop for think_rounds
-                    // For now, re-present the same data (deferred until generation is in CLI)
-                    // When generation lands:
-                    //   let logits = prefill(&input, &pulse);
-                    //   let output = decode_loop(logits, max_gen_tokens);
-                    //   input = output; target = shifted(output);
-                    eprintln!("    [speak phase: deferred — generation not yet in CLI]");
+                    // SPEAK — generate output via prefill + decode_token
+                    // Then REDIRECT — generated output becomes next round's input
+                    #[cfg(feature = "cuda")]
+                    if round + 1 < *rounds {
+                        let gen_tokens = phase.max_gen_tokens.unwrap_or(phase_seq_len);
+                        let gen_temp = phase.temperature.unwrap_or(0.0);
+                        let gen_top_k = phase.top_k.unwrap_or(0);
+
+                        let mut kv_caches: Vec<GpuKVCache> = Vec::new();
+                        let speak_pulse = conductor.pulse();
+                        let logits = gpu_stacked_prefill(
+                            &gpu_params, &mag_cfg, &input, &speak_pulse,
+                            &mut gpu_context, &mut kv_caches, &mut None,
+                        );
+
+                        // Decode loop: generate output tokens
+                        let mut output = Vec::with_capacity(gen_tokens);
+                        let mut next_tok = sample_token(&logits, gen_temp, gen_top_k);
+                        output.push(next_tok);
+
+                        let mut decode_ws = StackedDecodeWorkspace::new(
+                            gpu_params.n_blocks(), d, v,
+                        );
+                        for _ in 1..gen_tokens {
+                            let dp = conductor.pulse();
+                            let logits = gpu_stacked_decode_token(
+                                &gpu_params, &mag_cfg, next_tok, &dp,
+                                &mut gpu_context, &mut kv_caches, &mut decode_ws,
+                            );
+                            next_tok = sample_token(&logits, gen_temp, gen_top_k);
+                            output.push(next_tok);
+                        }
+
+                        // REDIRECT — pad/truncate output to seq_len, use as next input
+                        let new_input = if output.len() >= phase_seq_len {
+                            output[output.len() - phase_seq_len..].to_vec()
+                        } else {
+                            // Left-pad with first token from output (CS-50 safe)
+                            let pad = crate::sample::safe_pad_token(&output, v);
+                            let pad_count = phase_seq_len - output.len();
+                            let mut padded = vec![pad; pad_count];
+                            padded.extend_from_slice(&output);
+                            padded
+                        };
+                        // Target is input shifted by one (next-token prediction)
+                        target = new_input[1..].to_vec();
+                        target.push(new_input[0]); // wrap-around for last position
+                        input = new_input;
+
+                        eprintln!("    [speak: generated {} tokens → redirect as round {} input]",
+                            output.len(), round + 2);
+                    }
                 }
             }
         }
