@@ -353,31 +353,30 @@ A config with no `phases` array degrades to the current behavior:
 When `phases` is absent, the runtime synthesizes a single phase from `data.path`
 and `build.steps`. Existing configs continue to work unchanged.
 
-## Chat as a Phase (Future)
+## Chat Command
 
-Chat is not yet implemented in the Rust CLI. When it is, it will be a special
-phase type:
+Chat is implemented as a standalone CLI subcommand (`nl_hecate chat`) rather
+than a phase type. It takes a config, checkpoint, and tokenizer path:
 
-```json
-{"chat": true, "tokenizer": "SmolLM2", "max_gen_tokens": 512, "temperature": 0.8}
+```bash
+nl_hecate chat --config config.json --load checkpoint.safetensors --tokenizer tokenizer.json \
+    --temperature 0.8 --top-k 50 --max-tokens 256 --learn
 ```
 
-A chat phase runs an interactive loop: learn from user input via `step_adamw()`,
-then speak via `prefill() + decode_token()`. It terminates on user exit or EOF.
+Two modes:
+- **Stateful** (default): CMS memory carries conversation context. Only the new
+  user message is fed each turn. Constant prompt size.
+- **Stateless** (`--stateless`): Full history re-sent each turn. Traditional
+  transformer-style chat without CMS memory persistence.
 
-Chat phases can appear in the phase list like any other:
+The `--learn` flag enables test-time learning: each user turn runs
+`forward + backward + optimizer` before generation. Without it, the model
+only generates (no weight updates).
 
-```json
-"phases": [
-    {"data": "data/foundations", "steps": 10000},
-    {"chat": true, "tokenizer": "SmolLM2"},
-    {"data": "data/foundations", "steps": 10000}
-]
-```
+Slash commands: `/quit`, `/clear`, `/mode`, `/stats`.
 
-Build 10K steps, drop into interactive chat (model learns from conversation),
-then resume building on foundations. The checkpoint carries all state across
-phase types.
+ChatML encoding uses explicit special token IDs (`<|im_start|>=0`,
+`<|im_end|>=1`) matching the tokenizer training in `prepare_sharegpt.py`.
 
 ### Backward Pass in Chat
 

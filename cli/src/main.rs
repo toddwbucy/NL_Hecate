@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 
+mod chat;
 mod config;
 mod data;
 mod generate;
@@ -66,6 +67,45 @@ enum Commands {
         gpu: Option<usize>,
     },
 
+    /// Interactive multi-turn chat
+    Chat {
+        /// Path to JSON config file
+        #[arg(short, long)]
+        config: String,
+
+        /// Path to .safetensors checkpoint
+        #[arg(short = 'l', long)]
+        load: String,
+
+        /// Path to tokenizer.json (HuggingFace tokenizers format)
+        #[arg(short, long)]
+        tokenizer: String,
+
+        /// Maximum tokens to generate per response
+        #[arg(long, default_value = "256")]
+        max_tokens: usize,
+
+        /// Sampling temperature (0 = greedy)
+        #[arg(long, default_value = "0.8")]
+        temperature: f32,
+
+        /// Top-k filtering (0 = disabled)
+        #[arg(long, default_value = "50")]
+        top_k: usize,
+
+        /// Stateless mode (full history re-sent each turn, no CMS memory)
+        #[arg(long)]
+        stateless: bool,
+
+        /// Enable learning: run forward+backward+optimizer on each user turn
+        #[arg(long)]
+        learn: bool,
+
+        /// Override GPU index (CUDA_VISIBLE_DEVICES)
+        #[arg(long)]
+        gpu: Option<usize>,
+    },
+
     /// Inspect a checkpoint file
     Inspect {
         /// Path to .safetensors checkpoint
@@ -99,6 +139,12 @@ fn main() {
                 std::process::exit(1);
             }
             generate::generate(&config, &load, &prompt_tokens, max_tokens, temperature, top_k, stop_token);
+        }
+        Commands::Chat { config, load, tokenizer, max_tokens, temperature, top_k, stateless, learn, gpu } => {
+            if let Some(gpu_id) = gpu {
+                std::env::set_var("CUDA_VISIBLE_DEVICES", gpu_id.to_string());
+            }
+            chat::chat(&config, &load, &tokenizer, max_tokens, temperature, top_k, stateless, learn);
         }
         Commands::Inspect { path } => {
             inspect(&path);
