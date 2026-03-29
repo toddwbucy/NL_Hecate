@@ -176,7 +176,9 @@ pub struct BuildConfig {
 }
 
 /// A single phase in the curriculum (spec 61).
+/// deny_unknown_fields catches typos and invalid model-structure overrides (d_model, num_heads, k).
 #[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct PhaseConfig {
     /// Path to tokenized data directory.
     pub data: String,
@@ -562,6 +564,22 @@ mod tests {
         assert_eq!(opt.lr(), 0.0001);
         // weight_decay inherited from build
         assert_eq!(opt.weight_decay(), 0.1);
+    }
+
+    #[test]
+    fn phase_rejects_model_structure_fields() {
+        // d_model in a phase should fail — model structure is not overridable per phase
+        let json = format!(r#"{{
+            {},
+            "build": {{"optimizer": {{"type": "adamw", "lr": 0.0003}}}},
+            "phases": [
+                {{"data": "data/test", "steps": 100, "d_model": 512}}
+            ]
+        }}"#, minimal_model_json());
+
+        let err = Config::from_str(&json);
+        assert!(err.is_err(), "phase with d_model should fail to parse");
+        assert!(err.unwrap_err().contains("unknown field"));
     }
 
     #[test]

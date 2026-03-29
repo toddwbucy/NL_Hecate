@@ -404,14 +404,19 @@ flag in the config schema until it is needed.**
 
 All phases produce and consume the same checkpoint format (safetensors):
 - Model weights (W_K, W_V, W_Q, gates, MLP params)
-- Build state (optimizer moments, global step, LR schedule position)
-- Context memory (M matrices, momentum S, conductor step)
+- Build state (global step, conductor state, stream cursor)
+- Context memory (M matrices, momentum S — persisted as context_memory lifetime)
 - CMS sidecar (`.cms.json`, if `cms_sidecar: true`)
-- Phase index (which phase was active when checkpoint was written)
 
-The `load` field in `build` resumes from any checkpoint. If the checkpoint was
-written mid-phase, execution resumes at that phase and step. If at a phase
-boundary, execution begins the next phase.
+**Not currently stored**: optimizer moments (AdamW m/v buffers are reinitialized
+on resume), phase index, or step-within-phase. Resuming from a checkpoint
+restarts the phase loop from phase 0, skipping no phases — only `global_step`
+and conductor state are restored. Mid-phase resume (continuing at a specific
+phase index and step offset) is not yet implemented and will require extending
+`BuildResumeState` in the core crate.
+
+The `load` field in `build` resumes from any checkpoint. The model weights and
+context memory are restored; the phase list re-executes from the beginning.
 
 ## Example Configs
 
