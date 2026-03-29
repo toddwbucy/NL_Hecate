@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 
 mod config;
 mod data;
+mod generate;
 mod run;
 mod log;
 mod sample;
@@ -30,6 +31,41 @@ enum Commands {
         resume: bool,
     },
 
+    /// Generate tokens from a checkpoint
+    Generate {
+        /// Path to JSON config file
+        #[arg(short, long)]
+        config: String,
+
+        /// Path to .safetensors checkpoint
+        #[arg(short = 'l', long)]
+        load: String,
+
+        /// Comma-separated prompt token IDs (e.g. "1,42,100,7")
+        #[arg(short, long)]
+        prompt: String,
+
+        /// Maximum tokens to generate
+        #[arg(long, default_value = "64")]
+        max_tokens: usize,
+
+        /// Sampling temperature (0 = greedy)
+        #[arg(long, default_value = "0.8")]
+        temperature: f32,
+
+        /// Top-k filtering (0 = disabled)
+        #[arg(long, default_value = "0")]
+        top_k: usize,
+
+        /// Stop token ID (generation halts when emitted)
+        #[arg(long)]
+        stop_token: Option<usize>,
+
+        /// Override GPU index (CUDA_VISIBLE_DEVICES)
+        #[arg(long)]
+        gpu: Option<usize>,
+    },
+
     /// Inspect a checkpoint file
     Inspect {
         /// Path to .safetensors checkpoint
@@ -46,6 +82,23 @@ fn main() {
                 std::env::set_var("CUDA_VISIBLE_DEVICES", gpu_id.to_string());
             }
             run::run(&config, resume);
+        }
+        Commands::Generate { config, load, prompt, max_tokens, temperature, top_k, stop_token, gpu } => {
+            if let Some(gpu_id) = gpu {
+                std::env::set_var("CUDA_VISIBLE_DEVICES", gpu_id.to_string());
+            }
+            let prompt_tokens: Vec<usize> = prompt.split(',')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.trim().parse::<usize>().unwrap_or_else(|_| {
+                    eprintln!("ERROR: invalid token ID: {s}");
+                    std::process::exit(1);
+                }))
+                .collect();
+            if prompt_tokens.is_empty() {
+                eprintln!("ERROR: --prompt must contain at least one token ID");
+                std::process::exit(1);
+            }
+            generate::generate(&config, &load, &prompt_tokens, max_tokens, temperature, top_k, stop_token);
         }
         Commands::Inspect { path } => {
             inspect(&path);
