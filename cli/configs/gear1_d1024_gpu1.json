@@ -42,7 +42,7 @@
         "run_dir": "/home/todd/olympus/NL_Hecate/runs/gear1_d1024_foundations",
         "save_path": "/home/todd/olympus/NL_Hecate/runs/gear1_d1024_foundations/checkpoints/model.safetensors",
         "log_file": "/home/todd/olympus/NL_Hecate/runs/gear1_d1024_foundations/metrics.jsonl",
-        "load": "/home/todd/olympus/NL_Hecate/runs/gear1_d1024_foundations/checkpoints/model_step1000.safetensors",
+        "load": "/home/todd/olympus/NL_Hecate/runs/gear1_d1024_foundations/checkpoints/model_step2000.safetensors",
         "flashcard": false,
         "profile_every": 500,
         "tokenizer_path": "/home/todd/olympus/NL_Hecate/data/gear1_foundations/tokenizer.json",
