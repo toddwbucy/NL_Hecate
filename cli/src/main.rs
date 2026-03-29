@@ -3,6 +3,8 @@ use clap::{Parser, Subcommand};
 mod chat;
 mod config;
 mod data;
+#[allow(clippy::module_inception)]
+mod eval;
 mod generate;
 mod run;
 mod log;
@@ -106,6 +108,37 @@ enum Commands {
         gpu: Option<usize>,
     },
 
+    /// Run evaluation probes (coherence, within-generation, cross-exposure)
+    Eval {
+        /// Path to JSON config file
+        #[arg(short, long)]
+        config: String,
+
+        /// Path to .safetensors checkpoint
+        #[arg(short = 'l', long)]
+        load: String,
+
+        /// Path to tokenizer.json (HuggingFace tokenizers format)
+        #[arg(short, long)]
+        tokenizer: String,
+
+        /// Maximum tokens per probe generation
+        #[arg(long, default_value = "30")]
+        max_tokens: usize,
+
+        /// Sampling temperature
+        #[arg(long, default_value = "0.7")]
+        temperature: f32,
+
+        /// Top-k filtering (0 = disabled)
+        #[arg(long, default_value = "0")]
+        top_k: usize,
+
+        /// Override GPU index (CUDA_VISIBLE_DEVICES)
+        #[arg(long)]
+        gpu: Option<usize>,
+    },
+
     /// Inspect a checkpoint file
     Inspect {
         /// Path to .safetensors checkpoint
@@ -145,6 +178,12 @@ fn main() {
                 std::env::set_var("CUDA_VISIBLE_DEVICES", gpu_id.to_string());
             }
             chat::chat(&config, &load, &tokenizer, max_tokens, temperature, top_k, stateless, learn);
+        }
+        Commands::Eval { config, load, tokenizer, max_tokens, temperature, top_k, gpu } => {
+            if let Some(gpu_id) = gpu {
+                std::env::set_var("CUDA_VISIBLE_DEVICES", gpu_id.to_string());
+            }
+            eval::run_probes(&config, &load, &tokenizer, max_tokens, temperature, top_k);
         }
         Commands::Inspect { path } => {
             inspect(&path);
