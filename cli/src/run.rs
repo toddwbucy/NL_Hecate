@@ -531,6 +531,9 @@ pub fn run(config_path: &str, _resume: bool) {
 
                     let pulse = conductor.pulse();
 
+                    // Spec 63: compute log_this early so backward can skip gnorm readback
+                    let log_this = log_every > 0 && phase_step % log_every == 0;
+
                     // Forward + Backward + Optimizer
                     #[cfg(feature = "cuda")]
                     let do_profile = profile_every > 0 && phase_step > 0
@@ -552,6 +555,7 @@ pub fn run(config_path: &str, _resume: bool) {
                             d, v,
                             &reset_intervals, &mut fire_counts,
                             &mut profiler,
+                            log_this || phase_step == 0,
                         )
                     };
 
@@ -598,7 +602,6 @@ pub fn run(config_path: &str, _resume: bool) {
                     }
 
                     // Logging + CMS diagnostics (gated to log_every to avoid per-step GPU stalls)
-                    let log_this = log_every > 0 && phase_step % log_every == 0;
                     if log_this || phase_step == 0 {
                         // M-norm tracking: 48+ kernel launches + D2H copies per call.
                         // Only run on log steps to avoid stalling the GPU pipeline every step.
@@ -733,6 +736,7 @@ pub fn run(config_path: &str, _resume: bool) {
                             d, v,
                             &reset_intervals, &mut fire_counts,
                             &mut None, // no profiling in think_rounds (too few steps)
+                            true, // think_rounds always log
                         )
                     };
 
@@ -978,6 +982,7 @@ fn run_step(
     reset_intervals: &[usize],
     fire_counts: &mut [usize],
     profiler: &mut Option<GpuProfiler>,
+    log_this: bool,
 ) -> (f32, f32, BlockLevelGnorms) {
     if let Some(ref mut p) = profiler { p.step_start(); }
 
@@ -987,7 +992,7 @@ fn run_step(
     );
 
     let mut grads = gpu_stacked_backward(
-        gpu_params, mag_cfg, &cache, profiler,
+        gpu_params, mag_cfg, &cache, profiler, log_this,
     );
 
     // Extract per-level gradient norms before optimizer consumes grads

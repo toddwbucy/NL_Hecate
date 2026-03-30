@@ -340,7 +340,7 @@ pub fn chat(
                     &pulse, &mut gpu_context, &mut None,
                 );
                 let mut grads = gpu_stacked_backward(
-                    &gpu_params, &mag_cfg, &cache, &mut None,
+                    &gpu_params, &mag_cfg, &cache, &mut None, false,
                 );
 
                 if adamw_state.is_none() {
