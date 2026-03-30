@@ -194,4 +194,92 @@ cudaError_t grad_scale_cuda(float* g, float scale, int n) {
     return err;
 }
 
+// ── Reduce partial sums + compute clip scale on GPU (spec 62) ────────
+// Single-block kernel: sums all partial_sums[0..total_partials], computes
+// L2 norm = sqrt(sum), writes norm to out_norm and clip scale to out_scale.
+// Scale = min(1.0, max_grad_norm / norm). If norm <= max_grad_norm, scale = 1.0.
+// Grid: 1 block of 256 threads. Handles up to 65536 partials via grid-stride.
+
+__global__ void reduce_partials_clip_kernel(
+    const float* __restrict__ partial_sums,
+    int total_partials,
+    float max_grad_norm,
+    float* __restrict__ out_norm,
+    float* __restrict__ out_scale)
+{
+    extern __shared__ float smem[];
+    int tid = threadIdx.x;
+    int block_size = blockDim.x;
+
+    // Grid-stride accumulation into shared memory
+    float acc = 0.0f;
+    for (int i = tid; i < total_partials; i += block_size) {
+        acc += partial_sums[i];
+    }
+    smem[tid] = acc;
+    __syncthreads();
+
+    // Tree reduction
+    for (int s = block_size >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            smem[tid] += smem[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float norm = sqrtf(smem[0]);
+        *out_norm = norm;
+        *out_scale = (norm > max_grad_norm && max_grad_norm > 0.0f)
+                     ? (max_grad_norm / norm) : 1.0f;
+    }
+}
+
+cudaError_t reduce_partials_clip_cuda(
+    const float* partial_sums, int total_partials,
+    float max_grad_norm,
+    float* out_norm, float* out_scale)
+{
+    int block = 256;
+    reduce_partials_clip_kernel<<<1, block, block * sizeof(float)>>>(
+        partial_sums, total_partials, max_grad_norm, out_norm, out_scale);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "reduce_partials_clip_cuda: launch failed: %s\n",
+                cudaGetErrorString(err));
+    }
+    return err;
+}
+
+// ── Conditional gradient scaling from device pointer (spec 62) ───────
+// Reads scale from *scale_ptr. If scale >= 1.0, all threads exit immediately
+// (uniform warp branch, near-zero cost). Otherwise g[i] *= scale.
+
+__global__ void grad_scale_conditional_kernel(
+    float* __restrict__ g,
+    const float* __restrict__ scale_ptr,
+    int n)
+{
+    float scale = *scale_ptr;
+    if (scale >= 1.0f) return;  // uniform branch: entire warp exits
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        g[i] *= scale;
+    }
+}
+
+cudaError_t grad_scale_conditional_cuda(
+    float* g, const float* scale_ptr, int n)
+{
+    int block = 256;
+    int grid = (n + block - 1) / block;
+    grad_scale_conditional_kernel<<<grid, block>>>(g, scale_ptr, n);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "grad_scale_conditional_cuda: launch failed: %s\n",
+                cudaGetErrorString(err));
+    }
+    return err;
+}
+
 } // extern "C"
