@@ -198,6 +198,11 @@ pub fn gpu_stacked_backward(
     }
     let mut deferred_mag_blocks: Vec<DeferredMagBlock> = Vec::new();
 
+    // Spec 63: deferred chain gnorm metadata — (block_idx, level, seg_start, seg_end)
+    // Accumulated across ALL blocks so we can do ONE sync + ONE D2H after the loop.
+    let mut deferred_chain_gnorms: Vec<(usize, usize, usize, usize)> = Vec::new();
+    let mut chain_gnorm_max_offset: usize = 0;
+
     // Spec 63: hoist keep-alive buffers outside the block loop so their cudaFree
     // calls don't create per-block sync points. cudaFree is synchronous (waits for
     // all pending GPU work), so dropping per-block was causing pipeline stalls.
@@ -282,10 +287,12 @@ pub fn gpu_stacked_backward(
             };
 
             // Spec 54/63: batched gnorm launches for chain mode.
-            // Spec 63: gnorms are purely diagnostic in chain mode — skip entirely
-            // on non-log steps to eliminate per-block cuda_sync pipeline stalls.
-            let mut gnorm_offset = 0usize;
-            let mut gnorm_segs: Vec<(usize, usize, usize)> = Vec::new();
+            // Spec 63: gnorms are purely diagnostic in chain mode — skip kernel
+            // launch entirely on non-log steps. On log steps, each block writes
+            // to its own region of the expanded scratch buffer (base = b * per_block_slots)
+            // so ONE sync after the block loop replaces per-block syncs.
+            let block_gnorm_base = b * per_block_slots;
+            let mut gnorm_offset = block_gnorm_base;
 
             // Reverse chain: k-1 → 0
             for level in (0..cfg.k).rev() {
@@ -316,9 +323,10 @@ pub fn gpu_stacked_backward(
                     }
                 };
 
-                // Spec 54/63: launch gnorm kernel at offset (no sync yet).
+                // Spec 54/63: launch gnorm kernel at block-specific offset (no sync yet).
                 // Spec 63: skip entirely on non-log steps — gnorms are diagnostic only
-                // in chain mode, and each launch + readback was a pipeline stall.
+                // in chain mode. On log steps, results accumulate across blocks for
+                // a single post-loop sync.
                 if need_gnorms && bc.memory_caches[level].is_some() {
                     let buf_len = d_upstream.len() as i32;
                     let mut nb: i32 = 0;
@@ -331,8 +339,11 @@ pub fn gpu_stacked_backward(
                     };
                     assert_eq!(err, 0, "grad_norm_sq_cuda failed");
                     let seg_end = gnorm_offset + nb as usize;
-                    gnorm_segs.push((level, gnorm_offset, seg_end));
+                    deferred_chain_gnorms.push((b, level, gnorm_offset, seg_end));
                     gnorm_offset = seg_end;
+                    if seg_end > chain_gnorm_max_offset {
+                        chain_gnorm_max_offset = seg_end;
+                    }
                 }
 
                 // Dispatch based on forward's cached mode (memory_caches[level].is_some()),
@@ -383,17 +394,8 @@ pub fn gpu_stacked_backward(
                 }
             }
 
-            // Spec 54 Phase 2: ONE sync + D2H for all chain gnorms
-            if gnorm_offset > 0 {
-                crate::dispatch::cuda_sync();
-                gnorm_scratch.slice(0, gnorm_offset).copy_to_host(&mut gnorm_host[..gnorm_offset]);
-                for &(level, start, end) in &gnorm_segs {
-                    let sq_sum: f64 = (start..end).map(|i| gnorm_host[i] as f64).sum();
-                    block_level_gnorms[level] = sq_sum.sqrt() as f32;
-                }
-            }
-            // Spec 63: keep-alive buffers now live in all_keep_alive (hoisted)
-            // — freed after block loop to avoid per-block cudaFree syncs.
+            // Spec 63: chain gnorm sync deferred to post-loop (deferred_chain_gnorms).
+            // keep-alive buffers live in all_keep_alive — freed after block loop.
 
             // d_upstream is now d_ln_mem_out (at full resolution [bs*s, d])
             d_mem_input = d_upstream;
@@ -649,42 +651,51 @@ pub fn gpu_stacked_backward(
         });
     }
 
-    // ── Spec 63: deferred MAG readback — ONE sync for all blocks ─────
-    if !deferred_mag_blocks.is_empty() {
-        // Find the maximum offset written across all blocks
-        let max_offset = deferred_mag_blocks.iter()
-            .flat_map(|dm| dm.dot_segs.last().map(|&(_, end)| end))
-            .max()
-            .unwrap_or(0);
-        if max_offset > 0 {
-            crate::dispatch::cuda_sync();
-            gnorm_scratch.slice(0, max_offset).copy_to_host(&mut gnorm_host[..max_offset]);
+    // ── Spec 63: deferred readback — ONE sync for all blocks ───────────
+    // Both chain gnorms and MAG gnorm+dots write to non-overlapping regions
+    // of gnorm_scratch. ONE sync + ONE D2H covers all blocks.
+    let mag_max_offset = deferred_mag_blocks.iter()
+        .flat_map(|dm| dm.dot_segs.last().map(|&(_, end)| end))
+        .max()
+        .unwrap_or(0);
+    let total_max_offset = chain_gnorm_max_offset.max(mag_max_offset);
+
+    if total_max_offset > 0 {
+        crate::dispatch::cuda_sync();
+        gnorm_scratch.slice(0, total_max_offset).copy_to_host(&mut gnorm_host[..total_max_offset]);
+    }
+
+    // Process deferred chain gnorms → block_level_gnorms (diagnostic only)
+    for &(block_idx, level, start, end) in &deferred_chain_gnorms {
+        let bg = block_grads[block_idx].as_mut().unwrap();
+        let sq_sum: f64 = (start..end).map(|i| gnorm_host[i] as f64).sum();
+        bg.level_output_gnorms[level] = sq_sum.sqrt() as f32;
+    }
+
+    // Process deferred MAG blocks → d_alpha_mem + block_level_gnorms
+    for dm in &deferred_mag_blocks {
+        let bg = block_grads[dm.block_idx].as_mut().unwrap();
+
+        // Reduce gnorm partials → block_level_gnorms
+        if need_gnorms {
+            let gnorm_sq: f64 = (dm.base_offset..dm.base_offset + dm.gnorm_nb)
+                .map(|i| gnorm_host[i] as f64).sum();
+            let d_y_norm = gnorm_sq.sqrt() as f32;
+            for level in 0..cfg.k {
+                bg.level_output_gnorms[level] = d_y_norm;
+            }
         }
 
-        for dm in &deferred_mag_blocks {
-            let bg = block_grads[dm.block_idx].as_mut().unwrap();
-
-            // Reduce gnorm partials → block_level_gnorms
-            if need_gnorms {
-                let gnorm_sq: f64 = (dm.base_offset..dm.base_offset + dm.gnorm_nb)
-                    .map(|i| gnorm_host[i] as f64).sum();
-                let d_y_norm = gnorm_sq.sqrt() as f32;
-                for level in 0..cfg.k {
-                    bg.level_output_gnorms[level] = d_y_norm;
-                }
-            }
-
-            // Reduce dot partials → d_alpha_mem (needed every step for optimizer)
-            let w = &dm.alpha_weights;
-            let mut dots = vec![0.0f64; cfg.k];
-            for (l, &(start, end)) in dm.dot_segs.iter().enumerate() {
-                dots[l] = (start..end).map(|i| gnorm_host[i] as f64).sum();
-            }
-            let weighted_dot_sum: f64 = (0..cfg.k).map(|j| w[j] as f64 * dots[j]).sum();
-            bg.d_alpha_mem = (0..cfg.k)
-                .map(|l| (w[l] as f64 * (dots[l] - weighted_dot_sum)) as f32)
-                .collect();
+        // Reduce dot partials → d_alpha_mem (needed every step for optimizer)
+        let w = &dm.alpha_weights;
+        let mut dots = vec![0.0f64; cfg.k];
+        for (l, &(start, end)) in dm.dot_segs.iter().enumerate() {
+            dots[l] = (start..end).map(|i| gnorm_host[i] as f64).sum();
         }
+        let weighted_dot_sum: f64 = (0..cfg.k).map(|j| w[j] as f64 * dots[j]).sum();
+        bg.d_alpha_mem = (0..cfg.k)
+            .map(|l| (w[l] as f64 * (dots[l] - weighted_dot_sum)) as f32)
+            .collect();
     }
 
     // Spec 63: drop all keep-alive buffers here (after block loop + deferred MAG).

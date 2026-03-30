@@ -234,7 +234,7 @@ pub fn run_probes(
                     &pulse, &mut gpu_context, &mut None,
                 );
                 let mut grads = gpu_stacked_backward(
-                    &gpu_params, &mag_cfg, &cache, &mut None, true,
+                    &gpu_params, &mag_cfg, &cache, &mut None, false,
                 );
                 if adamw_state.is_none() {
                     adamw_state = Some(GpuStackedAdamWState::from_params(&gpu_params));
@@ -601,7 +601,7 @@ fn generate_learning_losses(
             &pulse, gpu_context, &mut None,
         );
         let mut grads = gpu_stacked_backward(
-            gpu_params, mag_cfg, &cache, &mut None, true,
+            gpu_params, mag_cfg, &cache, &mut None, false,
         );
         if adamw_state.is_none() {
             *adamw_state = Some(GpuStackedAdamWState::from_params(gpu_params));

@@ -86,14 +86,18 @@ Each block (line 526 of `gpu_stacked_forward.rs`) does:
 `GpuStackedBlockGrads` but never used for inter-block gradient flow. The gradient
 to the next block flows through `d_residual_stream`, which is independent.
 
-#### Chain mode: skip readback on non-log steps
+#### Chain mode: skip entirely on non-log steps
 
 The gnorm values are purely diagnostic. On non-log steps:
-- Still launch `grad_norm_sq_cuda` kernels (they're cheap and stream-ordered)
-- **Skip** the `cuda_sync()` + `copy_to_host()` entirely
-- Set `block_level_gnorms` to zeros
+- **Skip** `grad_norm_sq_cuda` kernel launches entirely (no point computing
+  values that won't be read)
+- **Skip** `cuda_sync()` + `copy_to_host()` entirely
+- `block_level_gnorms` remains zeros (default initialization)
 
-On log steps: batch all blocks' readback into ONE sync + ONE D2H after the loop.
+On log steps (`need_gnorms=true`): each block launches gnorm kernels at
+block-specific offsets in the expanded scratch buffer (`b * per_block_slots`).
+ONE sync + ONE D2H after the entire block loop reads all blocks' partials,
+then host-side reduction fills `block_level_gnorms` for each block.
 
 #### MAG mode: batch across blocks
 
