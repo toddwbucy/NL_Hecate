@@ -680,6 +680,22 @@ extern "C" {
     /// Scale gradient buffer in-place: g[i] *= scale.
     pub(crate) fn grad_scale_cuda(g: *mut f32, scale: f32, n: i32) -> u32;  // cudaError_t: 0 = cudaSuccess
 
+    /// Reduce partial norm sums on GPU + compute clip scale (spec 62).
+    /// Single-block kernel: sums partial_sums[0..total_partials], writes
+    /// L2 norm to out_norm and clip scale to out_scale.
+    /// Scale = min(1.0, max_grad_norm / norm).
+    pub(crate) fn reduce_partials_clip_cuda(
+        partial_sums: *const f32, total_partials: i32,
+        max_grad_norm: f32,
+        out_norm: *mut f32, out_scale: *mut f32,
+    ) -> u32;
+
+    /// Conditional gradient scaling from device pointer (spec 62).
+    /// Reads *scale_ptr; if >= 1.0, exits immediately. Otherwise g[i] *= scale.
+    pub(crate) fn grad_scale_conditional_cuda(
+        g: *mut f32, scale_ptr: *const f32, n: i32,
+    ) -> u32;
+
     // ── M3 optimizer kernels (spec 34) ────────────────────────────────
 
     /// Fused M1 + V + conditional M2 EMA update.

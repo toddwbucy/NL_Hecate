@@ -19,6 +19,7 @@ use nl_hecate_core::gpu_stacked_backward::gpu_stacked_backward;
 #[cfg(feature = "cuda")]
 use nl_hecate_core::gpu_stacked_optimizer::{
     GpuStackedAdamWState, gpu_stacked_adamw_update, gpu_stacked_sync_embed_weights,
+    gpu_read_grad_norm,
 };
 #[cfg(feature = "cuda")]
 use nl_hecate_core::gpu_stacked_forward::{
@@ -542,7 +543,7 @@ pub fn run(config_path: &str, _resume: bool) {
                     };
 
                     #[cfg(feature = "cuda")]
-                    let (loss, grad_norm, block_level_gnorms) = {
+                    let (loss, _gnorm_deferred, block_level_gnorms) = {
                         run_step(
                             &mut gpu_params, &mag_cfg, &mut gpu_context,
                             &mut adamw_state,
@@ -596,33 +597,42 @@ pub fn run(config_path: &str, _resume: bool) {
                         break;
                     }
 
-                    // Collect per-level CMS diagnostics
-                    #[cfg(feature = "cuda")]
-                    let cms_diag = collect_cms_diagnostics(&gpu_context, &block_level_gnorms, k);
-
-                    // Check for dormancy transitions and log events
-                    #[cfg(feature = "cuda")]
-                    for (l, status) in cms_diag.dormancy_status.iter().enumerate() {
-                        if status != "active" {
-                            // Find the worst-case block for this level's count
-                            let max_count = gpu_context.dormancy_below_count.iter()
-                                .filter_map(|b| b.get(l))
-                                .copied()
-                                .max()
-                                .unwrap_or(0);
-                            logger.log_dormancy(global_step, 0, l, status, max_count);
-                        }
-                    }
-
-                    // CMS tape sidecar
-                    #[cfg(feature = "cuda")]
-                    if let Some(ref mut tape) = cms_tape {
-                        tape.log_step(global_step, &cms_diag);
-                    }
-
-                    // Logging
+                    // Logging + CMS diagnostics (gated to log_every to avoid per-step GPU stalls)
                     let log_this = log_every > 0 && phase_step % log_every == 0;
                     if log_this || phase_step == 0 {
+                        // M-norm tracking: 48+ kernel launches + D2H copies per call.
+                        // Only run on log steps to avoid stalling the GPU pipeline every step.
+                        #[cfg(feature = "cuda")]
+                        gpu_context.update_m_norm_tracking();
+
+                        #[cfg(feature = "cuda")]
+                        let cms_diag = collect_cms_diagnostics(&gpu_context, &block_level_gnorms, k);
+
+                        // Check for dormancy transitions and log events
+                        #[cfg(feature = "cuda")]
+                        for (l, status) in cms_diag.dormancy_status.iter().enumerate() {
+                            if status != "active" {
+                                let max_count = gpu_context.dormancy_below_count.iter()
+                                    .filter_map(|b| b.get(l))
+                                    .copied()
+                                    .max()
+                                    .unwrap_or(0);
+                                logger.log_dormancy(global_step, 0, l, status, max_count);
+                            }
+                        }
+
+                        // CMS tape sidecar
+                        #[cfg(feature = "cuda")]
+                        if let Some(ref mut tape) = cms_tape {
+                            tape.log_step(global_step, &cms_diag);
+                        }
+
+                        // Spec 62: read grad norm from GPU only on log steps (deferred readback)
+                        #[cfg(feature = "cuda")]
+                        let grad_norm = if let Some(ref state) = adamw_state {
+                            gpu_read_grad_norm(state)
+                        } else { 0.0 };
+
                         let elapsed = t_start.elapsed().as_secs_f64();
                         let tok_s = step_tokens as f64 / elapsed;
                         let ppl = (loss as f64).exp();
@@ -714,7 +724,7 @@ pub fn run(config_path: &str, _resume: bool) {
 
                     // LEARN from current input
                     #[cfg(feature = "cuda")]
-                    let (loss, grad_norm, block_level_gnorms) = {
+                    let (loss, _gnorm_deferred, block_level_gnorms) = {
                         run_step(
                             &mut gpu_params, &mag_cfg, &mut gpu_context,
                             &mut adamw_state,
@@ -732,6 +742,12 @@ pub fn run(config_path: &str, _resume: bool) {
 
                     if loss_first.is_none() { loss_first = Some(loss); }
                     loss_last = loss;
+
+                    // Spec 62: deferred grad norm readback (think_rounds always log)
+                    #[cfg(feature = "cuda")]
+                    let grad_norm = if let Some(ref state) = adamw_state {
+                        gpu_read_grad_norm(state)
+                    } else { 0.0 };
 
                     #[cfg(feature = "cuda")]
                     let cms_diag = collect_cms_diagnostics(&gpu_context, &block_level_gnorms, k);
@@ -1004,9 +1020,6 @@ fn run_step(
 
     // Weight tying
     gpu_stacked_sync_embed_weights(gpu_params, d, v);
-
-    // Dormancy tracking
-    gpu_context.update_m_norm_tracking();
 
     // Selective periodic reset (spec 57)
     maybe_reset_levels(pulse, reset_intervals, fire_counts, gpu_context);
