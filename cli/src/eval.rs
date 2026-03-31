@@ -198,17 +198,15 @@ pub fn run_probes(
 
             // Generate tokens (same function, one at a time)
             let mut gen = Vec::new();
-            let mut next_tok = sample_token(&logits, temperature, top_k);
-            gen.push(next_tok);
-
-            for _ in 1..max_tokens {
-                let logits = gpu_stacked_forward_tokens(
+            let mut last_logits = logits;
+            for _ in 0..max_tokens {
+                let next_tok = sample_token(&last_logits, temperature, top_k);
+                gen.push(next_tok);
+                last_logits = gpu_stacked_forward_tokens(
                     &gpu_params, &mag_cfg, &[next_tok],
                     &mut conductor, &mut gpu_context, &mut kv_caches, &mut decode_ws,
                     None,
                 );
-                next_tok = sample_token(&logits, temperature, top_k);
-                gen.push(next_tok);
             }
 
             let gen_text = decode_tokens(&tokenizer, &gen);
@@ -376,17 +374,15 @@ pub fn run_inline_probes(
 
         // Generate tokens (same function)
         let mut gen = Vec::new();
-        let mut next_tok = sample_token(&logits, temperature, 50);
-        gen.push(next_tok);
-
-        for _ in 1..max_tokens {
-            let logits = gpu_stacked_forward_tokens(
+        let mut last_logits = logits;
+        for _ in 0..max_tokens {
+            let next_tok = sample_token(&last_logits, temperature, 50);
+            gen.push(next_tok);
+            last_logits = gpu_stacked_forward_tokens(
                 &gpu_params, &probe_cfg, &[next_tok],
                 &mut conductor, &mut gpu_context, &mut kv_caches, &mut decode_ws,
                 None,
             );
-            next_tok = sample_token(&logits, temperature, 50);
-            gen.push(next_tok);
         }
 
         let gen_text = decode_tokens(&tokenizer, &gen);

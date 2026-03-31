@@ -171,28 +171,11 @@ pub fn generate(config_path: &str, checkpoint_path: &str, prompt_tokens: &[usize
             None, // no activation window for generation
         );
 
-        // Sample first token
-        let mut next_tok = sample_token(&logits, temperature, top_k);
-        if let Some(stop) = stop_token {
-            if next_tok == stop {
-                eprintln!("---");
-                eprintln!("(stopped after prompt: hit stop token)");
-                return;
-            }
-        }
-        print_token(next_tok);
+        let mut generated = Vec::new();
+        let mut last_logits = logits;
 
-        let mut generated = vec![next_tok];
-
-        // ── Generate remaining tokens (same function, one at a time) ─
-        for _i in 1..max_tokens {
-            let logits = gpu_stacked_forward_tokens(
-                &gpu_params, &mag_cfg, &[next_tok],
-                &mut conductor, &mut gpu_context, &mut kv_caches, &mut ws,
-                None,
-            );
-
-            next_tok = sample_token(&logits, temperature, top_k);
+        for _i in 0..max_tokens {
+            let next_tok = sample_token(&last_logits, temperature, top_k);
             if let Some(stop) = stop_token {
                 if next_tok == stop {
                     break;
@@ -200,6 +183,12 @@ pub fn generate(config_path: &str, checkpoint_path: &str, prompt_tokens: &[usize
             }
             print_token(next_tok);
             generated.push(next_tok);
+
+            last_logits = gpu_stacked_forward_tokens(
+                &gpu_params, &mag_cfg, &[next_tok],
+                &mut conductor, &mut gpu_context, &mut kv_caches, &mut ws,
+                None,
+            );
         }
 
         let elapsed = t_start.elapsed().as_secs_f64();
