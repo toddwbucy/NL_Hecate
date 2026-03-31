@@ -767,7 +767,8 @@ pub fn run(config_path: &str, _resume: bool) {
                     }
 
                     total_tokens_seen += phase_seq_len; // think_rounds: bs=1
-                    eprintln!("    loss={loss:.4}  gnorm={grad_norm:.4}");
+                    let segments = total_tokens_seen / TOKENS_PER_SEGMENT;
+                    eprintln!("    seg={segments}  loss={loss:.4}  gnorm={grad_norm:.4}");
                     logger.log_step(global_step, loss, grad_norm, lr,
                         t_start.elapsed().as_secs_f64(), &pulse_to_active(&pulse),
                         &level_firings(&pulse, phase_seq_len, &chunk_sizes),
