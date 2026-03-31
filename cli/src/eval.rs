@@ -34,7 +34,7 @@ use nl_hecate_core::gpu_forward::GpuKVCache;
 
 use crate::config::Config;
 use crate::log::MetricsLogger;
-use crate::sample::{sample_token, safe_pad_token};
+use crate::sample::sample_token;
 
 // Probing prompts matched to FineWeb-Edu domain (educational text)
 const PROBE_PROMPTS: &[&str] = &[
@@ -223,14 +223,13 @@ pub fn run_probes(
         eprintln!("── Probe: Within-Generation Learning ──");
         for prompt_str in PROBE_PROMPTS {
             let prompt_ids = encode_prompt(&tokenizer, prompt_str);
-            let safe_pad = safe_pad_token(&prompt_ids, v);
 
             let mut conductor = Conductor::new(k, chunk_sizes.clone());
 
             let losses = generate_learning_losses(
                 &mut gpu_params, &mag_cfg, &mut gpu_context,
                 &mut adamw_state, &mut conductor,
-                &prompt_ids, seq_len, v, safe_pad, max_tokens,
+                &prompt_ids, seq_len, v, max_tokens,
                 temperature, top_k,
                 lr, beta1, beta2, wd, max_grad_norm, d,
             );
@@ -259,7 +258,6 @@ pub fn run_probes(
         eprintln!("  (The definitive NL test — no transformer can do this)");
         for prompt_str in PROBE_PROMPTS {
             let prompt_ids = encode_prompt(&tokenizer, prompt_str);
-            let safe_pad = safe_pad_token(&prompt_ids, v);
 
             // Run 1: cold start
             let mut conductor = Conductor::new(k, chunk_sizes.clone());
@@ -268,7 +266,7 @@ pub fn run_probes(
             let losses1 = generate_learning_losses(
                 &mut gpu_params, &mag_cfg, &mut gpu_context,
                 &mut adamw_state, &mut conductor,
-                &prompt_ids, seq_len, v, safe_pad, max_tokens,
+                &prompt_ids, seq_len, v, max_tokens,
                 temperature, top_k,
                 lr, beta1, beta2, wd, max_grad_norm, d,
             );
@@ -281,7 +279,7 @@ pub fn run_probes(
             let losses2 = generate_learning_losses(
                 &mut gpu_params, &mag_cfg, &mut gpu_context,
                 &mut adamw_state, &mut conductor,
-                &prompt_ids, seq_len, v, safe_pad, max_tokens,
+                &prompt_ids, seq_len, v, max_tokens,
                 temperature, top_k,
                 lr, beta1, beta2, wd, max_grad_norm, d,
             );
@@ -404,13 +402,12 @@ pub fn run_inline_probes(
         let mut adamw_state: Option<GpuStackedAdamWState> = None;
 
         let prompt_ids = encode_prompt(&tokenizer, prompt_str);
-        let safe_pad = safe_pad_token(&prompt_ids, v);
         let mut conductor = Conductor::new(k, chunk_sizes.to_vec());
 
         let losses = generate_learning_losses(
             &mut gpu_params, &probe_cfg, &mut gpu_context,
             &mut adamw_state, &mut conductor,
-            &prompt_ids, seq_len, v, safe_pad, max_tokens,
+            &prompt_ids, seq_len, v, max_tokens,
             temperature, 50,
             lr, beta1, beta2, wd, max_grad_norm, d,
         );
@@ -441,14 +438,13 @@ pub fn run_inline_probes(
         let mut adamw_state: Option<GpuStackedAdamWState> = None;
 
         let prompt_ids = encode_prompt(&tokenizer, prompt_str);
-        let safe_pad = safe_pad_token(&prompt_ids, v);
 
         // Run 1: cold start
         let mut conductor = Conductor::new(k, chunk_sizes.to_vec());
         let losses1 = generate_learning_losses(
             &mut gpu_params, &probe_cfg, &mut gpu_context,
             &mut adamw_state, &mut conductor,
-            &prompt_ids, seq_len, v, safe_pad, max_tokens,
+            &prompt_ids, seq_len, v, max_tokens,
             temperature, 50,
             lr, beta1, beta2, wd, max_grad_norm, d,
         );
@@ -461,7 +457,7 @@ pub fn run_inline_probes(
         let losses2 = generate_learning_losses(
             &mut gpu_params, &probe_cfg, &mut gpu_context,
             &mut adamw_state, &mut conductor,
-            &prompt_ids, seq_len, v, safe_pad, max_tokens,
+            &prompt_ids, seq_len, v, max_tokens,
             temperature, 50,
             lr, beta1, beta2, wd, max_grad_norm, d,
         );
@@ -565,7 +561,6 @@ fn generate_learning_losses(
     prompt_ids: &[usize],
     seq_len: usize,
     vocab_size: usize,
-    _safe_pad: usize,
     max_tokens: usize,
     temperature: f32,
     top_k_val: usize,

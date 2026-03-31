@@ -1293,8 +1293,9 @@ impl ActivationWindow {
                 }
             }
 
-            // Alpha weights: same for all tokens in the window (per-block parameter)
-            let alpha_weights = self.entries[0].block_caches[b].alpha_weights.clone();
+            // Alpha weights: use the most recent token's alpha (params may have been
+            // updated between tokens during within-gen learning).
+            let alpha_weights = self.entries.back().unwrap().block_caches[b].alpha_weights.clone();
 
             block_caches.push(GpuStackedBlockCache {
                 block_input,
@@ -1442,7 +1443,24 @@ fn concat_memory_caches<'a>(
                 m_states: assemble_m_states(&caches, d, s, nh, hd, false, false),
             }
         }
-        _ => panic!("concat_memory_caches: unsupported memory cache variant"),
+        GpuMemoryCache::DGD { .. } => {
+            let bs_mem = nh;
+            GpuMemoryCache::DGD {
+                k_mem: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DGD { k_mem, .. } => k_mem, _ => unreachable!() }), bs_mem * hd),
+                v_mem: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DGD { v_mem, .. } => v_mem, _ => unreachable!() }), bs_mem * hd),
+                q_mem: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DGD { q_mem, .. } => q_mem, _ => unreachable!() }), bs_mem * hd),
+                alpha: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DGD { alpha, .. } => alpha, _ => unreachable!() }), bs_mem),
+                theta: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DGD { theta, .. } => theta, _ => unreachable!() }), bs_mem),
+                k_norms: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DGD { k_norms, .. } => k_norms, _ => unreachable!() }), bs_mem),
+                q_norms: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DGD { q_norms, .. } => q_norms, _ => unreachable!() }), bs_mem),
+                m_states: assemble_m_states(&caches, d, s, nh, hd, false, false),
+            }
+        }
+        _ => panic!(
+            "concat_memory_caches: unsupported memory cache variant — \
+             unified path currently supports Delta, Titans, Hebbian, DGD. \
+             SwiGlu/Mlp/Ckpt/Chunkwise variants require separate assembly logic.",
+        ),
     }
 }
 

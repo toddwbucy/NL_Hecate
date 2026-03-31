@@ -24,7 +24,7 @@ use nl_hecate_core::gpu_stacked_forward::{
 use nl_hecate_core::gpu_forward::GpuKVCache;
 
 use crate::config::Config;
-use crate::sample::{sample_token, safe_pad_token};
+use crate::sample::sample_token;
 
 /// Generate tokens from a checkpoint given a prompt.
 pub fn generate(config_path: &str, checkpoint_path: &str, prompt_tokens: &[usize],

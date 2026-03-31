@@ -1,22 +1,22 @@
-# 68 — Unified Forward Path: One Code Path for Training and Generation
+# 68 — Unified Forward Path: One Code Path for Building and Generation
 
 ## CONTRACT
 
 | Field     | Value |
 |-----------|-------|
-| Purpose   | Eliminate the train/eval code path split by establishing a single forward function that processes tokens identically whether building the model or generating from it |
-| Expects   | Three separate forward functions: `gpu_stacked_forward` (training), `gpu_stacked_prefill` (prompt processing), `gpu_stacked_decode_token` (generation). Context resets between fixed-length chunks. Padding required for short inputs. |
+| Purpose   | Eliminate the build/eval code path split by establishing a single forward function that processes tokens identically whether building the model or generating from it |
+| Expects   | Three separate forward functions: `gpu_stacked_forward` (building), `gpu_stacked_prefill` (prompt processing), `gpu_stacked_decode_token` (generation). Context resets between fixed-length chunks. Padding required for short inputs. |
 | Guarantees | One forward entry point for all modes. No padding. No seq_len constraint on input. Sliding activation window for gradient computation. Continuous memory accumulation across arbitrary token streams. |
 | Cost      | Refactor of forward/backward pipeline. New sliding activation cache. Per-token backward amortization strategy. |
 | Trade-off | Token-by-token processing is slower than monolithic seq_len chunks. TNT chunking remains as a provably-equivalent throughput optimization, not a separate code path. |
-| Position  | Fixes CS-10 violation (separate train/eval paths). Prerequisite for chat interface. Supersedes the prefill+decode split. |
-| Source    | Session observation: model trained via `gpu_stacked_forward` produces NaN when evaluated via `gpu_stacked_prefill` due to padding; `gpu_stacked_decode_token` produces valid output. The paths diverged silently. |
+| Position  | Fixes CS-10 violation (separate build/eval paths). Prerequisite for chat interface. Supersedes the prefill+decode split. |
+| Source    | Session observation: model built via `gpu_stacked_forward` produces NaN when evaluated via `gpu_stacked_prefill` due to padding; `gpu_stacked_decode_token` produces valid output. The paths diverged silently. |
 
 ## Problem
 
 The model currently has three forward functions:
 
-1. **`gpu_stacked_forward(input_ids[batch×seq_len], targets, pulse, context)`** — training path. Processes a full seq_len chunk atomically. Hand-written CUDA backward uses cached activations. Requires fixed-length padded input.
+1. **`gpu_stacked_forward(input_ids[batch×seq_len], targets, pulse, context)`** — building path. Processes a full seq_len chunk atomically. Hand-written CUDA backward uses cached activations. Requires fixed-length padded input.
 
 2. **`gpu_stacked_prefill(input_ids[seq_len], pulse, context)`** — generation prompt path. Calls `gpu_stacked_forward` internally with dummy targets. Inherits the padding requirement.
 
@@ -24,9 +24,9 @@ The model currently has three forward functions:
 
 ### Consequences
 
-1. **NaN on generation**: Padding 3 prompt tokens to seq_len=4096 with 4093 copies of a repeated token causes NaN in the forward pass. The model was never trained on padded input — it saw real text at every position.
+1. **NaN on generation**: Padding 3 prompt tokens to seq_len=4096 with 4093 copies of a repeated token causes NaN in the forward pass. The model was never built on padded input — it saw real text at every position.
 
-2. **CS-10 violation**: The forward pass IS different between training and generation. Different code paths means different numerical behavior, different memory update patterns, different attention computation.
+2. **CS-10 violation**: The forward pass IS different between building and generation. Different code paths means different numerical behavior, different memory update patterns, different attention computation.
 
 3. **No chat capability**: A chat interface sends variable-length messages. There is no valid way to process 12 tokens through a path that requires 4096.
 
@@ -41,7 +41,7 @@ The model is: **process one token → update memory → produce output**. That i
 ### Single Entry Point
 
 ```rust
-/// Process N tokens through the model. N can be 1 (generation) or any count (training).
+/// Process N tokens through the model. N can be 1 (generation) or any count (building).
 /// Same function, same kernels, same memory update, always.
 pub fn gpu_stacked_forward_tokens(
     params: &GpuStackedParams,
@@ -105,27 +105,29 @@ impl ActivationWindow {
 
 ### Backward Over the Window
 
+**Implementation**: Rather than a wholly new backward function, the backward pass
+bridges the `ActivationWindow` to the existing `gpu_stacked_backward` via
+`ActivationWindow::assemble_cache()`:
+
 ```rust
-/// Compute gradients over the activation window (the last N tokens).
-/// Called periodically during training — NOT after every single token.
-pub fn gpu_stacked_backward_window(
-    params: &GpuStackedParams,
-    cfg: &MAGConfig,
-    window: &ActivationWindow,
-    targets: &[usize],           // targets aligned to window entries
-) -> GpuStackedGrads {
-    // Cross-entropy loss over window entries that have valid targets
-    let loss = compute_loss(&window, targets);
+// 1. Assemble per-token activations into the GpuStackedCache format
+//    that gpu_stacked_backward expects. This includes:
+//    - Concatenating per-token [d] buffers into contiguous [window_len, d]
+//    - Recomputing batched SWA attention weights from saved Q/K/V
+//      (single-token SWA doesn't produce attention weights)
+//    - Assembling per-token memory caches (Delta/Titans/Hebbian/DGD)
+let cache: GpuStackedCache = window.assemble_cache(cfg, &target_ids);
 
-    // Backward through window in reverse order (newest → oldest)
-    // Same CUDA backward kernels, applied per-token
-    let grads = backward_through_window(params, cfg, &window);
-
-    grads
-}
+// 2. Reuse the existing backward — same kernels, same gradients
+let grads = gpu_stacked_backward(params, cfg, &cache, &mut None, false);
 ```
 
-### Training Loop (New)
+This approach avoids duplicating backward logic. The `assemble_cache()` method is
+the bridging layer that packs the ring buffer into the shape backward already
+knows how to process. Called periodically during building — NOT after every
+single token.
+
+### Building Loop (New)
 
 ```rust
 // Continuous token stream — no epochs, no resets
@@ -162,7 +164,7 @@ loop {
 // User sends a message
 let prompt_tokens = tokenize(user_message);
 
-// Process prompt — SAME function as training
+// Process prompt — SAME function as building
 gpu_stacked_forward_tokens(
     &params, &cfg, &prompt_tokens, &mut conductor,
     &mut context, &mut kv_caches, &mut activation_window,
@@ -193,7 +195,7 @@ loop {
 | Old meaning | New meaning |
 |-------------|-------------|
 | Fixed input size for forward pass | **gradient_window_size**: how many tokens of backward context we maintain |
-| Architectural constraint | Training hyperparameter |
+| Architectural constraint | Building hyperparameter |
 | Requires padding | No padding ever |
 | Determines batch shape | Determines VRAM budget for activation cache |
 
@@ -235,8 +237,8 @@ The SWA KV cache grows as tokens are processed. For long conversations:
 - Remove `gpu_stacked_prefill` entirely
 - `gpu_stacked_forward` becomes an internal optimization path (TNT chunked equivalent)
 
-### Phase C: Sliding Window Training
-- Modify training loop to use continuous token stream with sliding window
+### Phase C: Sliding Window Building
+- Modify building loop to use continuous token stream with sliding window
 - Remove fixed-chunk batch boundaries
 - Checkpoint: save M state, KV cache tail, conductor step, stream cursor, activation window
 - Restart GPU0 with the unified path
@@ -252,22 +254,22 @@ The SWA KV cache grows as tokens are processed. For long conversations:
 |------|--------|
 | `core/src/gpu_stacked_forward.rs` | New `gpu_stacked_forward_tokens`, `forward_single_token`, `ActivationWindow`. Deprecate `gpu_stacked_prefill`. |
 | `core/src/gpu_stacked_backward.rs` | New `gpu_stacked_backward_window` that operates on the activation ring buffer |
-| `cli/src/run.rs` | Replace chunk-based training loop with continuous sliding window loop |
+| `cli/src/run.rs` | Replace chunk-based building loop with continuous sliding window loop |
 | `cli/src/generate.rs` | Use `gpu_stacked_forward_tokens` instead of prefill+decode |
 | `cli/src/eval.rs` | Use `gpu_stacked_forward_tokens` for all probes |
 | `cli/src/chat.rs` | Same function as generate, with persistent state |
 
 ## Validation
 
-1. **Numerical equivalence**: `forward_single_token` called N times produces identical logits to `gpu_stacked_forward` on the same N tokens (at chunk_size=1, no TNT)
-2. **No padding**: Generation works with any prompt length (1 token to 100K tokens)
-3. **Same code path**: `generate` and training call the same function
-4. **Gradient correctness**: `backward_window` produces identical gradients to current `gpu_stacked_backward` for the same token sequence
+1. **Forward equivalence**: Generate a fixed random token sequence, run `forward_single_token` in a loop (chunk_size=1) accumulating M state and collect logits, then run `gpu_stacked_forward` on the same sequence (chunk_size=1) and assert logits match within tight tolerance. Deterministic seed, identical inputs.
+2. **Backward equivalence**: Run forward then call `ActivationWindow::assemble_cache()` to prepare a `GpuStackedCache`, compute gradients via `gpu_stacked_backward`. Separately run the original `gpu_stacked_forward` + `gpu_stacked_backward` on the same sequence. Compare all parameter gradients — must match within f32 tolerance. Ensure `assemble_cache` SWA recomputation produces identical attention weights by using same deterministic inputs.
+3. **No padding**: Generation works with any prompt length (1 token to 100K tokens)
+4. **Same code path**: `generate` and building call the same function (`gpu_stacked_forward_tokens`)
 5. **Continuous context**: M state accumulates across gradient window boundaries — loss at window N+1 reflects learning from window N
 
 ## Success Criteria
 
-1. One forward function for training, generation, chat, and evaluation
+1. One forward function for building, generation, chat, and evaluation
 2. No padding tokens ever
 3. seq_len is a gradient window parameter, not an input shape constraint
 4. Model learns continuously — no boundary resets
@@ -277,5 +279,5 @@ The SWA KV cache grows as tokens are processed. For long conversations:
 
 - Async backward (backward still synchronous with forward)
 - Multi-GPU (single GPU first)
-- Dynamic gradient window resizing during training
+- Dynamic gradient window resizing during building
 - Quantized activation cache (full f32 for now)
