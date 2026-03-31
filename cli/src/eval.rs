@@ -182,8 +182,9 @@ pub fn run_probes(
             let prompt_ids = encode_prompt(&tokenizer, prompt_str);
 
             // Unified forward path (spec 68) — same function for prompt + generation
+            let kv_len = prompt_ids.len().max(seq_len) + max_tokens;
             let mut kv_caches: Vec<GpuKVCache> = (0..n_blocks)
-                .map(|_| GpuKVCache::new(seq_len + max_tokens, d, 1))
+                .map(|_| GpuKVCache::new(kv_len, d, 1))
                 .collect();
             let mut decode_ws = StackedDecodeWorkspace::new(n_blocks, d, v);
             let mut conductor = Conductor::new(k, chunk_sizes.clone());
@@ -359,8 +360,9 @@ pub fn run_inline_probes(
         let prompt_ids = encode_prompt(&tokenizer, prompt_str);
 
         // Unified forward path (spec 68)
+        let kv_len = prompt_ids.len().max(seq_len) + max_tokens;
         let mut kv_caches: Vec<GpuKVCache> = (0..n_blocks)
-            .map(|_| GpuKVCache::new(seq_len + max_tokens, d, 1))
+            .map(|_| GpuKVCache::new(kv_len, d, 1))
             .collect();
         let mut decode_ws = StackedDecodeWorkspace::new(n_blocks, d, v);
         let mut conductor = Conductor::new(k, chunk_sizes.to_vec());
@@ -618,14 +620,14 @@ fn generate_learning_losses(
             gpu_params, mag_cfg, &cache, &mut None, false,
         );
 
-        // Optimizer step
+        // Optimizer step — use cache.pulse (matches the window's activations),
+        // not conductor.pulse() which has already advanced past the window.
         if adamw_state.is_none() {
             *adamw_state = Some(GpuStackedAdamWState::from_params(gpu_params));
         }
-        let pulse = conductor.pulse();
         let aw = adamw_state.as_mut().unwrap();
         gpu_stacked_adamw_update(
-            gpu_params, &mut grads, aw, &pulse,
+            gpu_params, &mut grads, aw, &cache.pulse,
             lr, beta1, beta2, 1e-8, wd, max_grad_norm,
             false, &mut None,
         );

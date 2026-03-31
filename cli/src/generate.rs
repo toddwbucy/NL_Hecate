@@ -158,8 +158,9 @@ pub fn generate(config_path: &str, checkpoint_path: &str, prompt_tokens: &[usize
         // ── Unified forward path (spec 68) ──────────────────────────
         // Same function for prompt processing and generation.
         // No prefill. No padding. No separate eval mode.
+        let kv_len = prompt_tokens.len().max(seq_len) + max_tokens;
         let mut kv_caches: Vec<GpuKVCache> = (0..n_blocks)
-            .map(|_| GpuKVCache::new(seq_len + max_tokens, d, 1))
+            .map(|_| GpuKVCache::new(kv_len, d, 1))
             .collect();
         let mut ws = StackedDecodeWorkspace::new(n_blocks, d, v);
 
