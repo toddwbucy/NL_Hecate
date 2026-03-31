@@ -217,8 +217,8 @@ This unblocks the d=2048 run immediately while the full pipeline is implemented.
 3. New config with empty `before_save`/`after_save` runs only the save
 4. New config with probe in `after_save` runs probes after save
 5. New config with profile in `before_save` runs profile before save
-5. `probe_max_tokens: 0` in legacy config skips probes (immediate fix)
-6. Action ordering respected within each phase (`before_save`, `after_save`)
+6. `probe_max_tokens: 0` in legacy config skips probes (immediate fix)
+7. Action ordering respected within each phase (`before_save`, `after_save`)
 
 ## Success Criteria
 
