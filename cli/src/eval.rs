@@ -20,8 +20,8 @@ use nl_hecate_core::model::{
 use nl_hecate_core::gpu_params::{GpuStackedParams, GpuStackedContext};
 #[cfg(feature = "cuda")]
 use nl_hecate_core::gpu_stacked_forward::{
-    gpu_stacked_prefill, gpu_stacked_forward,
-    gpu_stacked_decode_token, StackedDecodeWorkspace,
+    gpu_stacked_forward_tokens,
+    StackedDecodeWorkspace, ActivationWindow,
 };
 #[cfg(feature = "cuda")]
 use nl_hecate_core::gpu_stacked_backward::gpu_stacked_backward;
@@ -34,7 +34,7 @@ use nl_hecate_core::gpu_forward::GpuKVCache;
 
 use crate::config::Config;
 use crate::log::MetricsLogger;
-use crate::sample::{sample_token, safe_pad_token};
+use crate::sample::sample_token;
 
 // Probing prompts matched to FineWeb-Edu domain (educational text)
 const PROBE_PROMPTS: &[&str] = &[
@@ -180,28 +180,33 @@ pub fn run_probes(
         eprintln!("── Probe: Coherence Samples ──");
         for prompt_str in PROBE_PROMPTS {
             let prompt_ids = encode_prompt(&tokenizer, prompt_str);
-            let safe_pad = safe_pad_token(&prompt_ids, v);
-            let ctx = pad_to_seq_len(&prompt_ids, seq_len, safe_pad);
 
-            // Simple generation (no learning) via repeated prefill
-            let conductor = Conductor::new(k, chunk_sizes.clone());
+            // Unified forward path (spec 68) — same function for prompt + generation
+            let kv_len = prompt_ids.len().max(seq_len) + max_tokens;
+            let mut kv_caches: Vec<GpuKVCache> = (0..n_blocks)
+                .map(|_| GpuKVCache::new(kv_len, d, 1))
+                .collect();
+            let mut decode_ws = StackedDecodeWorkspace::new(n_blocks, d, v);
+            let mut conductor = Conductor::new(k, chunk_sizes.clone());
+
+            // Process prompt
+            let logits = gpu_stacked_forward_tokens(
+                &gpu_params, &mag_cfg, &prompt_ids,
+                &mut conductor, &mut gpu_context, &mut kv_caches, &mut decode_ws,
+                None,
+            );
+
+            // Generate tokens (same function, one at a time)
             let mut gen = Vec::new();
-            let mut full_ctx = ctx.clone();
-
+            let mut last_logits = logits;
             for _ in 0..max_tokens {
-                let mut kv: Vec<GpuKVCache> = Vec::new();
-                let pulse = conductor.pulse();
-                let logits = gpu_stacked_prefill(
-                    &gpu_params, &mag_cfg, &full_ctx, &pulse,
-                    &mut gpu_context, &mut kv, &mut None,
-                );
-                let next_tok = sample_token(&logits, temperature, top_k);
+                let next_tok = sample_token(&last_logits, temperature, top_k);
                 gen.push(next_tok);
-
-                // Slide context window
-                let mut extended: Vec<usize> = prompt_ids.clone();
-                extended.extend_from_slice(&gen);
-                full_ctx = pad_to_seq_len(&extended, seq_len, safe_pad);
+                last_logits = gpu_stacked_forward_tokens(
+                    &gpu_params, &mag_cfg, &[next_tok],
+                    &mut conductor, &mut gpu_context, &mut kv_caches, &mut decode_ws,
+                    None,
+                );
             }
 
             let gen_text = decode_tokens(&tokenizer, &gen);
@@ -217,50 +222,16 @@ pub fn run_probes(
         eprintln!("── Probe: Within-Generation Learning ──");
         for prompt_str in PROBE_PROMPTS {
             let prompt_ids = encode_prompt(&tokenizer, prompt_str);
-            let safe_pad = safe_pad_token(&prompt_ids, v);
 
             let mut conductor = Conductor::new(k, chunk_sizes.clone());
-            let mut seq = prompt_ids.clone();
-            let mut losses: Vec<f32> = Vec::new();
 
-            for _tok_i in 0..max_tokens {
-                let ctx = build_context(&seq, seq_len, safe_pad);
-                let target = build_target(&seq, seq_len, v);
-
-                // LEARN
-                let pulse = conductor.pulse();
-                let (loss, cache) = gpu_stacked_forward(
-                    &gpu_params, &mag_cfg, &ctx, &target,
-                    &pulse, &mut gpu_context, &mut None,
-                );
-                let mut grads = gpu_stacked_backward(
-                    &gpu_params, &mag_cfg, &cache, &mut None, false,
-                );
-                if adamw_state.is_none() {
-                    adamw_state = Some(GpuStackedAdamWState::from_params(&gpu_params));
-                }
-                let aw = adamw_state.as_mut().unwrap();
-                gpu_stacked_adamw_update(
-                    &mut gpu_params, &mut grads, aw, &pulse,
-                    lr, beta1, beta2, 1e-8, wd, max_grad_norm,
-                    false, &mut None,
-                );
-                gpu_stacked_sync_embed_weights(&mut gpu_params, d, v);
-                conductor.advance();
-
-                if loss.is_nan() || loss.is_infinite() { break; }
-                losses.push(loss);
-
-                // SPEAK: prefill + sample one token
-                let mut kv: Vec<GpuKVCache> = Vec::new();
-                let sp = conductor.pulse();
-                let logits = gpu_stacked_prefill(
-                    &gpu_params, &mag_cfg, &ctx, &sp,
-                    &mut gpu_context, &mut kv, &mut None,
-                );
-                let next_tok = sample_token(&logits, temperature, top_k);
-                seq.push(next_tok);
-            }
+            let losses = generate_learning_losses(
+                &mut gpu_params, &mag_cfg, &mut gpu_context,
+                &mut adamw_state, &mut conductor,
+                &prompt_ids, seq_len, v, max_tokens,
+                temperature, top_k,
+                lr, beta1, beta2, wd, max_grad_norm, d,
+            );
 
             // Compute summary
             let n = losses.len();
@@ -286,7 +257,6 @@ pub fn run_probes(
         eprintln!("  (The definitive NL test — no transformer can do this)");
         for prompt_str in PROBE_PROMPTS {
             let prompt_ids = encode_prompt(&tokenizer, prompt_str);
-            let safe_pad = safe_pad_token(&prompt_ids, v);
 
             // Run 1: cold start
             let mut conductor = Conductor::new(k, chunk_sizes.clone());
@@ -295,7 +265,7 @@ pub fn run_probes(
             let losses1 = generate_learning_losses(
                 &mut gpu_params, &mag_cfg, &mut gpu_context,
                 &mut adamw_state, &mut conductor,
-                &prompt_ids, seq_len, v, safe_pad, max_tokens,
+                &prompt_ids, seq_len, v, max_tokens,
                 temperature, top_k,
                 lr, beta1, beta2, wd, max_grad_norm, d,
             );
@@ -308,7 +278,7 @@ pub fn run_probes(
             let losses2 = generate_learning_losses(
                 &mut gpu_params, &mag_cfg, &mut gpu_context,
                 &mut adamw_state, &mut conductor,
-                &prompt_ids, seq_len, v, safe_pad, max_tokens,
+                &prompt_ids, seq_len, v, max_tokens,
                 temperature, top_k,
                 lr, beta1, beta2, wd, max_grad_norm, d,
             );
@@ -389,26 +359,33 @@ pub fn run_inline_probes(
         let mut gpu_context = GpuStackedContext::new(n_blocks, k, d, 1, Some(&probe_cfg));
 
         let prompt_ids = encode_prompt(&tokenizer, prompt_str);
-        let safe_pad = safe_pad_token(&prompt_ids, v);
-        let ctx = pad_to_seq_len(&prompt_ids, seq_len, safe_pad);
 
-        let conductor = Conductor::new(k, chunk_sizes.to_vec());
+        // Unified forward path (spec 68)
+        let kv_len = prompt_ids.len().max(seq_len) + max_tokens;
+        let mut kv_caches: Vec<GpuKVCache> = (0..n_blocks)
+            .map(|_| GpuKVCache::new(kv_len, d, 1))
+            .collect();
+        let mut decode_ws = StackedDecodeWorkspace::new(n_blocks, d, v);
+        let mut conductor = Conductor::new(k, chunk_sizes.to_vec());
+
+        // Process prompt
+        let logits = gpu_stacked_forward_tokens(
+            &gpu_params, &probe_cfg, &prompt_ids,
+            &mut conductor, &mut gpu_context, &mut kv_caches, &mut decode_ws,
+            None,
+        );
+
+        // Generate tokens (same function)
         let mut gen = Vec::new();
-        let mut full_ctx = ctx.clone();
-
+        let mut last_logits = logits;
         for _ in 0..max_tokens {
-            let mut kv: Vec<GpuKVCache> = Vec::new();
-            let pulse = conductor.pulse();
-            let logits = gpu_stacked_prefill(
-                &gpu_params, &probe_cfg, &full_ctx, &pulse,
-                &mut gpu_context, &mut kv, &mut None,
-            );
-            let next_tok = sample_token(&logits, temperature, 50);
+            let next_tok = sample_token(&last_logits, temperature, 50);
             gen.push(next_tok);
-
-            let mut extended: Vec<usize> = prompt_ids.clone();
-            extended.extend_from_slice(&gen);
-            full_ctx = pad_to_seq_len(&extended, seq_len, safe_pad);
+            last_logits = gpu_stacked_forward_tokens(
+                &gpu_params, &probe_cfg, &[next_tok],
+                &mut conductor, &mut gpu_context, &mut kv_caches, &mut decode_ws,
+                None,
+            );
         }
 
         let gen_text = decode_tokens(&tokenizer, &gen);
@@ -426,13 +403,12 @@ pub fn run_inline_probes(
         let mut adamw_state: Option<GpuStackedAdamWState> = None;
 
         let prompt_ids = encode_prompt(&tokenizer, prompt_str);
-        let safe_pad = safe_pad_token(&prompt_ids, v);
         let mut conductor = Conductor::new(k, chunk_sizes.to_vec());
 
         let losses = generate_learning_losses(
             &mut gpu_params, &probe_cfg, &mut gpu_context,
             &mut adamw_state, &mut conductor,
-            &prompt_ids, seq_len, v, safe_pad, max_tokens,
+            &prompt_ids, seq_len, v, max_tokens,
             temperature, 50,
             lr, beta1, beta2, wd, max_grad_norm, d,
         );
@@ -463,14 +439,13 @@ pub fn run_inline_probes(
         let mut adamw_state: Option<GpuStackedAdamWState> = None;
 
         let prompt_ids = encode_prompt(&tokenizer, prompt_str);
-        let safe_pad = safe_pad_token(&prompt_ids, v);
 
         // Run 1: cold start
         let mut conductor = Conductor::new(k, chunk_sizes.to_vec());
         let losses1 = generate_learning_losses(
             &mut gpu_params, &probe_cfg, &mut gpu_context,
             &mut adamw_state, &mut conductor,
-            &prompt_ids, seq_len, v, safe_pad, max_tokens,
+            &prompt_ids, seq_len, v, max_tokens,
             temperature, 50,
             lr, beta1, beta2, wd, max_grad_norm, d,
         );
@@ -483,7 +458,7 @@ pub fn run_inline_probes(
         let losses2 = generate_learning_losses(
             &mut gpu_params, &probe_cfg, &mut gpu_context,
             &mut adamw_state, &mut conductor,
-            &prompt_ids, seq_len, v, safe_pad, max_tokens,
+            &prompt_ids, seq_len, v, max_tokens,
             temperature, 50,
             lr, beta1, beta2, wd, max_grad_norm, d,
         );
@@ -572,7 +547,11 @@ fn build_target(seq: &[usize], seq_len: usize, vocab_size: usize) -> Vec<usize> 
     }
 }
 
-/// Run generate_learning loop, return per-token losses.
+/// Run generate_learning loop via unified forward path, return per-token losses.
+///
+/// Unified path (spec 68): process tokens one at a time through forward_single_token,
+/// accumulate activations in a window, backward through the window, update params,
+/// then sample next token from the last logits. Same code path as training.
 #[cfg(feature = "cuda")]
 fn generate_learning_losses(
     gpu_params: &mut GpuStackedParams,
@@ -583,7 +562,6 @@ fn generate_learning_losses(
     prompt_ids: &[usize],
     seq_len: usize,
     vocab_size: usize,
-    safe_pad: usize,
     max_tokens: usize,
     temperature: f32,
     top_k_val: usize,
@@ -591,45 +569,79 @@ fn generate_learning_losses(
     d: usize,
 ) -> Vec<f32> {
     let v = vocab_size;
-    let mut seq = prompt_ids.to_vec();
+    let n_blocks = gpu_params.n_blocks();
+    let k = mag_cfg.k;
+    let chunk_sizes = mag_cfg.chunk_sizes.clone();
     let mut losses = Vec::new();
 
-    for _ in 0..max_tokens {
-        let ctx = build_context(&seq, seq_len, safe_pad);
-        let target = build_target(&seq, seq_len, v);
+    // KV caches + workspace for the unified forward path
+    let mut kv_caches: Vec<GpuKVCache> = (0..n_blocks)
+        .map(|_| GpuKVCache::new(seq_len + max_tokens + prompt_ids.len(), d, 1))
+        .collect();
+    let mut decode_ws = StackedDecodeWorkspace::new(n_blocks, d, v);
 
-        let pulse = conductor.pulse();
-        let (loss, cache) = gpu_stacked_forward(
-            gpu_params, mag_cfg, &ctx, &target,
-            &pulse, gpu_context, &mut None,
-        );
+    // Activation window: gradient_window_size = seq_len
+    let mut window = ActivationWindow::new(seq_len);
+
+    // Process prompt tokens through the unified path (with activation caching)
+    gpu_stacked_forward_tokens(
+        gpu_params, mag_cfg, prompt_ids,
+        conductor, gpu_context, &mut kv_caches, &mut decode_ws,
+        Some(&mut window),
+    );
+
+    // Generate tokens: each one gets forward → backward → update → sample
+    for _ in 0..max_tokens {
+        let win_len = window.len();
+        if win_len < 2 { break; } // need at least 2 tokens for loss
+
+        // Build targets: shifted by 1 (next-token prediction)
+        // Window contains the last `win_len` tokens; targets are tokens[1..] + mask
+        let mut target_ids: Vec<usize> = Vec::with_capacity(win_len);
+        // We don't have easy access to the token IDs from window entries,
+        // so reconstruct from the activation caches
+        for i in 1..win_len {
+            target_ids.push(window.entries[i].token_id);
+        }
+        target_ids.push(vocab_size); // mask the last position
+
+        // Assemble window into GpuStackedCache for backward
+        let cache = window.assemble_cache(mag_cfg, &target_ids);
+
+        // Compute loss on host from assembled logits + targets
+        let loss = host_cross_entropy_loss(&cache.logits, &target_ids, v, win_len);
+
+        if loss.is_nan() || loss.is_infinite() { break; }
+        losses.push(loss);
+
+        // Backward through the assembled cache
         let mut grads = gpu_stacked_backward(
             gpu_params, mag_cfg, &cache, &mut None, false,
         );
+
+        // Optimizer step — use cache.pulse (matches the window's activations),
+        // not conductor.pulse() which has already advanced past the window.
         if adamw_state.is_none() {
             *adamw_state = Some(GpuStackedAdamWState::from_params(gpu_params));
         }
         let aw = adamw_state.as_mut().unwrap();
         gpu_stacked_adamw_update(
-            gpu_params, &mut grads, aw, &pulse,
+            gpu_params, &mut grads, aw, &cache.pulse,
             lr, beta1, beta2, 1e-8, wd, max_grad_norm,
             false, &mut None,
         );
         gpu_stacked_sync_embed_weights(gpu_params, d, v);
-        conductor.advance();
 
-        if loss.is_nan() || loss.is_infinite() { break; }
-        losses.push(loss);
-
-        // SPEAK: prefill + sample one token
-        let mut kv: Vec<GpuKVCache> = Vec::new();
-        let sp = conductor.pulse();
-        let logits = gpu_stacked_prefill(
-            gpu_params, mag_cfg, &ctx, &sp,
-            gpu_context, &mut kv, &mut None,
-        );
+        // SPEAK: sample next token from last logits in window
+        let logits = window.last_logits().unwrap();
         let next_tok = sample_token(&logits, temperature, top_k_val);
-        seq.push(next_tok);
+
+        // Forward the new token through the unified path (pushes onto window)
+        gpu_stacked_forward_tokens(
+            gpu_params, mag_cfg, &[next_tok],
+            conductor, gpu_context, &mut kv_caches, &mut decode_ws,
+            Some(&mut window),
+        );
     }
 
     losses
@@ -653,6 +665,39 @@ fn linear_slope(values: &[f32]) -> f32 {
         .sum();
     let den: f32 = (0..n).map(|i| (i as f32 - mean_x).powi(2)).sum();
     if den > 0.0 { num / den } else { 0.0 }
+}
+
+/// Host-side cross-entropy loss from GPU logits buffer + target IDs.
+/// Used by probes only — not on the training hot path.
+#[cfg(feature = "cuda")]
+fn host_cross_entropy_loss(
+    logits_gpu: &nl_hecate_core::gpu_buf::GpuBuf<f32>,
+    target_ids: &[usize],
+    vocab_size: usize,
+    seq_len: usize,
+) -> f32 {
+    let mut logits_host = vec![0.0f32; seq_len * vocab_size];
+    logits_gpu.copy_to_host(&mut logits_host);
+
+    let mut total_loss = 0.0f32;
+    let mut count = 0usize;
+
+    for t in 0..seq_len {
+        let target = target_ids[t];
+        if target >= vocab_size { continue; } // masked position
+
+        let offset = t * vocab_size;
+        let row = &logits_host[offset..offset + vocab_size];
+
+        // log-sum-exp for numerical stability
+        let max_logit = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let lse: f32 = row.iter().map(|&x| (x - max_logit).exp()).sum::<f32>().ln() + max_logit;
+        let log_prob = row[target] - lse;
+        total_loss -= log_prob;
+        count += 1;
+    }
+
+    if count > 0 { total_loss / count as f32 } else { 0.0 }
 }
 
 fn default_chunk_sizes(k: usize) -> Vec<usize> {
