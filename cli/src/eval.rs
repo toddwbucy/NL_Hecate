@@ -360,6 +360,9 @@ pub fn run_inline_probes(
     wd: f32,
     max_grad_norm: f32,
 ) -> serde_json::Value {
+    if max_tokens == 0 {
+        return json!({"skipped": true});
+    }
     let tokenizer = match Tokenizer::from_file(tokenizer_path) {
         Ok(t) => t,
         Err(e) => {
