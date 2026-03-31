@@ -23,9 +23,10 @@ for bh in 0..bs_mem {
 }
 ```
 
-At d=768, nh=12, bs=2: `bs_mem = 24`, × 4 levels × 6 blocks = **576 separate launches per step**
-just for M-norm clamping. Each launch has trivial work (one 64×64 matrix) but pays full
-kernel launch overhead (~5-10 µs).
+At d_model=768, nh=12, bs=2: each head has an hd×hd memory matrix where hd = d_model/nh = 64.
+The batch-head count is `bs_mem = bs * nh = 24`, so the loop fires 24 times per level,
+× 4 levels × 6 blocks = **576 separate launches per step** just for M-norm clamping.
+Each launch clamps a single 64×64 (hd×hd) matrix but pays full kernel launch overhead (~5-10 µs).
 
 ## Design: Batched Kernel
 
