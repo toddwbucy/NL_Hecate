@@ -31,11 +31,15 @@ impl MetricsLogger {
         active_levels: &[bool],
         level_firings: &[usize],
         cms_diag: Option<&CmsDiagnostics>,
+        total_tokens: usize,
     ) {
         let ppl = (loss as f64).exp();
+        let segments = total_tokens / 512;
         let mut entry = json!({
             "event": "step",
             "step": step,
+            "segments": segments,
+            "total_tokens": total_tokens,
             "loss": loss,
             "ppl": ppl,
             "grad_norm": grad_norm,
@@ -105,10 +109,13 @@ impl MetricsLogger {
 
     /// Log build end event.
     pub fn log_build_end(&mut self, steps: usize, elapsed: f64, tok_per_sec: f64,
-                         loss_first: f32, loss_last: f32) {
+                         loss_first: f32, loss_last: f32, total_tokens: usize) {
+        let segments = total_tokens / 512;
         let entry = json!({
             "event": "build_end",
             "steps": steps,
+            "segments": segments,
+            "total_tokens": total_tokens,
             "elapsed": elapsed,
             "tok_per_sec": tok_per_sec,
             "loss_first": loss_first,

@@ -443,6 +443,7 @@ pub fn run(config_path: &str, _resume: bool) {
     let mut loss_first: Option<f32> = None;
     let mut loss_last: f32 = 0.0;
     let mut step_tokens: usize = 0;
+    let mut total_tokens_seen: usize = 0; // CG-6: cumulative tokens for segment accounting
     let mut aborted = false;
 
     for (phase_idx, phase) in phases.iter().enumerate() {
@@ -589,7 +590,9 @@ pub fn run(config_path: &str, _resume: bool) {
                     }
 
                     conductor.advance();
-                    step_tokens += batch_size * phase_seq_len;
+                    let tokens_this_step = batch_size * phase_seq_len;
+                    step_tokens += tokens_this_step;
+                    total_tokens_seen += tokens_this_step;
                     global_step += 1;
 
                     if loss_first.is_none() { loss_first = Some(loss); }
@@ -641,7 +644,8 @@ pub fn run(config_path: &str, _resume: bool) {
                         let ppl = (loss as f64).exp();
                         let rss_mb = get_rss_mb();
 
-                        eprintln!("  step {:>6}  loss={loss:.4}  ppl={ppl:.1}  tok/s={tok_s:.0}  gnorm={grad_norm:.4}  lr={lr:.6}  rss={rss_mb}MB",
+                        let segments = total_tokens_seen / 512;
+                        eprintln!("  step {:>6}  seg={segments:<8}  loss={loss:.4}  ppl={ppl:.1}  tok/s={tok_s:.0}  gnorm={grad_norm:.4}  lr={lr:.6}  rss={rss_mb}MB",
                             global_step);
 
                         logger.log_step(global_step, loss, grad_norm, lr, elapsed,
@@ -650,6 +654,7 @@ pub fn run(config_path: &str, _resume: bool) {
                             Some(&cms_diag),
                             #[cfg(not(feature = "cuda"))]
                             None,
+                            total_tokens_seen,
                         );
                     }
 
@@ -761,6 +766,7 @@ pub fn run(config_path: &str, _resume: bool) {
                         tape.log_step(global_step, &cms_diag);
                     }
 
+                    total_tokens_seen += phase_seq_len; // think_rounds: bs=1
                     eprintln!("    loss={loss:.4}  gnorm={grad_norm:.4}");
                     logger.log_step(global_step, loss, grad_norm, lr,
                         t_start.elapsed().as_secs_f64(), &pulse_to_active(&pulse),
@@ -769,6 +775,7 @@ pub fn run(config_path: &str, _resume: bool) {
                         Some(&cms_diag),
                         #[cfg(not(feature = "cuda"))]
                         None,
+                        total_tokens_seen,
                     );
 
                     if loss.is_nan() || loss.is_infinite() {
@@ -892,14 +899,16 @@ pub fn run(config_path: &str, _resume: bool) {
     let tok_s = step_tokens as f64 / elapsed;
     eprintln!();
     eprintln!("============================================================");
+    let total_segments = total_tokens_seen / 512;
     eprintln!("  Phases:   {} complete", phases.len());
     eprintln!("  Steps:    {global_step} ({elapsed:.0}s)");
+    eprintln!("  Segments: {total_segments} ({} tokens)", fmt_num(total_tokens_seen));
     eprintln!("  Tok/s:    {tok_s:.0}");
     eprintln!("  Loss:     {:.4} → {loss_last:.4}", loss_first.unwrap_or(0.0));
     eprintln!("============================================================");
 
     logger.log_build_end(global_step - resume_step, elapsed, tok_s,
-        loss_first.unwrap_or(0.0), loss_last);
+        loss_first.unwrap_or(0.0), loss_last, total_tokens_seen);
 }
 
 // ── Extracted helpers ────────────────────────────────────────────────
