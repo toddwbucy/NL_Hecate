@@ -1,9 +1,8 @@
-/// Autoregressive generation: prefill + decode_token loop.
-/// Rust port of Python generate_stacked() from engine/generation.py.
+/// Autoregressive generation via the unified forward path (spec 68).
 ///
-/// Uses single-token decode path (spec 47): one prefill call processes the full
-/// prompt and populates per-block KV caches, then each subsequent token runs
-/// through the O(d^2) decode path instead of O(seq_len * d^2) full forward.
+/// One code path for training and generation: `gpu_stacked_forward_tokens`
+/// processes tokens one at a time through decode_token. No prefill, no padding,
+/// no separate eval mode.
 
 use std::path::Path;
 use std::time::Instant;
@@ -19,7 +18,7 @@ use nl_hecate_core::model::{
 use nl_hecate_core::gpu_params::{GpuStackedParams, GpuStackedContext};
 #[cfg(feature = "cuda")]
 use nl_hecate_core::gpu_stacked_forward::{
-    gpu_stacked_prefill, gpu_stacked_decode_token, StackedDecodeWorkspace,
+    gpu_stacked_forward_tokens, StackedDecodeWorkspace,
 };
 #[cfg(feature = "cuda")]
 use nl_hecate_core::gpu_forward::GpuKVCache;
@@ -150,44 +149,33 @@ pub fn generate(config_path: &str, checkpoint_path: &str, prompt_tokens: &[usize
         );
 
         let mut conductor = Conductor::new(k, chunk_sizes);
-        // Advance conductor to match checkpoint state
-        for _ in 0..step {
-            conductor.advance();
-        }
-
-        // ── Pad/truncate prompt to seq_len ───────────────────────────
-        let safe_pad = safe_pad_token(prompt_tokens, v);
-        let ctx: Vec<usize> = if prompt_tokens.len() >= seq_len {
-            // Truncate to last seq_len tokens
-            prompt_tokens[prompt_tokens.len() - seq_len..].to_vec()
-        } else {
-            // Left-pad with safe token
-            let pad_count = seq_len - prompt_tokens.len();
-            let mut padded = vec![safe_pad; pad_count];
-            padded.extend_from_slice(prompt_tokens);
-            padded
-        };
 
         eprintln!("Generating: max_tokens={max_tokens}, temperature={temperature}, top_k={top_k}");
         eprintln!("---");
 
         let t_start = Instant::now();
 
-        // ── Prefill: process full prompt ─────────────────────────────
-        let mut kv_caches: Vec<GpuKVCache> = Vec::new();
-        let pulse = conductor.pulse();
-        let logits = gpu_stacked_prefill(
-            &gpu_params, &mag_cfg, &ctx, &pulse,
-            &mut gpu_context, &mut kv_caches, &mut None,
-        );
-        conductor.advance();
+        // ── Unified forward path (spec 68) ──────────────────────────
+        // Same function for prompt processing and generation.
+        // No prefill. No padding. No separate eval mode.
+        let mut kv_caches: Vec<GpuKVCache> = (0..n_blocks)
+            .map(|_| GpuKVCache::new(seq_len + max_tokens, d, 1))
+            .collect();
+        let mut ws = StackedDecodeWorkspace::new(n_blocks, d, v);
 
-        // Sample first token from prefill logits
+        // Process prompt tokens (no activation saving — pure inference)
+        let logits = gpu_stacked_forward_tokens(
+            &gpu_params, &mag_cfg, prompt_tokens,
+            &mut conductor, &mut gpu_context, &mut kv_caches, &mut ws,
+            None, // no activation window for generation
+        );
+
+        // Sample first token
         let mut next_tok = sample_token(&logits, temperature, top_k);
         if let Some(stop) = stop_token {
             if next_tok == stop {
                 eprintln!("---");
-                eprintln!("(stopped after prefill: hit stop token)");
+                eprintln!("(stopped after prompt: hit stop token)");
                 return;
             }
         }
@@ -195,16 +183,13 @@ pub fn generate(config_path: &str, checkpoint_path: &str, prompt_tokens: &[usize
 
         let mut generated = vec![next_tok];
 
-        // ── Decode loop ──────────────────────────────────────────────
-        let mut ws = StackedDecodeWorkspace::new(n_blocks, d, v);
-
+        // ── Generate remaining tokens (same function, one at a time) ─
         for _i in 1..max_tokens {
-            let pulse = conductor.pulse();
-            let logits = gpu_stacked_decode_token(
-                &gpu_params, &mag_cfg, next_tok, &pulse,
-                &mut gpu_context, &mut kv_caches, &mut ws,
+            let logits = gpu_stacked_forward_tokens(
+                &gpu_params, &mag_cfg, &[next_tok],
+                &mut conductor, &mut gpu_context, &mut kv_caches, &mut ws,
+                None,
             );
-            conductor.advance();
 
             next_tok = sample_token(&logits, temperature, top_k);
             if let Some(stop) = stop_token {
