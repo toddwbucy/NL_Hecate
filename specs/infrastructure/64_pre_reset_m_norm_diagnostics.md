@@ -17,9 +17,9 @@ Expects:    Spec 57 delivered: selective periodic reset via maybe_reset_levels()
 
 Guarantees: Pre-reset M norms captured on log steps with zero additional GPU syncs
             on non-log steps. Numerically identical training — no change to forward,
-            backward, or optimizer paths. Existing post-reset norm tracking unchanged.
-            CMS tape sidecar and metrics.jsonl emit both pre-reset and post-reset
-            (zero) norms for each level.
+            backward, or optimizer paths. CMS tape sidecar and metrics.jsonl emit
+            pre-reset norms for each level (post-reset norms are always zero by
+            definition with reset_intervals=[1,1,1,1] and are not emitted).
 
 Cost:       One memory_norms() call per log step (already existed, just moved earlier).
             No new GPU buffers. No new CUDA kernels. ~48 kernel launches + 1 D2H
@@ -45,7 +45,7 @@ Source:     hd=32 vs hd=64 ablation (2026-03-30): all level_m_norms read 0.0 aft
 With `reset_intervals=[1,1,1,1]` (correct per gear curriculum design — all levels
 reset at sequence boundary), the execution order in `run_step` is:
 
-```
+```text
 1. gpu_stacked_forward()     — memory accumulates across seq_len tokens
 2. gpu_stacked_backward()    — gradients flow through memory trajectory
 3. extract block_level_gnorms
@@ -55,7 +55,7 @@ reset at sequence boundary), the execution order in `run_step` is:
 ```
 
 Then in the main loop (log steps only):
-```
+```text
 7. update_m_norm_tracking()  — calls memory_norms()        ← reads zeros
 8. collect_cms_diagnostics() — reports zeros to metrics
 ```
@@ -125,7 +125,8 @@ This enables:
 2. `level_m_deltas` reflects step-over-step changes in memory state
 3. Zero additional GPU syncs on non-log steps (no perf regression)
 4. Training is numerically identical — same loss curve with and without the fix
-5. `cargo test --features cuda --lib` passes
+5. `cargo test --features cuda --lib` has no new failures relative to baseline
+   (3 pre-existing CUDA graph scratch path failures are known and unrelated)
 6. Dormancy detection (spec 28) functional again
 
 ## Ontological Compliance
