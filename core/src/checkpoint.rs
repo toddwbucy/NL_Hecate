@@ -814,6 +814,7 @@ mod tests {
             context: ContextState::new(1, d),
             global_step: 77,
             stream_cursors: Vec::new(),
+            total_tokens_seen: 38_912,
         };
 
         let dir = std::env::temp_dir().join("hecate_test_st_build");
@@ -829,6 +830,7 @@ mod tests {
         assert_eq!(bs.global_step, 77);
         assert_eq!(bs.conductor.step, 77);
         assert_eq!(bs.stream_cursor.position, 500);
+        assert_eq!(bs.total_tokens_seen, 38_912);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -924,6 +926,7 @@ mod tests {
             context: ContextState::new(cfg.k, d),
             global_step: 500,
             stream_cursors: Vec::new(),
+            total_tokens_seen: 256000,
         };
 
         let dir = std::env::temp_dir().join("hecate_test_stacked_bs");
@@ -937,6 +940,7 @@ mod tests {
         let bs = loaded_bs.expect("build_state should be present");
         assert_eq!(bs.global_step, 500);
         assert_eq!(bs.stream_cursor.position, 10000);
+        assert_eq!(bs.total_tokens_seen, 256000);
 
         std::fs::remove_dir_all(&dir).ok();
     }

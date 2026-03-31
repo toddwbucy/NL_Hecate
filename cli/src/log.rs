@@ -2,6 +2,9 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use serde_json::json;
 
+/// Tokens per segment (1 segment = 1 SWA window = 512 tokens).
+pub const TOKENS_PER_SEGMENT: usize = 512;
+
 /// Append-only JSONL metrics logger.
 pub struct MetricsLogger {
     file: File,
@@ -31,11 +34,15 @@ impl MetricsLogger {
         active_levels: &[bool],
         level_firings: &[usize],
         cms_diag: Option<&CmsDiagnostics>,
+        total_tokens: usize,
     ) {
         let ppl = (loss as f64).exp();
+        let segments = total_tokens / TOKENS_PER_SEGMENT;
         let mut entry = json!({
             "event": "step",
             "step": step,
+            "segments": segments,
+            "total_tokens": total_tokens,
             "loss": loss,
             "ppl": ppl,
             "grad_norm": grad_norm,
@@ -105,10 +112,13 @@ impl MetricsLogger {
 
     /// Log build end event.
     pub fn log_build_end(&mut self, steps: usize, elapsed: f64, tok_per_sec: f64,
-                         loss_first: f32, loss_last: f32) {
+                         loss_first: f32, loss_last: f32, total_tokens: usize) {
+        let segments = total_tokens / TOKENS_PER_SEGMENT;
         let entry = json!({
             "event": "build_end",
             "steps": steps,
+            "segments": segments,
+            "total_tokens": total_tokens,
             "elapsed": elapsed,
             "tok_per_sec": tok_per_sec,
             "loss_first": loss_first,

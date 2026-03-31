@@ -34,7 +34,7 @@ use crate::config::{Config, OptimizerConfig, PhaseDuration};
 use crate::data::BpeTokenStream;
 #[cfg(feature = "cuda")]
 use crate::eval::run_inline_probes;
-use crate::log::{MetricsLogger, CmsDiagnostics, CmsTapeLogger};
+use crate::log::{MetricsLogger, CmsDiagnostics, CmsTapeLogger, TOKENS_PER_SEGMENT};
 use crate::sample::sample_token;
 
 /// Cosine annealing with linear warmup.
@@ -162,6 +162,7 @@ pub fn run(config_path: &str, _resume: bool) {
 
     // ── Load checkpoint or init ──────────────────────────────────────
     let mut resume_step: usize = 0;
+    let mut resume_tokens: usize = 0;
     let mut resume_cursors: Vec<StreamCursor> = Vec::new();
 
     #[cfg(feature = "cuda")]
@@ -208,6 +209,7 @@ pub fn run(config_path: &str, _resume: bool) {
 
         if let Some(bs) = &build_state {
             resume_step = bs.global_step;
+            resume_tokens = bs.total_tokens_seen;
             // Restore per-slot cursors for batch>1 resume
             if !bs.stream_cursors.is_empty() {
                 resume_cursors = bs.stream_cursors.clone();
@@ -219,6 +221,7 @@ pub fn run(config_path: &str, _resume: bool) {
         if cfg.build.reset_step {
             eprintln!("  [reset_step: overriding checkpoint step {} → 0]", resume_step);
             resume_step = 0;
+            resume_tokens = 0;
             resume_cursors.clear();
         }
 
@@ -443,6 +446,7 @@ pub fn run(config_path: &str, _resume: bool) {
     let mut loss_first: Option<f32> = None;
     let mut loss_last: f32 = 0.0;
     let mut step_tokens: usize = 0;
+    let mut total_tokens_seen: usize = resume_tokens; // CG-6: cumulative tokens for segment accounting
     let mut aborted = false;
 
     for (phase_idx, phase) in phases.iter().enumerate() {
@@ -589,7 +593,9 @@ pub fn run(config_path: &str, _resume: bool) {
                     }
 
                     conductor.advance();
-                    step_tokens += batch_size * phase_seq_len;
+                    let tokens_this_step = batch_size * phase_seq_len;
+                    step_tokens += tokens_this_step;
+                    total_tokens_seen += tokens_this_step;
                     global_step += 1;
 
                     if loss_first.is_none() { loss_first = Some(loss); }
@@ -639,7 +645,8 @@ pub fn run(config_path: &str, _resume: bool) {
                         let ppl = (loss as f64).exp();
                         let rss_mb = get_rss_mb();
 
-                        eprintln!("  step {:>6}  loss={loss:.4}  ppl={ppl:.1}  tok/s={tok_s:.0}  gnorm={grad_norm:.4}  lr={lr:.6}  rss={rss_mb}MB",
+                        let segments = total_tokens_seen / TOKENS_PER_SEGMENT;
+                        eprintln!("  step {:>6}  seg={segments:<8}  loss={loss:.4}  ppl={ppl:.1}  tok/s={tok_s:.0}  gnorm={grad_norm:.4}  lr={lr:.6}  rss={rss_mb}MB",
                             global_step);
 
                         logger.log_step(global_step, loss, grad_norm, lr, elapsed,
@@ -648,6 +655,7 @@ pub fn run(config_path: &str, _resume: bool) {
                             Some(&cms_diag),
                             #[cfg(not(feature = "cuda"))]
                             None,
+                            total_tokens_seen,
                         );
                     }
 
@@ -658,7 +666,7 @@ pub fn run(config_path: &str, _resume: bool) {
 
                     if do_checkpoint {
                         save_checkpoint(
-                            &save_path, global_step,
+                            &save_path, global_step, total_tokens_seen,
                             #[cfg(feature = "cuda")]
                             &gpu_params,
                             #[cfg(feature = "cuda")]
@@ -759,7 +767,9 @@ pub fn run(config_path: &str, _resume: bool) {
                         tape.log_step(global_step, &cms_diag);
                     }
 
-                    eprintln!("    loss={loss:.4}  gnorm={grad_norm:.4}");
+                    total_tokens_seen += phase_seq_len; // think_rounds: bs=1
+                    let segments = total_tokens_seen / TOKENS_PER_SEGMENT;
+                    eprintln!("    seg={segments}  loss={loss:.4}  gnorm={grad_norm:.4}");
                     logger.log_step(global_step, loss, grad_norm, lr,
                         t_start.elapsed().as_secs_f64(), &pulse_to_active(&pulse),
                         &level_firings(&pulse, phase_seq_len, &chunk_sizes),
@@ -767,6 +777,7 @@ pub fn run(config_path: &str, _resume: bool) {
                         Some(&cms_diag),
                         #[cfg(not(feature = "cuda"))]
                         None,
+                        total_tokens_seen,
                     );
 
                     if loss.is_nan() || loss.is_infinite() {
@@ -860,7 +871,7 @@ pub fn run(config_path: &str, _resume: bool) {
             // Synthesize a minimal loader list for checkpoint metadata
             let loaders_empty: Vec<BpeTokenStream> = Vec::new();
             save_checkpoint(
-                &save_path, global_step,
+                &save_path, global_step, total_tokens_seen,
                 &gpu_params,
                 &gpu_context,
                 &mag_cfg, &conductor, &chunk_sizes,
@@ -890,14 +901,16 @@ pub fn run(config_path: &str, _resume: bool) {
     let tok_s = step_tokens as f64 / elapsed;
     eprintln!();
     eprintln!("============================================================");
+    let total_segments = total_tokens_seen / TOKENS_PER_SEGMENT;
     eprintln!("  Phases:   {} complete", phases.len());
     eprintln!("  Steps:    {global_step} ({elapsed:.0}s)");
+    eprintln!("  Segments: {total_segments} ({} tokens)", fmt_num(total_tokens_seen));
     eprintln!("  Tok/s:    {tok_s:.0}");
     eprintln!("  Loss:     {:.4} → {loss_last:.4}", loss_first.unwrap_or(0.0));
     eprintln!("============================================================");
 
     logger.log_build_end(global_step - resume_step, elapsed, tok_s,
-        loss_first.unwrap_or(0.0), loss_last);
+        loss_first.unwrap_or(0.0), loss_last, total_tokens_seen);
 }
 
 // ── Extracted helpers ────────────────────────────────────────────────
@@ -1039,6 +1052,7 @@ fn run_step(
 fn save_checkpoint(
     save_path: &str,
     global_step: usize,
+    total_tokens_seen: usize,
     #[cfg(feature = "cuda")] gpu_params: &GpuStackedParams,
     #[cfg(feature = "cuda")] gpu_context: &GpuStackedContext,
     mag_cfg: &MAGConfig,
@@ -1088,6 +1102,7 @@ fn save_checkpoint(
             context: host_context,
             global_step,
             stream_cursors,
+            total_tokens_seen,
         };
         match save_stacked_safetensors(
             Path::new(&ckpt_path), &host_params, mag_cfg,
