@@ -603,10 +603,8 @@ pub fn run(config_path: &str, _resume: bool) {
 
                     // Logging + CMS diagnostics (gated to log_every to avoid per-step GPU stalls)
                     if log_this || phase_step == 0 {
-                        // M-norm tracking: 48+ kernel launches + D2H copies per call.
-                        // Only run on log steps to avoid stalling the GPU pipeline every step.
-                        #[cfg(feature = "cuda")]
-                        gpu_context.update_m_norm_tracking();
+                        // Spec 64: update_m_norm_tracking() now called inside run_step(),
+                        // before maybe_reset_levels(), so we read pre-reset norms.
 
                         #[cfg(feature = "cuda")]
                         let cms_diag = collect_cms_diagnostics(&gpu_context, &block_level_gnorms, k);
@@ -928,8 +926,8 @@ fn collect_cms_diagnostics(
     }
     for g in &mut level_gnorms { *g /= nb; }
 
-    // M-norms: use prev_m_norms (captured by update_m_norm_tracking before periodic reset
-    // may zero the buffers). Calling memory_norms() again here would read post-reset zeros.
+    // M-norms: use prev_m_norms (spec 64: captured inside run_step BEFORE maybe_reset_levels
+    // zeros the buffers). These are pre-reset norms — the actual end-of-sequence memory state.
     let mut level_m_norms = vec![0.0f32; k];
     for block_norms in &gpu_context.prev_m_norms {
         for (l, &n) in block_norms.iter().enumerate() {
@@ -1025,6 +1023,11 @@ fn run_step(
 
     // Weight tying
     gpu_stacked_sync_embed_weights(gpu_params, d, v);
+
+    // Spec 64: capture pre-reset M norms on log steps (before reset zeros the buffers)
+    if log_this {
+        gpu_context.update_m_norm_tracking();
+    }
 
     // Selective periodic reset (spec 57)
     maybe_reset_levels(pulse, reset_intervals, fire_counts, gpu_context);
