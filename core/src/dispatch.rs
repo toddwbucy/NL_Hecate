@@ -3056,3 +3056,26 @@ pub fn tnt_combine_gradients_dd(
         );
     }
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// M-norm clamp dispatch (spec 65)
+// ══════════════════════════════════════════════════════════════════════
+
+/// Clamp the Frobenius norm of a single d×d matrix on device.
+/// No-op if m_norm_max <= 0 or >= 1e30.
+#[cfg(feature = "cuda")]
+pub fn m_norm_clamp(m: &mut GpuBuf<f32>, d: i32, m_norm_max: f32) {
+    unsafe {
+        crate::cuda_ffi::m_norm_clamp_f32_cuda(m.ptr(), d, m_norm_max);
+    }
+}
+
+/// Batched M-norm clamp: clamp batch_size independent d×d matrices in one launch.
+/// m points to contiguous [batch_size, d*d] buffer on device.
+/// No-op if m_norm_max <= 0 or >= 1e30.
+#[cfg(feature = "cuda")]
+pub fn m_norm_clamp_batch(m: &mut GpuBuf<f32>, d: i32, batch_size: i32, m_norm_max: f32) {
+    unsafe {
+        crate::cuda_ffi::m_norm_clamp_batch_f32_cuda(m.ptr(), d, batch_size, m_norm_max);
+    }
+}
