@@ -34,7 +34,21 @@ New kernel `m_norm_clamp_batch_kernel` with `grid=(batch_size)`. Each block inde
 clamps its own d×d matrix — identical math to the single-matrix kernel, just indexed by
 `blockIdx.x`.
 
-### Kernel
+### Algorithm
+
+The Frobenius norm clamp rescales M in-place when its norm exceeds a threshold:
+
+```text
+if ||M||_F > m_norm_max:
+    M ← M × (m_norm_max / ||M||_F)
+```
+
+This is an engineering stability mechanism (not a paper equation). It prevents
+gradual norm divergence of the memory matrix M without polluting the forward/backward
+kernel hot paths with per-timestep reduction overhead. The backward pass uses
+straight-through estimation (clamp Jacobian = identity), same as gradient clipping.
+
+### Kernel (CUDA)
 
 ```c
 __global__ void m_norm_clamp_batch_kernel(float* m, int dd, float m_norm_max) {
@@ -127,7 +141,8 @@ m_norm_clamp_batch_f32_cuda(context_m, d, bs_mem as i32, m_norm_max);
 
 1. `cargo test --features cuda` — all existing tests pass
 2. New test: `test_batched_clamp_matches_single_loop` — for (d, batch_size) in
-   [(32,8), (64,4), (128,2), (64,1)], run both paths and compare element-wise (tol 1e-6)
+   [(32,8), (64,4), (128,2), (64,1)], run both paths and compare element-wise
+   (bit-identical expected since reduction order is the same; tol 1e-6 as defensive slack)
 3. New test: `test_batched_clamp_noop_when_below_threshold` — high m_norm_max, verify no-op
 4. Training equivalence: loss/gnorm unchanged vs pre-batched baseline
 
