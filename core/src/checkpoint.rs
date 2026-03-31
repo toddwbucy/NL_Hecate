@@ -814,6 +814,7 @@ mod tests {
             context: ContextState::new(1, d),
             global_step: 77,
             stream_cursors: Vec::new(),
+            total_tokens_seen: 0,
         };
 
         let dir = std::env::temp_dir().join("hecate_test_st_build");
@@ -924,6 +925,7 @@ mod tests {
             context: ContextState::new(cfg.k, d),
             global_step: 500,
             stream_cursors: Vec::new(),
+            total_tokens_seen: 0,
         };
 
         let dir = std::env::temp_dir().join("hecate_test_stacked_bs");

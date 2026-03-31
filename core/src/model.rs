@@ -2926,6 +2926,10 @@ pub struct BuildResumeState {
     /// `stream_cursor` (which remains for backward compat with batch=1 checkpoints).
     #[serde(default)]
     pub stream_cursors: Vec<StreamCursor>,
+    /// Cumulative tokens seen (CG-6: segment accounting). Defaults to 0 for
+    /// checkpoints saved before this field existed.
+    #[serde(default)]
+    pub total_tokens_seen: usize,
 }
 
 /// Declared checkpoint format (v1+). Schema-versioned with optional build-resume state.
@@ -3286,6 +3290,7 @@ mod tests {
             context: ContextState::new(1, d),
             global_step: 42,
             stream_cursors: Vec::new(),
+            total_tokens_seen: 0,
         };
 
         let dir = std::env::temp_dir().join("hecate_test_ckpt_build");

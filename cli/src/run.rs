@@ -162,6 +162,7 @@ pub fn run(config_path: &str, _resume: bool) {
 
     // ── Load checkpoint or init ──────────────────────────────────────
     let mut resume_step: usize = 0;
+    let mut resume_tokens: usize = 0;
     let mut resume_cursors: Vec<StreamCursor> = Vec::new();
 
     #[cfg(feature = "cuda")]
@@ -208,6 +209,7 @@ pub fn run(config_path: &str, _resume: bool) {
 
         if let Some(bs) = &build_state {
             resume_step = bs.global_step;
+            resume_tokens = bs.total_tokens_seen;
             // Restore per-slot cursors for batch>1 resume
             if !bs.stream_cursors.is_empty() {
                 resume_cursors = bs.stream_cursors.clone();
@@ -219,6 +221,7 @@ pub fn run(config_path: &str, _resume: bool) {
         if cfg.build.reset_step {
             eprintln!("  [reset_step: overriding checkpoint step {} → 0]", resume_step);
             resume_step = 0;
+            resume_tokens = 0;
             resume_cursors.clear();
         }
 
@@ -443,7 +446,7 @@ pub fn run(config_path: &str, _resume: bool) {
     let mut loss_first: Option<f32> = None;
     let mut loss_last: f32 = 0.0;
     let mut step_tokens: usize = 0;
-    let mut total_tokens_seen: usize = 0; // CG-6: cumulative tokens for segment accounting
+    let mut total_tokens_seen: usize = resume_tokens; // CG-6: cumulative tokens for segment accounting
     let mut aborted = false;
 
     for (phase_idx, phase) in phases.iter().enumerate() {
@@ -665,7 +668,7 @@ pub fn run(config_path: &str, _resume: bool) {
 
                     if do_checkpoint {
                         save_checkpoint(
-                            &save_path, global_step,
+                            &save_path, global_step, total_tokens_seen,
                             #[cfg(feature = "cuda")]
                             &gpu_params,
                             #[cfg(feature = "cuda")]
@@ -870,7 +873,7 @@ pub fn run(config_path: &str, _resume: bool) {
             // Synthesize a minimal loader list for checkpoint metadata
             let loaders_empty: Vec<BpeTokenStream> = Vec::new();
             save_checkpoint(
-                &save_path, global_step,
+                &save_path, global_step, total_tokens_seen,
                 &gpu_params,
                 &gpu_context,
                 &mag_cfg, &conductor, &chunk_sizes,
@@ -1046,6 +1049,7 @@ fn run_step(
 fn save_checkpoint(
     save_path: &str,
     global_step: usize,
+    total_tokens_seen: usize,
     #[cfg(feature = "cuda")] gpu_params: &GpuStackedParams,
     #[cfg(feature = "cuda")] gpu_context: &GpuStackedContext,
     mag_cfg: &MAGConfig,
@@ -1095,6 +1099,7 @@ fn save_checkpoint(
             context: host_context,
             global_step,
             stream_cursors,
+            total_tokens_seen,
         };
         match save_stacked_safetensors(
             Path::new(&ckpt_path), &host_params, mag_cfg,
