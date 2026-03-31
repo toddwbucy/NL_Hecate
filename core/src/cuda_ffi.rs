@@ -451,6 +451,10 @@ extern "C" {
     /// No-op if m_norm_max <= 0 or >= 1e30.
     pub(crate) fn m_norm_clamp_f32_cuda(m: *mut f32, d: i32, m_norm_max: f32);
 
+    /// Spec 65: batched M-norm clamp — one launch for batch_size independent d×d matrices.
+    /// m points to contiguous [batch_size, d*d] buffer.
+    pub(crate) fn m_norm_clamp_batch_f32_cuda(m: *mut f32, d: i32, batch_size: i32, m_norm_max: f32);
+
     // ── DGD delta norm ───────────────────────────────────────────────
 
     /// Compute ‖M @ k - v‖₂ — the DGD prediction error norm.

@@ -1234,13 +1234,11 @@ pub(crate) fn gpu_memory_forward(
                 );
                 crate::dispatch::cuda_sync();
                 copy_final_m_batch(&m_states, context_m, s, dd, bs);
-                for b in 0..bs {
-                    unsafe {
-                        crate::cuda_ffi::m_norm_clamp_f32_cuda(
-                            (context_m.ptr() as *mut u8).add(b * dd * 4) as *mut f32,
-                            d_i32, m_norm_max,
-                        );
-                    }
+                // Spec 65: batched clamp — one launch for all batch elements
+                unsafe {
+                    crate::cuda_ffi::m_norm_clamp_batch_f32_cuda(
+                        context_m.ptr(), d_i32, bs as i32, m_norm_max,
+                    );
                 }
                 // Fused path is exact only (spec 43: proxy uses chunkwise, not fused)
                 return (y, GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states, k_norms, q_norms, proxy: false });
@@ -1266,13 +1264,11 @@ pub(crate) fn gpu_memory_forward(
                 );
                 crate::dispatch::cuda_sync();
                 copy_final_m_batch(&m_states, context_m, s, dd, bs);
-                for b in 0..bs {
-                    unsafe {
-                        crate::cuda_ffi::m_norm_clamp_f32_cuda(
-                            (context_m.ptr() as *mut u8).add(b * dd * 4) as *mut f32,
-                            d_i32, m_norm_max,
-                        );
-                    }
+                // Spec 65: batched clamp — one launch for all batch elements
+                unsafe {
+                    crate::cuda_ffi::m_norm_clamp_batch_f32_cuda(
+                        context_m.ptr(), d_i32, bs as i32, m_norm_max,
+                    );
                 }
                 // Fused path is exact only (spec 43: proxy uses chunkwise, not fused)
                 return (y, GpuMemoryCache::Titans { k_mem, v_mem, q_mem, alpha, theta, eta, m_states, s_states, k_norms, q_norms, proxy: false });
@@ -1350,13 +1346,11 @@ pub(crate) fn gpu_memory_forward(
             }
             crate::dispatch::cuda_sync();
             copy_final_m_batch(&m_chunk_states, context_m, num_chunks, dd_mem, bs_mem);
-            for bh in 0..bs_mem {
-                unsafe {
-                    crate::cuda_ffi::m_norm_clamp_f32_cuda(
-                        (context_m.ptr() as *mut u8).add(bh * dd_mem * 4) as *mut f32,
-                        hd_i32, m_norm_max,
-                    );
-                }
+            // Spec 65: batched clamp — one launch for all batch-head elements
+            unsafe {
+                crate::cuda_ffi::m_norm_clamp_batch_f32_cuda(
+                    context_m.ptr(), hd_i32, bs_mem as i32, m_norm_max,
+                );
             }
             let y = reshape_from_per_head(&y_ph, batch_size, s, nh, hd);
             (y, GpuMemoryCache::DeltaChunkwise { k_mem, v_mem, q_mem, alpha, theta, m_chunk_states, k_norms, q_norms, chunk_size, num_chunks })
@@ -1372,13 +1366,11 @@ pub(crate) fn gpu_memory_forward(
             );
             crate::dispatch::cuda_sync();
             copy_final_m_batch(&m_states, context_m, s, dd_mem, bs_mem);
-            for bh in 0..bs_mem {
-                unsafe {
-                    crate::cuda_ffi::m_norm_clamp_f32_cuda(
-                        (context_m.ptr() as *mut u8).add(bh * dd_mem * 4) as *mut f32,
-                        hd_i32, m_norm_max,
-                    );
-                }
+            // Spec 65: batched clamp — one launch for all batch-head elements
+            unsafe {
+                crate::cuda_ffi::m_norm_clamp_batch_f32_cuda(
+                    context_m.ptr(), hd_i32, bs_mem as i32, m_norm_max,
+                );
             }
             let y = reshape_from_per_head(&y_ph, batch_size, s, nh, hd);
             (y, GpuMemoryCache::Delta { k_mem, v_mem, q_mem, alpha, theta, m_states, k_norms, q_norms, proxy: false })
@@ -1411,13 +1403,11 @@ pub(crate) fn gpu_memory_forward(
             }
             crate::dispatch::cuda_sync();
             copy_final_m_batch(&m_chunk_states, context_m, num_chunks, dd_mem, bs_mem);
-            for bh in 0..bs_mem {
-                unsafe {
-                    crate::cuda_ffi::m_norm_clamp_f32_cuda(
-                        (context_m.ptr() as *mut u8).add(bh * dd_mem * 4) as *mut f32,
-                        hd_i32, m_norm_max,
-                    );
-                }
+            // Spec 65: batched clamp — one launch for all batch-head elements
+            unsafe {
+                crate::cuda_ffi::m_norm_clamp_batch_f32_cuda(
+                    context_m.ptr(), hd_i32, bs_mem as i32, m_norm_max,
+                );
             }
             let y = reshape_from_per_head(&y_ph, batch_size, s, nh, hd);
             (y, GpuMemoryCache::TitansChunkwise { k_mem, v_mem, q_mem, alpha, theta, eta: eta_dm, m_chunk_states, s_chunk_states, k_norms, q_norms, chunk_size, num_chunks })
@@ -1442,13 +1432,11 @@ pub(crate) fn gpu_memory_forward(
             crate::dispatch::cuda_sync();
             // Copy per-head final M back to context_m
             copy_final_m_batch(&m_states, context_m, s, dd_mem, bs_mem);
-            for bh in 0..bs_mem {
-                unsafe {
-                    crate::cuda_ffi::m_norm_clamp_f32_cuda(
-                        (context_m.ptr() as *mut u8).add(bh * dd_mem * 4) as *mut f32,
-                        hd_i32, m_norm_max,
-                    );
-                }
+            // Spec 65: batched clamp — one launch for all batch-head elements
+            unsafe {
+                crate::cuda_ffi::m_norm_clamp_batch_f32_cuda(
+                    context_m.ptr(), hd_i32, bs_mem as i32, m_norm_max,
+                );
             }
             // Transpose y from [bs*nh, s, hd] → [bs, s, d]
             let y = reshape_from_per_head(&y_ph, batch_size, s, nh, hd);
@@ -1467,13 +1455,11 @@ pub(crate) fn gpu_memory_forward(
             );
             crate::dispatch::cuda_sync();
             copy_final_m_batch(&m_states, context_m, s, dd_mem, bs_mem);
-            for bh in 0..bs_mem {
-                unsafe {
-                    crate::cuda_ffi::m_norm_clamp_f32_cuda(
-                        (context_m.ptr() as *mut u8).add(bh * dd_mem * 4) as *mut f32,
-                        hd_i32, m_norm_max,
-                    );
-                }
+            // Spec 65: batched clamp — one launch for all batch-head elements
+            unsafe {
+                crate::cuda_ffi::m_norm_clamp_batch_f32_cuda(
+                    context_m.ptr(), hd_i32, bs_mem as i32, m_norm_max,
+                );
             }
             let y = reshape_from_per_head(&y_ph, batch_size, s, nh, hd);
             (y, GpuMemoryCache::Hebbian { k_mem, v_mem, q_mem, alpha, m_states, k_norms, q_norms })
@@ -1515,11 +1501,13 @@ pub(crate) fn gpu_memory_forward(
                         dd_mem * 4,
                     );
                     assert_eq!(rc, 0, "copy final ckpt failed for head {h}");
-                    crate::cuda_ffi::m_norm_clamp_f32_cuda(
-                        (context_m.ptr() as *mut u8).add(dst_offset * 4) as *mut f32,
-                        hd_i32, m_norm_max,
-                    );
                 }
+            }
+            // Spec 65: batched clamp after all copies
+            unsafe {
+                crate::cuda_ffi::m_norm_clamp_batch_f32_cuda(
+                    context_m.ptr(), hd_i32, nh as i32, m_norm_max,
+                );
             }
             let y = reshape_from_per_head(&y_ph, batch_size, s, nh, hd);
             (y, GpuMemoryCache::DeltaCkpt { k_mem, v_mem, q_mem, alpha, theta, m_checkpoints, checkpoint_interval: c, k_norms, q_norms })
@@ -1564,11 +1552,13 @@ pub(crate) fn gpu_memory_forward(
                         dd_mem * 4,
                     );
                     assert_eq!(rc, 0, "copy final ckpt failed for head {h}");
-                    crate::cuda_ffi::m_norm_clamp_f32_cuda(
-                        (context_m.ptr() as *mut u8).add(dst_offset * 4) as *mut f32,
-                        hd_i32, m_norm_max,
-                    );
                 }
+            }
+            // Spec 65: batched clamp after all copies
+            unsafe {
+                crate::cuda_ffi::m_norm_clamp_batch_f32_cuda(
+                    context_m.ptr(), hd_i32, nh as i32, m_norm_max,
+                );
             }
             let y = reshape_from_per_head(&y_ph, batch_size, s, nh, hd);
             (y, GpuMemoryCache::TitansCkpt { k_mem, v_mem, q_mem, alpha, theta, eta: eta_dm, m_checkpoints, s_checkpoints, checkpoint_interval: c, k_norms, q_norms })
@@ -1604,11 +1594,13 @@ pub(crate) fn gpu_memory_forward(
                         dd_mem * 4,
                     );
                     assert_eq!(rc, 0, "copy final ckpt failed for head {h}");
-                    crate::cuda_ffi::m_norm_clamp_f32_cuda(
-                        (context_m.ptr() as *mut u8).add(dst_offset * 4) as *mut f32,
-                        hd_i32, m_norm_max,
-                    );
                 }
+            }
+            // Spec 65: batched clamp after all copies
+            unsafe {
+                crate::cuda_ffi::m_norm_clamp_batch_f32_cuda(
+                    context_m.ptr(), hd_i32, nh as i32, m_norm_max,
+                );
             }
             let y = reshape_from_per_head(&y_ph, batch_size, s, nh, hd);
             (y, GpuMemoryCache::HebbianCkpt { k_mem, v_mem, q_mem, alpha, m_checkpoints, checkpoint_interval: c, k_norms, q_norms })
@@ -2170,14 +2162,11 @@ pub(crate) fn gpu_tnt_forward(
         }
         crate::dispatch::cuda_sync();
 
-        // Apply m_norm_clamp per head
-        for h in 0..bs_mem {
-            unsafe {
-                crate::cuda_ffi::m_norm_clamp_f32_cuda(
-                    (context_m.ptr() as *mut u8).add(h * dd_mem * 4) as *mut f32,
-                    hd_i32, m_norm_max,
-                );
-            }
+        // Spec 65: batched clamp — one launch for all batch-head elements
+        unsafe {
+            crate::cuda_ffi::m_norm_clamp_batch_f32_cuda(
+                context_m.ptr(), hd_i32, bs_mem as i32, m_norm_max,
+            );
         }
 
         // Save caches for backward — inner caches are cycle-scoped,
@@ -2646,13 +2635,11 @@ fn gpu_cms_replay(
             let m_states = &context.level_scratch[level].m_states;
             copy_final_m_batch(m_states, &mut context.memory[level], s, dd, bs);
             let m_norm_max = cfg.max_m_norm(level);
-            for b in 0..bs {
-                unsafe {
-                    crate::cuda_ffi::m_norm_clamp_f32_cuda(
-                        (context.memory[level].ptr() as *mut u8).add(b * dd * 4) as *mut f32,
-                        d_i32, m_norm_max,
-                    );
-                }
+            // Spec 65: batched clamp — one launch for all batch elements
+            unsafe {
+                crate::cuda_ffi::m_norm_clamp_batch_f32_cuda(
+                    context.memory[level].ptr(), d_i32, bs as i32, m_norm_max,
+                );
             }
         }
     }
