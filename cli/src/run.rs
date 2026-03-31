@@ -34,7 +34,7 @@ use crate::config::{Config, OptimizerConfig, PhaseDuration};
 use crate::data::BpeTokenStream;
 #[cfg(feature = "cuda")]
 use crate::eval::run_inline_probes;
-use crate::log::{MetricsLogger, CmsDiagnostics, CmsTapeLogger};
+use crate::log::{MetricsLogger, CmsDiagnostics, CmsTapeLogger, TOKENS_PER_SEGMENT};
 use crate::sample::sample_token;
 
 /// Cosine annealing with linear warmup.
@@ -644,7 +644,7 @@ pub fn run(config_path: &str, _resume: bool) {
                         let ppl = (loss as f64).exp();
                         let rss_mb = get_rss_mb();
 
-                        let segments = total_tokens_seen / 512;
+                        let segments = total_tokens_seen / TOKENS_PER_SEGMENT;
                         eprintln!("  step {:>6}  seg={segments:<8}  loss={loss:.4}  ppl={ppl:.1}  tok/s={tok_s:.0}  gnorm={grad_norm:.4}  lr={lr:.6}  rss={rss_mb}MB",
                             global_step);
 
@@ -899,7 +899,7 @@ pub fn run(config_path: &str, _resume: bool) {
     let tok_s = step_tokens as f64 / elapsed;
     eprintln!();
     eprintln!("============================================================");
-    let total_segments = total_tokens_seen / 512;
+    let total_segments = total_tokens_seen / TOKENS_PER_SEGMENT;
     eprintln!("  Phases:   {} complete", phases.len());
     eprintln!("  Steps:    {global_step} ({elapsed:.0}s)");
     eprintln!("  Segments: {total_segments} ({} tokens)", fmt_num(total_tokens_seen));
