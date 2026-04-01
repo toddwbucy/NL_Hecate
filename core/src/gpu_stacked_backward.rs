@@ -397,7 +397,24 @@ pub fn gpu_stacked_backward(
             // Spec 63: chain gnorm sync deferred to post-loop (deferred_chain_gnorms).
             // keep-alive buffers live in all_keep_alive — freed after block loop.
 
-            // d_upstream is now d_ln_mem_out (at full resolution [bs*s, d])
+            // Backward through level-0 pool: forward pooled ln_mem_out [bs*s, d] → [bs*s_f, d].
+            // The inter-level pool backward (level > 0 guard above) doesn't handle this.
+            // Use cached level_seq_lens rather than re-deriving from chunk_sizes — safer if
+            // ActivationWindow::assemble_cache computes s_f differently than forward_sequence.
+            if bc.level_seq_lens[0] < s {
+                let c0 = s / bc.level_seq_lens[0];
+                let mut d_full = GpuBuf::zeros(bsd);
+                unsafe {
+                    crate::cuda_ffi::mean_pool_1d_backward_f32_cuda(
+                        d_upstream.as_ptr(), d_full.ptr(),
+                        bs as i32, s as i32, d as i32, c0 as i32,
+                    );
+                }
+                let old = std::mem::replace(&mut d_upstream, d_full);
+                all_keep_alive.push(old);
+            }
+
+            // d_upstream is now at full resolution [bs*s, d]
             d_mem_input = d_upstream;
         } else {
             // ── Independent/FreqGated aggregation backward ──────────

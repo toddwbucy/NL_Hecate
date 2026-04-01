@@ -39,7 +39,9 @@ use crate::config::Config;
 use crate::log::MetricsLogger;
 use crate::sample::sample_token;
 #[cfg(feature = "cuda")]
-use crate::step::{generate, host_cross_entropy_loss};
+use crate::step::generate;
+#[cfg(feature = "cuda")]
+use nl_hecate_core::gpu_stacked_forward::gpu_cross_entropy_loss;
 
 // Probing prompts matched to FineWeb-Edu domain (educational text)
 const PROBE_PROMPTS: &[&str] = &[
@@ -538,7 +540,7 @@ fn generate_learning_losses(
         let cache = window.assemble_cache(mag_cfg, &target_ids);
 
         // Compute loss on host from assembled logits + targets
-        let loss = host_cross_entropy_loss(&cache.logits, &target_ids, v, win_len);
+        let loss = gpu_cross_entropy_loss(&cache.logits, &cache.target_ids_gpu, &target_ids, v, win_len);
 
         if loss.is_nan() || loss.is_infinite() { break; }
         losses.push(loss);

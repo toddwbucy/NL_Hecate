@@ -1034,6 +1034,40 @@ pub fn forward_single_token(
 
 /// Process N tokens per-token through the model (generation path).
 ///
+/// Spec 72: GPU-side cross-entropy loss — 4-byte D2H instead of s×v×4 host copy.
+/// Calls the existing cross_entropy_forward_cuda kernel (fused softmax + NLL).
+#[cfg(feature = "cuda")]
+pub fn gpu_cross_entropy_loss(
+    logits_gpu: &GpuBuf<f32>,
+    target_ids_gpu: &GpuBuf<f32>,
+    target_ids_host: &[usize],
+    vocab_size: usize,
+    seq_len: usize,
+) -> f32 {
+    assert_eq!(target_ids_host.len(), seq_len,
+        "gpu_cross_entropy_loss: target_ids_host.len()={} != seq_len={}", target_ids_host.len(), seq_len);
+
+    let valid_count = target_ids_host.iter()
+        .filter(|&&t| t < vocab_size)
+        .count();
+    if valid_count == 0 { return 0.0; }
+
+    let loss_buf = GpuBuf::<f32>::zeros(1);
+    unsafe {
+        crate::cuda_ffi::cross_entropy_forward_cuda(
+            logits_gpu.as_ptr(),
+            target_ids_gpu.ptr() as *const i32,
+            loss_buf.ptr(),
+            seq_len as i32, vocab_size as i32,
+        );
+    }
+    crate::dispatch::cuda_sync();
+
+    let mut loss_host = [0.0f32; 1];
+    loss_buf.copy_to_host(&mut loss_host);
+    loss_host[0] / valid_count as f32
+}
+
 /// Returns logits for the last token (for sampling during generation).
 /// Saves per-token activations into ActivationWindow for deferred backward.
 ///
