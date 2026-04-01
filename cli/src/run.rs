@@ -550,7 +550,14 @@ pub fn run(config_path: &str, _resume: bool) {
                         None
                     };
 
-                    // Process each batch sample through the unified forward path
+                    // Process each batch sample sequentially through the unified forward path.
+                    // NOTE: This is intentionally sequential — gpu_stacked_forward_tokens
+                    // processes tokens one-at-a-time through ActivationWindow, so each
+                    // sample gets its own forward→backward→update pass. This matches the
+                    // NL paradigm (forward IS optimization) but means batch_size > 1
+                    // doesn't benefit from GPU-parallel batching.
+                    // TODO: If throughput for batch_size > 1 becomes critical, extend
+                    // the unified path to support batched token processing.
                     #[cfg(feature = "cuda")]
                     let (loss, _gnorm_deferred, block_level_gnorms) = {
                         let mut total_loss = 0.0f32;
