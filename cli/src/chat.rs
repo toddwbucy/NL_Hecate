@@ -24,10 +24,8 @@ use nl_hecate_core::model::{
 use nl_hecate_core::gpu_params::{GpuStackedParams, GpuStackedContext};
 #[cfg(feature = "cuda")]
 use nl_hecate_core::gpu_stacked_forward::{
-    gpu_stacked_prefill, gpu_stacked_decode_token, StackedDecodeWorkspace,
+    gpu_stacked_forward_tokens, StackedDecodeWorkspace, ActivationWindow,
 };
-#[cfg(feature = "cuda")]
-use nl_hecate_core::gpu_stacked_forward::gpu_stacked_forward;
 #[cfg(feature = "cuda")]
 use nl_hecate_core::gpu_stacked_backward::gpu_stacked_backward;
 #[cfg(feature = "cuda")]
@@ -38,7 +36,8 @@ use nl_hecate_core::gpu_stacked_optimizer::{
 use nl_hecate_core::gpu_forward::GpuKVCache;
 
 use crate::config::Config;
-use crate::sample::{sample_token, safe_pad_token};
+use crate::eval::host_cross_entropy_loss;
+use crate::sample::sample_token;
 
 // ChatML special token IDs (must match tokenizer training in prepare_sharegpt.py)
 const IM_START: u32 = 0; // <|im_start|>
@@ -316,80 +315,96 @@ pub fn chat(
                 prompt
             };
 
-            // Pad/truncate to seq_len for prefill
-            let safe_pad = safe_pad_token(&prompt_tokens, v);
-            let ctx: Vec<usize> = if prompt_tokens.len() >= seq_len {
+            // Truncate to seq_len if needed (no padding — unified path handles variable-length)
+            let ctx: Vec<usize> = if prompt_tokens.len() > seq_len {
                 prompt_tokens[prompt_tokens.len() - seq_len..].to_vec()
             } else {
-                let pad_count = seq_len - prompt_tokens.len();
-                let mut padded = vec![safe_pad; pad_count];
-                padded.extend_from_slice(&prompt_tokens);
-                padded
+                prompt_tokens.clone()
             };
 
             let t0 = Instant::now();
 
             // ── LEARN step (if enabled) ──────────────────────────
-            if learn {
-                // Create shifted target for next-token prediction
-                let target: Vec<usize> = ctx[1..].iter().chain(std::iter::once(&ctx[0])).copied().collect();
-                let pulse = conductor.pulse();
+            // Same composable path as eval probes: forward → backward → update
+            if learn && ctx.len() >= 2 {
+                let mut learn_kv: Vec<GpuKVCache> = (0..n_blocks)
+                    .map(|_| GpuKVCache::new(ctx.len(), d, 1))
+                    .collect();
+                let mut learn_ws = StackedDecodeWorkspace::new(n_blocks, d, v);
+                let mut window = ActivationWindow::new(seq_len);
 
-                let (loss, cache) = gpu_stacked_forward(
-                    &gpu_params, &mag_cfg, &ctx, &target,
-                    &pulse, &mut gpu_context, &mut None,
-                );
-                let mut grads = gpu_stacked_backward(
-                    &gpu_params, &mag_cfg, &cache, &mut None, false,
+                gpu_stacked_forward_tokens(
+                    &gpu_params, &mag_cfg, &ctx,
+                    &mut conductor, &mut gpu_context,
+                    &mut learn_kv, &mut learn_ws,
+                    Some(&mut window),
                 );
 
-                if adamw_state.is_none() {
-                    adamw_state = Some(GpuStackedAdamWState::from_params(&gpu_params));
+                // Build targets: shifted by 1 (next-token prediction)
+                let win_len = window.len();
+                let mut target_ids: Vec<usize> = Vec::with_capacity(win_len);
+                for i in 1..win_len {
+                    target_ids.push(window.entries[i].token_id);
                 }
-                let aw = adamw_state.as_mut().unwrap();
-                let lr = cfg.build.optimizer.lr();
-                let gnorm = gpu_stacked_adamw_update(
-                    &mut gpu_params, &mut grads, aw,
-                    &pulse,
-                    lr, cfg.build.optimizer.beta1(), cfg.build.optimizer.beta2(), 1e-8,
-                    cfg.build.optimizer.weight_decay(), cfg.build.max_grad_norm,
-                    false, &mut None,
-                );
-                gpu_stacked_sync_embed_weights(&mut gpu_params, d, v);
-                gpu_context.update_m_norm_tracking();
+                target_ids.push(v); // mask last position
 
-                conductor.advance();
-                eprintln!("  \x1b[2m[learn: loss={loss:.4}, gnorm={gnorm:.4}]\x1b[0m");
+                let cache = window.assemble_cache(&mag_cfg, &target_ids);
+                let loss = host_cross_entropy_loss(&cache.logits, &target_ids, v, win_len);
+
+                if !loss.is_nan() && !loss.is_infinite() {
+                    let mut grads = gpu_stacked_backward(
+                        &gpu_params, &mag_cfg, &cache, &mut None, false,
+                    );
+
+                    if adamw_state.is_none() {
+                        adamw_state = Some(GpuStackedAdamWState::from_params(&gpu_params));
+                    }
+                    let aw = adamw_state.as_mut().unwrap();
+                    let lr = cfg.build.optimizer.lr();
+                    let gnorm = gpu_stacked_adamw_update(
+                        &mut gpu_params, &mut grads, aw,
+                        &cache.pulse,
+                        lr, cfg.build.optimizer.beta1(), cfg.build.optimizer.beta2(), 1e-8,
+                        cfg.build.optimizer.weight_decay(), cfg.build.max_grad_norm,
+                        false, &mut None,
+                    );
+                    gpu_stacked_sync_embed_weights(&mut gpu_params, d, v);
+                    gpu_context.update_m_norm_tracking();
+
+                    eprintln!("  \x1b[2m[learn: loss={loss:.4}, gnorm={gnorm:.4}]\x1b[0m");
+                }
             }
 
             // ── SPEAK: generate response ─────────────────────────
-            let mut kv_caches: Vec<GpuKVCache> = Vec::new();
-            let speak_pulse = conductor.pulse();
-            let logits = gpu_stacked_prefill(
-                &gpu_params, &mag_cfg, &ctx, &speak_pulse,
-                &mut gpu_context, &mut kv_caches, &mut None,
+            // Same composable path as generate.rs: forward tokens → sample → forward next
+            let mut kv_caches: Vec<GpuKVCache> = (0..n_blocks)
+                .map(|_| GpuKVCache::new(ctx.len() + max_tokens, d, 1))
+                .collect();
+            let mut decode_ws = StackedDecodeWorkspace::new(n_blocks, d, v);
+
+            let logits = gpu_stacked_forward_tokens(
+                &gpu_params, &mag_cfg, &ctx,
+                &mut conductor, &mut gpu_context,
+                &mut kv_caches, &mut decode_ws,
+                None,
             );
 
             let mut gen_tokens: Vec<usize> = Vec::new();
-            let mut next_tok = sample_token(&logits, temperature, top_k);
+            let mut last_logits = logits;
 
-            // Stop on IM_END or max tokens
-            if next_tok != IM_END as usize {
+            for _ in 0..max_tokens {
+                let next_tok = sample_token(&last_logits, temperature, top_k);
+                if next_tok == IM_END as usize {
+                    break;
+                }
                 gen_tokens.push(next_tok);
 
-                let mut decode_ws = StackedDecodeWorkspace::new(n_blocks, d, v);
-                for _ in 1..max_tokens {
-                    let dp = conductor.pulse();
-                    let logits = gpu_stacked_decode_token(
-                        &gpu_params, &mag_cfg, next_tok, &dp,
-                        &mut gpu_context, &mut kv_caches, &mut decode_ws,
-                    );
-                    next_tok = sample_token(&logits, temperature, top_k);
-                    if next_tok == IM_END as usize {
-                        break;
-                    }
-                    gen_tokens.push(next_tok);
-                }
+                last_logits = gpu_stacked_forward_tokens(
+                    &gpu_params, &mag_cfg, &[next_tok],
+                    &mut conductor, &mut gpu_context,
+                    &mut kv_caches, &mut decode_ws,
+                    None,
+                );
             }
 
             let elapsed = t0.elapsed().as_secs_f64();
