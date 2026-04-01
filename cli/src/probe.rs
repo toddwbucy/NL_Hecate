@@ -165,6 +165,7 @@ pub fn run_probes(
     // ── GPU setup ────────────────────────────────────────────────────
     #[cfg(feature = "cuda")]
     {
+        nl_hecate_core::gpu_buf::gpu_pool_enable();
         let mut gpu_params = GpuStackedParams::from_host(&host_params);
         let mut gpu_context = GpuStackedContext::new(
             n_blocks, k, d, 1, Some(&mag_cfg),
