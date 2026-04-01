@@ -141,10 +141,15 @@ std::thread_local! {
 
 /// Enable the GPU buffer pool. Call once before the build loop.
 /// After this, GpuBuf allocations recycle freed buffers instead of calling cudaMalloc.
+/// Safe to call multiple times — drains any existing pool first.
 #[cfg(feature = "cuda")]
 pub fn gpu_pool_enable() {
     GPU_POOL.with(|cell| {
-        *cell.borrow_mut() = Some(GpuPool::new());
+        let mut slot = cell.borrow_mut();
+        if let Some(mut old) = slot.take() {
+            old.drain();
+        }
+        *slot = Some(GpuPool::new());
     });
 }
 

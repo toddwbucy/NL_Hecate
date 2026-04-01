@@ -137,8 +137,8 @@ pub fn gpu_pool_stats() -> Option<PoolStats> {
 | File | Change |
 |------|--------|
 | `core/src/gpu_buf.rs` | Add `GpuPool`, `PoolStats`, thread-local `GPU_POOL`. Modify `GpuBuf::new()` to try pool first. Modify `Drop` to return to pool. Add `gpu_pool_enable()`, `gpu_pool_drain()`, `gpu_pool_stats()`. |
-| `core/src/lib.rs` | Re-export `gpu_pool_enable`, `gpu_pool_drain`, `gpu_pool_stats`. |
-| `cli/src/run.rs` | Call `gpu_pool_enable()` before build loop. Call `gpu_pool_drain()` on clean exit, log stats. |
+| `cli/src/feed.rs` | Call `gpu_pool_enable()` before build loop. Call `gpu_pool_drain()` on clean exit, log stats. |
+| `cli/src/probe.rs` | Call `gpu_pool_enable()` before generation. Call `gpu_pool_drain()` on exit. |
 
 ### What does NOT change
 

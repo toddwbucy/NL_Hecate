@@ -287,6 +287,9 @@ pub fn run_probes(
 
         eprintln!("\n{sep}");
         eprintln!("Probes complete.");
+        let pool_stats = nl_hecate_core::gpu_buf::gpu_pool_drain();
+        eprintln!("  GPU pool: {} hits, {} misses, {} unique sizes",
+            pool_stats.hits, pool_stats.misses, pool_stats.unique_sizes);
         eprintln!("{sep}");
     }
 }
