@@ -705,11 +705,16 @@ fn assemble_m_states(
     let chunk = bs_mem * dd;
 
     // Build full trajectory [M_0, M_1, ..., M_s] from per-token [M_t, M_{t+1}] caches.
+    // Each per-token cache must have at least 2 chunks (initial + final M).
     let total = (s + 1) * chunk;
     let out = GpuBuf::<f32>::zeros(total);
 
     for (t, cache) in caches.iter().enumerate() {
         let src = extract_m_or_s_states(cache, is_s_states);
+        assert!(src.len() >= 2 * chunk,
+            "assemble_m_states: per-token cache has {} elements but needs >= {} (2 chunks). \
+             Proxy-only caches (1 chunk) cannot be assembled into a full trajectory.",
+            src.len(), 2 * chunk);
         // Copy M_t (first chunk of each per-token cache)
         let dst_offset = t * chunk * 4;
         unsafe {
@@ -1268,6 +1273,11 @@ fn forward_sequence(
             for level in 0..cfg.k {
                 let c = cfg.chunk_sizes.get(level).copied().unwrap_or(1);
                 let s_f = s / c.max(1);
+                assert!(s_f > 0, "chunk_size {c} > seq_len {s} at level {level} — \
+                    chunk_size must be <= seq_len");
+                assert!(c <= 1 || s % c == 0,
+                    "seq_len {s} not divisible by chunk_size {c} at level {level} — \
+                    would silently drop {remain} tail tokens", remain = s % c);
                 let effective_active = pulse.active_levels[level]
                     || matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp);
 
@@ -1331,6 +1341,11 @@ fn forward_sequence(
             for level in 0..cfg.k {
                 let c = cfg.chunk_sizes.get(level).copied().unwrap_or(1);
                 let s_f = s / c.max(1);
+                assert!(s_f > 0, "chunk_size {c} > seq_len {s} at level {level} — \
+                    chunk_size must be <= seq_len");
+                assert!(c <= 1 || s % c == 0,
+                    "seq_len {s} not divisible by chunk_size {c} at level {level} — \
+                    would silently drop {remain} tail tokens", remain = s % c);
                 let effective_active = pulse.active_levels[level]
                     || matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp);
 
