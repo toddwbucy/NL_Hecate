@@ -3,7 +3,7 @@
 ## CONTRACT
 - **Purpose**: Eliminate the host-side logits readback bottleneck by wiring the existing GPU cross-entropy kernel into the stacked forward path.
 - **Expects**: `cross_entropy_forward_cuda` kernel (already in `core/kernels/cross_entropy.cu`), `GpuStackedCache` with `logits` (GPU), `target_ids_gpu` (GPU), `target_ids_i32` (host).
-- **Guarantees**: Loss computation stays entirely on GPU. D2H transfer drops from `seq_len × vocab_size × 4` bytes to 4 bytes per step. Bit-identical loss values (same log-sum-exp arithmetic). No change to backward path (already uses `cross_entropy_backward_cuda`).
+- **Guarantees**: Loss computation stays entirely on GPU. D2H transfer drops from `seq_len × vocab_size × 4` bytes to 4 bytes per step. Loss values match within f32 tolerance (GPU `atomicAdd` reduction order may differ from sequential host sum). No change to backward path (already uses `cross_entropy_backward_cuda`).
 - **Cost**: Zero new kernels, zero new CUDA code. Wiring change only.
 - **Trade-off**: None — strictly eliminates waste.
 - **Position**: Infrastructure optimization. Unblocks sustained GPU utilization for build runs.
@@ -81,7 +81,7 @@ fn gpu_cross_entropy_loss(
 
 ### Data flow
 
-```
+```text
 Before:  logits [s×v GPU] → copy_to_host [s×v host] → CPU log-sum-exp → scalar
 After:   logits [s×v GPU] → GPU kernel → scalar [1 GPU] → copy_to_host [1 host]
 
@@ -105,6 +105,6 @@ The 4-byte scalar loss is still read back every step. NaN/Inf detection works ex
 ## Verification
 
 1. `cargo test --features cuda --lib` — all existing tests pass
-2. Loss values match `host_cross_entropy_loss` within f32 epsilon (same arithmetic)
+2. Loss values match `host_cross_entropy_loss` within f32 tolerance (`atomicAdd` reduction order differs from sequential host sum)
 3. nvtop: GPU idle gaps between forward and backward should shrink dramatically
 4. tok/s improvement measurable on d=1024 build

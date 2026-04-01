@@ -399,8 +399,10 @@ pub fn gpu_stacked_backward(
 
             // Backward through level-0 pool: forward pooled ln_mem_out [bs*s, d] → [bs*s_f, d].
             // The inter-level pool backward (level > 0 guard above) doesn't handle this.
-            let c0 = cfg.chunk_sizes.get(0).copied().unwrap_or(1);
-            if c0 > 1 {
+            // Use cached level_seq_lens rather than re-deriving from chunk_sizes — safer if
+            // ActivationWindow::assemble_cache computes s_f differently than forward_sequence.
+            if bc.level_seq_lens[0] < s {
+                let c0 = s / bc.level_seq_lens[0];
                 let mut d_full = GpuBuf::zeros(bsd);
                 unsafe {
                     crate::cuda_ffi::mean_pool_1d_backward_f32_cuda(

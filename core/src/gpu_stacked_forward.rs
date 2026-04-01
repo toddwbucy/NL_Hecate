@@ -1044,6 +1044,9 @@ pub fn gpu_cross_entropy_loss(
     vocab_size: usize,
     seq_len: usize,
 ) -> f32 {
+    assert_eq!(target_ids_host.len(), seq_len,
+        "gpu_cross_entropy_loss: target_ids_host.len()={} != seq_len={}", target_ids_host.len(), seq_len);
+
     let valid_count = target_ids_host.iter()
         .filter(|&&t| t < vocab_size)
         .count();
