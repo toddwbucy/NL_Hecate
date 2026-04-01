@@ -189,11 +189,13 @@ pub fn run_probes(
             let mut decode_ws = StackedDecodeWorkspace::new(n_blocks, d, v);
             let mut conductor = Conductor::new(k, chunk_sizes.clone());
 
+            let mut window = ActivationWindow::new(seq_len);
+
             // Process prompt
             let logits = gpu_stacked_forward_tokens(
                 &gpu_params, &mag_cfg, &prompt_ids,
                 &mut conductor, &mut gpu_context, &mut kv_caches, &mut decode_ws,
-                None,
+                &mut window,
             );
 
             // Generate tokens (same function, one at a time)
@@ -205,7 +207,7 @@ pub fn run_probes(
                 last_logits = gpu_stacked_forward_tokens(
                     &gpu_params, &mag_cfg, &[next_tok],
                     &mut conductor, &mut gpu_context, &mut kv_caches, &mut decode_ws,
-                    None,
+                    &mut window,
                 );
             }
 
@@ -368,11 +370,13 @@ pub fn run_inline_probes(
         let mut decode_ws = StackedDecodeWorkspace::new(n_blocks, d, v);
         let mut conductor = Conductor::new(k, chunk_sizes.to_vec());
 
+        let mut window = ActivationWindow::new(seq_len);
+
         // Process prompt
         let logits = gpu_stacked_forward_tokens(
             &gpu_params, &probe_cfg, &prompt_ids,
             &mut conductor, &mut gpu_context, &mut kv_caches, &mut decode_ws,
-            None,
+            &mut window,
         );
 
         // Generate tokens (same function)
@@ -384,7 +388,7 @@ pub fn run_inline_probes(
             last_logits = gpu_stacked_forward_tokens(
                 &gpu_params, &probe_cfg, &[next_tok],
                 &mut conductor, &mut gpu_context, &mut kv_caches, &mut decode_ws,
-                None,
+                &mut window,
             );
         }
 
@@ -587,7 +591,7 @@ fn generate_learning_losses(
     gpu_stacked_forward_tokens(
         gpu_params, mag_cfg, prompt_ids,
         conductor, gpu_context, &mut kv_caches, &mut decode_ws,
-        Some(&mut window),
+        &mut window,
     );
 
     // Generate tokens: each one gets forward → backward → update → sample
@@ -640,7 +644,7 @@ fn generate_learning_losses(
         gpu_stacked_forward_tokens(
             gpu_params, mag_cfg, &[next_tok],
             conductor, gpu_context, &mut kv_caches, &mut decode_ws,
-            Some(&mut window),
+            &mut window,
         );
     }
 

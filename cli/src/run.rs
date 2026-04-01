@@ -835,11 +835,13 @@ pub fn run(config_path: &str, _resume: bool) {
                             .collect();
                         let mut decode_ws = StackedDecodeWorkspace::new(n_blocks, d, v);
 
+                        let mut speak_window = ActivationWindow::new(phase_seq_len);
+
                         let logits = gpu_stacked_forward_tokens(
                             &gpu_params, &mag_cfg, &input,
                             &mut conductor, &mut gpu_context,
                             &mut kv_caches, &mut decode_ws,
-                            None, // no activation saving for generation
+                            &mut speak_window,
                         );
 
                         // Decode loop: generate output tokens
@@ -852,7 +854,7 @@ pub fn run(config_path: &str, _resume: bool) {
                                 &gpu_params, &mag_cfg, &[next_tok],
                                 &mut conductor, &mut gpu_context,
                                 &mut kv_caches, &mut decode_ws,
-                                None,
+                                &mut speak_window,
                             );
                             next_tok = sample_token(&logits, gen_temp, gen_top_k);
                             output.push(next_tok);
@@ -1045,7 +1047,7 @@ fn run_step(
     gpu_stacked_forward_tokens(
         gpu_params, mag_cfg, tokens,
         conductor, gpu_context, &mut kv_caches, &mut ws,
-        Some(&mut window),
+        &mut window,
     );
 
     // Assemble activation cache for backward (recomputes batched SWA attention)

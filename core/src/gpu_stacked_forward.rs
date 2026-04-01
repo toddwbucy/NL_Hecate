@@ -17,28 +17,7 @@ use crate::model::{MAGConfig, MemoryRuleKind, HopeVariant};
 #[cfg(feature = "cuda")]
 use crate::conductor::Pulse;
 #[cfg(feature = "cuda")]
-use crate::parallel::ParallelStrategy;
-#[cfg(feature = "cuda")]
-use crate::gpu_forward::{GpuMemoryCache, gpu_memory_forward, gpu_memory_read_only, gpu_tnt_forward};
-#[cfg(feature = "cuda")]
-use crate::gpu_profiler::GpuProfiler;
-#[cfg(feature = "cuda")]
-use crate::{prof_start, prof_stop};
-
-// ══════════════════════════════════════════════════════════════════════
-// Debug: set HECATE_DEBUG_CMS=1 to log CMS dispatch on pattern changes
-// ══════════════════════════════════════════════════════════════════════
-
-#[cfg(feature = "cuda")]
-static DEBUG_CMS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    std::env::var("HECATE_DEBUG_CMS").map(|v| v == "1").unwrap_or(false)
-});
-
-#[cfg(feature = "cuda")]
-use std::sync::Mutex;
-#[cfg(feature = "cuda")]
-static LAST_CMS_PATTERN: std::sync::LazyLock<Mutex<(Vec<bool>, usize)>> =
-    std::sync::LazyLock::new(|| Mutex::new((Vec::new(), 0)));
+use crate::gpu_forward::{GpuMemoryCache, gpu_memory_forward, gpu_memory_read_only};
 
 // ══════════════════════════════════════════════════════════════════════
 // GpuStackedBlockCache — per-block forward activations
@@ -121,7 +100,7 @@ pub struct GpuStackedCache {
 // Stacked decode workspace — pre-allocated GPU buffers for single-token decode
 // ══════════════════════════════════════════════════════════════════════
 
-/// Pre-allocated GPU workspace for `gpu_stacked_decode_token`.
+/// Pre-allocated GPU workspace for single-token forward pass.
 /// Created once at prefill, reused for every decode call (zero cudaMalloc per token).
 ///
 /// Spec: specs/infrastructure/47_single_token_decode.md
@@ -203,250 +182,6 @@ impl StackedDecodeWorkspace {
     }
 }
 
-
-// ══════════════════════════════════════════════════════════════════════
-// gpu_stacked_decode_token — decode one token using KV caches + M state
-// ══════════════════════════════════════════════════════════════════════
-
-/// Decode one token through all stacked blocks. Returns logits [vocab_size].
-///
-/// Per-token path:
-/// 1. Embed 1 token
-/// 2. Per block: LN → QKV → append KV cache → SWA single-token → memory(s=1) → MAG gate → residual
-/// 3. Final LN → unembed → logits
-///
-/// Spec: specs/infrastructure/47_single_token_decode.md
-#[cfg(feature = "cuda")]
-pub fn gpu_stacked_decode_token(
-    params: &GpuStackedParams,
-    cfg: &MAGConfig,
-    token_id: usize,
-    pulse: &Pulse,
-    context: &mut GpuStackedContext,
-    kv_caches: &mut [crate::gpu_forward::GpuKVCache],
-    ws: &mut StackedDecodeWorkspace,
-) -> Vec<f32> {
-    let d = cfg.swa.d_model;
-    let v = cfg.swa.vocab_size;
-    let nh = cfg.swa.num_heads;
-    let hd = cfg.swa.head_dim;
-    let window_size = cfg.swa.window_size;
-    let n_blocks = params.n_blocks();
-    let d_i32 = d as i32;
-
-    assert!(token_id < v, "token_id {} >= vocab_size {}", token_id, v);
-    assert_eq!(kv_caches.len(), n_blocks, "need one KV cache per block");
-
-    // ── Embed 1 token ──────────────────────────────────────────────
-    let input_i32 = [token_id as i32];
-    unsafe {
-        let rc = crate::gpu_forward::gpu_buf_memcpy_h2d(
-            ws.d_input.ptr() as *mut std::ffi::c_void,
-            input_i32.as_ptr() as *const std::ffi::c_void,
-            4,
-        );
-        assert_eq!(rc, 0);
-    }
-
-    // Gather embedding for 1 token into workspace residual (no allocation)
-    ws.residual.zero();
-    unsafe {
-        crate::cuda_ffi::embedding_gather_cuda(
-            params.w_embed.as_ptr(),
-            ws.d_input.ptr() as *const i32,
-            ws.residual.ptr(),
-            1, d_i32,
-        );
-    }
-
-    let is_chained = matches!(cfg.hope_variant, HopeVariant::Chained | HopeVariant::Sequential);
-
-    // ── Per-block forward ──────────────────────────────────────────
-    for b in 0..n_blocks {
-        let block = &params.blocks[b];
-        let block_ctx = &mut context.blocks[b];
-        let kv = &mut kv_caches[b];
-        let bws = &mut ws.per_block[b];
-
-        // Save block input for residual
-        let block_input_ptr = ws.residual.as_ptr();
-
-        // ── LN_attn ────────────────────────────────────────────────
-        unsafe {
-            crate::cuda_ffi::layer_norm_forward_cuda(
-                ws.residual.as_ptr(),
-                block.ln_attn_gamma.as_ptr(),
-                block.ln_attn_beta.as_ptr(),
-                bws.ln_attn_out.ptr(), bws.ln_attn_mean.ptr(), bws.ln_attn_rstd.ptr(),
-                1, d_i32, 1e-5,
-            );
-        }
-
-        // ── QKV projections [1,d] @ [d,d]^T ───────────────────────
-        crate::dispatch::cublas_matmul_transb_dd(&bws.ln_attn_out, &block.w_q, &mut bws.q_f32, 1, d, d, 0.0);
-        crate::dispatch::cublas_matmul_transb_dd(&bws.ln_attn_out, &block.w_k, &mut bws.k_f32, 1, d, d, 0.0);
-        crate::dispatch::cublas_matmul_transb_dd(&bws.ln_attn_out, &block.w_v, &mut bws.v_f32, 1, d, d, 0.0);
-
-        // ── Append K,V to cache ────────────────────────────────────
-        kv.append_f32(&bws.k_f32, &bws.v_f32, 1);
-
-        // ── SWA single-token attention ─────────────────────────────
-        unsafe {
-            crate::cuda_ffi::f32_to_bf16_cuda(bws.q_f32.as_ptr(), bws.q_bf16.ptr(), d_i32);
-        }
-        crate::dispatch::swa_single_token_dd(
-            &bws.q_bf16, &kv.k_cache_bf16, &kv.v_cache_bf16,
-            &mut bws.attn_out_bf16,
-            kv.len, nh, hd, window_size,
-        );
-        unsafe {
-            crate::cuda_ffi::bf16_to_f32_cuda(bws.attn_out_bf16.as_ptr(), bws.attn_out_f32.ptr(), d_i32);
-        }
-
-        // ── Output projection: attn_proj = attn_out @ W_O^T ───────
-        crate::dispatch::cublas_matmul_transb_dd(&bws.attn_out_f32, &block.w_o, &mut bws.attn_proj, 1, d, d, 0.0);
-
-        // ── Residual skip 1 ────────────────────────────────────────
-        bws.residual_after_attn.zero();
-        unsafe {
-            crate::cuda_ffi::saxpy_cuda(1.0, block_input_ptr, bws.residual_after_attn.ptr(), d_i32);
-            crate::cuda_ffi::saxpy_cuda(1.0, bws.attn_proj.as_ptr(), bws.residual_after_attn.ptr(), d_i32);
-        }
-
-        // ── LN_mem ─────────────────────────────────────────────────
-        unsafe {
-            crate::cuda_ffi::layer_norm_forward_cuda(
-                bws.residual_after_attn.as_ptr(),
-                block.ln_mem_gamma.as_ptr(),
-                block.ln_mem_beta.as_ptr(),
-                bws.ln_mem_out.ptr(), bws.ln_mem_mean.ptr(), bws.ln_mem_rstd.ptr(),
-                1, d_i32, 1e-5,
-            );
-        }
-
-        // ── CMS memory per level (s=1, no pooling) ─────────────────
-        // Note: at s=1, gpu_memory_forward and gpu_tnt_forward produce identical
-        // results (TNT chunkwise with C=1 chunk of 1 token = standard memory update).
-        // Using gpu_memory_forward unconditionally is CS-10 compliant.
-        let mut y_per_level: Vec<GpuBuf<f32>> = Vec::with_capacity(cfg.k);
-
-        if is_chained {
-            // Chain mode: each level processes previous level's output.
-            // Copy ln_mem_out into workspace chain_h to avoid clone allocation.
-            bws.chain_h.zero();
-            unsafe {
-                crate::cuda_ffi::saxpy_cuda(1.0, bws.ln_mem_out.as_ptr(), bws.chain_h.ptr(), d_i32);
-            }
-            for level in 0..cfg.k {
-                let effective_active = pulse.active_levels[level]
-                    || matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp);
-
-                if effective_active {
-                    let (y_level, _mem_cache) = gpu_memory_forward(
-                        &block.levels[level], cfg, &bws.chain_h,
-                        &mut block_ctx.memory[level],
-                        1, d, level, 1,
-                    );
-                    y_per_level.push(y_level);
-                } else {
-                    let y_level = gpu_memory_read_only(
-                        &block.levels[level], &bws.chain_h,
-                        &block_ctx.memory[level],
-                        1, d, nh, hd,
-                    );
-                    y_per_level.push(y_level);
-                }
-                // Chain: next level's input is this level's output
-                if level < cfg.k - 1 {
-                    bws.chain_h.zero();
-                    unsafe {
-                        crate::cuda_ffi::saxpy_cuda(1.0, y_per_level[level].as_ptr(), bws.chain_h.ptr(), d_i32);
-                    }
-                }
-            }
-        } else {
-            // Independent mode: all levels process ln_mem_out
-            for level in 0..cfg.k {
-                let effective_active = pulse.active_levels[level]
-                    || matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp);
-
-                if effective_active {
-                    let (y_level, _mem_cache) = gpu_memory_forward(
-                        &block.levels[level], cfg, &bws.ln_mem_out,
-                        &mut block_ctx.memory[level],
-                        1, d, level, 1,
-                    );
-                    y_per_level.push(y_level);
-                } else {
-                    let y_level = gpu_memory_read_only(
-                        &block.levels[level], &bws.ln_mem_out,
-                        &block_ctx.memory[level],
-                        1, d, nh, hd,
-                    );
-                    y_per_level.push(y_level);
-                }
-            }
-        }
-
-        // ── Level aggregation ──────────────────────────────────────
-        if is_chained {
-            // Chain: use last level output directly
-            bws.y_combined.zero();
-            unsafe {
-                crate::cuda_ffi::saxpy_cuda(1.0, y_per_level.last().unwrap().as_ptr(), bws.y_combined.ptr(), d_i32);
-            }
-        } else {
-            // Learnable weighted sum
-            let mut alpha_host = vec![0.0f32; cfg.k];
-            block.alpha_mem.slice(0, cfg.k).copy_to_host(&mut alpha_host);
-            let alpha_weights = crate::stacked_model::host_softmax(&alpha_host);
-            bws.y_combined.zero();
-            for (l, y_level) in y_per_level.iter().enumerate() {
-                unsafe {
-                    crate::cuda_ffi::saxpy_cuda(alpha_weights[l], y_level.as_ptr(), bws.y_combined.ptr(), d_i32);
-                }
-            }
-        }
-
-        // ── MAG sigmoid gating ─────────────────────────────────────
-        unsafe {
-            crate::cuda_ffi::sigmoid_cuda(bws.y_combined.as_ptr(), bws.gate.ptr(), d_i32);
-            crate::cuda_ffi::elemwise_mul_cuda(bws.attn_proj.as_ptr(), bws.gate.as_ptr(), bws.gated_out.ptr(), d_i32);
-        }
-
-        // ── Residual skip 2 (write into workspace buffer, then swap) ─
-        bws.residual_out.zero();
-        unsafe {
-            crate::cuda_ffi::saxpy_cuda(1.0, block_input_ptr, bws.residual_out.ptr(), d_i32);
-            crate::cuda_ffi::saxpy_cuda(1.0, bws.gated_out.as_ptr(), bws.residual_out.ptr(), d_i32);
-        }
-        // Copy block output into ws.residual for next block's input
-        ws.residual.zero();
-        unsafe {
-            crate::cuda_ffi::saxpy_cuda(1.0, bws.residual_out.as_ptr(), ws.residual.ptr(), d_i32);
-        }
-    }
-
-    // ── Final LN ───────────────────────────────────────────────────
-    unsafe {
-        crate::cuda_ffi::layer_norm_forward_cuda(
-            ws.residual.as_ptr(),
-            params.ln_final_gamma.as_ptr(),
-            params.ln_final_beta.as_ptr(),
-            ws.ln_final_out.ptr(), ws.ln_final_mean.ptr(), ws.ln_final_rstd.ptr(),
-            1, d_i32, 1e-5,
-        );
-    }
-
-    // ── Unembed ────────────────────────────────────────────────────
-    crate::dispatch::cublas_matmul_dd(&ws.ln_final_out, &params.w_unembed, &mut ws.logits_gpu, 1, d, v, 0.0);
-    crate::dispatch::cuda_sync();
-
-    // Download logits
-    let mut logits = vec![0.0f32; v];
-    ws.logits_gpu.copy_to_host(&mut logits);
-    logits
-}
 
 // ══════════════════════════════════════════════════════════════════════
 // GpuBuf clone helper
@@ -980,7 +715,7 @@ fn assemble_m_states(
 /// Process one token through all blocks, saving activations for backward.
 ///
 /// This is the atomic operation of the unified forward path. Same computation
-/// as `gpu_stacked_decode_token`, but snapshots workspace buffers into a
+/// Same computation as the old decode_token path, but snapshots workspace buffers into a
 /// `TokenActivationCache` that can be assembled for backward.
 ///
 /// Spec 68: "The model is: process one token → update memory → produce output.
@@ -1271,9 +1006,10 @@ pub fn forward_single_token(
 ///
 /// Returns logits for the last token (for sampling during generation).
 ///
-/// When `save_activations` is true, each token's activations are pushed into the
-/// activation window for later backward. When false (pure inference without learning),
-/// tokens are processed but only logits are returned.
+/// Every token always saves activations into the ActivationWindow. There is no
+/// "inference without learning" — the memory system MUST update on every token.
+/// Whether the caller runs backward on those activations is a separate decision,
+/// but the forward path is always identical (CS-10: no mode distinction).
 ///
 /// Spec 68: "The model is: process one token → update memory → produce output.
 /// That is the atomic unit of computation. Everything else is an optimization."
@@ -1286,27 +1022,19 @@ pub fn gpu_stacked_forward_tokens(
     context: &mut GpuStackedContext,
     kv_caches: &mut [crate::gpu_forward::GpuKVCache],
     ws: &mut StackedDecodeWorkspace,
-    mut activation_window: Option<&mut ActivationWindow>,
+    activation_window: &mut ActivationWindow,
 ) -> Vec<f32> {
     let v = cfg.swa.vocab_size;
     let mut last_logits = vec![0.0f32; v];
 
-    let save = activation_window.is_some();
-
     for &token in token_ids {
         let pulse = conductor.pulse();
 
-        if save {
-            let token_cache = forward_single_token(
-                params, cfg, token, &pulse, context, kv_caches, ws,
-            );
-            token_cache.logits.copy_to_host(&mut last_logits);
-            activation_window.as_mut().unwrap().push(token_cache);
-        } else {
-            last_logits = gpu_stacked_decode_token(
-                params, cfg, token, &pulse, context, kv_caches, ws,
-            );
-        }
+        let token_cache = forward_single_token(
+            params, cfg, token, &pulse, context, kv_caches, ws,
+        );
+        token_cache.logits.copy_to_host(&mut last_logits);
+        activation_window.push(token_cache);
 
         conductor.advance();
     }
