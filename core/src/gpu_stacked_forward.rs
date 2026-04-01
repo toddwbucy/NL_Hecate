@@ -618,11 +618,70 @@ fn concat_memory_caches<'a>(
                 m_states: assemble_m_states(&caches, d, s, nh, hd, false, false),
             }
         }
+        // Chunkwise variants from proxy config: per-token (s=1) caches have the same
+        // [M_t, M_{t+1}] structure as exact variants (num_chunks=1 when s=1).
+        // Assemble into exact Titans/Delta for backward — the assembled full trajectory
+        // is exact (each per-token call computed the exact update for that token).
+        GpuMemoryCache::TitansChunkwise { .. } => {
+            let bs_mem = nh;
+            let bs = 1;
+            GpuMemoryCache::Titans {
+                k_mem: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::TitansChunkwise { k_mem, .. } => k_mem, _ => unreachable!() }), bs_mem * hd),
+                v_mem: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::TitansChunkwise { v_mem, .. } => v_mem, _ => unreachable!() }), bs_mem * hd),
+                q_mem: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::TitansChunkwise { q_mem, .. } => q_mem, _ => unreachable!() }), bs_mem * hd),
+                alpha: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::TitansChunkwise { alpha, .. } => alpha, _ => unreachable!() }), bs),
+                theta: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::TitansChunkwise { theta, .. } => theta, _ => unreachable!() }), bs),
+                eta: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::TitansChunkwise { eta, .. } => eta, _ => unreachable!() }), bs),
+                k_norms: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::TitansChunkwise { k_norms, .. } => k_norms, _ => unreachable!() }), bs),
+                q_norms: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::TitansChunkwise { q_norms, .. } => q_norms, _ => unreachable!() }), bs),
+                m_states: assemble_m_states(&caches, d, s, nh, hd, true, false),
+                s_states: assemble_m_states(&caches, d, s, nh, hd, true, true),
+                proxy: false, // assembled full trajectory is exact
+            }
+        }
+        GpuMemoryCache::DeltaChunkwise { .. } => {
+            let bs_mem = nh;
+            let bs = 1;
+            GpuMemoryCache::Delta {
+                k_mem: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DeltaChunkwise { k_mem, .. } => k_mem, _ => unreachable!() }), bs_mem * hd),
+                v_mem: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DeltaChunkwise { v_mem, .. } => v_mem, _ => unreachable!() }), bs_mem * hd),
+                q_mem: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DeltaChunkwise { q_mem, .. } => q_mem, _ => unreachable!() }), bs_mem * hd),
+                alpha: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DeltaChunkwise { alpha, .. } => alpha, _ => unreachable!() }), bs),
+                theta: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DeltaChunkwise { theta, .. } => theta, _ => unreachable!() }), bs),
+                k_norms: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DeltaChunkwise { k_norms, .. } => k_norms, _ => unreachable!() }), bs),
+                q_norms: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DeltaChunkwise { q_norms, .. } => q_norms, _ => unreachable!() }), bs),
+                m_states: assemble_m_states(&caches, d, s, nh, hd, true, false),
+                proxy: false, // assembled full trajectory is exact
+            }
+        }
         _ => panic!(
             "concat_memory_caches: unsupported memory cache variant — \
-             unified path currently supports Delta, Titans, Hebbian, DGD. \
-             SwiGlu/Mlp/Ckpt/Chunkwise variants require separate assembly logic.",
+             unified path currently supports Delta, Titans, Hebbian, DGD, \
+             TitansChunkwise, DeltaChunkwise. SwiGlu/Mlp/Ckpt variants \
+             require separate assembly logic.",
         ),
+    }
+}
+
+/// Extract the m_states or s_states buffer from any supported GpuMemoryCache variant.
+#[cfg(feature = "cuda")]
+fn extract_m_or_s_states(cache: &GpuMemoryCache, is_s_states: bool) -> &GpuBuf<f32> {
+    if is_s_states {
+        match cache {
+            GpuMemoryCache::Titans { s_states, .. } => s_states,
+            GpuMemoryCache::TitansChunkwise { s_chunk_states, .. } => s_chunk_states,
+            _ => unreachable!("s_states only available for Titans/TitansChunkwise"),
+        }
+    } else {
+        match cache {
+            GpuMemoryCache::Delta { m_states, .. } => m_states,
+            GpuMemoryCache::Titans { m_states, .. } => m_states,
+            GpuMemoryCache::Hebbian { m_states, .. } => m_states,
+            GpuMemoryCache::DGD { m_states, .. } => m_states,
+            GpuMemoryCache::TitansChunkwise { m_chunk_states, .. } => m_chunk_states,
+            GpuMemoryCache::DeltaChunkwise { m_chunk_states, .. } => m_chunk_states,
+            _ => unreachable!("m_states not available for this variant"),
+        }
     }
 }
 
@@ -646,55 +705,40 @@ fn assemble_m_states(
     let chunk = bs_mem * dd;
 
     // Build full trajectory [M_0, M_1, ..., M_s] from per-token [M_t, M_{t+1}] caches.
+    // Each per-token cache must have at least 2 chunks (initial + final M).
     let total = (s + 1) * chunk;
     let out = GpuBuf::<f32>::zeros(total);
 
-    {
-        for (t, cache) in caches.iter().enumerate() {
-            let src = if is_s_states {
-                match cache { GpuMemoryCache::Titans { s_states, .. } => s_states, _ => unreachable!() }
-            } else {
-                match cache {
-                    GpuMemoryCache::Delta { m_states, .. } => m_states,
-                    GpuMemoryCache::Titans { m_states, .. } => m_states,
-                    GpuMemoryCache::Hebbian { m_states, .. } => m_states,
-                    _ => unreachable!(),
-                }
-            };
-            // Copy M_t (first chunk of each per-token cache)
-            let dst_offset = t * chunk * 4;
-            unsafe {
-                let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
-                    (out.ptr() as *mut u8).add(dst_offset) as *mut std::ffi::c_void,
-                    src.as_ptr() as *const std::ffi::c_void,
-                    chunk * 4,
-                );
-                assert_eq!(rc, 0);
-            }
-        }
-        // Copy M_s from the last token's second chunk
-        let last_src = if is_s_states {
-            match caches.last().unwrap() { GpuMemoryCache::Titans { s_states, .. } => s_states, _ => unreachable!() }
-        } else {
-            match caches.last().unwrap() {
-                GpuMemoryCache::Delta { m_states, .. } => m_states,
-                GpuMemoryCache::Titans { m_states, .. } => m_states,
-                GpuMemoryCache::Hebbian { m_states, .. } => m_states,
-                _ => unreachable!(),
-            }
-        };
-        let dst_offset = s * chunk * 4;
-        let src_offset = chunk * 4; // second chunk of last token
+    for (t, cache) in caches.iter().enumerate() {
+        let src = extract_m_or_s_states(cache, is_s_states);
+        assert!(src.len() >= 2 * chunk,
+            "assemble_m_states: per-token cache has {} elements but needs >= {} (2 chunks). \
+             Proxy-only caches (1 chunk) cannot be assembled into a full trajectory.",
+            src.len(), 2 * chunk);
+        // Copy M_t (first chunk of each per-token cache)
+        let dst_offset = t * chunk * 4;
         unsafe {
             let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
                 (out.ptr() as *mut u8).add(dst_offset) as *mut std::ffi::c_void,
-                (last_src.as_ptr() as *const u8).add(src_offset) as *const std::ffi::c_void,
+                src.as_ptr() as *const std::ffi::c_void,
                 chunk * 4,
             );
             assert_eq!(rc, 0);
         }
-        out
     }
+    // Copy M_s from the last token's second chunk
+    let last_src = extract_m_or_s_states(caches.last().unwrap(), is_s_states);
+    let dst_offset = s * chunk * 4;
+    let src_offset = chunk * 4; // second chunk of last token
+    unsafe {
+        let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+            (out.ptr() as *mut u8).add(dst_offset) as *mut std::ffi::c_void,
+            (last_src.as_ptr() as *const u8).add(src_offset) as *const std::ffi::c_void,
+            chunk * 4,
+        );
+        assert_eq!(rc, 0);
+    }
+    out
 }
 
 // ── Single-token forward with activation caching ────────────────────
@@ -988,15 +1032,10 @@ pub fn forward_single_token(
 
 // ── Unified entry point ─────────────────────────────────────────────
 
-/// Process N tokens through the model. N can be 1 (generation) or any count (training).
-/// Same function, same kernels, same memory update, always.
+/// Process N tokens per-token through the model (generation path).
 ///
 /// Returns logits for the last token (for sampling during generation).
-///
-/// Every token always saves activations into the ActivationWindow. There is no
-/// "inference without learning" — the memory system MUST update on every token.
-/// Whether the caller runs backward on those activations is a separate decision,
-/// but the forward path is always identical (CS-10: no mode distinction).
+/// Saves per-token activations into ActivationWindow for deferred backward.
 ///
 /// Spec 68: "The model is: process one token → update memory → produce output.
 /// That is the atomic unit of computation. Everything else is an optimization."
@@ -1027,4 +1066,430 @@ pub fn gpu_stacked_forward_tokens(
     }
 
     last_logits
+}
+
+// ── Full-sequence forward (spec 71) ─────────────────────────────────
+
+/// Process all tokens at once through full-sequence kernels (build mode).
+///
+/// Returns (last_logits, GpuStackedCache) — the cache goes directly to backward
+/// with no ActivationWindow assembly step. Conductor advances once for the whole
+/// sequence (one optimizer step), not per-token.
+///
+/// Same kernels as per-token path: SWA, gpu_memory_forward, cuBLAS projections.
+/// The difference is batch size: s tokens in one kernel launch vs s individual launches.
+///
+/// Spec 71: "Build mode knows ALL tokens upfront — it should process them as a batch."
+#[cfg(feature = "cuda")]
+pub fn gpu_stacked_forward_sequence(
+    params: &GpuStackedParams,
+    cfg: &MAGConfig,
+    token_ids: &[usize],
+    target_ids: &[usize],
+    conductor: &mut Conductor,
+    context: &mut GpuStackedContext,
+) -> (Vec<f32>, GpuStackedCache) {
+    assert!(token_ids.len() > 1, "forward_sequence requires > 1 token; use forward_single_token for s=1");
+
+    // Advance conductor once for the full sequence (one step, not per-token)
+    let pulse = conductor.pulse();
+    conductor.advance();
+
+    let (last_logits, cache) = forward_sequence(params, cfg, token_ids, target_ids, &pulse, context);
+    (last_logits, cache)
+}
+
+/// Internal: full-sequence forward through all blocks.
+///
+/// Embed → (LN_attn → SWA → W_O → residual → LN_mem → CMS memory → aggregate → MAG gate → residual) per block → LN_final → unembed.
+#[cfg(feature = "cuda")]
+fn forward_sequence(
+    params: &GpuStackedParams,
+    cfg: &MAGConfig,
+    token_ids: &[usize],
+    target_ids: &[usize],
+    pulse: &Pulse,
+    context: &mut GpuStackedContext,
+) -> (Vec<f32>, GpuStackedCache) {
+    let s = token_ids.len();
+    let d = cfg.swa.d_model;
+    let v = cfg.swa.vocab_size;
+    let nh = cfg.swa.num_heads;
+    let hd = cfg.swa.head_dim;
+    let window_size = cfg.swa.window_size;
+    let n_blocks = params.n_blocks();
+    let bs: usize = 1;
+    let d_i32 = d as i32;
+    let s_i32 = s as i32;
+    let sd = s * d;
+    let sd_i32 = sd as i32;
+
+    let is_chained = matches!(cfg.hope_variant, HopeVariant::Chained | HopeVariant::Sequential);
+
+    // ── Embed all tokens at once ──────────────────────────────────────
+    let input_ids_i32: Vec<i32> = token_ids.iter().map(|&t| {
+        assert!(t < v, "token_id {} >= vocab_size {}", t, v);
+        t as i32
+    }).collect();
+    let target_ids_i32: Vec<i32> = target_ids.iter()
+        .map(|&x| i32::try_from(x).expect("target token id overflows i32"))
+        .collect();
+    assert_eq!(target_ids_i32.len(), s, "target_ids length must match token count");
+
+    let d_input = GpuBuf::<f32>::new(s);
+    unsafe {
+        let rc = crate::gpu_forward::gpu_buf_memcpy_h2d(
+            d_input.ptr() as *mut std::ffi::c_void,
+            input_ids_i32.as_ptr() as *const std::ffi::c_void,
+            s * 4,
+        );
+        assert_eq!(rc, 0);
+    }
+
+    let mut residual = GpuBuf::<f32>::zeros(sd);
+    unsafe {
+        crate::cuda_ffi::embedding_gather_cuda(
+            params.w_embed.as_ptr(),
+            d_input.ptr() as *const i32,
+            residual.ptr(),
+            s_i32, d_i32,
+        );
+    }
+    let embedded = residual.clone_buf();
+
+    // Upload target IDs for backward's cross-entropy
+    let input_ids_gpu = GpuBuf::<f32>::new(s);
+    let target_ids_gpu = GpuBuf::<f32>::new(s);
+    unsafe {
+        let rc = crate::gpu_forward::gpu_buf_memcpy_h2d(
+            input_ids_gpu.ptr() as *mut std::ffi::c_void,
+            input_ids_i32.as_ptr() as *const std::ffi::c_void,
+            s * 4,
+        );
+        assert_eq!(rc, 0);
+        let rc = crate::gpu_forward::gpu_buf_memcpy_h2d(
+            target_ids_gpu.ptr() as *mut std::ffi::c_void,
+            target_ids_i32.as_ptr() as *const std::ffi::c_void,
+            s * 4,
+        );
+        assert_eq!(rc, 0);
+    }
+
+    // ── Per-block forward ─────────────────────────────────────────────
+    let mut block_caches = Vec::with_capacity(n_blocks);
+
+    for b in 0..n_blocks {
+        let block = &params.blocks[b];
+        let block_ctx = &mut context.blocks[b];
+
+        let block_input = residual.clone_buf();
+
+        // ── LN_attn [s, d] ───────────────────────────────────────────
+        let ln_attn_out = GpuBuf::zeros(sd);
+        let ln_attn_mean = GpuBuf::zeros(s);
+        let ln_attn_rstd = GpuBuf::zeros(s);
+        unsafe {
+            crate::cuda_ffi::layer_norm_forward_cuda(
+                residual.as_ptr(),
+                block.ln_attn_gamma.as_ptr(),
+                block.ln_attn_beta.as_ptr(),
+                ln_attn_out.ptr(), ln_attn_mean.ptr(), ln_attn_rstd.ptr(),
+                s_i32, d_i32, 1e-5,
+            );
+        }
+
+        // ── QKV projections [s, d] → [s, d] each ─────────────────────
+        let mut q_f32 = GpuBuf::zeros(sd);
+        let mut k_f32 = GpuBuf::zeros(sd);
+        let mut v_f32 = GpuBuf::zeros(sd);
+        crate::dispatch::cublas_matmul_transb_dd(&ln_attn_out, &block.w_q, &mut q_f32, s, d, d, 0.0);
+        crate::dispatch::cublas_matmul_transb_dd(&ln_attn_out, &block.w_k, &mut k_f32, s, d, d, 0.0);
+        crate::dispatch::cublas_matmul_transb_dd(&ln_attn_out, &block.w_v, &mut v_f32, s, d, d, 0.0);
+
+        // ── SWA full-sequence attention (bf16) ────────────────────────
+        let q_bf16 = GpuBuf::<u16>::zeros(sd);
+        let k_bf16 = GpuBuf::<u16>::zeros(sd);
+        let v_bf16 = GpuBuf::<u16>::zeros(sd);
+        unsafe {
+            crate::cuda_ffi::f32_to_bf16_cuda(q_f32.as_ptr(), q_bf16.ptr(), sd_i32);
+            crate::cuda_ffi::f32_to_bf16_cuda(k_f32.as_ptr(), k_bf16.ptr(), sd_i32);
+            crate::cuda_ffi::f32_to_bf16_cuda(v_f32.as_ptr(), v_bf16.ptr(), sd_i32);
+        }
+
+        let aw_total = bs * nh * s * window_size;
+        let mut attn_out_bf16 = GpuBuf::<u16>::zeros(sd);
+        let mut attn_weights_bf16 = GpuBuf::<u16>::zeros(aw_total);
+        crate::dispatch::swa_forward_dd(
+            &q_bf16, &k_bf16, &v_bf16,
+            &mut attn_out_bf16, &mut attn_weights_bf16,
+            s, nh, hd, window_size, bs,
+        );
+
+        let attn_out = GpuBuf::<f32>::zeros(sd);
+        unsafe {
+            crate::cuda_ffi::bf16_to_f32_cuda(attn_out_bf16.as_ptr(), attn_out.ptr(), sd_i32);
+        }
+
+        // ── Output projection ─────────────────────────────────────────
+        let mut attn_proj = GpuBuf::zeros(sd);
+        crate::dispatch::cublas_matmul_transb_dd(&attn_out, &block.w_o, &mut attn_proj, s, d, d, 0.0);
+
+        // ── Residual skip 1: block_input + attn_proj ──────────────────
+        let residual_after_attn = GpuBuf::zeros(sd);
+        unsafe {
+            crate::cuda_ffi::saxpy_cuda(1.0, block_input.as_ptr(), residual_after_attn.ptr(), sd_i32);
+            crate::cuda_ffi::saxpy_cuda(1.0, attn_proj.as_ptr(), residual_after_attn.ptr(), sd_i32);
+        }
+
+        // ── LN_mem [s, d] ─────────────────────────────────────────────
+        let ln_mem_out = GpuBuf::zeros(sd);
+        let ln_mem_mean = GpuBuf::zeros(s);
+        let ln_mem_rstd = GpuBuf::zeros(s);
+        unsafe {
+            crate::cuda_ffi::layer_norm_forward_cuda(
+                residual_after_attn.as_ptr(),
+                block.ln_mem_gamma.as_ptr(),
+                block.ln_mem_beta.as_ptr(),
+                ln_mem_out.ptr(), ln_mem_mean.ptr(), ln_mem_rstd.ptr(),
+                s_i32, d_i32, 1e-5,
+            );
+        }
+
+        // ── CMS memory per level ──────────────────────────────────────
+        // y_per_level stores at level resolution (s_f) — backward indexes by s_f.
+        // y_upsampled is temporary full-res for aggregation into y_combined.
+        let mut y_per_level: Vec<GpuBuf<f32>> = Vec::with_capacity(cfg.k);
+        let mut y_upsampled: Vec<GpuBuf<f32>> = Vec::with_capacity(cfg.k);
+        let mut memory_caches: Vec<Option<GpuMemoryCache>> = Vec::with_capacity(cfg.k);
+        let mut level_seq_lens: Vec<usize> = Vec::with_capacity(cfg.k);
+
+        if is_chained {
+            // Chained CMS: level N input = output of level N-1 (at full resolution)
+            // Level 0 input = ln_mem_out
+            let mut chain_input = ln_mem_out.clone_buf();
+            // chain_input_s tracks the current resolution (starts at full s)
+            let mut chain_input_s = s;
+
+            for level in 0..cfg.k {
+                let c = cfg.chunk_sizes.get(level).copied().unwrap_or(1);
+                let s_f = s / c.max(1);
+                assert!(s_f > 0, "chunk_size {c} > seq_len {s} at level {level} — \
+                    chunk_size must be <= seq_len");
+                assert!(c <= 1 || s % c == 0,
+                    "seq_len {s} not divisible by chunk_size {c} at level {level} — \
+                    would silently drop {remain} tail tokens", remain = s % c);
+                let effective_active = pulse.active_levels[level]
+                    || matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp);
+
+                // Pool input for higher levels (spec 46)
+                let level_input = if c > 1 && chain_input_s > s_f {
+                    let mut pooled = GpuBuf::zeros(bs * s_f * d);
+                    unsafe {
+                        crate::cuda_ffi::mean_pool_1d_f32_cuda(
+                            chain_input.as_ptr(), pooled.ptr(),
+                            bs as i32, chain_input_s as i32, d_i32,
+                            (chain_input_s / s_f) as i32,
+                        );
+                    }
+                    pooled
+                } else {
+                    chain_input.clone_buf()
+                };
+
+                let y_level = if effective_active {
+                    let (y_lev, mem_cache) = gpu_memory_forward(
+                        &block.levels[level], cfg, &level_input,
+                        &mut block_ctx.memory[level],
+                        s_f, d, level, bs,
+                    );
+                    memory_caches.push(Some(mem_cache));
+                    y_lev
+                } else {
+                    let y_lev = gpu_memory_read_only(
+                        &block.levels[level], &level_input,
+                        &block_ctx.memory[level],
+                        s_f, d, nh, hd,
+                    );
+                    memory_caches.push(None);
+                    y_lev
+                };
+
+                // Upsample to full resolution for aggregation + chain propagation
+                let y_full = if c > 1 {
+                    let mut upsampled = GpuBuf::zeros(sd);
+                    unsafe {
+                        crate::cuda_ffi::repeat_upsample_1d_f32_cuda(
+                            y_level.as_ptr(), upsampled.ptr(),
+                            bs as i32, s_f as i32, d_i32, c as i32,
+                        );
+                    }
+                    upsampled
+                } else {
+                    y_level.clone_buf()
+                };
+
+                // Chain: next level's input is this level's output (at full res)
+                chain_input = y_full.clone_buf();
+                chain_input_s = s;
+
+                y_per_level.push(y_level);
+                y_upsampled.push(y_full);
+                level_seq_lens.push(s_f);
+            }
+        } else {
+            // Independent CMS: all levels receive ln_mem_out (pooled per level)
+            for level in 0..cfg.k {
+                let c = cfg.chunk_sizes.get(level).copied().unwrap_or(1);
+                let s_f = s / c.max(1);
+                assert!(s_f > 0, "chunk_size {c} > seq_len {s} at level {level} — \
+                    chunk_size must be <= seq_len");
+                assert!(c <= 1 || s % c == 0,
+                    "seq_len {s} not divisible by chunk_size {c} at level {level} — \
+                    would silently drop {remain} tail tokens", remain = s % c);
+                let effective_active = pulse.active_levels[level]
+                    || matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp);
+
+                let level_input = if c > 1 {
+                    let mut pooled = GpuBuf::zeros(bs * s_f * d);
+                    unsafe {
+                        crate::cuda_ffi::mean_pool_1d_f32_cuda(
+                            ln_mem_out.as_ptr(), pooled.ptr(),
+                            bs as i32, s as i32, d_i32, c as i32,
+                        );
+                    }
+                    pooled
+                } else {
+                    ln_mem_out.clone_buf()
+                };
+
+                let y_level = if effective_active {
+                    let (y_lev, mem_cache) = gpu_memory_forward(
+                        &block.levels[level], cfg, &level_input,
+                        &mut block_ctx.memory[level],
+                        s_f, d, level, bs,
+                    );
+                    memory_caches.push(Some(mem_cache));
+                    y_lev
+                } else {
+                    let y_lev = gpu_memory_read_only(
+                        &block.levels[level], &level_input,
+                        &block_ctx.memory[level],
+                        s_f, d, nh, hd,
+                    );
+                    memory_caches.push(None);
+                    y_lev
+                };
+
+                // Upsample to full resolution for aggregation
+                let y_full = if c > 1 {
+                    let mut upsampled = GpuBuf::zeros(sd);
+                    unsafe {
+                        crate::cuda_ffi::repeat_upsample_1d_f32_cuda(
+                            y_level.as_ptr(), upsampled.ptr(),
+                            bs as i32, s_f as i32, d_i32, c as i32,
+                        );
+                    }
+                    upsampled
+                } else {
+                    y_level.clone_buf()
+                };
+
+                y_per_level.push(y_level);
+                y_upsampled.push(y_full);
+                level_seq_lens.push(s_f);
+            }
+        }
+
+        // ── Level aggregation (at full resolution via y_upsampled) ────
+        let (y_combined, alpha_weights) = if is_chained {
+            // Chain uses last level directly (already upsampled)
+            (y_upsampled.last().unwrap().clone_buf(), vec![1.0])
+        } else {
+            let mut alpha_host = vec![0.0f32; cfg.k];
+            block.alpha_mem.slice(0, cfg.k).copy_to_host(&mut alpha_host);
+            let weights = crate::stacked_model::host_softmax(&alpha_host);
+            let combined = GpuBuf::zeros(sd);
+            for (l, y_full) in y_upsampled.iter().enumerate() {
+                unsafe {
+                    crate::cuda_ffi::saxpy_cuda(weights[l], y_full.as_ptr(), combined.ptr(), sd_i32);
+                }
+            }
+            (combined, weights)
+        };
+
+        // ── MAG sigmoid gating ────────────────────────────────────────
+        let gate = GpuBuf::zeros(sd);
+        let gated_out = GpuBuf::zeros(sd);
+        unsafe {
+            crate::cuda_ffi::sigmoid_cuda(y_combined.as_ptr(), gate.ptr(), sd_i32);
+            crate::cuda_ffi::elemwise_mul_cuda(attn_proj.as_ptr(), gate.as_ptr(), gated_out.ptr(), sd_i32);
+        }
+
+        // ── Residual skip 2: block_input + gated_out ──────────────────
+        residual = GpuBuf::zeros(sd);
+        unsafe {
+            crate::cuda_ffi::saxpy_cuda(1.0, block_input.as_ptr(), residual.ptr(), sd_i32);
+            crate::cuda_ffi::saxpy_cuda(1.0, gated_out.as_ptr(), residual.ptr(), sd_i32);
+        }
+
+        block_caches.push(GpuStackedBlockCache {
+            block_input,
+            q_f32, k_f32, v_f32,
+            q_bf16, k_bf16, v_bf16,
+            attn_out_bf16, attn_weights_bf16,
+            attn_out,
+            ln_attn_out, ln_attn_mean, ln_attn_rstd,
+            ln_mem_out, ln_mem_mean, ln_mem_rstd,
+            memory_caches,
+            y_per_level,
+            level_seq_lens,
+            y_combined,
+            gate, attn_proj,
+            alpha_weights,
+            residual_after_attn,
+        });
+    }
+
+    // ── Final LN ──────────────────────────────────────────────────────
+    let ln_final_out = GpuBuf::zeros(sd);
+    let ln_final_mean = GpuBuf::zeros(s);
+    let ln_final_rstd = GpuBuf::zeros(s);
+    unsafe {
+        crate::cuda_ffi::layer_norm_forward_cuda(
+            residual.as_ptr(),
+            params.ln_final_gamma.as_ptr(),
+            params.ln_final_beta.as_ptr(),
+            ln_final_out.ptr(), ln_final_mean.ptr(), ln_final_rstd.ptr(),
+            s_i32, d_i32, 1e-5,
+        );
+    }
+
+    // ── Unembed → logits [s, v] ───────────────────────────────────────
+    let mut logits = GpuBuf::zeros(s * v);
+    crate::dispatch::cublas_matmul_dd(&ln_final_out, &params.w_unembed, &mut logits, s, d, v, 0.0);
+    crate::dispatch::cuda_sync();
+
+    // Last token's logits on host (for sampling in StepResult).
+    // cache.logits retains the full [s, v] GPU buffer for backward loss computation.
+    let mut last_logits = vec![0.0f32; v];
+    logits.slice((s - 1) * v, v).copy_to_host(&mut last_logits);
+
+    let cache = GpuStackedCache {
+        block_caches,
+        embedded,
+        input_ids_i32,
+        target_ids_i32,
+        input_ids_gpu,
+        target_ids_gpu,
+        ln_final_out,
+        ln_final_mean,
+        ln_final_rstd,
+        logits,
+        pulse: pulse.clone(),
+        s, d, v, nh, hd,
+        ws: window_size,
+        batch_size: bs,
+    };
+
+    (last_logits, cache)
 }
