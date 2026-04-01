@@ -37,11 +37,38 @@ fn cosine_lr(step: usize, warmup_steps: usize, total_steps: usize, lr_peak: f32)
     0.5 * lr_peak * (1.0 + (std::f32::consts::PI * progress).cos())
 }
 
-pub fn feed(config_path: &str, _resume: bool) {
-    let cfg = Config::from_file(config_path).unwrap_or_else(|e| {
+pub fn feed(config_path: &str, resume: bool) {
+    let mut cfg = Config::from_file(config_path).unwrap_or_else(|e| {
         eprintln!("ERROR: {e}");
         std::process::exit(1);
     });
+
+    // --resume: find latest checkpoint in run_dir if build.load is not set
+    if resume && cfg.build.load.is_none() {
+        let run_dir = cfg.build.run_dir.as_deref().unwrap_or("runs/default");
+        let ckpt_dir = format!("{run_dir}/checkpoints");
+        if let Ok(entries) = std::fs::read_dir(&ckpt_dir) {
+            let mut latest: Option<(std::time::SystemTime, String)> = None;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().map_or(false, |e| e == "safetensors") {
+                    if let Ok(meta) = entry.metadata() {
+                        if let Ok(modified) = meta.modified() {
+                            if latest.as_ref().map_or(true, |(t, _)| modified > *t) {
+                                latest = Some((modified, path.to_string_lossy().into_owned()));
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some((_, path)) = latest {
+                eprintln!("  [resume: loading {path}]");
+                cfg.build.load = Some(path);
+            } else {
+                eprintln!("  [resume: no checkpoints found in {ckpt_dir}, starting fresh]");
+            }
+        }
+    }
 
     let seq_len = cfg.seq_len();
     let d = cfg.model.d_model;
@@ -152,6 +179,7 @@ pub fn feed(config_path: &str, _resume: bool) {
 
     // ── Load checkpoint or init ──────────────────────────────────────
     let mut resume_step: usize = 0;
+    let mut resume_conductor_step: usize = 0;
     let mut resume_tokens: usize = 0;
     let mut resume_cursors: Vec<StreamCursor> = Vec::new();
 
@@ -199,6 +227,7 @@ pub fn feed(config_path: &str, _resume: bool) {
 
         if let Some(bs) = &build_state {
             resume_step = bs.global_step;
+            resume_conductor_step = bs.conductor.step;
             resume_tokens = bs.total_tokens_seen;
             // Restore per-slot cursors for batch>1 resume
             if !bs.stream_cursors.is_empty() {
@@ -211,6 +240,7 @@ pub fn feed(config_path: &str, _resume: bool) {
         if cfg.build.reset_step {
             eprintln!("  [reset_step: overriding checkpoint step {} → 0]", resume_step);
             resume_step = 0;
+            resume_conductor_step = 0;
             resume_tokens = 0;
             resume_cursors.clear();
         }
@@ -319,6 +349,7 @@ pub fn feed(config_path: &str, _resume: bool) {
         k = target_k;
         chunk_sizes = new_chunks;
         resume_step = 0; // New phase starts from step 0
+        resume_conductor_step = 0;
     }
 
     // ── Reset intervals (spec 57) ────────────────────────────────────
@@ -327,9 +358,11 @@ pub fn feed(config_path: &str, _resume: bool) {
     let mut fire_counts = vec![0usize; k];
 
     // ── Conductor ────────────────────────────────────────────────────
+    // Replay conductor to its persisted per-token step (not global_step which
+    // counts optimizer steps). step()/generate() advance conductor per-token.
     let mut conductor = Conductor::new(k, chunk_sizes.clone());
     conductor.set_seq_len(seq_len);
-    for _ in 0..resume_step {
+    for _ in 0..resume_conductor_step {
         conductor.advance();
     }
 
@@ -827,6 +860,12 @@ pub fn feed(config_path: &str, _resume: bool) {
                             None, // no stop token for think rounds
                             &mut None, // no profiling
                         );
+
+                        // Account for generate()'s optimizer step in bookkeeping.
+                        // generate() forwarded prompt + generated tokens and ran backward.
+                        let gen_tok_count = gen_result.tokens.len();
+                        step_tokens += gen_tok_count;
+                        total_tokens_seen += gen_tok_count;
 
                         // REDIRECT — truncate output to seq_len, use as next input
                         let output = gen_result.tokens;

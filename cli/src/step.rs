@@ -209,18 +209,24 @@ pub fn generate(
 
     for _ in 0..max_tokens {
         let next_tok = sample_token(&last_logits, temperature, top_k);
-        if let Some(stop) = stop_token {
-            if next_tok == stop {
-                break;
-            }
-        }
         generated.push(next_tok);
 
+        // Forward the token so the model sees it (memory updates + activation saved)
         last_logits = gpu_stacked_forward_tokens(
             gpu_params, mag_cfg, &[next_tok],
             conductor, gpu_context, &mut kv_caches, &mut ws,
             &mut window,
         );
+
+        // Stop AFTER forwarding — the model learns the stop decision.
+        // Remove the stop token from returned tokens (callers don't want it in output)
+        // but it remains in the window for deferred backward.
+        if let Some(stop) = stop_token {
+            if next_tok == stop {
+                generated.pop(); // strip from output
+                break;
+            }
+        }
     }
 
     // ── Deferred backward: learn from the full generated sequence ────

@@ -30,7 +30,7 @@ use nl_hecate_core::gpu_stacked_optimizer::GpuStackedAdamWState;
 
 use crate::config::Config;
 #[cfg(feature = "cuda")]
-use crate::step::{step, generate};
+use crate::step::generate;
 
 // ChatML special token IDs (must match tokenizer training in prepare_sharegpt.py)
 const IM_START: u32 = 0; // <|im_start|>
@@ -120,7 +120,8 @@ pub fn chat(
         std::process::exit(1);
     }
 
-    let loaded_step = build_state.as_ref().map(|bs| bs.global_step).unwrap_or(0);
+    // Use conductor.step for replay (per-token counter), not global_step (optimizer steps)
+    let loaded_conductor_step = build_state.as_ref().map(|bs| bs.conductor.step).unwrap_or(0);
 
     // ── Build MAGConfig ──────────────────────────────────────────────
     let chunk_sizes = cfg.model.chunk_sizes.clone()
@@ -195,7 +196,7 @@ pub fn chat(
         );
 
         let mut conductor = Conductor::new(k, chunk_sizes.clone());
-        for _ in 0..loaded_step {
+        for _ in 0..loaded_conductor_step {
             conductor.advance();
         }
 
@@ -214,7 +215,7 @@ pub fn chat(
 
         eprintln!("\n{sep}");
         eprintln!("  NL-Hecate Chat");
-        eprintln!("  Model: d={d}, heads={nh}, k={k}, blocks={n_blocks} (step {loaded_step})");
+        eprintln!("  Model: d={d}, heads={nh}, k={k}, blocks={n_blocks} (step {loaded_conductor_step})");
         eprintln!("  Mode: {mode_label} + learning");
         eprintln!("  temp={temperature}, top_k={top_k}, max_tokens={max_tokens}");
         eprintln!("{sep}");
@@ -262,7 +263,7 @@ pub fn chat(
                 turn_count = 0;
                 if !stateless {
                     conductor = Conductor::new(k, chunk_sizes.clone());
-                    for _ in 0..loaded_step {
+                    for _ in 0..loaded_conductor_step {
                         conductor.advance();
                     }
                     gpu_context = GpuStackedContext::new(
@@ -319,30 +320,10 @@ pub fn chat(
 
             let t0 = Instant::now();
 
-            // ── LEARN step: step() on user prompt ────────────────
-            // The model learns from the user's input via forward → backward → update.
-            // Targets are shifted by 1 (next-token prediction on the prompt).
-            if ctx.len() >= 2 {
-                let tokens = &ctx[..ctx.len() - 1];
-                let targets = &ctx[1..];
-                let result = step(
-                    &mut gpu_params, &mag_cfg, &mut gpu_context,
-                    &mut adamw_state,
-                    tokens, targets,
-                    &mut conductor,
-                    &cfg.build.optimizer,
-                    lr, max_grad_norm,
-                    d, v,
-                    &[], &mut [],    // no reset intervals for chat
-                    &mut None, false, // no profiling
-                );
-                eprintln!("  \x1b[2m[learn: loss={:.4}, gnorm={:.4}]\x1b[0m",
-                    result.loss, result.grad_norm);
-            }
-
-            // ── SPEAK: generate response via generate() ──────────
-            // generate() runs forward on prompt, samples tokens, then runs deferred
-            // backward on the full sequence so the model learns from its own output.
+            // ── generate() handles both LEARN and SPEAK ──────────
+            // generate() forwards the prompt (memory updates), samples response tokens,
+            // then runs deferred backward on the FULL sequence (prompt + generated).
+            // No separate LEARN step needed — generate() learns from everything.
             let gen_result = generate(
                 &mut gpu_params, &mag_cfg, &mut gpu_context,
                 &mut adamw_state, &mut conductor,
@@ -366,8 +347,8 @@ pub fn chat(
             let tps = gen_result.tokens.len() as f64 / elapsed.max(1e-9);
 
             println!("\x1b[1;32mAssistant:\x1b[0m {}", response_text.trim());
-            eprintln!("  \x1b[2m[{} tokens, {tps:.0} tok/s, loss={:.4}, prompt={} tokens]\x1b[0m\n",
-                gen_result.tokens.len(), gen_result.loss, prompt_tokens.len());
+            eprintln!("  \x1b[2m[{} tokens, {tps:.0} tok/s, loss={:.4}, gnorm={:.4}, prompt={} tokens]\x1b[0m\n",
+                gen_result.tokens.len(), gen_result.loss, gen_result.grad_norm, prompt_tokens.len());
         }
     }
 }
