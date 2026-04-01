@@ -677,6 +677,7 @@ fn extract_m_or_s_states(cache: &GpuMemoryCache, is_s_states: bool) -> &GpuBuf<f
             GpuMemoryCache::Delta { m_states, .. } => m_states,
             GpuMemoryCache::Titans { m_states, .. } => m_states,
             GpuMemoryCache::Hebbian { m_states, .. } => m_states,
+            GpuMemoryCache::DGD { m_states, .. } => m_states,
             GpuMemoryCache::TitansChunkwise { m_chunk_states, .. } => m_chunk_states,
             GpuMemoryCache::DeltaChunkwise { m_chunk_states, .. } => m_chunk_states,
             _ => unreachable!("m_states not available for this variant"),
@@ -1453,7 +1454,8 @@ fn forward_sequence(
     crate::dispatch::cublas_matmul_dd(&ln_final_out, &params.w_unembed, &mut logits, s, d, v, 0.0);
     crate::dispatch::cuda_sync();
 
-    // Last token's logits (for sampling)
+    // Last token's logits on host (for sampling in StepResult).
+    // cache.logits retains the full [s, v] GPU buffer for backward loss computation.
     let mut last_logits = vec![0.0f32; v];
     logits.slice((s - 1) * v, v).copy_to_host(&mut last_logits);
 
