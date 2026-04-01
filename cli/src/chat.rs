@@ -337,7 +337,7 @@ pub fn chat(
                     &gpu_params, &mag_cfg, &ctx,
                     &mut conductor, &mut gpu_context,
                     &mut learn_kv, &mut learn_ws,
-                    Some(&mut window),
+                    &mut window,
                 );
 
                 // Build targets: shifted by 1 (next-token prediction)
@@ -382,11 +382,13 @@ pub fn chat(
                 .collect();
             let mut decode_ws = StackedDecodeWorkspace::new(n_blocks, d, v);
 
+            let mut speak_window = ActivationWindow::new(seq_len);
+
             let logits = gpu_stacked_forward_tokens(
                 &gpu_params, &mag_cfg, &ctx,
                 &mut conductor, &mut gpu_context,
                 &mut kv_caches, &mut decode_ws,
-                None,
+                &mut speak_window,
             );
 
             let mut gen_tokens: Vec<usize> = Vec::new();
@@ -403,7 +405,7 @@ pub fn chat(
                     &gpu_params, &mag_cfg, &[next_tok],
                     &mut conductor, &mut gpu_context,
                     &mut kv_caches, &mut decode_ws,
-                    None,
+                    &mut speak_window,
                 );
             }
 

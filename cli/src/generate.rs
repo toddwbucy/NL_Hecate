@@ -18,7 +18,7 @@ use nl_hecate_core::model::{
 use nl_hecate_core::gpu_params::{GpuStackedParams, GpuStackedContext};
 #[cfg(feature = "cuda")]
 use nl_hecate_core::gpu_stacked_forward::{
-    gpu_stacked_forward_tokens, StackedDecodeWorkspace,
+    gpu_stacked_forward_tokens, StackedDecodeWorkspace, ActivationWindow,
 };
 #[cfg(feature = "cuda")]
 use nl_hecate_core::gpu_forward::GpuKVCache;
@@ -164,11 +164,14 @@ pub fn generate(config_path: &str, checkpoint_path: &str, prompt_tokens: &[usize
             .collect();
         let mut ws = StackedDecodeWorkspace::new(n_blocks, d, v);
 
-        // Process prompt tokens (no activation saving — pure inference)
+        // Always save activations — NLMs learn on every token (CS-10).
+        // Generation doesn't run backward, but the forward path is identical.
+        let mut window = ActivationWindow::new(seq_len);
+
         let logits = gpu_stacked_forward_tokens(
             &gpu_params, &mag_cfg, prompt_tokens,
             &mut conductor, &mut gpu_context, &mut kv_caches, &mut ws,
-            None, // no activation window for generation
+            &mut window,
         );
 
         let mut generated = Vec::new();
@@ -187,7 +190,7 @@ pub fn generate(config_path: &str, checkpoint_path: &str, prompt_tokens: &[usize
             last_logits = gpu_stacked_forward_tokens(
                 &gpu_params, &mag_cfg, &[next_tok],
                 &mut conductor, &mut gpu_context, &mut kv_caches, &mut ws,
-                None,
+                &mut window,
             );
         }
 
