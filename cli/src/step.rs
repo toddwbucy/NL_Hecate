@@ -13,7 +13,8 @@ use nl_hecate_core::conductor::Pulse;
 use nl_hecate_core::gpu_params::{GpuStackedParams, GpuStackedContext};
 #[cfg(feature = "cuda")]
 use nl_hecate_core::gpu_stacked_forward::{
-    gpu_stacked_forward_tokens, StackedDecodeWorkspace, ActivationWindow,
+    gpu_stacked_forward_tokens, gpu_stacked_forward_sequence,
+    StackedDecodeWorkspace, ActivationWindow,
 };
 #[cfg(feature = "cuda")]
 use nl_hecate_core::gpu_stacked_backward::gpu_stacked_backward;
@@ -85,25 +86,15 @@ pub fn step(
 ) -> StepResult {
     if let Some(ref mut p) = profiler { p.step_start(); }
 
-    // Fresh KV caches per chunk (no cross-chunk attention leaking)
-    let n_blocks = gpu_params.n_blocks();
-    let mut kv_caches: Vec<GpuKVCache> = (0..n_blocks)
-        .map(|_| GpuKVCache::new(tokens.len(), d, 1))
-        .collect();
-    let mut ws = StackedDecodeWorkspace::new(n_blocks, d, v);
-
-    // Forward: process all tokens through unified path, saving activations
-    let mut window = ActivationWindow::new(tokens.len());
-    let last_logits = gpu_stacked_forward_tokens(
-        gpu_params, mag_cfg, tokens,
-        conductor, gpu_context, &mut kv_caches, &mut ws,
-        &mut window,
+    // Spec 71: full-sequence forward for build mode (s > 1).
+    // Bypasses ActivationWindow — returns GpuStackedCache directly.
+    // Conductor advances once (one optimizer step), not per-token.
+    let (last_logits, cache) = gpu_stacked_forward_sequence(
+        gpu_params, mag_cfg, tokens, targets,
+        conductor, gpu_context,
     );
 
-    // Assemble activation cache for backward (recomputes batched SWA attention)
-    let cache = window.assemble_cache(mag_cfg, targets);
-
-    // Loss (host-side cross-entropy from assembled logits)
+    // Loss (host-side cross-entropy from full-sequence logits)
     let loss = host_cross_entropy_loss(&cache.logits, targets, v, tokens.len());
 
     // Capture pulse before backward consumes it
