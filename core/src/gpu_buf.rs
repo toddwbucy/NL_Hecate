@@ -53,6 +53,126 @@ impl GpuElement for u16 {
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// GpuPool — thread-local buffer recycling (spec 73)
+// ══════════════════════════════════════════════════════════════════════
+
+/// Pool statistics for diagnostics.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Debug, Default)]
+pub struct GpuPoolStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub returns: u64,
+    pub unique_sizes: usize,
+    pub cached_buffers: usize,
+    pub cached_bytes: usize,
+}
+
+#[cfg(feature = "cuda")]
+struct GpuPool {
+    free_lists: std::collections::HashMap<usize, Vec<*mut u8>>,
+    hits: u64,
+    misses: u64,
+    returns: u64,
+}
+
+#[cfg(feature = "cuda")]
+impl GpuPool {
+    fn new() -> Self {
+        GpuPool {
+            free_lists: std::collections::HashMap::new(),
+            hits: 0,
+            misses: 0,
+            returns: 0,
+        }
+    }
+
+    fn alloc(&mut self, bytes: usize) -> Option<*mut u8> {
+        if let Some(list) = self.free_lists.get_mut(&bytes) {
+            if let Some(ptr) = list.pop() {
+                self.hits += 1;
+                return Some(ptr);
+            }
+        }
+        self.misses += 1;
+        None
+    }
+
+    fn free(&mut self, ptr: *mut u8, bytes: usize) {
+        self.returns += 1;
+        self.free_lists.entry(bytes).or_default().push(ptr);
+    }
+
+    fn stats(&self) -> GpuPoolStats {
+        let cached_buffers: usize = self.free_lists.values().map(|v| v.len()).sum();
+        let cached_bytes: usize = self.free_lists.iter().map(|(sz, v)| sz * v.len()).sum();
+        GpuPoolStats {
+            hits: self.hits,
+            misses: self.misses,
+            returns: self.returns,
+            unique_sizes: self.free_lists.values().filter(|v| !v.is_empty()).count(),
+            cached_buffers,
+            cached_bytes,
+        }
+    }
+
+    fn drain(&mut self) -> GpuPoolStats {
+        let stats = self.stats();
+        for (_, ptrs) in self.free_lists.drain() {
+            for ptr in ptrs {
+                unsafe { cudaFree(ptr as *mut std::ffi::c_void); }
+            }
+        }
+        stats
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for GpuPool {
+    fn drop(&mut self) {
+        self.drain();
+    }
+}
+
+#[cfg(feature = "cuda")]
+std::thread_local! {
+    static GPU_POOL: std::cell::RefCell<Option<GpuPool>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Enable the GPU buffer pool. Call once before the build loop.
+/// After this, GpuBuf allocations recycle freed buffers instead of calling cudaMalloc.
+/// Safe to call multiple times — drains any existing pool first.
+#[cfg(feature = "cuda")]
+pub fn gpu_pool_enable() {
+    GPU_POOL.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if let Some(mut old) = slot.take() {
+            old.drain();
+        }
+        *slot = Some(GpuPool::new());
+    });
+}
+
+/// Drain the pool: free all cached GPU buffers and return statistics.
+/// Call on clean shutdown. After this, the pool is disabled.
+#[cfg(feature = "cuda")]
+pub fn gpu_pool_drain() -> GpuPoolStats {
+    GPU_POOL.with(|cell| {
+        cell.borrow_mut().take()
+            .map(|mut p| p.drain())
+            .unwrap_or_default()
+    })
+}
+
+/// Read pool statistics without draining.
+#[cfg(feature = "cuda")]
+pub fn gpu_pool_stats() -> Option<GpuPoolStats> {
+    GPU_POOL.with(|cell| {
+        cell.borrow().as_ref().map(|p| p.stats())
+    })
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // GpuBuf<T> — owning RAII device buffer
 // ══════════════════════════════════════════════════════════════════════
 
@@ -75,13 +195,25 @@ pub struct GpuBuf<T: GpuElement> {
 #[cfg(feature = "cuda")]
 impl<T: GpuElement> GpuBuf<T> {
     /// Allocate `len` elements of uninitialized device memory.
+    /// When the GPU buffer pool is enabled (spec 73), tries to recycle a
+    /// previously freed buffer of the same byte size before calling cudaMalloc.
     pub fn new(len: usize) -> Self {
         assert!(len > 0, "GpuBuf::new: len must be > 0");
         let bytes = len * T::byte_size();
-        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        let rc = unsafe { cudaMalloc(&mut ptr, bytes) };
-        assert_eq!(rc, 0, "cudaMalloc failed: error code {rc} (requested {bytes} bytes)");
-        GpuBuf { ptr: ptr as *mut T, len, owned: true, _not_send_sync: std::marker::PhantomData }
+        // Try pool first (spec 73)
+        let pooled = GPU_POOL.with(|cell| {
+            cell.borrow_mut().as_mut().and_then(|p| p.alloc(bytes))
+        });
+        let ptr = match pooled {
+            Some(p) => p as *mut T,
+            None => {
+                let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+                let rc = unsafe { cudaMalloc(&mut p, bytes) };
+                assert_eq!(rc, 0, "cudaMalloc failed: error code {rc} (requested {bytes} bytes)");
+                p as *mut T
+            }
+        };
+        GpuBuf { ptr, len, owned: true, _not_send_sync: std::marker::PhantomData }
     }
 
     /// Create a non-owning view into device memory owned by another buffer.
@@ -226,11 +358,20 @@ impl<T: GpuElement> GpuBuf<T> {
 #[cfg(feature = "cuda")]
 impl<T: GpuElement> Drop for GpuBuf<T> {
     fn drop(&mut self) {
-        if self.owned {
+        if !self.owned || self.ptr.is_null() { return; }
+        let bytes = self.len * T::byte_size();
+        // Spec 73: return to pool if enabled, else cudaFree
+        let returned = GPU_POOL.with(|cell| {
+            cell.borrow_mut().as_mut().map(|p| {
+                p.free(self.ptr as *mut u8, bytes);
+                true
+            }).unwrap_or(false)
+        });
+        if !returned {
             let rc = unsafe { cudaFree(self.ptr as *mut std::ffi::c_void) };
             debug_assert_eq!(rc, 0, "cudaFree failed: error code {rc}");
         }
-        // owned=false: memory is managed by the originating GpuLevelScratch — no-op here.
+        self.ptr = std::ptr::null_mut();
     }
 }
 

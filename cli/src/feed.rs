@@ -463,6 +463,15 @@ pub fn feed(config_path: &str, resume: bool) {
 
     logger.log_build_start(d, nh, seq_len, k, n_blocks, cfg.build.steps, default_opt.lr(), total_params);
 
+    // Spec 73: enable GPU buffer pool to recycle allocations across steps.
+    // After the first warm-up step, all ~572 per-step cudaMalloc/cudaFree calls
+    // become free-list hits (zero CUDA runtime overhead).
+    #[cfg(feature = "cuda")]
+    {
+        nl_hecate_core::gpu_buf::gpu_pool_enable();
+        eprintln!("  GPU pool: enabled (spec 73)");
+    }
+
     // ── Phase loop (spec 61) ─────────────────────────────────────────
     let t_start = Instant::now();
     let mut global_step = resume_step;
@@ -951,6 +960,13 @@ pub fn feed(config_path: &str, resume: bool) {
     eprintln!("  Segments: {total_segments} ({} tokens)", fmt_num(total_tokens_seen));
     eprintln!("  Tok/s:    {tok_s:.0}");
     eprintln!("  Loss:     {:.4} → {loss_last:.4}", loss_first.unwrap_or(0.0));
+    // Spec 73: drain GPU buffer pool and report statistics
+    #[cfg(feature = "cuda")]
+    {
+        let pool_stats = nl_hecate_core::gpu_buf::gpu_pool_drain();
+        eprintln!("  GPU pool: {} hits, {} misses, {} unique sizes, {} cached",
+            pool_stats.hits, pool_stats.misses, pool_stats.unique_sizes, pool_stats.cached_buffers);
+    }
     eprintln!("============================================================");
 
     logger.log_build_end(global_step - resume_step, elapsed, tok_s,

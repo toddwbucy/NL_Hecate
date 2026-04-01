@@ -165,6 +165,7 @@ pub fn run_probes(
     // ── GPU setup ────────────────────────────────────────────────────
     #[cfg(feature = "cuda")]
     {
+        nl_hecate_core::gpu_buf::gpu_pool_enable();
         let mut gpu_params = GpuStackedParams::from_host(&host_params);
         let mut gpu_context = GpuStackedContext::new(
             n_blocks, k, d, 1, Some(&mag_cfg),
@@ -286,6 +287,9 @@ pub fn run_probes(
 
         eprintln!("\n{sep}");
         eprintln!("Probes complete.");
+        let pool_stats = nl_hecate_core::gpu_buf::gpu_pool_drain();
+        eprintln!("  GPU pool: {} hits, {} misses, {} unique sizes",
+            pool_stats.hits, pool_stats.misses, pool_stats.unique_sizes);
         eprintln!("{sep}");
     }
 }
