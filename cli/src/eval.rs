@@ -668,9 +668,9 @@ fn linear_slope(values: &[f32]) -> f32 {
 }
 
 /// Host-side cross-entropy loss from GPU logits buffer + target IDs.
-/// Used by probes only — not on the training hot path.
+/// Used by probes and chat learn mode — not on the training hot path.
 #[cfg(feature = "cuda")]
-fn host_cross_entropy_loss(
+pub(crate) fn host_cross_entropy_loss(
     logits_gpu: &nl_hecate_core::gpu_buf::GpuBuf<f32>,
     target_ids: &[usize],
     vocab_size: usize,
