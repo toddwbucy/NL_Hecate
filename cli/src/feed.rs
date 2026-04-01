@@ -13,29 +13,19 @@ use nl_hecate_core::parallel::{ParallelConfig, ParallelStrategy};
 #[cfg(feature = "cuda")]
 use nl_hecate_core::gpu_params::{GpuStackedParams, GpuStackedContext};
 #[cfg(feature = "cuda")]
-use nl_hecate_core::gpu_stacked_forward::{
-    gpu_stacked_forward_tokens, StackedDecodeWorkspace, ActivationWindow,
-};
-#[cfg(feature = "cuda")]
-use nl_hecate_core::gpu_stacked_backward::gpu_stacked_backward;
-#[cfg(feature = "cuda")]
 use nl_hecate_core::gpu_stacked_optimizer::{
-    GpuStackedAdamWState, gpu_stacked_adamw_update, gpu_stacked_sync_embed_weights,
-    gpu_read_grad_norm,
+    GpuStackedAdamWState, gpu_read_grad_norm,
 };
-#[cfg(feature = "cuda")]
-use nl_hecate_core::gpu_forward::GpuKVCache;
 #[cfg(feature = "cuda")]
 use nl_hecate_core::gpu_profiler::GpuProfiler;
 
-use crate::config::{Config, OptimizerConfig, PhaseDuration};
+use crate::config::{Config, PhaseDuration};
 use crate::data::BpeTokenStream;
 #[cfg(feature = "cuda")]
-use crate::eval::run_inline_probes;
+use crate::probe::run_inline_probes;
 #[cfg(feature = "cuda")]
-use crate::eval::host_cross_entropy_loss;
+use crate::step::{step, generate, BlockLevelGnorms};
 use crate::log::{MetricsLogger, CmsDiagnostics, CmsTapeLogger, TOKENS_PER_SEGMENT};
-use crate::sample::sample_token;
 
 /// Cosine annealing with linear warmup.
 fn cosine_lr(step: usize, warmup_steps: usize, total_steps: usize, lr_peak: f32) -> f32 {
@@ -47,7 +37,7 @@ fn cosine_lr(step: usize, warmup_steps: usize, total_steps: usize, lr_peak: f32)
     0.5 * lr_peak * (1.0 + (std::f32::consts::PI * progress).cos())
 }
 
-pub fn run(config_path: &str, _resume: bool) {
+pub fn feed(config_path: &str, _resume: bool) {
     let cfg = Config::from_file(config_path).unwrap_or_else(|e| {
         eprintln!("ERROR: {e}");
         std::process::exit(1);
@@ -533,7 +523,7 @@ pub fn run(config_path: &str, _resume: bool) {
                         all_target.extend_from_slice(&tgt);
                     }
 
-                    // Capture pulse snapshot for logging (conductor advances inside run_step)
+                    // Capture pulse snapshot for logging (conductor advances inside step())
                     let pulse = conductor.pulse();
 
                     // Spec 63: compute log_this early so backward can skip gnorm readback
@@ -566,7 +556,7 @@ pub fn run(config_path: &str, _resume: bool) {
                         for sample_idx in 0..batch_size {
                             let start = sample_idx * phase_seq_len;
                             let end = start + phase_seq_len;
-                            let (loss_i, gnorm_i, gnorms_i) = run_step(
+                            let result = step(
                                 &mut gpu_params, &mag_cfg, &mut gpu_context,
                                 &mut adamw_state,
                                 &all_input[start..end], &all_target[start..end],
@@ -577,12 +567,12 @@ pub fn run(config_path: &str, _resume: bool) {
                                 &mut profiler,
                                 log_this || phase_step == 0,
                             );
-                            total_loss += loss_i;
-                            acc_gnorm += gnorm_i;
+                            total_loss += result.loss;
+                            acc_gnorm += result.grad_norm;
                             if acc_gnorms.is_empty() {
-                                acc_gnorms = gnorms_i;
+                                acc_gnorms = result.block_level_gnorms;
                             } else {
-                                for (acc, val) in acc_gnorms.iter_mut().zip(gnorms_i.iter()) {
+                                for (acc, val) in acc_gnorms.iter_mut().zip(result.block_level_gnorms.iter()) {
                                     for (a, v) in acc.iter_mut().zip(val.iter()) {
                                         *a += v;
                                     }
@@ -625,7 +615,7 @@ pub fn run(config_path: &str, _resume: bool) {
                         prof.reset();
                     }
 
-                    // conductor.advance() removed — now happens per-token inside run_step
+                    // conductor.advance() removed — now happens per-token inside step()
                     let tokens_this_step = batch_size * phase_seq_len;
                     step_tokens += tokens_this_step;
                     total_tokens_seen += tokens_this_step;
@@ -642,7 +632,7 @@ pub fn run(config_path: &str, _resume: bool) {
 
                     // Logging + CMS diagnostics (gated to log_every to avoid per-step GPU stalls)
                     if log_this || phase_step == 0 {
-                        // Spec 64: update_m_norm_tracking() now called inside run_step(),
+                        // Spec 64: update_m_norm_tracking() now called inside step(),
                         // before maybe_reset_levels(), so we read pre-reset norms.
 
                         #[cfg(feature = "cuda")]
@@ -767,7 +757,7 @@ pub fn run(config_path: &str, _resume: bool) {
                     // LEARN from current input (unified forward path)
                     #[cfg(feature = "cuda")]
                     let (loss, _gnorm_deferred, block_level_gnorms) = {
-                        run_step(
+                        let result = step(
                             &mut gpu_params, &mag_cfg, &mut gpu_context,
                             &mut adamw_state,
                             &input, &target,
@@ -777,10 +767,11 @@ pub fn run(config_path: &str, _resume: bool) {
                             &reset_intervals, &mut fire_counts,
                             &mut None, // no profiling in think_rounds (too few steps)
                             true, // think_rounds always log
-                        )
+                        );
+                        (result.loss, result.grad_norm, result.block_level_gnorms)
                     };
 
-                    // conductor.advance() removed — happens per-token inside run_step
+                    // conductor.advance() removed — happens per-token inside step()
                     step_tokens += phase_seq_len;
                     global_step += 1;
 
@@ -820,7 +811,7 @@ pub fn run(config_path: &str, _resume: bool) {
                         break;
                     }
 
-                    // SPEAK — generate output via unified forward path
+                    // SPEAK — generate via step() with deferred backward
                     // Then REDIRECT — generated output becomes next round's input
                     #[cfg(feature = "cuda")]
                     if round + 1 < *rounds {
@@ -828,40 +819,17 @@ pub fn run(config_path: &str, _resume: bool) {
                         let gen_temp = phase.temperature.unwrap_or(0.0);
                         let gen_top_k = phase.top_k.unwrap_or(0);
 
-                        // Process prompt through unified path (no prefill)
-                        let n_blocks = gpu_params.n_blocks();
-                        let mut kv_caches: Vec<GpuKVCache> = (0..n_blocks)
-                            .map(|_| GpuKVCache::new(input.len() + gen_tokens, d, 1))
-                            .collect();
-                        let mut decode_ws = StackedDecodeWorkspace::new(n_blocks, d, v);
-
-                        let mut speak_window = ActivationWindow::new(phase_seq_len);
-
-                        let logits = gpu_stacked_forward_tokens(
-                            &gpu_params, &mag_cfg, &input,
-                            &mut conductor, &mut gpu_context,
-                            &mut kv_caches, &mut decode_ws,
-                            &mut speak_window,
+                        let gen_result = generate(
+                            &mut gpu_params, &mag_cfg, &mut gpu_context,
+                            &mut adamw_state, &mut conductor,
+                            opt, lr, max_grad_norm, d, v,
+                            &input, gen_tokens, gen_temp, gen_top_k,
+                            None, // no stop token for think rounds
+                            &mut None, // no profiling
                         );
 
-                        // Decode loop: generate output tokens
-                        let mut output = Vec::with_capacity(gen_tokens);
-                        let mut next_tok = sample_token(&logits, gen_temp, gen_top_k);
-                        output.push(next_tok);
-
-                        for _ in 1..gen_tokens {
-                            let logits = gpu_stacked_forward_tokens(
-                                &gpu_params, &mag_cfg, &[next_tok],
-                                &mut conductor, &mut gpu_context,
-                                &mut kv_caches, &mut decode_ws,
-                                &mut speak_window,
-                            );
-                            next_tok = sample_token(&logits, gen_temp, gen_top_k);
-                            output.push(next_tok);
-                        }
-
                         // REDIRECT — truncate output to seq_len, use as next input
-                        // No padding — unified path handles variable-length
+                        let output = gen_result.tokens;
                         let new_input = if output.len() >= phase_seq_len {
                             output[output.len() - phase_seq_len..].to_vec()
                         } else {
@@ -872,8 +840,8 @@ pub fn run(config_path: &str, _resume: bool) {
                         target.push(new_input[0]); // wrap-around for last position
                         input = new_input;
 
-                        eprintln!("    [speak: generated {} tokens → redirect as round {} input]",
-                            output.len(), round + 2);
+                        eprintln!("    [speak: generated {} tokens, loss={:.4} → redirect as round {} input]",
+                            output.len(), gen_result.loss, round + 2);
                     }
                 }
             }
@@ -952,10 +920,6 @@ pub fn run(config_path: &str, _resume: bool) {
 
 // ── Extracted helpers ────────────────────────────────────────────────
 
-/// Per-level gradient norms extracted from backward pass (one Vec<f32> per block).
-#[cfg(feature = "cuda")]
-type BlockLevelGnorms = Vec<Vec<f32>>;
-
 /// Build CMS diagnostics from gpu_context state and per-block gradient norms.
 /// Aggregates across blocks: gnorms and m-deltas are averaged, dormancy uses worst-case.
 #[cfg(feature = "cuda")]
@@ -976,7 +940,7 @@ fn collect_cms_diagnostics(
     }
     for g in &mut level_gnorms { *g /= nb; }
 
-    // M-norms: use prev_m_norms (spec 64: captured inside run_step BEFORE maybe_reset_levels
+    // M-norms: use prev_m_norms (spec 64: captured inside step() BEFORE maybe_reset_levels
     // zeros the buffers). These are pre-reset norms — the actual end-of-sequence memory state.
     let mut level_m_norms = vec![0.0f32; k];
     for block_norms in &gpu_context.prev_m_norms {
@@ -1009,97 +973,6 @@ fn collect_cms_diagnostics(
     }
 
     CmsDiagnostics { level_gnorms, level_m_norms, level_m_deltas, dormancy_status }
-}
-
-/// Run a single training step: forward + backward + optimizer update.
-/// Uses the unified composable forward path (spec 68 Phase C).
-/// Returns (loss, grad_norm, per_block_level_gnorms).
-#[cfg(feature = "cuda")]
-fn run_step(
-    gpu_params: &mut GpuStackedParams,
-    mag_cfg: &MAGConfig,
-    gpu_context: &mut GpuStackedContext,
-    adamw_state: &mut Option<GpuStackedAdamWState>,
-    tokens: &[usize],
-    targets: &[usize],
-    conductor: &mut Conductor,
-    opt: &OptimizerConfig,
-    lr: f32,
-    max_grad_norm: f32,
-    d: usize,
-    v: usize,
-    reset_intervals: &[usize],
-    fire_counts: &mut [usize],
-    profiler: &mut Option<GpuProfiler>,
-    log_this: bool,
-) -> (f32, f32, BlockLevelGnorms) {
-    if let Some(ref mut p) = profiler { p.step_start(); }
-
-    // Fresh KV caches per chunk (no cross-chunk attention leaking)
-    let n_blocks = gpu_params.n_blocks();
-    let mut kv_caches: Vec<GpuKVCache> = (0..n_blocks)
-        .map(|_| GpuKVCache::new(tokens.len(), d, 1))
-        .collect();
-    let mut ws = StackedDecodeWorkspace::new(n_blocks, d, v);
-
-    // Forward: process all tokens through unified path, saving activations
-    let mut window = ActivationWindow::new(tokens.len());
-    gpu_stacked_forward_tokens(
-        gpu_params, mag_cfg, tokens,
-        conductor, gpu_context, &mut kv_caches, &mut ws,
-        &mut window,
-    );
-
-    // Assemble activation cache for backward (recomputes batched SWA attention)
-    let cache = window.assemble_cache(mag_cfg, targets);
-
-    // Loss (host-side cross-entropy from assembled logits)
-    let loss = host_cross_entropy_loss(&cache.logits, targets, v, tokens.len());
-
-    let mut grads = gpu_stacked_backward(
-        gpu_params, mag_cfg, &cache, profiler, log_this,
-    );
-
-    // Extract per-level gradient norms before optimizer consumes grads
-    let block_level_gnorms: BlockLevelGnorms = grads.blocks.iter()
-        .map(|bg| bg.level_output_gnorms.clone())
-        .collect();
-
-    // Dispatch optimizer by type
-    let gnorm = match opt.optimizer_type() {
-        "adamw" => {
-            if adamw_state.is_none() {
-                *adamw_state = Some(GpuStackedAdamWState::from_params(gpu_params));
-            }
-            let state = adamw_state.as_mut().unwrap();
-            gpu_stacked_adamw_update(
-                gpu_params, &mut grads, state,
-                &cache.pulse,
-                lr, opt.beta1(), opt.beta2(), 1e-8,
-                opt.weight_decay(), max_grad_norm,
-                false, // freeze_embed
-                profiler,
-            )
-        }
-        other => {
-            panic!("Unsupported optimizer type: \"{other}\". Only \"adamw\" is currently implemented.");
-        }
-    };
-
-    if let Some(ref mut p) = profiler { p.step_stop(); }
-
-    // Weight tying
-    gpu_stacked_sync_embed_weights(gpu_params, d, v);
-
-    // Spec 64: capture pre-reset M norms on log steps (before reset zeros the buffers)
-    if log_this {
-        gpu_context.update_m_norm_tracking();
-    }
-
-    // Selective periodic reset (spec 57)
-    maybe_reset_levels(&cache.pulse, reset_intervals, fire_counts, gpu_context);
-
-    (loss, gnorm, block_level_gnorms)
 }
 
 /// Save checkpoint with build state.
@@ -1212,30 +1085,6 @@ fn level_firings(pulse: &Pulse, seq_len: usize, chunk_sizes: &[usize]) -> Vec<us
             0
         }
     }).collect()
-}
-
-/// Selective periodic reset (spec 57).
-#[cfg(feature = "cuda")]
-fn maybe_reset_levels(
-    pulse: &Pulse,
-    reset_intervals: &[usize],
-    fire_counts: &mut [usize],
-    context: &mut GpuStackedContext,
-) {
-    if reset_intervals.is_empty() { return; }
-    for (level, active) in pulse.active_levels.iter().enumerate() {
-        if !active { continue; }
-        if level >= reset_intervals.len() { continue; }
-        fire_counts[level] += 1;
-        if reset_intervals[level] > 0 && fire_counts[level] >= reset_intervals[level] {
-            fire_counts[level] = 0;
-            for block_ctx in &mut context.blocks {
-                if level < block_ctx.memory.len() {
-                    block_ctx.memory[level].zero();
-                }
-            }
-        }
-    }
 }
 
 /// Get resident set size in MB (Linux).
