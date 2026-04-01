@@ -559,58 +559,62 @@ fn concat_memory_caches<'a>(
     match &caches[0] {
         GpuMemoryCache::Delta { proxy, .. } => {
             let proxy = *proxy;
-            let bs_mem = nh;  // batch_size=1, fold heads into batch
+            let bs_mem = nh;  // batch_size=1, fold heads into batch (per-head quantities)
+            let bs = 1;       // gates and norms are d_model resolution (1 per token)
             GpuMemoryCache::Delta {
                 k_mem: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Delta { k_mem, .. } => k_mem, _ => unreachable!() }), bs_mem * hd),
                 v_mem: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Delta { v_mem, .. } => v_mem, _ => unreachable!() }), bs_mem * hd),
                 q_mem: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Delta { q_mem, .. } => q_mem, _ => unreachable!() }), bs_mem * hd),
-                alpha: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Delta { alpha, .. } => alpha, _ => unreachable!() }), bs_mem),
-                theta: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Delta { theta, .. } => theta, _ => unreachable!() }), bs_mem),
-                k_norms: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Delta { k_norms, .. } => k_norms, _ => unreachable!() }), bs_mem),
-                q_norms: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Delta { q_norms, .. } => q_norms, _ => unreachable!() }), bs_mem),
+                alpha: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Delta { alpha, .. } => alpha, _ => unreachable!() }), bs),
+                theta: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Delta { theta, .. } => theta, _ => unreachable!() }), bs),
+                k_norms: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Delta { k_norms, .. } => k_norms, _ => unreachable!() }), bs),
+                q_norms: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Delta { q_norms, .. } => q_norms, _ => unreachable!() }), bs),
                 m_states: assemble_m_states(&caches, d, s, nh, hd, proxy, false),
                 proxy,
             }
         }
         GpuMemoryCache::Titans { proxy, .. } => {
             let proxy = *proxy;
-            let bs_mem = nh;
+            let bs_mem = nh;  // per-head quantities
+            let bs = 1;       // gates and norms are d_model resolution
             GpuMemoryCache::Titans {
                 k_mem: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Titans { k_mem, .. } => k_mem, _ => unreachable!() }), bs_mem * hd),
                 v_mem: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Titans { v_mem, .. } => v_mem, _ => unreachable!() }), bs_mem * hd),
                 q_mem: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Titans { q_mem, .. } => q_mem, _ => unreachable!() }), bs_mem * hd),
-                alpha: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Titans { alpha, .. } => alpha, _ => unreachable!() }), bs_mem),
-                theta: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Titans { theta, .. } => theta, _ => unreachable!() }), bs_mem),
-                eta: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Titans { eta, .. } => eta, _ => unreachable!() }), bs_mem),
-                k_norms: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Titans { k_norms, .. } => k_norms, _ => unreachable!() }), bs_mem),
-                q_norms: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Titans { q_norms, .. } => q_norms, _ => unreachable!() }), bs_mem),
+                alpha: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Titans { alpha, .. } => alpha, _ => unreachable!() }), bs),
+                theta: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Titans { theta, .. } => theta, _ => unreachable!() }), bs),
+                eta: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Titans { eta, .. } => eta, _ => unreachable!() }), bs),
+                k_norms: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Titans { k_norms, .. } => k_norms, _ => unreachable!() }), bs),
+                q_norms: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Titans { q_norms, .. } => q_norms, _ => unreachable!() }), bs),
                 m_states: assemble_m_states(&caches, d, s, nh, hd, proxy, false),
                 s_states: assemble_m_states(&caches, d, s, nh, hd, proxy, true),
                 proxy,
             }
         }
         GpuMemoryCache::Hebbian { .. } => {
-            let bs_mem = nh;
+            let bs_mem = nh;  // per-head quantities
+            let bs = 1;       // gates and norms are d_model resolution
             GpuMemoryCache::Hebbian {
                 k_mem: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Hebbian { k_mem, .. } => k_mem, _ => unreachable!() }), bs_mem * hd),
                 v_mem: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Hebbian { v_mem, .. } => v_mem, _ => unreachable!() }), bs_mem * hd),
                 q_mem: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Hebbian { q_mem, .. } => q_mem, _ => unreachable!() }), bs_mem * hd),
-                alpha: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Hebbian { alpha, .. } => alpha, _ => unreachable!() }), bs_mem),
-                k_norms: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Hebbian { k_norms, .. } => k_norms, _ => unreachable!() }), bs_mem),
-                q_norms: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Hebbian { q_norms, .. } => q_norms, _ => unreachable!() }), bs_mem),
+                alpha: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Hebbian { alpha, .. } => alpha, _ => unreachable!() }), bs),
+                k_norms: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Hebbian { k_norms, .. } => k_norms, _ => unreachable!() }), bs),
+                q_norms: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::Hebbian { q_norms, .. } => q_norms, _ => unreachable!() }), bs),
                 m_states: assemble_m_states(&caches, d, s, nh, hd, false, false),
             }
         }
         GpuMemoryCache::DGD { .. } => {
-            let bs_mem = nh;
+            let bs_mem = nh;  // per-head quantities
+            let bs = 1;       // gates and norms are d_model resolution
             GpuMemoryCache::DGD {
                 k_mem: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DGD { k_mem, .. } => k_mem, _ => unreachable!() }), bs_mem * hd),
                 v_mem: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DGD { v_mem, .. } => v_mem, _ => unreachable!() }), bs_mem * hd),
                 q_mem: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DGD { q_mem, .. } => q_mem, _ => unreachable!() }), bs_mem * hd),
-                alpha: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DGD { alpha, .. } => alpha, _ => unreachable!() }), bs_mem),
-                theta: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DGD { theta, .. } => theta, _ => unreachable!() }), bs_mem),
-                k_norms: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DGD { k_norms, .. } => k_norms, _ => unreachable!() }), bs_mem),
-                q_norms: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DGD { q_norms, .. } => q_norms, _ => unreachable!() }), bs_mem),
+                alpha: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DGD { alpha, .. } => alpha, _ => unreachable!() }), bs),
+                theta: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DGD { theta, .. } => theta, _ => unreachable!() }), bs),
+                k_norms: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DGD { k_norms, .. } => k_norms, _ => unreachable!() }), bs),
+                q_norms: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DGD { q_norms, .. } => q_norms, _ => unreachable!() }), bs),
                 m_states: assemble_m_states(&caches, d, s, nh, hd, false, false),
             }
         }
