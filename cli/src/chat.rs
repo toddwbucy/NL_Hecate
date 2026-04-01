@@ -1,11 +1,14 @@
-/// Interactive multi-turn chat with ChatML formatting.
-/// Rust port of Python run_chat() from engine/chat.py.
+/// Interactive multi-turn chat with ChatML formatting (spec 70).
 ///
-/// Two modes:
+/// Two memory modes:
 /// - Stateful (default): CMS memory carries conversation context.
 ///   Only the new user message is fed each turn. Constant prompt size.
 /// - Stateless (--stateless): Full conversation history re-sent each turn.
 ///   No CMS memory persistence. Traditional transformer-style chat.
+///
+/// The model ALWAYS learns (forward → backward → update) on every token it sees.
+/// There is no --learn flag — disabling learning produces a broken NLM (CS-10).
+/// Generation uses deferred backward: the model learns from its own output.
 
 use std::io::{self, BufRead, Write};
 use std::path::Path;
@@ -23,21 +26,11 @@ use nl_hecate_core::model::{
 #[cfg(feature = "cuda")]
 use nl_hecate_core::gpu_params::{GpuStackedParams, GpuStackedContext};
 #[cfg(feature = "cuda")]
-use nl_hecate_core::gpu_stacked_forward::{
-    gpu_stacked_forward_tokens, StackedDecodeWorkspace, ActivationWindow,
-};
-#[cfg(feature = "cuda")]
-use nl_hecate_core::gpu_stacked_backward::gpu_stacked_backward;
-#[cfg(feature = "cuda")]
-use nl_hecate_core::gpu_stacked_optimizer::{
-    GpuStackedAdamWState, gpu_stacked_adamw_update, gpu_stacked_sync_embed_weights,
-};
-#[cfg(feature = "cuda")]
-use nl_hecate_core::gpu_forward::GpuKVCache;
+use nl_hecate_core::gpu_stacked_optimizer::GpuStackedAdamWState;
 
 use crate::config::Config;
-use crate::eval::host_cross_entropy_loss;
-use crate::sample::sample_token;
+#[cfg(feature = "cuda")]
+use crate::step::generate;
 
 // ChatML special token IDs (must match tokenizer training in prepare_sharegpt.py)
 const IM_START: u32 = 0; // <|im_start|>
@@ -74,11 +67,11 @@ fn decode_tokens(tokenizer: &Tokenizer, tokens: &[usize]) -> String {
     tokenizer.decode(&ids32, true).unwrap_or_else(|_| String::from("???"))
 }
 
-/// Run interactive chat.
+/// Run interactive chat. The model learns from every token — no --learn flag needed.
 pub fn chat(
     config_path: &str, checkpoint_path: &str, tokenizer_path: &str,
     max_tokens: usize, temperature: f32, top_k: usize,
-    stateless: bool, learn: bool,
+    stateless: bool,
 ) {
     let cfg = Config::from_file(config_path).unwrap_or_else(|e| {
         eprintln!("ERROR: {e}");
@@ -127,7 +120,8 @@ pub fn chat(
         std::process::exit(1);
     }
 
-    let step = build_state.as_ref().map(|bs| bs.global_step).unwrap_or(0);
+    // Use conductor.step for replay (per-token counter), not global_step (optimizer steps)
+    let loaded_conductor_step = build_state.as_ref().map(|bs| bs.conductor.step).unwrap_or(0);
 
     // ── Build MAGConfig ──────────────────────────────────────────────
     let chunk_sizes = cfg.model.chunk_sizes.clone()
@@ -202,11 +196,14 @@ pub fn chat(
         );
 
         let mut conductor = Conductor::new(k, chunk_sizes.clone());
-        for _ in 0..step {
+        for _ in 0..loaded_conductor_step {
             conductor.advance();
         }
 
         let mut adamw_state: Option<GpuStackedAdamWState> = None;
+
+        let lr = cfg.build.optimizer.lr();
+        let max_grad_norm = cfg.build.max_grad_norm;
 
         // ── Banner ───────────────────────────────────────────────
         let sep = "\u{2500}".repeat(60);
@@ -215,12 +212,11 @@ pub fn chat(
         } else {
             "stateful (CMS memory)"
         };
-        let learn_label = if learn { " + learning" } else { "" };
 
         eprintln!("\n{sep}");
         eprintln!("  NL-Hecate Chat");
-        eprintln!("  Model: d={d}, heads={nh}, k={k}, blocks={n_blocks} (step {step})");
-        eprintln!("  Mode: {mode_label}{learn_label}");
+        eprintln!("  Model: d={d}, heads={nh}, k={k}, blocks={n_blocks} (step {loaded_conductor_step})");
+        eprintln!("  Mode: {mode_label} + learning");
         eprintln!("  temp={temperature}, top_k={top_k}, max_tokens={max_tokens}");
         eprintln!("{sep}");
         eprintln!("  Commands: /quit  /clear  /mode  /stats");
@@ -267,7 +263,7 @@ pub fn chat(
                 turn_count = 0;
                 if !stateless {
                     conductor = Conductor::new(k, chunk_sizes.clone());
-                    for _ in 0..step {
+                    for _ in 0..loaded_conductor_step {
                         conductor.advance();
                     }
                     gpu_context = GpuStackedContext::new(
@@ -279,7 +275,7 @@ pub fn chat(
             }
 
             if lower == "/mode" {
-                eprintln!("  Mode: {mode_label}{learn_label}");
+                eprintln!("  Mode: {mode_label} + learning");
                 eprintln!("  History: {} tokens, {turn_count} turns", history_tokens.len());
                 if !stateless {
                     eprintln!("  CMS: memory persists across turns (constant prompt size)");
@@ -324,93 +320,22 @@ pub fn chat(
 
             let t0 = Instant::now();
 
-            // ── LEARN step (if enabled) ──────────────────────────
-            // Same composable path as eval probes: forward → backward → update
-            if learn && ctx.len() >= 2 {
-                let mut learn_kv: Vec<GpuKVCache> = (0..n_blocks)
-                    .map(|_| GpuKVCache::new(ctx.len(), d, 1))
-                    .collect();
-                let mut learn_ws = StackedDecodeWorkspace::new(n_blocks, d, v);
-                let mut window = ActivationWindow::new(seq_len);
-
-                gpu_stacked_forward_tokens(
-                    &gpu_params, &mag_cfg, &ctx,
-                    &mut conductor, &mut gpu_context,
-                    &mut learn_kv, &mut learn_ws,
-                    &mut window,
-                );
-
-                // Build targets: shifted by 1 (next-token prediction)
-                let win_len = window.len();
-                let mut target_ids: Vec<usize> = Vec::with_capacity(win_len);
-                for i in 1..win_len {
-                    target_ids.push(window.entries[i].token_id);
-                }
-                target_ids.push(v); // mask last position
-
-                let cache = window.assemble_cache(&mag_cfg, &target_ids);
-                let loss = host_cross_entropy_loss(&cache.logits, &target_ids, v, win_len);
-
-                if !loss.is_nan() && !loss.is_infinite() {
-                    let mut grads = gpu_stacked_backward(
-                        &gpu_params, &mag_cfg, &cache, &mut None, false,
-                    );
-
-                    if adamw_state.is_none() {
-                        adamw_state = Some(GpuStackedAdamWState::from_params(&gpu_params));
-                    }
-                    let aw = adamw_state.as_mut().unwrap();
-                    let lr = cfg.build.optimizer.lr();
-                    let gnorm = gpu_stacked_adamw_update(
-                        &mut gpu_params, &mut grads, aw,
-                        &cache.pulse,
-                        lr, cfg.build.optimizer.beta1(), cfg.build.optimizer.beta2(), 1e-8,
-                        cfg.build.optimizer.weight_decay(), cfg.build.max_grad_norm,
-                        false, &mut None,
-                    );
-                    gpu_stacked_sync_embed_weights(&mut gpu_params, d, v);
-                    gpu_context.update_m_norm_tracking();
-
-                    eprintln!("  \x1b[2m[learn: loss={loss:.4}, gnorm={gnorm:.4}]\x1b[0m");
-                }
-            }
-
-            // ── SPEAK: generate response ─────────────────────────
-            // Same composable path as generate.rs: forward tokens → sample → forward next
-            let mut kv_caches: Vec<GpuKVCache> = (0..n_blocks)
-                .map(|_| GpuKVCache::new(ctx.len() + max_tokens, d, 1))
-                .collect();
-            let mut decode_ws = StackedDecodeWorkspace::new(n_blocks, d, v);
-
-            let mut speak_window = ActivationWindow::new(seq_len);
-
-            let logits = gpu_stacked_forward_tokens(
-                &gpu_params, &mag_cfg, &ctx,
-                &mut conductor, &mut gpu_context,
-                &mut kv_caches, &mut decode_ws,
-                &mut speak_window,
+            // ── generate() handles both LEARN and SPEAK ──────────
+            // generate() forwards the prompt (memory updates), samples response tokens,
+            // then runs deferred backward on the FULL sequence (prompt + generated).
+            // No separate LEARN step needed — generate() learns from everything.
+            let gen_result = generate(
+                &mut gpu_params, &mag_cfg, &mut gpu_context,
+                &mut adamw_state, &mut conductor,
+                &cfg.build.optimizer,
+                lr, max_grad_norm, d, v,
+                &ctx, max_tokens, temperature, top_k,
+                Some(IM_END as usize), // stop on end-of-turn
+                &mut None, // no profiling
             );
 
-            let mut gen_tokens: Vec<usize> = Vec::new();
-            let mut last_logits = logits;
-
-            for _ in 0..max_tokens {
-                let next_tok = sample_token(&last_logits, temperature, top_k);
-                if next_tok == IM_END as usize {
-                    break;
-                }
-                gen_tokens.push(next_tok);
-
-                last_logits = gpu_stacked_forward_tokens(
-                    &gpu_params, &mag_cfg, &[next_tok],
-                    &mut conductor, &mut gpu_context,
-                    &mut kv_caches, &mut decode_ws,
-                    &mut speak_window,
-                );
-            }
-
             let elapsed = t0.elapsed().as_secs_f64();
-            let response_text = decode_tokens(&tokenizer, &gen_tokens);
+            let response_text = decode_tokens(&tokenizer, &gen_result.tokens);
 
             // Accumulate history for stateless mode
             if stateless {
@@ -419,11 +344,11 @@ pub fn chat(
             }
 
             turn_count += 1;
-            let tps = gen_tokens.len() as f64 / elapsed.max(1e-9);
+            let tps = gen_result.tokens.len() as f64 / elapsed.max(1e-9);
 
             println!("\x1b[1;32mAssistant:\x1b[0m {}", response_text.trim());
-            eprintln!("  \x1b[2m[{} tokens, {tps:.0} tok/s, prompt={} tokens]\x1b[0m\n",
-                gen_tokens.len(), prompt_tokens.len());
+            eprintln!("  \x1b[2m[{} tokens, {tps:.0} tok/s, loss={:.4}, gnorm={:.4}, prompt={} tokens]\x1b[0m\n",
+                gen_result.tokens.len(), gen_result.loss, gen_result.grad_norm, prompt_tokens.len());
         }
     }
 }

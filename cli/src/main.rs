@@ -3,10 +3,9 @@ use clap::{Parser, Subcommand};
 mod chat;
 mod config;
 mod data;
-#[allow(clippy::module_inception)]
-mod eval;
-mod generate;
-mod run;
+mod feed;
+mod probe;
+mod step;
 mod log;
 mod sample;
 
@@ -19,8 +18,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Process tokens — training or inference determined by config
-    Run {
+    /// Feed tokens from a dataset — the model's primary learning loop
+    Feed {
         /// Path to JSON config file
         #[arg(short, long)]
         config: String,
@@ -34,42 +33,7 @@ enum Commands {
         resume: bool,
     },
 
-    /// Generate tokens from a checkpoint
-    Generate {
-        /// Path to JSON config file
-        #[arg(short, long)]
-        config: String,
-
-        /// Path to .safetensors checkpoint
-        #[arg(short = 'l', long)]
-        load: String,
-
-        /// Comma-separated prompt token IDs (e.g. "1,42,100,7")
-        #[arg(short, long)]
-        prompt: String,
-
-        /// Maximum tokens to generate
-        #[arg(long, default_value = "64")]
-        max_tokens: usize,
-
-        /// Sampling temperature (0 = greedy)
-        #[arg(long, default_value = "0.8")]
-        temperature: f32,
-
-        /// Top-k filtering (0 = disabled)
-        #[arg(long, default_value = "0")]
-        top_k: usize,
-
-        /// Stop token ID (generation halts when emitted)
-        #[arg(long)]
-        stop_token: Option<usize>,
-
-        /// Override GPU index (CUDA_VISIBLE_DEVICES)
-        #[arg(long)]
-        gpu: Option<usize>,
-    },
-
-    /// Interactive multi-turn chat
+    /// Interactive multi-turn chat (learning always on)
     Chat {
         /// Path to JSON config file
         #[arg(short, long)]
@@ -99,17 +63,13 @@ enum Commands {
         #[arg(long)]
         stateless: bool,
 
-        /// Enable learning: run forward+backward+optimizer on each user turn
-        #[arg(long)]
-        learn: bool,
-
         /// Override GPU index (CUDA_VISIBLE_DEVICES)
         #[arg(long)]
         gpu: Option<usize>,
     },
 
-    /// Run evaluation probes (coherence, within-generation, cross-exposure)
-    Eval {
+    /// Run coherence probes (within-generation, cross-exposure)
+    Probe {
         /// Path to JSON config file
         #[arg(short, long)]
         config: String,
@@ -150,40 +110,23 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run { config, gpu, resume } => {
+        Commands::Feed { config, gpu, resume } => {
             if let Some(gpu_id) = gpu {
                 std::env::set_var("CUDA_VISIBLE_DEVICES", gpu_id.to_string());
             }
-            run::run(&config, resume);
+            feed::feed(&config, resume);
         }
-        Commands::Generate { config, load, prompt, max_tokens, temperature, top_k, stop_token, gpu } => {
+        Commands::Chat { config, load, tokenizer, max_tokens, temperature, top_k, stateless, gpu } => {
             if let Some(gpu_id) = gpu {
                 std::env::set_var("CUDA_VISIBLE_DEVICES", gpu_id.to_string());
             }
-            let prompt_tokens: Vec<usize> = prompt.split(',')
-                .filter(|s| !s.is_empty())
-                .map(|s| s.trim().parse::<usize>().unwrap_or_else(|_| {
-                    eprintln!("ERROR: invalid token ID: {s}");
-                    std::process::exit(1);
-                }))
-                .collect();
-            if prompt_tokens.is_empty() {
-                eprintln!("ERROR: --prompt must contain at least one token ID");
-                std::process::exit(1);
-            }
-            generate::generate(&config, &load, &prompt_tokens, max_tokens, temperature, top_k, stop_token);
+            chat::chat(&config, &load, &tokenizer, max_tokens, temperature, top_k, stateless);
         }
-        Commands::Chat { config, load, tokenizer, max_tokens, temperature, top_k, stateless, learn, gpu } => {
+        Commands::Probe { config, load, tokenizer, max_tokens, temperature, top_k, gpu } => {
             if let Some(gpu_id) = gpu {
                 std::env::set_var("CUDA_VISIBLE_DEVICES", gpu_id.to_string());
             }
-            chat::chat(&config, &load, &tokenizer, max_tokens, temperature, top_k, stateless, learn);
-        }
-        Commands::Eval { config, load, tokenizer, max_tokens, temperature, top_k, gpu } => {
-            if let Some(gpu_id) = gpu {
-                std::env::set_var("CUDA_VISIBLE_DEVICES", gpu_id.to_string());
-            }
-            eval::run_probes(&config, &load, &tokenizer, max_tokens, temperature, top_k);
+            probe::run_probes(&config, &load, &tokenizer, max_tokens, temperature, top_k);
         }
         Commands::Inspect { path } => {
             inspect(&path);

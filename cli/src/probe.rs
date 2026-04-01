@@ -1,8 +1,11 @@
-/// Evaluation probes: cross-exposure, within-generation, coherence samples.
-/// Rust port of Python evaluation.py probes.
+/// Coherence probes: cross-exposure, within-generation, coherence samples (spec 70).
 ///
 /// All probes are CS-10 compliant: no eval mode, continuous learning during
-/// inference. The model's forward pass IS the optimization.
+/// generation. The model's forward pass IS the optimization.
+///
+/// Coherence samples use generate() from step.rs. Within-generation and
+/// cross-exposure probes use a per-window backward loop for fine-grained
+/// loss measurement.
 
 use std::path::Path;
 
@@ -35,6 +38,8 @@ use nl_hecate_core::gpu_forward::GpuKVCache;
 use crate::config::Config;
 use crate::log::MetricsLogger;
 use crate::sample::sample_token;
+#[cfg(feature = "cuda")]
+use crate::step::{generate, host_cross_entropy_loss};
 
 // Probing prompts matched to FineWeb-Edu domain (educational text)
 const PROBE_PROMPTS: &[&str] = &[
@@ -44,7 +49,7 @@ const PROBE_PROMPTS: &[&str] = &[
     "The history of",
 ];
 
-/// Run all probes on a checkpoint.
+/// Run all probes on a checkpoint (spec 70: probes are generate() + metrics sink).
 pub fn run_probes(
     config_path: &str, checkpoint_path: &str, tokenizer_path: &str,
     max_tokens: usize, temperature: f32, top_k: usize,
@@ -180,43 +185,24 @@ pub fn run_probes(
         eprintln!("── Probe: Coherence Samples ──");
         for prompt_str in PROBE_PROMPTS {
             let prompt_ids = encode_prompt(&tokenizer, prompt_str);
-
-            // Unified forward path (spec 68) — same function for prompt + generation
-            let kv_len = prompt_ids.len().max(seq_len) + max_tokens;
-            let mut kv_caches: Vec<GpuKVCache> = (0..n_blocks)
-                .map(|_| GpuKVCache::new(kv_len, d, 1))
-                .collect();
-            let mut decode_ws = StackedDecodeWorkspace::new(n_blocks, d, v);
             let mut conductor = Conductor::new(k, chunk_sizes.clone());
 
-            let mut window = ActivationWindow::new(seq_len);
-
-            // Process prompt
-            let logits = gpu_stacked_forward_tokens(
-                &gpu_params, &mag_cfg, &prompt_ids,
-                &mut conductor, &mut gpu_context, &mut kv_caches, &mut decode_ws,
-                &mut window,
+            let gen_result = generate(
+                &mut gpu_params, &mag_cfg, &mut gpu_context,
+                &mut adamw_state, &mut conductor,
+                &cfg.build.optimizer,
+                lr, max_grad_norm, d, v,
+                &prompt_ids, max_tokens, temperature, top_k,
+                None, &mut None,
             );
 
-            // Generate tokens (same function, one at a time)
-            let mut gen = Vec::new();
-            let mut last_logits = logits;
-            for _ in 0..max_tokens {
-                let next_tok = sample_token(&last_logits, temperature, top_k);
-                gen.push(next_tok);
-                last_logits = gpu_stacked_forward_tokens(
-                    &gpu_params, &mag_cfg, &[next_tok],
-                    &mut conductor, &mut gpu_context, &mut kv_caches, &mut decode_ws,
-                    &mut window,
-                );
-            }
-
-            let gen_text = decode_tokens(&tokenizer, &gen);
+            let gen_text = decode_tokens(&tokenizer, &gen_result.tokens);
             eprintln!("  \"{prompt_str}\" → {gen_text}");
 
             // Restore state for next prompt
             gpu_params = GpuStackedParams::from_host(&initial_host_params);
             gpu_context = GpuStackedContext::new(n_blocks, k, d, 1, Some(&mag_cfg));
+            adamw_state = None;
         }
         eprintln!();
 
@@ -356,48 +342,35 @@ pub fn run_inline_probes(
     let mut cross_exposure_results = Vec::new();
 
     // ── Probe 1: Coherence Samples ───────────────────────────────────
+    // Build a temporary OptimizerConfig for generate()
+    let probe_opt = crate::config::OptimizerConfig {
+        optimizer_type: Some("adamw".to_string()),
+        lr: Some(lr), beta1: Some(beta1), beta2: Some(beta2),
+        weight_decay: Some(wd),
+        meta_lr: None, inner_steps: None, momentum: None,
+    };
     for prompt_str in PROBE_PROMPTS {
         let mut gpu_params = GpuStackedParams::from_host(host_params);
         let mut gpu_context = GpuStackedContext::new(n_blocks, k, d, 1, Some(&probe_cfg));
+        let mut adamw_state: Option<GpuStackedAdamWState> = None;
 
         let prompt_ids = encode_prompt(&tokenizer, prompt_str);
-
-        // Unified forward path (spec 68)
-        let kv_len = prompt_ids.len().max(seq_len) + max_tokens;
-        let mut kv_caches: Vec<GpuKVCache> = (0..n_blocks)
-            .map(|_| GpuKVCache::new(kv_len, d, 1))
-            .collect();
-        let mut decode_ws = StackedDecodeWorkspace::new(n_blocks, d, v);
         let mut conductor = Conductor::new(k, chunk_sizes.to_vec());
 
-        let mut window = ActivationWindow::new(seq_len);
-
-        // Process prompt
-        let logits = gpu_stacked_forward_tokens(
-            &gpu_params, &probe_cfg, &prompt_ids,
-            &mut conductor, &mut gpu_context, &mut kv_caches, &mut decode_ws,
-            &mut window,
+        let gen_result = generate(
+            &mut gpu_params, &probe_cfg, &mut gpu_context,
+            &mut adamw_state, &mut conductor,
+            &probe_opt,
+            lr, max_grad_norm, d, v,
+            &prompt_ids, max_tokens, temperature, 50,
+            None, &mut None,
         );
 
-        // Generate tokens (same function)
-        let mut gen = Vec::new();
-        let mut last_logits = logits;
-        for _ in 0..max_tokens {
-            let next_tok = sample_token(&last_logits, temperature, 50);
-            gen.push(next_tok);
-            last_logits = gpu_stacked_forward_tokens(
-                &gpu_params, &probe_cfg, &[next_tok],
-                &mut conductor, &mut gpu_context, &mut kv_caches, &mut decode_ws,
-                &mut window,
-            );
-        }
-
-        let gen_text = decode_tokens(&tokenizer, &gen);
+        let gen_text = decode_tokens(&tokenizer, &gen_result.tokens);
         coherence_results.push(json!({
             "prompt": prompt_str,
             "generation": gen_text,
         }));
-        // gpu_params + gpu_context dropped here
     }
 
     // ── Probe 2: Within-Generation Learning ──────────────────────────
@@ -501,54 +474,6 @@ fn encode_prompt(tokenizer: &Tokenizer, text: &str) -> Vec<usize> {
 fn decode_tokens(tokenizer: &Tokenizer, tokens: &[usize]) -> String {
     let ids32: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
     tokenizer.decode(&ids32, true).unwrap_or_else(|_| String::from("???"))
-}
-
-fn pad_to_seq_len(tokens: &[usize], seq_len: usize, pad_tok: usize) -> Vec<usize> {
-    if tokens.len() >= seq_len {
-        tokens[tokens.len() - seq_len..].to_vec()
-    } else {
-        let pad_count = seq_len - tokens.len();
-        let mut padded = vec![pad_tok; pad_count];
-        padded.extend_from_slice(tokens);
-        padded
-    }
-}
-
-fn build_context(seq: &[usize], seq_len: usize, safe_pad: usize) -> Vec<usize> {
-    let ctx: Vec<usize> = if seq.len() >= seq_len {
-        seq[seq.len() - seq_len..].to_vec()
-    } else {
-        seq.to_vec()
-    };
-    pad_to_seq_len(&ctx, seq_len, safe_pad)
-}
-
-fn build_target(seq: &[usize], seq_len: usize, vocab_size: usize) -> Vec<usize> {
-    if seq.len() >= seq_len + 1 {
-        let src = &seq[seq.len() - seq_len + 1..];
-        let mut target = src.to_vec();
-        target.push(vocab_size); // mask last position
-        while target.len() < seq_len {
-            target.insert(0, vocab_size);
-        }
-        target
-    } else if seq.len() > 1 {
-        let shifted: Vec<usize> = seq[1..].to_vec();
-        let n_real = seq.len().min(seq_len);
-        let n_masked_prefix = seq_len - n_real;
-        let mut target = vec![vocab_size; n_masked_prefix];
-        let take = (seq_len - n_masked_prefix).min(shifted.len());
-        target.extend_from_slice(&shifted[..take]);
-        while target.len() < seq_len {
-            target.push(vocab_size);
-        }
-        if let Some(last) = target.last_mut() {
-            *last = vocab_size;
-        }
-        target
-    } else {
-        vec![vocab_size; seq_len]
-    }
 }
 
 /// Run generate_learning loop via unified forward path, return per-token losses.
@@ -671,39 +596,6 @@ fn linear_slope(values: &[f32]) -> f32 {
     if den > 0.0 { num / den } else { 0.0 }
 }
 
-/// Host-side cross-entropy loss from GPU logits buffer + target IDs.
-/// Used by probes and chat learn mode — not on the training hot path.
-#[cfg(feature = "cuda")]
-pub(crate) fn host_cross_entropy_loss(
-    logits_gpu: &nl_hecate_core::gpu_buf::GpuBuf<f32>,
-    target_ids: &[usize],
-    vocab_size: usize,
-    seq_len: usize,
-) -> f32 {
-    let mut logits_host = vec![0.0f32; seq_len * vocab_size];
-    logits_gpu.copy_to_host(&mut logits_host);
-
-    let mut total_loss = 0.0f32;
-    let mut count = 0usize;
-
-    for t in 0..seq_len {
-        let target = target_ids[t];
-        if target >= vocab_size { continue; } // masked position
-
-        let offset = t * vocab_size;
-        let row = &logits_host[offset..offset + vocab_size];
-
-        // log-sum-exp for numerical stability
-        let max_logit = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let lse: f32 = row.iter().map(|&x| (x - max_logit).exp()).sum::<f32>().ln() + max_logit;
-        let log_prob = row[target] - lse;
-        total_loss -= log_prob;
-        count += 1;
-    }
-
-    if count > 0 { total_loss / count as f32 } else { 0.0 }
-}
-
 fn default_chunk_sizes(k: usize) -> Vec<usize> {
     match k {
         1 => vec![1],
@@ -716,42 +608,6 @@ fn default_chunk_sizes(k: usize) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn pad_to_seq_len_short() {
-        let result = pad_to_seq_len(&[10, 20], 5, 99);
-        assert_eq!(result, vec![99, 99, 99, 10, 20]);
-    }
-
-    #[test]
-    fn pad_to_seq_len_exact() {
-        let result = pad_to_seq_len(&[1, 2, 3], 3, 99);
-        assert_eq!(result, vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn pad_to_seq_len_long() {
-        let result = pad_to_seq_len(&[1, 2, 3, 4, 5], 3, 99);
-        assert_eq!(result, vec![3, 4, 5]);
-    }
-
-    #[test]
-    fn build_target_short_seq() {
-        // seq = [10, 20], seq_len = 4, vocab = 100
-        let target = build_target(&[10, 20], 4, 100);
-        assert_eq!(target.len(), 4);
-        // Should have masked prefix + shifted content + masked last
-        assert_eq!(*target.last().unwrap(), 100); // last always masked
-    }
-
-    #[test]
-    fn build_target_long_seq() {
-        // seq longer than seq_len + 1
-        let seq: Vec<usize> = (0..10).collect();
-        let target = build_target(&seq, 4, 100);
-        assert_eq!(target.len(), 4);
-        assert_eq!(*target.last().unwrap(), 100); // last masked
-    }
 
     #[test]
     fn linear_slope_positive() {
