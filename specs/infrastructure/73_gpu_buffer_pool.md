@@ -3,9 +3,9 @@
 ## CONTRACT
 - **Purpose**: Eliminate ~572 `cudaMalloc`/`cudaFree` calls per build step via a thread-local recycling pool in `GpuBuf`.
 - **Expects**: `GpuBuf<T>` RAII wrapper in `core/src/gpu_buf.rs` with direct `cudaMalloc` on construction, `cudaFree` on drop.
-- **Guarantees**: After one warm-up step, zero `cudaMalloc`/`cudaFree` calls per step. Pool recycles buffers by exact byte size. Functionally identical behavior (same `cudaMemset` zeroing, same data flow, same numerical results). Pool drains cleanly on shutdown.
+- **Guarantees**: After one warm-up step, zero `cudaMalloc`/`cudaFree` calls per step **when allocation shapes are stable** (fixed seq_len, same model config). Pool recycles buffers by exact byte size — if shapes change between steps (e.g., phase transitions with different seq_len), stale buckets remain resident and new sizes incur misses until the pool re-warms. Functionally identical behavior (same `cudaMemset` zeroing, same data flow, same numerical results). Pool drains cleanly on shutdown.
 - **Cost**: ~80 lines new Rust in `gpu_buf.rs`. No new CUDA kernels. No changes to forward/backward math.
-- **Trade-off**: VRAM stays at high-water mark between steps (buffers recycled, not freed). This is desired for a build loop — the same buffers are needed every step.
+- **Trade-off**: VRAM stays at high-water mark between steps (buffers recycled, not freed). This is desired for a build loop — the same buffers are needed every step. If seq_len changes between phases, stale-sized buffers from the previous phase remain in the pool until drain — transient extra VRAM proportional to the old phase's working set.
 - **Position**: Infrastructure optimization. Eliminates the dominant source of GPU pipeline serialization visible in nvtop.
 - **Source**: nvtop profiling showing sawtooth GPU utilization at ~3100 tok/s constant across seq_len=4096/16384/32768. GPU computes in short bursts then idles waiting for `cudaMalloc`/`cudaFree` between kernel launches.
 
@@ -161,13 +161,13 @@ Buffers are pooled by exact byte count. For a typical d=1024, k=4, n_blocks=4 bu
 | `s × 4` | ~20 | LN mean/rstd, gate scalars |
 | `d × 4` | ~40 | gradient accumulators |
 
-After step 1, all ~572 buffers are in the pool. Step 2 finds exact-size matches for every allocation — zero `cudaMalloc` calls.
+After step 1, all ~572 buffers are in the pool. Step 2 finds exact-size matches for every allocation — zero `cudaMalloc` calls. This assumes **stable allocation shapes** (fixed seq_len, same model config). When seq_len changes between phases (spec 61), the new sizes miss the pool and allocate fresh; stale-sized buffers from the previous phase remain cached until `gpu_pool_drain()`.
 
 ### Memory overhead
 
 The pool holds ~572 buffers between steps. These are the same buffers that would be allocated anyway — no additional VRAM is consumed. The pool just prevents the free→realloc cycle.
 
-Peak VRAM usage is identical to the current implementation (all buffers exist simultaneously during forward+backward). The only difference is they persist across steps instead of being freed and reallocated.
+Peak VRAM usage is identical to the current implementation when shapes are stable (all buffers exist simultaneously during forward+backward). If shapes change between phases, stale buckets from the old phase add transient extra VRAM until the pool is drained or the process exits.
 
 ### Thread safety
 

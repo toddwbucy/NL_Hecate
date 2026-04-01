@@ -110,7 +110,7 @@ impl GpuPool {
             hits: self.hits,
             misses: self.misses,
             returns: self.returns,
-            unique_sizes: self.free_lists.len(),
+            unique_sizes: self.free_lists.values().filter(|v| !v.is_empty()).count(),
             cached_buffers,
             cached_bytes,
         }
