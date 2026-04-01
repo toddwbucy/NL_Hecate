@@ -628,12 +628,9 @@ fn concat_memory_caches<'a>(
 
 /// Assemble m_states (or s_states) from per-token caches into the format backward expects.
 ///
-/// When proxy=true: backward expects [(s+1) * bs_mem * dd] with M snapshots at each timestep.
-/// When proxy=false: backward expects [bs_mem * dd] — just the final M (already in context).
-///
-/// For the unified path at s=1 per token: each token's memory cache has either
-/// [2 * bs_mem * dd] (proxy, s=1: M_0 and M_1) or [bs_mem * dd] (non-proxy).
-/// We concatenate them into the expected layout.
+/// Backward expects [(s+1) * bs_mem * dd] with M snapshots at each timestep: [M_0, M_1, ..., M_s].
+/// Each per-token cache at s=1 has [2 * chunk]: [M_t, M_{t+1}] (initial and final for that token).
+/// Assembly: take M_t (first chunk) from each token, then M_s (second chunk) from the last.
 #[cfg(feature = "cuda")]
 fn assemble_m_states(
     caches: &[&GpuMemoryCache],
@@ -641,34 +638,18 @@ fn assemble_m_states(
     s: usize,
     nh: usize,
     hd: usize,
-    proxy: bool,
+    _proxy: bool,
     is_s_states: bool,
 ) -> GpuBuf<f32> {
     let dd = hd * hd;
     let bs_mem = nh;
     let chunk = bs_mem * dd;
 
-    if !proxy {
-        // Non-proxy: backward only needs final M. Take from last token.
-        let last = caches.last().unwrap();
-        let src = if is_s_states {
-            match last { GpuMemoryCache::Titans { s_states, .. } => s_states, _ => unreachable!() }
-        } else {
-            match last {
-                GpuMemoryCache::Delta { m_states, .. } => m_states,
-                GpuMemoryCache::Titans { m_states, .. } => m_states,
-                GpuMemoryCache::Hebbian { m_states, .. } => m_states,
-                _ => unreachable!(),
-            }
-        };
-        src.clone_buf()
-    } else {
-        // Proxy: backward expects M_0, M_1, ..., M_s layout.
-        // Each per-token cache at s=1 with proxy has [2 * chunk]: M_t and M_{t+1}.
-        // Assemble: take M_t from each token, then M_s from the last.
-        let total = (s + 1) * chunk;
-        let out = GpuBuf::<f32>::zeros(total);
+    // Build full trajectory [M_0, M_1, ..., M_s] from per-token [M_t, M_{t+1}] caches.
+    let total = (s + 1) * chunk;
+    let out = GpuBuf::<f32>::zeros(total);
 
+    {
         for (t, cache) in caches.iter().enumerate() {
             let src = if is_s_states {
                 match cache { GpuMemoryCache::Titans { s_states, .. } => s_states, _ => unreachable!() }
@@ -676,6 +657,7 @@ fn assemble_m_states(
                 match cache {
                     GpuMemoryCache::Delta { m_states, .. } => m_states,
                     GpuMemoryCache::Titans { m_states, .. } => m_states,
+                    GpuMemoryCache::Hebbian { m_states, .. } => m_states,
                     _ => unreachable!(),
                 }
             };
@@ -697,6 +679,7 @@ fn assemble_m_states(
             match caches.last().unwrap() {
                 GpuMemoryCache::Delta { m_states, .. } => m_states,
                 GpuMemoryCache::Titans { m_states, .. } => m_states,
+                GpuMemoryCache::Hebbian { m_states, .. } => m_states,
                 _ => unreachable!(),
             }
         };
