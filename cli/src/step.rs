@@ -14,6 +14,7 @@ use nl_hecate_core::gpu_params::{GpuStackedParams, GpuStackedContext};
 #[cfg(feature = "cuda")]
 use nl_hecate_core::gpu_stacked_forward::{
     gpu_stacked_forward_tokens, gpu_stacked_forward_sequence,
+    gpu_cross_entropy_loss,
     StackedDecodeWorkspace, ActivationWindow,
 };
 #[cfg(feature = "cuda")]
@@ -94,8 +95,8 @@ pub fn step(
         conductor, gpu_context,
     );
 
-    // Loss (host-side cross-entropy from full-sequence logits)
-    let loss = host_cross_entropy_loss(&cache.logits, targets, v, tokens.len());
+    // Spec 72: GPU-side cross-entropy (4-byte D2H instead of s×v×4 host copy)
+    let loss = gpu_cross_entropy_loss(&cache.logits, &cache.target_ids_gpu, targets, v, tokens.len());
 
     // Capture pulse before backward consumes it
     let pulse = cache.pulse.clone();
@@ -231,7 +232,7 @@ pub fn generate(
     target_ids.push(v); // mask last position (no target available)
 
     let cache = window.assemble_cache(mag_cfg, &target_ids);
-    let loss = host_cross_entropy_loss(&cache.logits, &target_ids, v, win_len);
+    let loss = gpu_cross_entropy_loss(&cache.logits, &cache.target_ids_gpu, &target_ids, v, win_len);
 
     let (grad_norm, block_level_gnorms) = if !loss.is_nan() && !loss.is_infinite() {
         let mut grads = gpu_stacked_backward(
@@ -265,38 +266,6 @@ pub fn generate(
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
-
-/// Host-side cross-entropy loss from GPU logits buffer + target IDs.
-#[cfg(feature = "cuda")]
-pub fn host_cross_entropy_loss(
-    logits_gpu: &nl_hecate_core::gpu_buf::GpuBuf<f32>,
-    target_ids: &[usize],
-    vocab_size: usize,
-    seq_len: usize,
-) -> f32 {
-    let mut logits_host = vec![0.0f32; seq_len * vocab_size];
-    logits_gpu.copy_to_host(&mut logits_host);
-
-    let mut total_loss = 0.0f32;
-    let mut count = 0usize;
-
-    for t in 0..seq_len {
-        let target = target_ids[t];
-        if target >= vocab_size { continue; } // masked position
-
-        let offset = t * vocab_size;
-        let row = &logits_host[offset..offset + vocab_size];
-
-        // log-sum-exp for numerical stability
-        let max_logit = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let lse: f32 = row.iter().map(|&x| (x - max_logit).exp()).sum::<f32>().ln() + max_logit;
-        let log_prob = row[target] - lse;
-        total_loss -= log_prob;
-        count += 1;
-    }
-
-    if count > 0 { total_loss / count as f32 } else { 0.0 }
-}
 
 /// Selective periodic reset (spec 57).
 #[cfg(feature = "cuda")]
