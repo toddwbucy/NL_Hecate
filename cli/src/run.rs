@@ -561,8 +561,8 @@ pub fn run(config_path: &str, _resume: bool) {
                     #[cfg(feature = "cuda")]
                     let (loss, _gnorm_deferred, block_level_gnorms) = {
                         let mut total_loss = 0.0f32;
-                        let mut last_gnorm = 0.0f32;
-                        let mut last_gnorms: BlockLevelGnorms = Vec::new();
+                        let mut acc_gnorm = 0.0f32;
+                        let mut acc_gnorms: BlockLevelGnorms = Vec::new();
                         for sample_idx in 0..batch_size {
                             let start = sample_idx * phase_seq_len;
                             let end = start + phase_seq_len;
@@ -578,10 +578,22 @@ pub fn run(config_path: &str, _resume: bool) {
                                 log_this || phase_step == 0,
                             );
                             total_loss += loss_i;
-                            last_gnorm = gnorm_i;
-                            last_gnorms = gnorms_i;
+                            acc_gnorm += gnorm_i;
+                            if acc_gnorms.is_empty() {
+                                acc_gnorms = gnorms_i;
+                            } else {
+                                for (acc, val) in acc_gnorms.iter_mut().zip(gnorms_i.iter()) {
+                                    for (a, v) in acc.iter_mut().zip(val.iter()) {
+                                        *a += v;
+                                    }
+                                }
+                            }
                         }
-                        (total_loss / batch_size as f32, last_gnorm, last_gnorms)
+                        let bs_f = batch_size as f32;
+                        for block in acc_gnorms.iter_mut() {
+                            for g in block.iter_mut() { *g /= bs_f; }
+                        }
+                        (total_loss / bs_f, acc_gnorm / bs_f, acc_gnorms)
                     };
 
                     // Collect and log profile if active
