@@ -618,11 +618,69 @@ fn concat_memory_caches<'a>(
                 m_states: assemble_m_states(&caches, d, s, nh, hd, false, false),
             }
         }
+        // Chunkwise variants from proxy config: per-token (s=1) caches have the same
+        // [M_t, M_{t+1}] structure as exact variants (num_chunks=1 when s=1).
+        // Assemble into exact Titans/Delta for backward — the assembled full trajectory
+        // is exact (each per-token call computed the exact update for that token).
+        GpuMemoryCache::TitansChunkwise { .. } => {
+            let bs_mem = nh;
+            let bs = 1;
+            GpuMemoryCache::Titans {
+                k_mem: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::TitansChunkwise { k_mem, .. } => k_mem, _ => unreachable!() }), bs_mem * hd),
+                v_mem: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::TitansChunkwise { v_mem, .. } => v_mem, _ => unreachable!() }), bs_mem * hd),
+                q_mem: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::TitansChunkwise { q_mem, .. } => q_mem, _ => unreachable!() }), bs_mem * hd),
+                alpha: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::TitansChunkwise { alpha, .. } => alpha, _ => unreachable!() }), bs),
+                theta: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::TitansChunkwise { theta, .. } => theta, _ => unreachable!() }), bs),
+                eta: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::TitansChunkwise { eta, .. } => eta, _ => unreachable!() }), bs),
+                k_norms: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::TitansChunkwise { k_norms, .. } => k_norms, _ => unreachable!() }), bs),
+                q_norms: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::TitansChunkwise { q_norms, .. } => q_norms, _ => unreachable!() }), bs),
+                m_states: assemble_m_states(&caches, d, s, nh, hd, true, false),
+                s_states: assemble_m_states(&caches, d, s, nh, hd, true, true),
+                proxy: false, // assembled full trajectory is exact
+            }
+        }
+        GpuMemoryCache::DeltaChunkwise { .. } => {
+            let bs_mem = nh;
+            let bs = 1;
+            GpuMemoryCache::Delta {
+                k_mem: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DeltaChunkwise { k_mem, .. } => k_mem, _ => unreachable!() }), bs_mem * hd),
+                v_mem: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DeltaChunkwise { v_mem, .. } => v_mem, _ => unreachable!() }), bs_mem * hd),
+                q_mem: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DeltaChunkwise { q_mem, .. } => q_mem, _ => unreachable!() }), bs_mem * hd),
+                alpha: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DeltaChunkwise { alpha, .. } => alpha, _ => unreachable!() }), bs),
+                theta: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DeltaChunkwise { theta, .. } => theta, _ => unreachable!() }), bs),
+                k_norms: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DeltaChunkwise { k_norms, .. } => k_norms, _ => unreachable!() }), bs),
+                q_norms: concat_f32_bufs(caches.iter().map(|c| match c { GpuMemoryCache::DeltaChunkwise { q_norms, .. } => q_norms, _ => unreachable!() }), bs),
+                m_states: assemble_m_states(&caches, d, s, nh, hd, true, false),
+                proxy: false, // assembled full trajectory is exact
+            }
+        }
         _ => panic!(
             "concat_memory_caches: unsupported memory cache variant — \
-             unified path currently supports Delta, Titans, Hebbian, DGD. \
-             SwiGlu/Mlp/Ckpt/Chunkwise variants require separate assembly logic.",
+             unified path currently supports Delta, Titans, Hebbian, DGD, \
+             TitansChunkwise, DeltaChunkwise. SwiGlu/Mlp/Ckpt variants \
+             require separate assembly logic.",
         ),
+    }
+}
+
+/// Extract the m_states or s_states buffer from any supported GpuMemoryCache variant.
+#[cfg(feature = "cuda")]
+fn extract_m_or_s_states(cache: &GpuMemoryCache, is_s_states: bool) -> &GpuBuf<f32> {
+    if is_s_states {
+        match cache {
+            GpuMemoryCache::Titans { s_states, .. } => s_states,
+            GpuMemoryCache::TitansChunkwise { s_chunk_states, .. } => s_chunk_states,
+            _ => unreachable!("s_states only available for Titans/TitansChunkwise"),
+        }
+    } else {
+        match cache {
+            GpuMemoryCache::Delta { m_states, .. } => m_states,
+            GpuMemoryCache::Titans { m_states, .. } => m_states,
+            GpuMemoryCache::Hebbian { m_states, .. } => m_states,
+            GpuMemoryCache::TitansChunkwise { m_chunk_states, .. } => m_chunk_states,
+            GpuMemoryCache::DeltaChunkwise { m_chunk_states, .. } => m_chunk_states,
+            _ => unreachable!("m_states not available for this variant"),
+        }
     }
 }
 
@@ -649,52 +707,32 @@ fn assemble_m_states(
     let total = (s + 1) * chunk;
     let out = GpuBuf::<f32>::zeros(total);
 
-    {
-        for (t, cache) in caches.iter().enumerate() {
-            let src = if is_s_states {
-                match cache { GpuMemoryCache::Titans { s_states, .. } => s_states, _ => unreachable!() }
-            } else {
-                match cache {
-                    GpuMemoryCache::Delta { m_states, .. } => m_states,
-                    GpuMemoryCache::Titans { m_states, .. } => m_states,
-                    GpuMemoryCache::Hebbian { m_states, .. } => m_states,
-                    _ => unreachable!(),
-                }
-            };
-            // Copy M_t (first chunk of each per-token cache)
-            let dst_offset = t * chunk * 4;
-            unsafe {
-                let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
-                    (out.ptr() as *mut u8).add(dst_offset) as *mut std::ffi::c_void,
-                    src.as_ptr() as *const std::ffi::c_void,
-                    chunk * 4,
-                );
-                assert_eq!(rc, 0);
-            }
-        }
-        // Copy M_s from the last token's second chunk
-        let last_src = if is_s_states {
-            match caches.last().unwrap() { GpuMemoryCache::Titans { s_states, .. } => s_states, _ => unreachable!() }
-        } else {
-            match caches.last().unwrap() {
-                GpuMemoryCache::Delta { m_states, .. } => m_states,
-                GpuMemoryCache::Titans { m_states, .. } => m_states,
-                GpuMemoryCache::Hebbian { m_states, .. } => m_states,
-                _ => unreachable!(),
-            }
-        };
-        let dst_offset = s * chunk * 4;
-        let src_offset = chunk * 4; // second chunk of last token
+    for (t, cache) in caches.iter().enumerate() {
+        let src = extract_m_or_s_states(cache, is_s_states);
+        // Copy M_t (first chunk of each per-token cache)
+        let dst_offset = t * chunk * 4;
         unsafe {
             let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
                 (out.ptr() as *mut u8).add(dst_offset) as *mut std::ffi::c_void,
-                (last_src.as_ptr() as *const u8).add(src_offset) as *const std::ffi::c_void,
+                src.as_ptr() as *const std::ffi::c_void,
                 chunk * 4,
             );
             assert_eq!(rc, 0);
         }
-        out
     }
+    // Copy M_s from the last token's second chunk
+    let last_src = extract_m_or_s_states(caches.last().unwrap(), is_s_states);
+    let dst_offset = s * chunk * 4;
+    let src_offset = chunk * 4; // second chunk of last token
+    unsafe {
+        let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+            (out.ptr() as *mut u8).add(dst_offset) as *mut std::ffi::c_void,
+            (last_src.as_ptr() as *const u8).add(src_offset) as *const std::ffi::c_void,
+            chunk * 4,
+        );
+        assert_eq!(rc, 0);
+    }
+    out
 }
 
 // ── Single-token forward with activation caching ────────────────────
