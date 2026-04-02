@@ -1980,6 +1980,13 @@ pub fn swa_single_token_dd(
     cache_len: usize, num_heads: usize, head_dim: usize, window_size: usize,
     n_persistent: usize,
 ) {
+    let d = num_heads * head_dim;
+    debug_assert!(cache_len >= n_persistent, "swa_single_token_dd: cache_len={cache_len} < n_persistent={n_persistent}");
+    debug_assert!(q.len() >= d, "swa_single_token_dd: q too small ({} < {d})", q.len());
+    debug_assert!(out.len() >= d, "swa_single_token_dd: out too small ({} < {d})", out.len());
+    let cache_elems = cache_len * d;
+    debug_assert!(k_cache.len() >= cache_elems, "swa_single_token_dd: k_cache too small ({} < {cache_elems})", k_cache.len());
+    debug_assert!(v_cache.len() >= cache_elems, "swa_single_token_dd: v_cache too small ({} < {cache_elems})", v_cache.len());
     unsafe {
         crate::cuda_ffi::swa_single_token_cuda(
             q.as_ptr(), k_cache.as_ptr(), v_cache.as_ptr(),

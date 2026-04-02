@@ -2971,12 +2971,14 @@ impl GpuKVCache {
         d: usize,
     ) {
         if n_persistent == 0 { return; }
-        debug_assert_eq!(d, self.d, "prepopulate_persistent: caller d={d} != self.d={}", self.d);
+        assert_eq!(d, self.d, "prepopulate_persistent: caller d={d} != self.d={}", self.d);
         assert!(n_persistent <= self.max_len,
             "KV cache too small for {} persistent tokens", n_persistent);
         assert_eq!(self.len, 0, "prepopulate_persistent must be called on empty cache");
 
         let npd = n_persistent * d;
+        assert!(persistent_tokens.len() >= npd,
+            "prepopulate_persistent: persistent_tokens.len()={} < n_persistent*d={npd}", persistent_tokens.len());
         let mut pk = GpuBuf::<f32>::zeros(npd);
         let mut pv = GpuBuf::<f32>::zeros(npd);
         crate::dispatch::cublas_matmul_transb_dd(persistent_tokens, w_k, &mut pk, n_persistent, d, d, 0.0);
@@ -2988,16 +2990,18 @@ impl GpuKVCache {
         unsafe {
             crate::cuda_ffi::f32_to_bf16_cuda(pk.as_ptr(), pk_bf16.ptr(), npd as i32);
             crate::cuda_ffi::f32_to_bf16_cuda(pv.as_ptr(), pv_bf16.ptr(), npd as i32);
-            gpu_buf_memcpy_d2d(
+            let rc = gpu_buf_memcpy_d2d(
                 self.k_cache_bf16.ptr() as *mut _,
                 pk_bf16.as_ptr() as *const _,
                 npd * 2,
             );
-            gpu_buf_memcpy_d2d(
+            assert_eq!(rc, 0, "prepopulate_persistent: k memcpy failed");
+            let rc = gpu_buf_memcpy_d2d(
                 self.v_cache_bf16.ptr() as *mut _,
                 pv_bf16.as_ptr() as *const _,
                 npd * 2,
             );
+            assert_eq!(rc, 0, "prepopulate_persistent: v memcpy failed");
         }
         self.len = n_persistent;
     }
@@ -3013,11 +3017,13 @@ impl GpuKVCache {
         d: usize,
     ) {
         if n_persistent == 0 { return; }
-        debug_assert_eq!(d, self.d, "refresh_persistent: caller d={d} != self.d={}", self.d);
+        assert_eq!(d, self.d, "refresh_persistent: caller d={d} != self.d={}", self.d);
         assert!(self.len >= n_persistent,
             "cache len {} < n_persistent {}", self.len, n_persistent);
 
         let npd = n_persistent * d;
+        assert!(persistent_tokens.len() >= npd,
+            "refresh_persistent: persistent_tokens.len()={} < n_persistent*d={npd}", persistent_tokens.len());
         let mut pk = GpuBuf::<f32>::zeros(npd);
         let mut pv = GpuBuf::<f32>::zeros(npd);
         crate::dispatch::cublas_matmul_transb_dd(persistent_tokens, w_k, &mut pk, n_persistent, d, d, 0.0);
@@ -3028,16 +3034,18 @@ impl GpuKVCache {
         unsafe {
             crate::cuda_ffi::f32_to_bf16_cuda(pk.as_ptr(), pk_bf16.ptr(), npd as i32);
             crate::cuda_ffi::f32_to_bf16_cuda(pv.as_ptr(), pv_bf16.ptr(), npd as i32);
-            gpu_buf_memcpy_d2d(
+            let rc = gpu_buf_memcpy_d2d(
                 self.k_cache_bf16.ptr() as *mut _,
                 pk_bf16.as_ptr() as *const _,
                 npd * 2,
             );
-            gpu_buf_memcpy_d2d(
+            assert_eq!(rc, 0, "refresh_persistent: k memcpy failed");
+            let rc = gpu_buf_memcpy_d2d(
                 self.v_cache_bf16.ptr() as *mut _,
                 pv_bf16.as_ptr() as *const _,
                 npd * 2,
             );
+            assert_eq!(rc, 0, "refresh_persistent: v memcpy failed");
         }
     }
 
