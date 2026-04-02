@@ -24,7 +24,7 @@
 __device__ __forceinline__ void m_norm_project_inplace(
     float* m_ptr, float* scratch, int dd, int tid, float m_norm_max)
 {
-    if (m_norm_max >= 1e30f) return;
+    if (m_norm_max <= 0.0f || m_norm_max >= 1e30f) return;
 
     // Partial sum of squares across M elements
     float local_sq = 0.0f;
