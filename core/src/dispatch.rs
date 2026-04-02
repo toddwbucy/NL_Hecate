@@ -743,8 +743,8 @@ pub fn delta_forward_dispatch(
     y: &mut [f32],
     seq_len: usize,
     d: usize,
-    m_norm_max: f32,
     error_clip: f32,
+    m_norm_max: f32,
 ) {
     #[cfg(feature = "cuda")]
     {
@@ -755,7 +755,7 @@ pub fn delta_forward_dispatch(
         }
     }
     rust_delta_forward(k_mem, v_mem, q_mem, alpha, theta, m_initial,
-                       m_states, y, seq_len, d, m_norm_max, error_clip);
+                       m_states, y, seq_len, d, error_clip, m_norm_max);
 }
 
 /// Delta Rule backward inner loop dispatch.
@@ -810,8 +810,8 @@ pub fn titans_forward_dispatch(
     y: &mut [f32],
     seq_len: usize,
     d: usize,
-    m_norm_max: f32,
     error_clip: f32,
+    m_norm_max: f32,
 ) {
     #[cfg(feature = "cuda")]
     {
@@ -824,7 +824,7 @@ pub fn titans_forward_dispatch(
     }
     rust_titans_forward(k_mem, v_mem, q_mem, alpha, theta, eta,
                         m_initial, s_initial, m_states, s_states, y,
-                        seq_len, d, m_norm_max, error_clip);
+                        seq_len, d, error_clip, m_norm_max);
 }
 
 /// Titans LMM backward inner loop dispatch.
@@ -966,7 +966,7 @@ pub fn dgd_forward_dispatch(
     }
     // DGD math is identical to Delta Rule at L2 bias
     rust_delta_forward(k_mem, v_mem, q_mem, alpha, theta, m_initial,
-                       m_states, y, seq_len, d, f32::MAX, error_clip);
+                       m_states, y, seq_len, d, error_clip, f32::MAX);
 }
 
 /// DGD backward inner loop dispatch.
@@ -1041,7 +1041,7 @@ fn rust_delta_forward(
     k_mem: &[f32], v_mem: &[f32], q_mem: &[f32],
     alpha: &[f32], theta: &[f32], m_initial: &[f32],
     m_states: &mut [f32], y: &mut [f32],
-    seq_len: usize, d: usize, m_norm_max: f32, error_clip: f32,
+    seq_len: usize, d: usize, error_clip: f32, m_norm_max: f32,
 ) {
     let dd = d * d;
     m_states[..dd].copy_from_slice(m_initial);
@@ -1187,7 +1187,7 @@ fn rust_titans_forward(
     alpha: &[f32], theta: &[f32], eta: &[f32],
     m_initial: &[f32], s_initial: &[f32],
     m_states: &mut [f32], s_states: &mut [f32], y: &mut [f32],
-    seq_len: usize, d: usize, m_norm_max: f32, error_clip: f32,
+    seq_len: usize, d: usize, error_clip: f32, m_norm_max: f32,
 ) {
     let dd = d * d;
     m_states[..dd].copy_from_slice(m_initial);
@@ -1956,11 +1956,11 @@ pub fn swa_forward_dd(
     let qkv_len = batch_size * seq_len * total_dim;
     let aw_stride = n_persistent + window_size;
     let aw_len = batch_size * num_heads * seq_len * aw_stride;
-    debug_assert!(q.len() >= qkv_len, "swa_forward_dd: q too small ({} < {qkv_len})", q.len());
-    debug_assert!(k.len() >= qkv_len, "swa_forward_dd: k too small ({} < {qkv_len})", k.len());
-    debug_assert!(v.len() >= qkv_len, "swa_forward_dd: v too small ({} < {qkv_len})", v.len());
-    debug_assert!(out.len() >= qkv_len, "swa_forward_dd: out too small ({} < {qkv_len})", out.len());
-    debug_assert!(attn_weights.len() >= aw_len, "swa_forward_dd: attn_weights too small ({} < {aw_len})", attn_weights.len());
+    assert!(q.len() >= qkv_len, "swa_forward_dd: q too small ({} < {qkv_len})", q.len());
+    assert!(k.len() >= qkv_len, "swa_forward_dd: k too small ({} < {qkv_len})", k.len());
+    assert!(v.len() >= qkv_len, "swa_forward_dd: v too small ({} < {qkv_len})", v.len());
+    assert!(out.len() >= qkv_len, "swa_forward_dd: out too small ({} < {qkv_len})", out.len());
+    assert!(attn_weights.len() >= aw_len, "swa_forward_dd: attn_weights too small ({} < {aw_len})", attn_weights.len());
     unsafe {
         crate::cuda_ffi::swa_forward_f32_cuda(
             q.as_ptr(), k.as_ptr(), v.as_ptr(),
@@ -1981,12 +1981,12 @@ pub fn swa_single_token_dd(
     n_persistent: usize,
 ) {
     let d = num_heads * head_dim;
-    debug_assert!(cache_len >= n_persistent, "swa_single_token_dd: cache_len={cache_len} < n_persistent={n_persistent}");
-    debug_assert!(q.len() >= d, "swa_single_token_dd: q too small ({} < {d})", q.len());
-    debug_assert!(out.len() >= d, "swa_single_token_dd: out too small ({} < {d})", out.len());
+    assert!(cache_len >= n_persistent, "swa_single_token_dd: cache_len={cache_len} < n_persistent={n_persistent}");
+    assert!(q.len() >= d, "swa_single_token_dd: q too small ({} < {d})", q.len());
+    assert!(out.len() >= d, "swa_single_token_dd: out too small ({} < {d})", out.len());
     let cache_elems = cache_len * d;
-    debug_assert!(k_cache.len() >= cache_elems, "swa_single_token_dd: k_cache too small ({} < {cache_elems})", k_cache.len());
-    debug_assert!(v_cache.len() >= cache_elems, "swa_single_token_dd: v_cache too small ({} < {cache_elems})", v_cache.len());
+    assert!(k_cache.len() >= cache_elems, "swa_single_token_dd: k_cache too small ({} < {cache_elems})", k_cache.len());
+    assert!(v_cache.len() >= cache_elems, "swa_single_token_dd: v_cache too small ({} < {cache_elems})", v_cache.len());
     unsafe {
         crate::cuda_ffi::swa_single_token_cuda(
             q.as_ptr(), k_cache.as_ptr(), v_cache.as_ptr(),
@@ -2010,14 +2010,14 @@ pub fn swa_backward_dd(
     let qkv_len = batch_size * seq_len * total_dim;
     let aw_stride = n_persistent + window_size;
     let aw_len = batch_size * num_heads * seq_len * aw_stride;
-    debug_assert!(q.len() >= qkv_len, "swa_backward_dd: q too small ({} < {qkv_len})", q.len());
-    debug_assert!(k.len() >= qkv_len, "swa_backward_dd: k too small ({} < {qkv_len})", k.len());
-    debug_assert!(v.len() >= qkv_len, "swa_backward_dd: v too small ({} < {qkv_len})", v.len());
-    debug_assert!(attn_weights.len() >= aw_len, "swa_backward_dd: attn_weights too small ({} < {aw_len})", attn_weights.len());
-    debug_assert!(d_attn_out.len() >= qkv_len, "swa_backward_dd: d_attn_out too small ({} < {qkv_len})", d_attn_out.len());
-    debug_assert!(d_q.len() >= qkv_len, "swa_backward_dd: d_q too small ({} < {qkv_len})", d_q.len());
-    debug_assert!(d_k.len() >= qkv_len, "swa_backward_dd: d_k too small ({} < {qkv_len})", d_k.len());
-    debug_assert!(d_v.len() >= qkv_len, "swa_backward_dd: d_v too small ({} < {qkv_len})", d_v.len());
+    assert!(q.len() >= qkv_len, "swa_backward_dd: q too small ({} < {qkv_len})", q.len());
+    assert!(k.len() >= qkv_len, "swa_backward_dd: k too small ({} < {qkv_len})", k.len());
+    assert!(v.len() >= qkv_len, "swa_backward_dd: v too small ({} < {qkv_len})", v.len());
+    assert!(attn_weights.len() >= aw_len, "swa_backward_dd: attn_weights too small ({} < {aw_len})", attn_weights.len());
+    assert!(d_attn_out.len() >= qkv_len, "swa_backward_dd: d_attn_out too small ({} < {qkv_len})", d_attn_out.len());
+    assert!(d_q.len() >= qkv_len, "swa_backward_dd: d_q too small ({} < {qkv_len})", d_q.len());
+    assert!(d_k.len() >= qkv_len, "swa_backward_dd: d_k too small ({} < {qkv_len})", d_k.len());
+    assert!(d_v.len() >= qkv_len, "swa_backward_dd: d_v too small ({} < {qkv_len})", d_v.len());
     unsafe {
         crate::cuda_ffi::swa_backward_f32_cuda(
             q.as_ptr(), k.as_ptr(), v.as_ptr(),
