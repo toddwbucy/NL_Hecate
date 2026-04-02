@@ -72,7 +72,7 @@ pub struct GpuCMSCache {
     pub k_bf16: GpuBuf<u16>,          // [bs*s, d] bf16
     pub v_bf16: GpuBuf<u16>,          // [bs*s, d] bf16
     pub attn_out_bf16: GpuBuf<u16>,   // [bs*s, d] bf16
-    pub attn_weights_bf16: GpuBuf<u16>, // [bs*nh, s, ws] bf16
+    pub attn_weights_bf16: GpuBuf<u16>, // [bs*nh, s, n_persistent+ws] bf16
     pub attn_out: GpuBuf<f32>,        // [bs*s, d] f32 (converted back)
 
     // Memory branch per level
@@ -867,7 +867,9 @@ pub fn gpu_cms_forward(
 
     // ── Stage 3a: SWA attention (bf16 on GPU) ─────────────────────────
     let total = bs * s * d;
-    let aw_total = bs * nh * s * ws;
+    let n_p = cfg.n_persistent;
+    let aw_stride = n_p + ws;
+    let aw_total = bs * nh * s * aw_stride;
     let total_i32 = i32::try_from(total).expect("bs*s*d exceeds i32::MAX");
     let q_bf16 = GpuBuf::<u16>::zeros(total);
     let k_bf16 = GpuBuf::<u16>::zeros(total);
@@ -886,7 +888,7 @@ pub fn gpu_cms_forward(
     crate::dispatch::swa_forward_dd(
         &q_bf16, &k_bf16, &v_bf16,
         &mut attn_out_bf16, &mut attn_weights_bf16,
-        s, nh, hd, ws, bs,
+        s, nh, hd, ws, bs, n_p,
     );
 
     // bf16 → f32 for attn_out (needed for gating)
@@ -2484,7 +2486,7 @@ fn gpu_cms_capture_all_patterns(
         }
         crate::dispatch::swa_forward_dd(&fwd.q_bf16, &fwd.k_bf16, &fwd.v_bf16,
                                          &mut fwd.attn_out_bf16, &mut fwd.attn_weights_bf16,
-                                         s, nh, hd, ws, bs);
+                                         s, nh, hd, ws, bs, cfg.n_persistent);
         unsafe { crate::cuda_ffi::bf16_to_f32_cuda(fwd.attn_out_bf16.as_ptr(), fwd.attn_out.ptr(), total_i32); }
 
         // Stage 2b+3b: Memory per level
@@ -2700,7 +2702,7 @@ fn gpu_cms_replay(
         k_bf16:              unsafe { GpuBuf::from_raw_non_owning(fwd.k_bf16.ptr(), bs * s * d) },
         v_bf16:              unsafe { GpuBuf::from_raw_non_owning(fwd.v_bf16.ptr(), bs * s * d) },
         attn_out_bf16:       unsafe { GpuBuf::from_raw_non_owning(fwd.attn_out_bf16.ptr(), bs * s * d) },
-        attn_weights_bf16:   unsafe { GpuBuf::from_raw_non_owning(fwd.attn_weights_bf16.ptr(), bs * nh * s * ws) },
+        attn_weights_bf16:   unsafe { GpuBuf::from_raw_non_owning(fwd.attn_weights_bf16.ptr(), bs * nh * s * (cfg.n_persistent + ws)) },
         attn_out:            unsafe { GpuBuf::from_raw_non_owning(fwd.attn_out.ptr(), bs * s * d) },
         memory_caches,
         y_per_level,
@@ -2957,6 +2959,86 @@ impl GpuKVCache {
         self.len += n_tokens;
     }
 
+    /// Pre-populate positions [0, n_persistent) with projected persistent token K/V.
+    /// Must be called once per block before any tokens are processed.
+    /// `persistent_tokens` is [n_p, d] f32, `w_k`/`w_v` are [d, d] f32.
+    pub fn prepopulate_persistent(
+        &mut self,
+        persistent_tokens: &GpuBuf<f32>,
+        w_k: &GpuBuf<f32>,
+        w_v: &GpuBuf<f32>,
+        n_persistent: usize,
+        d: usize,
+    ) {
+        if n_persistent == 0 { return; }
+        assert!(n_persistent <= self.max_len,
+            "KV cache too small for {} persistent tokens", n_persistent);
+        assert_eq!(self.len, 0, "prepopulate_persistent must be called on empty cache");
+
+        let npd = n_persistent * d;
+        let mut pk = GpuBuf::<f32>::zeros(npd);
+        let mut pv = GpuBuf::<f32>::zeros(npd);
+        crate::dispatch::cublas_matmul_transb_dd(persistent_tokens, w_k, &mut pk, n_persistent, d, d, 0.0);
+        crate::dispatch::cublas_matmul_transb_dd(persistent_tokens, w_v, &mut pv, n_persistent, d, d, 0.0);
+
+        // Convert to bf16 and copy into cache positions [0, n_p)
+        let pk_bf16 = GpuBuf::<u16>::zeros(npd);
+        let pv_bf16 = GpuBuf::<u16>::zeros(npd);
+        unsafe {
+            crate::cuda_ffi::f32_to_bf16_cuda(pk.as_ptr(), pk_bf16.ptr(), npd as i32);
+            crate::cuda_ffi::f32_to_bf16_cuda(pv.as_ptr(), pv_bf16.ptr(), npd as i32);
+            gpu_buf_memcpy_d2d(
+                self.k_cache_bf16.ptr() as *mut _,
+                pk_bf16.as_ptr() as *const _,
+                npd * 2,
+            );
+            gpu_buf_memcpy_d2d(
+                self.v_cache_bf16.ptr() as *mut _,
+                pv_bf16.as_ptr() as *const _,
+                npd * 2,
+            );
+        }
+        self.len = n_persistent;
+    }
+
+    /// Re-project persistent tokens into positions [0, n_p) after optimizer updates.
+    /// Same as prepopulate_persistent but works on a non-empty cache (no len change).
+    pub fn refresh_persistent(
+        &mut self,
+        persistent_tokens: &GpuBuf<f32>,
+        w_k: &GpuBuf<f32>,
+        w_v: &GpuBuf<f32>,
+        n_persistent: usize,
+        d: usize,
+    ) {
+        if n_persistent == 0 { return; }
+        assert!(self.len >= n_persistent,
+            "cache len {} < n_persistent {}", self.len, n_persistent);
+
+        let npd = n_persistent * d;
+        let mut pk = GpuBuf::<f32>::zeros(npd);
+        let mut pv = GpuBuf::<f32>::zeros(npd);
+        crate::dispatch::cublas_matmul_transb_dd(persistent_tokens, w_k, &mut pk, n_persistent, d, d, 0.0);
+        crate::dispatch::cublas_matmul_transb_dd(persistent_tokens, w_v, &mut pv, n_persistent, d, d, 0.0);
+
+        let pk_bf16 = GpuBuf::<u16>::zeros(npd);
+        let pv_bf16 = GpuBuf::<u16>::zeros(npd);
+        unsafe {
+            crate::cuda_ffi::f32_to_bf16_cuda(pk.as_ptr(), pk_bf16.ptr(), npd as i32);
+            crate::cuda_ffi::f32_to_bf16_cuda(pv.as_ptr(), pv_bf16.ptr(), npd as i32);
+            gpu_buf_memcpy_d2d(
+                self.k_cache_bf16.ptr() as *mut _,
+                pk_bf16.as_ptr() as *const _,
+                npd * 2,
+            );
+            gpu_buf_memcpy_d2d(
+                self.v_cache_bf16.ptr() as *mut _,
+                pv_bf16.as_ptr() as *const _,
+                npd * 2,
+            );
+        }
+    }
+
     /// Reset the cache (set len=0, no dealloc).
     pub fn reset(&mut self) {
         self.len = 0;
@@ -3033,7 +3115,8 @@ pub fn gpu_prefill_forward(
 
     // ── Stage 3a: SWA attention (bf16) ─────────────────────────────
     let total = s * d;
-    let aw_total = nh * s * ws;
+    let aw_stride = cfg.n_persistent + ws;
+    let aw_total = nh * s * aw_stride;
     let q_bf16 = GpuBuf::<u16>::zeros(total);
     let k_bf16 = GpuBuf::<u16>::zeros(total);
     let v_bf16 = GpuBuf::<u16>::zeros(total);
@@ -3050,7 +3133,7 @@ pub fn gpu_prefill_forward(
     crate::dispatch::swa_forward_dd(
         &q_bf16, &k_bf16, &v_bf16,
         &mut attn_out_bf16, &mut attn_weights_bf16,
-        s, nh, hd, ws, 1,
+        s, nh, hd, ws, 1, cfg.n_persistent,
     );
 
     let attn_out = GpuBuf::<f32>::zeros(total);
@@ -3243,7 +3326,7 @@ pub fn gpu_single_token_forward(
     crate::dispatch::swa_single_token_dd(
         &ws.q_bf16, &kv_cache.k_cache_bf16, &kv_cache.v_cache_bf16,
         &mut ws.attn_out_bf16,
-        kv_cache.len, nh, hd, window_size,
+        kv_cache.len, nh, hd, window_size, cfg.n_persistent,
     );
 
     unsafe {

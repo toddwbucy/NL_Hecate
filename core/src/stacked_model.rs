@@ -154,6 +154,10 @@ pub struct StackedMAGParams {
     pub ln_final_beta: Vec<f32>,    // [d]
     // N blocks
     pub blocks: Vec<BlockParams>,
+    /// Persistent tokens (Titans Eq 19/26/27): [n_persistent * d_model].
+    /// Learnable, input-independent tokens always visible to SWA*.
+    /// Empty when n_persistent == 0.
+    pub persistent_tokens: Vec<f32>,
 }
 
 impl StackedMAGParams {
@@ -183,15 +187,22 @@ impl StackedMAGParams {
             .map(|b| BlockParams::init(cfg, seed.wrapping_add(10_000 + b as u64 * 10_000)))
             .collect();
 
+        // Persistent tokens: small random init (same scale as embeddings)
+        let n_pt = cfg.n_persistent * d;
+        let mut persistent_tokens = vec![0.0f32; n_pt];
+        if n_pt > 0 {
+            rng.fill_uniform(&mut persistent_tokens, embed_scale);
+        }
+
         StackedMAGParams {
             w_embed, w_unembed,
             ln_final_gamma, ln_final_beta,
-            blocks,
+            blocks, persistent_tokens,
         }
     }
 
     /// Zero-initialized stacked params (for gradient accumulation).
-    pub fn zeros(d: usize, vocab: usize, k: usize, n_blocks: usize) -> Self {
+    pub fn zeros(d: usize, vocab: usize, k: usize, n_blocks: usize, n_persistent: usize) -> Self {
         let blocks = (0..n_blocks).map(|_| BlockParams::zeros(d, k)).collect();
         StackedMAGParams {
             w_embed: vec![0.0; vocab * d],
@@ -199,13 +210,15 @@ impl StackedMAGParams {
             ln_final_gamma: vec![0.0; d],
             ln_final_beta: vec![0.0; d],
             blocks,
+            persistent_tokens: vec![0.0; n_persistent * d],
         }
     }
 
     /// Total parameter count across all blocks + shared params.
     pub fn num_params(&self) -> usize {
         let shared = self.w_embed.len() + self.w_unembed.len()
-            + self.ln_final_gamma.len() + self.ln_final_beta.len();
+            + self.ln_final_gamma.len() + self.ln_final_beta.len()
+            + self.persistent_tokens.len();
         let blocks: usize = self.blocks.iter().map(|b| b.num_params()).sum();
         shared + blocks
     }
@@ -251,6 +264,7 @@ impl StackedMAGParams {
             ln_final_gamma: vec![1.0; d],
             ln_final_beta: vec![0.0; d],
             blocks: vec![block],
+            persistent_tokens: params.persistent_tokens.clone(),
         }
     }
 
@@ -344,6 +358,7 @@ impl StackedMAGParams {
             ln_final_gamma: self.ln_final_gamma.clone(),
             ln_final_beta: self.ln_final_beta.clone(),
             blocks: new_blocks,
+            persistent_tokens: self.persistent_tokens.clone(),
         }
     }
 
@@ -433,6 +448,7 @@ impl StackedMAGParams {
             ln_final_gamma: self.ln_final_gamma.clone(),
             ln_final_beta: self.ln_final_beta.clone(),
             blocks: new_blocks,
+            persistent_tokens: self.persistent_tokens.clone(),
         }
     }
 }
@@ -538,7 +554,7 @@ mod tests {
 
     #[test]
     fn test_zeros() {
-        let z = StackedMAGParams::zeros(8, 32, 2, 3);
+        let z = StackedMAGParams::zeros(8, 32, 2, 3, 0);
         assert!(z.w_embed.iter().all(|&x| x == 0.0));
         assert!(z.blocks[0].w_q.iter().all(|&x| x == 0.0));
         assert_eq!(z.blocks.len(), 3);

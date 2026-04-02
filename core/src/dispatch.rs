@@ -650,6 +650,7 @@ fn cuda_forward(
             d_q.ptr, d_k.ptr, d_v.ptr,
             d_out.ptr, d_aw.ptr,
             seq_len as i32, num_heads as i32, head_dim as i32, window_size as i32, 1,
+            0, // n_persistent=0 for raw-slice test helper
         );
         let rc = cudaDeviceSynchronize();
         assert_eq!(rc, 0, "cudaDeviceSynchronize failed after SWA forward kernel (error code {rc})");
@@ -702,6 +703,7 @@ fn cuda_backward(
             d_aw.ptr, d_dao.ptr as *const f32,
             d_dq.ptr, d_dk.ptr, d_dv.ptr,
             seq_len as i32, num_heads as i32, head_dim as i32, window_size as i32, 1,
+            0, // n_persistent=0 for raw-slice test helper
         );
         let rc = cudaDeviceSynchronize();
         assert_eq!(rc, 0, "cudaDeviceSynchronize failed after SWA backward kernel (error code {rc})");
@@ -1941,19 +1943,21 @@ pub fn cublas_matmul_acc_dd(
 }
 
 /// SWA forward on device bf16 buffers. No H2D/D2H.
+/// `n_persistent`: number of persistent prefix tokens (SWA* from Titans Eq 27).
+/// When 0, behaves as standard sliding window attention.
 #[cfg(feature = "cuda")]
 pub fn swa_forward_dd(
     q: &GpuBuf<u16>, k: &GpuBuf<u16>, v: &GpuBuf<u16>,
     out: &mut GpuBuf<u16>, attn_weights: &mut GpuBuf<u16>,
     seq_len: usize, num_heads: usize, head_dim: usize, window_size: usize,
-    batch_size: usize,
+    batch_size: usize, n_persistent: usize,
 ) {
     unsafe {
         crate::cuda_ffi::swa_forward_f32_cuda(
             q.as_ptr(), k.as_ptr(), v.as_ptr(),
             out.ptr(), attn_weights.ptr(),
             seq_len as i32, num_heads as i32, head_dim as i32, window_size as i32,
-            batch_size as i32,
+            batch_size as i32, n_persistent as i32,
         );
     }
 }
@@ -1965,12 +1969,14 @@ pub fn swa_single_token_dd(
     q: &GpuBuf<u16>, k_cache: &GpuBuf<u16>, v_cache: &GpuBuf<u16>,
     out: &mut GpuBuf<u16>,
     cache_len: usize, num_heads: usize, head_dim: usize, window_size: usize,
+    n_persistent: usize,
 ) {
     unsafe {
         crate::cuda_ffi::swa_single_token_cuda(
             q.as_ptr(), k_cache.as_ptr(), v_cache.as_ptr(),
             out.ptr(),
             cache_len as i32, num_heads as i32, head_dim as i32, window_size as i32,
+            n_persistent as i32,
         );
     }
 }
@@ -1982,7 +1988,7 @@ pub fn swa_backward_dd(
     attn_weights: &GpuBuf<u16>, d_attn_out: &GpuBuf<f32>,
     d_q: &mut GpuBuf<f32>, d_k: &mut GpuBuf<f32>, d_v: &mut GpuBuf<f32>,
     seq_len: usize, num_heads: usize, head_dim: usize, window_size: usize,
-    batch_size: usize,
+    batch_size: usize, n_persistent: usize,
 ) {
     unsafe {
         crate::cuda_ffi::swa_backward_f32_cuda(
@@ -1990,7 +1996,7 @@ pub fn swa_backward_dd(
             attn_weights.as_ptr(), d_attn_out.as_ptr(),
             d_q.ptr(), d_k.ptr(), d_v.ptr(),
             seq_len as i32, num_heads as i32, head_dim as i32, window_size as i32,
-            batch_size as i32,
+            batch_size as i32, n_persistent as i32,
         );
     }
 }

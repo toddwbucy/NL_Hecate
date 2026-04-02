@@ -330,7 +330,7 @@ pub fn feed(config_path: &str, resume: bool) {
         // Perform the extension
         #[cfg(feature = "cuda")]
         {
-            let host = gpu_params.to_host(d, v, k);
+            let host = gpu_params.to_host(&mag_cfg);
             let init = match cfg.build.push_up_init.as_str() {
                 "clone" => PushUpInit::Clone,
                 _ => PushUpInit::Random,
@@ -422,7 +422,7 @@ pub fn feed(config_path: &str, resume: bool) {
     // ── Print banner ─────────────────────────────────────────────────
     let total_params = {
         #[cfg(feature = "cuda")]
-        { gpu_params.to_host(d, v, k).num_params() }
+        { gpu_params.to_host(&mag_cfg).num_params() }
     };
 
     let default_opt = &cfg.build.optimizer;
@@ -744,7 +744,7 @@ pub fn feed(config_path: &str, resume: bool) {
                         // Run inline probes if tokenizer is configured
                         #[cfg(feature = "cuda")]
                         if let Some(ref tok_path) = cfg.build.tokenizer_path {
-                            let snapshot = gpu_params.to_host(d, v, k);
+                            let snapshot = gpu_params.to_host(&mag_cfg);
                             let probe_results = run_inline_probes(
                                 &snapshot, &mag_cfg, tok_path, global_step,
                                 d, v, k, n_blocks, &chunk_sizes,
@@ -935,7 +935,7 @@ pub fn feed(config_path: &str, resume: bool) {
             // Run inline probes at phase boundary
             if let Some(ref tok_path) = cfg.build.tokenizer_path {
                 let default_opt = &cfg.build.optimizer;
-                let snapshot = gpu_params.to_host(d, v, k);
+                let snapshot = gpu_params.to_host(&mag_cfg);
                 let probe_results = run_inline_probes(
                     &snapshot, &mag_cfg, tok_path, global_step,
                     d, v, k, n_blocks, &chunk_sizes,
@@ -1053,7 +1053,7 @@ fn save_checkpoint(
 
     #[cfg(feature = "cuda")]
     {
-        let host_params = gpu_params.to_host(d, v, k);
+        let host_params = gpu_params.to_host(mag_cfg);
         let host_context = gpu_context.blocks[0].to_host(k);
         let stream_position = loaders.first().map(|l| l.position as u64).unwrap_or(0);
 

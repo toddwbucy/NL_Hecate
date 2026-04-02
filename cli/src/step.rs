@@ -180,9 +180,16 @@ pub fn generate(
 ) -> GenerateResult {
     let n_blocks = gpu_params.n_blocks();
     let kv_len = prompt.len().max(mag_cfg.swa.seq_len) + max_tokens;
+    let n_p = mag_cfg.n_persistent;
     let mut kv_caches: Vec<GpuKVCache> = (0..n_blocks)
-        .map(|_| GpuKVCache::new(kv_len, d, 1))
+        .map(|_| GpuKVCache::new(kv_len + n_p, d, 1))
         .collect();
+    for (b, kv) in kv_caches.iter_mut().enumerate() {
+        kv.prepopulate_persistent(
+            &gpu_params.persistent_tokens, &gpu_params.blocks[b].w_k,
+            &gpu_params.blocks[b].w_v, n_p, d,
+        );
+    }
     let mut ws = StackedDecodeWorkspace::new(n_blocks, d, v);
 
     // ActivationWindow collects all tokens (prompt + generated) for deferred backward
@@ -231,7 +238,7 @@ pub fn generate(
     }
     target_ids.push(v); // mask last position (no target available)
 
-    let cache = window.assemble_cache(mag_cfg, &target_ids);
+    let cache = window.assemble_cache(gpu_params, mag_cfg, &target_ids);
     let loss = gpu_cross_entropy_loss(&cache.logits, &cache.target_ids_gpu, &target_ids, v, win_len);
 
     let (grad_norm, block_level_gnorms) = if !loss.is_nan() && !loss.is_infinite() {

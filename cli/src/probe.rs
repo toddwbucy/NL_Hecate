@@ -182,7 +182,7 @@ pub fn run_probes(
         eprintln!("{sep}\n");
 
         // Save initial state for restore between probes
-        let initial_host_params = gpu_params.to_host(d, v, k);
+        let initial_host_params = gpu_params.to_host(&mag_cfg);
 
         // ── Probe 1: Coherence Samples ───────────────────────────
         eprintln!("── Probe: Coherence Samples ──");
@@ -510,9 +510,16 @@ fn generate_learning_losses(
     let mut losses = Vec::new();
 
     // KV caches + workspace for the unified forward path
+    let n_p = mag_cfg.n_persistent;
     let mut kv_caches: Vec<GpuKVCache> = (0..n_blocks)
-        .map(|_| GpuKVCache::new(seq_len + max_tokens + prompt_ids.len(), d, 1))
+        .map(|_| GpuKVCache::new(seq_len + max_tokens + prompt_ids.len() + n_p, d, 1))
         .collect();
+    for (b, kv) in kv_caches.iter_mut().enumerate() {
+        kv.prepopulate_persistent(
+            &gpu_params.persistent_tokens, &gpu_params.blocks[b].w_k,
+            &gpu_params.blocks[b].w_v, n_p, d,
+        );
+    }
     let mut decode_ws = StackedDecodeWorkspace::new(n_blocks, d, v);
 
     // Activation window: gradient_window_size = seq_len
@@ -541,7 +548,7 @@ fn generate_learning_losses(
         target_ids.push(vocab_size); // mask the last position
 
         // Assemble window into GpuStackedCache for backward
-        let cache = window.assemble_cache(mag_cfg, &target_ids);
+        let cache = window.assemble_cache(gpu_params, mag_cfg, &target_ids);
 
         // Compute loss on host from assembled logits + targets
         let loss = gpu_cross_entropy_loss(&cache.logits, &cache.target_ids_gpu, &target_ids, v, win_len);
@@ -566,6 +573,16 @@ fn generate_learning_losses(
             false, &mut None,
         );
         gpu_stacked_sync_embed_weights(gpu_params, d, v);
+
+        // Refresh persistent K/V in KV cache after optimizer updated persistent_tokens
+        if n_p > 0 {
+            for (b, kv) in kv_caches.iter_mut().enumerate() {
+                kv.refresh_persistent(
+                    &gpu_params.persistent_tokens, &gpu_params.blocks[b].w_k,
+                    &gpu_params.blocks[b].w_v, n_p, d,
+                );
+            }
+        }
 
         // SPEAK: sample next token from last logits in window
         let logits = window.last_logits().unwrap();

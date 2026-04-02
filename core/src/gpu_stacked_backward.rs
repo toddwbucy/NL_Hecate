@@ -58,6 +58,8 @@ pub struct GpuStackedGrads {
     pub d_w_unembed: GpuBuf<f32>,
     pub d_ln_final_gamma: GpuBuf<f32>,
     pub d_ln_final_beta: GpuBuf<f32>,
+    /// Gradient for persistent tokens [n_persistent, d]. Accumulated across all blocks.
+    pub d_persistent_tokens: GpuBuf<f32>,
     // Per-block gradients
     pub blocks: Vec<GpuStackedBlockGrads>,
 }
@@ -103,12 +105,15 @@ pub fn gpu_stacked_backward(
     let n_blocks = params.n_blocks();
 
     let inter = if cfg.memory_rule == MemoryRuleKind::SwiGluMlp { cfg.intermediate_size } else { 0 };
+    let n_p = cfg.n_persistent;
+    let s_aug = n_p + s;
 
     // Initialize shared gradient buffers
     let d_w_embed = GpuBuf::zeros(v * d);
     let mut d_w_unembed = GpuBuf::zeros(d * v);
     let d_ln_final_gamma = GpuBuf::zeros(d);
     let d_ln_final_beta = GpuBuf::zeros(d);
+    let d_persistent_tokens = GpuBuf::zeros(n_p.max(1) * d);
 
     // ── Cross-entropy backward ─────────────────────────────────────────
     prof_start!(profiler, "cross_entropy_bwd", Loss, None, None);
@@ -604,38 +609,86 @@ pub fn gpu_stacked_backward(
         );
         prof_stop!(profiler);
 
-        // ── SWA backward ───────────────────────────────────────────
+        // ── SWA backward (augmented dimensions for persistent tokens) ──
         prof_start!(profiler, "swa_bwd", Attention, Some(b), None);
-        let mut d_q = GpuBuf::zeros(bsd);
-        let mut d_k = GpuBuf::zeros(bsd);
-        let mut d_v = GpuBuf::zeros(bsd);
+        let n_aug = bs * s_aug;
+        let bsd_aug = n_aug * d;
+
+        // Expand d_attn_out [bs*s, d] → d_attn_out_aug [bs*s_aug, d]
+        // Persistent prefix positions get zero gradient (they don't contribute to output)
+        let d_attn_out_aug = if n_p > 0 {
+            let aug = GpuBuf::zeros(bsd_aug);
+            unsafe {
+                crate::gpu_forward::gpu_buf_memcpy_d2d(
+                    (aug.ptr() as *mut u8).add(n_p * d * 4) as *mut _,
+                    d_attn_out.as_ptr() as *const _,
+                    bsd * 4,
+                );
+            }
+            aug
+        } else {
+            d_attn_out
+        };
+
+        let mut d_q = GpuBuf::zeros(bsd_aug);
+        let mut d_k = GpuBuf::zeros(bsd_aug);
+        let mut d_v = GpuBuf::zeros(bsd_aug);
 
         crate::dispatch::swa_backward_dd(
             &bc.q_bf16, &bc.k_bf16, &bc.v_bf16,
-            &bc.attn_weights_bf16, &d_attn_out,
+            &bc.attn_weights_bf16, &d_attn_out_aug,
             &mut d_q, &mut d_k, &mut d_v,
-            s, nh, hd, ws, bs,
+            s_aug, nh, hd, ws, bs, n_p,
         );
         prof_stop!(profiler);
 
-        // ── QKV projection backward ───────────────────────────────
+        // ── QKV projection backward (augmented) ───────────────────
+        // Forward: Q/K/V = qkv_source @ W_Q/K/V where qkv_source = [persistent; ln_attn_out]
+        // d_qkv_source = d_Q @ W_Q^T + d_K @ W_K^T + d_V @ W_V^T  [bs*s_aug, d]
+        // d_W_Q += qkv_source^T @ d_Q  (matmul_transa)
         prof_start!(profiler, "qkv_proj_bwd", Projection, Some(b), None);
-        let mut d_qkv_source = GpuBuf::zeros(bsd);
-        crate::dispatch::cublas_matmul_acc_dd(&d_q, &block.w_q, &mut d_qkv_source, n_tokens, d, d);
-        crate::dispatch::cublas_matmul_acc_dd(&d_k, &block.w_k, &mut d_qkv_source, n_tokens, d, d);
-        crate::dispatch::cublas_matmul_acc_dd(&d_v, &block.w_v, &mut d_qkv_source, n_tokens, d, d);
+        let mut d_qkv_source = GpuBuf::zeros(bsd_aug);
+        crate::dispatch::cublas_matmul_acc_dd(&d_q, &block.w_q, &mut d_qkv_source, n_aug, d, d);
+        crate::dispatch::cublas_matmul_acc_dd(&d_k, &block.w_k, &mut d_qkv_source, n_aug, d, d);
+        crate::dispatch::cublas_matmul_acc_dd(&d_v, &block.w_v, &mut d_qkv_source, n_aug, d, d);
 
-        gpu_matmul_transa_dd(&d_q, &bc.ln_attn_out, &mut d_w_q, d, n_tokens, d);
-        gpu_matmul_transa_dd(&d_k, &bc.ln_attn_out, &mut d_w_k, d, n_tokens, d);
-        gpu_matmul_transa_dd(&d_v, &bc.ln_attn_out, &mut d_w_v, d, n_tokens, d);
+        gpu_matmul_transa_dd(&d_q, &bc.qkv_source, &mut d_w_q, d, n_aug, d);
+        gpu_matmul_transa_dd(&d_k, &bc.qkv_source, &mut d_w_k, d, n_aug, d);
+        gpu_matmul_transa_dd(&d_v, &bc.qkv_source, &mut d_w_v, d, n_aug, d);
         prof_stop!(profiler);
+
+        // Split d_qkv_source into persistent token gradient + d_ln_attn_out
+        // d_persistent_tokens accumulates across all blocks (shared parameter)
+        if n_p > 0 {
+            unsafe {
+                crate::cuda_ffi::saxpy_cuda(
+                    1.0, d_qkv_source.as_ptr(), d_persistent_tokens.ptr(),
+                    (n_p * d) as i32,
+                );
+            }
+        }
+
+        // Extract d_ln_attn_out from the suffix of d_qkv_source
+        let d_ln_attn_out = if n_p > 0 {
+            let d_ln = GpuBuf::zeros(bsd);
+            unsafe {
+                crate::gpu_forward::gpu_buf_memcpy_d2d(
+                    d_ln.ptr() as *mut _,
+                    (d_qkv_source.as_ptr() as *const u8).add(n_p * d * 4) as *const _,
+                    bsd * 4,
+                );
+            }
+            d_ln
+        } else {
+            d_qkv_source
+        };
 
         // ── LN_attn backward ──────────────────────────────────────
         prof_start!(profiler, "ln_attn_bwd", LayerNorm, Some(b), None);
         let d_block_input = GpuBuf::zeros(bsd);
         unsafe {
             crate::cuda_ffi::layer_norm_backward_cuda(
-                d_qkv_source.as_ptr(),
+                d_ln_attn_out.as_ptr(),
                 bc.block_input.as_ptr(),
                 block.ln_attn_gamma.as_ptr(),
                 bc.ln_attn_mean.as_ptr(),
@@ -740,6 +793,7 @@ pub fn gpu_stacked_backward(
         d_w_unembed,
         d_ln_final_gamma,
         d_ln_final_beta,
+        d_persistent_tokens,
         blocks: block_grads.into_iter().map(|bg| bg.unwrap()).collect(),
     }
 }
@@ -799,5 +853,235 @@ mod tests {
                 "n={n}: gpu={gpu_dot:.8}, cpu={cpu_dot:.8}, rel_err={rel_err:.2e}"
             );
         }
+    }
+
+    /// Helper: create a test MAGConfig with persistent tokens.
+    fn persistent_test_config(n_persistent: usize) -> crate::model::MAGConfig {
+        let mut cfg = crate::model::MAGConfig::test_config();
+        cfg.n_persistent = n_persistent;
+        cfg
+    }
+
+    /// Integration test: n_persistent=2 end-to-end forward→backward→update.
+    /// Verifies: nonzero logits, nonzero d_persistent_tokens, params change after update,
+    /// output differs between n_persistent=0 and n_persistent=2.
+    #[test]
+    fn test_persistent_tokens_end_to_end() {
+        use crate::stacked_model::StackedMAGParams;
+        use crate::gpu_stacked_forward::gpu_stacked_forward_sequence;
+        use crate::gpu_stacked_optimizer::{GpuStackedAdamWState, gpu_stacked_adamw_update};
+        use crate::conductor::Conductor;
+
+        let n_blocks = 1;
+        let n_p = 2;
+
+        // ── Run with n_persistent=2 ──────────────────────────
+        let cfg_p2 = persistent_test_config(n_p);
+        let d = cfg_p2.swa.d_model;
+        let v = cfg_p2.swa.vocab_size;
+
+        let host_params = StackedMAGParams::init(&cfg_p2, n_blocks, 42);
+        assert_eq!(host_params.persistent_tokens.len(), n_p * d,
+            "persistent_tokens should be [n_p, d]");
+
+        let mut gpu_params = GpuStackedParams::from_host(&host_params);
+        let mut context = crate::gpu_params::GpuStackedContext::new(
+            n_blocks, cfg_p2.k, d, 1, Some(&cfg_p2),
+        );
+        let mut conductor = Conductor::new(cfg_p2.k, cfg_p2.chunk_sizes.clone());
+
+        let tokens: Vec<usize> = vec![1, 3, 5, 7];
+        let targets: Vec<usize> = vec![3, 5, 7, 2];
+
+        // Forward
+        let (logits_p2, cache) = gpu_stacked_forward_sequence(
+            &gpu_params, &cfg_p2, &tokens, &targets,
+            &mut conductor, &mut context,
+        );
+        assert!(!logits_p2.iter().any(|x| x.is_nan()), "logits contain NaN");
+        assert!(logits_p2.iter().any(|x| *x != 0.0), "logits all zero");
+
+        // Backward
+        let mut grads = gpu_stacked_backward(
+            &gpu_params, &cfg_p2, &cache, &mut None, false,
+        );
+
+        // Check d_persistent_tokens is nonzero
+        let mut d_pt_host = vec![0.0f32; n_p * d];
+        crate::dispatch::cuda_sync();
+        grads.d_persistent_tokens.copy_to_host(&mut d_pt_host);
+        let pt_gnorm: f64 = d_pt_host.iter().map(|x| (*x as f64) * (*x as f64)).sum();
+        assert!(pt_gnorm > 1e-20,
+            "d_persistent_tokens all zero — gradient not flowing through QKV→SWA chain");
+
+        // Save persistent tokens before update
+        let mut pt_before = vec![0.0f32; n_p * d];
+        gpu_params.persistent_tokens.copy_to_host(&mut pt_before);
+
+        // AdamW update
+        let mut state = GpuStackedAdamWState::from_params(&gpu_params);
+        gpu_stacked_adamw_update(
+            &mut gpu_params, &mut grads, &mut state,
+            &cache.pulse,
+            1e-3, 0.9, 0.999, 1e-8, 0.01, 1.0,
+            false, &mut None,
+        );
+
+        // Check persistent tokens changed
+        let mut pt_after = vec![0.0f32; n_p * d];
+        crate::dispatch::cuda_sync();
+        gpu_params.persistent_tokens.copy_to_host(&mut pt_after);
+        let diff: f64 = pt_before.iter().zip(pt_after.iter())
+            .map(|(a, b)| ((*a - *b) as f64).powi(2)).sum();
+        assert!(diff > 1e-20,
+            "persistent_tokens unchanged after AdamW update");
+
+        // Second forward should produce different output
+        let mut conductor2 = Conductor::new(cfg_p2.k, cfg_p2.chunk_sizes.clone());
+        let (logits_p2_after, _) = gpu_stacked_forward_sequence(
+            &gpu_params, &cfg_p2, &tokens, &targets,
+            &mut conductor2, &mut context,
+        );
+        let logit_diff: f64 = logits_p2.iter().zip(logits_p2_after.iter())
+            .map(|(a, b)| ((*a - *b) as f64).powi(2)).sum();
+        assert!(logit_diff > 1e-20,
+            "logits unchanged after parameter update");
+
+        // ── Compare to n_persistent=0 ────────────────────────
+        let cfg_p0 = persistent_test_config(0);
+        let host_params_p0 = StackedMAGParams::init(&cfg_p0, n_blocks, 42);
+        let gpu_params_p0 = GpuStackedParams::from_host(&host_params_p0);
+        let mut context_p0 = crate::gpu_params::GpuStackedContext::new(
+            n_blocks, cfg_p0.k, d, 1, Some(&cfg_p0),
+        );
+        let mut conductor_p0 = Conductor::new(cfg_p0.k, cfg_p0.chunk_sizes.clone());
+
+        let (logits_p0, _) = gpu_stacked_forward_sequence(
+            &gpu_params_p0, &cfg_p0, &tokens, &targets,
+            &mut conductor_p0, &mut context_p0,
+        );
+
+        // Outputs must differ (persistent tokens affect attention)
+        let p0_vs_p2: f64 = logits_p0.iter().zip(logits_p2.iter())
+            .map(|(a, b)| ((*a - *b) as f64).powi(2)).sum();
+        assert!(p0_vs_p2 > 1e-10,
+            "n_persistent=0 and n_persistent=2 produce identical output — persistent tokens not wired");
+    }
+
+    /// FD gradient check: verify d_persistent_tokens gradient direction + loose magnitude.
+    ///
+    /// Persistent tokens flow through bf16 SWA (Q/K/V and attention weights stored as bf16).
+    /// With head_dim=4, perturbations near eps=1e-2 produce attention score changes at the
+    /// bf16 precision floor, causing FD to measure the "quantized step function" gradient
+    /// rather than the smooth analytical gradient. Sign agreement validates gradient direction;
+    /// magnitude tolerance is relaxed to account for bf16 quantization noise.
+    #[test]
+    fn test_persistent_tokens_fd_gradient() {
+        use crate::stacked_model::StackedMAGParams;
+        use crate::gpu_stacked_forward::{gpu_stacked_forward_sequence, gpu_cross_entropy_loss};
+        use crate::conductor::Conductor;
+
+        let n_blocks = 1;
+        let n_p = 2;
+        let cfg = persistent_test_config(n_p);
+        let d = cfg.swa.d_model;
+        let v = cfg.swa.vocab_size;
+
+        let host_params = StackedMAGParams::init(&cfg, n_blocks, 42);
+        let tokens: Vec<usize> = vec![1, 3, 5, 7];
+        let targets: Vec<usize> = vec![3, 5, 7, 2];
+
+        // ── Analytical gradient via backward ──────────────────
+        let gpu_params = GpuStackedParams::from_host(&host_params);
+        let mut context = crate::gpu_params::GpuStackedContext::new(
+            n_blocks, cfg.k, d, 1, Some(&cfg),
+        );
+        let mut conductor = Conductor::new(cfg.k, cfg.chunk_sizes.clone());
+
+        let (_, cache) = gpu_stacked_forward_sequence(
+            &gpu_params, &cfg, &tokens, &targets,
+            &mut conductor, &mut context,
+        );
+        let loss_base = gpu_cross_entropy_loss(
+            &cache.logits, &cache.target_ids_gpu, &targets, v, tokens.len(),
+        );
+        assert!(!loss_base.is_nan(), "base loss is NaN");
+
+        let grads = gpu_stacked_backward(
+            &gpu_params, &cfg, &cache, &mut None, false,
+        );
+        let mut analytical = vec![0.0f32; n_p * d];
+        crate::dispatch::cuda_sync();
+        grads.d_persistent_tokens.copy_to_host(&mut analytical);
+
+        // ── FD gradient (central differences) ─────────────────
+        let eps = 1e-2f32;
+        let abs_threshold = 5e-4;
+
+        let mut sign_matches = 0usize;
+        let mut magnitude_matches = 0usize;
+        let mut checked = 0usize;
+
+        for i in 0..(n_p * d) {
+            let ag = analytical[i];
+            if ag.abs() < abs_threshold { continue; }
+
+            // loss(p + eps)
+            let mut params_plus = host_params.clone();
+            params_plus.persistent_tokens[i] += eps;
+            let gpu_plus = GpuStackedParams::from_host(&params_plus);
+            let mut ctx_plus = crate::gpu_params::GpuStackedContext::new(
+                n_blocks, cfg.k, d, 1, Some(&cfg),
+            );
+            let mut cond_plus = Conductor::new(cfg.k, cfg.chunk_sizes.clone());
+            let (_, cache_plus) = gpu_stacked_forward_sequence(
+                &gpu_plus, &cfg, &tokens, &targets,
+                &mut cond_plus, &mut ctx_plus,
+            );
+            let loss_plus = gpu_cross_entropy_loss(
+                &cache_plus.logits, &cache_plus.target_ids_gpu, &targets, v, tokens.len(),
+            );
+
+            // loss(p - eps)
+            let mut params_minus = host_params.clone();
+            params_minus.persistent_tokens[i] -= eps;
+            let gpu_minus = GpuStackedParams::from_host(&params_minus);
+            let mut ctx_minus = crate::gpu_params::GpuStackedContext::new(
+                n_blocks, cfg.k, d, 1, Some(&cfg),
+            );
+            let mut cond_minus = Conductor::new(cfg.k, cfg.chunk_sizes.clone());
+            let (_, cache_minus) = gpu_stacked_forward_sequence(
+                &gpu_minus, &cfg, &tokens, &targets,
+                &mut cond_minus, &mut ctx_minus,
+            );
+            let loss_minus = gpu_cross_entropy_loss(
+                &cache_minus.logits, &cache_minus.target_ids_gpu, &targets, v, tokens.len(),
+            );
+
+            let fd = (loss_plus - loss_minus) / (2.0 * eps);
+            let sign_ok = (ag > 0.0) == (fd > 0.0);
+            let rel_err = ((fd - ag) as f64).abs() / (ag as f64).abs();
+
+            checked += 1;
+            if sign_ok { sign_matches += 1; }
+            // bf16 quantization: accept up to 5x magnitude discrepancy
+            if rel_err < 4.0 { magnitude_matches += 1; }
+
+            if !sign_ok {
+                eprintln!("FD SIGN MISMATCH i={i}: analytical={ag:.6}, fd={fd:.6}");
+            }
+        }
+
+        assert!(checked > 0, "no gradients above abs_threshold — model too small or grads zero");
+        let sign_rate = sign_matches as f64 / checked as f64;
+        let mag_rate = magnitude_matches as f64 / checked as f64;
+        eprintln!("FD check: {checked} checked, sign={sign_matches}/{checked} ({:.0}%), mag={magnitude_matches}/{checked} ({:.0}%)",
+            sign_rate * 100.0, mag_rate * 100.0);
+        // Primary: gradient direction must be correct (sign agreement ≥ 80%)
+        assert!(sign_rate >= 0.80,
+            "FD sign check failed: only {sign_matches}/{checked} sign matches — backward path likely wrong");
+        // Secondary: magnitude within 5x for most elements (bf16 quantization noise)
+        assert!(mag_rate >= 0.70,
+            "FD magnitude check failed: only {magnitude_matches}/{checked} within 5x — possible scaling bug");
     }
 }
