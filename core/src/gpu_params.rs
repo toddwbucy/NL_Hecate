@@ -539,23 +539,34 @@ pub struct GpuStackedParams {
     pub ln_final_gamma: GpuBuf<f32>, // [d]
     pub ln_final_beta: GpuBuf<f32>,  // [d]
     pub blocks: Vec<GpuBlockParams>,
+    /// Persistent tokens on GPU: [n_persistent, d]. Empty when n_persistent == 0.
+    pub persistent_tokens: GpuBuf<f32>,
 }
 
 #[cfg(feature = "cuda")]
 impl GpuStackedParams {
     /// Upload all stacked parameters from host to GPU.
     pub fn from_host(host: &crate::stacked_model::StackedMAGParams) -> Self {
+        let persistent_tokens = if host.persistent_tokens.is_empty() {
+            GpuBuf::zeros(1) // placeholder for n_persistent=0
+        } else {
+            GpuBuf::from_host(&host.persistent_tokens)
+        };
         GpuStackedParams {
             w_embed: GpuBuf::from_host(&host.w_embed),
             w_unembed: GpuBuf::from_host(&host.w_unembed),
             ln_final_gamma: GpuBuf::from_host(&host.ln_final_gamma),
             ln_final_beta: GpuBuf::from_host(&host.ln_final_beta),
             blocks: host.blocks.iter().map(GpuBlockParams::from_host).collect(),
+            persistent_tokens,
         }
     }
 
     /// Download all parameters from GPU to host.
-    pub fn to_host(&self, d: usize, vocab: usize, k: usize) -> crate::stacked_model::StackedMAGParams {
+    pub fn to_host(&self, cfg: &crate::model::MAGConfig) -> crate::stacked_model::StackedMAGParams {
+        let d = cfg.swa.d_model;
+        let vocab = cfg.swa.vocab_size;
+        let k = cfg.k;
         let mut w_embed = vec![0.0f32; vocab * d];
         let mut w_unembed = vec![0.0f32; d * vocab];
         let mut ln_final_gamma = vec![0.0f32; d];
@@ -566,10 +577,17 @@ impl GpuStackedParams {
         self.ln_final_gamma.copy_to_host(&mut ln_final_gamma);
         self.ln_final_beta.copy_to_host(&mut ln_final_beta);
 
+        let n_pt = cfg.n_persistent * d;
+        let mut persistent_tokens = vec![0.0f32; n_pt];
+        if n_pt > 0 {
+            self.persistent_tokens.copy_to_host(&mut persistent_tokens);
+        }
+
         crate::stacked_model::StackedMAGParams {
             w_embed, w_unembed,
             ln_final_gamma, ln_final_beta,
             blocks: self.blocks.iter().map(|b| b.to_host(d, k)).collect(),
+            persistent_tokens,
         }
     }
 

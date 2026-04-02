@@ -165,7 +165,7 @@ mod cuda_tests {
         let mut y_cuda = vec![0.0f32; seq_len * d];
         delta_forward_dispatch(
             &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_initial,
-            &mut m_states_cuda, &mut y_cuda, seq_len, d, f32::MAX, 0.0,
+            &mut m_states_cuda, &mut y_cuda, seq_len, d, 0.0, f32::MAX,
         );
 
         // Force Rust path
@@ -174,7 +174,7 @@ mod cuda_tests {
         let mut y_rust = vec![0.0f32; seq_len * d];
         delta_forward_dispatch(
             &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_initial,
-            &mut m_states_rust, &mut y_rust, seq_len, d, f32::MAX, 0.0,
+            &mut m_states_rust, &mut y_rust, seq_len, d, 0.0, f32::MAX,
         );
 
         // Reset
@@ -185,6 +185,56 @@ mod cuda_tests {
             let diff = (y_cuda[i] - y_rust[i]).abs();
             assert!(diff < 1e-5,
                     "y[{i}] CUDA={} Rust={} diff={}", y_cuda[i], y_rust[i], diff);
+        }
+    }
+
+    /// Parity test with active error_clip and m_norm_max.
+    /// Non-sentinel values detect parameter order swaps between CUDA and Rust.
+    #[test]
+    #[serial]
+    fn test_force_rust_parity_with_clipping() {
+        let d = 4;
+        let seq_len = 4;
+        let dd = d * d;
+        let k_mem = vec![0.5f32; seq_len * d];
+        let v_mem = vec![0.3f32; seq_len * d];
+        let q_mem = vec![0.2f32; seq_len * d];
+        let alpha = vec![0.01f32; seq_len];
+        let theta = vec![0.5f32; seq_len];
+        let m_initial = vec![0.0f32; dd];
+
+        // Active clipping: error_clip=1.0, m_norm_max=5.0
+        let error_clip = 1.0f32;
+        let m_norm_max = 5.0f32;
+
+        // CUDA path
+        force_rust_reference(false);
+        let mut m_cuda = vec![0.0f32; (seq_len + 1) * dd];
+        let mut y_cuda = vec![0.0f32; seq_len * d];
+        delta_forward_dispatch(
+            &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_initial,
+            &mut m_cuda, &mut y_cuda, seq_len, d, error_clip, m_norm_max,
+        );
+
+        // Rust path
+        force_rust_reference(true);
+        let mut m_rust = vec![0.0f32; (seq_len + 1) * dd];
+        let mut y_rust = vec![0.0f32; seq_len * d];
+        delta_forward_dispatch(
+            &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_initial,
+            &mut m_rust, &mut y_rust, seq_len, d, error_clip, m_norm_max,
+        );
+        force_rust_reference(false);
+
+        for i in 0..y_cuda.len() {
+            let diff = (y_cuda[i] - y_rust[i]).abs();
+            assert!(diff < 1e-5,
+                    "clip_parity y[{i}] CUDA={} Rust={} diff={}", y_cuda[i], y_rust[i], diff);
+        }
+        for i in 0..m_cuda.len() {
+            let diff = (m_cuda[i] - m_rust[i]).abs();
+            assert!(diff < 1e-5,
+                    "clip_parity m[{i}] CUDA={} Rust={} diff={}", m_cuda[i], m_rust[i], diff);
         }
     }
 }

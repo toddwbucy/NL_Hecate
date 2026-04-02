@@ -378,7 +378,7 @@ pub fn gpu_cms_backward(
         &cache.q_bf16, &cache.k_bf16, &cache.v_bf16,
         &cache.attn_weights_bf16, &d_attn_out,
         &mut d_q, &mut d_k, &mut d_v,
-        s, nh, hd, ws, bs,
+        s, nh, hd, ws, bs, cfg.n_persistent,
     );
 
     // ── Stage 2a: QKV projection backward ────────────────────────────

@@ -284,7 +284,7 @@ fn test_cuda_delta_forward_d2048() {
     let mut y_cuda = vec![0.0f32; seq_len * d];
     delta_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_initial,
-        &mut m_states_cuda, &mut y_cuda, seq_len, d, f32::MAX, 0.0);
+        &mut m_states_cuda, &mut y_cuda, seq_len, d, 0.0, f32::MAX);
 
     check_close("delta_d2048_y", &y_rust, &y_cuda, 1e-4);
     check_close("delta_d2048_m", &m_states_rust, &m_states_cuda, 1e-4);
@@ -314,7 +314,7 @@ fn test_cuda_delta_backward_d2048() {
     let mut y = vec![0.0f32; seq_len * d];
     delta_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_initial,
-        &mut m_states, &mut y, seq_len, d, f32::MAX, 0.0);
+        &mut m_states, &mut y, seq_len, d, 0.0, f32::MAX);
 
     let d_y = rand_buf(seq_len * d, 20004);
 
@@ -450,7 +450,7 @@ fn test_cuda_titans_forward_d2048() {
     titans_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
         &m_initial, &s_initial,
-        &mut m_cuda, &mut s_cuda, &mut y_cuda, seq_len, d, f32::MAX, 0.0);
+        &mut m_cuda, &mut s_cuda, &mut y_cuda, seq_len, d, 0.0, f32::MAX);
 
     check_close("titans_d2048_y", &y_rust, &y_cuda, 1e-4);
     check_close("titans_d2048_m", &m_rust, &m_cuda, 1e-4);
@@ -484,7 +484,7 @@ fn test_cuda_titans_backward_d2048() {
     titans_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
         &m_initial, &s_initial,
-        &mut m_states, &mut s_states, &mut y, seq_len, d, f32::MAX, 0.0);
+        &mut m_states, &mut s_states, &mut y, seq_len, d, 0.0, f32::MAX);
 
     let d_y = rand_buf(seq_len * d, 41004);
 
@@ -698,7 +698,7 @@ fn test_cuda_delta_forward_d1536() {
     let mut y_cuda = vec![0.0f32; seq_len * d];
     delta_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &m_initial,
-        &mut m_states_cuda, &mut y_cuda, seq_len, d, f32::MAX, 0.0);
+        &mut m_states_cuda, &mut y_cuda, seq_len, d, 0.0, f32::MAX);
 
     check_close("delta_d1536_y", &y_rust, &y_cuda, 1e-4);
     check_close("delta_d1536_m", &m_states_rust, &m_states_cuda, 1e-4);

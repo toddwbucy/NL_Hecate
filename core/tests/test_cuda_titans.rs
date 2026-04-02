@@ -8,7 +8,7 @@
 mod cuda_test_utils;
 use cuda_test_utils::{rand_buf, check_close};
 
-use nl_hecate_core::dispatch::{titans_forward_dispatch, titans_backward_dispatch};
+use nl_hecate_core::dispatch::{titans_forward_dispatch, titans_backward_dispatch, force_rust_reference};
 
 /// Rust reference Titans forward inner loop.
 fn rust_titans_forward(
@@ -90,7 +90,7 @@ fn test_cuda_titans_forward_matches_rust() {
     titans_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
         &m_initial, &s_initial, &mut m_cuda, &mut s_cuda, &mut y_cuda,
-        seq_len, d, f32::MAX, 0.0);
+        seq_len, d, 0.0, f32::MAX);
 
     check_close("titans_fwd_y", &y_rust, &y_cuda, 1e-5);
     check_close("titans_fwd_m", &m_rust, &m_cuda, 1e-5);
@@ -121,7 +121,7 @@ fn test_cuda_titans_forward_seq_len_1() {
     titans_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
         &m_initial, &s_initial, &mut m_cuda, &mut s_cuda, &mut y_cuda,
-        1, d, f32::MAX, 0.0);
+        1, d, 0.0, f32::MAX);
 
     check_close("titans_seq1_y", &y_rust, &y_cuda, 1e-5);
 }
@@ -147,7 +147,7 @@ fn test_cuda_titans_forward_momentum_nonzero() {
     titans_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
         &m_initial, &s_initial, &mut m_states, &mut s_states, &mut y,
-        seq_len, d, f32::MAX, 0.0);
+        seq_len, d, 0.0, f32::MAX);
 
     let s_final = &s_states[seq_len * dd..];
     let s_max = s_final.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
@@ -316,7 +316,7 @@ fn test_cuda_titans_backward_nonzero() {
     titans_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
         &m_initial, &s_initial, &mut m_states, &mut s_states, &mut y,
-        seq_len, d, f32::MAX, 0.0);
+        seq_len, d, 0.0, f32::MAX);
 
     let d_y = vec![1.0f32; seq_len * d];
     let mut dk = vec![0.0f32; seq_len * d];
@@ -363,7 +363,7 @@ fn test_cuda_titans_forward_deterministic() {
     titans_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
         &m_initial, &s_initial, &mut m1, &mut s1, &mut y1,
-        seq_len, d, f32::MAX, 0.0);
+        seq_len, d, 0.0, f32::MAX);
 
     let mut y2 = vec![0.0f32; seq_len * d];
     let mut m2 = vec![0.0f32; (seq_len + 1) * dd];
@@ -371,7 +371,7 @@ fn test_cuda_titans_forward_deterministic() {
     titans_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
         &m_initial, &s_initial, &mut m2, &mut s2, &mut y2,
-        seq_len, d, f32::MAX, 0.0);
+        seq_len, d, 0.0, f32::MAX);
 
     assert_eq!(y1, y2, "CUDA titans forward should be deterministic");
 }
@@ -404,7 +404,7 @@ fn test_cuda_titans_forward_large_d() {
     titans_forward_dispatch(
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
         &m_initial, &s_initial, &mut m_cuda, &mut s_cuda, &mut y_cuda,
-        seq_len, d, f32::MAX, 0.0);
+        seq_len, d, 0.0, f32::MAX);
 
     check_close("titans_large_d_y", &y_rust, &y_cuda, 1e-4);
     check_close("titans_large_d_m", &m_rust, &m_cuda, 1e-4);
@@ -414,4 +414,54 @@ fn test_cuda_titans_forward_large_d() {
     let m_final = &m_cuda[seq_len * dd..];
     let m_norm: f32 = m_final.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(m_norm > 1e-6, "M_final should be non-zero at d=128, got ‖M‖={m_norm}");
+}
+
+// ── CUDA/Rust parity with active clipping/clamping ──────────────────
+
+use serial_test::serial;
+
+#[test]
+#[serial]
+fn test_cuda_titans_parity_with_clipping() {
+    let d = 8;
+    let seq_len = 8;
+    let dd = d * d;
+
+    let k_mem = rand_buf(seq_len * d, 500);
+    let v_mem = rand_buf(seq_len * d, 600);
+    let q_mem = rand_buf(seq_len * d, 700);
+    let alpha = vec![0.05f32; seq_len];
+    let theta = vec![0.5f32; seq_len];
+    let eta = vec![0.9f32; seq_len];
+    let m_initial = vec![0.0f32; dd];
+    let s_initial = vec![0.0f32; dd];
+
+    // Active clipping: error_clip=1.0, m_norm_max=5.0
+    let error_clip = 1.0f32;
+    let m_norm_max = 5.0f32;
+
+    // CUDA path
+    force_rust_reference(false);
+    let mut m_cuda = vec![0.0f32; (seq_len + 1) * dd];
+    let mut s_cuda = vec![0.0f32; (seq_len + 1) * dd];
+    let mut y_cuda = vec![0.0f32; seq_len * d];
+    titans_forward_dispatch(
+        &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
+        &m_initial, &s_initial, &mut m_cuda, &mut s_cuda, &mut y_cuda,
+        seq_len, d, error_clip, m_norm_max);
+
+    // Rust path
+    force_rust_reference(true);
+    let mut m_rust = vec![0.0f32; (seq_len + 1) * dd];
+    let mut s_rust = vec![0.0f32; (seq_len + 1) * dd];
+    let mut y_rust = vec![0.0f32; seq_len * d];
+    titans_forward_dispatch(
+        &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
+        &m_initial, &s_initial, &mut m_rust, &mut s_rust, &mut y_rust,
+        seq_len, d, error_clip, m_norm_max);
+    force_rust_reference(false);
+
+    check_close("titans_clip_y", &y_rust, &y_cuda, 1e-5);
+    check_close("titans_clip_m", &m_rust, &m_cuda, 1e-5);
+    check_close("titans_clip_s", &s_rust, &s_cuda, 1e-5);
 }

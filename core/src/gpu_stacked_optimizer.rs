@@ -67,6 +67,7 @@ pub struct GpuStackedAdamWState {
     m_unembed: GpuBuf<f32>, v_unembed: GpuBuf<f32>,
     m_ln_final_gamma: GpuBuf<f32>, v_ln_final_gamma: GpuBuf<f32>,
     m_ln_final_beta: GpuBuf<f32>, v_ln_final_beta: GpuBuf<f32>,
+    m_persistent_tokens: GpuBuf<f32>, v_persistent_tokens: GpuBuf<f32>,
     // Per-block moments
     blocks: Vec<MomentBlock>,
     pub step: u32,
@@ -132,6 +133,7 @@ impl GpuStackedAdamWState {
         total_partials += partials_for(params.w_unembed.len());
         total_partials += partials_for(params.ln_final_gamma.len());
         total_partials += partials_for(params.ln_final_beta.len());
+        total_partials += partials_for(params.persistent_tokens.len());
         for bp in &params.blocks {
             for buf in [&bp.w_q, &bp.w_k, &bp.w_v, &bp.w_o,
                         &bp.ln_attn_gamma, &bp.ln_attn_beta,
@@ -159,6 +161,8 @@ impl GpuStackedAdamWState {
             v_ln_final_gamma: GpuBuf::zeros(params.ln_final_gamma.len()),
             m_ln_final_beta: GpuBuf::zeros(params.ln_final_beta.len()),
             v_ln_final_beta: GpuBuf::zeros(params.ln_final_beta.len()),
+            m_persistent_tokens: GpuBuf::zeros(params.persistent_tokens.len()),
+            v_persistent_tokens: GpuBuf::zeros(params.persistent_tokens.len()),
             blocks,
             step: 0,
             norm_scratch: GpuBuf::zeros(max_partials),
@@ -195,7 +199,7 @@ fn gpu_stacked_grad_norm_clip_fused(
     // ── Launch all grad_norm_sq_cuda into scratch without sync ────────
 
     // Shared grads
-    let shared_ptrs: Vec<(*const f32, i32)> = if skip_embed {
+    let mut shared_ptrs: Vec<(*const f32, i32)> = if skip_embed {
         vec![(grads.d_ln_final_gamma.as_ptr(), grads.d_ln_final_gamma.len() as i32),
              (grads.d_ln_final_beta.as_ptr(), grads.d_ln_final_beta.len() as i32)]
     } else {
@@ -204,6 +208,9 @@ fn gpu_stacked_grad_norm_clip_fused(
              (grads.d_ln_final_gamma.as_ptr(), grads.d_ln_final_gamma.len() as i32),
              (grads.d_ln_final_beta.as_ptr(), grads.d_ln_final_beta.len() as i32)]
     };
+    if grads.d_persistent_tokens.len() > 0 {
+        shared_ptrs.push((grads.d_persistent_tokens.as_ptr(), grads.d_persistent_tokens.len() as i32));
+    }
     for &(ptr, n) in &shared_ptrs {
         if n == 0 { continue; }
         let mut nb: i32 = 0;
@@ -290,6 +297,7 @@ fn gpu_stacked_grad_norm_clip_fused(
     }
     cond_scale(&mut grads.d_ln_final_gamma);
     cond_scale(&mut grads.d_ln_final_beta);
+    cond_scale(&mut grads.d_persistent_tokens);
     for bg in &mut grads.blocks {
         cond_scale(&mut bg.d_w_q);
         cond_scale(&mut bg.d_w_k);
@@ -463,6 +471,7 @@ fn gpu_stacked_scale_grads_ex(grads: &mut GpuStackedGrads, scale: f32, skip_embe
     }
     scale_buf(&mut grads.d_ln_final_gamma);
     scale_buf(&mut grads.d_ln_final_beta);
+    scale_buf(&mut grads.d_persistent_tokens);
 
     // Per-block grads
     for bg in &mut grads.blocks {
@@ -542,6 +551,11 @@ pub fn gpu_stacked_adamw_update(
     adamw_one(&mut params.ln_final_beta, &grads.d_ln_final_beta,
               &mut state.m_ln_final_beta, &mut state.v_ln_final_beta,
               lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
+    if params.persistent_tokens.len() > 1 {
+        adamw_one(&mut params.persistent_tokens, &grads.d_persistent_tokens,
+                  &mut state.m_persistent_tokens, &mut state.v_persistent_tokens,
+                  lr, beta1, beta2, eps, bc1_inv, bc2_inv, weight_decay);
+    }
     prof_stop!(profiler);
 
     // ── Per-block params ───────────────────────────────────────────────
@@ -705,6 +719,7 @@ pub struct GpuStackedM3State {
     m1_unembed: GpuBuf<f32>, m2_unembed: GpuBuf<f32>, v_unembed: GpuBuf<f32>,
     m1_ln_final_gamma: GpuBuf<f32>, m2_ln_final_gamma: GpuBuf<f32>, v_ln_final_gamma: GpuBuf<f32>,
     m1_ln_final_beta: GpuBuf<f32>,  m2_ln_final_beta: GpuBuf<f32>,  v_ln_final_beta: GpuBuf<f32>,
+    m1_persistent_tokens: GpuBuf<f32>, m2_persistent_tokens: GpuBuf<f32>, v_persistent_tokens_m3: GpuBuf<f32>,
     // Per-block moments
     blocks: Vec<M3MomentBlockStacked>,
     pub step: u32,
@@ -730,9 +745,10 @@ impl GpuStackedM3State {
         let (m1_unembed, m2_unembed, v_unembed) = z3(params.w_unembed.len());
         let (m1_ln_final_gamma, m2_ln_final_gamma, v_ln_final_gamma) = z3(params.ln_final_gamma.len());
         let (m1_ln_final_beta, m2_ln_final_beta, v_ln_final_beta) = z3(params.ln_final_beta.len());
+        let (m1_persistent_tokens, m2_persistent_tokens, v_persistent_tokens_m3) = z3(params.persistent_tokens.len());
 
         // Pre-compute max 2D buffer size for NS scratch allocation
-        let mut max_2d = params.w_embed.len().max(params.w_unembed.len());
+        let mut max_2d = params.w_embed.len().max(params.w_unembed.len()).max(params.persistent_tokens.len());
         for bp in &params.blocks {
             for buf in [&bp.w_q, &bp.w_k, &bp.w_v, &bp.w_o] {
                 max_2d = max_2d.max(buf.len());
@@ -802,6 +818,7 @@ impl GpuStackedM3State {
             m1_unembed, m2_unembed, v_unembed,
             m1_ln_final_gamma, m2_ln_final_gamma, v_ln_final_gamma,
             m1_ln_final_beta, m2_ln_final_beta, v_ln_final_beta,
+            m1_persistent_tokens, m2_persistent_tokens, v_persistent_tokens_m3,
             blocks,
             step: 0,
             config,
@@ -835,6 +852,9 @@ fn gpu_stacked_m3_grad_norm(
     }
     add(&grads.d_ln_final_gamma);
     add(&grads.d_ln_final_beta);
+    if grads.d_persistent_tokens.len() > 0 {
+        add(&grads.d_persistent_tokens);
+    }
     for bg in &grads.blocks {
         add(&bg.d_w_q);
         add(&bg.d_w_k);
@@ -885,6 +905,7 @@ fn gpu_stacked_m3_scale_grads(grads: &mut GpuStackedGrads, scale: f32, skip_embe
     }
     scale_buf(&mut grads.d_ln_final_gamma);
     scale_buf(&mut grads.d_ln_final_beta);
+    scale_buf(&mut grads.d_persistent_tokens);
     for bg in &mut grads.blocks {
         scale_buf(&mut bg.d_w_q);
         scale_buf(&mut bg.d_w_k);
@@ -983,6 +1004,12 @@ pub fn gpu_stacked_m3_update(
                     lr, cfg.alpha, cfg.eps, bc2);
     m3_apply_1d_one(&mut params.ln_final_beta, &state.m1_ln_final_beta, &state.m2_ln_final_beta, &state.v_ln_final_beta,
                     lr, cfg.alpha, cfg.eps, bc2);
+    if params.persistent_tokens.len() > 1 {
+        let n_p = params.persistent_tokens.len() / d;
+        m3_ema_one(&mut state.m1_persistent_tokens, &mut state.m2_persistent_tokens, &mut state.v_persistent_tokens_m3, &grads.d_persistent_tokens,
+                   cfg.beta1, cfg.beta2, cfg.beta3, update_m2);
+        ns_2d!(params.persistent_tokens, state.m1_persistent_tokens, state.m2_persistent_tokens, n_p, d);
+    }
     prof_stop!(profiler);
 
     // ── Per-block params ──────────────────────────────────────────────

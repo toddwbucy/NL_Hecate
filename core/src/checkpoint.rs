@@ -386,6 +386,9 @@ pub fn save_stacked_safetensors(
     tensors.push(("shared.lm_head.weight".into(), enc(&params.w_unembed)));
     tensors.push(("shared.ln_final.gamma".into(), enc(&params.ln_final_gamma)));
     tensors.push(("shared.ln_final.beta".into(), enc(&params.ln_final_beta)));
+    if !params.persistent_tokens.is_empty() {
+        tensors.push(("shared.persistent_tokens".into(), enc(&params.persistent_tokens)));
+    }
 
     // Per-block parameters
     for (b, block) in params.blocks.iter().enumerate() {
@@ -626,10 +629,25 @@ pub fn load_stacked_safetensors(
         });
     }
 
+    // Optional persistent tokens (backward compat: empty if not present)
+    let persistent_tokens = {
+        let t = get("shared.persistent_tokens");
+        let expected = config.n_persistent * d;
+        if t.is_empty() {
+            vec![0.0f32; expected]
+        } else if t.len() != expected {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("shared.persistent_tokens length mismatch: got {} but config expects {} (n_persistent={} * d={})",
+                    t.len(), expected, config.n_persistent, d)));
+        } else {
+            t
+        }
+    };
+
     let params = StackedMAGParams {
         w_embed, w_unembed,
         ln_final_gamma, ln_final_beta,
-        blocks,
+        blocks, persistent_tokens,
     };
 
     Ok((params, config, n_blocks, build_state))

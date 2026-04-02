@@ -34,6 +34,7 @@ extern "C" {
         head_dim: i32,
         window_size: i32,
         batch_size: i32,
+        n_persistent: i32,
     );
 
     /// CUDA SWA backward kernel (bf16 inputs, f32 gradients).
@@ -55,6 +56,7 @@ extern "C" {
         num_heads: i32,
         head_dim: i32,
         window_size: i32,
+        n_persistent: i32,
     );
 
     pub(crate) fn swa_backward_f32_cuda(
@@ -71,6 +73,7 @@ extern "C" {
         head_dim: i32,
         window_size: i32,
         batch_size: i32,
+        n_persistent: i32,
     );
 
     // ── Delta Rule memory kernels (all f32) ─────────────────────────

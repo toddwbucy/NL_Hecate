@@ -340,7 +340,7 @@ impl ForwardScratch {
             k_bf16:            GpuBuf::zeros(bs * s * d),
             v_bf16:            GpuBuf::zeros(bs * s * d),
             attn_out_bf16:     GpuBuf::zeros(bs * s * d),
-            attn_weights_bf16: GpuBuf::zeros(bs * nh * s * ws),
+            attn_weights_bf16: GpuBuf::zeros(bs * nh * s * (cfg.n_persistent + ws)),
             attn_out:          GpuBuf::zeros(bs * s * d),
             y_combined:        GpuBuf::zeros(bs * s * d),
             gate:              GpuBuf::zeros(bs * s * d),

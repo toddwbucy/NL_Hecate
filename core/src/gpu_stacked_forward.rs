@@ -28,16 +28,19 @@ use crate::gpu_forward::{GpuMemoryCache, gpu_memory_forward, gpu_memory_read_onl
 pub struct GpuStackedBlockCache {
     // Block input (residual stream at this block's entry)
     pub block_input: GpuBuf<f32>,     // [bs*s, d]
-    // Attention branch
-    pub q_f32: GpuBuf<f32>,           // [bs*s, d]
-    pub k_f32: GpuBuf<f32>,           // [bs*s, d]
-    pub v_f32: GpuBuf<f32>,           // [bs*s, d]
-    pub q_bf16: GpuBuf<u16>,          // [bs*s, d]
-    pub k_bf16: GpuBuf<u16>,          // [bs*s, d]
-    pub v_bf16: GpuBuf<u16>,          // [bs*s, d]
-    pub attn_out_bf16: GpuBuf<u16>,   // [bs*s, d]
-    pub attn_weights_bf16: GpuBuf<u16>, // [bs*nh, s, ws]
-    pub attn_out: GpuBuf<f32>,        // [bs*s, d]
+    // Attention branch — QKV/attn_weights use augmented length s_aug = n_persistent + s
+    pub q_f32: GpuBuf<f32>,           // [bs*s_aug, d]
+    pub k_f32: GpuBuf<f32>,           // [bs*s_aug, d]
+    pub v_f32: GpuBuf<f32>,           // [bs*s_aug, d]
+    pub q_bf16: GpuBuf<u16>,          // [bs*s_aug, d]
+    pub k_bf16: GpuBuf<u16>,          // [bs*s_aug, d]
+    pub v_bf16: GpuBuf<u16>,          // [bs*s_aug, d]
+    pub attn_out_bf16: GpuBuf<u16>,   // [bs*s_aug, d] — full augmented output
+    pub attn_weights_bf16: GpuBuf<u16>, // [bs*nh, s_aug, n_persistent+ws]
+    pub attn_out: GpuBuf<f32>,        // [bs*s, d] — stripped (no persistent prefix)
+    /// QKV source: [persistent_tokens; ln_attn_out] when n_persistent > 0,
+    /// otherwise same as ln_attn_out. Shape [bs*s_aug, d]. Needed for backward weight gradients.
+    pub qkv_source: GpuBuf<f32>,
     // LayerNorm caches
     pub ln_attn_out: GpuBuf<f32>,     // [bs*s, d]
     pub ln_attn_mean: GpuBuf<f32>,    // [bs*s]
@@ -90,6 +93,8 @@ pub struct GpuStackedCache {
     pub hd: usize,
     pub ws: usize,
     pub batch_size: usize,
+    /// Augmented sequence length: n_persistent + s. Same as s when n_persistent=0.
+    pub s_aug: usize,
 }
 
 // gpu_stacked_forward DELETED — spec 68 Phase C.
@@ -335,6 +340,7 @@ impl ActivationWindow {
     /// Recomputes batched SWA to get attention weights for backward.
     pub fn assemble_cache(
         &self,
+        params: &GpuStackedParams,
         cfg: &MAGConfig,
         target_ids: &[usize],
     ) -> GpuStackedCache {
@@ -394,25 +400,107 @@ impl ActivationWindow {
             let k_f32 = concat_f32_bufs(self.entries.iter().map(|e| &e.block_caches[b].k_f32), d);
             let v_f32 = concat_f32_bufs(self.entries.iter().map(|e| &e.block_caches[b].v_f32), d);
 
-            // bf16 QKV for SWA recomputation
-            let q_bf16 = concat_u16_bufs(self.entries.iter().map(|e| &e.block_caches[b].q_bf16), d);
-            let k_bf16 = concat_u16_bufs(self.entries.iter().map(|e| &e.block_caches[b].k_bf16), d);
-            let v_bf16 = concat_u16_bufs(self.entries.iter().map(|e| &e.block_caches[b].v_bf16), d);
+            // bf16 QKV for SWA recomputation — concatenate per-token [d] into [s, d]
+            let q_bf16_input = concat_u16_bufs(self.entries.iter().map(|e| &e.block_caches[b].q_bf16), d);
+            let k_bf16_input = concat_u16_bufs(self.entries.iter().map(|e| &e.block_caches[b].k_bf16), d);
+            let v_bf16_input = concat_u16_bufs(self.entries.iter().map(|e| &e.block_caches[b].v_bf16), d);
+
+            let n_p = cfg.n_persistent;
+            let s_aug = n_p + s;
+            let sd_aug = s_aug * d;
+
+            // Prepend persistent token QKV projections for SWA*
+            let (q_bf16, k_bf16, v_bf16, qkv_source) = if n_p > 0 {
+                let block = &params.blocks[b];
+                // Project persistent tokens through W_Q/W_K/W_V → [n_p, d] each (f32)
+                let mut pq = GpuBuf::<f32>::zeros(n_p * d);
+                let mut pk = GpuBuf::<f32>::zeros(n_p * d);
+                let mut pv = GpuBuf::<f32>::zeros(n_p * d);
+                crate::dispatch::cublas_matmul_transb_dd(&params.persistent_tokens, &block.w_q, &mut pq, n_p, d, d, 0.0);
+                crate::dispatch::cublas_matmul_transb_dd(&params.persistent_tokens, &block.w_k, &mut pk, n_p, d, d, 0.0);
+                crate::dispatch::cublas_matmul_transb_dd(&params.persistent_tokens, &block.w_v, &mut pv, n_p, d, d, 0.0);
+
+                // Convert persistent projections to bf16
+                let pq_bf16 = GpuBuf::<u16>::zeros(n_p * d);
+                let pk_bf16 = GpuBuf::<u16>::zeros(n_p * d);
+                let pv_bf16 = GpuBuf::<u16>::zeros(n_p * d);
+                unsafe {
+                    crate::cuda_ffi::f32_to_bf16_cuda(pq.as_ptr(), pq_bf16.ptr(), (n_p * d) as i32);
+                    crate::cuda_ffi::f32_to_bf16_cuda(pk.as_ptr(), pk_bf16.ptr(), (n_p * d) as i32);
+                    crate::cuda_ffi::f32_to_bf16_cuda(pv.as_ptr(), pv_bf16.ptr(), (n_p * d) as i32);
+                }
+
+                // Concat [persistent; input] → [s_aug, d] bf16
+                let q_aug = GpuBuf::<u16>::zeros(sd_aug);
+                let k_aug = GpuBuf::<u16>::zeros(sd_aug);
+                let v_aug = GpuBuf::<u16>::zeros(sd_aug);
+                unsafe {
+                    crate::gpu_forward::gpu_buf_memcpy_d2d(q_aug.ptr() as *mut _, pq_bf16.as_ptr() as *const _, n_p * d * 2);
+                    crate::gpu_forward::gpu_buf_memcpy_d2d((q_aug.ptr() as *mut u8).add(n_p * d * 2) as *mut _, q_bf16_input.as_ptr() as *const _, s * d * 2);
+                    crate::gpu_forward::gpu_buf_memcpy_d2d(k_aug.ptr() as *mut _, pk_bf16.as_ptr() as *const _, n_p * d * 2);
+                    crate::gpu_forward::gpu_buf_memcpy_d2d((k_aug.ptr() as *mut u8).add(n_p * d * 2) as *mut _, k_bf16_input.as_ptr() as *const _, s * d * 2);
+                    crate::gpu_forward::gpu_buf_memcpy_d2d(v_aug.ptr() as *mut _, pv_bf16.as_ptr() as *const _, n_p * d * 2);
+                    crate::gpu_forward::gpu_buf_memcpy_d2d((v_aug.ptr() as *mut u8).add(n_p * d * 2) as *mut _, v_bf16_input.as_ptr() as *const _, s * d * 2);
+                }
+
+                // Build qkv_source [s_aug, d] f32 for backward weight grads
+                let ln_attn_out_cat = concat_f32_bufs(self.entries.iter().map(|e| &e.block_caches[b].ln_attn_out), d);
+                let qkv_src = GpuBuf::<f32>::zeros(sd_aug);
+                unsafe {
+                    crate::gpu_forward::gpu_buf_memcpy_d2d(qkv_src.ptr() as *mut _, params.persistent_tokens.as_ptr() as *const _, n_p * d * 4);
+                    crate::gpu_forward::gpu_buf_memcpy_d2d((qkv_src.ptr() as *mut u8).add(n_p * d * 4) as *mut _, ln_attn_out_cat.as_ptr() as *const _, s * d * 4);
+                }
+
+                (q_aug, k_aug, v_aug, qkv_src)
+            } else {
+                let qkv_src = concat_f32_bufs(self.entries.iter().map(|e| &e.block_caches[b].ln_attn_out), d);
+                (q_bf16_input, k_bf16_input, v_bf16_input, qkv_src)
+            };
+
+            // Also build the augmented f32 QKV for backward cache
+            let q_f32 = if n_p > 0 {
+                let aug = GpuBuf::<f32>::zeros(sd_aug);
+                unsafe { crate::cuda_ffi::bf16_to_f32_cuda(q_bf16.as_ptr(), aug.ptr(), sd_aug as i32); }
+                aug
+            } else { concat_f32_bufs(self.entries.iter().map(|e| &e.block_caches[b].q_f32), d) };
+            let k_f32 = if n_p > 0 {
+                let aug = GpuBuf::<f32>::zeros(sd_aug);
+                unsafe { crate::cuda_ffi::bf16_to_f32_cuda(k_bf16.as_ptr(), aug.ptr(), sd_aug as i32); }
+                aug
+            } else { concat_f32_bufs(self.entries.iter().map(|e| &e.block_caches[b].k_f32), d) };
+            let v_f32 = if n_p > 0 {
+                let aug = GpuBuf::<f32>::zeros(sd_aug);
+                unsafe { crate::cuda_ffi::bf16_to_f32_cuda(v_bf16.as_ptr(), aug.ptr(), sd_aug as i32); }
+                aug
+            } else { concat_f32_bufs(self.entries.iter().map(|e| &e.block_caches[b].v_f32), d) };
 
             // Recompute batched SWA to get attention weights for backward
-            let aw_total = bs * nh * s * ws;
-            let mut attn_out_bf16 = GpuBuf::<u16>::zeros(s * d);
+            let aw_stride = n_p + ws;
+            let aw_total = bs * nh * s_aug * aw_stride;
+            let mut attn_out_bf16 = GpuBuf::<u16>::zeros(sd_aug);
             let mut attn_weights_bf16 = GpuBuf::<u16>::zeros(aw_total);
             crate::dispatch::swa_forward_dd(
                 &q_bf16, &k_bf16, &v_bf16,
                 &mut attn_out_bf16, &mut attn_weights_bf16,
-                s, nh, hd, ws, bs,
+                s_aug, nh, hd, ws, bs, n_p,
             );
 
-            // Convert recomputed attn_out to f32 (matches what single-token produced)
+            // Convert recomputed attn_out to f32 and strip persistent prefix
             let attn_out = GpuBuf::<f32>::zeros(s * d);
-            unsafe {
-                crate::cuda_ffi::bf16_to_f32_cuda(attn_out_bf16.as_ptr(), attn_out.ptr(), (s * d) as i32);
+            if n_p > 0 {
+                let aug_f32 = GpuBuf::<f32>::zeros(sd_aug);
+                unsafe {
+                    crate::cuda_ffi::bf16_to_f32_cuda(attn_out_bf16.as_ptr(), aug_f32.ptr(), sd_aug as i32);
+                    crate::gpu_forward::gpu_buf_memcpy_d2d(
+                        attn_out.ptr() as *mut _,
+                        (aug_f32.as_ptr() as *const u8).add(n_p * d * 4) as *const _,
+                        s * d * 4,
+                    );
+                }
+            } else {
+                unsafe {
+                    crate::cuda_ffi::bf16_to_f32_cuda(attn_out_bf16.as_ptr(), attn_out.ptr(), (s * d) as i32);
+                }
             }
 
             let attn_proj = concat_f32_bufs(self.entries.iter().map(|e| &e.block_caches[b].attn_proj), d);
@@ -461,6 +549,7 @@ impl ActivationWindow {
                 q_bf16, k_bf16, v_bf16,
                 attn_out_bf16, attn_weights_bf16,
                 attn_out,
+                qkv_source,
                 ln_attn_out, ln_attn_mean, ln_attn_rstd,
                 ln_mem_out, ln_mem_mean, ln_mem_rstd,
                 memory_caches,
@@ -492,6 +581,7 @@ impl ActivationWindow {
             hd,
             ws,
             batch_size: bs,
+            s_aug: cfg.n_persistent + s,
         }
     }
 }
@@ -836,7 +926,7 @@ pub fn forward_single_token(
         crate::dispatch::swa_single_token_dd(
             &bws.q_bf16, &kv.k_cache_bf16, &kv.v_cache_bf16,
             &mut bws.attn_out_bf16,
-            kv.len, nh, hd, window_size,
+            kv.len, nh, hd, window_size, cfg.n_persistent,
         );
         unsafe {
             crate::cuda_ffi::bf16_to_f32_cuda(bws.attn_out_bf16.as_ptr(), bws.attn_out_f32.ptr(), d_i32);
@@ -1232,36 +1322,83 @@ fn forward_sequence(
             );
         }
 
-        // ── QKV projections [s, d] → [s, d] each ─────────────────────
-        let mut q_f32 = GpuBuf::zeros(sd);
-        let mut k_f32 = GpuBuf::zeros(sd);
-        let mut v_f32 = GpuBuf::zeros(sd);
-        crate::dispatch::cublas_matmul_transb_dd(&ln_attn_out, &block.w_q, &mut q_f32, s, d, d, 0.0);
-        crate::dispatch::cublas_matmul_transb_dd(&ln_attn_out, &block.w_k, &mut k_f32, s, d, d, 0.0);
-        crate::dispatch::cublas_matmul_transb_dd(&ln_attn_out, &block.w_v, &mut v_f32, s, d, d, 0.0);
+        // ── QKV projections with persistent token prepend ─────────────
+        // SWA* (Titans Eq 27): persistent tokens are prepended to the QKV
+        // source so positions [0, n_p) contain their projections. The SWA
+        // kernel's two-range mask ensures they're always visible.
+        let n_p = cfg.n_persistent;
+        let s_aug = n_p + s; // augmented sequence length for SWA
+        let sd_aug = s_aug * d;
 
-        // ── SWA full-sequence attention (bf16) ────────────────────────
-        let q_bf16 = GpuBuf::<u16>::zeros(sd);
-        let k_bf16 = GpuBuf::<u16>::zeros(sd);
-        let v_bf16 = GpuBuf::<u16>::zeros(sd);
+        // Build augmented QKV source: [persistent_tokens; ln_attn_out]
+        let qkv_source = if n_p > 0 {
+            let aug = GpuBuf::<f32>::zeros(sd_aug);
+            unsafe {
+                // Copy persistent tokens [n_p, d] to positions [0, n_p*d)
+                let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                    aug.ptr() as *mut std::ffi::c_void,
+                    params.persistent_tokens.as_ptr() as *const std::ffi::c_void,
+                    n_p * d * 4,
+                );
+                assert_eq!(rc, 0);
+                // Copy ln_attn_out [s, d] to positions [n_p*d, (n_p+s)*d)
+                let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                    (aug.ptr() as *mut u8).add(n_p * d * 4) as *mut std::ffi::c_void,
+                    ln_attn_out.as_ptr() as *const std::ffi::c_void,
+                    s * d * 4,
+                );
+                assert_eq!(rc, 0);
+            }
+            aug
+        } else {
+            ln_attn_out.clone_buf()
+        };
+
+        let mut q_f32 = GpuBuf::zeros(sd_aug);
+        let mut k_f32 = GpuBuf::zeros(sd_aug);
+        let mut v_f32 = GpuBuf::zeros(sd_aug);
+        crate::dispatch::cublas_matmul_transb_dd(&qkv_source, &block.w_q, &mut q_f32, s_aug, d, d, 0.0);
+        crate::dispatch::cublas_matmul_transb_dd(&qkv_source, &block.w_k, &mut k_f32, s_aug, d, d, 0.0);
+        crate::dispatch::cublas_matmul_transb_dd(&qkv_source, &block.w_v, &mut v_f32, s_aug, d, d, 0.0);
+
+        // ── SWA full-sequence attention (bf16) on augmented sequence ───
+        let q_bf16 = GpuBuf::<u16>::zeros(sd_aug);
+        let k_bf16 = GpuBuf::<u16>::zeros(sd_aug);
+        let v_bf16 = GpuBuf::<u16>::zeros(sd_aug);
         unsafe {
-            crate::cuda_ffi::f32_to_bf16_cuda(q_f32.as_ptr(), q_bf16.ptr(), sd_i32);
-            crate::cuda_ffi::f32_to_bf16_cuda(k_f32.as_ptr(), k_bf16.ptr(), sd_i32);
-            crate::cuda_ffi::f32_to_bf16_cuda(v_f32.as_ptr(), v_bf16.ptr(), sd_i32);
+            crate::cuda_ffi::f32_to_bf16_cuda(q_f32.as_ptr(), q_bf16.ptr(), sd_aug as i32);
+            crate::cuda_ffi::f32_to_bf16_cuda(k_f32.as_ptr(), k_bf16.ptr(), sd_aug as i32);
+            crate::cuda_ffi::f32_to_bf16_cuda(v_f32.as_ptr(), v_bf16.ptr(), sd_aug as i32);
         }
 
-        let aw_total = bs * nh * s * window_size;
-        let mut attn_out_bf16 = GpuBuf::<u16>::zeros(sd);
+        let aw_stride = n_p + window_size;
+        let aw_total = bs * nh * s_aug * aw_stride;
+        let mut attn_out_bf16 = GpuBuf::<u16>::zeros(sd_aug);
         let mut attn_weights_bf16 = GpuBuf::<u16>::zeros(aw_total);
         crate::dispatch::swa_forward_dd(
             &q_bf16, &k_bf16, &v_bf16,
             &mut attn_out_bf16, &mut attn_weights_bf16,
-            s, nh, hd, window_size, bs,
+            s_aug, nh, hd, window_size, bs, n_p,
         );
 
+        // Convert bf16→f32 and strip persistent prefix (take positions [n_p..])
         let attn_out = GpuBuf::<f32>::zeros(sd);
-        unsafe {
-            crate::cuda_ffi::bf16_to_f32_cuda(attn_out_bf16.as_ptr(), attn_out.ptr(), sd_i32);
+        if n_p > 0 {
+            // Convert full augmented output, then copy the suffix
+            let attn_out_aug = GpuBuf::<f32>::zeros(sd_aug);
+            unsafe {
+                crate::cuda_ffi::bf16_to_f32_cuda(attn_out_bf16.as_ptr(), attn_out_aug.ptr(), sd_aug as i32);
+                let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                    attn_out.ptr() as *mut std::ffi::c_void,
+                    (attn_out_aug.as_ptr() as *const u8).add(n_p * d * 4) as *const std::ffi::c_void,
+                    sd * 4,
+                );
+                assert_eq!(rc, 0);
+            }
+        } else {
+            unsafe {
+                crate::cuda_ffi::bf16_to_f32_cuda(attn_out_bf16.as_ptr(), attn_out.ptr(), sd_i32);
+            }
         }
 
         // ── Output projection ─────────────────────────────────────────
@@ -1471,7 +1608,7 @@ fn forward_sequence(
             q_f32, k_f32, v_f32,
             q_bf16, k_bf16, v_bf16,
             attn_out_bf16, attn_weights_bf16,
-            attn_out,
+            attn_out, qkv_source,
             ln_attn_out, ln_attn_mean, ln_attn_rstd,
             ln_mem_out, ln_mem_mean, ln_mem_rstd,
             memory_caches,
@@ -1523,6 +1660,7 @@ fn forward_sequence(
         s, d, v, nh, hd,
         ws: window_size,
         batch_size: bs,
+        s_aug: cfg.n_persistent + s,
     };
 
     (last_logits, cache)
