@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "error_clip.cuh"
+#include "m_norm_project.cuh"
 
 static inline void check_cuda_launch(const char* kernel_name, int d, int smem_bytes) {
     cudaError_t err = cudaGetLastError();
@@ -51,7 +52,8 @@ __global__ void delta_chunkwise_forward_kernel(
     float* __restrict__ y,                    // [batch_size, seq_len, d]
     float* __restrict__ m_work,               // [batch_size, d*d]
     float* __restrict__ error_work,           // [batch_size, chunk_size*d]
-    int seq_len, int d, int chunk_size, float error_clip)
+    int seq_len, int d, int chunk_size, float error_clip,
+    float m_norm_max)
 {
     int b = blockIdx.x;
     int tid = threadIdx.x;
@@ -149,6 +151,9 @@ __global__ void delta_chunkwise_forward_kernel(
             }
             __syncthreads();
 
+            // Per-token M-norm projection (spec 74, matches CPU reference)
+            m_norm_project_inplace(m_work, prediction, dd, tid, m_norm_max);
+
             // y_t = M_{t+1} @ q_t (readout uses evolving M)
             for (int row = tid; row < d; row += blockDim.x) {
                 float sum = 0.0f;
@@ -171,7 +176,8 @@ extern "C" void delta_chunkwise_forward_f32_cuda(
     const float* k_mem, const float* v_mem, const float* q_mem,
     const float* alpha, const float* theta, const float* m_initial,
     float* m_chunk_states, float* y,
-    int seq_len, int d, int batch_size, int chunk_size, float error_clip)
+    int seq_len, int d, int batch_size, int chunk_size, float error_clip,
+    float m_norm_max)
 {
     if (d <= 0 || 2 * d * (int)sizeof(float) > 163840) {
         fprintf(stderr, "delta_chunkwise_forward_f32_cuda: d=%d out of range.\n", d);
@@ -206,7 +212,7 @@ extern "C" void delta_chunkwise_forward_f32_cuda(
     delta_chunkwise_forward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_initial,
         m_chunk_states, y, m_work, error_work,
-        seq_len, d, chunk_size, error_clip);
+        seq_len, d, chunk_size, error_clip, m_norm_max);
     check_cuda_launch("delta_chunkwise_forward_kernel", d, smem_bytes);
 
     check_cuda_alloc("delta_chunkwise_fwd: cudaDeviceSynchronize",

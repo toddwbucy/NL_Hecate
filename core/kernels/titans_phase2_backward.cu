@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "m_norm_project.cuh"
 
 static inline void check_cuda_launch(const char* kernel_name, int d, int smem_bytes) {
     cudaError_t err = cudaGetLastError();
@@ -45,7 +46,8 @@ __global__ void titans_phase2_backward_kernel(
     float* __restrict__ d_M0,                 // [batch_size, d*d]
     float* __restrict__ m_recompute,          // [batch_size, (chunk_size+1)*d*d]
     float* __restrict__ s_recompute,          // [batch_size, (chunk_size+1)*d*d]
-    int seq_len, int d, int chunk_size, int chunk_idx)
+    int seq_len, int d, int chunk_size, int chunk_idx,
+    float m_norm_max)
 {
     int b = blockIdx.x;
     int tid = threadIdx.x;
@@ -116,6 +118,9 @@ __global__ void titans_phase2_backward_kernel(
             mrecomp_b[next + idx] = retention * mrecomp_b[cur + idx] + s_new;
         }
         __syncthreads();
+
+        // Per-token M-norm projection (spec 74, matches forward replay)
+        m_norm_project_inplace(&mrecomp_b[next], error_buf, dd, tid, m_norm_max);
     }
 
     // ── Initialize d_M₀ ──
@@ -292,7 +297,8 @@ extern "C" void titans_phase2_backward_f32_cuda(
     float* d_alpha, float* d_theta, float* d_eta,
     float* d_M, float* d_S, float* d_M0,
     float* m_recompute, float* s_recompute,
-    int seq_len, int d, int batch_size, int chunk_size, int chunk_idx)
+    int seq_len, int d, int batch_size, int chunk_size, int chunk_idx,
+    float m_norm_max)
 {
     int block_size = (d < 512) ? d : 512;
     int rounded = 1;
@@ -310,6 +316,6 @@ extern "C" void titans_phase2_backward_f32_cuda(
         m_chunk_states, s_chunk_states, d_y,
         d_k_mem, d_v_mem, d_q_mem, d_alpha, d_theta, d_eta,
         d_M, d_S, d_M0, m_recompute, s_recompute,
-        seq_len, d, chunk_size, chunk_idx);
+        seq_len, d, chunk_size, chunk_idx, m_norm_max);
     check_cuda_launch("titans_phase2_backward_kernel", d, smem_bytes);
 }

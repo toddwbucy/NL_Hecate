@@ -682,6 +682,7 @@ pub(crate) fn gpu_memory_backward(
                     &mut d_alpha_ph, &mut d_theta_ph, &mut d_m_initial,
                     s, hd, bs_mem, *chunk_size,
                     cfg.error_clip_for_level(level),
+                    cfg.max_m_norm(level),
                 );
             } else {
                 crate::dispatch::delta_chunkwise_backward_dd(
@@ -691,6 +692,7 @@ pub(crate) fn gpu_memory_backward(
                     &mut d_alpha_ph, &mut d_theta_ph, &mut d_m_initial,
                     s, hd, bs_mem, *chunk_size,
                     cfg.error_clip_for_level(level),
+                    cfg.max_m_norm(level),
                 );
             }
 
@@ -757,6 +759,7 @@ pub(crate) fn gpu_memory_backward(
                     &mut d_m_initial, &mut d_s_initial,
                     s, hd, bs_mem, *chunk_size,
                     cfg.error_clip_for_level(level),
+                    cfg.max_m_norm(level),
                 );
             } else {
                 crate::dispatch::titans_chunkwise_backward_dd(
@@ -767,6 +770,7 @@ pub(crate) fn gpu_memory_backward(
                     &mut d_m_initial, &mut d_s_initial,
                     s, hd, bs_mem, *chunk_size,
                     cfg.error_clip_for_level(level),
+                    cfg.max_m_norm(level),
                 );
             }
 
@@ -872,6 +876,7 @@ pub(crate) fn gpu_memory_backward(
                 &k_mem_ph, &v_mem_ph, &q_mem_ph, &alpha_ph, &theta_ph,
                 m_checkpoints, &d_y_ph,
                 s, hd, c, nh, cfg.error_clip_for_level(level),
+                cfg.max_m_norm(level),
             );
 
             let d_alpha = crate::gpu_forward::sum_gates_across_heads(&d_alpha_ph, 1, s, nh);
@@ -924,6 +929,7 @@ pub(crate) fn gpu_memory_backward(
                 &k_mem_ph, &v_mem_ph, &q_mem_ph, &alpha_ph, &theta_ph, &eta_ph,
                 m_checkpoints, s_checkpoints, &d_y_ph,
                 s, hd, c, nh, cfg.error_clip_for_level(level),
+                cfg.max_m_norm(level),
             );
 
             let d_alpha = crate::gpu_forward::sum_gates_across_heads(&d_alpha_ph, 1, s, nh);
@@ -1062,10 +1068,13 @@ pub(crate) fn gpu_memory_backward(
             let theta_ph = crate::gpu_forward::broadcast_gates(theta, 1, s, nh);
 
             // Single batched call — DGD reuses delta backward kernels
+            // DGD fused forward does NOT apply per-token M-norm projection (spec 74),
+            // so replay must also disable it to match forward M states.
             let (d_k_ph, d_v_ph, d_q_ph, d_alpha_ph, d_theta_ph) = delta_backward_checkpointed(
                 &k_mem_ph, &v_mem_ph, &q_mem_ph, &alpha_ph, &theta_ph,
                 m_checkpoints, &d_y_ph,
                 s, hd, c, nh, cfg.error_clip_for_level(level),
+                f32::MAX,
             );
 
             let d_alpha = crate::gpu_forward::sum_gates_across_heads(&d_alpha_ph, 1, s, nh);
@@ -1701,6 +1710,7 @@ fn delta_backward_checkpointed(
     alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>,
     m_checkpoints: &GpuBuf<f32>, d_y: &GpuBuf<f32>,
     s: usize, d: usize, c: usize, bs: usize, error_clip: f32,
+    m_norm_max: f32,
 ) -> (GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>) {
     let dd = d * d;
     let segments = segment_boundaries(s, c);
@@ -1753,6 +1763,7 @@ fn delta_backward_checkpointed(
                 local_y.ptr(),
                 seg_len as i32, d as i32, bs as i32,
                 s as i32, (num_ckpt * dd) as i32, error_clip,
+                m_norm_max,
             );
         }
         crate::dispatch::cuda_sync();
@@ -1785,6 +1796,7 @@ fn titans_backward_checkpointed(
     m_checkpoints: &GpuBuf<f32>, s_checkpoints: &GpuBuf<f32>,
     d_y: &GpuBuf<f32>,
     s: usize, d: usize, c: usize, bs: usize, error_clip: f32,
+    m_norm_max: f32,
 ) -> (GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>, GpuBuf<f32>) {
     let dd = d * d;
     let segments = segment_boundaries(s, c);
@@ -1840,6 +1852,7 @@ fn titans_backward_checkpointed(
                 local_y.ptr(),
                 seg_len as i32, d as i32, bs as i32,
                 s as i32, (num_ckpt * dd) as i32, error_clip,
+                m_norm_max,
             );
         }
         crate::dispatch::cuda_sync();

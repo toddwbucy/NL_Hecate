@@ -95,6 +95,7 @@ extern "C" {
         input_stride: i32,
         m_stride: i32,
         error_clip: f32,
+        m_norm_max: f32,
     );
 
     /// CUDA DeltaRule backward inner loop (all f32).
@@ -145,6 +146,7 @@ extern "C" {
         input_stride: i32,
         m_stride: i32,
         error_clip: f32,
+        m_norm_max: f32,
     );
 
     /// CUDA TitansLMM backward inner loop (all f32).
@@ -218,6 +220,7 @@ extern "C" {
         alpha: *const f32, theta: *const f32, m_initial: *const f32,
         m_states: *mut f32, y: *mut f32,
         seq_len: i32, d: i32, checkpoint_interval: i32, error_clip: f32,
+        m_norm_max: f32,
     );
 
     /// TitansLMM forward with checkpoint_interval — stores M/S every C steps.
@@ -227,6 +230,7 @@ extern "C" {
         m_initial: *const f32, s_initial: *const f32,
         m_states: *mut f32, s_states: *mut f32, y: *mut f32,
         seq_len: i32, d: i32, checkpoint_interval: i32, error_clip: f32,
+        m_norm_max: f32,
     );
 
     /// HebbianRule forward with checkpoint_interval — stores M every C steps.
@@ -351,6 +355,7 @@ extern "C" {
         alpha: *const f32, theta: *const f32, m_initial: *const f32,
         m_chunk_states: *mut f32, y: *mut f32,
         seq_len: i32, d: i32, batch_size: i32, chunk_size: i32, error_clip: f32,
+        m_norm_max: f32,
     );
 
     /// Delta chunkwise backward (frozen-M₀). Key: d_M = (1-α)d_M only, no error chain.
@@ -361,6 +366,7 @@ extern "C" {
         d_k_mem: *mut f32, d_v_mem: *mut f32, d_q_mem: *mut f32,
         d_alpha: *mut f32, d_theta: *mut f32, d_m_initial: *mut f32,
         seq_len: i32, d: i32, batch_size: i32, chunk_size: i32, error_clip: f32,
+        m_norm_max: f32,
     );
 
     /// Titans chunkwise forward (frozen-M₀). Stores (num_chunks+1) M and S states.
@@ -370,6 +376,7 @@ extern "C" {
         m_initial: *const f32, s_initial: *const f32,
         m_chunk_states: *mut f32, s_chunk_states: *mut f32, y: *mut f32,
         seq_len: i32, d: i32, batch_size: i32, chunk_size: i32, error_clip: f32,
+        m_norm_max: f32,
     );
 
     /// Titans chunkwise backward (frozen-M₀). Three accumulators: d_M, d_S, d_M₀.
@@ -382,6 +389,7 @@ extern "C" {
         d_alpha: *mut f32, d_theta: *mut f32, d_eta: *mut f32,
         d_m_initial: *mut f32, d_s_initial: *mut f32,
         seq_len: i32, d: i32, batch_size: i32, chunk_size: i32, error_clip: f32,
+        m_norm_max: f32,
     );
 
     // ── Spec 44: Phase 2 kernels + error_subtract_clip ─────────────────
@@ -399,6 +407,7 @@ extern "C" {
         errors: *const f32, m_work: *mut f32,
         m_chunk_states: *mut f32, y: *mut f32,
         seq_len: i32, d: i32, batch_size: i32, chunk_size: i32, chunk_idx: i32,
+        m_norm_max: f32,
     );
 
     /// Titans Phase 2 forward: sequential M+S recurrence + readout for one chunk.
@@ -408,6 +417,7 @@ extern "C" {
         errors: *const f32, m_work: *mut f32, s_work: *mut f32,
         m_chunk_states: *mut f32, s_chunk_states: *mut f32, y: *mut f32,
         seq_len: i32, d: i32, batch_size: i32, chunk_size: i32, chunk_idx: i32,
+        m_norm_max: f32,
     );
 
     /// Delta Phase 2 backward: reverse token loop for one chunk.
@@ -420,6 +430,7 @@ extern "C" {
         d_alpha: *mut f32, d_theta: *mut f32,
         d_M: *mut f32, d_M0: *mut f32, m_recompute: *mut f32,
         seq_len: i32, d: i32, batch_size: i32, chunk_size: i32, chunk_idx: i32,
+        m_norm_max: f32,
     );
 
     /// Titans Phase 2 backward: reverse token loop for one chunk.
@@ -434,6 +445,7 @@ extern "C" {
         d_M: *mut f32, d_S: *mut f32, d_M0: *mut f32,
         m_recompute: *mut f32, s_recompute: *mut f32,
         seq_len: i32, d: i32, batch_size: i32, chunk_size: i32, chunk_idx: i32,
+        m_norm_max: f32,
     );
 
     // ── Broadcast fill (spec 27) ───────────────────────────────────────
@@ -937,6 +949,7 @@ extern "C" {
         d: i32,
         batch_size: i32,
         error_clip: f32,
+        m_norm_max: f32,
     );
 
     // ── Per-head memory transpose/broadcast (Spec 45) ────────────────

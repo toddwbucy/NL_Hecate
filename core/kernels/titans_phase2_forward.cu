@@ -17,6 +17,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "m_norm_project.cuh"
 
 static inline void check_cuda_launch(const char* kernel_name, int d, int smem_bytes) {
     cudaError_t err = cudaGetLastError();
@@ -39,7 +40,8 @@ __global__ void titans_phase2_forward_kernel(
     float* __restrict__ m_chunk_states,       // [batch_size, (num_chunks+1)*d*d]
     float* __restrict__ s_chunk_states,       // [batch_size, (num_chunks+1)*d*d]
     float* __restrict__ y,                    // [batch_size, seq_len, d]
-    int seq_len, int d, int chunk_size, int chunk_idx)
+    int seq_len, int d, int chunk_size, int chunk_idx,
+    float m_norm_max)
 {
     int b = blockIdx.x;
     int tid = threadIdx.x;
@@ -103,6 +105,9 @@ __global__ void titans_phase2_forward_kernel(
         }
         __syncthreads();
 
+        // Per-token M-norm projection (spec 74, matches CPU reference)
+        m_norm_project_inplace(m_b, error_buf, dd, tid, m_norm_max);
+
         // y_t = M_{t+1} @ q_t
         for (int row = tid; row < d; row += blockDim.x) {
             float sum = 0.0f;
@@ -128,7 +133,8 @@ extern "C" void titans_phase2_forward_f32_cuda(
     const float* alpha, const float* theta, const float* eta,
     const float* errors, float* m_work, float* s_work,
     float* m_chunk_states, float* s_chunk_states, float* y,
-    int seq_len, int d, int batch_size, int chunk_size, int chunk_idx)
+    int seq_len, int d, int batch_size, int chunk_size, int chunk_idx,
+    float m_norm_max)
 {
     int dd = d * d;
     int block_size = (dd < 1024) ? dd : 1024;
@@ -141,6 +147,6 @@ extern "C" void titans_phase2_forward_f32_cuda(
     titans_phase2_forward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, q_mem, alpha, theta, eta, errors, m_work, s_work,
         m_chunk_states, s_chunk_states, y,
-        seq_len, d, chunk_size, chunk_idx);
+        seq_len, d, chunk_size, chunk_idx, m_norm_max);
     check_cuda_launch("titans_phase2_forward_kernel", d, smem_bytes);
 }

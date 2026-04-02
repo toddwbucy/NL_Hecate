@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "error_clip.cuh"
+#include "m_norm_project.cuh"
 
 static inline void check_cuda_launch(const char* kernel_name, int d, int smem_bytes) {
     cudaError_t err = cudaGetLastError();
@@ -71,7 +72,8 @@ __global__ void titans_chunkwise_backward_kernel(
     float* __restrict__ m_recompute,      // [batch_size, (chunk_size+1)*d*d]
     float* __restrict__ s_recompute,      // [batch_size, (chunk_size+1)*d*d]
     float* __restrict__ error_recompute,  // [batch_size, chunk_size*d]
-    int seq_len, int d, int chunk_size, float error_clip)
+    int seq_len, int d, int chunk_size, float error_clip,
+    float m_norm_max)
 {
     int b = blockIdx.x;
     int tid = threadIdx.x;
@@ -179,6 +181,9 @@ __global__ void titans_chunkwise_backward_kernel(
                 m_recompute[next + idx] = retention * m_recompute[cur + idx] + s_new;
             }
             __syncthreads();
+
+            // Per-token M-norm projection (spec 74, matches forward replay)
+            m_norm_project_inplace(&m_recompute[next], error_buf, dd, tid, m_norm_max);
         }
 
         // ── d_M₀ accumulator for this chunk ──
@@ -361,7 +366,8 @@ extern "C" void titans_chunkwise_backward_f32_cuda(
     float* d_k_mem, float* d_v_mem, float* d_q_mem,
     float* d_alpha, float* d_theta, float* d_eta,
     float* d_m_initial, float* d_s_initial,
-    int seq_len, int d, int batch_size, int chunk_size, float error_clip)
+    int seq_len, int d, int batch_size, int chunk_size, float error_clip,
+    float m_norm_max)
 {
     if (d <= 0) {
         fprintf(stderr, "titans_chunkwise_backward_f32_cuda: d=%d must be > 0.\n", d);
@@ -420,7 +426,7 @@ extern "C" void titans_chunkwise_backward_f32_cuda(
         d_m_initial, d_s_initial,
         d_M_work, d_S_work, d_M0_work,
         m_recompute, s_recompute, error_recompute,
-        seq_len, d, chunk_size, error_clip);
+        seq_len, d, chunk_size, error_clip, m_norm_max);
     check_cuda_launch("titans_chunkwise_backward_kernel", d, smem_bytes);
 
     check_cuda_alloc("titans_chunkwise_bwd: cudaDeviceSynchronize",
