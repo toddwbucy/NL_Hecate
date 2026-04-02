@@ -2150,6 +2150,7 @@ pub fn delta_chunkwise_backward_dd(
     d_k_mem: &mut GpuBuf<f32>, d_v_mem: &mut GpuBuf<f32>, d_q_mem: &mut GpuBuf<f32>,
     d_alpha: &mut GpuBuf<f32>, d_theta: &mut GpuBuf<f32>, d_m_initial: &mut GpuBuf<f32>,
     seq_len: usize, d: usize, batch_size: usize, chunk_size: usize, error_clip: f32,
+    m_norm_max: f32,
 ) {
     unsafe {
         crate::cuda_ffi::delta_chunkwise_backward_f32_cuda(
@@ -2159,6 +2160,7 @@ pub fn delta_chunkwise_backward_dd(
             d_k_mem.ptr(), d_v_mem.ptr(), d_q_mem.ptr(),
             d_alpha.ptr(), d_theta.ptr(), d_m_initial.ptr(),
             seq_len as i32, d as i32, batch_size as i32, chunk_size as i32, error_clip,
+            m_norm_max,
         );
     }
 }
@@ -2197,6 +2199,7 @@ pub fn titans_chunkwise_backward_dd(
     d_alpha: &mut GpuBuf<f32>, d_theta: &mut GpuBuf<f32>, d_eta: &mut GpuBuf<f32>,
     d_m_initial: &mut GpuBuf<f32>, d_s_initial: &mut GpuBuf<f32>,
     seq_len: usize, d: usize, batch_size: usize, chunk_size: usize, error_clip: f32,
+    m_norm_max: f32,
 ) {
     unsafe {
         crate::cuda_ffi::titans_chunkwise_backward_f32_cuda(
@@ -2208,6 +2211,7 @@ pub fn titans_chunkwise_backward_dd(
             d_alpha.ptr(), d_theta.ptr(), d_eta.ptr(),
             d_m_initial.ptr(), d_s_initial.ptr(),
             seq_len as i32, d as i32, batch_size as i32, chunk_size as i32, error_clip,
+            m_norm_max,
         );
     }
 }
@@ -2381,6 +2385,7 @@ pub fn delta_chunkwise_backward_batched_dd(
     d_k_mem: &mut GpuBuf<f32>, d_v_mem: &mut GpuBuf<f32>, d_q_mem: &mut GpuBuf<f32>,
     d_alpha: &mut GpuBuf<f32>, d_theta: &mut GpuBuf<f32>, d_m_initial: &mut GpuBuf<f32>,
     seq_len: usize, d: usize, batch_size: usize, chunk_size: usize, error_clip: f32,
+    m_norm_max: f32,
 ) {
     let dd = d * d;
     let num_chunks = (seq_len + chunk_size - 1) / chunk_size;
@@ -2444,6 +2449,7 @@ pub fn delta_chunkwise_backward_batched_dd(
                 d_M.ptr(), d_M0.ptr(), m_recompute.ptr(),
                 seq_len as i32, d as i32, batch_size as i32,
                 chunk_size as i32, c as i32,
+                m_norm_max,
             );
         }
     }
@@ -2480,6 +2486,7 @@ pub fn titans_chunkwise_backward_batched_dd(
     d_alpha: &mut GpuBuf<f32>, d_theta: &mut GpuBuf<f32>, d_eta: &mut GpuBuf<f32>,
     d_m_initial: &mut GpuBuf<f32>, d_s_initial: &mut GpuBuf<f32>,
     seq_len: usize, d: usize, batch_size: usize, chunk_size: usize, error_clip: f32,
+    m_norm_max: f32,
 ) {
     let dd = d * d;
     let num_chunks = (seq_len + chunk_size - 1) / chunk_size;
@@ -2545,6 +2552,7 @@ pub fn titans_chunkwise_backward_batched_dd(
                 m_recompute.ptr(), s_recompute.ptr(),
                 seq_len as i32, d as i32, batch_size as i32,
                 chunk_size as i32, c as i32,
+                m_norm_max,
             );
         }
     }

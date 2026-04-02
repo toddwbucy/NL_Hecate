@@ -366,6 +366,7 @@ extern "C" {
         d_k_mem: *mut f32, d_v_mem: *mut f32, d_q_mem: *mut f32,
         d_alpha: *mut f32, d_theta: *mut f32, d_m_initial: *mut f32,
         seq_len: i32, d: i32, batch_size: i32, chunk_size: i32, error_clip: f32,
+        m_norm_max: f32,
     );
 
     /// Titans chunkwise forward (frozen-M₀). Stores (num_chunks+1) M and S states.
@@ -388,6 +389,7 @@ extern "C" {
         d_alpha: *mut f32, d_theta: *mut f32, d_eta: *mut f32,
         d_m_initial: *mut f32, d_s_initial: *mut f32,
         seq_len: i32, d: i32, batch_size: i32, chunk_size: i32, error_clip: f32,
+        m_norm_max: f32,
     );
 
     // ── Spec 44: Phase 2 kernels + error_subtract_clip ─────────────────
@@ -428,6 +430,7 @@ extern "C" {
         d_alpha: *mut f32, d_theta: *mut f32,
         d_M: *mut f32, d_M0: *mut f32, m_recompute: *mut f32,
         seq_len: i32, d: i32, batch_size: i32, chunk_size: i32, chunk_idx: i32,
+        m_norm_max: f32,
     );
 
     /// Titans Phase 2 backward: reverse token loop for one chunk.
@@ -442,6 +445,7 @@ extern "C" {
         d_M: *mut f32, d_S: *mut f32, d_M0: *mut f32,
         m_recompute: *mut f32, s_recompute: *mut f32,
         seq_len: i32, d: i32, batch_size: i32, chunk_size: i32, chunk_idx: i32,
+        m_norm_max: f32,
     );
 
     // ── Broadcast fill (spec 27) ───────────────────────────────────────

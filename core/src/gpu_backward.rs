@@ -682,6 +682,7 @@ pub(crate) fn gpu_memory_backward(
                     &mut d_alpha_ph, &mut d_theta_ph, &mut d_m_initial,
                     s, hd, bs_mem, *chunk_size,
                     cfg.error_clip_for_level(level),
+                    cfg.max_m_norm(level),
                 );
             } else {
                 crate::dispatch::delta_chunkwise_backward_dd(
@@ -691,6 +692,7 @@ pub(crate) fn gpu_memory_backward(
                     &mut d_alpha_ph, &mut d_theta_ph, &mut d_m_initial,
                     s, hd, bs_mem, *chunk_size,
                     cfg.error_clip_for_level(level),
+                    cfg.max_m_norm(level),
                 );
             }
 
@@ -757,6 +759,7 @@ pub(crate) fn gpu_memory_backward(
                     &mut d_m_initial, &mut d_s_initial,
                     s, hd, bs_mem, *chunk_size,
                     cfg.error_clip_for_level(level),
+                    cfg.max_m_norm(level),
                 );
             } else {
                 crate::dispatch::titans_chunkwise_backward_dd(
@@ -767,6 +770,7 @@ pub(crate) fn gpu_memory_backward(
                     &mut d_m_initial, &mut d_s_initial,
                     s, hd, bs_mem, *chunk_size,
                     cfg.error_clip_for_level(level),
+                    cfg.max_m_norm(level),
                 );
             }
 

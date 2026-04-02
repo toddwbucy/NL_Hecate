@@ -52,7 +52,7 @@ This creates the observed instability pattern:
 ### Evidence
 
 d=1024 build (2026-04-01), `m_norm_max = [10.0]`:
-```
+```text
 step=  393  m_norm=40.00  m_delta=0.000   (M frozen at clamp ceiling)
 step= 1097  m_norm=40.00  m_delta=0.000   gnorm=14851
 step= 6553  loss=11.32    ppl=82298       (catastrophic spike)
@@ -151,16 +151,16 @@ Spec 65's post-forward clamp is **retained as a safety net**. With per-token pro
 ## Performance Impact
 
 Per-token overhead for d=64 (head_dim in production configs):
-- Sum-of-squares: 64 FP multiplies + adds per thread (dd/blockDim.x = 4096/64)
-- Tree reduction: 6 steps (log2(64))
+- Sum-of-squares: 64 FP multiplies + adds per thread (`dd/blockDim.x = 4096/64`)
+- Tree reduction: 6 steps (`log2(64)`)
 - Conditional scale: 64 FP multiplies per thread (when triggered)
 
 Compared to existing per-token work:
-- `M @ k` matrix-vector product: 2 * 64 * 64 = 8192 FP ops
-- `M @ q` matrix-vector product: 8192 FP ops
-- M/S update: 5 * 4096 = 20480 FP ops
+- `M @ k` matrix-vector product: `2 * 64 * 64 = 8192` FP ops
+- `M @ q` matrix-vector product: `8192` FP ops
+- M/S update: `5 * 4096 = 20480` FP ops
 
-The projection adds ~4160 FP ops per token (sum-of-squares + scale), which is ~11% of a single matvec. With the conditional (only fires when ||M|| > target), it's often just the sum-of-squares check (~2048 ops, ~5%).
+The projection adds ~4160 FP ops per token (sum-of-squares + scale), which is ~11% of a single matvec. With the conditional (only fires when `||M|| > target`), it's often just the sum-of-squares check (~2048 ops, ~5%).
 
 ## Verification
 

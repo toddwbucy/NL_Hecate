@@ -1208,7 +1208,10 @@ pub(crate) fn gpu_memory_forward(
     let use_fused = eff_ckpt.is_none()
         && !is_proxy
         && nh == 1  // Spec 45: skip fused when per-head is active
-        && matches!(cfg.memory_rule, MemoryRuleKind::DeltaRule | MemoryRuleKind::TitansLMM);
+        && matches!(cfg.memory_rule, MemoryRuleKind::DeltaRule | MemoryRuleKind::TitansLMM)
+        // Spec 74: DGD fused kernel lacks per-token M-norm projection.
+        // When m_norm_max is finite, DeltaRule must use the unfused path.
+        && !(cfg.memory_rule == MemoryRuleKind::DeltaRule && m_norm_max < 1e30);
 
     if use_fused {
         // Allocate output buffers for gates and norms (produced by fused kernel)
@@ -2241,6 +2244,11 @@ fn gpu_memory_forward_into_scratch(
 
     match (eff_ckpt, cfg.memory_rule) {
         (None, MemoryRuleKind::DeltaRule) => {
+            // Spec 74: DGD fused kernel lacks per-token M-norm projection.
+            // Fall back to standard dispatch when m_norm_max is finite.
+            if cfg.max_m_norm(level) < 1e30 {
+                return false;
+            }
             // Spec 39: Fused kernel — L2-normalize + gate compute + clamp + DGD recurrence
             // in a single launch. Writes normalized k/q back to scratch.k_mem/q_mem,
             // gates to scratch.alpha/theta, norms to scratch.k_norms/q_norms.
@@ -4198,7 +4206,7 @@ mod chunkwise_tests {
             &m_chunk_states, &d_y_gpu,
             &mut d_k, &mut d_v, &mut d_q,
             &mut d_alpha_buf, &mut d_theta_buf, &mut d_m_init,
-            s, d, bs, chunk_size, error_clip,
+            s, d, bs, chunk_size, error_clip, f32::MAX,
         );
         crate::dispatch::cuda_sync();
 
@@ -4323,7 +4331,7 @@ mod chunkwise_tests {
             &mut d_k, &mut d_v, &mut d_q,
             &mut d_alpha_buf, &mut d_theta_buf, &mut d_eta_buf,
             &mut d_m_init_buf, &mut d_s_init_buf,
-            s, d, bs, chunk_size, error_clip,
+            s, d, bs, chunk_size, error_clip, f32::MAX,
         );
         crate::dispatch::cuda_sync();
 

@@ -33,12 +33,18 @@ __device__ __forceinline__ void m_norm_project_inplace(
         local_sq += v * v;
     }
 
-    // Warp-level reduction via shuffle
-    for (int off = WARP_SZ / 2; off > 0; off >>= 1)
-        local_sq += __shfl_down_sync(0xFFFFFFFF, local_sq, off);
-
-    // Inter-warp reduction via scratch[]
+    // Warp-level reduction via shuffle (handles partial final warp)
     int warp_id = tid / WARP_SZ, lane = tid % WARP_SZ;
+    int lanes_in_warp = min((int)blockDim.x - warp_id * WARP_SZ, WARP_SZ);
+    unsigned wmask = (lanes_in_warp >= WARP_SZ)
+                         ? 0xFFFFFFFFu
+                         : ((1u << lanes_in_warp) - 1u);
+    for (int off = WARP_SZ / 2; off > 0; off >>= 1) {
+        float other = __shfl_down_sync(wmask, local_sq, off);
+        if (lane + off < lanes_in_warp)
+            local_sq += other;
+    }
+
     if (lane == 0) scratch[warp_id] = local_sq;
     __syncthreads();
 
