@@ -96,6 +96,18 @@ pub fn run_probes(
         eprintln!("ERROR: checkpoint n_blocks={loaded_n_blocks} but config n_blocks={n_blocks}");
         std::process::exit(1);
     }
+    if loaded_cfg.swa.num_heads != nh {
+        eprintln!("ERROR: checkpoint num_heads={} but config num_heads={nh}", loaded_cfg.swa.num_heads);
+        std::process::exit(1);
+    }
+    if loaded_cfg.swa.vocab_size != v {
+        eprintln!("ERROR: checkpoint vocab_size={} but config vocab_size={v}", loaded_cfg.swa.vocab_size);
+        std::process::exit(1);
+    }
+    if loaded_cfg.k != k {
+        eprintln!("ERROR: checkpoint k={} but config k={k}", loaded_cfg.k);
+        std::process::exit(1);
+    }
 
     let step = build_state.as_ref().map(|bs| bs.global_step).unwrap_or(0);
 

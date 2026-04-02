@@ -632,7 +632,16 @@ pub fn load_stacked_safetensors(
     // Optional persistent tokens (backward compat: empty if not present)
     let persistent_tokens = {
         let t = get("shared.persistent_tokens");
-        if t.is_empty() { vec![0.0f32; config.n_persistent * d] } else { t }
+        let expected = config.n_persistent * d;
+        if t.is_empty() {
+            vec![0.0f32; expected]
+        } else if t.len() != expected {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("shared.persistent_tokens length mismatch: got {} but config expects {} (n_persistent={} * d={})",
+                    t.len(), expected, config.n_persistent, d)));
+        } else {
+            t
+        }
     };
 
     let params = StackedMAGParams {

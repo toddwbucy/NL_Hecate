@@ -2971,6 +2971,7 @@ impl GpuKVCache {
         d: usize,
     ) {
         if n_persistent == 0 { return; }
+        debug_assert_eq!(d, self.d, "prepopulate_persistent: caller d={d} != self.d={}", self.d);
         assert!(n_persistent <= self.max_len,
             "KV cache too small for {} persistent tokens", n_persistent);
         assert_eq!(self.len, 0, "prepopulate_persistent must be called on empty cache");
@@ -3012,6 +3013,7 @@ impl GpuKVCache {
         d: usize,
     ) {
         if n_persistent == 0 { return; }
+        debug_assert_eq!(d, self.d, "refresh_persistent: caller d={d} != self.d={}", self.d);
         assert!(self.len >= n_persistent,
             "cache len {} < n_persistent {}", self.len, n_persistent);
 

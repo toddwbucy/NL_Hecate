@@ -309,6 +309,16 @@ pub fn feed(config_path: &str, resume: bool) {
             c
         };
 
+        // Stacked checkpoints only support push_up (not stack_up) per spec 22
+        if cfg.build.stack_up {
+            eprintln!("ERROR: stacked extend_k only supports push_up (not stack_up)");
+            std::process::exit(1);
+        }
+
+        // Snapshot pre-extension config for to_host — GPU buffers still have old k
+        #[cfg(feature = "cuda")]
+        let pre_extend_cfg = mag_cfg.clone();
+
         // Update MAGConfig for new k
         mag_cfg.k = target_k;
         mag_cfg.chunk_sizes = new_chunks.clone();
@@ -321,16 +331,10 @@ pub fn feed(config_path: &str, resume: bool) {
             mag_cfg.error_clip.push(*mag_cfg.error_clip.last().unwrap_or(&100.0));
         }
 
-        // Stacked checkpoints only support push_up (not stack_up) per spec 22
-        if cfg.build.stack_up {
-            eprintln!("ERROR: stacked extend_k only supports push_up (not stack_up)");
-            std::process::exit(1);
-        }
-
         // Perform the extension
         #[cfg(feature = "cuda")]
         {
-            let host = gpu_params.to_host(&mag_cfg);
+            let host = gpu_params.to_host(&pre_extend_cfg);
             let init = match cfg.build.push_up_init.as_str() {
                 "clone" => PushUpInit::Clone,
                 _ => PushUpInit::Random,

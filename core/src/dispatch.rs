@@ -1952,6 +1952,15 @@ pub fn swa_forward_dd(
     seq_len: usize, num_heads: usize, head_dim: usize, window_size: usize,
     batch_size: usize, n_persistent: usize,
 ) {
+    let total_dim = num_heads * head_dim;
+    let qkv_len = batch_size * seq_len * total_dim;
+    let aw_stride = n_persistent + window_size;
+    let aw_len = batch_size * num_heads * seq_len * aw_stride;
+    debug_assert!(q.len() >= qkv_len, "swa_forward_dd: q too small ({} < {qkv_len})", q.len());
+    debug_assert!(k.len() >= qkv_len, "swa_forward_dd: k too small ({} < {qkv_len})", k.len());
+    debug_assert!(v.len() >= qkv_len, "swa_forward_dd: v too small ({} < {qkv_len})", v.len());
+    debug_assert!(out.len() >= qkv_len, "swa_forward_dd: out too small ({} < {qkv_len})", out.len());
+    debug_assert!(attn_weights.len() >= aw_len, "swa_forward_dd: attn_weights too small ({} < {aw_len})", attn_weights.len());
     unsafe {
         crate::cuda_ffi::swa_forward_f32_cuda(
             q.as_ptr(), k.as_ptr(), v.as_ptr(),
@@ -1990,6 +1999,18 @@ pub fn swa_backward_dd(
     seq_len: usize, num_heads: usize, head_dim: usize, window_size: usize,
     batch_size: usize, n_persistent: usize,
 ) {
+    let total_dim = num_heads * head_dim;
+    let qkv_len = batch_size * seq_len * total_dim;
+    let aw_stride = n_persistent + window_size;
+    let aw_len = batch_size * num_heads * seq_len * aw_stride;
+    debug_assert!(q.len() >= qkv_len, "swa_backward_dd: q too small ({} < {qkv_len})", q.len());
+    debug_assert!(k.len() >= qkv_len, "swa_backward_dd: k too small ({} < {qkv_len})", k.len());
+    debug_assert!(v.len() >= qkv_len, "swa_backward_dd: v too small ({} < {qkv_len})", v.len());
+    debug_assert!(attn_weights.len() >= aw_len, "swa_backward_dd: attn_weights too small ({} < {aw_len})", attn_weights.len());
+    debug_assert!(d_attn_out.len() >= qkv_len, "swa_backward_dd: d_attn_out too small ({} < {qkv_len})", d_attn_out.len());
+    debug_assert!(d_q.len() >= qkv_len, "swa_backward_dd: d_q too small ({} < {qkv_len})", d_q.len());
+    debug_assert!(d_k.len() >= qkv_len, "swa_backward_dd: d_k too small ({} < {qkv_len})", d_k.len());
+    debug_assert!(d_v.len() >= qkv_len, "swa_backward_dd: d_v too small ({} < {qkv_len})", d_v.len());
     unsafe {
         crate::cuda_ffi::swa_backward_f32_cuda(
             q.as_ptr(), k.as_ptr(), v.as_ptr(),
