@@ -34,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "error_clip.cuh"
+#include "m_norm_project.cuh"
 
 // ══════════════════════════════════════════════════════════════════════
 // Ampere+ cp.async helpers (sm_80+)
@@ -88,7 +89,7 @@ __global__ void delta_forward_kernel(
     float* __restrict__ m_states,         // [batch_size, (seq_len+1)*d*d]
     float* __restrict__ y,                // [batch_size, seq_len, d]
     int seq_len, int d, int input_stride, int m_stride,
-    float error_clip)
+    float error_clip, float m_norm_max)
 {
     int b = blockIdx.x;   // batch index
     int tid = threadIdx.x;
@@ -198,6 +199,9 @@ __global__ void delta_forward_kernel(
         }
         __syncthreads();
 
+        // Per-token M-norm projection (spec 74, matches CPU reference)
+        m_norm_project_inplace(&m_states[m_next_off], prediction, dd, tid, m_norm_max);
+
         // ── y_t[i] = sum_j M_{t+1}[i,j] * q_t[j] (strided: supports d > blockDim.x) ──
         for (int row = tid; row < d; row += blockDim.x) {
             float sum = 0.0f;
@@ -251,6 +255,9 @@ __global__ void delta_forward_kernel(
         }
         __syncthreads();
 
+        // Per-token M-norm projection (spec 74, matches CPU reference)
+        m_norm_project_inplace(&m_states[m_next_off], prediction, dd, tid, m_norm_max);
+
         // ── y_t[i] = sum_j M_{t+1}[i,j] * q_t[j] (strided: supports d > blockDim.x) ──
         for (int row = tid; row < d; row += blockDim.x) {
             float sum = 0.0f;
@@ -280,7 +287,8 @@ __global__ void delta_forward_ckpt_kernel(
     float* __restrict__ m_states,         // [num_ckpt * d*d]
     float* __restrict__ y,
     float* __restrict__ m_work,           // [d*d] — working M in global memory
-    int seq_len, int d, int checkpoint_interval, float error_clip)
+    int seq_len, int d, int checkpoint_interval, float error_clip,
+    float m_norm_max)
 {
     int tid = threadIdx.x;
     int dd = d * d;
@@ -334,6 +342,9 @@ __global__ void delta_forward_ckpt_kernel(
         }
         __syncthreads();
 
+        // Per-token M-norm projection (spec 74, matches CPU reference)
+        m_norm_project_inplace(m_work, prediction, dd, tid, m_norm_max);
+
         // Store checkpoint if at interval boundary or final step
         if (((t + 1) % checkpoint_interval == 0) || (t + 1 == seq_len)) {
             int off = ckpt_idx * dd;
@@ -359,7 +370,8 @@ extern "C" void delta_forward_ckpt_f32_cuda(
     const float* k_mem, const float* v_mem, const float* q_mem,
     const float* alpha, const float* theta, const float* m_initial,
     float* m_states, float* y,
-    int seq_len, int d, int checkpoint_interval, float error_clip)
+    int seq_len, int d, int checkpoint_interval, float error_clip,
+    float m_norm_max)
 {
     if (d <= 0 || 2 * d * (int)sizeof(float) > 163840) {
         fprintf(stderr, "delta_forward_ckpt_f32_cuda: d=%d out of range.\n", d);
@@ -401,7 +413,8 @@ extern "C" void delta_forward_ckpt_f32_cuda(
 
     delta_forward_ckpt_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_initial,
-        m_states, y, m_work, seq_len, d, checkpoint_interval, error_clip);
+        m_states, y, m_work, seq_len, d, checkpoint_interval, error_clip,
+        m_norm_max);
     check_cuda_launch("delta_forward_ckpt_kernel", d, smem_bytes);
 
     check_cuda_alloc("delta_forward_ckpt: cudaDeviceSynchronize",
@@ -414,7 +427,8 @@ extern "C" void delta_forward_f32_cuda(
     const float* alpha, const float* theta, const float* m_initial,
     float* m_states, float* y,
     int seq_len, int d, int batch_size,
-    int input_stride, int m_stride, float error_clip)
+    int input_stride, int m_stride, float error_clip,
+    float m_norm_max)
 {
     if (d <= 0 || 8 * d * (int)sizeof(float) > 163840) {
         fprintf(stderr, "delta_forward_f32_cuda: d=%d out of range (must be 1..=5120).\n", d);
@@ -449,6 +463,7 @@ extern "C" void delta_forward_f32_cuda(
 
     delta_forward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, m_initial,
-        m_states, y, seq_len, d, input_stride, m_stride, error_clip);
+        m_states, y, seq_len, d, input_stride, m_stride, error_clip,
+        m_norm_max);
     check_cuda_launch("delta_forward_kernel", d, smem_bytes);
 }

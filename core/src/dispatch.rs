@@ -746,14 +746,9 @@ pub fn delta_forward_dispatch(
 ) {
     #[cfg(feature = "cuda")]
     {
-        // Gate CUDA path: CUDA inner kernels don't implement per-step m_norm_max
-        // clamping (that's handled by the standalone m_norm_clamp_f32_cuda called
-        // once per level after the forward pass). Fall back to Rust when an
-        // active clamp is requested via this parameter.
-        let clamp_enabled = m_norm_max > 0.0 && m_norm_max < f32::MAX;
-        if !is_rust_forced() && !clamp_enabled {
+        if !is_rust_forced() {
             cuda_delta_forward(k_mem, v_mem, q_mem, alpha, theta, m_initial,
-                               m_states, y, seq_len, d, error_clip);
+                               m_states, y, seq_len, d, error_clip, m_norm_max);
             return;
         }
     }
@@ -818,12 +813,10 @@ pub fn titans_forward_dispatch(
 ) {
     #[cfg(feature = "cuda")]
     {
-        // Gate CUDA path when active clamp requested — see delta_forward_dispatch.
-        let clamp_enabled = m_norm_max > 0.0 && m_norm_max < f32::MAX;
-        if !is_rust_forced() && !clamp_enabled {
+        if !is_rust_forced() {
             cuda_titans_forward(k_mem, v_mem, q_mem, alpha, theta, eta,
                                 m_initial, s_initial, m_states, s_states, y,
-                                seq_len, d, error_clip);
+                                seq_len, d, error_clip, m_norm_max);
             return;
         }
     }
@@ -1465,6 +1458,7 @@ fn cuda_delta_forward(
     alpha: &[f32], theta: &[f32], m_initial: &[f32],
     m_states: &mut [f32], y: &mut [f32],
     seq_len: usize, d: usize, error_clip: f32,
+    m_norm_max: f32,
 ) {
     let dd = d * d;
     let dev_km = DevBuf::new(seq_len * d);
@@ -1492,6 +1486,7 @@ fn cuda_delta_forward(
             dev_mstates.ptr, dev_y.ptr,
             seq_len as i32, d as i32, 1,
             seq_len as i32, (d * d) as i32, error_clip,
+            m_norm_max,
         );
         let rc = cudaDeviceSynchronize();
         assert_eq!(rc, 0, "cudaDeviceSynchronize failed after delta forward (error {rc})");
@@ -1566,6 +1561,7 @@ fn cuda_titans_forward(
     m_initial: &[f32], s_initial: &[f32],
     m_states: &mut [f32], s_states: &mut [f32], y: &mut [f32],
     seq_len: usize, d: usize, error_clip: f32,
+    m_norm_max: f32,
 ) {
     let dd = d * d;
     let dev_km = DevBuf::new(seq_len * d);
@@ -1600,6 +1596,7 @@ fn cuda_titans_forward(
             dev_mstates.ptr, dev_sstates.ptr, dev_y.ptr,
             seq_len as i32, d as i32, 1,
             seq_len as i32, (d * d) as i32, error_clip,
+            m_norm_max,
         );
         let rc = cudaDeviceSynchronize();
         assert_eq!(rc, 0, "cudaDeviceSynchronize failed after titans forward (error {rc})");
@@ -2028,6 +2025,7 @@ pub fn delta_forward_dd(
     m_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
     seq_len: usize, d: usize, batch_size: usize,
     input_stride: usize, m_stride: usize, error_clip: f32,
+    m_norm_max: f32,
 ) {
     check_forward_strides(seq_len, d, batch_size, input_stride, m_stride);
     unsafe {
@@ -2038,6 +2036,7 @@ pub fn delta_forward_dd(
             m_states.ptr(), y.ptr(),
             seq_len as i32, d as i32, batch_size as i32,
             input_stride as i32, m_stride as i32, error_clip,
+            m_norm_max,
         );
     }
 }
@@ -2073,6 +2072,7 @@ pub fn titans_forward_dd(
     m_states: &mut GpuBuf<f32>, s_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
     seq_len: usize, d: usize, batch_size: usize,
     input_stride: usize, m_stride: usize, error_clip: f32,
+    m_norm_max: f32,
 ) {
     check_forward_strides(seq_len, d, batch_size, input_stride, m_stride);
     unsafe {
@@ -2083,6 +2083,7 @@ pub fn titans_forward_dd(
             m_states.ptr(), s_states.ptr(), y.ptr(),
             seq_len as i32, d as i32, batch_size as i32,
             input_stride as i32, m_stride as i32, error_clip,
+            m_norm_max,
         );
     }
 }
@@ -2125,6 +2126,7 @@ pub fn delta_chunkwise_forward_dd(
     m_initial: &GpuSlice<f32>,
     m_chunk_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
     seq_len: usize, d: usize, batch_size: usize, chunk_size: usize, error_clip: f32,
+    m_norm_max: f32,
 ) {
     unsafe {
         crate::cuda_ffi::delta_chunkwise_forward_f32_cuda(
@@ -2133,6 +2135,7 @@ pub fn delta_chunkwise_forward_dd(
             m_initial.as_ptr(),
             m_chunk_states.ptr(), y.ptr(),
             seq_len as i32, d as i32, batch_size as i32, chunk_size as i32, error_clip,
+            m_norm_max,
         );
     }
 }
@@ -2169,6 +2172,7 @@ pub fn titans_chunkwise_forward_dd(
     m_initial: &GpuSlice<f32>, s_initial: &GpuSlice<f32>,
     m_chunk_states: &mut GpuBuf<f32>, s_chunk_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
     seq_len: usize, d: usize, batch_size: usize, chunk_size: usize, error_clip: f32,
+    m_norm_max: f32,
 ) {
     unsafe {
         crate::cuda_ffi::titans_chunkwise_forward_f32_cuda(
@@ -2177,6 +2181,7 @@ pub fn titans_chunkwise_forward_dd(
             m_initial.as_ptr(), s_initial.as_ptr(),
             m_chunk_states.ptr(), s_chunk_states.ptr(), y.ptr(),
             seq_len as i32, d as i32, batch_size as i32, chunk_size as i32, error_clip,
+            m_norm_max,
         );
     }
 }
@@ -2219,6 +2224,7 @@ pub fn delta_chunkwise_forward_batched_dd(
     m_initial: &GpuSlice<f32>,
     m_chunk_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
     seq_len: usize, d: usize, batch_size: usize, chunk_size: usize, error_clip: f32,
+    m_norm_max: f32,
 ) {
     let dd = d * d;
     let num_chunks = (seq_len + chunk_size - 1) / chunk_size;
@@ -2280,6 +2286,7 @@ pub fn delta_chunkwise_forward_batched_dd(
                 m_chunk_states.ptr(), y.ptr(),
                 seq_len as i32, d as i32, batch_size as i32,
                 chunk_size as i32, c as i32,
+                m_norm_max,
             );
         }
     }
@@ -2294,6 +2301,7 @@ pub fn titans_chunkwise_forward_batched_dd(
     m_initial: &GpuSlice<f32>, s_initial: &GpuSlice<f32>,
     m_chunk_states: &mut GpuBuf<f32>, s_chunk_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
     seq_len: usize, d: usize, batch_size: usize, chunk_size: usize, error_clip: f32,
+    m_norm_max: f32,
 ) {
     let dd = d * d;
     let num_chunks = (seq_len + chunk_size - 1) / chunk_size;
@@ -2357,6 +2365,7 @@ pub fn titans_chunkwise_forward_batched_dd(
                 m_chunk_states.ptr(), s_chunk_states.ptr(), y.ptr(),
                 seq_len as i32, d as i32, batch_size as i32,
                 chunk_size as i32, c as i32,
+                m_norm_max,
             );
         }
     }
@@ -2606,6 +2615,7 @@ pub fn titans_fused_forward_dd(
     alpha_out: &mut GpuBuf<f32>, theta_out: &mut GpuBuf<f32>, eta_out: &mut GpuBuf<f32>,
     k_norms_out: &mut GpuBuf<f32>, q_norms_out: &mut GpuBuf<f32>,
     seq_len: usize, d: usize, batch_size: usize, error_clip: f32,
+    m_norm_max: f32,
 ) {
     unsafe {
         crate::cuda_ffi::titans_fused_forward_f32_cuda(
@@ -2619,6 +2629,7 @@ pub fn titans_fused_forward_dd(
             alpha_out.ptr(), theta_out.ptr(), eta_out.ptr(),
             k_norms_out.ptr(), q_norms_out.ptr(),
             seq_len as i32, d as i32, batch_size as i32, error_clip,
+            m_norm_max,
         );
     }
 }
@@ -2723,6 +2734,7 @@ pub fn delta_forward_dd_ckpt(
     m_initial: &GpuSlice<f32>,
     m_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
     seq_len: usize, d: usize, checkpoint_interval: usize, error_clip: f32,
+    m_norm_max: f32,
 ) {
     unsafe {
         crate::cuda_ffi::delta_forward_ckpt_f32_cuda(
@@ -2731,6 +2743,7 @@ pub fn delta_forward_dd_ckpt(
             m_initial.as_ptr(),
             m_states.ptr(), y.ptr(),
             seq_len as i32, d as i32, checkpoint_interval as i32, error_clip,
+            m_norm_max,
         );
     }
 }
@@ -2743,6 +2756,7 @@ pub fn titans_forward_dd_ckpt(
     m_initial: &GpuSlice<f32>, s_initial: &GpuSlice<f32>,
     m_states: &mut GpuBuf<f32>, s_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
     seq_len: usize, d: usize, checkpoint_interval: usize, error_clip: f32,
+    m_norm_max: f32,
 ) {
     unsafe {
         crate::cuda_ffi::titans_forward_ckpt_f32_cuda(
@@ -2751,6 +2765,7 @@ pub fn titans_forward_dd_ckpt(
             m_initial.as_ptr(), s_initial.as_ptr(),
             m_states.ptr(), s_states.ptr(), y.ptr(),
             seq_len as i32, d as i32, checkpoint_interval as i32, error_clip,
+            m_norm_max,
         );
     }
 }

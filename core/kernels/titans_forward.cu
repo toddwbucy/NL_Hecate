@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "error_clip.cuh"
+#include "m_norm_project.cuh"
 
 // ══════════════════════════════════════════════════════════════════════
 // Ampere+ cp.async helpers (sm_80+)
@@ -92,7 +93,7 @@ __global__ void titans_forward_kernel(
     float* __restrict__ s_states,         // [batch_size, (seq_len+1)*d*d]
     float* __restrict__ y,                // [batch_size, seq_len, d]
     int seq_len, int d, int input_stride, int m_stride,
-    float error_clip)
+    float error_clip, float m_norm_max)
 {
     int b = blockIdx.x;   // batch index
     int tid = threadIdx.x;
@@ -209,6 +210,9 @@ __global__ void titans_forward_kernel(
         }
         __syncthreads();
 
+        // Per-token M-norm projection (spec 74, matches CPU reference)
+        m_norm_project_inplace(&m_states[m_next_off], prediction, dd, tid, m_norm_max);
+
         // y = M_{t+1} @ q (strided: supports d > blockDim.x)
         for (int row = tid; row < d; row += blockDim.x) {
             float sum = 0.0f;
@@ -265,6 +269,9 @@ __global__ void titans_forward_kernel(
         }
         __syncthreads();
 
+        // Per-token M-norm projection (spec 74, matches CPU reference)
+        m_norm_project_inplace(&m_states[m_next_off], prediction, dd, tid, m_norm_max);
+
         // y = M_{t+1} @ q (strided: supports d > blockDim.x)
         for (int row = tid; row < d; row += blockDim.x) {
             float sum = 0.0f;
@@ -297,7 +304,8 @@ __global__ void titans_forward_ckpt_kernel(
     float* __restrict__ y,
     float* __restrict__ m_work,           // [d*d] — working M
     float* __restrict__ s_work,           // [d*d] — working S
-    int seq_len, int d, int checkpoint_interval, float error_clip)
+    int seq_len, int d, int checkpoint_interval, float error_clip,
+    float m_norm_max)
 {
     int tid = threadIdx.x;
     int dd = d * d;
@@ -356,6 +364,9 @@ __global__ void titans_forward_ckpt_kernel(
         }
         __syncthreads();
 
+        // Per-token M-norm projection (spec 74, matches CPU reference)
+        m_norm_project_inplace(m_work, prediction, dd, tid, m_norm_max);
+
         // Store checkpoint if at interval boundary or final step
         if (((t + 1) % checkpoint_interval == 0) || (t + 1 == seq_len)) {
             int off = ckpt_idx * dd;
@@ -383,7 +394,8 @@ extern "C" void titans_forward_ckpt_f32_cuda(
     const float* alpha, const float* theta, const float* eta,
     const float* m_initial, const float* s_initial,
     float* m_states, float* s_states, float* y,
-    int seq_len, int d, int checkpoint_interval, float error_clip)
+    int seq_len, int d, int checkpoint_interval, float error_clip,
+    float m_norm_max)
 {
     if (d <= 0 || 2 * d * (int)sizeof(float) > 163840) {
         fprintf(stderr, "titans_forward_ckpt_f32_cuda: d=%d out of range.\n", d);
@@ -413,7 +425,8 @@ extern "C" void titans_forward_ckpt_f32_cuda(
     titans_forward_ckpt_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, eta,
         m_initial, s_initial, m_states, s_states, y,
-        m_work, s_work, seq_len, d, checkpoint_interval, error_clip);
+        m_work, s_work, seq_len, d, checkpoint_interval, error_clip,
+        m_norm_max);
     check_cuda_launch("titans_forward_ckpt_kernel", d, smem_bytes);
 
     check_cuda_alloc("titans_forward_ckpt: cudaDeviceSynchronize",
@@ -428,7 +441,8 @@ extern "C" void titans_forward_f32_cuda(
     const float* m_initial, const float* s_initial,
     float* m_states, float* s_states, float* y,
     int seq_len, int d, int batch_size,
-    int input_stride, int m_stride, float error_clip)
+    int input_stride, int m_stride, float error_clip,
+    float m_norm_max)
 {
     if (d <= 0 || 8 * d * (int)sizeof(float) > 163840) {
         fprintf(stderr, "titans_forward_f32_cuda: d=%d out of range (must be 1..=5120).\n", d);
@@ -456,7 +470,7 @@ extern "C" void titans_forward_f32_cuda(
     titans_forward_kernel<<<grid, block, smem_bytes>>>(
         k_mem, v_mem, q_mem, alpha, theta, eta,
         m_initial, s_initial, m_states, s_states, y,
-        seq_len, d, input_stride, m_stride, error_clip);
+        seq_len, d, input_stride, m_stride, error_clip, m_norm_max);
     check_cuda_launch("titans_forward_kernel", d, smem_bytes);
 }
 
@@ -497,7 +511,7 @@ __global__ void titans_fused_forward_kernel(
     float* __restrict__ eta_out,            // [bs*s]
     float* __restrict__ k_norms_out,        // [bs*s]
     float* __restrict__ q_norms_out,        // [bs*s]
-    int seq_len, int d, float error_clip)
+    int seq_len, int d, float error_clip, float m_norm_max)
 {
     int b = blockIdx.x;
     int tid = threadIdx.x;
@@ -713,6 +727,9 @@ __global__ void titans_fused_forward_kernel(
         }
         __syncthreads();
 
+        // Per-token M-norm projection (spec 74, matches CPU reference)
+        m_norm_project_inplace(&m_states[m_next_off], prediction, dd, tid, m_norm_max);
+
         // y = M_{t+1} @ q
         for (int row = tid; row < d; row += blockDim.x) {
             float sum = 0.0f;
@@ -735,7 +752,8 @@ extern "C" void titans_fused_forward_f32_cuda(
     float* m_states, float* s_states, float* y,
     float* alpha_out, float* theta_out, float* eta_out,
     float* k_norms_out, float* q_norms_out,
-    int seq_len, int d, int batch_size, float error_clip)
+    int seq_len, int d, int batch_size, float error_clip,
+    float m_norm_max)
 {
     // Shared memory: 11*d + 32 floats
     int smem_floats = 11 * d + 32;
@@ -762,6 +780,6 @@ extern "C" void titans_fused_forward_f32_cuda(
         m_initial, s_initial, m_states, s_states, y,
         alpha_out, theta_out, eta_out,
         k_norms_out, q_norms_out,
-        seq_len, d, error_clip);
+        seq_len, d, error_clip, m_norm_max);
     check_cuda_launch("titans_fused_forward_kernel", d, smem_bytes);
 }
