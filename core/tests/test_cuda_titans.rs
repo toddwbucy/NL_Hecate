@@ -8,7 +8,7 @@
 mod cuda_test_utils;
 use cuda_test_utils::{rand_buf, check_close};
 
-use nl_hecate_core::dispatch::{titans_forward_dispatch, titans_backward_dispatch};
+use nl_hecate_core::dispatch::{titans_forward_dispatch, titans_backward_dispatch, force_rust_reference};
 
 /// Rust reference Titans forward inner loop.
 fn rust_titans_forward(
@@ -414,4 +414,54 @@ fn test_cuda_titans_forward_large_d() {
     let m_final = &m_cuda[seq_len * dd..];
     let m_norm: f32 = m_final.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(m_norm > 1e-6, "M_final should be non-zero at d=128, got ‖M‖={m_norm}");
+}
+
+// ── CUDA/Rust parity with active clipping/clamping ──────────────────
+
+use serial_test::serial;
+
+#[test]
+#[serial]
+fn test_cuda_titans_parity_with_clipping() {
+    let d = 8;
+    let seq_len = 8;
+    let dd = d * d;
+
+    let k_mem = rand_buf(seq_len * d, 500);
+    let v_mem = rand_buf(seq_len * d, 600);
+    let q_mem = rand_buf(seq_len * d, 700);
+    let alpha = vec![0.05f32; seq_len];
+    let theta = vec![0.5f32; seq_len];
+    let eta = vec![0.9f32; seq_len];
+    let m_initial = vec![0.0f32; dd];
+    let s_initial = vec![0.0f32; dd];
+
+    // Active clipping: error_clip=1.0, m_norm_max=5.0
+    let error_clip = 1.0f32;
+    let m_norm_max = 5.0f32;
+
+    // CUDA path
+    force_rust_reference(false);
+    let mut m_cuda = vec![0.0f32; (seq_len + 1) * dd];
+    let mut s_cuda = vec![0.0f32; (seq_len + 1) * dd];
+    let mut y_cuda = vec![0.0f32; seq_len * d];
+    titans_forward_dispatch(
+        &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
+        &m_initial, &s_initial, &mut m_cuda, &mut s_cuda, &mut y_cuda,
+        seq_len, d, error_clip, m_norm_max);
+
+    // Rust path
+    force_rust_reference(true);
+    let mut m_rust = vec![0.0f32; (seq_len + 1) * dd];
+    let mut s_rust = vec![0.0f32; (seq_len + 1) * dd];
+    let mut y_rust = vec![0.0f32; seq_len * d];
+    titans_forward_dispatch(
+        &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
+        &m_initial, &s_initial, &mut m_rust, &mut s_rust, &mut y_rust,
+        seq_len, d, error_clip, m_norm_max);
+    force_rust_reference(false);
+
+    check_close("titans_clip_y", &y_rust, &y_cuda, 1e-5);
+    check_close("titans_clip_m", &m_rust, &m_cuda, 1e-5);
+    check_close("titans_clip_s", &s_rust, &s_cuda, 1e-5);
 }

@@ -1956,6 +1956,7 @@ pub fn swa_forward_dd(
     let qkv_len = batch_size * seq_len * total_dim;
     let aw_stride = n_persistent + window_size;
     let aw_len = batch_size * num_heads * seq_len * aw_stride;
+    assert!(n_persistent <= seq_len, "swa_forward_dd: n_persistent ({n_persistent}) > seq_len ({seq_len})");
     assert!(q.len() >= qkv_len, "swa_forward_dd: q too small ({} < {qkv_len})", q.len());
     assert!(k.len() >= qkv_len, "swa_forward_dd: k too small ({} < {qkv_len})", k.len());
     assert!(v.len() >= qkv_len, "swa_forward_dd: v too small ({} < {qkv_len})", v.len());
@@ -2010,6 +2011,7 @@ pub fn swa_backward_dd(
     let qkv_len = batch_size * seq_len * total_dim;
     let aw_stride = n_persistent + window_size;
     let aw_len = batch_size * num_heads * seq_len * aw_stride;
+    assert!(n_persistent <= seq_len, "swa_backward_dd: n_persistent ({n_persistent}) > seq_len ({seq_len})");
     assert!(q.len() >= qkv_len, "swa_backward_dd: q too small ({} < {qkv_len})", q.len());
     assert!(k.len() >= qkv_len, "swa_backward_dd: k too small ({} < {qkv_len})", k.len());
     assert!(v.len() >= qkv_len, "swa_backward_dd: v too small ({} < {qkv_len})", v.len());
