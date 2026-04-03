@@ -119,6 +119,26 @@ impl MemoryRuleKind {
     }
 }
 
+/// Activation function for MLP memory (spec 75).
+/// Controls the nonlinearity σ applied between layers of the deep neural memory.
+/// GELU is the default, matching MONETA/YAAD/MEMORA in MIRAS and the Titans paper.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum MemoryActivation {
+    /// GELU: x · Φ(x). Default, matching MONETA/YAAD/MEMORA.
+    #[serde(rename = "gelu")]
+    GELU,
+    /// SiLU (Swish): x · σ(x). Alternative nonlinearity.
+    #[serde(rename = "silu")]
+    SiLU,
+    /// ReLU: max(0, x). Simplest nonlinearity.
+    #[serde(rename = "relu")]
+    ReLU,
+}
+
+impl Default for MemoryActivation {
+    fn default() -> Self { MemoryActivation::GELU }
+}
+
 /// MIRAS Knob 2: Attentional bias (loss function for memory updates).
 ///
 /// Selects the objective that drives the inner-loop memory gradient.
@@ -800,6 +820,22 @@ pub struct MAGConfig {
     /// Ignored for MomentumKind::None/EMA/DeltaMomentum.
     #[serde(default)]
     pub momentum_d_hidden: usize,
+    /// Number of MLP layers for deep neural memory (spec 75, Titans §3.1).
+    /// 1 = linear M (d×d matrix, current behavior, backward compatible default).
+    /// 2+ = MLP memory: M(x) = W₂ @ σ(W₁ @ x + b₁) + b₂.
+    /// Nonlinearity breaks associative scan — forces chunkwise GD.
+    #[serde(default = "default_one")]
+    pub memory_layers: usize,
+    /// Expansion factor for MLP memory hidden dimension (spec 75).
+    /// d_h = memory_expansion_factor × head_dim. Default: 4 (matching MONETA).
+    /// Only used when memory_layers >= 2.
+    #[serde(default = "default_memory_expansion_factor")]
+    pub memory_expansion_factor: usize,
+    /// Activation function for MLP memory layers (spec 75).
+    /// Applied between all layers except the last. Default: GELU.
+    /// Only used when memory_layers >= 2.
+    #[serde(default)]
+    pub memory_activation: MemoryActivation,
     /// Projection style for memory key/value/query generation (HOPE §5).
     /// Static (default) = Phase 1 W @ x. Adaptive = Phase 2 DGD projection memories.
     #[serde(default)]
@@ -889,6 +925,8 @@ where
 
 fn default_false() -> bool { false }
 
+fn default_memory_expansion_factor() -> usize { 4 }
+
 fn default_sign_sharpness() -> f32 { 10.0 }
 
 impl MAGConfig {
@@ -950,28 +988,46 @@ impl MAGConfig {
     pub fn tape_budget_bytes(&self, n_blocks: usize) -> usize {
         let cl = self.cycle_length();
         let d = self.swa.d_model;
-        let dd = d * d;
         let seq_len = self.swa.seq_len;
         let cycles_in_seq = if cl > 0 { (seq_len + cl - 1) / cl } else { seq_len };
         let retained = self.tape_multiplier.min(cycles_in_seq.max(1));
+
+        // State size per snapshot: d*d for linear, MLP-sized for memory_layers >= 2
+        let state_size = if self.memory_layers >= 2 {
+            let d_h = self.memory_expansion_factor * d;
+            let mut sp = 0;
+            for l in 0..self.memory_layers {
+                let (rows, cols) = if l == 0 {
+                    (d_h, d)
+                } else if l == self.memory_layers - 1 {
+                    (d, d_h)
+                } else {
+                    (d_h, d_h)
+                };
+                sp += rows * cols + rows; // weight + bias
+            }
+            sp
+        } else {
+            d * d
+        };
 
         let mut total = 0usize;
         for level in 0..self.k {
             let per_cycle = match self.tape_strategy_for_level(level) {
                 LevelTapeStrategy::Exact => {
-                    cl * 2 * dd * 4            // M + S full trajectories
+                    cl * 2 * state_size * 4    // M + S full trajectories
                     + cl * d * 3 * 4           // projections (k, v, q)
                     + cl * 3 * 4               // gates (alpha, theta, eta)
                     + cl * 2 * 4               // k_norms, q_norms
                 }
                 LevelTapeStrategy::Proxy => {
                     // Spec 43: chunkwise stores (num_chunks+1) M states.
-                    // With chunk_size=cl (single chunk): num_chunks=1, stores M₀+M_final = 2*dd.
+                    // With chunk_size=cl (single chunk): num_chunks=1, stores M₀+M_final.
                     // Titans also stores S₀+S_final; Delta has no momentum S.
                     let m_s_bytes = match self.memory_rule {
                         MemoryRuleKind::TitansLMM
-                        | MemoryRuleKind::AtlasOmega => 2 * 2 * dd * 4, // M+S boundary pairs
-                        _ => 2 * dd * 4,                                 // M boundary pair only
+                        | MemoryRuleKind::AtlasOmega => 2 * 2 * state_size * 4, // M+S boundary pairs
+                        _ => 2 * state_size * 4,                                 // M boundary pair only
                     };
                     m_s_bytes
                     + cl * d * 3 * 4           // projections still stored
@@ -1085,6 +1141,9 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            memory_layers: 1,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
@@ -1133,6 +1192,9 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            memory_layers: 1,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
@@ -1181,6 +1243,9 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            memory_layers: 1,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
@@ -1230,6 +1295,9 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            memory_layers: 1,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
@@ -1279,6 +1347,9 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            memory_layers: 1,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
@@ -1328,6 +1399,9 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            memory_layers: 1,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
@@ -1376,6 +1450,9 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            memory_layers: 1,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
@@ -1424,6 +1501,9 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            memory_layers: 1,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
@@ -1472,6 +1552,9 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            memory_layers: 1,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
@@ -1520,6 +1603,9 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            memory_layers: 1,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
@@ -1578,6 +1664,9 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            memory_layers: 1,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
@@ -1636,6 +1725,9 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            memory_layers: 1,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
@@ -1694,6 +1786,9 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            memory_layers: 1,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
@@ -1752,6 +1847,9 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            memory_layers: 1,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
@@ -1810,6 +1908,9 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            memory_layers: 1,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
@@ -1868,6 +1969,9 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            memory_layers: 1,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
@@ -1917,6 +2021,9 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            memory_layers: 1,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
@@ -1966,6 +2073,9 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            memory_layers: 1,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
@@ -2018,6 +2128,9 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            memory_layers: 1,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
@@ -2070,6 +2183,9 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            memory_layers: 1,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
@@ -2118,6 +2234,9 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            memory_layers: 1,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
@@ -2166,6 +2285,9 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            memory_layers: 1,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
@@ -2214,6 +2336,9 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            memory_layers: 1,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
@@ -2262,6 +2387,9 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            memory_layers: 1,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
@@ -2311,6 +2439,9 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            memory_layers: 1,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
@@ -2359,6 +2490,9 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            memory_layers: 1,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
@@ -2408,6 +2542,9 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            memory_layers: 1,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
@@ -2457,6 +2594,9 @@ impl MAGConfig {
             kernel_size: 0,
             momentum_kind: MomentumKind::None,
             momentum_d_hidden: 0,
+            memory_layers: 1,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
             projection_kind: ProjectionKind::Static,
             self_generated_values: false,
             self_ref_chunk_size: 1,
