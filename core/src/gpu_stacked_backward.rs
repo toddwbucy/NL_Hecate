@@ -63,6 +63,94 @@ pub struct GpuStackedGrads {
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// Spec 76: Gradient accumulation helpers
+// ══════════════════════════════════════════════════════════════════════
+
+/// Zero all gradient buffers (called once at the start of each logical step).
+#[cfg(feature = "cuda")]
+pub fn gpu_zero_grads(grads: &mut GpuStackedGrads) {
+    grads.d_w_embed.zero();
+    grads.d_w_unembed.zero();
+    grads.d_ln_final_gamma.zero();
+    grads.d_ln_final_beta.zero();
+    for block in &mut grads.blocks {
+        block.d_w_q.zero();
+        block.d_w_k.zero();
+        block.d_w_v.zero();
+        block.d_w_o.zero();
+        block.d_ln_attn_gamma.zero();
+        block.d_ln_attn_beta.zero();
+        block.d_ln_mem_gamma.zero();
+        block.d_ln_mem_beta.zero();
+        for lg in &mut block.levels {
+            lg.d_w_k_mem.zero();
+            lg.d_w_v_mem.zero();
+            lg.d_w_q_mem.zero();
+            lg.d_w_alpha.zero();
+            lg.d_b_alpha.zero();
+            lg.d_w_theta.zero();
+            lg.d_b_theta.zero();
+            lg.d_w_eta.zero();
+            lg.d_b_eta.zero();
+            lg.d_gate_proj.zero();
+            lg.d_up_proj.zero();
+            lg.d_down_proj.zero();
+        }
+        for g in &mut block.d_alpha_mem { *g = 0.0; }
+        block.level_output_gnorms.iter_mut().for_each(|g| *g = 0.0);
+    }
+}
+
+/// Accumulate: accum += micro (element-wise add on GPU via SAXPY).
+/// After all micro-steps, the accumulator holds the sum of gradients.
+#[cfg(feature = "cuda")]
+pub fn gpu_accumulate_grads(accum: &mut GpuStackedGrads, micro: &GpuStackedGrads) {
+    let saxpy = |dst: &mut GpuBuf<f32>, src: &GpuBuf<f32>| {
+        let n = dst.len() as i32;
+        if n == 0 { return; }
+        unsafe { crate::cuda_ffi::saxpy_cuda(1.0, src.as_ptr(), dst.ptr(), n); }
+    };
+
+    saxpy(&mut accum.d_w_embed, &micro.d_w_embed);
+    saxpy(&mut accum.d_w_unembed, &micro.d_w_unembed);
+    saxpy(&mut accum.d_ln_final_gamma, &micro.d_ln_final_gamma);
+    saxpy(&mut accum.d_ln_final_beta, &micro.d_ln_final_beta);
+
+    for (acc_block, mic_block) in accum.blocks.iter_mut().zip(micro.blocks.iter()) {
+        saxpy(&mut acc_block.d_w_q, &mic_block.d_w_q);
+        saxpy(&mut acc_block.d_w_k, &mic_block.d_w_k);
+        saxpy(&mut acc_block.d_w_v, &mic_block.d_w_v);
+        saxpy(&mut acc_block.d_w_o, &mic_block.d_w_o);
+        saxpy(&mut acc_block.d_ln_attn_gamma, &mic_block.d_ln_attn_gamma);
+        saxpy(&mut acc_block.d_ln_attn_beta, &mic_block.d_ln_attn_beta);
+        saxpy(&mut acc_block.d_ln_mem_gamma, &mic_block.d_ln_mem_gamma);
+        saxpy(&mut acc_block.d_ln_mem_beta, &mic_block.d_ln_mem_beta);
+        for (acc_lv, mic_lv) in acc_block.levels.iter_mut().zip(mic_block.levels.iter()) {
+            saxpy(&mut acc_lv.d_w_k_mem, &mic_lv.d_w_k_mem);
+            saxpy(&mut acc_lv.d_w_v_mem, &mic_lv.d_w_v_mem);
+            saxpy(&mut acc_lv.d_w_q_mem, &mic_lv.d_w_q_mem);
+            saxpy(&mut acc_lv.d_w_alpha, &mic_lv.d_w_alpha);
+            saxpy(&mut acc_lv.d_b_alpha, &mic_lv.d_b_alpha);
+            saxpy(&mut acc_lv.d_w_theta, &mic_lv.d_w_theta);
+            saxpy(&mut acc_lv.d_b_theta, &mic_lv.d_b_theta);
+            saxpy(&mut acc_lv.d_w_eta, &mic_lv.d_w_eta);
+            saxpy(&mut acc_lv.d_b_eta, &mic_lv.d_b_eta);
+            saxpy(&mut acc_lv.d_gate_proj, &mic_lv.d_gate_proj);
+            saxpy(&mut acc_lv.d_up_proj, &mic_lv.d_up_proj);
+            saxpy(&mut acc_lv.d_down_proj, &mic_lv.d_down_proj);
+        }
+        // Host-side alpha_mem grads
+        for (a, m) in acc_block.d_alpha_mem.iter_mut().zip(mic_block.d_alpha_mem.iter()) {
+            *a += m;
+        }
+        // Accumulate gnorm diagnostics
+        for (a, m) in acc_block.level_output_gnorms.iter_mut().zip(mic_block.level_output_gnorms.iter()) {
+            *a += m;
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // gpu_stacked_backward — main entry point
 // ══════════════════════════════════════════════════════════════════════
 
