@@ -377,6 +377,13 @@ extern "C" void titans_mlp_forward_f32_cuda(
         exit(1);
     }
 
+    // Validate activation ID before launching
+    if (activation != ACT_GELU && activation != ACT_SILU && activation != ACT_RELU) {
+        fprintf(stderr, "titans_mlp_forward_f32_cuda: invalid activation=%d "
+                "(expected 0=GELU, 1=SiLU, 2=ReLU).\n", activation);
+        abort();
+    }
+
     // Dispatch by activation template
     if (activation == ACT_GELU) {
         check_cuda_alloc("titans_mlp_forward: cudaFuncSetAttribute",

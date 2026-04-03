@@ -148,7 +148,7 @@ fn test_titans_mlp_cuda_single_token_debug() {
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
         &m_initial, &s_initial,
         &mut cuda_m, &mut cuda_s, &mut cuda_y,
-        seq_len, d, d_h, 0, f32::MAX);
+        seq_len, d, d_h, 1, 0, f32::MAX);
 
     // Check initial M copy
     check_close("M_0 copy", &cuda_m[..state_size], &cpu_m[..state_size], 1e-7);
@@ -206,7 +206,7 @@ fn test_titans_mlp_cuda_parity_gelu() {
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
         &m_initial, &s_initial,
         &mut cuda_m, &mut cuda_s, &mut cuda_y,
-        seq_len, d, d_h, 0, // activation=0 (GELU)
+        seq_len, d, d_h, 1, 0, // activation=0 (GELU)
         m_norm_max);
 
     // Compare with tolerance (f32 accumulation + transcendental functions)
@@ -248,7 +248,7 @@ fn test_titans_mlp_cuda_parity_silu() {
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
         &m_initial, &s_initial,
         &mut cuda_m, &mut cuda_s, &mut cuda_y,
-        seq_len, d, d_h, 1, // activation=1 (SiLU)
+        seq_len, d, d_h, 1, 1, // activation=1 (SiLU)
         f32::MAX);
 
     check_close("titans_mlp y (SiLU)", &cuda_y, &cpu_y, 1e-4);
@@ -289,7 +289,7 @@ fn test_titans_mlp_cuda_parity_relu() {
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
         &m_initial, &s_initial,
         &mut cuda_m, &mut cuda_s, &mut cuda_y,
-        seq_len, d, d_h, 2, // activation=2 (ReLU)
+        seq_len, d, d_h, 1, 2, // activation=2 (ReLU)
         f32::MAX);
 
     check_close("titans_mlp y (ReLU)", &cuda_y, &cpu_y, 1e-4);
@@ -335,7 +335,7 @@ fn test_titans_mlp_cuda_m_norm_clamp() {
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
         &m_initial, &s_initial,
         &mut cuda_m, &mut cuda_s, &mut cuda_y,
-        seq_len, d, d_h, 0, m_norm_max);
+        seq_len, d, d_h, 1, 0, m_norm_max);
 
     check_close("titans_mlp y (M-norm)", &cuda_y, &cpu_y, 1e-4);
     check_close("titans_mlp m_states (M-norm)", &cuda_m, &cpu_m, 1e-4);
@@ -388,7 +388,7 @@ fn test_titans_mlp_cuda_longer_sequence() {
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
         &m_initial, &s_initial,
         &mut cuda_m, &mut cuda_s, &mut cuda_y,
-        seq_len, d, d_h, 0, f32::MAX);
+        seq_len, d, d_h, 1, 0, f32::MAX);
 
     // Relaxed tolerance for 16-step accumulation
     check_close("titans_mlp y (seq=16)", &cuda_y, &cpu_y, 5e-4);
@@ -430,9 +430,122 @@ fn test_titans_mlp_cuda_nonzero_s_initial() {
         &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
         &m_initial, &s_initial,
         &mut cuda_m, &mut cuda_s, &mut cuda_y,
-        seq_len, d, d_h, 0, f32::MAX);
+        seq_len, d, d_h, 1, 0, f32::MAX);
 
     check_close("titans_mlp y (S_0≠0)", &cuda_y, &cpu_y, 1e-4);
     check_close("titans_mlp m_states (S_0≠0)", &cuda_m, &cpu_m, 1e-4);
     check_close("titans_mlp s_states (S_0≠0)", &cuda_s, &cpu_s, 1e-4);
+}
+
+/// Batched test: batch_size=4, each batch processed independently.
+#[test]
+#[serial(cuda)]
+fn test_titans_mlp_cuda_batched() {
+    let d = 8;
+    let expansion = 4;
+    let d_h = d * expansion;
+    let seq_len = 4;
+    let batch_size = 4;
+    let layout = MLPMemoryLayout::new(2, d, expansion);
+    let state_size = layout.total_params;
+
+    // Generate per-batch data by concatenating with different seeds.
+    let mut k_all = Vec::new();
+    let mut v_all = Vec::new();
+    let mut q_all = Vec::new();
+    let mut alpha_all = Vec::new();
+    let mut theta_all = Vec::new();
+    let mut eta_all = Vec::new();
+    let mut m_init_all = Vec::new();
+    let mut s_init_all = Vec::new();
+
+    for b in 0..batch_size {
+        let seed_base = 100 + b as u64 * 10;
+        k_all.extend_from_slice(&rand_buf(seq_len * d, seed_base));
+        v_all.extend_from_slice(&rand_buf(seq_len * d, seed_base + 1));
+        q_all.extend_from_slice(&rand_buf(seq_len * d, seed_base + 2));
+        alpha_all.extend(vec![0.05 + 0.01 * b as f32; seq_len]);
+        theta_all.extend(vec![0.01; seq_len]);
+        eta_all.extend(vec![0.9; seq_len]);
+        m_init_all.extend_from_slice(&rand_buf(state_size, seed_base + 3));
+        s_init_all.extend(vec![0.0f32; state_size]);
+    }
+
+    // CUDA batched call
+    let mut cuda_m = vec![0.0f32; batch_size * (seq_len + 1) * state_size];
+    let mut cuda_s = vec![0.0f32; batch_size * (seq_len + 1) * state_size];
+    let mut cuda_y = vec![0.0f32; batch_size * seq_len * d];
+
+    titans_mlp_forward_cuda(
+        &k_all, &v_all, &q_all, &alpha_all, &theta_all, &eta_all,
+        &m_init_all, &s_init_all,
+        &mut cuda_m, &mut cuda_s, &mut cuda_y,
+        seq_len, d, d_h, batch_size, 0, f32::MAX);
+
+    // Compare each batch element against independent CPU reference
+    let input_stride = seq_len * d;
+    let gate_stride = seq_len;
+    let init_stride = state_size;
+    let states_stride = (seq_len + 1) * state_size;
+    let y_stride = seq_len * d;
+
+    for b in 0..batch_size {
+        let (cpu_m, cpu_s, cpu_y) = cpu_mlp_inner_loop(
+            &k_all[b * input_stride..(b + 1) * input_stride],
+            &v_all[b * input_stride..(b + 1) * input_stride],
+            &q_all[b * input_stride..(b + 1) * input_stride],
+            &alpha_all[b * gate_stride..(b + 1) * gate_stride],
+            &theta_all[b * gate_stride..(b + 1) * gate_stride],
+            &eta_all[b * gate_stride..(b + 1) * gate_stride],
+            &m_init_all[b * init_stride..(b + 1) * init_stride],
+            &s_init_all[b * init_stride..(b + 1) * init_stride],
+            seq_len, d, d_h,
+            MemoryActivation::GELU, f32::MAX);
+
+        let label = format!("batch {b}");
+        check_close(&format!("{label} y"), &cuda_y[b * y_stride..(b + 1) * y_stride], &cpu_y, 1e-4);
+        check_close(&format!("{label} m"), &cuda_m[b * states_stride..(b + 1) * states_stride], &cpu_m, 1e-4);
+        check_close(&format!("{label} s"), &cuda_s[b * states_stride..(b + 1) * states_stride], &cpu_s, 1e-4);
+    }
+}
+
+/// Non-power-of-two d_hidden: d=6, expansion=3, d_h=18.
+/// Verifies the kernel handles non-aligned dimensions correctly.
+#[test]
+#[serial(cuda)]
+fn test_titans_mlp_cuda_non_pow2_d_hidden() {
+    let d = 6;
+    let expansion = 3;
+    let d_h = d * expansion; // 18 — not a power of 2
+    let seq_len = 4;
+    let layout = MLPMemoryLayout::new(2, d, expansion);
+    let state_size = layout.total_params;
+
+    let k_mem = rand_buf(seq_len * d, 200);
+    let v_mem = rand_buf(seq_len * d, 201);
+    let q_mem = rand_buf(seq_len * d, 202);
+    let alpha: Vec<f32> = vec![0.05; seq_len];
+    let theta: Vec<f32> = vec![0.01; seq_len];
+    let eta: Vec<f32> = vec![0.9; seq_len];
+    let m_initial = rand_buf(state_size, 203);
+    let s_initial = vec![0.0f32; state_size];
+
+    let (cpu_m, cpu_s, cpu_y) = cpu_mlp_inner_loop(
+        &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
+        &m_initial, &s_initial, seq_len, d, d_h,
+        MemoryActivation::GELU, f32::MAX);
+
+    let mut cuda_m = vec![0.0f32; (seq_len + 1) * state_size];
+    let mut cuda_s = vec![0.0f32; (seq_len + 1) * state_size];
+    let mut cuda_y = vec![0.0f32; seq_len * d];
+
+    titans_mlp_forward_cuda(
+        &k_mem, &v_mem, &q_mem, &alpha, &theta, &eta,
+        &m_initial, &s_initial,
+        &mut cuda_m, &mut cuda_s, &mut cuda_y,
+        seq_len, d, d_h, 1, 0, f32::MAX);
+
+    check_close("titans_mlp y (non-pow2 d_h)", &cuda_y, &cpu_y, 1e-4);
+    check_close("titans_mlp m_states (non-pow2 d_h)", &cuda_m, &cpu_m, 1e-4);
+    check_close("titans_mlp s_states (non-pow2 d_h)", &cuda_s, &cpu_s, 1e-4);
 }

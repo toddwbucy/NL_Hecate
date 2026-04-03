@@ -872,11 +872,15 @@ pub fn titans_backward_dispatch(
 
 // ── TitansLMM MLP Memory forward dispatch (Spec 75) ────────────────
 
-/// TitansLMM MLP memory forward inner loop dispatch.
+/// TitansLMM MLP memory forward inner loop — **test-only host↔device helper**.
+///
+/// Copies host buffers to device, launches `titans_mlp_forward_f32_cuda`,
+/// synchronizes, and copies results back. Forward-only — no backward kernel
+/// or OpaqueVjp registration. The backward CUDA kernel and tape wiring are
+/// Phase C scope; the production GPU path will call the FFI directly from
+/// `gpu_stacked_forward.rs` with proper tape integration.
 ///
 /// Packed L_M=2 buffer: W1[d_h,d], b1[d_h], W2[d,d_h], b2[d].
-/// CUDA kernel launched with batch_size=1 (unit-test path; stacked GPU path
-/// calls the FFI directly with batch_size > 1).
 /// activation: 0=GELU, 1=SiLU, 2=ReLU.
 #[cfg(feature = "cuda")]
 pub fn titans_mlp_forward_cuda(
@@ -894,21 +898,27 @@ pub fn titans_mlp_forward_cuda(
     seq_len: usize,
     d: usize,
     d_hidden: usize,
+    batch_size: usize,
     activation: i32,
     m_norm_max: f32,
 ) {
     let state_size = d_hidden * d + d_hidden + d * d_hidden + d;
-    let dev_km = DevBuf::new(seq_len * d);
-    let dev_vm = DevBuf::new(seq_len * d);
-    let dev_qm = DevBuf::new(seq_len * d);
-    let dev_alpha = DevBuf::new(seq_len);
-    let dev_theta = DevBuf::new(seq_len);
-    let dev_eta = DevBuf::new(seq_len);
-    let dev_minit = DevBuf::new(state_size);
-    let dev_sinit = DevBuf::new(state_size);
-    let dev_mstates = DevBuf::new((seq_len + 1) * state_size);
-    let dev_sstates = DevBuf::new((seq_len + 1) * state_size);
-    let dev_y = DevBuf::new(seq_len * d);
+    let input_total = batch_size * seq_len * d;
+    let gate_total = batch_size * seq_len;
+    let init_total = batch_size * state_size;
+    let states_total = batch_size * (seq_len + 1) * state_size;
+
+    let dev_km = DevBuf::new(input_total);
+    let dev_vm = DevBuf::new(input_total);
+    let dev_qm = DevBuf::new(input_total);
+    let dev_alpha = DevBuf::new(gate_total);
+    let dev_theta = DevBuf::new(gate_total);
+    let dev_eta = DevBuf::new(gate_total);
+    let dev_minit = DevBuf::new(init_total);
+    let dev_sinit = DevBuf::new(init_total);
+    let dev_mstates = DevBuf::new(states_total);
+    let dev_sstates = DevBuf::new(states_total);
+    let dev_y = DevBuf::new(input_total);
 
     dev_km.copy_from_host(k_mem);
     dev_vm.copy_from_host(v_mem);
@@ -932,7 +942,7 @@ pub fn titans_mlp_forward_cuda(
             dev_minit.ptr, dev_sinit.ptr,
             dev_mstates.ptr, dev_sstates.ptr, dev_y.ptr,
             seq_len as i32, d as i32, d_hidden as i32,
-            1, // batch_size = 1
+            batch_size as i32,
             input_stride as i32, m_stride as i32,
             activation, m_norm_max,
         );
