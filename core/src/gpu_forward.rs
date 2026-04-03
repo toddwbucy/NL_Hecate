@@ -25,6 +25,19 @@ use crate::conductor::Pulse;
 #[cfg(feature = "cuda")]
 static WARNED_FROZEN_MLP: AtomicBool = AtomicBool::new(false);
 
+/// Panic if a frozen TitansLMM MLP level is encountered — read-only MLP kernel
+/// not implemented. Called from gpu_cms_forward, gpu_prefill_forward, gpu_single_token_forward.
+#[cfg(feature = "cuda")]
+#[inline]
+fn panic_if_frozen_titans_mlp(cfg: &MAGConfig, level: usize) {
+    if cfg.memory_layers == 2 && matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM) {
+        panic!(
+            "Frozen TitansLMM MLP level unsupported (level {level}): \
+             read-only MLP kernel not implemented"
+        );
+    }
+}
+
 /// Returns a zeroed GPU buffer for a frozen MLP level, with a one-time warning.
 /// MLP rules (Moneta/YAAD) have context_m = [W1|W2], incompatible with
 /// gpu_memory_read_only's [d,d] matrix assumption.
@@ -803,7 +816,7 @@ pub fn gpu_cms_forward(
         // Spec 27: CUDA graph scratch always allocates full trajectory —
         // proxy levels must use the standard dispatch path for VRAM savings.
         let has_proxy = (0..cfg.k).any(|l| cfg.tape_strategy_for_level(l) == LevelTapeStrategy::Proxy);
-        let is_mlp = cfg.memory_layers >= 2
+        let is_mlp = cfg.memory_layers == 2
             && matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM);
         let can_capture = !cfg.residual
             && matches!(cfg.memory_rule, MemoryRuleKind::DeltaRule | MemoryRuleKind::TitansLMM)
@@ -993,9 +1006,8 @@ pub fn gpu_cms_forward(
             }
         } else {
             // Frozen level: read-only M @ q_mem on GPU.
-            if cfg.memory_layers >= 2 && matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM) {
-                panic!("Frozen TitansLMM MLP level unsupported (level {level}): read-only MLP kernel not implemented");
-            } else if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD) {
+            panic_if_frozen_titans_mlp(cfg, level);
+            if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD) {
                 y_per_level.push(frozen_mlp_fallback("gpu_cms_forward", level, cfg.memory_rule, bs * s * d));
                 memory_caches.push(None);
             } else {
@@ -1212,12 +1224,8 @@ pub(crate) fn gpu_memory_forward(
     // Memory M is nh × (hd × hd) instead of 1 × (d × d).
     // dd_mem = per-head state size, bs_mem = batch folded with heads.
     // Spec 75: MLP memory has larger per-head state: {W1,b1,W2,b2} packed.
-    let is_mlp_mem = cfg.memory_layers >= 2
+    let is_mlp_mem = cfg.memory_layers == 2
         && matches!(cfg.memory_rule, crate::model::MemoryRuleKind::TitansLMM);
-    if is_mlp_mem {
-        assert_eq!(cfg.memory_layers, 2,
-            "TitansLMM CUDA MLP supports exactly 2 memory layers, got {}", cfg.memory_layers);
-    }
     let dd_mem = if is_mlp_mem {
         let d_h = cfg.memory_expansion_factor * hd;
         2 * hd * d_h + d_h + hd
@@ -3244,9 +3252,8 @@ pub fn gpu_prefill_forward(
             );
             y_per_level.push(y_level);
         } else {
-            if cfg.memory_layers >= 2 && matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM) {
-                panic!("Frozen TitansLMM MLP level unsupported (level {level}): read-only MLP kernel not implemented");
-            } else if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD) {
+            panic_if_frozen_titans_mlp(cfg, level);
+            if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD) {
                 y_per_level.push(frozen_mlp_fallback("gpu_prefill_forward", level, cfg.memory_rule, s * d));
             } else {
             let y_level = gpu_memory_read_only(
@@ -3439,9 +3446,8 @@ pub fn gpu_single_token_forward(
             );
             y_per_level.push(y_level);
         } else {
-            if cfg.memory_layers >= 2 && matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM) {
-                panic!("Frozen TitansLMM MLP level unsupported (level {level}): read-only MLP kernel not implemented");
-            } else if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD) {
+            panic_if_frozen_titans_mlp(cfg, level);
+            if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD) {
                 y_per_level.push(frozen_mlp_fallback("gpu_single_token_forward", level, cfg.memory_rule, d));
             } else {
             let y_level = gpu_memory_read_only(
