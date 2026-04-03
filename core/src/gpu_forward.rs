@@ -803,8 +803,11 @@ pub fn gpu_cms_forward(
         // Spec 27: CUDA graph scratch always allocates full trajectory —
         // proxy levels must use the standard dispatch path for VRAM savings.
         let has_proxy = (0..cfg.k).any(|l| cfg.tape_strategy_for_level(l) == LevelTapeStrategy::Proxy);
+        let is_mlp = cfg.memory_layers >= 2
+            && matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM);
         let can_capture = !cfg.residual
             && matches!(cfg.memory_rule, MemoryRuleKind::DeltaRule | MemoryRuleKind::TitansLMM)
+            && !is_mlp  // Spec 75: CUDA-graph scratch/replay assumes hd×hd layout
             && !has_ckpt
             && !is_tnt_mode
             && !has_proxy;
@@ -990,9 +993,9 @@ pub fn gpu_cms_forward(
             }
         } else {
             // Frozen level: read-only M @ q_mem on GPU.
-            if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD)
-                || (cfg.memory_layers >= 2 && matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM))
-            {
+            if cfg.memory_layers >= 2 && matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM) {
+                panic!("Frozen TitansLMM MLP level unsupported (level {level}): read-only MLP kernel not implemented");
+            } else if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD) {
                 y_per_level.push(frozen_mlp_fallback("gpu_cms_forward", level, cfg.memory_rule, bs * s * d));
                 memory_caches.push(None);
             } else {
@@ -3241,9 +3244,9 @@ pub fn gpu_prefill_forward(
             );
             y_per_level.push(y_level);
         } else {
-            if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD)
-                || (cfg.memory_layers >= 2 && matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM))
-            {
+            if cfg.memory_layers >= 2 && matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM) {
+                panic!("Frozen TitansLMM MLP level unsupported (level {level}): read-only MLP kernel not implemented");
+            } else if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD) {
                 y_per_level.push(frozen_mlp_fallback("gpu_prefill_forward", level, cfg.memory_rule, s * d));
             } else {
             let y_level = gpu_memory_read_only(
@@ -3436,9 +3439,9 @@ pub fn gpu_single_token_forward(
             );
             y_per_level.push(y_level);
         } else {
-            if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD)
-                || (cfg.memory_layers >= 2 && matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM))
-            {
+            if cfg.memory_layers >= 2 && matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM) {
+                panic!("Frozen TitansLMM MLP level unsupported (level {level}): read-only MLP kernel not implemented");
+            } else if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD) {
                 y_per_level.push(frozen_mlp_fallback("gpu_single_token_forward", level, cfg.memory_rule, d));
             } else {
             let y_level = gpu_memory_read_only(
