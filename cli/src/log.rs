@@ -35,6 +35,8 @@ impl MetricsLogger {
         level_firings: &[usize],
         cms_diag: Option<&CmsDiagnostics>,
         total_tokens: usize,
+        tokens_this_step: usize,
+        accum_steps: usize,
     ) {
         let ppl = (loss as f64).exp();
         let segments = total_tokens / TOKENS_PER_SEGMENT;
@@ -43,6 +45,8 @@ impl MetricsLogger {
             "step": step,
             "segments": segments,
             "total_tokens": total_tokens,
+            "tok_per_step": tokens_this_step,
+            "accum_steps": accum_steps,
             "loss": loss,
             "ppl": ppl,
             "grad_norm": grad_norm,

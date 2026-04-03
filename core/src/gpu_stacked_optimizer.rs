@@ -452,9 +452,10 @@ pub fn gpu_stacked_per_block_grad_norms(
     PerBlockGradNorms { block_norms, l0_block_norms }
 }
 
-/// Scale all stacked gradient buffers by a constant factor (for clipping).
+/// Scale all stacked gradient buffers by a constant factor.
+/// Spec 76: now public for gradient averaging after accumulation.
 #[cfg(feature = "cuda")]
-fn gpu_stacked_scale_grads_ex(grads: &mut GpuStackedGrads, scale: f32, skip_embed: bool) {
+pub fn gpu_stacked_scale_grads_ex(grads: &mut GpuStackedGrads, scale: f32, skip_embed: bool) {
     let scale_buf = |g: &mut GpuBuf<f32>| {
         let n = g.len() as i32;
         if n == 0 { return; }

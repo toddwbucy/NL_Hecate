@@ -1,6 +1,9 @@
 /// Spec 70 — Unified CLI Loop: one core method, output handlers.
+/// Spec 76 — Split into step_micro() + step_update() for gradient accumulation.
 ///
-/// `step()` is the atomic NLM operation: forward → backward → update → logits.
+/// `step_micro()` runs forward → backward only (immutable weights).
+/// `step_update()` runs optimizer on accumulated gradients (mutates weights).
+/// `step()` is a convenience wrapper: step_micro() + step_update() in one call.
 /// `generate()` is autoregressive sampling via step() with deferred backward.
 ///
 /// Every token the model sees goes through step(). There is no inference-without-learning.
@@ -18,7 +21,7 @@ use nl_hecate_core::gpu_stacked_forward::{
     StackedDecodeWorkspace, ActivationWindow,
 };
 #[cfg(feature = "cuda")]
-use nl_hecate_core::gpu_stacked_backward::gpu_stacked_backward;
+use nl_hecate_core::gpu_stacked_backward::{gpu_stacked_backward, GpuStackedGrads};
 #[cfg(feature = "cuda")]
 use nl_hecate_core::gpu_stacked_optimizer::{
     GpuStackedAdamWState, gpu_stacked_adamw_update, gpu_stacked_sync_embed_weights,
@@ -41,6 +44,16 @@ use crate::sample::sample_token;
 #[cfg(feature = "cuda")]
 pub type BlockLevelGnorms = Vec<Vec<f32>>;
 
+/// Result of step_micro(): forward → backward only. No optimizer.
+#[cfg(feature = "cuda")]
+pub struct MicroStepResult {
+    pub logits: Vec<f32>,           // [vocab_size] — last token's logits
+    pub loss: f32,
+    pub grads: GpuStackedGrads,
+    pub block_level_gnorms: BlockLevelGnorms,
+    pub pulse: Pulse,               // snapshot for logging
+}
+
 /// Result of a single step: forward → backward → update.
 #[cfg(feature = "cuda")]
 pub struct StepResult {
@@ -60,12 +73,115 @@ pub struct GenerateResult {
     pub block_level_gnorms: BlockLevelGnorms,
 }
 
-// ── Core: step() ────────────────────────────────────────────────────
+// ── Core: step_micro() ─────────────────────────────────────────────
+
+/// Spec 76: Forward + backward only. Returns gradients. Does NOT run optimizer.
+///
+/// Weights are immutable during micro-steps — gradients accumulate across
+/// multiple calls before one optimizer step fires.
+#[cfg(feature = "cuda")]
+pub fn step_micro(
+    gpu_params: &GpuStackedParams,     // immutable — weights don't change during accumulation
+    mag_cfg: &MAGConfig,
+    gpu_context: &mut GpuStackedContext,
+    tokens: &[usize],
+    targets: &[usize],
+    conductor: &mut Conductor,
+    profiler: &mut Option<GpuProfiler>,
+    log_this: bool,
+) -> MicroStepResult {
+    if let Some(ref mut p) = profiler { p.step_start(); }
+
+    // Spec 71: full-sequence forward for build mode (s > 1).
+    let (last_logits, cache) = gpu_stacked_forward_sequence(
+        gpu_params, mag_cfg, tokens, targets,
+        conductor, gpu_context,
+    );
+
+    // Spec 72: GPU-side cross-entropy
+    let v = mag_cfg.swa.vocab_size;
+    let loss = gpu_cross_entropy_loss(&cache.logits, &cache.target_ids_gpu, targets, v, tokens.len());
+
+    // Capture pulse before backward consumes it
+    let pulse = cache.pulse.clone();
+
+    let grads = gpu_stacked_backward(
+        gpu_params, mag_cfg, &cache, profiler, log_this,
+    );
+
+    // Extract per-level gradient norms
+    let block_level_gnorms: BlockLevelGnorms = grads.blocks.iter()
+        .map(|bg| bg.level_output_gnorms.clone())
+        .collect();
+
+    if let Some(ref mut p) = profiler { p.step_stop(); }
+
+    MicroStepResult { logits: last_logits, loss, grads, block_level_gnorms, pulse }
+}
+
+// ── Core: step_update() ────────────────────────────────────────────
+
+/// Spec 76: Optimizer step on accumulated gradients. Mutates weights.
+///
+/// Called once per logical step after all micro-steps have accumulated.
+/// Handles: grad clip → AdamW → weight tying → M-norm tracking → level resets.
+#[cfg(feature = "cuda")]
+pub fn step_update(
+    gpu_params: &mut GpuStackedParams,
+    grads: &mut GpuStackedGrads,
+    adamw_state: &mut Option<GpuStackedAdamWState>,
+    pulse: &Pulse,
+    opt: &OptimizerConfig,
+    lr: f32,
+    max_grad_norm: f32,
+    d: usize,
+    v: usize,
+    reset_intervals: &[usize],
+    fire_counts: &mut [usize],
+    gpu_context: &mut GpuStackedContext,
+    profiler: &mut Option<GpuProfiler>,
+    log_this: bool,
+) -> f32 {
+    // Dispatch optimizer by type
+    let gnorm = match opt.optimizer_type() {
+        "adamw" => {
+            if adamw_state.is_none() {
+                *adamw_state = Some(GpuStackedAdamWState::from_params(gpu_params));
+            }
+            let state = adamw_state.as_mut().unwrap();
+            gpu_stacked_adamw_update(
+                gpu_params, grads, state,
+                pulse,
+                lr, opt.beta1(), opt.beta2(), 1e-8,
+                opt.weight_decay(), max_grad_norm,
+                false, // freeze_embed
+                profiler,
+            )
+        }
+        other => {
+            panic!("Unsupported optimizer type: \"{other}\". Only \"adamw\" is currently implemented.");
+        }
+    };
+
+    // Weight tying
+    gpu_stacked_sync_embed_weights(gpu_params, d, v);
+
+    // Spec 64: capture pre-reset M norms on log steps (before reset zeros the buffers)
+    if log_this {
+        gpu_context.update_m_norm_tracking();
+    }
+
+    // Selective periodic reset (spec 57)
+    maybe_reset_levels(pulse, reset_intervals, fire_counts, gpu_context);
+
+    gnorm
+}
+
+// ── Core: step() — convenience wrapper ─────────────────────────────
 
 /// Process a chunk of tokens: forward → backward → update.
-/// This is the ONE thing an NLM does. Every token goes through this.
-///
-/// Returns StepResult with logits (for sampling), loss, grad_norm, and per-block gnorms.
+/// Convenience wrapper around step_micro() + step_update() for callers
+/// that don't need gradient accumulation (generate, think_rounds, etc.).
 #[cfg(feature = "cuda")]
 pub fn step(
     gpu_params: &mut GpuStackedParams,
@@ -85,66 +201,18 @@ pub fn step(
     profiler: &mut Option<GpuProfiler>,
     log_this: bool,
 ) -> StepResult {
-    if let Some(ref mut p) = profiler { p.step_start(); }
-
-    // Spec 71: full-sequence forward for build mode (s > 1).
-    // Bypasses ActivationWindow — returns GpuStackedCache directly.
-    // Conductor advances once (one optimizer step), not per-token.
-    let (last_logits, cache) = gpu_stacked_forward_sequence(
-        gpu_params, mag_cfg, tokens, targets,
-        conductor, gpu_context,
+    let MicroStepResult { logits, loss, mut grads, block_level_gnorms, pulse } = step_micro(
+        gpu_params, mag_cfg, gpu_context,
+        tokens, targets, conductor, profiler, log_this,
     );
 
-    // Spec 72: GPU-side cross-entropy (4-byte D2H instead of s×v×4 host copy)
-    let loss = gpu_cross_entropy_loss(&cache.logits, &cache.target_ids_gpu, targets, v, tokens.len());
-
-    // Capture pulse before backward consumes it
-    let pulse = cache.pulse.clone();
-
-    let mut grads = gpu_stacked_backward(
-        gpu_params, mag_cfg, &cache, profiler, log_this,
+    let gnorm = step_update(
+        gpu_params, &mut grads, adamw_state,
+        &pulse, opt, lr, max_grad_norm, d, v,
+        reset_intervals, fire_counts, gpu_context, profiler, log_this,
     );
 
-    // Extract per-level gradient norms before optimizer consumes grads
-    let block_level_gnorms: BlockLevelGnorms = grads.blocks.iter()
-        .map(|bg| bg.level_output_gnorms.clone())
-        .collect();
-
-    // Dispatch optimizer by type
-    let gnorm = match opt.optimizer_type() {
-        "adamw" => {
-            if adamw_state.is_none() {
-                *adamw_state = Some(GpuStackedAdamWState::from_params(gpu_params));
-            }
-            let state = adamw_state.as_mut().unwrap();
-            gpu_stacked_adamw_update(
-                gpu_params, &mut grads, state,
-                &cache.pulse,
-                lr, opt.beta1(), opt.beta2(), 1e-8,
-                opt.weight_decay(), max_grad_norm,
-                false, // freeze_embed
-                profiler,
-            )
-        }
-        other => {
-            panic!("Unsupported optimizer type: \"{other}\". Only \"adamw\" is currently implemented.");
-        }
-    };
-
-    if let Some(ref mut p) = profiler { p.step_stop(); }
-
-    // Weight tying
-    gpu_stacked_sync_embed_weights(gpu_params, d, v);
-
-    // Spec 64: capture pre-reset M norms on log steps (before reset zeros the buffers)
-    if log_this {
-        gpu_context.update_m_norm_tracking();
-    }
-
-    // Selective periodic reset (spec 57)
-    maybe_reset_levels(&pulse, reset_intervals, fire_counts, gpu_context);
-
-    StepResult { logits: last_logits, loss, grad_norm: gnorm, block_level_gnorms, pulse }
+    StepResult { logits, loss, grad_norm: gnorm, block_level_gnorms, pulse }
 }
 
 // ── Core: generate() ────────────────────────────────────────────────

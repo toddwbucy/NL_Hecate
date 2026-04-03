@@ -13,8 +13,10 @@ use nl_hecate_core::parallel::{ParallelConfig, ParallelStrategy};
 #[cfg(feature = "cuda")]
 use nl_hecate_core::gpu_params::{GpuStackedParams, GpuStackedContext};
 #[cfg(feature = "cuda")]
+use nl_hecate_core::gpu_stacked_backward::{gpu_accumulate_grads, GpuStackedGrads};
+#[cfg(feature = "cuda")]
 use nl_hecate_core::gpu_stacked_optimizer::{
-    GpuStackedAdamWState, gpu_read_grad_norm,
+    GpuStackedAdamWState, gpu_read_grad_norm, gpu_stacked_scale_grads_ex,
 };
 #[cfg(feature = "cuda")]
 use nl_hecate_core::gpu_profiler::GpuProfiler;
@@ -24,7 +26,7 @@ use crate::data::BpeTokenStream;
 #[cfg(feature = "cuda")]
 use crate::probe::run_inline_probes;
 #[cfg(feature = "cuda")]
-use crate::step::{step, generate, BlockLevelGnorms};
+use crate::step::{step, step_micro, step_update, generate, BlockLevelGnorms};
 use crate::log::{MetricsLogger, CmsDiagnostics, CmsTapeLogger, TOKENS_PER_SEGMENT};
 
 /// Cosine annealing with linear warmup.
@@ -545,9 +547,14 @@ pub fn feed(config_path: &str, resume: bool) {
                 // Clear resume cursors after first use (subsequent phases start fresh)
                 resume_cursors.clear();
 
+                let accum_steps = phase.accum_steps.unwrap_or(cfg.build.accum_steps);
+
                 let total_tokens_phase = loaders[0].total_tokens;
-                eprintln!("  Data:  {} tokens, batch_size={batch_size}, seq_len={phase_seq_len}",
+                let tok_per_logical_step = accum_steps * batch_size * phase_seq_len;
+                eprintln!("  Data:  {} tokens, batch_size={batch_size}, accum_steps={accum_steps}, seq_len={phase_seq_len}",
                     fmt_num(total_tokens_phase));
+                eprintln!("  Eff:   {} tokens per logical step",
+                    fmt_num(tok_per_logical_step));
                 eprintln!("  Opt:   {} lr={} wd={} gnorm_clip={}",
                     opt.optimizer_type(), opt.lr(), opt.weight_decay(), max_grad_norm);
 
@@ -557,25 +564,13 @@ pub fn feed(config_path: &str, resume: bool) {
                 for phase_step in 0..*total_phase_steps {
                     let lr = cosine_lr(phase_step, warmup_steps, *total_phase_steps, opt.lr());
 
-                    // Assemble batch
-                    let mut all_input = Vec::with_capacity(batch_size * phase_seq_len);
-                    let mut all_target = Vec::with_capacity(batch_size * phase_seq_len);
-                    for loader in &mut loaders {
-                        let (inp, tgt) = loader.next_chunk(phase_seq_len).unwrap_or_else(|| {
-                            eprintln!("ERROR: data exhausted");
-                            std::process::exit(1);
-                        });
-                        all_input.extend_from_slice(&inp);
-                        all_target.extend_from_slice(&tgt);
-                    }
-
-                    // Capture pulse snapshot for logging (conductor advances inside step())
+                    // Capture pulse snapshot for logging (conductor advances inside step_micro())
                     let pulse = conductor.pulse();
 
                     // Spec 63: compute log_this early so backward can skip gnorm readback
                     let log_this = log_every > 0 && phase_step % log_every == 0;
 
-                    // Forward + Backward + Optimizer
+                    // Profiler setup
                     #[cfg(feature = "cuda")]
                     let do_profile = profile_every > 0 && phase_step > 0
                         && phase_step % profile_every == 0;
@@ -586,50 +581,85 @@ pub fn feed(config_path: &str, resume: bool) {
                         None
                     };
 
-                    // Process each batch sample sequentially through the unified forward path.
-                    // NOTE: This is intentionally sequential — gpu_stacked_forward_tokens
-                    // processes tokens one-at-a-time through ActivationWindow, so each
-                    // sample gets its own forward→backward→update pass. This matches the
-                    // NL paradigm (forward IS optimization) but means batch_size > 1
-                    // doesn't benefit from GPU-parallel batching.
-                    // TODO: If throughput for batch_size > 1 becomes critical, extend
-                    // the unified path to support batched token processing.
+                    // ── Spec 76: Gradient accumulation loop ──────────────────────
+                    // Accumulate gradients across accum_steps micro-steps, each with
+                    // batch_size samples. ONE optimizer step on averaged gradients.
                     #[cfg(feature = "cuda")]
                     let (loss, _gnorm_deferred, block_level_gnorms) = {
                         let mut total_loss = 0.0f32;
-                        let mut acc_gnorm = 0.0f32;
+                        let mut total_micro_samples = 0usize;
                         let mut acc_gnorms: BlockLevelGnorms = Vec::new();
-                        for sample_idx in 0..batch_size {
-                            let start = sample_idx * phase_seq_len;
-                            let end = start + phase_seq_len;
-                            let result = step(
-                                &mut gpu_params, &mag_cfg, &mut gpu_context,
-                                &mut adamw_state,
-                                &all_input[start..end], &all_target[start..end],
-                                &mut conductor,
-                                opt, lr, max_grad_norm,
-                                d, v,
-                                &reset_intervals, &mut fire_counts,
-                                &mut profiler,
-                                log_this || phase_step == 0,
-                            );
-                            total_loss += result.loss;
-                            acc_gnorm += result.grad_norm;
-                            if acc_gnorms.is_empty() {
-                                acc_gnorms = result.block_level_gnorms;
-                            } else {
-                                for (acc, val) in acc_gnorms.iter_mut().zip(result.block_level_gnorms.iter()) {
-                                    for (a, v) in acc.iter_mut().zip(val.iter()) {
-                                        *a += v;
+                        // First micro-step produces the accumulator (grads from backward)
+                        let mut grad_accum: Option<GpuStackedGrads> = None;
+
+                        for _micro in 0..accum_steps {
+                            // Assemble fresh batch for this micro-step (no data replay)
+                            let mut all_input = Vec::with_capacity(batch_size * phase_seq_len);
+                            let mut all_target = Vec::with_capacity(batch_size * phase_seq_len);
+                            for loader in &mut loaders {
+                                let (inp, tgt) = loader.next_chunk(phase_seq_len).unwrap_or_else(|| {
+                                    eprintln!("ERROR: data exhausted");
+                                    std::process::exit(1);
+                                });
+                                all_input.extend_from_slice(&inp);
+                                all_target.extend_from_slice(&tgt);
+                            }
+
+                            // Each batch sample: forward + backward (NO optimizer)
+                            for sample_idx in 0..batch_size {
+                                let start = sample_idx * phase_seq_len;
+                                let end = start + phase_seq_len;
+
+                                let micro_result = step_micro(
+                                    &gpu_params, &mag_cfg, &mut gpu_context,
+                                    &all_input[start..end], &all_target[start..end],
+                                    &mut conductor,
+                                    &mut profiler,
+                                    log_this && total_micro_samples == 0,
+                                );
+
+                                // Accumulate gradients
+                                match grad_accum {
+                                    None => {
+                                        // First micro-step: take ownership of grads as accumulator
+                                        acc_gnorms = micro_result.block_level_gnorms;
+                                        grad_accum = Some(micro_result.grads);
+                                    }
+                                    Some(ref mut accum) => {
+                                        gpu_accumulate_grads(accum, &micro_result.grads);
+                                        // Accumulate gnorms for diagnostics
+                                        for (acc, val) in acc_gnorms.iter_mut().zip(micro_result.block_level_gnorms.iter()) {
+                                            for (a, v) in acc.iter_mut().zip(val.iter()) {
+                                                *a += v;
+                                            }
+                                        }
                                     }
                                 }
+
+                                total_loss += micro_result.loss;
+                                total_micro_samples += 1;
                             }
                         }
-                        let bs_f = batch_size as f32;
+
+                        let n_samples_f = total_micro_samples as f32;
+                        // Average gnorms across all micro-step samples
                         for block in acc_gnorms.iter_mut() {
-                            for g in block.iter_mut() { *g /= bs_f; }
+                            for g in block.iter_mut() { *g /= n_samples_f; }
                         }
-                        (total_loss / bs_f, acc_gnorm / bs_f, acc_gnorms)
+
+                        // Scale accumulated gradients: average over all micro-steps × batch samples
+                        let mut grads = grad_accum.expect("at least one micro-step");
+                        gpu_stacked_scale_grads_ex(&mut grads, 1.0 / n_samples_f, false);
+
+                        // ONE optimizer step on averaged gradients
+                        let gnorm = step_update(
+                            &mut gpu_params, &mut grads, &mut adamw_state,
+                            &pulse, opt, lr, max_grad_norm, d, v,
+                            &reset_intervals, &mut fire_counts,
+                            &mut gpu_context, &mut profiler, log_this,
+                        );
+
+                        (total_loss / n_samples_f, gnorm, acc_gnorms)
                     };
 
                     // Collect and log profile if active
@@ -661,8 +691,8 @@ pub fn feed(config_path: &str, resume: bool) {
                         prof.reset();
                     }
 
-                    // conductor.advance() removed — now happens per-token inside step()
-                    let tokens_this_step = batch_size * phase_seq_len;
+                    // Spec 76: tokens per logical step = accum_steps × batch_size × seq_len
+                    let tokens_this_step = accum_steps * batch_size * phase_seq_len;
                     step_tokens += tokens_this_step;
                     total_tokens_seen += tokens_this_step;
                     global_step += 1;
@@ -678,7 +708,7 @@ pub fn feed(config_path: &str, resume: bool) {
 
                     // Logging + CMS diagnostics (gated to log_every to avoid per-step GPU stalls)
                     if log_this || phase_step == 0 {
-                        // Spec 64: update_m_norm_tracking() now called inside step(),
+                        // Spec 64: update_m_norm_tracking() now called inside step_update(),
                         // before maybe_reset_levels(), so we read pre-reset norms.
 
                         #[cfg(feature = "cuda")]
@@ -725,6 +755,8 @@ pub fn feed(config_path: &str, resume: bool) {
                             #[cfg(not(feature = "cuda"))]
                             None,
                             total_tokens_seen,
+                            tokens_this_step,
+                            accum_steps,
                         );
                     }
 
@@ -849,6 +881,8 @@ pub fn feed(config_path: &str, resume: bool) {
                         #[cfg(not(feature = "cuda"))]
                         None,
                         total_tokens_seen,
+                        phase_seq_len, // think_rounds: batch_size=1, accum_steps=1
+                        1, // no accumulation in think_rounds
                     );
 
                     if loss.is_nan() || loss.is_infinite() {

@@ -152,6 +152,9 @@ pub struct BuildConfig {
     pub theta_ceil: Option<Vec<f32>>,
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    /// Spec 76: gradient accumulation micro-steps. Effective batch = accum_steps × batch_size.
+    #[serde(default = "default_accum_steps")]
+    pub accum_steps: usize,
     #[serde(default = "default_log_every")]
     pub log_every: usize,
     #[serde(default = "default_save_every")]
@@ -230,6 +233,7 @@ pub struct PhaseConfig {
     // Per-phase overrides (revert to build defaults after phase completes)
     pub optimizer: Option<OptimizerConfig>,
     pub batch_size: Option<usize>,
+    pub accum_steps: Option<usize>,
     pub seq_len: Option<usize>,
     pub save_every: Option<usize>,
     pub log_every: Option<usize>,
@@ -265,6 +269,7 @@ fn default_lr() -> f32 { 0.0003 }
 fn default_steps() -> usize { 10000 }
 fn default_max_grad_norm() -> f32 { 1.0 }
 fn default_batch_size() -> usize { 1 }
+fn default_accum_steps() -> usize { 1 }
 fn default_log_every() -> usize { 8 }
 fn default_save_every() -> usize { 1000 }
 fn default_seed() -> u64 { 42 }
@@ -315,6 +320,7 @@ impl Config {
         let mut cfg: Config = serde_json::from_str(text)
             .map_err(|e| format!("Failed to parse config: {e}"))?;
         Self::apply_legacy_compat(&mut cfg);
+        Self::validate(&cfg)?;
         Ok(cfg)
     }
 
@@ -325,7 +331,23 @@ impl Config {
             .map_err(|e| format!("Failed to parse config {path}: {e}"))?;
 
         Self::apply_legacy_compat(&mut cfg);
+        Self::validate(&cfg)?;
         Ok(cfg)
+    }
+
+    fn validate(cfg: &Config) -> Result<(), String> {
+        if cfg.build.accum_steps < 1 {
+            return Err("accum_steps must be >= 1".into());
+        }
+        if let Some(ref phases) = cfg.phases {
+            for (i, phase) in phases.iter().enumerate() {
+                if phase.accum_steps == Some(0) {
+                    let label = phase.label.as_deref().unwrap_or(&phase.data);
+                    return Err(format!("phase {i} ({label}): accum_steps must be >= 1"));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Apply backward-compat: promote flat build.lr/beta1/etc into the optimizer block,
@@ -392,6 +414,7 @@ impl Config {
                     label: phase.label.clone().unwrap_or_else(|| phase.data.clone()),
                     optimizer: merged_optimizer,
                     batch_size: phase.batch_size,
+                    accum_steps: phase.accum_steps,
                     seq_len: phase.seq_len,
                     save_every: phase.save_every,
                     log_every: phase.log_every,
@@ -414,6 +437,7 @@ impl Config {
                 label: "default".into(),
                 optimizer: None,
                 batch_size: None,
+                accum_steps: None,
                 seq_len: None,
                 save_every: None,
                 log_every: None,
@@ -435,6 +459,7 @@ pub struct ResolvedPhase {
     pub label: String,
     pub optimizer: Option<OptimizerConfig>,
     pub batch_size: Option<usize>,
+    pub accum_steps: Option<usize>,
     pub seq_len: Option<usize>,
     pub save_every: Option<usize>,
     pub log_every: Option<usize>,
