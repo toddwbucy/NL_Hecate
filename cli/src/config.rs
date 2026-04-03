@@ -320,6 +320,7 @@ impl Config {
         let mut cfg: Config = serde_json::from_str(text)
             .map_err(|e| format!("Failed to parse config: {e}"))?;
         Self::apply_legacy_compat(&mut cfg);
+        Self::validate(&cfg)?;
         Ok(cfg)
     }
 
@@ -330,7 +331,15 @@ impl Config {
             .map_err(|e| format!("Failed to parse config {path}: {e}"))?;
 
         Self::apply_legacy_compat(&mut cfg);
+        Self::validate(&cfg)?;
         Ok(cfg)
+    }
+
+    fn validate(cfg: &Config) -> Result<(), String> {
+        if cfg.build.accum_steps < 1 {
+            return Err("accum_steps must be >= 1".into());
+        }
+        Ok(())
     }
 
     /// Apply backward-compat: promote flat build.lr/beta1/etc into the optimizer block,
