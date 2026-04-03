@@ -502,6 +502,10 @@ pub fn titans_lmm_opaque_backward(
         q_conv_cache: q_conv_cache_restored,
         fm_z_k_mem,
         fm_z_q_mem,
+        mlp_layout: None,
+        mlp_activation: crate::model::MemoryActivation::GELU,
+        mlp_k_pre_acts: Vec::new(),
+        mlp_k_activations: Vec::new(),
     };
 
     let theta_floor = if saved[0].len() > 6 { saved[0][5] } else { 0.0 };
@@ -518,6 +522,9 @@ pub fn titans_lmm_opaque_backward(
         theta_ceil,
         m_norm_max: f32::MAX,
         feature_map: fm_kind,
+        memory_layers: 1,
+        memory_expansion_factor: 4,
+        memory_activation: crate::model::MemoryActivation::GELU,
     };
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
@@ -1957,6 +1964,7 @@ mod tests {
             theta_ceil: f32::MAX,
             m_norm_max: f32::MAX,
             feature_map: FMKind::RandomFourier { sigma: 1.0 },
+            memory_layers: 1, memory_expansion_factor: 4, memory_activation: crate::model::MemoryActivation::GELU,
         };
         assert_opaque_roundtrip_with_params(&rule, &params, d, 3);
     }
@@ -1977,6 +1985,7 @@ mod tests {
             theta_ceil: f32::MAX,
             m_norm_max: f32::MAX,
             feature_map: FMKind::ELU,
+            memory_layers: 1, memory_expansion_factor: 4, memory_activation: crate::model::MemoryActivation::GELU,
         };
         assert_opaque_roundtrip_with_params(&rule, &params, d, 3);
     }
@@ -1994,6 +2003,7 @@ mod tests {
             theta_ceil: f32::MAX,
             m_norm_max: f32::MAX,
             feature_map: crate::feature_map::FeatureMapKind::Identity,
+            memory_layers: 1, memory_expansion_factor: 4, memory_activation: crate::model::MemoryActivation::GELU,
         };
         assert_opaque_roundtrip(&rule, 4, 3);
     }

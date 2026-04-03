@@ -24,10 +24,298 @@ use crate::tensor::{
     outer_product_f32, frobenius_dot_f32,
 };
 use crate::retention::l2_apply_retention;
-use crate::model::MemoryLevelParams;
+use crate::model::{MemoryLevelParams, MemoryActivation};
 use crate::moneta::{apply_attentional_bias, apply_attentional_bias_backward};
 use crate::delta_rule::{MemoryRule, MemoryState, Gates, MemoryError};
 use crate::feature_map::{self, FeatureMapKind};
+
+// ══════════════════════════════════════════════════════════════════════
+// MLP Memory — Deep Neural Memory (spec 75, Titans §3.1 Eqs 8-15)
+// ══════════════════════════════════════════════════════════════════════
+
+/// Describes the flat-buffer layout for an L_M-layer MLP memory.
+///
+/// All weight and bias parameters are packed into a single contiguous
+/// `Vec<f32>` so that momentum/retention/M-norm can operate element-wise
+/// on the entire buffer, identical to the linear d×d case.
+#[derive(Clone, Debug)]
+pub struct MLPMemoryLayout {
+    pub n_layers: usize,
+    pub d: usize,
+    pub d_h: usize,
+    pub total_params: usize,
+    pub layers: Vec<MLPLayerDesc>,
+}
+
+/// Per-layer descriptor within the flat buffer.
+#[derive(Clone, Debug)]
+pub struct MLPLayerDesc {
+    pub w_offset: usize,
+    pub w_rows: usize,
+    pub w_cols: usize,
+    pub b_offset: usize,
+    pub b_size: usize,
+}
+
+impl MLPMemoryLayout {
+    /// Build layout for L_M layers with given d (head_dim) and expansion factor.
+    ///
+    /// Layer shapes for L_M=2: W₁[d_h, d], b₁[d_h], W₂[d, d_h], b₂[d].
+    /// General: layer 1 expands d→d_h, layers 2..L-1 are d_h→d_h, layer L projects d_h→d.
+    pub fn new(n_layers: usize, d: usize, expansion_factor: usize) -> Self {
+        assert!(n_layers >= 2, "MLP memory requires at least 2 layers, got {n_layers}");
+        let d_h = expansion_factor * d;
+        let mut layers = Vec::with_capacity(n_layers);
+        let mut offset = 0;
+
+        for l in 0..n_layers {
+            let (rows, cols) = if l == 0 {
+                (d_h, d) // expand: d → d_h
+            } else if l == n_layers - 1 {
+                (d, d_h) // project: d_h → d
+            } else {
+                (d_h, d_h) // hidden: d_h → d_h
+            };
+            let w_size = rows * cols;
+            let w_offset = offset;
+            offset += w_size;
+            let b_offset = offset;
+            let b_size = rows;
+            offset += b_size;
+            layers.push(MLPLayerDesc { w_offset, w_rows: rows, w_cols: cols, b_offset, b_size });
+        }
+
+        MLPMemoryLayout { n_layers, d, d_h, total_params: offset, layers }
+    }
+
+    /// Weight slice for layer l within a state buffer at the given base offset.
+    #[inline]
+    pub fn w_slice<'a>(&self, buf: &'a [f32], base: usize, l: usize) -> &'a [f32] {
+        let desc = &self.layers[l];
+        &buf[base + desc.w_offset..base + desc.w_offset + desc.w_rows * desc.w_cols]
+    }
+
+    /// Mutable weight slice.
+    #[inline]
+    pub fn w_slice_mut<'a>(&self, buf: &'a mut [f32], base: usize, l: usize) -> &'a mut [f32] {
+        let desc = &self.layers[l];
+        &mut buf[base + desc.w_offset..base + desc.w_offset + desc.w_rows * desc.w_cols]
+    }
+
+    /// Bias slice for layer l.
+    #[inline]
+    pub fn b_slice<'a>(&self, buf: &'a [f32], base: usize, l: usize) -> &'a [f32] {
+        let desc = &self.layers[l];
+        &buf[base + desc.b_offset..base + desc.b_offset + desc.b_size]
+    }
+
+    /// Mutable bias slice.
+    #[inline]
+    pub fn b_slice_mut<'a>(&self, buf: &'a mut [f32], base: usize, l: usize) -> &'a mut [f32] {
+        let desc = &self.layers[l];
+        &mut buf[base + desc.b_offset..base + desc.b_offset + desc.b_size]
+    }
+}
+
+// ── Activation functions and derivatives ────────────────────────────
+
+/// GELU approximation matching PyTorch: 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x³)))
+#[inline]
+fn gelu_f32(x: f32) -> f32 {
+    let c = 0.7978845608028654f32; // sqrt(2/pi)
+    let inner = c * (x + 0.044715 * x * x * x);
+    0.5 * x * (1.0 + inner.tanh())
+}
+
+/// GELU derivative: Φ(x) + x·φ(x), approximated via the tanh form.
+#[inline]
+fn gelu_derivative_f32(x: f32) -> f32 {
+    let c = 0.7978845608028654f32;
+    let a = 0.044715f32;
+    let inner = c * (x + a * x * x * x);
+    let t = inner.tanh();
+    let sech2 = 1.0 - t * t;
+    let d_inner = c * (1.0 + 3.0 * a * x * x);
+    0.5 * (1.0 + t) + 0.5 * x * sech2 * d_inner
+}
+
+/// SiLU (Swish): x * sigmoid(x)
+#[inline]
+fn silu_f32(x: f32) -> f32 {
+    x * sigmoid_f32(x)
+}
+
+/// SiLU derivative: σ(x) + x·σ(x)·(1-σ(x)) = σ(x)(1 + x(1-σ(x)))
+#[inline]
+fn silu_derivative_f32(x: f32) -> f32 {
+    let s = sigmoid_f32(x);
+    s * (1.0 + x * (1.0 - s))
+}
+
+/// ReLU: max(0, x)
+#[inline]
+fn relu_f32(x: f32) -> f32 {
+    x.max(0.0)
+}
+
+/// ReLU derivative: 1 if x > 0, else 0
+#[inline]
+fn relu_derivative_f32(x: f32) -> f32 {
+    if x > 0.0 { 1.0 } else { 0.0 }
+}
+
+/// Apply activation function element-wise.
+fn apply_activation(dst: &mut [f32], activation: MemoryActivation) {
+    match activation {
+        MemoryActivation::GELU => {
+            for x in dst.iter_mut() { *x = gelu_f32(*x); }
+        }
+        MemoryActivation::SiLU => {
+            for x in dst.iter_mut() { *x = silu_f32(*x); }
+        }
+        MemoryActivation::ReLU => {
+            for x in dst.iter_mut() { *x = relu_f32(*x); }
+        }
+    }
+}
+
+/// Apply activation derivative element-wise, given pre-activation values.
+fn apply_activation_derivative(dst: &mut [f32], pre_act: &[f32], activation: MemoryActivation) {
+    match activation {
+        MemoryActivation::GELU => {
+            for (d, &p) in dst.iter_mut().zip(pre_act.iter()) {
+                *d *= gelu_derivative_f32(p);
+            }
+        }
+        MemoryActivation::SiLU => {
+            for (d, &p) in dst.iter_mut().zip(pre_act.iter()) {
+                *d *= silu_derivative_f32(p);
+            }
+        }
+        MemoryActivation::ReLU => {
+            for (d, &p) in dst.iter_mut().zip(pre_act.iter()) {
+                *d *= relu_derivative_f32(p);
+            }
+        }
+    }
+}
+
+// ── MLP forward / inner-loop backward ───────────────────────────────
+
+/// MLP forward pass: evaluate M(input) given weights in flat buffer.
+///
+/// Returns the output vector (d-dim) and per-layer pre-activation values
+/// needed for the analytical backward.
+///
+/// `state_buf`: flat buffer of MLP params at base offset `base`.
+/// `input`: d-dim input vector (k_t or q_t).
+/// `layout`: MLP buffer layout.
+/// `activation`: which nonlinearity.
+///
+/// Returns (output[d], pre_activations[n_layers], activations[n_layers+1])
+/// where activations[0] = input and activations[l] = σ(W_l @ activations[l-1] + b_l).
+pub fn mlp_forward(
+    state_buf: &[f32],
+    base: usize,
+    input: &[f32],
+    layout: &MLPMemoryLayout,
+    activation: MemoryActivation,
+) -> (Vec<f32>, Vec<Vec<f32>>, Vec<Vec<f32>>) {
+    let n = layout.n_layers;
+    let mut activations: Vec<Vec<f32>> = Vec::with_capacity(n + 1);
+    let mut pre_acts: Vec<Vec<f32>> = Vec::with_capacity(n);
+    activations.push(input.to_vec());
+
+    for l in 0..n {
+        let desc = &layout.layers[l];
+        let w = layout.w_slice(state_buf, base, l);
+        let b = layout.b_slice(state_buf, base, l);
+        let h_prev = &activations[l];
+
+        // pre_act = W @ h_prev + b
+        let out_dim = desc.w_rows;
+        let in_dim = desc.w_cols;
+        let mut pre_act = vec![0.0f32; out_dim];
+        matmul_f32(w, h_prev, &mut pre_act, out_dim, in_dim, 1);
+        for i in 0..out_dim {
+            pre_act[i] += b[i];
+        }
+
+        pre_acts.push(pre_act.clone());
+
+        // Apply activation (all layers except last)
+        if l < n - 1 {
+            apply_activation(&mut pre_act, activation);
+        }
+        activations.push(pre_act);
+    }
+
+    let output = activations[n].clone();
+    (output, pre_acts, activations)
+}
+
+/// MLP inner-loop analytical backward: compute gradients of L2 loss w.r.t.
+/// all MLP weight/bias parameters.
+///
+/// Given `d_out` (gradient w.r.t. MLP output, e.g. `2 * error` for L2 loss),
+/// computes grad_W_l and grad_b_l for each layer and writes them into `grad_buf`
+/// using the same flat layout as the state buffer.
+///
+/// `pre_acts[l]`: pre-activation values from forward pass.
+/// `activations[l]`: post-activation values (activations[0] = input).
+pub fn mlp_inner_backward(
+    d_out_init: &[f32],
+    pre_acts: &[Vec<f32>],
+    activations: &[Vec<f32>],
+    state_buf: &[f32],
+    base: usize,
+    layout: &MLPMemoryLayout,
+    activation: MemoryActivation,
+    grad_buf: &mut [f32],
+    grad_base: usize,
+) {
+    let n = layout.n_layers;
+    let mut d_out = d_out_init.to_vec();
+
+    for l in (0..n).rev() {
+        let desc = &layout.layers[l];
+        let h_prev = &activations[l];
+
+        // Apply activation derivative (all layers except last)
+        if l < n - 1 {
+            apply_activation_derivative(&mut d_out, &pre_acts[l], activation);
+        }
+
+        // grad_W_l = outer(d_out, h_prev)
+        let gw = layout.w_slice_mut(grad_buf, grad_base, l);
+        let out_dim = desc.w_rows;
+        let in_dim = desc.w_cols;
+        for i in 0..out_dim {
+            for j in 0..in_dim {
+                gw[i * in_dim + j] = d_out[i] * h_prev[j];
+            }
+        }
+
+        // grad_b_l = d_out
+        let gb = layout.b_slice_mut(grad_buf, grad_base, l);
+        gb.copy_from_slice(&d_out[..desc.b_size]);
+
+        // Propagate to previous layer: d_out = W_l^T @ d_out
+        if l > 0 {
+            let w = layout.w_slice(state_buf, base, l);
+            let mut d_prev = vec![0.0f32; in_dim];
+            // W is [out_dim, in_dim], we need W^T @ d_out = [in_dim] vector
+            for j in 0..in_dim {
+                let mut sum = 0.0f32;
+                for i in 0..out_dim {
+                    sum += w[i * in_dim + j] * d_out[i];
+                }
+                d_prev[j] = sum;
+            }
+            d_out = d_prev;
+        }
+    }
+}
 
 // ── Titans LMM implementation ───────────────────────────────────────
 
@@ -35,6 +323,11 @@ use crate::feature_map::{self, FeatureMapKind};
 /// `bias` controls the inner-loop loss: L2 (default), L1, or Lp(p).
 /// `sign_sharpness` controls the tanh approximation steepness for non-L2 biases.
 /// `momentum_kind` selects the momentum variant (EMA/Delta/Deep).
+///
+/// When `memory_layers >= 2` (spec 75), memory M becomes a multi-layer MLP:
+///   M(x) = W₂ @ σ(W₁ @ x + b₁) + b₂
+/// The inner loop computes analytical gradients through the MLP layers,
+/// and momentum/retention/M-norm operate element-wise on the flat parameter buffer.
 pub struct TitansLMM {
     pub bias: crate::model::AttentionalBias,
     pub sign_sharpness: f32,
@@ -50,10 +343,16 @@ pub struct TitansLMM {
     pub m_norm_max: f32,
     /// Feature map applied to k_t and q_t before memory operations (φ).
     pub feature_map: FeatureMapKind,
+    /// Number of MLP layers (1 = linear d×d matrix, 2+ = deep MLP). Spec 75.
+    pub memory_layers: usize,
+    /// Expansion factor for MLP hidden dim: d_h = factor × d. Default: 4.
+    pub memory_expansion_factor: usize,
+    /// Activation function for MLP layers. Default: GELU.
+    pub memory_activation: MemoryActivation,
 }
 
 impl TitansLMM {
-    /// L2 bias (backward compatible default — EMA momentum).
+    /// L2 bias (backward compatible default — EMA momentum, linear memory).
     pub fn l2() -> Self {
         TitansLMM {
             bias: crate::model::AttentionalBias::L2,
@@ -66,6 +365,9 @@ impl TitansLMM {
             theta_ceil: f32::MAX,
             m_norm_max: f32::MAX,
             feature_map: FeatureMapKind::Identity,
+            memory_layers: 1,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
         }
     }
     /// Construct from MAGConfig fields for a specific CMS level.
@@ -82,11 +384,219 @@ impl TitansLMM {
             theta_ceil: cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX),
             m_norm_max: cfg.max_m_norm(level),
             feature_map: cfg.feature_map.clone(),
+            memory_layers: cfg.memory_layers,
+            memory_expansion_factor: cfg.memory_expansion_factor,
+            memory_activation: cfg.memory_activation,
         }
     }
     /// Construct from MAGConfig fields (backward compat — no level clamp).
     pub fn from_cfg(cfg: &crate::model::MAGConfig) -> Self {
         Self::from_cfg_level(cfg, 0)
+    }
+
+    // ── MLP memory forward path (spec 75) ───────────────────────────
+
+    /// Full sequence forward using MLP memory (memory_layers >= 2).
+    ///
+    /// The memory M is an L_M-layer MLP whose parameters are updated
+    /// per-token by analytical gradient descent. Momentum and retention
+    /// operate element-wise on the flat parameter buffer.
+    fn step_mlp(
+        &self,
+        level_params: &MemoryLevelParams,
+        embedded: &[f32],
+        seq_len: usize,
+        d: usize,
+        initial_m: Option<Vec<f32>>,
+    ) -> (Vec<f32>, TitansLMMCache) {
+        debug_assert_eq!(embedded.len(), seq_len * d);
+
+        let layout = MLPMemoryLayout::new(self.memory_layers, d, self.memory_expansion_factor);
+        let state_size = layout.total_params;
+
+        // ── Shared preamble: project embedded → k_mem, v_mem, q_mem ──
+        let mut w_k_mem_t = vec![0.0f32; d * d];
+        let mut w_v_mem_t = vec![0.0f32; d * d];
+        let mut w_q_mem_t = vec![0.0f32; d * d];
+        let w_k_f32 = level_params.w_k_mem.as_f32();
+        let w_v_f32 = level_params.w_v_mem.as_f32();
+        let w_q_f32 = level_params.w_q_mem.as_f32();
+        transpose_f32(&w_k_f32, &mut w_k_mem_t, d, d);
+        transpose_f32(&w_v_f32, &mut w_v_mem_t, d, d);
+        transpose_f32(&w_q_f32, &mut w_q_mem_t, d, d);
+
+        let mut k_mem = vec![0.0f32; seq_len * d];
+        let mut v_mem = vec![0.0f32; seq_len * d];
+        let mut q_mem = vec![0.0f32; seq_len * d];
+        matmul_f32(embedded, &w_k_mem_t, &mut k_mem, seq_len, d, d);
+        matmul_f32(embedded, &w_v_mem_t, &mut v_mem, seq_len, d, d);
+        matmul_f32(embedded, &w_q_mem_t, &mut q_mem, seq_len, d, d);
+
+        // Conv1D key/query preprocessing
+        let (k_conv_cache, q_conv_cache) = crate::conv1d::apply_conv1d_to_kq(
+            &mut k_mem, &mut q_mem, level_params, seq_len, d);
+
+        // L2-normalize keys and queries
+        let k_mem_norms = crate::tensor::l2_normalize_rows(&mut k_mem, seq_len, d);
+        let q_mem_norms = crate::tensor::l2_normalize_rows(&mut q_mem, seq_len, d);
+
+        // Feature map setup
+        let has_fm = !matches!(self.feature_map, FeatureMapKind::Identity);
+        let mut fm_z_k_mem = if has_fm { vec![0.0f32; seq_len * d] } else { vec![] };
+        let mut fm_z_q_mem = if has_fm { vec![0.0f32; seq_len * d] } else { vec![] };
+        let mut phi_k_buf = vec![0.0f32; d];
+        let mut phi_q_buf = vec![0.0f32; d];
+        let mut z_k_buf = if has_fm { vec![0.0f32; d] } else { vec![] };
+        let mut z_q_buf = if has_fm { vec![0.0f32; d] } else { vec![] };
+
+        // ── MLP-specific allocations ─────────────────────────────────
+        let mut m_states = vec![0.0f32; (seq_len + 1) * state_size];
+        let mut s_states = vec![0.0f32; (seq_len + 1) * state_size];
+        if let Some(m0) = initial_m {
+            assert_eq!(m0.len(), state_size,
+                "MLP initial_m size mismatch: expected {state_size}, got {}", m0.len());
+            m_states[..state_size].copy_from_slice(&m0);
+        }
+
+        // Gate buffers (same as linear path)
+        let mut concat_kv = vec![0.0f32; seq_len * 2 * d];
+        let mut alpha_pre = vec![0.0f32; seq_len];
+        let mut alpha = vec![0.0f32; seq_len];
+        let mut theta_pre = vec![0.0f32; seq_len];
+        let mut theta = vec![0.0f32; seq_len];
+        let mut eta_pre = vec![0.0f32; seq_len];
+        let mut eta = vec![0.0f32; seq_len];
+        let mut error = vec![0.0f32; seq_len * d];
+        let mut y = vec![0.0f32; seq_len * d];
+
+        // Reusable gradient buffer (cleared each token)
+        let mut grad_buf = vec![0.0f32; state_size];
+
+        // Per-token MLP activation caches (for outer-loop backward)
+        let mut mlp_k_pre_acts: Vec<Vec<Vec<f32>>> = Vec::with_capacity(seq_len);
+        let mut mlp_k_activations: Vec<Vec<Vec<f32>>> = Vec::with_capacity(seq_len);
+
+        // ── Sequential token loop ────────────────────────────────────
+        for t in 0..seq_len {
+            let k_t = &k_mem[t * d..(t + 1) * d];
+            let v_t = &v_mem[t * d..(t + 1) * d];
+            let q_t = &q_mem[t * d..(t + 1) * d];
+
+            // Feature map
+            let (phi_k_t, phi_q_t): (&[f32], &[f32]) = if has_fm {
+                feature_map::apply_into(k_t, &self.feature_map, &level_params.w_rand, &level_params.b_rand, &mut phi_k_buf, &mut z_k_buf, d);
+                feature_map::apply_into(q_t, &self.feature_map, &level_params.w_rand, &level_params.b_rand, &mut phi_q_buf, &mut z_q_buf, d);
+                fm_z_k_mem[t * d..(t + 1) * d].copy_from_slice(&z_k_buf);
+                fm_z_q_mem[t * d..(t + 1) * d].copy_from_slice(&z_q_buf);
+                (&phi_k_buf, &phi_q_buf)
+            } else {
+                (k_t, q_t)
+            };
+
+            // ── Gate computation (shared with linear) ────────────────
+            let c_base = t * 2 * d;
+            concat_kv[c_base..c_base + d].copy_from_slice(k_t);
+            concat_kv[c_base + d..c_base + 2 * d].copy_from_slice(v_t);
+            let concat_t = &concat_kv[c_base..c_base + 2 * d];
+
+            let mut alpha_pre_t = level_params.b_alpha[0];
+            for i in 0..(2 * d) { alpha_pre_t += concat_t[i] * level_params.w_alpha[i]; }
+            alpha_pre[t] = alpha_pre_t;
+            alpha[t] = sigmoid_f32(alpha_pre_t).clamp(self.alpha_floor, self.alpha_ceil);
+
+            let mut theta_pre_t = level_params.b_theta[0];
+            for i in 0..(2 * d) { theta_pre_t += concat_t[i] * level_params.w_theta[i]; }
+            theta_pre[t] = theta_pre_t;
+            theta[t] = softplus_f32(theta_pre_t).clamp(self.theta_floor, self.theta_ceil);
+
+            let mut eta_pre_t = level_params.b_eta[0];
+            for i in 0..(2 * d) { eta_pre_t += concat_t[i] * level_params.w_eta[i]; }
+            eta_pre[t] = eta_pre_t;
+            eta[t] = sigmoid_f32(eta_pre_t);
+
+            let eta_t = eta[t];
+            let theta_t = theta[t];
+
+            // ── 1. MLP forward on φ(k_t) → prediction ───────────────
+            let m_base = t * state_size;
+            let (prediction, pre_acts, activations) = mlp_forward(
+                &m_states, m_base, phi_k_t, &layout, self.memory_activation);
+
+            // ── 2. Error = prediction - v_t ──────────────────────────
+            let e_base = t * d;
+            for i in 0..d {
+                error[e_base + i] = prediction[i] - v_t[i];
+            }
+
+            // ── 3. Attentional bias → d_out for MLP backward ────────
+            let biased = apply_attentional_bias(
+                &error[e_base..e_base + d], self.bias, self.sign_sharpness);
+
+            // ── 4. Analytical backward through MLP → grad_buf ────────
+            grad_buf.fill(0.0);
+            mlp_inner_backward(
+                &biased, &pre_acts, &activations,
+                &m_states, m_base, &layout, self.memory_activation,
+                &mut grad_buf, 0);
+
+            // Cache activations for outer-loop backward
+            mlp_k_pre_acts.push(pre_acts);
+            mlp_k_activations.push(activations);
+
+            // ── 5. EMA momentum: S_{t+1} = η·S_t - θ·grad ──────────
+            let s_base = t * state_size;
+            let s_next = (t + 1) * state_size;
+            for i in 0..state_size {
+                s_states[s_next + i] = eta_t * s_states[s_base + i]
+                                     - theta_t * grad_buf[i];
+            }
+
+            // ── 6. Retention + momentum: M_{t+1} = (1-α)·M_t + S_{t+1}
+            let m_next = (t + 1) * state_size;
+            m_states.copy_within(m_base..m_base + state_size, m_next);
+            l2_apply_retention(&mut m_states[m_next..m_next + state_size], 1.0 - alpha[t]);
+            for i in 0..state_size {
+                m_states[m_next + i] += s_states[s_next + i];
+            }
+
+            // ── 7. M-norm clamp (Frobenius norm over entire MLP state)
+            if self.m_norm_max < f32::MAX {
+                let slice = &mut m_states[m_next..m_next + state_size];
+                let norm_sq: f32 = slice.iter().map(|x| x * x).sum();
+                let norm = norm_sq.sqrt();
+                if norm > self.m_norm_max {
+                    let scale = self.m_norm_max / norm;
+                    for x in slice.iter_mut() { *x *= scale; }
+                }
+            }
+
+            // ── 8. Read: y_t = M_{t+1}(φ(q_t)) ─────────────────────
+            let (y_t, _, _) = mlp_forward(
+                &m_states, m_next, phi_q_t, &layout, self.memory_activation);
+            y[t * d..(t + 1) * d].copy_from_slice(&y_t);
+        }
+
+        // ── Build cache ──────────────────────────────────────────────
+        let cache = TitansLMMCache {
+            seq_len, d, m_states, s_states, k_mem, v_mem, q_mem, concat_kv,
+            alpha_pre, alpha, theta_pre, theta, eta_pre, eta,
+            error,
+            grad_outer: Vec::new(), // MLP path doesn't use outer product
+            y: y.clone(),
+            fm_z_k_mem, fm_z_q_mem,
+            momentum_kind: crate::model::MomentumKind::EMA,
+            decay: Vec::new(),
+            deep_cache: None,
+            deep_d_hidden: 0,
+            k_conv_cache, q_conv_cache,
+            k_mem_norms, q_mem_norms,
+            mlp_layout: Some(layout),
+            mlp_activation: self.memory_activation,
+            mlp_k_pre_acts,
+            mlp_k_activations,
+        };
+
+        (y, cache)
     }
 }
 
@@ -148,6 +658,18 @@ pub struct TitansLMMCache {
     pub k_mem_norms: Vec<f32>,
     /// Pre-normalization L2 norms of q_mem rows: [seq_len].
     pub q_mem_norms: Vec<f32>,
+    /// MLP layout (None for linear memory, Some for memory_layers >= 2).
+    pub mlp_layout: Option<MLPMemoryLayout>,
+    /// MLP activation (stored for backward). Only meaningful when mlp_layout.is_some().
+    pub mlp_activation: MemoryActivation,
+    /// Per-token MLP pre-activations for k-path (for backward through inner loop).
+    /// mlp_k_pre_acts[t][l] = pre-activation vector at layer l for token t.
+    /// Empty when linear memory.
+    pub mlp_k_pre_acts: Vec<Vec<Vec<f32>>>,
+    /// Per-token MLP activations for k-path (including input as [0]).
+    /// mlp_k_activations[t][l] = activation vector at layer l for token t.
+    /// Empty when linear memory.
+    pub mlp_k_activations: Vec<Vec<Vec<f32>>>,
 }
 
 impl MemoryRule for TitansLMM {
@@ -204,6 +726,11 @@ impl MemoryRule for TitansLMM {
         d: usize,
         initial_m: Option<Vec<f32>>,
     ) -> (Vec<f32>, TitansLMMCache) {
+        // MLP memory dispatch (spec 75, Titans §3.1)
+        if self.memory_layers >= 2 {
+            return self.step_mlp(level_params, embedded, seq_len, d, initial_m);
+        }
+
         debug_assert_eq!(embedded.len(), seq_len * d);
 
         // Project embedded → k_mem, v_mem, q_mem via W^T
@@ -400,6 +927,10 @@ impl MemoryRule for TitansLMM {
             deep_d_hidden: deep_dh,
             k_conv_cache, q_conv_cache,
             k_mem_norms, q_mem_norms,
+            mlp_layout: None,
+            mlp_activation: MemoryActivation::GELU,
+            mlp_k_pre_acts: Vec::new(),
+            mlp_k_activations: Vec::new(),
         };
 
         (y, cache)
@@ -922,7 +1453,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = TitansLMM { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0, alpha_floor: 0.0, alpha_ceil: 1.0, theta_floor: 0.0, theta_ceil: f32::MAX, m_norm_max: f32::MAX, feature_map: FeatureMapKind::Identity };
+        let rule = TitansLMM { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0, alpha_floor: 0.0, alpha_ceil: 1.0, theta_floor: 0.0, theta_ceil: f32::MAX, m_norm_max: f32::MAX, feature_map: FeatureMapKind::Identity, memory_layers: 1, memory_expansion_factor: 4, memory_activation: MemoryActivation::GELU };
         let (y, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for (i, &v) in y.iter().enumerate() {
             assert!(v.is_finite(), "L1 y[{i}] not finite: {v}");
@@ -934,7 +1465,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = TitansLMM { bias: crate::model::AttentionalBias::Lp(3.0), sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0, alpha_floor: 0.0, alpha_ceil: 1.0, theta_floor: 0.0, theta_ceil: f32::MAX, m_norm_max: f32::MAX, feature_map: FeatureMapKind::Identity };
+        let rule = TitansLMM { bias: crate::model::AttentionalBias::Lp(3.0), sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0, alpha_floor: 0.0, alpha_ceil: 1.0, theta_floor: 0.0, theta_ceil: f32::MAX, m_norm_max: f32::MAX, feature_map: FeatureMapKind::Identity, memory_layers: 1, memory_expansion_factor: 4, memory_activation: MemoryActivation::GELU };
         let (y, _) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         for (i, &v) in y.iter().enumerate() {
             assert!(v.is_finite(), "Lp(3) y[{i}] not finite: {v}");
@@ -946,7 +1477,7 @@ mod tests {
         let cfg = test_config();
         let params = MAGParams::init(&cfg, 42);
         let embedded = make_embedded(&cfg, 99);
-        let rule = TitansLMM { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0, alpha_floor: 0.0, alpha_ceil: 1.0, theta_floor: 0.0, theta_ceil: f32::MAX, m_norm_max: f32::MAX, feature_map: FeatureMapKind::Identity };
+        let rule = TitansLMM { bias: crate::model::AttentionalBias::L1, sign_sharpness: 10.0, momentum_kind: crate::model::MomentumKind::EMA, momentum_d_hidden: 0, alpha_floor: 0.0, alpha_ceil: 1.0, theta_floor: 0.0, theta_ceil: f32::MAX, m_norm_max: f32::MAX, feature_map: FeatureMapKind::Identity, memory_layers: 1, memory_expansion_factor: 4, memory_activation: MemoryActivation::GELU };
         let (y, cache) = rule.step(&params.levels[0], &embedded, cfg.swa.seq_len, cfg.swa.d_model, None);
         let d_y = vec![1.0f32; y.len()];
         let (grads, d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
@@ -1004,6 +1535,7 @@ mod tests {
             theta_ceil: f32::MAX,
             m_norm_max: f32::MAX,
             feature_map: FeatureMapKind::Identity,
+            memory_layers: 1, memory_expansion_factor: 4, memory_activation: MemoryActivation::GELU,
         };
         let (y_delta, cache_delta) = delta_rule.step(&params.levels[0], &embedded, s, d, None);
 
@@ -1042,6 +1574,9 @@ mod tests {
             theta_ceil: f32::MAX,
             m_norm_max: f32::MAX,
             feature_map: FeatureMapKind::Identity,
+            memory_layers: 1,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
         };
         let (y_deep, cache_deep) = deep_rule.step(&params.levels[0], &embedded, s, d, None);
 
@@ -1064,5 +1599,326 @@ mod tests {
         let (y_ema, _) = ema_rule.step(&params.levels[0], &embedded, s, d, None);
         let diff: f32 = y_ema.iter().zip(y_deep.iter()).map(|(a, b)| (a - b).abs()).sum();
         assert!(diff > 1e-6, "DeepMomentum should differ from EMA, diff={diff}");
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // MLP Memory tests (spec 75)
+    // ══════════════════════════════════════════════════════════════════
+
+    fn mlp_config(layers: usize, expansion: usize) -> MAGConfig {
+        let mut cfg = test_config();
+        cfg.memory_layers = layers;
+        cfg.memory_expansion_factor = expansion;
+        cfg
+    }
+
+    #[test]
+    fn test_mlp_layout_2layer() {
+        let layout = MLPMemoryLayout::new(2, 8, 4);
+        assert_eq!(layout.n_layers, 2);
+        assert_eq!(layout.d, 8);
+        assert_eq!(layout.d_h, 32);
+        // W1[32,8] + b1[32] + W2[8,32] + b2[8] = 256 + 32 + 256 + 8 = 552
+        assert_eq!(layout.total_params, 552);
+
+        assert_eq!(layout.layers[0].w_rows, 32);
+        assert_eq!(layout.layers[0].w_cols, 8);
+        assert_eq!(layout.layers[0].b_size, 32);
+
+        assert_eq!(layout.layers[1].w_rows, 8);
+        assert_eq!(layout.layers[1].w_cols, 32);
+        assert_eq!(layout.layers[1].b_size, 8);
+    }
+
+    #[test]
+    fn test_mlp_layout_3layer() {
+        let layout = MLPMemoryLayout::new(3, 4, 2);
+        // W1[8,4] + b1[8] + W2[8,8] + b2[8] + W3[4,8] + b3[4] = 32+8+64+8+32+4 = 148
+        assert_eq!(layout.d_h, 8);
+        assert_eq!(layout.total_params, 148);
+        assert_eq!(layout.layers[1].w_rows, 8); // hidden layer
+        assert_eq!(layout.layers[1].w_cols, 8);
+    }
+
+    #[test]
+    fn test_mlp_forward_zero_weights() {
+        // MLP with all-zero weights → output should be all-zero (bias=0 too)
+        let layout = MLPMemoryLayout::new(2, 4, 2);
+        let state = vec![0.0f32; layout.total_params];
+        let input = vec![1.0f32; 4];
+        let (output, pre_acts, activations) = mlp_forward(&state, 0, &input, &layout, MemoryActivation::GELU);
+        assert_eq!(output.len(), 4);
+        for &v in &output {
+            assert_eq!(v, 0.0, "Zero-weight MLP should produce zero output");
+        }
+        assert_eq!(pre_acts.len(), 2);
+        assert_eq!(activations.len(), 3); // input + 2 layers
+    }
+
+    #[test]
+    fn test_mlp_forward_identity_like() {
+        // Set W1 = I (via expansion), W2 so that M acts like identity on first d elements
+        let d = 4;
+        let layout = MLPMemoryLayout::new(2, d, 1); // expansion=1 → d_h=d
+        let mut state = vec![0.0f32; layout.total_params];
+
+        // W1 = I_d (d×d identity)
+        for i in 0..d {
+            state[layout.layers[0].w_offset + i * d + i] = 1.0;
+        }
+        // W2 = I_d
+        for i in 0..d {
+            state[layout.layers[1].w_offset + i * d + i] = 1.0;
+        }
+
+        let input = vec![0.5f32; d];
+        // With ReLU: ReLU(I@x + 0) = ReLU(x) = x (since x > 0), then I@x + 0 = x
+        let (output, _, _) = mlp_forward(&state, 0, &input, &layout, MemoryActivation::ReLU);
+        for i in 0..d {
+            let diff = (output[i] - input[i]).abs();
+            assert!(diff < 1e-6, "Identity-like MLP output[{i}]={} expected {}", output[i], input[i]);
+        }
+    }
+
+    #[test]
+    fn test_mlp_backward_gradient_finite() {
+        let d = 4;
+        let layout = MLPMemoryLayout::new(2, d, 2);
+        let mut state = vec![0.0f32; layout.total_params];
+        // Give weights small non-zero values
+        let mut rng = SimpleRng::new(42);
+        rng.fill_uniform(&mut state, 0.1);
+
+        let input = vec![0.5f32; d];
+        let (output, pre_acts, activations) = mlp_forward(&state, 0, &input, &layout, MemoryActivation::GELU);
+
+        // d_out = 2 * output (L2 loss gradient)
+        let d_out: Vec<f32> = output.iter().map(|x| 2.0 * x).collect();
+        let mut grad = vec![0.0f32; layout.total_params];
+        mlp_inner_backward(&d_out, &pre_acts, &activations, &state, 0, &layout, MemoryActivation::GELU, &mut grad, 0);
+
+        for (i, &g) in grad.iter().enumerate() {
+            assert!(g.is_finite(), "MLP backward grad[{i}] not finite: {g}");
+        }
+        let grad_norm: f32 = grad.iter().map(|x| x * x).sum();
+        assert!(grad_norm > 0.0, "MLP backward should produce non-zero gradients");
+    }
+
+    #[test]
+    fn test_memory_layers_1_uses_linear_path() {
+        // memory_layers=1 → takes the original linear d×d path, NOT step_mlp
+        let cfg = mlp_config(1, 4);
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let d = cfg.swa.d_model;
+        let s = cfg.swa.seq_len;
+
+        // linear-path rule (memory_layers=1)
+        let rule_linear = TitansLMM {
+            memory_layers: 1,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
+            ..TitansLMM::l2()
+        };
+        let (y1, cache1) = rule_linear.step(&params.levels[0], &embedded, s, d, None);
+
+        // baseline l2() constructor also has memory_layers=1
+        let rule_base = TitansLMM::l2();
+        let (y2, cache2) = rule_base.step(&params.levels[0], &embedded, s, d, None);
+
+        // Must be bit-identical: same code path, same inputs
+        assert_eq!(y1.len(), y2.len());
+        for i in 0..y1.len() {
+            assert_eq!(y1[i], y2[i],
+                "memory_layers=1 output should be bit-identical to l2(), y[{i}] {} vs {}", y1[i], y2[i]);
+        }
+        assert_eq!(cache1.m_states.len(), cache2.m_states.len());
+        // m_states should be d*d per step (linear), NOT MLP expanded
+        assert_eq!(cache1.m_states.len(), (s + 1) * d * d);
+        // MLP layout should be None for linear path
+        assert!(cache1.mlp_layout.is_none());
+    }
+
+    #[test]
+    fn test_mlp_memory_2layer_forward_finite() {
+        let cfg = mlp_config(2, 4);
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let d = cfg.swa.d_model;
+        let s = cfg.swa.seq_len;
+
+        let rule = TitansLMM {
+            memory_layers: 2,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
+            ..TitansLMM::l2()
+        };
+        let (y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
+
+        for (i, &v) in y.iter().enumerate() {
+            assert!(v.is_finite(), "MLP y[{i}] not finite: {v}");
+        }
+        assert_eq!(y.len(), s * d);
+
+        // Cache should have MLP layout
+        assert!(cache.mlp_layout.is_some());
+        let layout = cache.mlp_layout.as_ref().unwrap();
+        assert_eq!(layout.n_layers, 2);
+        // m_states should use MLP-sized buffers
+        assert_eq!(cache.m_states.len(), (s + 1) * layout.total_params);
+    }
+
+    #[test]
+    fn test_mlp_memory_evolves() {
+        let cfg = mlp_config(2, 4);
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let d = cfg.swa.d_model;
+        let s = cfg.swa.seq_len;
+
+        let rule = TitansLMM {
+            memory_layers: 2,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
+            ..TitansLMM::l2()
+        };
+        let (_, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
+
+        let layout = cache.mlp_layout.as_ref().unwrap();
+        let sp = layout.total_params;
+
+        let m0_norm: f32 = cache.m_states[..sp].iter().map(|x| x * x).sum();
+        let mt_norm: f32 = cache.m_states[s * sp..(s + 1) * sp].iter().map(|x| x * x).sum();
+        assert!(m0_norm < 1e-12, "M_0 should be zero, norm={m0_norm}");
+        assert!(mt_norm > 1e-12, "M_T should have evolved, norm={mt_norm}");
+    }
+
+    #[test]
+    fn test_mlp_output_differs_from_linear() {
+        // MLP memory should produce different output than linear memory
+        let cfg = test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let d = cfg.swa.d_model;
+        let s = cfg.swa.seq_len;
+
+        let linear_rule = TitansLMM::l2();
+        let (y_linear, _) = linear_rule.step(&params.levels[0], &embedded, s, d, None);
+
+        let mlp_rule = TitansLMM {
+            memory_layers: 2,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
+            ..TitansLMM::l2()
+        };
+        let (y_mlp, _) = mlp_rule.step(&params.levels[0], &embedded, s, d, None);
+
+        // Both produce finite output, but they should differ
+        let diff: f32 = y_linear.iter().zip(y_mlp.iter())
+            .map(|(a, b)| (a - b).abs()).sum();
+        assert!(diff > 1e-6,
+            "MLP and linear memory should produce different output, diff={diff}");
+    }
+
+    #[test]
+    fn test_mlp_m_norm_clamp() {
+        let cfg = test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let d = cfg.swa.d_model;
+        let s = cfg.swa.seq_len;
+
+        let rule = TitansLMM {
+            memory_layers: 2,
+            memory_expansion_factor: 2,
+            memory_activation: MemoryActivation::ReLU,
+            m_norm_max: 1.0, // very tight clamp
+            ..TitansLMM::l2()
+        };
+        let (y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
+
+        let layout = cache.mlp_layout.as_ref().unwrap();
+        let sp = layout.total_params;
+
+        // Check that every M_t respects the norm bound
+        for t in 1..=s {
+            let m_t = &cache.m_states[t * sp..(t + 1) * sp];
+            let norm: f32 = m_t.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!(norm <= 1.0 + 1e-5,
+                "M[{t}] norm {norm} exceeds m_norm_max=1.0");
+        }
+
+        // Output should still be finite
+        for (i, &v) in y.iter().enumerate() {
+            assert!(v.is_finite(), "Clamped MLP y[{i}] not finite: {v}");
+        }
+    }
+
+    #[test]
+    fn test_mlp_activation_variants() {
+        // All three activation functions produce finite, non-zero output
+        let cfg = test_config();
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let d = cfg.swa.d_model;
+        let s = cfg.swa.seq_len;
+
+        for act in [MemoryActivation::GELU, MemoryActivation::SiLU, MemoryActivation::ReLU] {
+            let rule = TitansLMM {
+                memory_layers: 2,
+                memory_expansion_factor: 2,
+                memory_activation: act,
+                ..TitansLMM::l2()
+            };
+            let (y, cache) = rule.step(&params.levels[0], &embedded, s, d, None);
+
+            for (i, &v) in y.iter().enumerate() {
+                assert!(v.is_finite(), "{act:?} MLP y[{i}] not finite: {v}");
+            }
+            assert!(cache.mlp_layout.is_some());
+            assert_eq!(cache.mlp_activation, act);
+        }
+    }
+
+    #[test]
+    fn test_mlp_initial_m_carry() {
+        // Passing initial_m should produce different output than starting from zero
+        let cfg = mlp_config(2, 2);
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let d = cfg.swa.d_model;
+        let s = cfg.swa.seq_len;
+
+        let rule = TitansLMM {
+            memory_layers: 2,
+            memory_expansion_factor: 2,
+            memory_activation: MemoryActivation::GELU,
+            ..TitansLMM::l2()
+        };
+
+        // Run once from zero to get M_T
+        let (y_first, cache_first) = rule.step(&params.levels[0], &embedded, s, d, None);
+        let layout = cache_first.mlp_layout.as_ref().unwrap();
+        let sp = layout.total_params;
+        let m_final = cache_first.m_states[s * sp..(s + 1) * sp].to_vec();
+
+        // Run again with M_T as initial_m
+        let (y_carry, _) = rule.step(&params.levels[0], &embedded, s, d, Some(m_final));
+
+        // Output should differ because initial state is different
+        let diff: f32 = y_first.iter().zip(y_carry.iter())
+            .map(|(a, b)| (a - b).abs()).sum();
+        assert!(diff > 1e-6,
+            "Carrying M state should produce different output, diff={diff}");
+    }
+
+    #[test]
+    fn test_mlp_from_cfg_level() {
+        // from_cfg_level correctly plumbs memory_layers from MAGConfig
+        let cfg = mlp_config(3, 2);
+        let rule = TitansLMM::from_cfg_level(&cfg, 0);
+        assert_eq!(rule.memory_layers, 3);
+        assert_eq!(rule.memory_expansion_factor, 2);
+        assert_eq!(rule.memory_activation, MemoryActivation::GELU);
     }
 }
