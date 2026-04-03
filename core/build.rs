@@ -78,6 +78,7 @@ fn main() {
             .file("kernels/titans_phase2_forward.cu")
             .file("kernels/titans_phase2_backward.cu")
             .file("kernels/pool_ops.cu")
+            .file("kernels/titans_mlp_forward.cu")
             .compile("nl_hecate_cuda_kernels");
 
         println!("cargo:rustc-link-search=native={}/lib64", cuda_path);
@@ -117,6 +118,8 @@ fn main() {
         println!("cargo:rerun-if-changed=kernels/delta_phase2_backward.cu");
         println!("cargo:rerun-if-changed=kernels/titans_phase2_forward.cu");
         println!("cargo:rerun-if-changed=kernels/titans_phase2_backward.cu");
+        println!("cargo:rerun-if-changed=kernels/titans_mlp_forward.cu");
+        println!("cargo:rerun-if-changed=kernels/m_norm_project.cuh");
         println!("cargo:rerun-if-changed=kernels/pool_ops.cu");
     }
 }

@@ -870,6 +870,91 @@ pub fn titans_backward_dispatch(
                          seq_len, d, error_clip);
 }
 
+// ── TitansLMM MLP Memory forward dispatch (Spec 75) ────────────────
+
+/// TitansLMM MLP memory forward inner loop — **test-only host↔device helper**.
+///
+/// Copies host buffers to device, launches `titans_mlp_forward_f32_cuda`,
+/// synchronizes, and copies results back. Forward-only — no backward kernel
+/// or OpaqueVjp registration. The backward CUDA kernel and tape wiring are
+/// Phase C scope; the production GPU path will call the FFI directly from
+/// `gpu_stacked_forward.rs` with proper tape integration.
+///
+/// Packed L_M=2 buffer: W1[d_h,d], b1[d_h], W2[d,d_h], b2[d].
+/// activation: 0=GELU, 1=SiLU, 2=ReLU.
+#[cfg(feature = "cuda")]
+pub fn titans_mlp_forward_cuda(
+    k_mem: &[f32],
+    v_mem: &[f32],
+    q_mem: &[f32],
+    alpha: &[f32],
+    theta: &[f32],
+    eta: &[f32],
+    m_initial: &[f32],
+    s_initial: &[f32],
+    m_states: &mut [f32],
+    s_states: &mut [f32],
+    y: &mut [f32],
+    seq_len: usize,
+    d: usize,
+    d_hidden: usize,
+    batch_size: usize,
+    activation: i32,
+    m_norm_max: f32,
+) {
+    let state_size = d_hidden * d + d_hidden + d * d_hidden + d;
+    let input_total = batch_size * seq_len * d;
+    let gate_total = batch_size * seq_len;
+    let init_total = batch_size * state_size;
+    let states_total = batch_size * (seq_len + 1) * state_size;
+
+    let dev_km = DevBuf::new(input_total);
+    let dev_vm = DevBuf::new(input_total);
+    let dev_qm = DevBuf::new(input_total);
+    let dev_alpha = DevBuf::new(gate_total);
+    let dev_theta = DevBuf::new(gate_total);
+    let dev_eta = DevBuf::new(gate_total);
+    let dev_minit = DevBuf::new(init_total);
+    let dev_sinit = DevBuf::new(init_total);
+    let dev_mstates = DevBuf::new(states_total);
+    let dev_sstates = DevBuf::new(states_total);
+    let dev_y = DevBuf::new(input_total);
+
+    dev_km.copy_from_host(k_mem);
+    dev_vm.copy_from_host(v_mem);
+    dev_qm.copy_from_host(q_mem);
+    dev_alpha.copy_from_host(alpha);
+    dev_theta.copy_from_host(theta);
+    dev_eta.copy_from_host(eta);
+    dev_minit.copy_from_host(m_initial);
+    dev_sinit.copy_from_host(s_initial);
+    dev_mstates.zero();
+    dev_sstates.zero();
+    dev_y.zero();
+
+    let input_stride = seq_len * d;
+    let m_stride = (seq_len + 1) * state_size;
+
+    unsafe {
+        crate::cuda_ffi::titans_mlp_forward_f32_cuda(
+            dev_km.ptr, dev_vm.ptr, dev_qm.ptr,
+            dev_alpha.ptr, dev_theta.ptr, dev_eta.ptr,
+            dev_minit.ptr, dev_sinit.ptr,
+            dev_mstates.ptr, dev_sstates.ptr, dev_y.ptr,
+            seq_len as i32, d as i32, d_hidden as i32,
+            batch_size as i32,
+            input_stride as i32, m_stride as i32,
+            activation, m_norm_max,
+        );
+        let rc = cudaDeviceSynchronize();
+        assert_eq!(rc, 0, "cudaDeviceSynchronize failed after titans_mlp forward (error {rc})");
+    }
+
+    dev_mstates.copy_to_host(m_states);
+    dev_sstates.copy_to_host(s_states);
+    dev_y.copy_to_host(y);
+}
+
 // ── Hebbian Rule dispatch ───────────────────────────────────────────
 
 /// Hebbian Rule forward inner loop dispatch.
