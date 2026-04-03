@@ -330,6 +330,9 @@ impl GpuContextState {
             if c.memory_layers >= 2
                 && matches!(c.memory_rule, crate::model::MemoryRuleKind::TitansLMM)
             {
+                assert_eq!(c.memory_layers, 2,
+                    "TitansLMM CUDA MLP currently supports exactly 2 memory layers, got {}",
+                    c.memory_layers);
                 let d_h = c.memory_expansion_factor * hd;
                 // packed: W1[d_h,hd] + b1[d_h] + W2[hd,d_h] + b2[hd]
                 nh * (2 * hd * d_h + d_h + hd)

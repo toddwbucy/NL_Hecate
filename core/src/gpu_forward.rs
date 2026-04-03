@@ -1211,6 +1211,10 @@ pub(crate) fn gpu_memory_forward(
     // Spec 75: MLP memory has larger per-head state: {W1,b1,W2,b2} packed.
     let is_mlp_mem = cfg.memory_layers >= 2
         && matches!(cfg.memory_rule, crate::model::MemoryRuleKind::TitansLMM);
+    if is_mlp_mem {
+        assert_eq!(cfg.memory_layers, 2,
+            "TitansLMM CUDA MLP supports exactly 2 memory layers, got {}", cfg.memory_layers);
+    }
     let dd_mem = if is_mlp_mem {
         let d_h = cfg.memory_expansion_factor * hd;
         2 * hd * d_h + d_h + hd
