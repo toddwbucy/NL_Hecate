@@ -161,17 +161,18 @@ __global__ void titans_mlp_backward_kernel(
     float* dS = d_S + b * state_size;
 
     // ── Shared memory layout ─────────────────────────────────────────
-    // k_buf[d] + pre_act[dh] + hidden[dh] + error_buf[d] + d_err[d]
+    // k_buf[d] + pre_act[dh] + hidden[dh] + error_buf[BS] + d_err[BS]
     // + grad_pre[dh] + d_h_buf[dh]
-    // Total: 3*d + 4*d_hidden
+    // Total: d + 2*BS + 4*d_hidden   (BS = blockDim.x, may be > d after rounding)
+    int BS = blockDim.x;
     extern __shared__ float smem[];
     float* k_buf     = smem;                                // [d]
     float* pre_act   = smem + d;                            // [dh]
     float* hidden    = smem + d + d_hidden;                 // [dh]
-    float* error_buf = smem + d + 2 * d_hidden;             // [d]
-    float* d_err     = smem + 2 * d + 2 * d_hidden;        // [d]
-    float* grad_pre  = smem + 3 * d + 2 * d_hidden;        // [dh]
-    float* d_h_buf   = smem + 3 * d + 3 * d_hidden;        // [dh]
+    float* error_buf = smem + d + 2 * d_hidden;             // [BS]
+    float* d_err     = smem + d + 2 * d_hidden + BS;        // [BS]
+    float* grad_pre  = smem + d + 2 * d_hidden + 2 * BS;   // [dh]
+    float* d_h_buf   = smem + d + 2 * d_hidden + 2 * BS + d_hidden; // [dh]
 
     // Init d_M = 0, d_S = 0
     for (int idx = tid; idx < state_size; idx += blockDim.x) {
@@ -592,8 +593,9 @@ extern "C" void titans_mlp_backward_f32_cuda(
     dim3 grid(batch_size);
     dim3 block(block_size);
 
-    // Shared memory: 3*d + 4*d_hidden floats
-    int smem_bytes = (3 * d + 4 * d_hidden) * (int)sizeof(float);
+    // Shared memory: d + 2*block_size + 4*d_hidden floats
+    // (reduction buffers error_buf/d_err use block_size, which may be > d after rounding)
+    int smem_bytes = (d + 2 * block_size + 4 * d_hidden) * (int)sizeof(float);
 
     if (smem_bytes > 163840) {
         fprintf(stderr, "titans_mlp_backward_f32_cuda: d=%d dh=%d requires %d bytes "

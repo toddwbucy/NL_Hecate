@@ -436,8 +436,11 @@ impl GpuContextState {
         head_dim: usize,
     ) -> Self {
         let d = host.d;
-        let mem_dd = num_heads * head_dim * head_dim;
-        let bytes = mem_dd * 4;
+        // Infer mem_dd from host memory size (supports both linear hd*hd and MLP state_size).
+        let mem_dd = host.memory.first()
+            .map(|m| m.len())
+            .unwrap_or(num_heads * head_dim * head_dim);
+        let bytes = mem_dd * std::mem::size_of::<f32>();
         let memory = host.memory.iter().map(|m| {
             let buf = GpuBuf::<f32>::zeros(batch_size * mem_dd);
             // Upload host M once, then D2D-copy to all slots.

@@ -1064,3 +1064,11 @@ fn test_titans_mlp_backward_longer() {
 fn test_titans_mlp_backward_single_token() {
     run_backward_parity(1, 8, 4, 1, MemoryActivation::GELU, 0, f32::MAX, "bw_1tok", 1e-3);
 }
+
+/// Backward parity: non-power-of-2 d with finite m_norm_max.
+/// Exercises rounded block_size > d shared memory layout and clamped state path.
+#[test]
+#[serial(cuda)]
+fn test_titans_mlp_backward_non_pow2_clamped() {
+    run_backward_parity(4, 6, 3, 1, MemoryActivation::GELU, 0, 1.0, "bw_np2_clamp", 2e-3);
+}

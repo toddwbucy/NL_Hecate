@@ -875,10 +875,10 @@ pub fn titans_backward_dispatch(
 /// TitansLMM MLP memory forward inner loop — **test-only host↔device helper**.
 ///
 /// Copies host buffers to device, launches `titans_mlp_forward_f32_cuda`,
-/// synchronizes, and copies results back. Forward-only — no backward kernel
-/// or OpaqueVjp registration. The backward CUDA kernel and tape wiring are
-/// Phase C scope; the production GPU path will call the FFI directly from
-/// `gpu_stacked_forward.rs` with proper tape integration.
+/// synchronizes, and copies results back. A backward helper
+/// (`titans_mlp_backward_cuda`) also exists below. The production GPU path
+/// is wired through `gpu_forward.rs` / `gpu_backward.rs` using the `_dd`
+/// device-to-device variants.
 ///
 /// Packed L_M=2 buffer: W1[d_h,d], b1[d_h], W2[d,d_h], b2[d].
 /// activation: 0=GELU, 1=SiLU, 2=ReLU.

@@ -990,7 +990,9 @@ pub fn gpu_cms_forward(
             }
         } else {
             // Frozen level: read-only M @ q_mem on GPU.
-            if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD) {
+            if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD)
+                || (cfg.memory_layers >= 2 && matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM))
+            {
                 y_per_level.push(frozen_mlp_fallback("gpu_cms_forward", level, cfg.memory_rule, bs * s * d));
                 memory_caches.push(None);
             } else {
@@ -1237,6 +1239,7 @@ pub(crate) fn gpu_memory_forward(
     // TODO: re-fuse with per-head gate computation for nh > 1.
     let use_fused = eff_ckpt.is_none()
         && !is_proxy
+        && !is_mlp_mem  // Spec 75: MLP memory uses its own dispatch path
         && nh == 1  // Spec 45: skip fused when per-head is active
         && matches!(cfg.memory_rule, MemoryRuleKind::DeltaRule | MemoryRuleKind::TitansLMM)
         // Spec 74: DGD fused kernel lacks per-token M-norm projection.
@@ -3227,7 +3230,9 @@ pub fn gpu_prefill_forward(
             );
             y_per_level.push(y_level);
         } else {
-            if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD) {
+            if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD)
+                || (cfg.memory_layers >= 2 && matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM))
+            {
                 y_per_level.push(frozen_mlp_fallback("gpu_prefill_forward", level, cfg.memory_rule, s * d));
             } else {
             let y_level = gpu_memory_read_only(
@@ -3420,7 +3425,9 @@ pub fn gpu_single_token_forward(
             );
             y_per_level.push(y_level);
         } else {
-            if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD) {
+            if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD)
+                || (cfg.memory_layers >= 2 && matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM))
+            {
                 y_per_level.push(frozen_mlp_fallback("gpu_single_token_forward", level, cfg.memory_rule, d));
             } else {
             let y_level = gpu_memory_read_only(
