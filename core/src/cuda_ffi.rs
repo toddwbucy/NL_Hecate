@@ -839,6 +839,40 @@ extern "C" {
         huber_delta: f32, lambda_local: f32, lambda_2: f32,
     );
 
+    // ── TitansLMM MLP Memory forward (Spec 75 Phase B) ────────────────
+    // Deep neural memory: M = {W₁, b₁, W₂, b₂} packed flat buffer.
+    // Fused forward+update kernel with EMA momentum, L2 bias, L2 retention.
+    // Batch support via grid dimension (batch_size parallel heads/levels).
+    // No cudaDeviceSynchronize inside — caller syncs.
+
+    /// TitansLMM MLP memory forward inner loop (all f32).
+    ///
+    /// Packed L_M=2 buffer: W1[d_h,d], b1[d_h], W2[d,d_h], b2[d].
+    /// Sequential token recurrence with fused gradient + EMA momentum + retention.
+    /// activation: 0=GELU, 1=SiLU, 2=ReLU.
+    /// Source: Titans (2501.00663) Eqs 12-15; core/src/titans_lmm.rs (step_mlp())
+    pub(crate) fn titans_mlp_forward_f32_cuda(
+        k_mem: *const f32,       // [batch_size, seq_len, d]
+        v_mem: *const f32,       // [batch_size, seq_len, d]
+        q_mem: *const f32,       // [batch_size, seq_len, d]
+        alpha: *const f32,       // [batch_size, seq_len]
+        theta: *const f32,       // [batch_size, seq_len]
+        eta: *const f32,         // [batch_size, seq_len]
+        m_initial: *const f32,   // [batch_size, state_size]
+        s_initial: *const f32,   // [batch_size, state_size]
+        m_states: *mut f32,      // [batch_size, (seq_len+1)*state_size]
+        s_states: *mut f32,      // [batch_size, (seq_len+1)*state_size]
+        y: *mut f32,             // [batch_size, seq_len, d]
+        seq_len: i32,
+        d: i32,
+        d_hidden: i32,
+        batch_size: i32,
+        input_stride: i32,       // seq_len * d
+        m_stride: i32,           // (seq_len+1) * state_size
+        activation: i32,         // 0=GELU, 1=SiLU, 2=ReLU
+        m_norm_max: f32,
+    );
+
     // ── SwiGLU MLP device-to-device kernels ────────────────────────────
     // Zero-PCIe variants used in the GPU training path. All pointers are
     // device memory. Caller provides pre-allocated GpuBuf<f32> buffers.
