@@ -339,6 +339,14 @@ impl Config {
         if cfg.build.accum_steps < 1 {
             return Err("accum_steps must be >= 1".into());
         }
+        if let Some(ref phases) = cfg.phases {
+            for (i, phase) in phases.iter().enumerate() {
+                if phase.accum_steps == Some(0) {
+                    let label = phase.label.as_deref().unwrap_or(&phase.data);
+                    return Err(format!("phase {i} ({label}): accum_steps must be >= 1"));
+                }
+            }
+        }
         Ok(())
     }
 
