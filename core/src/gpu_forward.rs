@@ -25,6 +25,19 @@ use crate::conductor::Pulse;
 #[cfg(feature = "cuda")]
 static WARNED_FROZEN_MLP: AtomicBool = AtomicBool::new(false);
 
+/// Panic if a frozen TitansLMM MLP level is encountered — read-only MLP kernel
+/// not implemented. Called from gpu_cms_forward, gpu_prefill_forward, gpu_single_token_forward.
+#[cfg(feature = "cuda")]
+#[inline]
+fn panic_if_frozen_titans_mlp(cfg: &MAGConfig, level: usize) {
+    if cfg.memory_layers == 2 && matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM) {
+        panic!(
+            "Frozen TitansLMM MLP level unsupported (level {level}): \
+             read-only MLP kernel not implemented"
+        );
+    }
+}
+
 /// Returns a zeroed GPU buffer for a frozen MLP level, with a one-time warning.
 /// MLP rules (Moneta/YAAD) have context_m = [W1|W2], incompatible with
 /// gpu_memory_read_only's [d,d] matrix assumption.
@@ -227,6 +240,22 @@ pub enum GpuMemoryCache {
         w1_boundary: Option<GpuBuf<f32>>,  // [d_hidden * d]
         w2_boundary: Option<GpuBuf<f32>>,  // [d * d_hidden]
     },
+    /// TitansLMM MLP memory (spec 75). Packed state: {W1, b1, W2, b2} per head.
+    /// state_size = 2*hd*d_h + d_h + hd per head, d_h = expansion_factor * hd.
+    TitansMlp {
+        k_mem: GpuBuf<f32>,       // [bs*s, d]
+        v_mem: GpuBuf<f32>,       // [bs*s, d]
+        q_mem: GpuBuf<f32>,       // [bs*s, d]
+        alpha: GpuBuf<f32>,       // [bs*s]
+        theta: GpuBuf<f32>,       // [bs*s]
+        eta: GpuBuf<f32>,         // [bs*s]
+        m_states: GpuBuf<f32>,    // [bs_mem * (s+1) * state_size]
+        s_states: GpuBuf<f32>,    // [bs_mem * (s+1) * state_size]
+        k_norms: GpuBuf<f32>,     // [bs*s]
+        q_norms: GpuBuf<f32>,     // [bs*s]
+        d_hidden: usize,
+        activation: i32,          // 0=GELU, 1=SiLU, 2=ReLU
+    },
     /// Delta chunkwise (spec 43 — frozen-M₀). Stores chunk boundary M states.
     /// m_chunk_states: [bs * (num_chunks+1) * d*d].
     DeltaChunkwise {
@@ -389,8 +418,9 @@ impl GpuMemoryCache {
                 }
                 max_delta
             }
-            // MLP memory (MONETA/YAAD): delta norm not supported yet (needs MLP-specific norm)
-            GpuMemoryCache::Mlp { .. } => 0.0,
+            // MLP memory: delta norm not applicable (M is not a matrix)
+            GpuMemoryCache::Mlp { .. }
+            | GpuMemoryCache::TitansMlp { .. } => 0.0,
             // Hebbian has no error vector; SwiGlu has no M state
             GpuMemoryCache::Hebbian { .. }
             | GpuMemoryCache::HebbianCkpt { .. }
@@ -418,6 +448,7 @@ impl GpuMemoryCache {
             | GpuMemoryCache::HebbianCkpt { alpha, .. }
             | GpuMemoryCache::DGDCkpt { alpha, .. }
             | GpuMemoryCache::Mlp { alpha, .. }
+            | GpuMemoryCache::TitansMlp { alpha, .. }
             | GpuMemoryCache::DeltaChunkwise { alpha, .. }
             | GpuMemoryCache::TitansChunkwise { alpha, .. } => Some(alpha),
             GpuMemoryCache::SwiGlu { .. } => None,
@@ -474,6 +505,7 @@ impl GpuMemoryCache {
     pub fn eta_stats(&self) -> Option<GateStats> {
         let eta_buf: Option<&GpuBuf<f32>> = match self {
             GpuMemoryCache::Titans { eta, .. }
+            | GpuMemoryCache::TitansMlp { eta, .. }
             | GpuMemoryCache::TitansCkpt { eta, .. }
             | GpuMemoryCache::TitansChunkwise { eta, .. } => Some(eta),
             GpuMemoryCache::Delta { .. }
@@ -536,6 +568,7 @@ impl GpuMemoryCache {
         let theta_buf: Option<&GpuBuf<f32>> = match self {
             GpuMemoryCache::Delta { theta, .. }
             | GpuMemoryCache::Titans { theta, .. }
+            | GpuMemoryCache::TitansMlp { theta, .. }
             | GpuMemoryCache::DGD { theta, .. }
             | GpuMemoryCache::DeltaCkpt { theta, .. }
             | GpuMemoryCache::TitansCkpt { theta, .. }
@@ -783,8 +816,11 @@ pub fn gpu_cms_forward(
         // Spec 27: CUDA graph scratch always allocates full trajectory —
         // proxy levels must use the standard dispatch path for VRAM savings.
         let has_proxy = (0..cfg.k).any(|l| cfg.tape_strategy_for_level(l) == LevelTapeStrategy::Proxy);
+        let is_mlp = cfg.memory_layers == 2
+            && matches!(cfg.memory_rule, MemoryRuleKind::TitansLMM);
         let can_capture = !cfg.residual
             && matches!(cfg.memory_rule, MemoryRuleKind::DeltaRule | MemoryRuleKind::TitansLMM)
+            && !is_mlp  // Spec 75: CUDA-graph scratch/replay assumes hd×hd layout
             && !has_ckpt
             && !is_tnt_mode
             && !has_proxy;
@@ -970,6 +1006,7 @@ pub fn gpu_cms_forward(
             }
         } else {
             // Frozen level: read-only M @ q_mem on GPU.
+            panic_if_frozen_titans_mlp(cfg, level);
             if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD) {
                 y_per_level.push(frozen_mlp_fallback("gpu_cms_forward", level, cfg.memory_rule, bs * s * d));
                 memory_caches.push(None);
@@ -1185,8 +1222,16 @@ pub(crate) fn gpu_memory_forward(
 
     // ── Spec 45: Per-head dimensions for memory kernels ──────────────
     // Memory M is nh × (hd × hd) instead of 1 × (d × d).
-    // dd_mem = per-head matrix size, bs_mem = batch folded with heads.
-    let dd_mem = hd * hd;
+    // dd_mem = per-head state size, bs_mem = batch folded with heads.
+    // Spec 75: MLP memory has larger per-head state: {W1,b1,W2,b2} packed.
+    let is_mlp_mem = cfg.memory_layers == 2
+        && matches!(cfg.memory_rule, crate::model::MemoryRuleKind::TitansLMM);
+    let dd_mem = if is_mlp_mem {
+        let d_h = cfg.memory_expansion_factor * hd;
+        2 * hd * d_h + d_h + hd
+    } else {
+        hd * hd
+    };
     let bs_mem = bs * nh;
     let hd_i32 = i32::try_from(hd).expect("head_dim exceeds i32::MAX");
 
@@ -1195,6 +1240,13 @@ pub(crate) fn gpu_memory_forward(
     let m_norm_max = cfg.max_m_norm(level);
     let eff_ckpt = cfg.effective_checkpoint_interval(level);
     let is_proxy = cfg.tape_strategy_for_level(level) == LevelTapeStrategy::Proxy;
+
+    // Spec 75: MLP memory only supports the unfused non-checkpointed path for now.
+    // Proxy, chunkwise, checkpoint, and CUDA-graph paths assume hd×hd layout.
+    if is_mlp_mem {
+        assert!(eff_ckpt.is_none(), "MLP memory (memory_layers >= 2) does not support checkpointing yet");
+        assert!(!is_proxy, "MLP memory (memory_layers >= 2) does not support proxy tape strategy yet");
+    }
 
     // Per-level gate clamp bounds
     let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
@@ -1209,6 +1261,7 @@ pub(crate) fn gpu_memory_forward(
     // TODO: re-fuse with per-head gate computation for nh > 1.
     let use_fused = eff_ckpt.is_none()
         && !is_proxy
+        && !is_mlp_mem  // Spec 75: MLP memory uses its own dispatch path
         && nh == 1  // Spec 45: skip fused when per-head is active
         && matches!(cfg.memory_rule, MemoryRuleKind::DeltaRule | MemoryRuleKind::TitansLMM)
         // Spec 74: DGD fused kernel lacks per-token M-norm projection.
@@ -1417,8 +1470,45 @@ pub(crate) fn gpu_memory_forward(
             let y = reshape_from_per_head(&y_ph, batch_size, s, nh, hd);
             (y, GpuMemoryCache::TitansChunkwise { k_mem, v_mem, q_mem, alpha, theta, eta: eta_dm, m_chunk_states, s_chunk_states, k_norms, q_norms, chunk_size, num_chunks })
         }
+        (None, MemoryRuleKind::TitansLMM) if is_mlp_mem => {
+            // ── Spec 75: MLP memory forward ──────────────────────────────
+            // M = {W1, b1, W2, b2} packed per head. state_size = dd_mem.
+            // No per-head reshape for k/v/q/gates — the MLP kernel operates
+            // on per-head vectors directly (d=hd, batch=bs_mem).
+            let d_h = cfg.memory_expansion_factor * hd;
+            let act_id = match cfg.memory_activation {
+                crate::model::MemoryActivation::GELU => 0i32,
+                crate::model::MemoryActivation::SiLU => 1,
+                crate::model::MemoryActivation::ReLU => 2,
+            };
+            let eta_dm = compute_eta(level_params, &k_mem, &v_mem, bs * s, d);
+            let eta_ph = broadcast_gates(&eta_dm, bs, s, nh);
+            let batch_s_initial = GpuBuf::zeros(bs_mem * dd_mem);
+            let s_initial_slice = batch_s_initial.slice(0, bs_mem * dd_mem);
+            let mut m_states = GpuBuf::zeros(bs_mem * (s + 1) * dd_mem);
+            let mut s_states = GpuBuf::zeros(bs_mem * (s + 1) * dd_mem);
+            let mut y_ph = GpuBuf::zeros(bs_mem * s * hd);
+            crate::dispatch::titans_mlp_forward_dd(
+                &k_mem_ph, &v_mem_ph, &q_mem_ph, &alpha_ph, &theta_ph, &eta_ph,
+                &m_initial_slice, &s_initial_slice,
+                &mut m_states, &mut s_states, &mut y_ph,
+                s, hd, d_h, bs_mem, act_id, m_norm_max,
+            );
+            crate::dispatch::cuda_sync();
+            copy_final_m_batch(&m_states, context_m, s, dd_mem, bs_mem);
+            // Note: m_norm_clamp_batch is NOT called here — the MLP forward kernel
+            // applies m_norm_project_inplace per token internally (m_norm_project.cuh),
+            // so the final M is already within the norm bound. The batch clamp kernel
+            // expects dd = d*d (square matrix), which doesn't apply to MLP state.
+            let y = reshape_from_per_head(&y_ph, batch_size, s, nh, hd);
+            (y, GpuMemoryCache::TitansMlp {
+                k_mem, v_mem, q_mem, alpha, theta, eta: eta_dm,
+                m_states, s_states, k_norms, q_norms,
+                d_hidden: d_h, activation: act_id,
+            })
+        }
         (None, MemoryRuleKind::TitansLMM) => {
-            // Exact: full per-token trajectory
+            // Exact: full per-token trajectory (linear M — hd×hd matrix)
             // Spec 45: eta computed at d_model resolution, then broadcast to per-head
             let eta_dm = compute_eta(level_params, &k_mem, &v_mem, bs * s, d);
             let eta_ph = broadcast_gates(&eta_dm, bs, s, nh);
@@ -3162,6 +3252,7 @@ pub fn gpu_prefill_forward(
             );
             y_per_level.push(y_level);
         } else {
+            panic_if_frozen_titans_mlp(cfg, level);
             if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD) {
                 y_per_level.push(frozen_mlp_fallback("gpu_prefill_forward", level, cfg.memory_rule, s * d));
             } else {
@@ -3355,6 +3446,7 @@ pub fn gpu_single_token_forward(
             );
             y_per_level.push(y_level);
         } else {
+            panic_if_frozen_titans_mlp(cfg, level);
             if matches!(cfg.memory_rule, MemoryRuleKind::Moneta | MemoryRuleKind::YAAD) {
                 y_per_level.push(frozen_mlp_fallback("gpu_single_token_forward", level, cfg.memory_rule, d));
             } else {

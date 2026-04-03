@@ -873,6 +873,45 @@ extern "C" {
         m_norm_max: f32,
     );
 
+    // ── TitansLMM MLP Memory backward (Spec 75 Phase C) ─────────────
+    // Analytical backward through deep neural memory with EMA momentum.
+    // Reverse token loop computing d_k, d_v, d_q, d_alpha, d_theta,
+    // d_eta, d_m_initial, d_s_initial.
+    // No cudaDeviceSynchronize inside — caller syncs.
+
+    /// TitansLMM MLP memory backward inner loop (all f32).
+    ///
+    /// Requires m_states/s_states from forward pass (full trajectory).
+    /// activation: 0=GELU, 1=SiLU, 2=ReLU.
+    /// Source: Titans (2501.00663) Eqs 12-15; core/src/titans_lmm.rs (mlp_inner_backward)
+    pub(crate) fn titans_mlp_backward_f32_cuda(
+        k_mem: *const f32,       // [batch_size, seq_len, d]
+        v_mem: *const f32,       // [batch_size, seq_len, d]
+        q_mem: *const f32,       // [batch_size, seq_len, d]
+        alpha: *const f32,       // [batch_size, seq_len]
+        theta: *const f32,       // [batch_size, seq_len]
+        eta: *const f32,         // [batch_size, seq_len]
+        m_states: *const f32,    // [batch_size, (seq_len+1)*state_size]
+        s_states: *const f32,    // [batch_size, (seq_len+1)*state_size]
+        d_y: *const f32,         // [batch_size, seq_len, d]
+        d_k_mem: *mut f32,       // [batch_size, seq_len, d]
+        d_v_mem: *mut f32,       // [batch_size, seq_len, d]
+        d_q_mem: *mut f32,       // [batch_size, seq_len, d]
+        d_alpha: *mut f32,       // [batch_size, seq_len]
+        d_theta: *mut f32,       // [batch_size, seq_len]
+        d_eta: *mut f32,         // [batch_size, seq_len]
+        d_m_initial: *mut f32,   // [batch_size, state_size]
+        d_s_initial: *mut f32,   // [batch_size, state_size]
+        seq_len: i32,
+        d: i32,
+        d_hidden: i32,
+        batch_size: i32,
+        input_stride: i32,       // seq_len * d
+        m_stride: i32,           // (seq_len+1) * state_size
+        activation: i32,         // 0=GELU, 1=SiLU, 2=ReLU
+        m_norm_max: f32,
+    );
+
     // ── SwiGLU MLP device-to-device kernels ────────────────────────────
     // Zero-PCIe variants used in the GPU training path. All pointers are
     // device memory. Caller provides pre-allocated GpuBuf<f32> buffers.

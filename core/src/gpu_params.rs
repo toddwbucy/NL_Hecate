@@ -274,8 +274,9 @@ impl GpuMAGParams {
 /// Per-level M matrices resident on GPU. Persists across steps.
 ///
 /// With batch_size > 1, each level buffer holds [batch_size * mem_dd] floats where
-/// mem_dd = num_heads * head_dim * head_dim. For per-head memory (num_heads > 1),
-/// the buffer is tightly packed: batch b, head h at offset (b*nh + h) * hd*hd.
+/// mem_dd = num_heads * head_dim * head_dim (linear M) or num_heads * state_size
+/// (MLP memory, spec 75). For per-head memory (num_heads > 1), the buffer is tightly
+/// packed: batch b, head h at offset (b*nh + h) * dd_per_head.
 /// Slot 0 is the "primary" context used for checkpointing and inference.
 ///
 /// When `cuda_graph_warmup > 0`: also holds pre-allocated `ForwardScratch` and per-level
@@ -290,6 +291,9 @@ pub struct GpuContextState {
     pub num_heads: usize,
     /// Per-head dimension (d / num_heads).
     pub head_dim: usize,
+    /// Total M elements across all heads: nh * hd² (linear) or nh * state_size (MLP).
+    /// Stored field — avoids recomputation and handles MLP memory sizing (spec 75).
+    stored_mem_dd: usize,
     /// Pre-allocated forward buffers for CUDA graph capture (None when warmup_steps=0).
     pub forward_scratch: Option<crate::cuda_graph::ForwardScratch>,
     /// Pre-allocated per-level activation buffers for CUDA graph capture (empty when warmup_steps=0).
@@ -300,16 +304,18 @@ pub struct GpuContextState {
 
 #[cfg(feature = "cuda")]
 impl GpuContextState {
-    /// Per-head M element count: num_heads * head_dim * head_dim.
-    /// For monolithic (nh=1): equals d*d. For per-head: equals d * head_dim.
+    /// Total M element count across all heads.
+    /// Linear M: num_heads * head_dim². MLP memory (spec 75): num_heads * state_size.
     #[inline]
     pub fn mem_dd(&self) -> usize {
-        self.num_heads * self.head_dim * self.head_dim
+        self.stored_mem_dd
     }
 
     /// Initialize zero M matrices for k levels, each [batch_size * mem_dd].
     ///
     /// Extracts num_heads/head_dim from cfg (defaults to nh=1, hd=d when cfg is None).
+    /// When `memory_layers >= 2` (TitansLMM MLP memory, spec 75), the per-head state
+    /// size is larger: state_size = 2*hd*d_h + d_h + hd instead of hd*hd.
     /// When `cuda_graph_warmup > 0`, also pre-allocates scratch buffers for all k levels
     /// and the forward pass. This adds persistent VRAM equal to ~one forward pass's
     /// intermediates — the same memory that would be dynamically allocated per step.
@@ -319,7 +325,23 @@ impl GpuContextState {
         cuda_graph_warmup: usize,
     ) -> Self {
         let (nh, hd) = cfg.map_or((1, d), |c| (c.swa.num_heads, c.swa.head_dim));
-        let mem_dd = nh * hd * hd;
+        // Spec 75: MLP memory needs larger per-head state buffer
+        let mem_dd = if let Some(c) = cfg {
+            if c.memory_layers >= 2
+                && matches!(c.memory_rule, crate::model::MemoryRuleKind::TitansLMM)
+            {
+                assert_eq!(c.memory_layers, 2,
+                    "TitansLMM CUDA MLP currently supports exactly 2 memory layers, got {}",
+                    c.memory_layers);
+                let d_h = c.memory_expansion_factor * hd;
+                // packed: W1[d_h,hd] + b1[d_h] + W2[hd,d_h] + b2[hd]
+                nh * (2 * hd * d_h + d_h + hd)
+            } else {
+                nh * hd * hd
+            }
+        } else {
+            nh * hd * hd
+        };
         let memory = (0..k).map(|_| GpuBuf::zeros(batch_size * mem_dd)).collect();
         let (forward_scratch, level_scratch) = if cuda_graph_warmup > 0 {
             if let Some(cfg) = cfg {
@@ -340,6 +362,7 @@ impl GpuContextState {
             batch_size,
             num_heads: nh,
             head_dim: hd,
+            stored_mem_dd: mem_dd,
             forward_scratch,
             level_scratch,
             cuda_graph: crate::cuda_graph::CudaGraphStore::new(cuda_graph_warmup),
@@ -416,8 +439,15 @@ impl GpuContextState {
         head_dim: usize,
     ) -> Self {
         let d = host.d;
-        let mem_dd = num_heads * head_dim * head_dim;
-        let bytes = mem_dd * 4;
+        // Infer mem_dd from host memory size (supports both linear hd*hd and MLP state_size).
+        let mem_dd = host.memory.first()
+            .map(|m| m.len())
+            .unwrap_or(num_heads * head_dim * head_dim);
+        assert!(
+            host.memory.iter().all(|m| m.len() == mem_dd),
+            "GpuContextState::from_host_context: all levels must have uniform memory size"
+        );
+        let bytes = mem_dd * std::mem::size_of::<f32>();
         let memory = host.memory.iter().map(|m| {
             let buf = GpuBuf::<f32>::zeros(batch_size * mem_dd);
             // Upload host M once, then D2D-copy to all slots.
@@ -440,6 +470,7 @@ impl GpuContextState {
             batch_size,
             num_heads,
             head_dim,
+            stored_mem_dd: mem_dd,
             forward_scratch: None,
             level_scratch: Vec::new(),
             cuda_graph: crate::cuda_graph::CudaGraphStore::new(0),
@@ -712,10 +743,11 @@ impl GpuStackedContext {
         for ctx in &self.blocks {
             let nh = ctx.num_heads;
             let hd = ctx.head_dim;
-            let mem_dd = ctx.mem_dd(); // nh * hd * hd
+            let mem_dd = ctx.mem_dd(); // nh * hd² (linear) or nh * state_size (MLP)
             let mut block_head_norms = Vec::with_capacity(ctx.memory.len());
             for buf in &ctx.memory {
-                if nh <= 1 || mem_dd == 0 || buf.len() < mem_dd {
+                // Skip per-head decomposition for MLP memory (non-square tiles)
+                if nh <= 1 || mem_dd == 0 || buf.len() < mem_dd || mem_dd != nh * hd * hd {
                     block_head_norms.push(Vec::new());
                     continue;
                 }
@@ -827,6 +859,7 @@ impl GpuStackedContext {
                 batch_size: ctx.batch_size,
                 num_heads: ctx.num_heads,
                 head_dim: ctx.head_dim,
+                stored_mem_dd: ctx.stored_mem_dd,
                 forward_scratch: None,
                 level_scratch: Vec::new(),
                 cuda_graph: crate::cuda_graph::CudaGraphStore::new(0),
