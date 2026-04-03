@@ -955,6 +955,117 @@ pub fn titans_mlp_forward_cuda(
     dev_y.copy_to_host(y);
 }
 
+/// TitansLMM MLP memory backward inner loop — **test-only host↔device helper**.
+///
+/// Copies host buffers to device, launches `titans_mlp_backward_f32_cuda`,
+/// synchronizes, and copies results back. The production GPU path will call
+/// the FFI directly from `gpu_backward.rs` with device buffers.
+///
+/// Requires m_states/s_states from forward pass (full trajectory).
+/// activation: 0=GELU, 1=SiLU, 2=ReLU.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn titans_mlp_backward_cuda(
+    k_mem: &[f32],
+    v_mem: &[f32],
+    q_mem: &[f32],
+    alpha: &[f32],
+    theta: &[f32],
+    eta: &[f32],
+    m_states: &[f32],
+    s_states: &[f32],
+    d_y: &[f32],
+    d_k_mem: &mut [f32],
+    d_v_mem: &mut [f32],
+    d_q_mem: &mut [f32],
+    d_alpha: &mut [f32],
+    d_theta: &mut [f32],
+    d_eta: &mut [f32],
+    d_m_initial: &mut [f32],
+    d_s_initial: &mut [f32],
+    seq_len: usize,
+    d: usize,
+    d_hidden: usize,
+    batch_size: usize,
+    activation: i32,
+    m_norm_max: f32,
+) {
+    let state_size = d_hidden * d + d_hidden + d * d_hidden + d;
+    let input_total = batch_size * seq_len * d;
+    let gate_total = batch_size * seq_len;
+    let init_total = batch_size * state_size;
+    let states_total = batch_size * (seq_len + 1) * state_size;
+
+    // Upload inputs
+    let dev_km = DevBuf::new(input_total);
+    let dev_vm = DevBuf::new(input_total);
+    let dev_qm = DevBuf::new(input_total);
+    let dev_alpha = DevBuf::new(gate_total);
+    let dev_theta = DevBuf::new(gate_total);
+    let dev_eta = DevBuf::new(gate_total);
+    let dev_mstates = DevBuf::new(states_total);
+    let dev_sstates = DevBuf::new(states_total);
+    let dev_dy = DevBuf::new(input_total);
+
+    dev_km.copy_from_host(k_mem);
+    dev_vm.copy_from_host(v_mem);
+    dev_qm.copy_from_host(q_mem);
+    dev_alpha.copy_from_host(alpha);
+    dev_theta.copy_from_host(theta);
+    dev_eta.copy_from_host(eta);
+    dev_mstates.copy_from_host(m_states);
+    dev_sstates.copy_from_host(s_states);
+    dev_dy.copy_from_host(d_y);
+
+    // Allocate outputs (zeroed by kernel or atomicAdd)
+    let dev_dkm = DevBuf::new(input_total);
+    let dev_dvm = DevBuf::new(input_total);
+    let dev_dqm = DevBuf::new(input_total);
+    let dev_dalpha = DevBuf::new(gate_total);
+    let dev_dtheta = DevBuf::new(gate_total);
+    let dev_deta = DevBuf::new(gate_total);
+    let dev_dm_init = DevBuf::new(init_total);
+    let dev_ds_init = DevBuf::new(init_total);
+
+    dev_dkm.zero();
+    dev_dvm.zero();
+    dev_dqm.zero();
+    dev_dalpha.zero();
+    dev_dtheta.zero();
+    dev_deta.zero();
+    dev_dm_init.zero();
+    dev_ds_init.zero();
+
+    let input_stride = seq_len * d;
+    let m_stride = (seq_len + 1) * state_size;
+
+    unsafe {
+        crate::cuda_ffi::titans_mlp_backward_f32_cuda(
+            dev_km.ptr, dev_vm.ptr, dev_qm.ptr,
+            dev_alpha.ptr, dev_theta.ptr, dev_eta.ptr,
+            dev_mstates.ptr, dev_sstates.ptr, dev_dy.ptr,
+            dev_dkm.ptr, dev_dvm.ptr, dev_dqm.ptr,
+            dev_dalpha.ptr, dev_dtheta.ptr, dev_deta.ptr,
+            dev_dm_init.ptr, dev_ds_init.ptr,
+            seq_len as i32, d as i32, d_hidden as i32,
+            batch_size as i32,
+            input_stride as i32, m_stride as i32,
+            activation, m_norm_max,
+        );
+        let rc = cudaDeviceSynchronize();
+        assert_eq!(rc, 0, "cudaDeviceSynchronize failed after titans_mlp backward (error {rc})");
+    }
+
+    dev_dkm.copy_to_host(d_k_mem);
+    dev_dvm.copy_to_host(d_v_mem);
+    dev_dqm.copy_to_host(d_q_mem);
+    dev_dalpha.copy_to_host(d_alpha);
+    dev_dtheta.copy_to_host(d_theta);
+    dev_deta.copy_to_host(d_eta);
+    dev_dm_init.copy_to_host(d_m_initial);
+    dev_ds_init.copy_to_host(d_s_initial);
+}
+
 // ── Hebbian Rule dispatch ───────────────────────────────────────────
 
 /// Hebbian Rule forward inner loop dispatch.
@@ -2231,6 +2342,72 @@ pub fn titans_backward_dd(
             d_alpha.ptr(), d_theta.ptr(), d_eta.ptr(),
             d_m_initial.ptr(), d_s_initial.ptr(),
             seq_len as i32, d as i32, batch_size as i32, error_clip,
+        );
+    }
+}
+
+// ── TitansLMM MLP memory dispatch (spec 75) ───────────────────────
+
+/// TitansLMM MLP memory forward on device buffers.
+/// state_size = 2*d*d_hidden + d_hidden + d per head.
+/// activation: 0=GELU, 1=SiLU, 2=ReLU.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn titans_mlp_forward_dd(
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>, eta: &GpuBuf<f32>,
+    m_initial: &GpuSlice<f32>, s_initial: &GpuSlice<f32>,
+    m_states: &mut GpuBuf<f32>, s_states: &mut GpuBuf<f32>, y: &mut GpuBuf<f32>,
+    seq_len: usize, d: usize, d_hidden: usize, batch_size: usize,
+    activation: i32, m_norm_max: f32,
+) {
+    let state_size = d_hidden * d + d_hidden + d * d_hidden + d;
+    let input_stride = seq_len * d;
+    let m_stride = (seq_len + 1) * state_size;
+    unsafe {
+        crate::cuda_ffi::titans_mlp_forward_f32_cuda(
+            k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
+            alpha.as_ptr(), theta.as_ptr(), eta.as_ptr(),
+            m_initial.as_ptr(), s_initial.as_ptr(),
+            m_states.ptr(), s_states.ptr(), y.ptr(),
+            seq_len as i32, d as i32, d_hidden as i32,
+            batch_size as i32,
+            input_stride as i32, m_stride as i32,
+            activation, m_norm_max,
+        );
+    }
+}
+
+/// TitansLMM MLP memory backward on device buffers.
+/// Requires m_states/s_states from forward pass (full trajectory).
+/// activation: 0=GELU, 1=SiLU, 2=ReLU.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn titans_mlp_backward_dd(
+    k_mem: &GpuBuf<f32>, v_mem: &GpuBuf<f32>, q_mem: &GpuBuf<f32>,
+    alpha: &GpuBuf<f32>, theta: &GpuBuf<f32>, eta: &GpuBuf<f32>,
+    m_states: &GpuBuf<f32>, s_states: &GpuBuf<f32>, d_y: &GpuBuf<f32>,
+    d_k_mem: &mut GpuBuf<f32>, d_v_mem: &mut GpuBuf<f32>, d_q_mem: &mut GpuBuf<f32>,
+    d_alpha: &mut GpuBuf<f32>, d_theta: &mut GpuBuf<f32>, d_eta: &mut GpuBuf<f32>,
+    d_m_initial: &mut GpuBuf<f32>, d_s_initial: &mut GpuBuf<f32>,
+    seq_len: usize, d: usize, d_hidden: usize, batch_size: usize,
+    activation: i32, m_norm_max: f32,
+) {
+    let state_size = d_hidden * d + d_hidden + d * d_hidden + d;
+    let input_stride = seq_len * d;
+    let m_stride = (seq_len + 1) * state_size;
+    unsafe {
+        crate::cuda_ffi::titans_mlp_backward_f32_cuda(
+            k_mem.as_ptr(), v_mem.as_ptr(), q_mem.as_ptr(),
+            alpha.as_ptr(), theta.as_ptr(), eta.as_ptr(),
+            m_states.as_ptr(), s_states.as_ptr(), d_y.as_ptr(),
+            d_k_mem.ptr(), d_v_mem.ptr(), d_q_mem.ptr(),
+            d_alpha.ptr(), d_theta.ptr(), d_eta.ptr(),
+            d_m_initial.ptr(), d_s_initial.ptr(),
+            seq_len as i32, d as i32, d_hidden as i32,
+            batch_size as i32,
+            input_stride as i32, m_stride as i32,
+            activation, m_norm_max,
         );
     }
 }

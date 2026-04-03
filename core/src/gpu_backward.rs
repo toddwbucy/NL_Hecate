@@ -474,7 +474,15 @@ pub(crate) fn gpu_memory_backward(
     // Spec 45: per-head memory dimensions
     let nh = cfg.swa.num_heads;
     let hd = cfg.swa.head_dim;
-    let dd_mem = hd * hd;
+    // Spec 75: MLP memory has larger per-head state
+    let is_mlp_mem = cfg.memory_layers >= 2
+        && matches!(cfg.memory_rule, crate::model::MemoryRuleKind::TitansLMM);
+    let dd_mem = if is_mlp_mem {
+        let d_h = cfg.memory_expansion_factor * hd;
+        2 * hd * d_h + d_h + hd
+    } else {
+        hd * hd
+    };
     let bs_mem = batch_size * nh;
     let bs_mem_s = bs_mem * s;
     let bs_mem_d = bs_mem * s * hd;
@@ -614,6 +622,80 @@ pub(crate) fn gpu_memory_backward(
                 &mut d_m_initial, &mut d_s_initial,
                 s, hd, bs_mem,
                 cfg.error_clip_for_level(level),
+            );
+
+            // Sum per-head gate grads → d_model resolution
+            let d_alpha = crate::gpu_forward::sum_gates_across_heads(&d_alpha_ph, batch_size, s, nh);
+            let d_theta = crate::gpu_forward::sum_gates_across_heads(&d_theta_ph, batch_size, s, nh);
+            let d_eta = crate::gpu_forward::sum_gates_across_heads(&d_eta_ph, batch_size, s, nh);
+
+            // CS-39 straight-through: zero d_alpha where alpha was clamped.
+            let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
+            let alpha_ceil  = cfg.alpha_ceil.get(level).copied().unwrap_or(1.0);
+            if alpha_floor > 0.0 || alpha_ceil < 1.0 {
+                unsafe {
+                    crate::cuda_ffi::theta_clamp_mask_cuda(
+                        alpha.as_ptr(), d_alpha.ptr(), bs_s as i32, alpha_floor, alpha_ceil,
+                    );
+                }
+            }
+
+            // CS-39 straight-through: zero d_theta where theta was clamped.
+            let theta_floor = cfg.theta_floor.get(level).copied().unwrap_or(0.0);
+            let theta_ceil  = cfg.theta_ceil.get(level).copied().unwrap_or(f32::MAX);
+            if theta_floor > 0.0 || theta_ceil < f32::MAX {
+                unsafe {
+                    crate::cuda_ffi::theta_clamp_mask_cuda(
+                        theta.as_ptr(), d_theta.ptr(), bs_s as i32, theta_floor, theta_ceil,
+                    );
+                }
+            }
+
+            // Transpose d_k/d_v/d_q back to d_model for projection grads
+            let d_k_mem = crate::gpu_forward::reshape_from_per_head(&d_k_ph, batch_size, s, nh, hd);
+            let d_v_mem = crate::gpu_forward::reshape_from_per_head(&d_v_ph, batch_size, s, nh, hd);
+            let d_q_mem = crate::gpu_forward::reshape_from_per_head(&d_q_ph, batch_size, s, nh, hd);
+
+            accumulate_projection_grads(
+                level_params, embedded,
+                k_mem, v_mem, q_mem, alpha, Some(theta), Some(eta),
+                &d_k_mem, &d_v_mem, &d_q_mem,
+                &d_alpha, Some(&d_theta), Some(&d_eta),
+                k_norms, q_norms,
+                level_grads, s, d, batch_size,
+            )
+        }
+        // ── TitansLMM MLP memory backward (spec 75) ───────────────────
+        GpuMemoryCache::TitansMlp { k_mem, v_mem, q_mem, alpha, theta, eta,
+            m_states, s_states, k_norms, q_norms, d_hidden, activation } => {
+            // Spec 45: per-head backward with MLP state
+            let d_y_ph = crate::gpu_forward::reshape_to_per_head(d_y, batch_size, s, nh, hd);
+            let k_mem_ph = crate::gpu_forward::reshape_to_per_head(k_mem, batch_size, s, nh, hd);
+            let v_mem_ph = crate::gpu_forward::reshape_to_per_head(v_mem, batch_size, s, nh, hd);
+            let q_mem_ph = crate::gpu_forward::reshape_to_per_head(q_mem, batch_size, s, nh, hd);
+            let alpha_ph = crate::gpu_forward::broadcast_gates(alpha, batch_size, s, nh);
+            let theta_ph = crate::gpu_forward::broadcast_gates(theta, batch_size, s, nh);
+            let eta_ph = crate::gpu_forward::broadcast_gates(eta, batch_size, s, nh);
+
+            let mut d_k_ph = GpuBuf::zeros(bs_mem_d);
+            let mut d_v_ph = GpuBuf::zeros(bs_mem_d);
+            let mut d_q_ph = GpuBuf::zeros(bs_mem_d);
+            let mut d_alpha_ph = GpuBuf::zeros(bs_mem_s);
+            let mut d_theta_ph = GpuBuf::zeros(bs_mem_s);
+            let mut d_eta_ph = GpuBuf::zeros(bs_mem_s);
+            let mut d_m_initial = GpuBuf::zeros(dd_mem);
+            let mut d_s_initial = GpuBuf::zeros(dd_mem);
+
+            let m_norm_max = cfg.max_m_norm(level);
+
+            crate::dispatch::titans_mlp_backward_dd(
+                &k_mem_ph, &v_mem_ph, &q_mem_ph, &alpha_ph, &theta_ph, &eta_ph,
+                m_states, s_states, &d_y_ph,
+                &mut d_k_ph, &mut d_v_ph, &mut d_q_ph,
+                &mut d_alpha_ph, &mut d_theta_ph, &mut d_eta_ph,
+                &mut d_m_initial, &mut d_s_initial,
+                s, hd, *d_hidden, bs_mem,
+                *activation, m_norm_max,
             );
 
             // Sum per-head gate grads → d_model resolution
