@@ -1226,6 +1226,13 @@ pub(crate) fn gpu_memory_forward(
     let eff_ckpt = cfg.effective_checkpoint_interval(level);
     let is_proxy = cfg.tape_strategy_for_level(level) == LevelTapeStrategy::Proxy;
 
+    // Spec 75: MLP memory only supports the unfused non-checkpointed path for now.
+    // Proxy, chunkwise, checkpoint, and CUDA-graph paths assume hd×hd layout.
+    if is_mlp_mem {
+        assert!(eff_ckpt.is_none(), "MLP memory (memory_layers >= 2) does not support checkpointing yet");
+        assert!(!is_proxy, "MLP memory (memory_layers >= 2) does not support proxy tape strategy yet");
+    }
+
     // Per-level gate clamp bounds
     let alpha_floor = cfg.alpha_floor.get(level).copied().unwrap_or(0.0);
     let alpha_ceil  = cfg.alpha_ceil.get(level).copied().unwrap_or(1.0);

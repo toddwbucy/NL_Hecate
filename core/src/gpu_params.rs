@@ -440,6 +440,10 @@ impl GpuContextState {
         let mem_dd = host.memory.first()
             .map(|m| m.len())
             .unwrap_or(num_heads * head_dim * head_dim);
+        assert!(
+            host.memory.iter().all(|m| m.len() == mem_dd),
+            "GpuContextState::from_host_context: all levels must have uniform memory size"
+        );
         let bytes = mem_dd * std::mem::size_of::<f32>();
         let memory = host.memory.iter().map(|m| {
             let buf = GpuBuf::<f32>::zeros(batch_size * mem_dd);
