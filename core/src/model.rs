@@ -988,28 +988,46 @@ impl MAGConfig {
     pub fn tape_budget_bytes(&self, n_blocks: usize) -> usize {
         let cl = self.cycle_length();
         let d = self.swa.d_model;
-        let dd = d * d;
         let seq_len = self.swa.seq_len;
         let cycles_in_seq = if cl > 0 { (seq_len + cl - 1) / cl } else { seq_len };
         let retained = self.tape_multiplier.min(cycles_in_seq.max(1));
+
+        // State size per snapshot: d*d for linear, MLP-sized for memory_layers >= 2
+        let state_size = if self.memory_layers >= 2 {
+            let d_h = self.memory_expansion_factor * d;
+            let mut sp = 0;
+            for l in 0..self.memory_layers {
+                let (rows, cols) = if l == 0 {
+                    (d_h, d)
+                } else if l == self.memory_layers - 1 {
+                    (d, d_h)
+                } else {
+                    (d_h, d_h)
+                };
+                sp += rows * cols + rows; // weight + bias
+            }
+            sp
+        } else {
+            d * d
+        };
 
         let mut total = 0usize;
         for level in 0..self.k {
             let per_cycle = match self.tape_strategy_for_level(level) {
                 LevelTapeStrategy::Exact => {
-                    cl * 2 * dd * 4            // M + S full trajectories
+                    cl * 2 * state_size * 4    // M + S full trajectories
                     + cl * d * 3 * 4           // projections (k, v, q)
                     + cl * 3 * 4               // gates (alpha, theta, eta)
                     + cl * 2 * 4               // k_norms, q_norms
                 }
                 LevelTapeStrategy::Proxy => {
                     // Spec 43: chunkwise stores (num_chunks+1) M states.
-                    // With chunk_size=cl (single chunk): num_chunks=1, stores M₀+M_final = 2*dd.
+                    // With chunk_size=cl (single chunk): num_chunks=1, stores M₀+M_final.
                     // Titans also stores S₀+S_final; Delta has no momentum S.
                     let m_s_bytes = match self.memory_rule {
                         MemoryRuleKind::TitansLMM
-                        | MemoryRuleKind::AtlasOmega => 2 * 2 * dd * 4, // M+S boundary pairs
-                        _ => 2 * dd * 4,                                 // M boundary pair only
+                        | MemoryRuleKind::AtlasOmega => 2 * 2 * state_size * 4, // M+S boundary pairs
+                        _ => 2 * state_size * 4,                                 // M boundary pair only
                     };
                     m_s_bytes
                     + cl * d * 3 * 4           // projections still stored

@@ -410,6 +410,13 @@ impl TitansLMM {
         initial_m: Option<Vec<f32>>,
     ) -> (Vec<f32>, TitansLMMCache) {
         debug_assert_eq!(embedded.len(), seq_len * d);
+        assert!(
+            matches!(self.momentum_kind,
+                crate::model::MomentumKind::EMA | crate::model::MomentumKind::None),
+            "MLP memory (memory_layers >= 2) only supports EMA momentum; \
+             got {:?}. DeltaMomentum/DeepMomentum for MLP deferred to Phase B.",
+            self.momentum_kind
+        );
 
         let layout = MLPMemoryLayout::new(self.memory_layers, d, self.memory_expansion_factor);
         let state_size = layout.total_params;
@@ -950,6 +957,9 @@ impl MemoryRule for TitansLMM {
         let d = cache.d;
         debug_assert_eq!(d_y.len(), s * d);
         debug_assert_eq!(embedded.len(), s * d);
+        assert!(cache.mlp_layout.is_none(),
+            "step_backward does not yet support MLP memory (memory_layers >= 2). \
+             MLP outer-loop backward deferred to Phase B.");
 
         let mut grads = MemoryLevelParams::zeros_like_from(level_params, d);
 

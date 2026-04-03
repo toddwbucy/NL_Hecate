@@ -459,11 +459,12 @@ For C=8, d_h=512, batch=3, heads=12: 8 × 512 × 3 × 12 × 4 = 589 KB — negli
   "model": {
     "memory_layers": 2,              // L_M: number of MLP layers (1 = linear, 2+ = MLP)
     "memory_expansion_factor": 4,    // d_h = expansion_factor × head_dim
-    "memory_activation": "gelu",     // activation: "gelu" | "silu" | "relu"
-    "memory_bias": true              // include bias terms in MLP layers
+    "memory_activation": "gelu"      // activation: "gelu" | "silu" | "relu"
   }
 }
 ```
+
+Note: Bias terms are always included in MLP layers (standard MLP convention). No separate `memory_bias` config field — biases are part of the flat buffer layout unconditionally.
 
 ### Defaults and Backward Compatibility
 
@@ -472,7 +473,6 @@ For C=8, d_h=512, batch=3, heads=12: 8 × 512 × 3 × 12 × 4 = 589 KB — negli
 | `memory_layers` | 1 | Preserves current behavior by default |
 | `memory_expansion_factor` | 4 | Matches MONETA (MIRAS Eq 24-25) |
 | `memory_activation` | `"gelu"` | Matches MONETA/YAAD/MEMORA |
-| `memory_bias` | `true` | Standard MLP convention |
 
 Existing configs with no `memory_layers` field default to 1 (linear M). No config migration needed.
 
@@ -497,14 +497,21 @@ Existing configs with no `memory_layers` field default to 1 (linear M). No confi
 
 ## Affected Files
 
-### CPU Reference (Rust)
+### Phase A: CPU Reference (Rust) — Implemented
 
 | File | Change |
 |------|--------|
-| `core/src/titans_lmm.rs` | Add `MLPMemory` struct with forward/backward/update. Gate existing linear path behind `memory_layers == 1`. New MLP path for `memory_layers >= 2`. Cache MLP activations for analytical backward. |
-| `core/src/model_config.rs` | Add `memory_layers`, `memory_expansion_factor`, `memory_activation`, `memory_bias` fields to MAGConfig. Add `max_m_norm_layer()` helper. |
-| `core/src/momentum.rs` | Generalize from single d×d matrix to Vec of weight matrices. EMA/DeltaMomentum/DeepMomentum apply per-layer. |
-| `core/src/checkpoint.rs` | Serialize/deserialize MLP weight vectors. Migration: `memory_layers=1` loads old d×d M as W₁ with zero bias. |
+| `core/src/titans_lmm.rs` | `MLPMemoryLayout` struct (flat buffer descriptor). `mlp_forward()` / `mlp_inner_backward()` helpers. `TitansLMM::step_mlp()` — full MLP forward path with gates, error, analytical backward, EMA momentum, retention, M-norm clamp. Dispatched from `step()` when `memory_layers >= 2`. |
+| `core/src/model.rs` | `MemoryActivation` enum (GELU/SiLU/ReLU). `memory_layers`, `memory_expansion_factor`, `memory_activation` fields on `MAGConfig`. `tape_budget_bytes()` updated for MLP state size. |
+| `core/src/opaque_adapters.rs` | Default MLP fields in backward cache/rule construction (MLP outer-loop backward deferred to Phase B). |
+
+### Phase A: Deferred to Phase B/C
+
+| Item | Notes |
+|------|-------|
+| `core/src/momentum.rs` | DeltaMomentum/DeepMomentum for MLP. Phase A only supports EMA (asserted). |
+| `core/src/checkpoint.rs` | MLP weight serialization. Phase A operates in-memory only. |
+| Outer-loop backward (`step_backward`) | Linear backward unchanged; MLP backward asserted-unreachable until Phase B. |
 
 ### CUDA Kernels
 
