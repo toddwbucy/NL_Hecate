@@ -591,7 +591,7 @@ impl TitansLMM {
             grad_outer: Vec::new(), // MLP path doesn't use outer product
             y: y.clone(),
             fm_z_k_mem, fm_z_q_mem,
-            momentum_kind: crate::model::MomentumKind::EMA,
+            momentum_kind: self.momentum_kind,
             decay: Vec::new(),
             deep_cache: None,
             deep_d_hidden: 0,

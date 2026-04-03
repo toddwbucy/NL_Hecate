@@ -6,7 +6,7 @@
 |-----------|-------|
 | Purpose   | Replace linear matrix memory M ∈ ℝ^{d×d} with a configurable multi-layer MLP memory M = {W₁, b₁, …, Wₗ, bₗ}, enabling nonlinear associative storage as described in the Titans and MIRAS papers |
 | Expects   | Working linear memory path (Titans LMM, Delta Rule) with per-token M-norm projection (spec 74); cuBLAS batched GEMM infrastructure from Phase 1 backward (spec 44). Note: MIRAS MLP rules (MONETA/YAAD/MEMORA) live in their own files and have separate GPU completion tracked by spec 77 / task_edfe4c. This spec focuses exclusively on extending TitansLMM from linear M to MLP M for MAG/MAC/MAL compositions. |
-| Guarantees | `memory_layers=1` reproduces current linear M behavior bit-exactly; `memory_layers≥2` implements the deep neural memory from Titans §3.1 and MIRAS §4; all CUDA kernels match CPU reference within 1e-4; backward gradients verified via finite-difference; momentum and retention gates apply per-weight-matrix |
+| Guarantees | **Phase A (this PR):** `memory_layers=1` reproduces current linear M behavior bit-exactly; `memory_layers≥2` forward path produces finite output with EMA momentum, L2 retention, and M-norm clamp operating element-wise on packed MLP state buffer; non-EMA momentum rejected with assert. **Phase B/C (deferred):** CUDA kernels match CPU reference within 1e-4; outer-loop backward gradients verified via finite-difference; DeltaMomentum/DeepMomentum support for MLP; checkpoint serialization of MLP weights. |
 | Cost      | Per token: O(d · d_h + d_h · d) per MLP layer for forward + analytical backward (vs O(d²) for linear). Memory: O(L_M · d · d_h) for weights + momentum per level per head |
 | Trade-off | Higher capacity per parameter (MLP can learn nonlinear associations — MIRAS §4.2) vs higher per-token compute. Nonlinearity breaks associative scan parallelization (chunkwise GD still works). 8× more memory state at expansion_factor=4 |
 | Position  | Implements the "Memory Structure" dimension of the MIRAS 4-knob framework (CS-34). Supersedes the matrix-only assumption in `01_titans_lmm.md` for L_M ≥ 2. Child of `memory_update_rules/00_interface.md` |
@@ -49,7 +49,7 @@ Titans §5.5 ablation shows L_M=2 outperforms L_M=1 at the same parameter budget
 
 Our current implementation (`titans_lmm.rs`, `gpu_forward.rs`) uses a single d×d matrix:
 
-```
+```text
 M ∈ ℝ^{d×d}
 Forward:    y = M @ q           (matrix-vector multiply)
 Error:      e = M @ k - v       (matrix-vector multiply)
@@ -72,7 +72,7 @@ Without MLP memory, our model implements only the simplest case of the Titans me
 
 For `memory_layers = L_M` (default 2), the memory M is an MLP with L_M layers:
 
-```
+```text
 M = {W₁, b₁, W₂, b₂, …, W_L, b_L}
 
 Layer dimensions (expansion_factor = 4, matching MONETA):
@@ -84,12 +84,12 @@ Layer dimensions (expansion_factor = 4, matching MONETA):
 ```
 
 For `L_M = 2` (the standard case):
-```
+```text
 M(x) = W₂ @ σ(W₁ @ x + b₁) + b₂
 ```
 
 For `L_M = 3`:
-```
+```text
 M(x) = W₃ @ σ(W₂ @ σ(W₁ @ x + b₁) + b₂) + b₃
 
   W₁ ∈ ℝ^{d_h × d}      (expand)
@@ -106,13 +106,13 @@ General pattern for L_M ≥ 2:
 ### Activation Function
 
 **GELU** (default, matching MONETA/YAAD/MEMORA in MIRAS):
-```
+```text
 σ(x) = x · Φ(x)    where Φ is the standard normal CDF
 σ'(x) = Φ(x) + x · φ(x)   where φ is the standard normal PDF
 ```
 
 Approximation (matching PyTorch):
-```
+```text
 σ(x) ≈ 0.5 · x · (1 + tanh(√(2/π) · (x + 0.044715 · x³)))
 ```
 
@@ -145,7 +145,7 @@ For 12 heads, 12 blocks, k=1: 131,712 × 12 × 12 = **18.97M** additional params
 ### Backward Compatibility: `memory_layers = 1`
 
 When `memory_layers = 1`, the MLP degenerates to a single linear layer:
-```
+```text
 M(x) = W₁ @ x + b₁     where W₁ ∈ ℝ^{d×d}, b₁ ∈ ℝ^{d}
 ```
 
@@ -159,7 +159,7 @@ With b₁ initialized to zero, this is equivalent to the current `M @ x` behavio
 
 Source: Titans Eq 12 + 15 + MONETA spec (MIRAS Eq 24-25)
 
-```
+```text
 ALGORITHM: mlp_memory_step(mlp: &mut MLPMemory, k_t, v_t, q_t, gates) -> y_t
   -- gates: alpha_t (retention), theta_t (learning rate), eta_t (momentum)
 
@@ -227,7 +227,7 @@ For linear M, spec 74 projects M onto the L2 ball: `if ||M||_F > max: M *= max/|
 
 For MLP memory, the natural analog is to constrain the **output norm** rather than parameter norms:
 
-```
+```text
 -- After MLP weight update, check output magnitude on a probe
 -- Option A: Parameter-level norm (per weight matrix)
 FOR l in 1..L_M:
@@ -251,7 +251,7 @@ The outer loop (AdamW) differentiates through the entire forward pass including 
 
 ### What the Outer Loop Differentiates Through
 
-```
+```text
 Outer-loop params:  W_K, W_V, W_Q, gate_params, W_init (MLP initial weights)
                     ↓
 Forward pass:       For each token t:
@@ -274,7 +274,7 @@ The MLP memory step is an opaque VJP block on the Wengert tape. Its backward pro
 
 Given `d_y_t` (gradient from downstream), compute gradients w.r.t. inputs:
 
-```
+```text
 ALGORITHM: mlp_memory_backward_token(
     d_y_t,              -- gradient from loss w.r.t. y_t
     mlp_state_t,        -- MLP weights AFTER token t's update
@@ -341,7 +341,7 @@ ALGORITHM: mlp_memory_backward_token(
 
 ### Inner-Loop State (per head, per level)
 
-```
+```text
 MLPMemoryState {
   -- MLP weights (inner_loop_state, mutated per-token)
   weights: Vec<{W: Tensor, b: Tensor}>  -- L_M layers
@@ -377,7 +377,7 @@ With chunk_size=8 (TNT local): 512 chunks × 131,712 × 2 = 134.9M floats = 515 
 
 The inner-loop analytical gradient needs cached activations from the MLP forward pass:
 
-```
+```text
 MLPForwardCache {
   h: Vec<Tensor>     -- L_M+1 activation vectors per token (input + each layer output)
   pre_act: Vec<Tensor>  -- L_M pre-activation vectors (before σ)
@@ -403,7 +403,7 @@ The current CUDA forward kernels (`titans_forward.cu`, `titans_chunkwise_forward
 
 Follow the existing Phase 1/Phase 2 pattern from spec 44 (batched cuBLAS backward):
 
-```
+```text
 Phase 1: cuBLAS batched GEMM for MLP forward passes (all tokens in chunk)
 Phase 2: Sequential per-token loop for state updates (momentum, retention, M-norm)
 ```
@@ -420,7 +420,7 @@ Phase 2: Sequential per-token loop for state updates (momentum, retention, M-nor
 
 #### Chunkwise Forward (TNT-Compatible)
 
-```
+```text
 FOR each chunk c of size C:
   -- Phase 1: Batch all MLP forwards in chunk (cuBLAS)
   --   Compute M(k_t) for all t in chunk using frozen M_c (chunk boundary state)
