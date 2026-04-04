@@ -227,7 +227,7 @@ pub fn feed(config_path: &str, resume: bool) {
             std::process::exit(1);
         }
 
-        if cfg.build.seq_len_override.is_some() {
+        if cfg.build.segments_override.is_some() {
             mag_cfg.swa.seq_len = seq_len;
         }
 
@@ -434,6 +434,12 @@ pub fn feed(config_path: &str, resume: bool) {
         .unwrap_or_default();
     let mut fire_counts = vec![0usize; k];
 
+    // ── CMS activation counter (SFL-4: health snapshot) ─────────────
+    // Counts how many optimizer steps each level was active since the
+    // last checkpoint. Separate from fire_counts (which tracks spec 57
+    // reset cycles). Reset on each checkpoint save.
+    let mut cms_activations = vec![0u64; k];
+
     // ── Conductor ────────────────────────────────────────────────────
     // Replay conductor to its persisted per-token step (not global_step which
     // counts optimizer steps). step()/generate() advance conductor per-token.
@@ -564,7 +570,7 @@ pub fn feed(config_path: &str, resume: bool) {
         // Resolve per-phase overrides (fall back to build defaults)
         let opt = phase.optimizer.as_ref().unwrap_or(default_opt);
         let batch_size = phase.batch_size.unwrap_or(cfg.build.batch_size);
-        let phase_seq_len = phase.seq_len.unwrap_or(seq_len);
+        let phase_seq_len = phase.segments.map(|s| s * ws).unwrap_or(seq_len);
         let save_every = phase.save_every.unwrap_or(cfg.build.save_every);
         let log_every = phase.log_every.unwrap_or(cfg.build.log_every);
 
@@ -653,6 +659,13 @@ pub fn feed(config_path: &str, resume: bool) {
 
                     // Capture pulse snapshot for logging (conductor advances inside step_micro())
                     let pulse = conductor.pulse();
+
+                    // SFL-4: count CMS activations per level for health snapshot
+                    for (level, &active) in pulse.active_levels.iter().enumerate() {
+                        if active && level < k {
+                            cms_activations[level] += 1;
+                        }
+                    }
 
                     // Spec 63: compute log_this early so backward can skip gnorm readback
                     let log_this = log_every > 0 && phase_step % log_every == 0;
@@ -867,10 +880,11 @@ pub fn feed(config_path: &str, resume: bool) {
                             #[cfg(feature = "cuda")]
                             &gpu_context,
                             &mag_cfg, &conductor, &chunk_sizes,
-                            &loaders, &fire_counts, d, v, k,
+                            &loaders, &cms_activations, d, v, k,
                             &mut logger,
                         );
                         trigger_state.record_checkpoint(total_tokens_seen as u64, loss);
+                        cms_activations.fill(0); // Reset for next interval
 
                         // Run inline probes if tokenizer is configured
                         #[cfg(feature = "cuda")]
@@ -1053,9 +1067,10 @@ pub fn feed(config_path: &str, resume: bool) {
         }
 
         // ── Phase boundary checkpoint ─────────────────────────────
-        eprintln!("  [phase {phase_idx} complete — checkpoint at step {global_step}]");
+        // Skip if the last step already saved (avoids duplicate entry).
         #[cfg(feature = "cuda")]
-        {
+        if trigger_state.is_stale(total_tokens_seen as u64) {
+            eprintln!("  [phase {phase_idx} complete — checkpoint at step {global_step}]");
             save_checkpoint(
                 &save_path, global_step, total_tokens_seen,
                 checkpoint_naming, loss_last,
@@ -1063,11 +1078,17 @@ pub fn feed(config_path: &str, resume: bool) {
                 &gpu_params,
                 &gpu_context,
                 &mag_cfg, &conductor, &chunk_sizes,
-                &last_loaders, &fire_counts, d, v, k,
+                &last_loaders, &cms_activations, d, v, k,
                 &mut logger,
             );
             trigger_state.record_checkpoint(total_tokens_seen as u64, loss_last);
+            cms_activations.fill(0);
+        } else {
+            eprintln!("  [phase {phase_idx} complete — already checkpointed at step {global_step}]");
+        }
 
+        #[cfg(feature = "cuda")]
+        {
             // Run inline probes at phase boundary
             if let Some(ref tok_path) = cfg.build.tokenizer_path {
                 let default_opt = &cfg.build.optimizer;
@@ -1097,7 +1118,7 @@ pub fn feed(config_path: &str, resume: bool) {
             &gpu_params,
             &gpu_context,
             &mag_cfg, &conductor, &chunk_sizes,
-            &last_loaders, &fire_counts, d, v, k,
+            &last_loaders, &cms_activations, d, v, k,
             &mut logger,
         );
     }
@@ -1199,7 +1220,7 @@ fn save_checkpoint(
     conductor: &Conductor,
     chunk_sizes: &[usize],
     loaders: &[BpeTokenStream],
-    fire_counts: &[usize],
+    cms_activations: &[u64],
     d: usize,
     v: usize,
     k: usize,
@@ -1281,10 +1302,6 @@ fn save_checkpoint(
                 for v in &mut gate_alpha_mean { *v /= n_blocks_params; }
                 for v in &mut gate_theta_mean { *v /= n_blocks_params; }
 
-                let cms_activations: Vec<u64> = fire_counts.iter()
-                    .map(|&c| c as u64)
-                    .collect();
-
                 let entry = CheckpointEntry {
                     path: ckpt_path.clone(),
                     tokens: total_tokens_seen as u64,
@@ -1295,7 +1312,7 @@ fn save_checkpoint(
                         m_norm_per_level,
                         gate_alpha_mean_per_level: gate_alpha_mean,
                         gate_theta_mean_per_level: gate_theta_mean,
-                        cms_activations_since_restore: cms_activations,
+                        cms_activations_since_restore: cms_activations.to_vec(),
                     },
                     session: SessionInfo::Build {
                         label: phase_label.into(),

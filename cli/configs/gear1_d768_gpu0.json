@@ -1,9 +1,9 @@
 {
-    "description": "Gear 1: L0/L1 init — d768, seq_len=512, batch=32. Fresh on foundations. Fixed Conductor.",
+    "description": "Gear 1: L0/L1 init — d768, 1 segment (512 tok), batch=32. Fresh on foundations. Fixed Conductor.",
     "model": {
         "d_model": 768,
         "num_heads": 24,
-        "seq_len": 512,
+        "segments": 1,
         "window_size": 512,
         "vocab_size": 49152,
         "memory_rule": "titans",
