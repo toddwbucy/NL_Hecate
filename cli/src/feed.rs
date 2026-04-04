@@ -21,7 +21,8 @@ use nl_hecate_core::gpu_stacked_optimizer::{
 #[cfg(feature = "cuda")]
 use nl_hecate_core::gpu_profiler::GpuProfiler;
 
-use crate::config::{Config, PhaseDuration};
+use crate::checkpoint_policy::{TriggerState, checkpoint_filename};
+use crate::config::{Config, PhaseDuration, TriggerConfig, CheckpointNaming};
 use crate::data::BpeTokenStream;
 #[cfg(feature = "cuda")]
 use crate::probe::run_inline_probes;
@@ -486,6 +487,7 @@ pub fn feed(config_path: &str, resume: bool) {
     let mut step_tokens: usize = 0;
     let mut total_tokens_seen: usize = resume_tokens; // CG-6: cumulative tokens for segment accounting
     let mut aborted = false;
+    let mut trigger_state = TriggerState::new(resume_tokens as u64);
 
     for (phase_idx, phase) in phases.iter().enumerate() {
         // Resolve per-phase overrides (fall back to build defaults)
@@ -494,6 +496,20 @@ pub fn feed(config_path: &str, resume: bool) {
         let phase_seq_len = phase.seq_len.unwrap_or(seq_len);
         let save_every = phase.save_every.unwrap_or(cfg.build.save_every);
         let log_every = phase.log_every.unwrap_or(cfg.build.log_every);
+
+        // Spec 78: resolve effective checkpoint policy for this phase.
+        // Priority: phase.checkpoint > build.checkpoint.triggers > save_every fallback
+        let phase_checkpoint_policy = phase.checkpoint.as_ref()
+            .unwrap_or(&cfg.build.checkpoint);
+        let effective_triggers: Vec<TriggerConfig> = if !phase_checkpoint_policy.triggers.is_empty() {
+            phase_checkpoint_policy.triggers.clone()
+        } else if save_every > 0 {
+            vec![TriggerConfig::StepCount { every: save_every }]
+        } else {
+            vec![]
+        };
+        let checkpoint_naming = &phase_checkpoint_policy.naming;
+        let has_new_style_triggers = effective_triggers.iter().any(|t| !matches!(t, TriggerConfig::StepCount { .. }));
         let max_grad_norm = phase.max_grad_norm.unwrap_or(cfg.build.max_grad_norm);
         let warmup_steps = phase.warmup_steps.unwrap_or(cfg.build.warmup_steps);
 
@@ -760,14 +776,20 @@ pub fn feed(config_path: &str, resume: bool) {
                         );
                     }
 
-                    // Checkpoint
-                    let do_checkpoint = save_every > 0
-                        && phase_step > 0
-                        && (phase_step + 1) % save_every == 0;
+                    // Spec 78: Checkpoint trigger evaluation
+                    trigger_state.record_loss(loss);
+                    let do_checkpoint = if has_new_style_triggers {
+                        // New-style triggers: token_count, elapsed_minutes, loss_plateau
+                        trigger_state.should_checkpoint(&effective_triggers, total_tokens_seen as u64)
+                    } else {
+                        // Legacy StepCount fallback: exact modulo semantics
+                        save_every > 0 && phase_step > 0 && (phase_step + 1) % save_every == 0
+                    };
 
                     if do_checkpoint {
                         save_checkpoint(
                             &save_path, global_step, total_tokens_seen,
+                            checkpoint_naming,
                             #[cfg(feature = "cuda")]
                             &gpu_params,
                             #[cfg(feature = "cuda")]
@@ -776,6 +798,7 @@ pub fn feed(config_path: &str, resume: bool) {
                             &loaders, d, v, k,
                             &mut logger,
                         );
+                        trigger_state.record_checkpoint(total_tokens_seen as u64, loss);
 
                         // Run inline probes if tokenizer is configured
                         #[cfg(feature = "cuda")]
@@ -963,12 +986,14 @@ pub fn feed(config_path: &str, resume: bool) {
             let loaders_empty: Vec<BpeTokenStream> = Vec::new();
             save_checkpoint(
                 &save_path, global_step, total_tokens_seen,
+                checkpoint_naming,
                 &gpu_params,
                 &gpu_context,
                 &mag_cfg, &conductor, &chunk_sizes,
                 &loaders_empty, d, v, k,
                 &mut logger,
             );
+            trigger_state.record_checkpoint(total_tokens_seen as u64, loss_last);
 
             // Run inline probes at phase boundary
             if let Some(ref tok_path) = cfg.build.tokenizer_path {
@@ -985,6 +1010,23 @@ pub fn feed(config_path: &str, resume: bool) {
                 logger.log_probe_results(global_step, probe_results);
             }
         }
+    }
+
+    // Spec 78: on_unload — save if work is unsaved (covers abort and graceful exit)
+    #[cfg(feature = "cuda")]
+    if cfg.build.checkpoint.on_unload && trigger_state.is_stale(total_tokens_seen as u64) {
+        eprintln!("  [on_unload: saving final checkpoint at step {global_step}]");
+        let naming = &cfg.build.checkpoint.naming;
+        let loaders_empty: Vec<BpeTokenStream> = Vec::new();
+        save_checkpoint(
+            &save_path, global_step, total_tokens_seen,
+            naming,
+            &gpu_params,
+            &gpu_context,
+            &mag_cfg, &conductor, &chunk_sizes,
+            &loaders_empty, d, v, k,
+            &mut logger,
+        );
     }
 
     // ── Summary ──────────────────────────────────────────────────────
@@ -1073,6 +1115,7 @@ fn save_checkpoint(
     save_path: &str,
     global_step: usize,
     total_tokens_seen: usize,
+    naming: &CheckpointNaming,
     #[cfg(feature = "cuda")] gpu_params: &GpuStackedParams,
     #[cfg(feature = "cuda")] gpu_context: &GpuStackedContext,
     mag_cfg: &MAGConfig,
@@ -1084,10 +1127,7 @@ fn save_checkpoint(
     k: usize,
     logger: &mut MetricsLogger,
 ) {
-    let ckpt_path = save_path.replace(
-        ".safetensors",
-        &format!("_step{global_step}.safetensors"),
-    );
+    let ckpt_path = checkpoint_filename(save_path, naming, global_step, total_tokens_seen);
 
     #[cfg(feature = "cuda")]
     {
