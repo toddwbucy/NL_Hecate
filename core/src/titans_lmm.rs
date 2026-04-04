@@ -384,6 +384,44 @@ pub fn mlp_backward_full(
     d_out // d_input
 }
 
+/// Input-only VJP through an MLP: returns d_input without computing weight gradients.
+/// Used for frozen levels where M is not updated and weight grads are discarded.
+pub fn mlp_backward_input_only(
+    d_output: &[f32],
+    pre_acts: &[Vec<f32>],
+    state_buf: &[f32],
+    base: usize,
+    layout: &MLPMemoryLayout,
+    activation: MemoryActivation,
+) -> Vec<f32> {
+    let n = layout.n_layers;
+    let mut d_out = d_output.to_vec();
+
+    for l in (0..n).rev() {
+        let desc = &layout.layers[l];
+
+        if l < n - 1 {
+            apply_activation_derivative(&mut d_out, &pre_acts[l], activation);
+        }
+
+        // Propagate: d_out = W_l^T @ d_out (skip weight/bias grad accumulation)
+        let w = layout.w_slice(state_buf, base, l);
+        let out_dim = desc.w_rows;
+        let in_dim = desc.w_cols;
+        let mut d_prev = vec![0.0f32; in_dim];
+        for j in 0..in_dim {
+            let mut sum = 0.0f32;
+            for i in 0..out_dim {
+                sum += w[i * in_dim + j] * d_out[i];
+            }
+            d_prev[j] = sum;
+        }
+        d_out = d_prev;
+    }
+
+    d_out
+}
+
 /// Frozen MLP read-only forward: y_t = M_mlp(q_t) for each token.
 /// Used for frozen CMS levels where M is not updated.
 /// Returns (y, q_mem) — same contract as delta_rule_read_only.
@@ -432,17 +470,14 @@ pub fn titans_mlp_read_only_backward(
     let mut grads = MemoryLevelParams::zeros_like(d);
     let mut d_q_mem = vec![0.0f32; seq_len * d];
 
-    // Allocate once outside loop — accumulated values are discarded (frozen M has no weight grads)
-    let mut dummy_dw = vec![0.0f32; layout.total_params];
     for t in 0..seq_len {
         let q_t = &q_mem[t * d..(t + 1) * d];
         let d_y_t = &d_y[t * d..(t + 1) * d];
-        // Recompute forward to get pre_acts/activations for backward
-        let (_, pre_acts, activations) = mlp_forward(frozen_m, 0, q_t, &layout, activation);
-        // MLP backward: d_input only (no weight gradients for frozen M)
-        let d_q_t = mlp_backward_full(
-            d_y_t, &pre_acts, &activations, frozen_m, 0, &layout, activation,
-            &mut dummy_dw, 0,
+        // Recompute forward to get pre_acts for input-only VJP
+        let (_, pre_acts, _) = mlp_forward(frozen_m, 0, q_t, &layout, activation);
+        // Input-only VJP: frozen M has no weight gradients
+        let d_q_t = mlp_backward_input_only(
+            d_y_t, &pre_acts, frozen_m, 0, &layout, activation,
         );
         d_q_mem[t * d..(t + 1) * d].copy_from_slice(&d_q_t);
     }
@@ -457,6 +492,64 @@ pub fn titans_mlp_read_only_backward(
     crate::dispatch::matmul_acc_dispatch(&d_q_mem, &w_q_f32, &mut d_embedded, seq_len, d, d);
 
     (grads, d_embedded)
+}
+
+// ── Shared backward helpers ─────────────────────────────────────────
+
+/// Post-loop backward for L2-norm → conv1d → projection (k/v/q_mem).
+/// Used by both MLP and linear backward paths to avoid duplication.
+fn projection_backward(
+    mut d_k_mem: Vec<f32>,
+    d_v_mem: &[f32],
+    mut d_q_mem: Vec<f32>,
+    cache: &TitansLMMCache,
+    level_params: &MemoryLevelParams,
+    grads: &mut MemoryLevelParams,
+    embedded: &[f32],
+    s: usize,
+    d: usize,
+) -> Vec<f32> {
+    if !cache.k_mem_norms.is_empty() {
+        let mut d_k_raw = vec![0.0f32; s * d];
+        crate::tensor::l2_normalize_rows_backward(
+            &d_k_mem, &cache.k_mem, &cache.k_mem_norms,
+            &mut d_k_raw, s, d);
+        d_k_mem = d_k_raw;
+
+        let mut d_q_raw = vec![0.0f32; s * d];
+        crate::tensor::l2_normalize_rows_backward(
+            &d_q_mem, &cache.q_mem, &cache.q_mem_norms,
+            &mut d_q_raw, s, d);
+        d_q_mem = d_q_raw;
+    }
+
+    crate::conv1d::backward_conv1d_kq(
+        &mut d_k_mem, &mut d_q_mem,
+        &cache.k_conv_cache, &cache.q_conv_cache,
+        level_params, grads, s, d);
+
+    let mut d_embedded = vec![0.0f32; s * d];
+
+    let mut d_k_mem_t = vec![0.0f32; d * s];
+    transpose_f32(&d_k_mem, &mut d_k_mem_t, s, d);
+    matmul_f32(&d_k_mem_t, embedded, grads.w_k_mem.master_mut(), d, s, d);
+
+    let mut d_v_mem_t = vec![0.0f32; d * s];
+    transpose_f32(d_v_mem, &mut d_v_mem_t, s, d);
+    matmul_f32(&d_v_mem_t, embedded, grads.w_v_mem.master_mut(), d, s, d);
+
+    let mut d_q_mem_t = vec![0.0f32; d * s];
+    transpose_f32(&d_q_mem, &mut d_q_mem_t, s, d);
+    matmul_f32(&d_q_mem_t, embedded, grads.w_q_mem.master_mut(), d, s, d);
+
+    let w_k_f32 = level_params.w_k_mem.as_f32();
+    let w_v_f32 = level_params.w_v_mem.as_f32();
+    let w_q_f32 = level_params.w_q_mem.as_f32();
+    crate::tensor::matmul_acc_f32(&d_k_mem, &w_k_f32, &mut d_embedded, s, d, d);
+    crate::tensor::matmul_acc_f32(d_v_mem, &w_v_f32, &mut d_embedded, s, d, d);
+    crate::tensor::matmul_acc_f32(&d_q_mem, &w_q_f32, &mut d_embedded, s, d, d);
+
+    d_embedded
 }
 
 // ── Titans LMM implementation ───────────────────────────────────────
@@ -1034,8 +1127,11 @@ impl TitansLMM {
             }
 
             // ── Gate backward ──
+            // Clamp gradient mask: zero gradient when alpha was at floor or ceil (CS-39)
+            let alpha_raw = sigmoid_f32(cache.alpha_pre[t]);
+            let alpha_clamp_mask = if alpha_raw <= self.alpha_floor || alpha_raw >= self.alpha_ceil { 0.0 } else { 1.0 };
             let sig_deriv = alpha_t * (1.0 - alpha_t);
-            let d_alpha_pre = d_alpha_scalar * sig_deriv;
+            let d_alpha_pre = d_alpha_scalar * sig_deriv * alpha_clamp_mask;
 
             let theta_raw = softplus_f32(theta_pre_t);
             let clamp_mask = if theta_raw <= self.theta_floor || theta_raw >= self.theta_ceil { 0.0 } else { 1.0 };
@@ -1076,46 +1172,8 @@ impl TitansLMM {
             // d_s was already updated in-place by ema_step_backward
         }
 
-        // ── Post-loop: L2 norm, conv1d, projection backward (shared with linear) ──
-        if !cache.k_mem_norms.is_empty() {
-            let mut d_k_raw = vec![0.0f32; s * d];
-            crate::tensor::l2_normalize_rows_backward(
-                &d_k_mem, &cache.k_mem, &cache.k_mem_norms,
-                &mut d_k_raw, s, d);
-            d_k_mem = d_k_raw;
-
-            let mut d_q_raw = vec![0.0f32; s * d];
-            crate::tensor::l2_normalize_rows_backward(
-                &d_q_mem, &cache.q_mem, &cache.q_mem_norms,
-                &mut d_q_raw, s, d);
-            d_q_mem = d_q_raw;
-        }
-
-        crate::conv1d::backward_conv1d_kq(
-            &mut d_k_mem, &mut d_q_mem,
-            &cache.k_conv_cache, &cache.q_conv_cache,
-            level_params, &mut grads, s, d);
-
-        let mut d_embedded = vec![0.0f32; s * d];
-
-        let mut d_k_mem_t = vec![0.0f32; d * s];
-        transpose_f32(&d_k_mem, &mut d_k_mem_t, s, d);
-        matmul_f32(&d_k_mem_t, embedded, grads.w_k_mem.master_mut(), d, s, d);
-
-        let mut d_v_mem_t = vec![0.0f32; d * s];
-        transpose_f32(&d_v_mem, &mut d_v_mem_t, s, d);
-        matmul_f32(&d_v_mem_t, embedded, grads.w_v_mem.master_mut(), d, s, d);
-
-        let mut d_q_mem_t = vec![0.0f32; d * s];
-        transpose_f32(&d_q_mem, &mut d_q_mem_t, s, d);
-        matmul_f32(&d_q_mem_t, embedded, grads.w_q_mem.master_mut(), d, s, d);
-
-        let w_k_f32 = level_params.w_k_mem.as_f32();
-        let w_v_f32 = level_params.w_v_mem.as_f32();
-        let w_q_f32 = level_params.w_q_mem.as_f32();
-        crate::tensor::matmul_acc_f32(&d_k_mem, &w_k_f32, &mut d_embedded, s, d, d);
-        crate::tensor::matmul_acc_f32(&d_v_mem, &w_v_f32, &mut d_embedded, s, d, d);
-        crate::tensor::matmul_acc_f32(&d_q_mem, &w_q_f32, &mut d_embedded, s, d, d);
+        let d_embedded = projection_backward(
+            d_k_mem, &d_v_mem, d_q_mem, cache, level_params, &mut grads, embedded, s, d);
 
         (grads, d_embedded)
     }
@@ -1633,8 +1691,11 @@ impl MemoryRule for TitansLMM {
             }
 
             // ── Gate backward: alpha_t = sigmoid(alpha_pre_t) ──
+            // Clamp gradient mask: zero gradient when alpha was at floor or ceil (CS-39)
+            let alpha_raw = sigmoid_f32(cache.alpha_pre[t]);
+            let alpha_clamp_mask = if alpha_raw <= self.alpha_floor || alpha_raw >= self.alpha_ceil { 0.0 } else { 1.0 };
             let sig_deriv = alpha_t * (1.0 - alpha_t);
-            let d_alpha_pre = d_alpha_scalar * sig_deriv;
+            let d_alpha_pre = d_alpha_scalar * sig_deriv * alpha_clamp_mask;
 
             // ── Gate backward: theta_t = softplus(theta_pre_t) ──
             // Clamp gradient mask: zero gradient when theta was at floor or ceil (CS-39)
@@ -1682,50 +1743,8 @@ impl MemoryRule for TitansLMM {
             d_s = d_s_prev;
         }
 
-        // ── L2 normalization backward (before conv1d backward) ──
-        // d_k_mem and d_q_mem are w.r.t. normalized k/q. Chain the normalization Jacobian.
-        // Guard: old tape recordings may have empty norms (backward compat).
-        if !cache.k_mem_norms.is_empty() {
-            let mut d_k_raw = vec![0.0f32; s * d];
-            crate::tensor::l2_normalize_rows_backward(
-                &d_k_mem, &cache.k_mem, &cache.k_mem_norms,
-                &mut d_k_raw, s, d);
-            d_k_mem = d_k_raw;
-
-            let mut d_q_raw = vec![0.0f32; s * d];
-            crate::tensor::l2_normalize_rows_backward(
-                &d_q_mem, &cache.q_mem, &cache.q_mem_norms,
-                &mut d_q_raw, s, d);
-            d_q_mem = d_q_raw;
-        }
-
-        // ── Conv1D backward (before projection backward) ──
-        crate::conv1d::backward_conv1d_kq(
-            &mut d_k_mem, &mut d_q_mem,
-            &cache.k_conv_cache, &cache.q_conv_cache,
-            level_params, &mut grads, s, d);
-
-        // ── Projection backward: k_mem = embedded @ W_K_mem^T ──
-        let mut d_embedded = vec![0.0f32; s * d];
-
-        let mut d_k_mem_t = vec![0.0f32; d * s];
-        transpose_f32(&d_k_mem, &mut d_k_mem_t, s, d);
-        matmul_f32(&d_k_mem_t, embedded, grads.w_k_mem.master_mut(), d, s, d);
-
-        let mut d_v_mem_t = vec![0.0f32; d * s];
-        transpose_f32(&d_v_mem, &mut d_v_mem_t, s, d);
-        matmul_f32(&d_v_mem_t, embedded, grads.w_v_mem.master_mut(), d, s, d);
-
-        let mut d_q_mem_t = vec![0.0f32; d * s];
-        transpose_f32(&d_q_mem, &mut d_q_mem_t, s, d);
-        matmul_f32(&d_q_mem_t, embedded, grads.w_q_mem.master_mut(), d, s, d);
-
-        let w_k_f32 = level_params.w_k_mem.as_f32();
-        let w_v_f32 = level_params.w_v_mem.as_f32();
-        let w_q_f32 = level_params.w_q_mem.as_f32();
-        crate::tensor::matmul_acc_f32(&d_k_mem, &w_k_f32, &mut d_embedded, s, d, d);
-        crate::tensor::matmul_acc_f32(&d_v_mem, &w_v_f32, &mut d_embedded, s, d, d);
-        crate::tensor::matmul_acc_f32(&d_q_mem, &w_q_f32, &mut d_embedded, s, d, d);
+        let d_embedded = projection_backward(
+            d_k_mem, &d_v_mem, d_q_mem, cache, level_params, &mut grads, embedded, s, d);
 
         (grads, d_embedded)
     }
