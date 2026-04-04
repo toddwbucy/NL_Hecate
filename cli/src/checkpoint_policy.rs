@@ -95,6 +95,32 @@ impl TriggerState {
     }
 }
 
+/// Format a token count as a human-readable SI-style label (spec 03).
+///
+/// | Range | Format | Example |
+/// |-------|--------|---------|
+/// | < 1K  | raw    | `512`   |
+/// | 1K–999K | `{n}K` | `750K` |
+/// | 1M–999M | `{n}M` | `150M` |
+/// | >= 1B   | `{n.d}B` | `1.2B` |
+pub fn format_tokens(total_tokens: u64) -> String {
+    const K: u64 = 1_000;
+    const M: u64 = 1_000_000;
+    const B: u64 = 1_000_000_000;
+
+    if total_tokens >= B {
+        let whole = total_tokens / B;
+        let frac = (total_tokens % B) / (B / 10);
+        format!("{whole}.{frac}B")
+    } else if total_tokens >= M {
+        format!("{}M", total_tokens / M)
+    } else if total_tokens >= K {
+        format!("{}K", total_tokens / K)
+    } else {
+        format!("{total_tokens}")
+    }
+}
+
 /// Generate checkpoint filename based on naming policy.
 ///
 /// Uses `std::path::Path` to robustly handle base_path regardless of
@@ -112,7 +138,10 @@ pub fn checkpoint_filename(
         .and_then(|s| s.to_str())
         .unwrap_or("model");
     let suffix = match naming {
-        CheckpointNaming::Tokens => format!("{stem}_{total_tokens}tok"),
+        CheckpointNaming::Tokens => {
+            let label = format_tokens(total_tokens as u64);
+            format!("{stem}_{label}_tok")
+        }
         CheckpointNaming::Steps => format!("{stem}_step{global_step}"),
     };
     let mut new_path = path.with_file_name(suffix);
@@ -228,6 +257,37 @@ mod tests {
     }
 
     #[test]
+    fn test_format_tokens_sub_1k() {
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(512), "512");
+        assert_eq!(format_tokens(999), "999");
+    }
+
+    #[test]
+    fn test_format_tokens_k_range() {
+        assert_eq!(format_tokens(1_000), "1K");
+        assert_eq!(format_tokens(5_120), "5K");
+        assert_eq!(format_tokens(750_000), "750K");
+        assert_eq!(format_tokens(999_999), "999K");
+    }
+
+    #[test]
+    fn test_format_tokens_m_range() {
+        assert_eq!(format_tokens(1_000_000), "1M");
+        assert_eq!(format_tokens(5_120_000), "5M");
+        assert_eq!(format_tokens(150_000_000), "150M");
+        assert_eq!(format_tokens(999_999_999), "999M");
+    }
+
+    #[test]
+    fn test_format_tokens_b_range() {
+        assert_eq!(format_tokens(1_000_000_000), "1.0B");
+        assert_eq!(format_tokens(1_200_000_000), "1.2B");
+        assert_eq!(format_tokens(12_500_000_000), "12.5B");
+        assert_eq!(format_tokens(100_000_000_000), "100.0B");
+    }
+
+    #[test]
     fn test_checkpoint_filename_tokens() {
         let path = checkpoint_filename(
             "checkpoints/model.safetensors",
@@ -235,7 +295,7 @@ mod tests {
             100,
             5_120_000,
         );
-        assert_eq!(path, "checkpoints/model_5120000tok.safetensors");
+        assert_eq!(path, "checkpoints/model_5M_tok.safetensors");
     }
 
     #[test]
@@ -256,9 +316,9 @@ mod tests {
             "checkpoints/model.bin",
             &CheckpointNaming::Tokens,
             100,
-            5_120_000,
+            150_000_000,
         );
-        assert_eq!(path, "checkpoints/model_5120000tok.safetensors");
+        assert_eq!(path, "checkpoints/model_150M_tok.safetensors");
 
         let path = checkpoint_filename(
             "checkpoints/model",
