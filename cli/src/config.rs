@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Top-level JSON config (spec 61: unified runtime with phase list).
 #[derive(Deserialize, Debug)]
@@ -126,6 +126,61 @@ impl OptimizerConfig {
 // Note: Rust allows multiple impl blocks for the same type.
 // optimizer_type(), merged_with() are defined above; lr/beta1/beta2/weight_decay here.
 
+// ── Spec 78: Checkpoint trigger policy ──────────────────────────────
+
+/// Individual trigger type. Composed via OR in CheckpointPolicy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TriggerConfig {
+    /// Fire when total_tokens_seen crosses a multiple of `every`.
+    TokenCount { every: u64 },
+    /// Fire when wall-clock minutes since last checkpoint exceeds `every`.
+    ElapsedMinutes { every: u32 },
+    /// Fire when loss plateaus over `window` steps within `min_delta`.
+    LossPlateau { window: usize, min_delta: f32 },
+    /// Internal-only: legacy save_every step-based trigger (not exposed in config schema).
+    #[serde(skip)]
+    StepCount { every: usize },
+}
+
+/// Checkpoint filename convention.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointNaming {
+    /// `model_{N}tok.safetensors` — invariant to config changes.
+    #[default]
+    Tokens,
+    /// `model_step{N}.safetensors` — legacy behavior.
+    Steps,
+}
+
+/// Spec 78: Composable checkpoint trigger policy.
+///
+/// Declares WHEN checkpoints fire. Spec 67 defines WHAT happens at each
+/// checkpoint (before_save/after_save action pipeline — future).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointPolicy {
+    /// Triggers compose via OR — any trigger firing initiates a checkpoint.
+    #[serde(default)]
+    pub triggers: Vec<TriggerConfig>,
+    /// Fire one final checkpoint on graceful shutdown if work is unsaved.
+    #[serde(default = "default_true")]
+    pub on_unload: bool,
+    /// Filename convention: "tokens" (default) or "steps".
+    #[serde(default)]
+    pub naming: CheckpointNaming,
+}
+
+impl Default for CheckpointPolicy {
+    fn default() -> Self {
+        Self {
+            triggers: Vec::new(),
+            on_unload: true,
+            naming: CheckpointNaming::default(),
+        }
+    }
+}
+
 #[derive(Deserialize, Debug)]
 pub struct BuildConfig {
     /// Nested optimizer block. Also accepts legacy flat string via custom deserialize.
@@ -173,6 +228,11 @@ pub struct BuildConfig {
     pub run_dir: Option<String>,
     pub save_path: Option<String>,
     pub log_file: Option<String>,
+
+    /// Spec 78: composable checkpoint trigger policy. When present, `triggers`
+    /// takes precedence over `save_every` (which becomes a fallback for legacy configs).
+    #[serde(default)]
+    pub checkpoint: CheckpointPolicy,
 
     // CMS diagnostic sidecar (written alongside each checkpoint)
     #[serde(default = "default_true")]
@@ -246,6 +306,8 @@ pub struct PhaseConfig {
     pub temperature: Option<f32>,
     /// Top-k filtering for speak step (default: 0 = disabled).
     pub top_k: Option<usize>,
+    /// Spec 78: per-phase checkpoint policy override. Inherits top-level if absent.
+    pub checkpoint: Option<CheckpointPolicy>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -347,6 +409,11 @@ impl Config {
                 }
             }
         }
+        // Spec 78: warn if both triggers and save_every are present
+        if !cfg.build.checkpoint.triggers.is_empty() && cfg.build.save_every > 0 {
+            eprintln!("WARNING: checkpoint.triggers present — save_every={} will be ignored",
+                cfg.build.save_every);
+        }
         Ok(())
     }
 
@@ -423,6 +490,7 @@ impl Config {
                     max_gen_tokens: phase.max_gen_tokens,
                     temperature: phase.temperature,
                     top_k: phase.top_k,
+                    checkpoint: phase.checkpoint.clone(),
                 });
             }
             Ok(resolved)
@@ -446,6 +514,7 @@ impl Config {
                 max_gen_tokens: None,
                 temperature: None,
                 top_k: None,
+                checkpoint: None,
             }])
         }
     }
@@ -469,6 +538,8 @@ pub struct ResolvedPhase {
     pub max_gen_tokens: Option<usize>,
     pub temperature: Option<f32>,
     pub top_k: Option<usize>,
+    /// Spec 78: per-phase checkpoint policy override.
+    pub checkpoint: Option<CheckpointPolicy>,
 }
 
 #[derive(Debug)]
@@ -703,5 +774,109 @@ mod tests {
         assert_eq!(cfg.build.optimizer.optimizer_type(), "m3");
         assert_eq!(cfg.build.optimizer.meta_lr, Some(0.001));
         assert_eq!(cfg.build.optimizer.inner_steps, Some(5));
+    }
+
+    // ── Spec 78: Checkpoint policy tests ────────────────────────────
+
+    #[test]
+    fn checkpoint_policy_defaults_when_absent() {
+        let json = format!(r#"{{
+            {},
+            "build": {{"optimizer": {{"type": "adamw", "lr": 0.0003}}, "steps": 1000}},
+            "data": {{"path": "data/test"}}
+        }}"#, minimal_model_json());
+
+        let cfg = Config::from_str(&json).unwrap();
+        assert!(cfg.build.checkpoint.triggers.is_empty());
+        assert!(cfg.build.checkpoint.on_unload);
+        assert!(matches!(cfg.build.checkpoint.naming, CheckpointNaming::Tokens));
+    }
+
+    #[test]
+    fn checkpoint_policy_parses_triggers() {
+        let json = format!(r#"{{
+            {},
+            "build": {{
+                "optimizer": {{"type": "adamw", "lr": 0.0003}},
+                "steps": 1000,
+                "checkpoint": {{
+                    "triggers": [
+                        {{"type": "token_count", "every": 512000}},
+                        {{"type": "elapsed_minutes", "every": 30}}
+                    ],
+                    "on_unload": false,
+                    "naming": "steps"
+                }}
+            }},
+            "data": {{"path": "data/test"}}
+        }}"#, minimal_model_json());
+
+        let cfg = Config::from_str(&json).unwrap();
+        assert_eq!(cfg.build.checkpoint.triggers.len(), 2);
+        assert!(!cfg.build.checkpoint.on_unload);
+        assert!(matches!(cfg.build.checkpoint.naming, CheckpointNaming::Steps));
+    }
+
+    #[test]
+    fn checkpoint_policy_loss_plateau_trigger() {
+        let json = format!(r#"{{
+            {},
+            "build": {{
+                "optimizer": {{"type": "adamw", "lr": 0.0003}},
+                "steps": 1000,
+                "checkpoint": {{
+                    "triggers": [
+                        {{"type": "loss_plateau", "window": 100, "min_delta": 0.01}}
+                    ]
+                }}
+            }},
+            "data": {{"path": "data/test"}}
+        }}"#, minimal_model_json());
+
+        let cfg = Config::from_str(&json).unwrap();
+        assert_eq!(cfg.build.checkpoint.triggers.len(), 1);
+        match &cfg.build.checkpoint.triggers[0] {
+            TriggerConfig::LossPlateau { window, min_delta } => {
+                assert_eq!(*window, 100);
+                assert!((min_delta - 0.01).abs() < 1e-6);
+            }
+            _ => panic!("expected LossPlateau trigger"),
+        }
+    }
+
+    #[test]
+    fn per_phase_checkpoint_override() {
+        let json = format!(r#"{{
+            {},
+            "build": {{
+                "optimizer": {{"type": "adamw", "lr": 0.0003}},
+                "checkpoint": {{
+                    "triggers": [{{"type": "token_count", "every": 1000000}}]
+                }}
+            }},
+            "phases": [
+                {{"data": "data/warmup", "steps": 100,
+                  "checkpoint": {{
+                      "triggers": [{{"type": "token_count", "every": 100000}}]
+                  }}
+                }},
+                {{"data": "data/main", "steps": 5000}}
+            ]
+        }}"#, minimal_model_json());
+
+        let cfg = Config::from_str(&json).unwrap();
+        let phases = cfg.resolved_phases().unwrap();
+
+        // Phase 0: has its own checkpoint policy
+        assert!(phases[0].checkpoint.is_some());
+        let p0_ckpt = phases[0].checkpoint.as_ref().unwrap();
+        assert_eq!(p0_ckpt.triggers.len(), 1);
+        match &p0_ckpt.triggers[0] {
+            TriggerConfig::TokenCount { every } => assert_eq!(*every, 100_000),
+            _ => panic!("expected TokenCount trigger"),
+        }
+
+        // Phase 1: no override, inherits top-level
+        assert!(phases[1].checkpoint.is_none());
     }
 }

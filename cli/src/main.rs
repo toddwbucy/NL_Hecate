@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 
 mod chat;
+mod checkpoint_policy;
 mod config;
 mod data;
 mod feed;
