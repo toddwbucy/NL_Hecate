@@ -55,14 +55,17 @@ pub fn ema_step_backward(
     grad_t: &[f32],
     eta_t: f32,
     theta_t: f32,
-    d: usize,
+    _d: usize,
 ) -> (f32, f32, Vec<f32>) {
-    let dd = d * d;
+    // Use slice length for state size — works for both linear (d*d) and MLP memory (state_size).
+    let ss = d_s.len();
+    debug_assert_eq!(s_t.len(), ss, "s_t length mismatch: expected {ss}, got {}", s_t.len());
+    debug_assert_eq!(grad_t.len(), ss, "grad_t length mismatch: expected {ss}, got {}", grad_t.len());
     let d_eta_scalar = frobenius_dot_f32(s_t, d_s);
     let d_theta_scalar = -frobenius_dot_f32(grad_t, d_s);
 
-    let mut d_grad = vec![0.0f32; dd];
-    for i in 0..dd {
+    let mut d_grad = vec![0.0f32; ss];
+    for i in 0..ss {
         d_grad[i] = -theta_t * d_s[i];
     }
 
@@ -122,9 +125,12 @@ pub fn delta_momentum_step_backward(
     eta_t: f32,
     theta_t: f32,
     decay_t: f32,
-    d: usize,
+    _d: usize,
 ) -> (f32, f32, Vec<f32>) {
-    let dd = d * d;
+    // Use slice length for state size — works for both linear (d*d) and MLP memory (state_size).
+    let ss = d_s.len();
+    debug_assert_eq!(s_t.len(), ss, "s_t length mismatch: expected {ss}, got {}", s_t.len());
+    debug_assert_eq!(grad_t.len(), ss, "grad_t length mismatch: expected {ss}, got {}", grad_t.len());
 
     // d_loss/d_decay = frob(S_t, d_S)  (since S_{t+1} = decay * S_t - ...)
     let d_decay = frobenius_dot_f32(s_t, d_s);
@@ -132,8 +138,8 @@ pub fn delta_momentum_step_backward(
     let d_theta_scalar = -frobenius_dot_f32(grad_t, d_s);
 
     // d_grad from -theta * d_S term (same as EMA)
-    let mut d_grad = vec![0.0f32; dd];
-    for i in 0..dd {
+    let mut d_grad = vec![0.0f32; ss];
+    for i in 0..ss {
         d_grad[i] = -theta_t * d_s[i];
     }
 
@@ -142,7 +148,7 @@ pub fn delta_momentum_step_backward(
     // For simplicity, we use the clamped decay_t to check:
     let raw_decay = eta_t - frobenius_dot_f32(grad_t, grad_t);
     if raw_decay > 1e-6 && raw_decay < 1.0 - 1e-6 {
-        for i in 0..dd {
+        for i in 0..ss {
             d_grad[i] += -2.0 * grad_t[i] * d_decay;
         }
     }

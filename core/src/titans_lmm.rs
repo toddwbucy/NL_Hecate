@@ -317,6 +317,255 @@ pub fn mlp_inner_backward(
     }
 }
 
+/// MLP backward w.r.t. both weights AND input (outer-loop VJP helper).
+///
+/// Unlike `mlp_inner_backward` which overwrites weight gradients in `grad_buf`,
+/// this function ACCUMULATES weight gradients into `d_weights` and also returns
+/// `d_input`. Needed for the outer-loop backward through the readout path
+/// `y = MLP(M, q)` and the prediction path `pred = MLP(M, k)`.
+///
+/// `d_output`: gradient w.r.t. MLP output.
+/// `pre_acts`, `activations`: from `mlp_forward`.
+/// `state_buf` at `base`: MLP weights (used for W^T propagation).
+/// `d_weights` at `d_base`: buffer for weight gradient accumulation.
+///
+/// Returns `d_input`.
+pub fn mlp_backward_full(
+    d_output: &[f32],
+    pre_acts: &[Vec<f32>],
+    activations: &[Vec<f32>],
+    state_buf: &[f32],
+    base: usize,
+    layout: &MLPMemoryLayout,
+    activation: MemoryActivation,
+    d_weights: &mut [f32],
+    d_base: usize,
+) -> Vec<f32> {
+    let n = layout.n_layers;
+    let mut d_out = d_output.to_vec();
+
+    for l in (0..n).rev() {
+        let desc = &layout.layers[l];
+        let h_prev = &activations[l];
+
+        if l < n - 1 {
+            apply_activation_derivative(&mut d_out, &pre_acts[l], activation);
+        }
+
+        // grad_W_l += outer(d_out, h_prev)
+        let out_dim = desc.w_rows;
+        let in_dim = desc.w_cols;
+        let gw = layout.w_slice_mut(d_weights, d_base, l);
+        for i in 0..out_dim {
+            for j in 0..in_dim {
+                gw[i * in_dim + j] += d_out[i] * h_prev[j];
+            }
+        }
+
+        // grad_b_l += d_out
+        let gb = layout.b_slice_mut(d_weights, d_base, l);
+        for i in 0..desc.b_size {
+            gb[i] += d_out[i];
+        }
+
+        // Propagate: d_out = W_l^T @ d_out (always, including l=0 for d_input)
+        let w = layout.w_slice(state_buf, base, l);
+        let mut d_prev = vec![0.0f32; in_dim];
+        for j in 0..in_dim {
+            let mut sum = 0.0f32;
+            for i in 0..out_dim {
+                sum += w[i * in_dim + j] * d_out[i];
+            }
+            d_prev[j] = sum;
+        }
+        d_out = d_prev;
+    }
+
+    d_out // d_input
+}
+
+/// Input-only VJP through an MLP: returns d_input without computing weight gradients.
+/// Used for frozen levels where M is not updated and weight grads are discarded.
+pub fn mlp_backward_input_only(
+    d_output: &[f32],
+    pre_acts: &[Vec<f32>],
+    state_buf: &[f32],
+    base: usize,
+    layout: &MLPMemoryLayout,
+    activation: MemoryActivation,
+) -> Vec<f32> {
+    let n = layout.n_layers;
+    let mut d_out = d_output.to_vec();
+
+    for l in (0..n).rev() {
+        let desc = &layout.layers[l];
+
+        if l < n - 1 {
+            apply_activation_derivative(&mut d_out, &pre_acts[l], activation);
+        }
+
+        // Propagate: d_out = W_l^T @ d_out (skip weight/bias grad accumulation)
+        let w = layout.w_slice(state_buf, base, l);
+        let out_dim = desc.w_rows;
+        let in_dim = desc.w_cols;
+        let mut d_prev = vec![0.0f32; in_dim];
+        for j in 0..in_dim {
+            let mut sum = 0.0f32;
+            for i in 0..out_dim {
+                sum += w[i * in_dim + j] * d_out[i];
+            }
+            d_prev[j] = sum;
+        }
+        d_out = d_prev;
+    }
+
+    d_out
+}
+
+/// Frozen MLP read-only forward: y_t = M_mlp(φ(q_t)) for each token.
+/// Used for frozen CMS levels where M is not updated.
+/// Conv1d and L2 norm are intentionally skipped for frozen levels (same as
+/// delta_rule_read_only), but the feature map IS applied to match active-path semantics.
+/// Returns (y, q_mem) — same contract as delta_rule_read_only.
+pub fn titans_mlp_read_only(
+    level_params: &MemoryLevelParams,
+    embedded: &[f32],
+    frozen_m: &[f32],
+    seq_len: usize,
+    d: usize,
+    memory_layers: usize,
+    expansion_factor: usize,
+    activation: MemoryActivation,
+    feature_map: &FeatureMapKind,
+) -> (Vec<f32>, Vec<f32>) {
+    debug_assert_eq!(embedded.len(), seq_len * d);
+    let layout = MLPMemoryLayout::new(memory_layers, d, expansion_factor);
+    debug_assert_eq!(frozen_m.len(), layout.total_params);
+
+    let mut q_mem = vec![0.0f32; seq_len * d];
+    let w_q_f32 = level_params.w_q_mem.as_f32();
+    crate::dispatch::matmul_transb_dispatch(embedded, &w_q_f32, &mut q_mem, seq_len, d, d);
+
+    let mut y = vec![0.0f32; seq_len * d];
+    let mut phi_q_buf = vec![0.0f32; d];
+    let mut z_q_buf = vec![0.0f32; d];
+    for t in 0..seq_len {
+        let q_t = &q_mem[t * d..(t + 1) * d];
+        feature_map::apply_into(q_t, feature_map, &level_params.w_rand, &level_params.b_rand, &mut phi_q_buf, &mut z_q_buf, d);
+        let (out, _, _) = mlp_forward(frozen_m, 0, &phi_q_buf, &layout, activation);
+        y[t * d..(t + 1) * d].copy_from_slice(&out);
+    }
+
+    (y, q_mem)
+}
+
+/// Frozen MLP read-only backward: d_q via MLP Jacobian + feature map VJP,
+/// then d_W_Q_mem and d_embedded.
+pub fn titans_mlp_read_only_backward(
+    level_params: &MemoryLevelParams,
+    frozen_m: &[f32],
+    q_mem: &[f32],
+    d_y: &[f32],
+    embedded: &[f32],
+    seq_len: usize,
+    d: usize,
+    memory_layers: usize,
+    expansion_factor: usize,
+    activation: MemoryActivation,
+    feature_map: &FeatureMapKind,
+) -> (MemoryLevelParams, Vec<f32>) {
+    let layout = MLPMemoryLayout::new(memory_layers, d, expansion_factor);
+    let mut grads = MemoryLevelParams::zeros_like_from(level_params, d);
+    let mut d_q_mem = vec![0.0f32; seq_len * d];
+
+    let mut z_q_buf = vec![0.0f32; d];
+    for t in 0..seq_len {
+        let q_t = &q_mem[t * d..(t + 1) * d];
+        let d_y_t = &d_y[t * d..(t + 1) * d];
+        // Apply feature map (matching forward path)
+        let (phi_q_t, z_q_t) = feature_map::apply(q_t, feature_map, &level_params.w_rand, &level_params.b_rand, d);
+        z_q_buf.copy_from_slice(&z_q_t);
+        // Recompute forward to get pre_acts for input-only VJP
+        let (_, pre_acts, _) = mlp_forward(frozen_m, 0, &phi_q_t, &layout, activation);
+        // Input-only VJP through MLP: d_phi_q
+        let d_phi_q_t = mlp_backward_input_only(
+            d_y_t, &pre_acts, frozen_m, 0, &layout, activation,
+        );
+        // Feature map VJP: d_phi_q → d_q
+        let d_q_t = feature_map::vjp(&d_phi_q_t, &z_q_buf, feature_map, &level_params.w_rand, d);
+        d_q_mem[t * d..(t + 1) * d].copy_from_slice(&d_q_t);
+    }
+
+    // q_mem = embedded @ W_Q_mem^T → d_W_Q_mem, d_embedded
+    let mut d_q_mem_t = vec![0.0f32; d * seq_len];
+    transpose_f32(&d_q_mem, &mut d_q_mem_t, seq_len, d);
+    crate::dispatch::matmul_dispatch(&d_q_mem_t, embedded, grads.w_q_mem.master_mut(), d, seq_len, d);
+
+    let mut d_embedded = vec![0.0f32; seq_len * d];
+    let w_q_f32 = level_params.w_q_mem.as_f32();
+    crate::dispatch::matmul_acc_dispatch(&d_q_mem, &w_q_f32, &mut d_embedded, seq_len, d, d);
+
+    (grads, d_embedded)
+}
+
+// ── Shared backward helpers ─────────────────────────────────────────
+
+/// Post-loop backward for L2-norm → conv1d → projection (k/v/q_mem).
+/// Used by both MLP and linear backward paths to avoid duplication.
+fn projection_backward(
+    mut d_k_mem: Vec<f32>,
+    d_v_mem: &[f32],
+    mut d_q_mem: Vec<f32>,
+    cache: &TitansLMMCache,
+    level_params: &MemoryLevelParams,
+    grads: &mut MemoryLevelParams,
+    embedded: &[f32],
+    s: usize,
+    d: usize,
+) -> Vec<f32> {
+    if !cache.k_mem_norms.is_empty() {
+        let mut d_k_raw = vec![0.0f32; s * d];
+        crate::tensor::l2_normalize_rows_backward(
+            &d_k_mem, &cache.k_mem, &cache.k_mem_norms,
+            &mut d_k_raw, s, d);
+        d_k_mem = d_k_raw;
+
+        let mut d_q_raw = vec![0.0f32; s * d];
+        crate::tensor::l2_normalize_rows_backward(
+            &d_q_mem, &cache.q_mem, &cache.q_mem_norms,
+            &mut d_q_raw, s, d);
+        d_q_mem = d_q_raw;
+    }
+
+    crate::conv1d::backward_conv1d_kq(
+        &mut d_k_mem, &mut d_q_mem,
+        &cache.k_conv_cache, &cache.q_conv_cache,
+        level_params, grads, s, d);
+
+    let mut d_embedded = vec![0.0f32; s * d];
+
+    let mut d_k_mem_t = vec![0.0f32; d * s];
+    transpose_f32(&d_k_mem, &mut d_k_mem_t, s, d);
+    matmul_f32(&d_k_mem_t, embedded, grads.w_k_mem.master_mut(), d, s, d);
+
+    let mut d_v_mem_t = vec![0.0f32; d * s];
+    transpose_f32(d_v_mem, &mut d_v_mem_t, s, d);
+    matmul_f32(&d_v_mem_t, embedded, grads.w_v_mem.master_mut(), d, s, d);
+
+    let mut d_q_mem_t = vec![0.0f32; d * s];
+    transpose_f32(&d_q_mem, &mut d_q_mem_t, s, d);
+    matmul_f32(&d_q_mem_t, embedded, grads.w_q_mem.master_mut(), d, s, d);
+
+    let w_k_f32 = level_params.w_k_mem.as_f32();
+    let w_v_f32 = level_params.w_v_mem.as_f32();
+    let w_q_f32 = level_params.w_q_mem.as_f32();
+    crate::tensor::matmul_acc_f32(&d_k_mem, &w_k_f32, &mut d_embedded, s, d, d);
+    crate::tensor::matmul_acc_f32(d_v_mem, &w_v_f32, &mut d_embedded, s, d, d);
+    crate::tensor::matmul_acc_f32(&d_q_mem, &w_q_f32, &mut d_embedded, s, d, d);
+
+    d_embedded
+}
+
 // ── Titans LMM implementation ───────────────────────────────────────
 
 /// Titans LMM: GD + momentum memory rule (Titans Eqs 12-15, 32-33).
@@ -604,6 +853,343 @@ impl TitansLMM {
         };
 
         (y, cache)
+    }
+
+    /// Full sequence backward through MLP memory (memory_layers >= 2).
+    ///
+    /// Follows the algorithm from the CUDA kernel (titans_mlp_backward.cu):
+    ///   Phase 1: Readout backward — y_t = MLP(M_{t+1}, q_t)
+    ///   Phase 2: Retention backward — d_S += d_M, d_alpha, d_M *= (1-α)
+    ///   Phase 3: Recompute inner gradient from cached activations
+    ///   Phase 4: Momentum backward (EMA) → d_eta, d_theta, d_grad
+    ///   Phase 5: Second-order inner gradient VJP → d_biased, cross-terms
+    ///   Phase 6: Combined prediction + activation path backward → d_k, d_v, d_M
+    fn step_backward_mlp(
+        &self,
+        level_params: &MemoryLevelParams,
+        cache: &TitansLMMCache,
+        d_y: &[f32],
+        embedded: &[f32],
+        layout: &MLPMemoryLayout,
+    ) -> (MemoryLevelParams, Vec<f32>) {
+        let s = cache.seq_len;
+        let d = cache.d;
+        let n = layout.n_layers;
+        let state_size = layout.total_params;
+        let activation = cache.mlp_activation;
+
+        assert!(matches!(cache.momentum_kind,
+            crate::model::MomentumKind::EMA | crate::model::MomentumKind::None),
+            "MLP memory backward only supports EMA momentum; got {:?}", cache.momentum_kind);
+
+        let mut grads = MemoryLevelParams::zeros_like_from(level_params, d);
+
+        let mut d_k_mem = vec![0.0f32; s * d];
+        let mut d_v_mem = vec![0.0f32; s * d];
+        let mut d_q_mem = vec![0.0f32; s * d];
+
+        let mut d_m = vec![0.0f32; state_size];
+        let mut d_s = vec![0.0f32; state_size];
+
+        let has_fm = !cache.fm_z_k_mem.is_empty();
+
+        // Reverse token loop
+        for t in (0..s).rev() {
+            let q_t = &cache.q_mem[t * d..(t + 1) * d];
+            let m_t_base = t * state_size;
+            let m_next_base = (t + 1) * state_size;
+            let s_t = &cache.s_states[t * state_size..(t + 1) * state_size];
+            let err_t = &cache.error[t * d..(t + 1) * d];
+            let c_base = t * 2 * d;
+            let concat_t = &cache.concat_kv[c_base..c_base + 2 * d];
+            let alpha_t = cache.alpha[t];
+            let theta_t = cache.theta[t];
+            let theta_pre_t = cache.theta_pre[t];
+            let eta_t = cache.eta[t];
+            let pre_acts_k = &cache.mlp_k_pre_acts[t];
+            let activations_k = &cache.mlp_k_activations[t];
+
+            // Feature maps
+            let z_k_t = if has_fm { &cache.fm_z_k_mem[t * d..(t + 1) * d] } else { &[] as &[f32] };
+            let z_q_t = if has_fm { &cache.fm_z_q_mem[t * d..(t + 1) * d] } else { &[] as &[f32] };
+            let phi_q_t = if has_fm {
+                feature_map::apply(q_t, &self.feature_map, &level_params.w_rand, &level_params.b_rand, d).0
+            } else {
+                q_t.to_vec()
+            };
+
+            let d_y_t = &d_y[t * d..(t + 1) * d];
+
+            // ── Phase 1: Readout backward — y_t = MLP(M_{t+1}, φ(q_t)) ──
+            let (_, q_pre_acts, q_activations) = mlp_forward(
+                &cache.m_states, m_next_base, &phi_q_t, layout, activation);
+            // d_M += weight grads from readout, d_phi_q = input grad
+            let d_phi_q_t = mlp_backward_full(
+                d_y_t, &q_pre_acts, &q_activations,
+                &cache.m_states, m_next_base, layout, activation,
+                &mut d_m, 0);
+            let d_q_t = feature_map::vjp(&d_phi_q_t, z_q_t, &self.feature_map, &level_params.w_rand, d);
+            d_q_mem[t * d..(t + 1) * d].copy_from_slice(&d_q_t);
+
+            // ── Phase 2: Retention backward ──
+            // d_S += d_M
+            for i in 0..state_size { d_s[i] += d_m[i]; }
+
+            // d_alpha = -frob(M_t, d_M)
+            let d_alpha_scalar = -frobenius_dot_f32(
+                &cache.m_states[m_t_base..m_t_base + state_size], &d_m);
+
+            // d_M_prev = (1-α) * d_M
+            let mut d_m_prev = d_m.clone();
+            l2_apply_retention(&mut d_m_prev, 1.0 - alpha_t);
+
+            // ── Phase 3: Recompute inner gradient ──
+            let biased = apply_attentional_bias(err_t, self.bias, self.sign_sharpness);
+            let mut grad_t = vec![0.0f32; state_size];
+            mlp_inner_backward(&biased, pre_acts_k, activations_k,
+                &cache.m_states, m_t_base, layout, activation, &mut grad_t, 0);
+
+            // ── Phase 4: Momentum backward (EMA) ──
+            // Note: `d` is passed for API compat but unused — ema_step_backward
+            // derives state size from d_s.len(), which handles both d*d and MLP layouts.
+            let (d_eta_scalar, d_theta_scalar, d_grad) =
+                crate::momentum::ema_step_backward(&mut d_s, s_t, &grad_t, eta_t, theta_t, d);
+
+            // ── Phase 5: Second-order inner gradient VJP ──
+
+            // Step 5a: Recompute inner backward d_out at each layer
+            // inner_d_outs[l] = the d_out vector at layer l (after activation derivative,
+            // before W^T propagation). Needed for cross-terms and inject values.
+            let mut inner_d_outs: Vec<Vec<f32>> = Vec::with_capacity(n);
+            {
+                let mut d_out_ib = biased.clone();
+                for l in (0..n).rev() {
+                    let desc = &layout.layers[l];
+                    if l < n - 1 {
+                        apply_activation_derivative(&mut d_out_ib, &pre_acts_k[l], activation);
+                    }
+                    inner_d_outs.push(d_out_ib.clone());
+                    if l > 0 {
+                        let w = layout.w_slice(&cache.m_states, m_t_base, l);
+                        let out_dim = desc.w_rows;
+                        let in_dim = desc.w_cols;
+                        let mut d_prev = vec![0.0f32; in_dim];
+                        for j in 0..in_dim {
+                            let mut sum = 0.0f32;
+                            for ii in 0..out_dim {
+                                sum += w[ii * in_dim + j] * d_out_ib[ii];
+                            }
+                            d_prev[j] = sum;
+                        }
+                        d_out_ib = d_prev;
+                    }
+                }
+            }
+            inner_d_outs.reverse(); // inner_d_outs[l] = d_out at layer l
+
+            // Step 5b: Forward adjoint → d_biased + cross-terms for d_M
+            //
+            // The inner gradient is LINEAR in biased (the error signal). The adjoint
+            // of this linear map gives d_biased from d_grad. Cross-terms arise from
+            // the inner backward's use of W_l^T for propagation — the VJP of W^T
+            // w.r.t. W produces outer(inner_d_out, adj) contributions to d_M.
+            let mut cross_terms = vec![0.0f32; state_size];
+            let d_biased: Vec<f32>;
+            {
+                let desc0 = &layout.layers[0];
+                let d_gw0 = layout.w_slice(&d_grad, 0, 0);
+                let d_gb0 = layout.b_slice(&d_grad, 0, 0);
+                let h0 = &activations_k[0]; // phi_k
+
+                // adj = d_grad_W[0] @ h[0] + d_grad_b[0]
+                let mut adj = vec![0.0f32; desc0.w_rows];
+                for i in 0..desc0.w_rows {
+                    let mut sum = 0.0f32;
+                    for j in 0..desc0.w_cols {
+                        sum += d_gw0[i * desc0.w_cols + j] * h0[j];
+                    }
+                    adj[i] = sum + d_gb0[i];
+                }
+
+                for l in 0..(n - 1) {
+                    // Apply activation derivative at layer l
+                    apply_activation_derivative(&mut adj, &pre_acts_k[l], activation);
+
+                    // Cross-term for W_{l+1}: outer(inner_d_outs[l+1], adj)
+                    // This is the VJP of W_{l+1}^T @ d_out w.r.t. W_{l+1}
+                    let desc_next = &layout.layers[l + 1];
+                    let cw = layout.w_slice_mut(&mut cross_terms, 0, l + 1);
+                    for i in 0..desc_next.w_rows {
+                        for j in 0..desc_next.w_cols {
+                            cw[i * desc_next.w_cols + j] += inner_d_outs[l + 1][i] * adj[j];
+                        }
+                    }
+
+                    // Propagate forward: adj = W_{l+1} @ adj
+                    let w_next = layout.w_slice(&cache.m_states, m_t_base, l + 1);
+                    let mut new_adj = vec![0.0f32; desc_next.w_rows];
+                    for i in 0..desc_next.w_rows {
+                        let mut sum = 0.0f32;
+                        for j in 0..desc_next.w_cols {
+                            sum += w_next[i * desc_next.w_cols + j] * adj[j];
+                        }
+                        new_adj[i] = sum;
+                    }
+                    adj = new_adj;
+
+                    // Add direct contribution from layer l+1
+                    let d_gw = layout.w_slice(&d_grad, 0, l + 1);
+                    let d_gb = layout.b_slice(&d_grad, 0, l + 1);
+                    let h = &activations_k[l + 1];
+                    for i in 0..desc_next.w_rows {
+                        let mut sum = 0.0f32;
+                        for j in 0..desc_next.w_cols {
+                            sum += d_gw[i * desc_next.w_cols + j] * h[j];
+                        }
+                        adj[i] += sum + d_gb[i];
+                    }
+                }
+
+                d_biased = adj; // [d]-dimensional
+            }
+
+            // Step 5c: Compute inject values for activation path
+            // inject[l] = d_grad_W[l]^T @ inner_d_outs[l] — gradient contribution
+            // from the inner gradient's dependence on activations[l] (which depend on phi_k).
+            let mut injects: Vec<Vec<f32>> = Vec::with_capacity(n);
+            for l in 0..n {
+                let desc = &layout.layers[l];
+                let d_gw = layout.w_slice(&d_grad, 0, l);
+                let d_out_l = &inner_d_outs[l];
+                let in_dim = desc.w_cols;
+                let out_dim = desc.w_rows;
+                let mut inject = vec![0.0f32; in_dim];
+                for j in 0..in_dim {
+                    let mut sum = 0.0f32;
+                    for i in 0..out_dim {
+                        sum += d_gw[i * in_dim + j] * d_out_l[i];
+                    }
+                    inject[j] = sum;
+                }
+                injects.push(inject);
+            }
+
+            // Step 5d: VJP through attentional bias
+            let d_err = apply_attentional_bias_backward(&d_biased, err_t, self.bias, self.sign_sharpness);
+
+            // ── Phase 6: Combined prediction + activation backward ──
+            // d_v from error = prediction - v
+            for i in 0..d { d_v_mem[t * d + i] -= d_err[i]; }
+
+            // Standard MLP backward from d_err (prediction path) fused with
+            // inject values (activation path). At each layer, the inject adds
+            // the inner gradient's contribution through phi_k → activations.
+            // Also accumulates d_M from prediction backward into d_m_prev.
+            let d_phi_k_t: Vec<f32>;
+            {
+                let mut d_out_combined = d_err.clone();
+                for l in (0..n).rev() {
+                    let desc = &layout.layers[l];
+                    let h_prev = &activations_k[l];
+
+                    if l < n - 1 {
+                        apply_activation_derivative(&mut d_out_combined, &pre_acts_k[l], activation);
+                    }
+
+                    // d_M_prev[W_l] += outer(d_out, h_prev)
+                    let out_dim = desc.w_rows;
+                    let in_dim = desc.w_cols;
+                    let gw = layout.w_slice_mut(&mut d_m_prev, 0, l);
+                    for i in 0..out_dim {
+                        for j in 0..in_dim {
+                            gw[i * in_dim + j] += d_out_combined[i] * h_prev[j];
+                        }
+                    }
+                    // d_M_prev[b_l] += d_out
+                    let gb = layout.b_slice_mut(&mut d_m_prev, 0, l);
+                    for i in 0..desc.b_size {
+                        gb[i] += d_out_combined[i];
+                    }
+
+                    // Propagate: d_out = W_l^T @ d_out
+                    let w = layout.w_slice(&cache.m_states, m_t_base, l);
+                    let mut d_prev = vec![0.0f32; in_dim];
+                    for j in 0..in_dim {
+                        let mut sum = 0.0f32;
+                        for ii in 0..out_dim {
+                            sum += w[ii * in_dim + j] * d_out_combined[ii];
+                        }
+                        d_prev[j] = sum;
+                    }
+                    d_out_combined = d_prev;
+
+                    // Add inject from activation path
+                    for j in 0..in_dim {
+                        d_out_combined[j] += injects[l][j];
+                    }
+                }
+                d_phi_k_t = d_out_combined;
+            }
+
+            // Add cross-terms from Phase 5b into d_M_prev
+            for i in 0..state_size { d_m_prev[i] += cross_terms[i]; }
+
+            // Feature map VJP for k
+            let d_k_t = feature_map::vjp(&d_phi_k_t, z_k_t, &self.feature_map, &level_params.w_rand, d);
+            for j in 0..d {
+                d_k_mem[t * d + j] += d_k_t[j];
+            }
+
+            // ── Gate backward ──
+            // Clamp gradient mask: zero gradient when alpha was at floor or ceil (CS-39)
+            let alpha_raw = sigmoid_f32(cache.alpha_pre[t]);
+            let alpha_clamp_mask = if alpha_raw <= self.alpha_floor || alpha_raw >= self.alpha_ceil { 0.0 } else { 1.0 };
+            let sig_deriv = alpha_t * (1.0 - alpha_t);
+            let d_alpha_pre = d_alpha_scalar * sig_deriv * alpha_clamp_mask;
+
+            let theta_raw = softplus_f32(theta_pre_t);
+            let clamp_mask = if theta_raw <= self.theta_floor || theta_raw >= self.theta_ceil { 0.0 } else { 1.0 };
+            let softplus_deriv = sigmoid_f32(theta_pre_t);
+            let d_theta_pre = d_theta_scalar * softplus_deriv * clamp_mask;
+
+            let eta_sig_deriv = eta_t * (1.0 - eta_t);
+            let d_eta_pre = d_eta_scalar * eta_sig_deriv;
+
+            // Gate weight gradients
+            for i in 0..(2 * d) {
+                grads.w_alpha[i] += d_alpha_pre * concat_t[i];
+            }
+            grads.b_alpha[0] += d_alpha_pre;
+            for i in 0..(2 * d) {
+                grads.w_theta[i] += d_theta_pre * concat_t[i];
+            }
+            grads.b_theta[0] += d_theta_pre;
+            for i in 0..(2 * d) {
+                grads.w_eta[i] += d_eta_pre * concat_t[i];
+            }
+            grads.b_eta[0] += d_eta_pre;
+
+            // Concat backward → d_k_mem, d_v_mem
+            for i in 0..d {
+                d_k_mem[t * d + i] += d_alpha_pre * level_params.w_alpha[i]
+                                    + d_theta_pre * level_params.w_theta[i]
+                                    + d_eta_pre * level_params.w_eta[i];
+            }
+            for i in 0..d {
+                d_v_mem[t * d + i] += d_alpha_pre * level_params.w_alpha[d + i]
+                                    + d_theta_pre * level_params.w_theta[d + i]
+                                    + d_eta_pre * level_params.w_eta[d + i];
+            }
+
+            // Carry d_m and d_s to next (earlier) token
+            d_m = d_m_prev;
+            // d_s was already updated in-place by ema_step_backward
+        }
+
+        let d_embedded = projection_backward(
+            d_k_mem, &d_v_mem, d_q_mem, cache, level_params, &mut grads, embedded, s, d);
+
+        (grads, d_embedded)
     }
 }
 
@@ -957,9 +1543,11 @@ impl MemoryRule for TitansLMM {
         let d = cache.d;
         debug_assert_eq!(d_y.len(), s * d);
         debug_assert_eq!(embedded.len(), s * d);
-        assert!(cache.mlp_layout.is_none(),
-            "step_backward does not yet support MLP memory (memory_layers >= 2). \
-             MLP outer-loop backward deferred to Phase B.");
+
+        // Dispatch to MLP backward when memory_layers >= 2
+        if let Some(ref layout) = cache.mlp_layout {
+            return self.step_backward_mlp(level_params, cache, d_y, embedded, layout);
+        }
 
         let mut grads = MemoryLevelParams::zeros_like_from(level_params, d);
 
@@ -1117,8 +1705,11 @@ impl MemoryRule for TitansLMM {
             }
 
             // ── Gate backward: alpha_t = sigmoid(alpha_pre_t) ──
+            // Clamp gradient mask: zero gradient when alpha was at floor or ceil (CS-39)
+            let alpha_raw = sigmoid_f32(cache.alpha_pre[t]);
+            let alpha_clamp_mask = if alpha_raw <= self.alpha_floor || alpha_raw >= self.alpha_ceil { 0.0 } else { 1.0 };
             let sig_deriv = alpha_t * (1.0 - alpha_t);
-            let d_alpha_pre = d_alpha_scalar * sig_deriv;
+            let d_alpha_pre = d_alpha_scalar * sig_deriv * alpha_clamp_mask;
 
             // ── Gate backward: theta_t = softplus(theta_pre_t) ──
             // Clamp gradient mask: zero gradient when theta was at floor or ceil (CS-39)
@@ -1166,53 +1757,12 @@ impl MemoryRule for TitansLMM {
             d_s = d_s_prev;
         }
 
-        // ── L2 normalization backward (before conv1d backward) ──
-        // d_k_mem and d_q_mem are w.r.t. normalized k/q. Chain the normalization Jacobian.
-        // Guard: old tape recordings may have empty norms (backward compat).
-        if !cache.k_mem_norms.is_empty() {
-            let mut d_k_raw = vec![0.0f32; s * d];
-            crate::tensor::l2_normalize_rows_backward(
-                &d_k_mem, &cache.k_mem, &cache.k_mem_norms,
-                &mut d_k_raw, s, d);
-            d_k_mem = d_k_raw;
-
-            let mut d_q_raw = vec![0.0f32; s * d];
-            crate::tensor::l2_normalize_rows_backward(
-                &d_q_mem, &cache.q_mem, &cache.q_mem_norms,
-                &mut d_q_raw, s, d);
-            d_q_mem = d_q_raw;
-        }
-
-        // ── Conv1D backward (before projection backward) ──
-        crate::conv1d::backward_conv1d_kq(
-            &mut d_k_mem, &mut d_q_mem,
-            &cache.k_conv_cache, &cache.q_conv_cache,
-            level_params, &mut grads, s, d);
-
-        // ── Projection backward: k_mem = embedded @ W_K_mem^T ──
-        let mut d_embedded = vec![0.0f32; s * d];
-
-        let mut d_k_mem_t = vec![0.0f32; d * s];
-        transpose_f32(&d_k_mem, &mut d_k_mem_t, s, d);
-        matmul_f32(&d_k_mem_t, embedded, grads.w_k_mem.master_mut(), d, s, d);
-
-        let mut d_v_mem_t = vec![0.0f32; d * s];
-        transpose_f32(&d_v_mem, &mut d_v_mem_t, s, d);
-        matmul_f32(&d_v_mem_t, embedded, grads.w_v_mem.master_mut(), d, s, d);
-
-        let mut d_q_mem_t = vec![0.0f32; d * s];
-        transpose_f32(&d_q_mem, &mut d_q_mem_t, s, d);
-        matmul_f32(&d_q_mem_t, embedded, grads.w_q_mem.master_mut(), d, s, d);
-
-        let w_k_f32 = level_params.w_k_mem.as_f32();
-        let w_v_f32 = level_params.w_v_mem.as_f32();
-        let w_q_f32 = level_params.w_q_mem.as_f32();
-        crate::tensor::matmul_acc_f32(&d_k_mem, &w_k_f32, &mut d_embedded, s, d, d);
-        crate::tensor::matmul_acc_f32(&d_v_mem, &w_v_f32, &mut d_embedded, s, d, d);
-        crate::tensor::matmul_acc_f32(&d_q_mem, &w_q_f32, &mut d_embedded, s, d, d);
+        let d_embedded = projection_backward(
+            d_k_mem, &d_v_mem, d_q_mem, cache, level_params, &mut grads, embedded, s, d);
 
         (grads, d_embedded)
     }
+
 }
 
 #[cfg(test)]
@@ -1930,5 +2480,357 @@ mod tests {
         assert_eq!(rule.memory_layers, 3);
         assert_eq!(rule.memory_expansion_factor, 2);
         assert_eq!(rule.memory_activation, MemoryActivation::GELU);
+    }
+
+    // ── MLP backward: finite-difference gradient verification ──────
+
+    /// Scalar loss for FD checking: L = sum(y^2), so dL/dy = 2*y.
+    fn mlp_fd_loss(
+        rule: &TitansLMM,
+        params: &MemoryLevelParams,
+        embedded: &[f32],
+        s: usize,
+        d: usize,
+        initial_m: Option<Vec<f32>>,
+    ) -> f32 {
+        let (y, _cache) = rule.step(params, embedded, s, d, initial_m);
+        y.iter().map(|v| v * v).sum()
+    }
+
+    /// Central-difference FD check for a single parameter slice.
+    /// Returns (checked, passed, max_rel_err).
+    fn mlp_fd_check_param(
+        rule: &TitansLMM,
+        params: &MemoryLevelParams,
+        embedded: &[f32],
+        s: usize,
+        d: usize,
+        initial_m: &Option<Vec<f32>>,
+        name: &str,
+        get: impl Fn(&MemoryLevelParams) -> &[f32],
+        set: impl Fn(&mut MemoryLevelParams, usize, f32),
+        get_grad: impl Fn(&MemoryLevelParams) -> &[f32],
+        grads: &MemoryLevelParams,
+        n_check: usize,
+        eps: f32,
+        tol: f32,
+        abs_thresh: f32,
+    ) -> (usize, usize, f32) {
+        let analytical = get_grad(grads);
+        let param_len = get(params).len();
+        let step = if param_len <= n_check { 1 } else { param_len / n_check };
+        let mut checked = 0;
+        let mut passed = 0;
+        let mut max_err = 0.0f32;
+
+        for idx in (0..param_len).step_by(step) {
+            let a_grad = analytical[idx];
+            if a_grad.abs() < abs_thresh { continue; }
+
+            let orig = get(params)[idx];
+
+            let mut p_plus = params.clone();
+            set(&mut p_plus, idx, orig + eps);
+            let l_plus = mlp_fd_loss(rule, &p_plus, embedded, s, d, initial_m.clone());
+
+            let mut p_minus = params.clone();
+            set(&mut p_minus, idx, orig - eps);
+            let l_minus = mlp_fd_loss(rule, &p_minus, embedded, s, d, initial_m.clone());
+
+            let fd_grad = (l_plus - l_minus) / (2.0 * eps);
+            let denom = a_grad.abs().max(fd_grad.abs()).max(1e-8);
+            let rel_err = (a_grad - fd_grad).abs() / denom;
+
+            checked += 1;
+            if rel_err < tol {
+                passed += 1;
+            } else {
+                eprintln!("  FAIL {name}[{idx}]: analytical={a_grad:.6e} fd={fd_grad:.6e} rel_err={rel_err:.4e}");
+            }
+            max_err = max_err.max(rel_err);
+        }
+        (checked, passed, max_err)
+    }
+
+    #[test]
+    fn test_mlp_backward_fd_w_k_mem() {
+        let cfg = mlp_config(2, 4);
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let s = cfg.swa.seq_len;
+        let d = cfg.swa.d_model;
+        let layout = MLPMemoryLayout::new(2, d, 4);
+        let initial_m = Some(make_mlp_initial_m(&layout, 77));
+
+        let rule = TitansLMM {
+            memory_layers: 2,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
+            ..TitansLMM::l2()
+        };
+        let (y, cache) = rule.step(&params.levels[0], &embedded, s, d, initial_m.clone());
+        let d_y: Vec<f32> = y.iter().map(|v| 2.0 * v).collect();
+        let (grads, _d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
+
+        let (checked, passed, max_err) = mlp_fd_check_param(
+            &rule, &params.levels[0], &embedded, s, d, &initial_m, "w_k_mem",
+            |p| p.w_k_mem.master(), |p, i, v| p.w_k_mem.set(i, v),
+            |g| g.w_k_mem.master(), &grads,
+            20, 1e-2, 0.10, 1e-6,
+        );
+        eprintln!("MLP FD w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(checked > 0, "w_k_mem: no gradients above threshold");
+        assert!(passed == checked, "MLP FD w_k_mem: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_mlp_backward_fd_w_v_mem() {
+        let cfg = mlp_config(2, 4);
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let s = cfg.swa.seq_len;
+        let d = cfg.swa.d_model;
+        let layout = MLPMemoryLayout::new(2, d, 4);
+        let initial_m = Some(make_mlp_initial_m(&layout, 77));
+
+        let rule = TitansLMM {
+            memory_layers: 2,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
+            ..TitansLMM::l2()
+        };
+        let (y, cache) = rule.step(&params.levels[0], &embedded, s, d, initial_m.clone());
+        let d_y: Vec<f32> = y.iter().map(|v| 2.0 * v).collect();
+        let (grads, _d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
+
+        let (checked, passed, max_err) = mlp_fd_check_param(
+            &rule, &params.levels[0], &embedded, s, d, &initial_m, "w_v_mem",
+            |p| p.w_v_mem.master(), |p, i, v| p.w_v_mem.set(i, v),
+            |g| g.w_v_mem.master(), &grads,
+            20, 1e-2, 0.10, 1e-6,
+        );
+        eprintln!("MLP FD w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(checked > 0, "w_v_mem: no gradients above threshold");
+        assert!(passed == checked, "MLP FD w_v_mem: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_mlp_backward_fd_w_q_mem() {
+        let cfg = mlp_config(2, 4);
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let s = cfg.swa.seq_len;
+        let d = cfg.swa.d_model;
+        let layout = MLPMemoryLayout::new(2, d, 4);
+        let initial_m = Some(make_mlp_initial_m(&layout, 77));
+
+        let rule = TitansLMM {
+            memory_layers: 2,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
+            ..TitansLMM::l2()
+        };
+        let (y, cache) = rule.step(&params.levels[0], &embedded, s, d, initial_m.clone());
+        let d_y: Vec<f32> = y.iter().map(|v| 2.0 * v).collect();
+        let (grads, _d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
+
+        let (checked, passed, max_err) = mlp_fd_check_param(
+            &rule, &params.levels[0], &embedded, s, d, &initial_m, "w_q_mem",
+            |p| p.w_q_mem.master(), |p, i, v| p.w_q_mem.set(i, v),
+            |g| g.w_q_mem.master(), &grads,
+            20, 1e-2, 0.10, 1e-6,
+        );
+        eprintln!("MLP FD w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(checked > 0, "w_q_mem: no gradients above threshold");
+        assert!(passed == checked, "MLP FD w_q_mem: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    #[test]
+    fn test_mlp_backward_fd_gates() {
+        let cfg = mlp_config(2, 4);
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let s = cfg.swa.seq_len;
+        let d = cfg.swa.d_model;
+        let layout = MLPMemoryLayout::new(2, d, 4);
+        let initial_m = Some(make_mlp_initial_m(&layout, 77));
+
+        let rule = TitansLMM {
+            memory_layers: 2,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
+            ..TitansLMM::l2()
+        };
+        let (y, cache) = rule.step(&params.levels[0], &embedded, s, d, initial_m.clone());
+        let d_y: Vec<f32> = y.iter().map(|v| 2.0 * v).collect();
+        let (grads, _d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
+
+        for (name, get, set, get_grad) in [
+            ("w_alpha",
+             (|p: &MemoryLevelParams| p.w_alpha.as_slice()) as fn(&MemoryLevelParams) -> &[f32],
+             (|p: &mut MemoryLevelParams, i: usize, v: f32| p.w_alpha[i] = v) as fn(&mut MemoryLevelParams, usize, f32),
+             (|g: &MemoryLevelParams| g.w_alpha.as_slice()) as fn(&MemoryLevelParams) -> &[f32]),
+            ("w_theta",
+             |p: &MemoryLevelParams| p.w_theta.as_slice(),
+             |p: &mut MemoryLevelParams, i: usize, v: f32| p.w_theta[i] = v,
+             |g: &MemoryLevelParams| g.w_theta.as_slice()),
+            ("w_eta",
+             |p: &MemoryLevelParams| p.w_eta.as_slice(),
+             |p: &mut MemoryLevelParams, i: usize, v: f32| p.w_eta[i] = v,
+             |g: &MemoryLevelParams| g.w_eta.as_slice()),
+            ("b_alpha",
+             |p: &MemoryLevelParams| p.b_alpha.as_slice(),
+             |p: &mut MemoryLevelParams, i: usize, v: f32| p.b_alpha[i] = v,
+             |g: &MemoryLevelParams| g.b_alpha.as_slice()),
+            ("b_theta",
+             |p: &MemoryLevelParams| p.b_theta.as_slice(),
+             |p: &mut MemoryLevelParams, i: usize, v: f32| p.b_theta[i] = v,
+             |g: &MemoryLevelParams| g.b_theta.as_slice()),
+            ("b_eta",
+             |p: &MemoryLevelParams| p.b_eta.as_slice(),
+             |p: &mut MemoryLevelParams, i: usize, v: f32| p.b_eta[i] = v,
+             |g: &MemoryLevelParams| g.b_eta.as_slice()),
+        ] {
+            let (checked, passed, max_err) = mlp_fd_check_param(
+                &rule, &params.levels[0], &embedded, s, d, &initial_m, name,
+                get, set, get_grad, &grads,
+                20, 1e-2, 0.10, 1e-6,
+            );
+            eprintln!("MLP FD {name}: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+            // Some gate grads may all be below threshold (e.g. b_eta with 1 element) — skip those
+            if checked > 0 {
+                assert!(passed == checked,
+                    "MLP FD {name}: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_mlp_backward_fd_d_embedded() {
+        let cfg = mlp_config(2, 4);
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let s = cfg.swa.seq_len;
+        let d = cfg.swa.d_model;
+        let layout = MLPMemoryLayout::new(2, d, 4);
+        let initial_m = Some(make_mlp_initial_m(&layout, 77));
+
+        let rule = TitansLMM {
+            memory_layers: 2,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
+            ..TitansLMM::l2()
+        };
+        let (y, cache) = rule.step(&params.levels[0], &embedded, s, d, initial_m.clone());
+        let d_y: Vec<f32> = y.iter().map(|v| 2.0 * v).collect();
+        let (_grads, d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
+
+        let eps = 1e-2f32;
+        let tol = 0.10;
+        let abs_thresh = 1e-6;
+        let n_check = 20;
+        let step_sz = if embedded.len() <= n_check { 1 } else { embedded.len() / n_check };
+        let mut checked = 0;
+        let mut passed = 0;
+        let mut max_err = 0.0f32;
+
+        for idx in (0..embedded.len()).step_by(step_sz) {
+            let a_grad = d_emb[idx];
+            if a_grad.abs() < abs_thresh { continue; }
+
+            let mut emb_plus = embedded.to_vec();
+            emb_plus[idx] += eps;
+            let l_plus = mlp_fd_loss(&rule, &params.levels[0], &emb_plus, s, d, initial_m.clone());
+
+            let mut emb_minus = embedded.to_vec();
+            emb_minus[idx] -= eps;
+            let l_minus = mlp_fd_loss(&rule, &params.levels[0], &emb_minus, s, d, initial_m.clone());
+
+            let fd_grad = (l_plus - l_minus) / (2.0 * eps);
+            let denom = a_grad.abs().max(fd_grad.abs()).max(1e-8);
+            let rel_err = (a_grad - fd_grad).abs() / denom;
+
+            checked += 1;
+            if rel_err < tol {
+                passed += 1;
+            } else {
+                eprintln!("  FAIL d_embedded[{idx}]: analytical={a_grad:.6e} fd={fd_grad:.6e} rel_err={rel_err:.4e}");
+            }
+            max_err = max_err.max(rel_err);
+        }
+        eprintln!("MLP FD d_embedded: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(checked > 0, "d_embedded: no gradients above threshold");
+        assert!(passed == checked, "MLP FD d_embedded: {passed}/{checked} passed, max_rel_err={max_err:.4e}");
+    }
+
+    /// Create a random initial MLP state with small non-zero weights.
+    /// This breaks the dead-neuron cycle that occurs with zero-initialized MLP memory
+    /// (W layers stay zero forever when M starts at zero because grad_W = outer(d_out, 0) = 0).
+    fn make_mlp_initial_m(layout: &MLPMemoryLayout, seed: u64) -> Vec<f32> {
+        let mut rng = SimpleRng::new(seed);
+        let mut m = vec![0.0f32; layout.total_params];
+        // fill_uniform seeds all params (weights + biases) in [-0.3, 0.3].
+        // Below we rescale weight matrices to Xavier init, undoing the 0.3 range first.
+        rng.fill_uniform(&mut m, 0.3);
+        for l in 0..layout.n_layers {
+            let desc = &layout.layers[l];
+            let fan_in = desc.w_cols;
+            let fan_out = desc.w_rows;
+            let xavier = (2.0 / (fan_in + fan_out) as f32).sqrt();
+            // Undo [-0.3,0.3] range then apply Xavier: net multiplier = xavier / 0.3
+            let rescale = xavier / 0.3;
+            let w = layout.w_slice_mut(&mut m, 0, l);
+            for x in w.iter_mut() { *x *= rescale; }
+        }
+        m
+    }
+
+    #[test]
+    fn test_mlp_backward_finite_and_nonzero() {
+        let cfg = mlp_config(2, 4);
+        let params = MAGParams::init(&cfg, 42);
+        let embedded = make_embedded(&cfg, 99);
+        let s = cfg.swa.seq_len;
+        let d = cfg.swa.d_model;
+        let layout = MLPMemoryLayout::new(2, d, 4);
+        let initial_m = Some(make_mlp_initial_m(&layout, 77));
+
+        let rule = TitansLMM {
+            memory_layers: 2,
+            memory_expansion_factor: 4,
+            memory_activation: MemoryActivation::GELU,
+            ..TitansLMM::l2()
+        };
+        let (y, cache) = rule.step(&params.levels[0], &embedded, s, d, initial_m);
+        let d_y: Vec<f32> = y.iter().map(|v| 2.0 * v).collect();
+        let (grads, d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
+
+
+        // All gradients must be finite
+        for (name, g) in [
+            ("w_k_mem", grads.w_k_mem.master()), ("w_v_mem", grads.w_v_mem.master()),
+            ("w_q_mem", grads.w_q_mem.master()), ("w_alpha", &grads.w_alpha),
+            ("b_alpha", &grads.b_alpha), ("w_theta", &grads.w_theta),
+            ("b_theta", &grads.b_theta), ("w_eta", &grads.w_eta),
+            ("b_eta", &grads.b_eta),
+        ] {
+            for (i, &v) in g.iter().enumerate() {
+                assert!(v.is_finite(), "MLP grad_{name}[{i}] not finite: {v}");
+            }
+        }
+        for (i, &v) in d_emb.iter().enumerate() {
+            assert!(v.is_finite(), "MLP d_embedded[{i}] not finite: {v}");
+        }
+
+        // Key projection gradients must be non-zero
+        for (name, g) in [
+            ("w_k_mem", grads.w_k_mem.master()), ("w_v_mem", grads.w_v_mem.master()),
+            ("w_q_mem", grads.w_q_mem.master()),
+        ] {
+            let max_abs = g.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            assert!(max_abs > 1e-10, "MLP grad_{name} is all zeros (max_abs={max_abs})");
+        }
+        let emb_max = d_emb.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        assert!(emb_max > 1e-10, "MLP d_embedded is all zeros");
     }
 }

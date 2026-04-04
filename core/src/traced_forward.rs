@@ -520,7 +520,14 @@ pub fn traced_cms_forward(
                 MemoryRuleKind::HebbianRule | MemoryRuleKind::AtlasOmega => delta_rule_read_only(
                     &params.levels[level], &embedded, frozen_ref, s, d, &crate::feature_map::FeatureMapKind::Identity,
                 ),
-                // Delta, Titans — support configured feature map.
+                // Titans with MLP memory: use MLP-specific read_only path.
+                MemoryRuleKind::TitansLMM if cfg.memory_layers >= 2 =>
+                    crate::titans_lmm::titans_mlp_read_only(
+                        &params.levels[level], &embedded, frozen_ref, s, d,
+                        cfg.memory_layers, cfg.memory_expansion_factor, cfg.memory_activation,
+                        &cfg.feature_map,
+                    ),
+                // Delta, Titans (linear) — support configured feature map.
                 _ => delta_rule_read_only(
                     &params.levels[level], &embedded, frozen_ref, s, d, &cfg.feature_map,
                 ),
@@ -562,13 +569,28 @@ pub fn traced_cms_forward(
 
             // Record frozen opaque block.
             // Meta: [s, d, fm_kind_f32, fm_sigma] (Identity: fm_kind=0, old tapes had len=2).
+            // For TitansLMM MLP: [s, d, fm_kind_f32, fm_sigma, memory_layers, expansion, activation].
             // Extra saves (if non-Identity): fm_z_q_mem, w_rand.
             let fk = frozen_opaque_key(cfg.memory_rule);
-            let meta = vec![s as f32, d as f32, fm_kind_f32, fm_sigma];
+            let mut meta = vec![s as f32, d as f32, fm_kind_f32, fm_sigma];
+            if cfg.memory_rule == MemoryRuleKind::TitansLMM && cfg.memory_layers >= 2 {
+                let mem_act_f32 = match cfg.memory_activation {
+                    crate::model::MemoryActivation::GELU => 0.0f32,
+                    crate::model::MemoryActivation::SiLU => 1.0,
+                    crate::model::MemoryActivation::ReLU => 2.0,
+                };
+                meta.push(cfg.memory_layers as f32);
+                meta.push(cfg.memory_expansion_factor as f32);
+                meta.push(mem_act_f32);
+            }
             let meta_id = tape.alloc(meta, vec![]);
             let m_saved = tape.alloc(frozen_ref.to_vec(), vec![]);
             let y_id = tape.alloc(y_data.clone(), vec![s, d]);
             let mut tape_saved = vec![meta_id, m_saved];
+            // MLP frozen backward needs q_mem to recompute activations for Jacobian.
+            if cfg.memory_rule == MemoryRuleKind::TitansLMM && cfg.memory_layers >= 2 {
+                tape_saved.push(tape.alloc(q_mem_data.clone(), vec![]));
+            }
             if has_fm {
                 tape_saved.push(tape.alloc(fm_z_q_save, vec![]));
                 tape_saved.push(tape.alloc(params.levels[level].w_rand.clone(), vec![]));
@@ -739,8 +761,14 @@ fn traced_active_level(
         MemoryRuleKind::TitansLMM => {
             let rule = TitansLMM::from_cfg_level(cfg, level);
             let (y, cache) = rule.step(level_params, embedded, s, d, initial_m);
-            let m_final_start = s * d * d;
-            let final_m = cache.m_states[m_final_start..m_final_start + d * d].to_vec();
+            // State size: d*d for linear memory, total_params for MLP memory
+            let state_size = if let Some(ref layout) = cache.mlp_layout {
+                layout.total_params
+            } else {
+                d * d
+            };
+            let m_final_start = s * state_size;
+            let final_m = cache.m_states[m_final_start..m_final_start + state_size].to_vec();
 
             let mk_f32 = match rule.momentum_kind {
                 crate::model::MomentumKind::None => 0.0f32,
@@ -757,7 +785,18 @@ fn traced_active_level(
                 crate::feature_map::FeatureMapKind::RandomFourier { sigma } => sigma,
                 _ => 1.0,
             };
-            let extra_meta = [crate::moneta::bias_to_f32(rule.bias), rule.sign_sharpness, mk_f32, rule.theta_floor, rule.theta_ceil, fm_kind_f32, fm_sigma];
+            let mem_act_f32 = match rule.memory_activation {
+                crate::model::MemoryActivation::GELU => 0.0f32,
+                crate::model::MemoryActivation::SiLU => 1.0,
+                crate::model::MemoryActivation::ReLU => 2.0,
+            };
+            let extra_meta = [
+                crate::moneta::bias_to_f32(rule.bias), rule.sign_sharpness, mk_f32,
+                rule.theta_floor, rule.theta_ceil, fm_kind_f32, fm_sigma,
+                1.0, // norms flag (backward compat)
+                rule.alpha_floor, rule.alpha_ceil,
+                rule.memory_layers as f32, rule.memory_expansion_factor as f32, mem_act_f32,
+            ];
             let (meta_id, lp_saved, emb_saved) =
                 alloc_common_saved(tape, level_params, embedded, s, d, &extra_meta);
             let lev = Some(level);
@@ -777,16 +816,30 @@ fn traced_active_level(
                 tape.alloc_named(cache.error.clone(), vec![], crate::tape::obs::ERROR, lev),
                 tape.alloc(cache.grad_outer.clone(), vec![]),
                 tape.alloc(cache.y.clone(), vec![]),
+                tape.alloc(cache.k_mem_norms.clone(), vec![]),  // saved[18]: L2 norms for k
+                tape.alloc(cache.q_mem_norms.clone(), vec![]),  // saved[19]: L2 norms for q
             ];
-            // Save DeltaMomentum decay buffer at saved[18] — backward adapter reads it there.
+            // MLP memory: save flattened pre-activations and activations (2 extra buffers).
+            // Backward adapter reads memory_layers from meta to know these exist.
+            if rule.memory_layers >= 2 {
+                let mut pre_acts_flat = Vec::new();
+                for token_pre in &cache.mlp_k_pre_acts {
+                    for layer_pre in token_pre { pre_acts_flat.extend_from_slice(layer_pre); }
+                }
+                let mut acts_flat = Vec::new();
+                for token_acts in &cache.mlp_k_activations {
+                    for layer_acts in token_acts { acts_flat.extend_from_slice(layer_acts); }
+                }
+                cache_ids.push(tape.alloc(pre_acts_flat, vec![]));
+                cache_ids.push(tape.alloc(acts_flat, vec![]));
+            }
+            // Save DeltaMomentum decay buffer — backward adapter reads it at dynamic offset.
             if rule.momentum_kind == crate::model::MomentumKind::DeltaMomentum {
                 assert!(!cache.decay.is_empty(),
                     "traced_forward TitansLMM: DeltaMomentum produced empty decay buffer");
                 cache_ids.push(tape.alloc(cache.decay.clone(), vec![]));
             }
             // Save feature map z caches and frozen FM weights before conv caches (if non-Identity).
-            // Backward adapter: fm_base = 18 (EMA/None) or 19 (DeltaMomentum).
-            // fm_z_k at fm_base, fm_z_q at fm_base+1, w_rand at fm_base+2, b_rand at fm_base+3.
             if !cache.fm_z_k_mem.is_empty() {
                 cache_ids.push(tape.alloc(cache.fm_z_k_mem.clone(), vec![]));
                 cache_ids.push(tape.alloc(cache.fm_z_q_mem.clone(), vec![]));
