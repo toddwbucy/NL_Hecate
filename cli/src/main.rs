@@ -6,6 +6,7 @@ mod config;
 mod data;
 mod feed;
 mod probe;
+mod state_file;
 mod step;
 mod log;
 mod sample;

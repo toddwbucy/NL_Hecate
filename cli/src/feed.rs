@@ -23,6 +23,9 @@ use nl_hecate_core::gpu_profiler::GpuProfiler;
 
 use crate::checkpoint_policy::{TriggerState, checkpoint_filename};
 use crate::config::{Config, PhaseDuration, TriggerConfig, CheckpointNaming};
+use crate::state_file::{
+    self, StateFile, CheckpointEntry, HealthSnapshot, SessionInfo,
+};
 use crate::data::BpeTokenStream;
 #[cfg(feature = "cuda")]
 use crate::probe::run_inline_probes;
@@ -274,6 +277,39 @@ pub fn feed(config_path: &str, resume: bool) {
             adamw_state = None;
         }
     }
+
+    // ── Spec 02: State file — lifecycle record ──────────────────────
+    let state_file_path = state_file::state_file_path(run_dir, "model");
+    let mut model_state = if state_file_path.exists() {
+        match state_file::load_state_file(&state_file_path) {
+            Ok(sf) => {
+                eprintln!("  [state file loaded: {} ({} checkpoints, {} tokens)]",
+                    state_file_path.display(), sf.checkpoints.len(), sf.tokens_total);
+                sf
+            }
+            Err(e) => {
+                eprintln!("WARNING: failed to load state file {}: {e} — creating fresh",
+                    state_file_path.display());
+                state_file::init_state_file("model", &mag_cfg)
+            }
+        }
+    } else {
+        let sf = if let Some(ref load_path) = cfg.build.load {
+            // Resuming from checkpoint without a state file — create one with parent ref
+            let mut sf = state_file::init_state_file("model", &mag_cfg);
+            sf.tokens_total = resume_tokens as u64;
+            eprintln!("  [state file created from checkpoint resume: {}]", state_file_path.display());
+            sf
+        } else {
+            eprintln!("  [state file created: {}]", state_file_path.display());
+            state_file::init_state_file("model", &mag_cfg)
+        };
+        // Persist immediately so the state file exists even if the run crashes before first checkpoint
+        if let Err(e) = state_file::save_state_file(&state_file_path, &sf) {
+            eprintln!("WARNING: failed to write state file: {e}");
+        }
+        sf
+    };
 
     // ── k-extension (spec 7 / spec 22) ─────────────────────────────
     // Mutables that extend_k may modify
@@ -789,7 +825,8 @@ pub fn feed(config_path: &str, resume: bool) {
                     if do_checkpoint {
                         save_checkpoint(
                             &save_path, global_step, total_tokens_seen,
-                            checkpoint_naming,
+                            checkpoint_naming, loss,
+                            &mut model_state, &state_file_path, &phase.label,
                             #[cfg(feature = "cuda")]
                             &gpu_params,
                             #[cfg(feature = "cuda")]
@@ -986,7 +1023,8 @@ pub fn feed(config_path: &str, resume: bool) {
             let loaders_empty: Vec<BpeTokenStream> = Vec::new();
             save_checkpoint(
                 &save_path, global_step, total_tokens_seen,
-                checkpoint_naming,
+                checkpoint_naming, loss_last,
+                &mut model_state, &state_file_path, &phase.label,
                 &gpu_params,
                 &gpu_context,
                 &mag_cfg, &conductor, &chunk_sizes,
@@ -1020,7 +1058,8 @@ pub fn feed(config_path: &str, resume: bool) {
         let loaders_empty: Vec<BpeTokenStream> = Vec::new();
         save_checkpoint(
             &save_path, global_step, total_tokens_seen,
-            naming,
+            naming, loss_last,
+            &mut model_state, &state_file_path, "on_unload",
             &gpu_params,
             &gpu_context,
             &mag_cfg, &conductor, &chunk_sizes,
@@ -1110,12 +1149,16 @@ fn collect_cms_diagnostics(
     CmsDiagnostics { level_gnorms, level_m_norms, level_m_deltas, dormancy_status }
 }
 
-/// Save checkpoint with build state.
+/// Save checkpoint with build state, and update the state file.
 fn save_checkpoint(
     save_path: &str,
     global_step: usize,
     total_tokens_seen: usize,
     naming: &CheckpointNaming,
+    loss: f32,
+    model_state: &mut StateFile,
+    state_file_path: &Path,
+    phase_label: &str,
     #[cfg(feature = "cuda")] gpu_params: &GpuStackedParams,
     #[cfg(feature = "cuda")] gpu_context: &GpuStackedContext,
     mag_cfg: &MAGConfig,
@@ -1161,7 +1204,7 @@ fn save_checkpoint(
             },
             context: host_context,
             global_step,
-            stream_cursors,
+            stream_cursors: stream_cursors.clone(),
             total_tokens_seen,
         };
         match save_stacked_safetensors(
@@ -1171,6 +1214,31 @@ fn save_checkpoint(
             Ok(()) => {
                 eprintln!("  [checkpoint saved: {ckpt_path}]");
                 logger.log_checkpoint(global_step, &ckpt_path);
+
+                // Spec 02: update state file with checkpoint entry
+                let entry = CheckpointEntry {
+                    path: ckpt_path.clone(),
+                    tokens: total_tokens_seen as u64,
+                    content_hash: String::new(), // TODO: SHA-256 of weight bytes (future)
+                    timestamp: state_file::iso8601_now(),
+                    health: HealthSnapshot {
+                        loss,
+                        m_norm_per_level: vec![],
+                        gate_alpha_mean_per_level: vec![],
+                        gate_theta_mean_per_level: vec![],
+                        cms_activations_since_restore: vec![],
+                    },
+                    session: SessionInfo::Build {
+                        label: phase_label.into(),
+                        dataset: String::new(),
+                        dataset_hash: String::new(),
+                        config_snapshot: String::new(),
+                    },
+                };
+                state_file::record_checkpoint(model_state, entry, &stream_cursors);
+                if let Err(e) = state_file::save_state_file(state_file_path, model_state) {
+                    eprintln!("WARNING: state file update failed: {e}");
+                }
             }
             Err(e) => {
                 eprintln!("ERROR: checkpoint save failed: {e}");
