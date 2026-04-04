@@ -481,9 +481,9 @@ impl MemoryLevelParams {
         let b_theta = vec![b_theta_init];
         let b_eta = vec![b_eta_init];
 
-        // Atlas Omega projection: zero-initialized by default.
-        // atlas_init() below provides Xavier-initialized w_omega.
-        let w_omega = vec![0.0f32; d * 2 * d];
+        // Atlas Omega projection: empty by default (non-Atlas rules don't use it).
+        // atlas_init() below allocates and Xavier-initializes w_omega.
+        let w_omega = vec![];
 
         // Dynamic frequency gate: empty by default (Fixed schedule).
         // Populated by MAGParams::init() when FrequencySchedule::Learned.
@@ -496,6 +496,7 @@ impl MemoryLevelParams {
     /// Initialize with Xavier-initialized w_omega for Atlas Omega rule.
     pub fn atlas_init(d: usize, rng: &mut SimpleRng, b_alpha_init: f32, b_theta_init: f32, b_eta_init: f32) -> Self {
         let mut params = Self::init(d, rng, b_alpha_init, b_theta_init, b_eta_init);
+        params.w_omega = vec![0.0f32; d * 2 * d];
         let omega_scale = (1.0 / (2 * d) as f32).sqrt();
         rng.fill_uniform(&mut params.w_omega, omega_scale);
         params
@@ -536,7 +537,7 @@ impl MemoryLevelParams {
             b_theta: vec![0.0f32; 1],
             w_eta: vec![0.0f32; 2 * d],
             b_eta: vec![0.0f32; 1],
-            w_omega: vec![0.0f32; d * 2 * d],
+            w_omega: vec![],
             w_freq: vec![],
             b_freq: vec![],
             w_k_conv: vec![],
@@ -577,6 +578,7 @@ impl MemoryLevelParams {
         if !template.m_eta_init.is_empty() { z.m_eta_init = vec![0.0f32; template.m_eta_init.len()]; }
         if !template.m_alpha_init.is_empty() { z.m_alpha_init = vec![0.0f32; template.m_alpha_init.len()]; }
         if !template.m_mem_init.is_empty() { z.m_mem_init = vec![0.0f32; template.m_mem_init.len()]; }
+        if !template.w_omega.is_empty() { z.w_omega = vec![0.0f32; template.w_omega.len()]; }
         if !template.gate_proj.is_empty() { z.gate_proj = vec![0.0f32; template.gate_proj.len()]; }
         if !template.up_proj.is_empty() { z.up_proj = vec![0.0f32; template.up_proj.len()]; }
         if !template.down_proj.is_empty() { z.down_proj = vec![0.0f32; template.down_proj.len()]; }
@@ -622,7 +624,9 @@ impl MemoryLevelParams {
         step(&mut self.b_theta, &grads.b_theta, lr);
         step(&mut self.w_eta, &grads.w_eta, lr);
         step(&mut self.b_eta, &grads.b_eta, lr);
-        step(&mut self.w_omega, &grads.w_omega, lr);
+        if !self.w_omega.is_empty() && !grads.w_omega.is_empty() {
+            step(&mut self.w_omega, &grads.w_omega, lr);
+        }
         if !self.w_freq.is_empty() && !grads.w_freq.is_empty() {
             step(&mut self.w_freq, &grads.w_freq, lr);
             step(&mut self.b_freq, &grads.b_freq, lr);
@@ -662,7 +666,9 @@ impl MemoryLevelParams {
         acc(&mut self.b_theta, &other.b_theta);
         acc(&mut self.w_eta, &other.w_eta);
         acc(&mut self.b_eta, &other.b_eta);
-        acc(&mut self.w_omega, &other.w_omega);
+        if !self.w_omega.is_empty() && !other.w_omega.is_empty() {
+            acc(&mut self.w_omega, &other.w_omega);
+        }
         if !self.w_freq.is_empty() && !other.w_freq.is_empty() {
             acc(&mut self.w_freq, &other.w_freq);
             acc(&mut self.b_freq, &other.b_freq);
@@ -2877,11 +2883,12 @@ impl MAGParams {
                 "extend_stack_up: level[{}] b_freq size {} vs expected {}",
                 i, lev.b_freq.len(), expect_freq_b,
             );
-            // Atlas Omega projection: always allocated as [d, 2*d] (zero-init for non-Atlas)
+            // Atlas Omega projection: [d, 2*d] for Atlas, empty for others
+            let expect_omega = if lev.w_omega.is_empty() { 0 } else { d * 2 * d };
             assert_eq!(
-                lev.w_omega.len(), d * 2 * d,
-                "extend_stack_up: level[{}] w_omega size {} vs expected d*2*d={}",
-                i, lev.w_omega.len(), d * 2 * d,
+                lev.w_omega.len(), expect_omega,
+                "extend_stack_up: level[{}] w_omega size {} vs expected {}",
+                i, lev.w_omega.len(), expect_omega,
             );
             // Self-referential init memories: present iff Adaptive projection
             let has_self_ref = matches!(new_cfg.projection_kind, ProjectionKind::Adaptive);
@@ -2932,8 +2939,12 @@ impl MAGParams {
     pub fn zeros_like(cfg: &MAGConfig) -> Self {
         let d = cfg.swa.d_model;
         let has_freq = matches!(cfg.frequency_schedule, FrequencySchedule::Learned(_));
+        let has_omega = cfg.memory_rule == MemoryRuleKind::AtlasOmega;
         let levels = (0..cfg.k).map(|_| {
             let mut z = MemoryLevelParams::zeros_like(d);
+            if has_omega {
+                z.w_omega = vec![0.0f32; d * 2 * d];
+            }
             if has_freq {
                 z.w_freq = vec![0.0f32; d];
                 z.b_freq = vec![0.0f32; 1];
@@ -3369,8 +3380,9 @@ mod tests {
         assert_eq!(p.levels[0].w_eta.len(), 2 * d);
         assert_eq!(p.levels[0].b_eta.len(), 1);
         // eta params included in num_params
-        // 3 proj (d*d each) + alpha gate (2*d + 1) + theta gate (2*d + 1) + eta gate (2*d + 1) + w_omega (d * 2*d)
-        let expected = 3 * d * d + 3 * (2 * d + 1) + d * 2 * d;
+        // 3 proj (d*d each) + alpha gate (2*d + 1) + theta gate (2*d + 1) + eta gate (2*d + 1)
+        // w_omega is empty for Titans (only allocated for AtlasOmega)
+        let expected = 3 * d * d + 3 * (2 * d + 1);
         assert_eq!(p.levels[0].num_params(), expected);
     }
 

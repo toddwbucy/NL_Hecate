@@ -118,6 +118,16 @@ pub fn level_params_to_flat(p: &MemoryLevelParams, out: &mut Vec<f32>) {
 /// `kernel_size`: Conv1D kernel size (0 = no conv fields). When > 0, expects
 /// 2*d*kernel_size + 2*d trailing elements for w_k_conv/b_k_conv/w_q_conv/b_q_conv.
 pub fn level_params_from_flat(flat: &[f32], d: usize, kernel_size: usize) -> MemoryLevelParams {
+    // Auto-detect w_omega from buffer length (backward compat).
+    // Mandatory fields = 3*d*d + 6*d + 3. If flat is long enough for omega, assume present.
+    let mandatory = 3 * d * d + 6 * d + 3;
+    let has_omega = flat.len() >= mandatory + d * 2 * d;
+    level_params_from_flat_ex(flat, d, kernel_size, has_omega)
+}
+
+/// Reconstruct MemoryLevelParams from a flat slice with explicit w_omega flag.
+/// `has_omega`: true for AtlasOmega rule (w_omega is [d, 2*d]), false for all others.
+pub fn level_params_from_flat_ex(flat: &[f32], d: usize, kernel_size: usize, has_omega: bool) -> MemoryLevelParams {
     let mut offset = 0;
     let take = |off: &mut usize, n: usize| -> Vec<f32> {
         let slice = flat[*off..*off + n].to_vec();
@@ -133,7 +143,7 @@ pub fn level_params_from_flat(flat: &[f32], d: usize, kernel_size: usize) -> Mem
     let b_theta = take(&mut offset, 1);
     let w_eta = take(&mut offset, 2 * d);
     let b_eta = take(&mut offset, 1);
-    let w_omega = take(&mut offset, d * 2 * d);
+    let w_omega = if has_omega { take(&mut offset, d * 2 * d) } else { vec![] };
     // Variable-length optional fields: freq then conv.
     // Both are detected from the remaining buffer length when kernel_size == 0
     // (opaque backward adapters don't carry kernel_size in metadata).
@@ -328,7 +338,7 @@ pub fn delta_rule_opaque_backward(
     };
 
     // Reconstruct level_params (w_rand/b_rand not in flat buffer; inject from tape).
-    let mut level_params = level_params_from_flat(saved[1], d, read_kernel_size(saved[0]));
+    let mut level_params = level_params_from_flat_ex(saved[1], d, read_kernel_size(saved[0]), false);
     level_params.w_rand = w_rand;
     level_params.b_rand = b_rand;
 
@@ -456,7 +466,7 @@ pub fn titans_lmm_opaque_backward(
     };
 
     // Reconstruct level_params (w_rand/b_rand not in flat buffer; inject from tape).
-    let mut level_params = level_params_from_flat(saved[1], d, read_kernel_size(saved[0]));
+    let mut level_params = level_params_from_flat_ex(saved[1], d, read_kernel_size(saved[0]), false);
     level_params.w_rand = w_rand;
     level_params.b_rand = b_rand;
 
@@ -539,7 +549,7 @@ pub fn hebbian_opaque_backward(
     d_inputs: &mut [Vec<f32>],
 ) {
     let (seq_len, d) = read_meta_2(saved[0]);
-    let level_params = level_params_from_flat(saved[1], d, read_kernel_size(saved[0]));
+    let level_params = level_params_from_flat_ex(saved[1], d, read_kernel_size(saved[0]), false);
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
@@ -581,7 +591,7 @@ pub fn moneta_opaque_backward(
     let lambda_2 = saved[0][4];
     let sign_sharpness = if saved[0].len() > 5 { saved[0][5] } else { 10.0 };
     let lq_q = if saved[0].len() > 6 { saved[0][6] } else { 2.0 };
-    let level_params = level_params_from_flat(saved[1], d, read_kernel_size(saved[0]));
+    let level_params = level_params_from_flat_ex(saved[1], d, read_kernel_size(saved[0]), false);
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
@@ -646,7 +656,7 @@ pub fn yaad_opaque_backward(
     let delta = saved[0][3];
     let lambda_local = saved[0][4];
     let lambda_2 = saved[0][5];
-    let level_params = level_params_from_flat(saved[1], d, read_kernel_size(saved[0]));
+    let level_params = level_params_from_flat_ex(saved[1], d, read_kernel_size(saved[0]), false);
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
@@ -696,7 +706,7 @@ pub fn memora_opaque_backward(
     d_inputs: &mut [Vec<f32>],
 ) {
     let (seq_len, d, d_hidden) = read_meta_3(saved[0]);
-    let level_params = level_params_from_flat(saved[1], d, read_kernel_size(saved[0]));
+    let level_params = level_params_from_flat_ex(saved[1], d, read_kernel_size(saved[0]), false);
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
@@ -752,7 +762,7 @@ pub fn lattice_osr_opaque_backward(
     } else {
         crate::model::LatticeVariant::Decode
     };
-    let level_params = level_params_from_flat(saved[1], d, read_kernel_size(saved[0]));
+    let level_params = level_params_from_flat_ex(saved[1], d, read_kernel_size(saved[0]), false);
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
@@ -797,7 +807,7 @@ pub fn trellis_opaque_backward(
     let (seq_len, d, d_k) = read_meta_3(saved[0]);
     let lambda_k = saved[0][3];
     let lambda_v = saved[0][4];
-    let level_params = level_params_from_flat(saved[1], d, read_kernel_size(saved[0]));
+    let level_params = level_params_from_flat_ex(saved[1], d, read_kernel_size(saved[0]), false);
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
@@ -853,7 +863,7 @@ pub fn atlas_omega_opaque_backward(
     d_inputs: &mut [Vec<f32>],
 ) {
     let (seq_len, d) = read_meta_2(saved[0]);
-    let level_params = level_params_from_flat(saved[1], d, read_kernel_size(saved[0]));
+    let level_params = level_params_from_flat_ex(saved[1], d, read_kernel_size(saved[0]), true);
     let embedded = saved[2];
     let d_y = d_outputs[0];
 
@@ -1788,6 +1798,12 @@ mod tests {
         MemoryLevelParams::init(d, &mut rng, 3.0, -4.6, -1.0)
     }
 
+    fn make_test_params_atlas(d: usize) -> MemoryLevelParams {
+        use crate::tensor::SimpleRng;
+        let mut rng = SimpleRng::new(42);
+        MemoryLevelParams::atlas_init(d, &mut rng, 3.0, -4.6, -1.0)
+    }
+
     fn make_test_embedded(seq_len: usize, d: usize) -> Vec<f32> {
         use crate::tensor::SimpleRng;
         let mut rng = SimpleRng::new(99);
@@ -2040,7 +2056,8 @@ mod tests {
 
     #[test]
     fn test_opaque_vjp_atlas_omega() {
-        assert_opaque_roundtrip(&AtlasOmega, 4, 3);
+        let params = make_test_params_atlas(4);
+        assert_opaque_roundtrip_with_params(&AtlasOmega, &params, 4, 3);
     }
 
     #[test]
@@ -2137,6 +2154,60 @@ mod tests {
         }
     }
 
+    fn assert_class1_isolation_with_params<R: MemoryRule>(
+        rule: &R, params: &MemoryLevelParams, d: usize, seq_len: usize,
+    ) {
+        let embedded = make_test_embedded(seq_len, d);
+
+        let (y_direct, cache) = rule.step(params, &embedded, seq_len, d, None);
+        let d_y = vec![1.0f32; seq_len * d];
+        let (param_grads_direct, d_embedded_direct) =
+            rule.step_backward(params, &cache, &d_y, &embedded);
+
+        let registry = register_opaque_vjps();
+        let y_tape = crate::tape::with_tape(registry, |tape| {
+            let (y, y_id, emb_in, lp_in) =
+                rule.record_on_tape(tape, params, &embedded, seq_len, d, None, None);
+
+            tape.seed_grad(y_id, d_y.clone());
+            tape.backward(y_id);
+
+            let d_emb_tape = tape.get_grad(emb_in)
+                .expect("embedded should have gradient");
+            let d_lp_tape = tape.get_grad(lp_in)
+                .expect("level_params should have gradient");
+
+            assert_eq!(d_emb_tape.len(), d_embedded_direct.len());
+            for (i, (&tv, &dv)) in d_emb_tape.iter().zip(d_embedded_direct.iter()).enumerate() {
+                assert_close(tv, dv, "d_embedded", i);
+            }
+
+            let lp_grads_direct = level_params_grads_to_flat(&param_grads_direct);
+            assert_eq!(d_lp_tape.len(), lp_grads_direct.len());
+            for (i, (&tv, &dv)) in d_lp_tape.iter().zip(lp_grads_direct.iter()).enumerate() {
+                assert_close(tv, dv, "d_level_params", i);
+            }
+
+            for buf_id in 0..tape.num_bufs() {
+                if buf_id == emb_in || buf_id == lp_in || buf_id == y_id {
+                    continue;
+                }
+                if let Some(grad) = tape.get_grad(buf_id) {
+                    let nonzero = grad.iter().any(|&g| g.abs() > 1e-30);
+                    assert!(!nonzero,
+                        "Gradient leaked to non-input buf {}: norm={}",
+                        buf_id, grad.iter().map(|g| g * g).sum::<f32>().sqrt());
+                }
+            }
+
+            y
+        });
+
+        for (i, (&a, &b)) in y_tape.iter().zip(y_direct.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-7, "y[{}]: tape={} direct={}", i, a, b);
+        }
+    }
+
     #[test]
     fn test_class1_delta_rule() { assert_class1_isolation(&DeltaRule::l2(), 4, 3); }
     #[test]
@@ -2154,7 +2225,10 @@ mod tests {
     #[test]
     fn test_class1_trellis() { assert_class1_isolation(&Trellis { d_k: 3, lambda_k: 0.01, lambda_v: 0.01, alpha_floor: 0.0, alpha_ceil: 1.0, theta_floor: 0.0, theta_ceil: f32::MAX }, 4, 3); }
     #[test]
-    fn test_class1_atlas_omega() { assert_class1_isolation(&AtlasOmega, 4, 3); }
+    fn test_class1_atlas_omega() {
+        let params = make_test_params_atlas(4);
+        assert_class1_isolation_with_params(&AtlasOmega, &params, 4, 3);
+    }
 
     // ── Class 1: SWA isolation ──────────────────────────────────────
 

@@ -3860,7 +3860,8 @@ mod scratch_tests {
             b_theta: GpuBuf::from_host(&[-4.6f32]),
             w_eta:   GpuBuf::from_host(&rand_vec(2 * d, seed + 5)),
             b_eta:   GpuBuf::from_host(&[2.0f32]),
-            w_omega: GpuBuf::from_host(&rand_vec(d * 2 * d, seed + 6)),
+            w_omega: GpuBuf::zeros(1),
+            has_omega: false,
             w_freq:  GpuBuf::zeros(1),
             b_freq:  GpuBuf::zeros(1),
             has_freq: false,
@@ -3883,8 +3884,10 @@ mod scratch_tests {
     fn make_cfg(d: usize, s: usize, rule: MemoryRuleKind) -> MAGConfig {
         let mut cfg = MAGConfig::test_config();
         cfg.swa.d_model = d;
-        cfg.swa.num_heads = 2;
-        cfg.swa.head_dim = d / 2;
+        // Scratch path operates in full-d mode (dd = d*d), not per-head mode.
+        // Use nh=1 so the standard path also uses full-d for valid comparison.
+        cfg.swa.num_heads = 1;
+        cfg.swa.head_dim = d;
         cfg.swa.seq_len = s;
         cfg.swa.window_size = s;
         cfg.memory_rule = rule;

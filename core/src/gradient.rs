@@ -16,7 +16,7 @@ use crate::mac::{mac_forward, mac_backward, cms_mac_forward, cms_mac_backward};
 use crate::conductor::{Pulse, ContextState, ErrorBuffer};
 use crate::tape::with_tape;
 use crate::traced_forward::traced_cms_forward;
-use crate::opaque_adapters::{register_opaque_vjps, level_params_from_flat};
+use crate::opaque_adapters::{register_opaque_vjps, level_params_from_flat, level_params_from_flat_ex};
 use crate::dynamic_freq::{compute_gate_surrogate, freq_gate_backward};
 
 /// Create a ContextState with the correct memory size per level for the given config.
@@ -370,7 +370,7 @@ pub fn tape_compute_gradients(
             // Slice off the standard prefix and extract MLP grads explicitly.
             let mut lp_grad = if cfg.memory_rule == crate::model::MemoryRuleKind::SwiGluMlp {
                 let inter = cfg.intermediate_size;
-                let std_size = 5 * d * d + 6 * d + 3; // standard fields, no freq/conv
+                let std_size = 3 * d * d + 6 * d + 3; // standard fields (no omega/freq/conv)
                 let required = std_size + 3 * inter * d;
                 assert!(
                     lp_grad_flat.len() >= required,
@@ -384,7 +384,8 @@ pub fn tape_compute_gradients(
                 lp.down_proj = lp_grad_flat[std_size + 2 * inter * d..std_size + 3 * inter * d].to_vec();
                 lp
             } else {
-                level_params_from_flat(&lp_grad_flat, d, cfg.kernel_size)
+                level_params_from_flat_ex(&lp_grad_flat, d, cfg.kernel_size,
+                    cfg.memory_rule == crate::model::MemoryRuleKind::AtlasOmega)
             };
 
             // For frozen levels, the w_q_mem was registered as a separate param.

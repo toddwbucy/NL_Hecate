@@ -90,7 +90,8 @@ pub struct GpuMemoryLevelParams {
     pub b_theta: GpuBuf<f32>,   // [1]
     pub w_eta: GpuBuf<f32>,     // [2*d]
     pub b_eta: GpuBuf<f32>,     // [1]
-    pub w_omega: GpuBuf<f32>,   // [d, 2*d]
+    pub w_omega: GpuBuf<f32>,   // [d, 2*d] for Atlas, dummy(1) for others
+    pub has_omega: bool,
     // Frequency gate (empty for Fixed schedule — use len=1 dummy)
     pub w_freq: GpuBuf<f32>,
     pub b_freq: GpuBuf<f32>,
@@ -160,7 +161,8 @@ impl GpuMemoryLevelParams {
             b_theta: GpuBuf::from_host(&host.b_theta),
             w_eta: GpuBuf::from_host(&host.w_eta),
             b_eta: GpuBuf::from_host(&host.b_eta),
-            w_omega: GpuBuf::from_host(&host.w_omega),
+            w_omega: if !host.w_omega.is_empty() { GpuBuf::from_host(&host.w_omega) } else { GpuBuf::zeros(1) },
+            has_omega: !host.w_omega.is_empty(),
             w_freq,
             b_freq,
             has_freq,
@@ -185,7 +187,10 @@ impl GpuMemoryLevelParams {
         self.b_theta.copy_to_host(&mut p.b_theta);
         self.w_eta.copy_to_host(&mut p.w_eta);
         self.b_eta.copy_to_host(&mut p.b_eta);
-        self.w_omega.copy_to_host(&mut p.w_omega);
+        if self.has_omega {
+            p.w_omega = vec![0.0f32; self.w_omega.len()];
+            self.w_omega.copy_to_host(&mut p.w_omega);
+        }
         if self.has_freq {
             p.w_freq = vec![0.0f32; self.w_freq.len()];
             p.b_freq = vec![0.0f32; self.b_freq.len()];
