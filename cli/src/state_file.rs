@@ -221,12 +221,18 @@ pub fn load_legacy_cursor(checkpoint_path: &str) -> Vec<StreamCursor> {
     }
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            eprintln!("WARNING: failed to read legacy cursor sidecar {}: {e}", path.display());
+            return Vec::new();
+        }
     };
     // Legacy sidecar schema: {"position": N, "total_tokens": N, "content_hash": N, ...}
     let val: serde_json::Value = match serde_json::from_str(&text) {
         Ok(v) => v,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            eprintln!("WARNING: failed to parse legacy cursor sidecar {}: {e}", path.display());
+            return Vec::new();
+        }
     };
     let position = val.get("position").and_then(|v| v.as_u64()).unwrap_or(0);
     let chunk_id = val.get("chunk_id").and_then(|v| v.as_u64()).unwrap_or(0);
