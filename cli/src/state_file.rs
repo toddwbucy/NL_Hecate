@@ -182,11 +182,24 @@ pub fn save_state_file(path: &Path, state: &StateFile) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Load a state file from disk.
+/// Load a state file from disk. Validates format and schema_version.
 pub fn load_state_file(path: &Path) -> std::io::Result<StateFile> {
     let text = std::fs::read_to_string(path)?;
-    serde_json::from_str(&text)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    let state: StateFile = serde_json::from_str(&text)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    if state.format != "nl_hecate_state" {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unknown state file format: {:?} (expected \"nl_hecate_state\")", state.format),
+        ));
+    }
+    if state.schema_version != "1.0" {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unsupported schema_version: {:?} (expected \"1.0\")", state.schema_version),
+        ));
+    }
+    Ok(state)
 }
 
 /// Derive the state file path from the save_path base.
@@ -538,5 +551,44 @@ mod tests {
             }
             _ => panic!("expected Serving session"),
         }
+    }
+
+    #[test]
+    fn test_load_rejects_wrong_format() {
+        let dir = std::env::temp_dir().join("nl_hecate_state_test_fmt");
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("bad_format.state.json");
+
+        let cfg = test_mag_config();
+        let mut state = init_state_file("test", &cfg);
+        state.format = "some_other_format".into();
+        // Write directly (bypass save_state_file which doesn't validate)
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        std::fs::write(&path, &json).unwrap();
+
+        let err = load_state_file(&path).unwrap_err();
+        assert!(err.to_string().contains("unknown state file format"));
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn test_load_rejects_wrong_schema_version() {
+        let dir = std::env::temp_dir().join("nl_hecate_state_test_ver");
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("bad_version.state.json");
+
+        let cfg = test_mag_config();
+        let mut state = init_state_file("test", &cfg);
+        state.schema_version = "2.0".into();
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        std::fs::write(&path, &json).unwrap();
+
+        let err = load_state_file(&path).unwrap_err();
+        assert!(err.to_string().contains("unsupported schema_version"));
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
     }
 }

@@ -278,39 +278,6 @@ pub fn feed(config_path: &str, resume: bool) {
         }
     }
 
-    // ── Spec 02: State file — lifecycle record ──────────────────────
-    let state_file_path = state_file::state_file_path(run_dir, "model");
-    let mut model_state = if state_file_path.exists() {
-        match state_file::load_state_file(&state_file_path) {
-            Ok(sf) => {
-                eprintln!("  [state file loaded: {} ({} checkpoints, {} tokens)]",
-                    state_file_path.display(), sf.checkpoints.len(), sf.tokens_total);
-                sf
-            }
-            Err(e) => {
-                eprintln!("WARNING: failed to load state file {}: {e} — creating fresh",
-                    state_file_path.display());
-                state_file::init_state_file("model", &mag_cfg)
-            }
-        }
-    } else {
-        let sf = if let Some(ref load_path) = cfg.build.load {
-            // Resuming from checkpoint without a state file — create one with parent ref
-            let mut sf = state_file::init_state_file("model", &mag_cfg);
-            sf.tokens_total = resume_tokens as u64;
-            eprintln!("  [state file created from checkpoint resume: {}]", state_file_path.display());
-            sf
-        } else {
-            eprintln!("  [state file created: {}]", state_file_path.display());
-            state_file::init_state_file("model", &mag_cfg)
-        };
-        // Persist immediately so the state file exists even if the run crashes before first checkpoint
-        if let Err(e) = state_file::save_state_file(&state_file_path, &sf) {
-            eprintln!("WARNING: failed to write state file: {e}");
-        }
-        sf
-    };
-
     // ── k-extension (spec 7 / spec 22) ─────────────────────────────
     // Mutables that extend_k may modify
     let mut k = k;
@@ -394,6 +361,44 @@ pub fn feed(config_path: &str, resume: bool) {
         resume_step = 0; // New phase starts from step 0
         resume_conductor_step = 0;
     }
+
+    // ── Spec 02: State file — lifecycle record ──────────────────────
+    // Placed after extend_k so that mag_cfg captures post-extension architecture.
+    let state_basename = std::path::Path::new(&save_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("model");
+    let state_file_path = state_file::state_file_path(run_dir, state_basename);
+    let mut model_state = if state_file_path.exists() {
+        match state_file::load_state_file(&state_file_path) {
+            Ok(sf) => {
+                eprintln!("  [state file loaded: {} ({} checkpoints, {} tokens)]",
+                    state_file_path.display(), sf.checkpoints.len(), sf.tokens_total);
+                sf
+            }
+            Err(e) => {
+                eprintln!("WARNING: failed to load state file {}: {e} — creating fresh",
+                    state_file_path.display());
+                state_file::init_state_file(state_basename, &mag_cfg)
+            }
+        }
+    } else {
+        let sf = if cfg.build.load.is_some() {
+            // Resuming from checkpoint without a state file — create one with parent ref
+            let mut sf = state_file::init_state_file(state_basename, &mag_cfg);
+            sf.tokens_total = resume_tokens as u64;
+            eprintln!("  [state file created from checkpoint resume: {}]", state_file_path.display());
+            sf
+        } else {
+            eprintln!("  [state file created: {}]", state_file_path.display());
+            state_file::init_state_file(state_basename, &mag_cfg)
+        };
+        // Persist immediately so the state file exists even if the run crashes before first checkpoint
+        if let Err(e) = state_file::save_state_file(&state_file_path, &sf) {
+            eprintln!("WARNING: failed to write state file: {e}");
+        }
+        sf
+    };
 
     // ── Reset intervals (spec 57) ────────────────────────────────────
     let reset_intervals: Vec<usize> = cfg.model.reset_intervals.clone()
@@ -524,6 +529,7 @@ pub fn feed(config_path: &str, resume: bool) {
     let mut total_tokens_seen: usize = resume_tokens; // CG-6: cumulative tokens for segment accounting
     let mut aborted = false;
     let mut trigger_state = TriggerState::new(resume_tokens as u64);
+    let mut last_loaders: Vec<BpeTokenStream> = Vec::new();
 
     for (phase_idx, phase) in phases.iter().enumerate() {
         // Resolve per-phase overrides (fall back to build defaults)
@@ -853,6 +859,8 @@ pub fn feed(config_path: &str, resume: bool) {
                         }
                     }
                 }
+                // Preserve loaders for on_unload cursor state
+                last_loaders = loaders;
             }
 
             PhaseDuration::ThinkRounds(rounds) => {
@@ -1019,8 +1027,6 @@ pub fn feed(config_path: &str, resume: bool) {
         eprintln!("  [phase {phase_idx} complete — checkpoint at step {global_step}]");
         #[cfg(feature = "cuda")]
         {
-            // Synthesize a minimal loader list for checkpoint metadata
-            let loaders_empty: Vec<BpeTokenStream> = Vec::new();
             save_checkpoint(
                 &save_path, global_step, total_tokens_seen,
                 checkpoint_naming, loss_last,
@@ -1028,7 +1034,7 @@ pub fn feed(config_path: &str, resume: bool) {
                 &gpu_params,
                 &gpu_context,
                 &mag_cfg, &conductor, &chunk_sizes,
-                &loaders_empty, d, v, k,
+                &last_loaders, d, v, k,
                 &mut logger,
             );
             trigger_state.record_checkpoint(total_tokens_seen as u64, loss_last);
@@ -1055,7 +1061,6 @@ pub fn feed(config_path: &str, resume: bool) {
     if cfg.build.checkpoint.on_unload && trigger_state.is_stale(total_tokens_seen as u64) {
         eprintln!("  [on_unload: saving final checkpoint at step {global_step}]");
         let naming = &cfg.build.checkpoint.naming;
-        let loaders_empty: Vec<BpeTokenStream> = Vec::new();
         save_checkpoint(
             &save_path, global_step, total_tokens_seen,
             naming, loss_last,
@@ -1063,7 +1068,7 @@ pub fn feed(config_path: &str, resume: bool) {
             &gpu_params,
             &gpu_context,
             &mag_cfg, &conductor, &chunk_sizes,
-            &loaders_empty, d, v, k,
+            &last_loaders, d, v, k,
             &mut logger,
         );
     }
