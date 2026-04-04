@@ -383,27 +383,22 @@ pub fn delta_rule_opaque_backward(
 
 /// Titans LMM opaque backward adapter.
 ///
-/// Saved buffer layout (TitansLMM, no DeltaMomentum, with L2 norms):
+/// Saved buffer layout (TitansLMM):
 ///   saved[0]     = meta: [seq_len, d, bias, sign_sharpness, mk_f32, theta_floor, theta_ceil,
-///                         fm_kind, sigma, has_norms(1.0), kernel_size]
+///                         fm_kind, sigma, memory_layers, memory_expansion, memory_activation,
+///                         kernel_size]
+///                  Old format (meta.len()=10): no MLP fields (defaults to linear memory).
 ///   saved[1]     = level_params_flat
 ///   saved[2]     = embedded
 ///   saved[3..17] = cache fields (m_states, s_states, k_mem, v_mem, q_mem, concat_kv,
 ///                                alpha_pre, alpha, theta_pre, theta, eta_pre, eta,
 ///                                error, grad_outer, y)
-///   saved[18]    = k_mem_norms (L2 norms for normalization backward)
-///   saved[19]    = q_mem_norms
-///   saved[20]    = fm_z_k_mem  (if non-Identity, fm_base=20)
-///   saved[21]    = fm_z_q_mem
-///   saved[22]    = w_rand
-///   saved[23]    = b_rand
+///   If MLP (memory_layers >= 2):
+///     saved[18]  = mlp_k_pre_acts_flat
+///     saved[19]  = mlp_k_activations_flat
+///   If DeltaMomentum: decay at saved[18 + mlp_offset]
+///   If non-Identity FM: fm buffers at saved[fm_base..fm_base+4]
 ///   saved[N-4..] = conv cache (always at tail)
-///
-/// With DeltaMomentum: decay at saved[20], fm shifts to fm_base=21.
-///
-/// Backward-compat: old recordings without norms have meta.len() <= 10,
-/// norms_offset=0, fm_base=18/19.
-///   len guard `saved[0].len() >= 11` detects new format with L2 norms.
 pub fn titans_lmm_opaque_backward(
     d_outputs: &[&[f32]],
     saved: &[&[f32]],
@@ -440,19 +435,29 @@ pub fn titans_lmm_opaque_backward(
     let fm_kind = decode_feature_map_kind(fm_kind_f32, fm_sigma);
     let has_fm = !matches!(fm_kind, crate::feature_map::FeatureMapKind::Identity);
 
-    // Detect L2 norms presence: new format has extra_meta with 8 elements (+ seq_len + d + kernel_size = 11).
-    // Old format has 7 extras → meta.len() = 10. New format → meta.len() = 11.
-    let has_norms = saved[0].len() >= 11;
-
-    // Base index for fm buffers shifts by +2 when norms present.
-    // Without norms: fm_base = 18 (EMA/None) or 19 (DeltaMomentum).
-    // With norms:    fm_base = 20 (EMA/None) or 21 (DeltaMomentum).
-    let norms_offset = if has_norms { 2 } else { 0 };
-    let fm_base = if momentum_kind == crate::model::MomentumKind::DeltaMomentum {
-        19 + norms_offset
+    // MLP memory fields (new format: meta[12]=memory_layers, meta[13]=expansion, meta[14]=activation).
+    // Old format (meta.len()=13) has no MLP fields → defaults to linear memory (memory_layers=1).
+    // New format (meta.len()=16) includes MLP fields after alpha_floor/alpha_ceil.
+    let memory_layers = if saved[0].len() >= 16 { saved[0][12] as usize } else { 1 };
+    let memory_expansion = if saved[0].len() >= 16 { saved[0][13] as usize } else { 4 };
+    let memory_activation = if saved[0].len() >= 16 {
+        match saved[0][14] as u8 {
+            0 => crate::model::MemoryActivation::GELU,
+            1 => crate::model::MemoryActivation::SiLU,
+            2 => crate::model::MemoryActivation::ReLU,
+            _ => crate::model::MemoryActivation::GELU,
+        }
     } else {
-        18 + norms_offset
+        crate::model::MemoryActivation::GELU
     };
+
+    // saved[18] = k_mem_norms, saved[19] = q_mem_norms — always present (may be empty).
+    // MLP buffers are saved right after norms (saved[20..22]) when memory_layers >= 2.
+    let mlp_offset: usize = if memory_layers >= 2 { 2 } else { 0 };
+
+    // Dynamic offset for optional buffers after norms + MLP.
+    let dm_offset: usize = if momentum_kind == crate::model::MomentumKind::DeltaMomentum { 1 } else { 0 };
+    let fm_base = 20 + mlp_offset + dm_offset;
 
     // Read frozen FM weights and z caches from tape if non-Identity.
     let (fm_z_k_mem, fm_z_q_mem, w_rand, b_rand) = if has_fm {
@@ -476,8 +481,50 @@ pub fn titans_lmm_opaque_backward(
         restore_conv_cache(&saved[n-4..])
     } else { (None, None) };
 
-    // Decay index shifts by +2 when norms are present.
-    let decay_idx = 18 + norms_offset;
+    // Decay buffer index (right after norms + MLP buffers).
+    let decay_idx = 20 + mlp_offset;
+
+    // Reconstruct MLP layout and restore pre-activations/activations from flat buffers.
+    let (mlp_layout, mlp_k_pre_acts, mlp_k_activations) = if memory_layers >= 2 {
+        let layout = crate::titans_lmm::MLPMemoryLayout::new(memory_layers, d, memory_expansion);
+        let pre_acts_flat = saved[20]; // right after norms at [18],[19]
+        let acts_flat = saved[21];
+
+        // Unflatten pre_acts: [seq_len][n_layers-1][layer_dim]
+        let n = layout.n_layers;
+        let mut pre_acts = Vec::with_capacity(seq_len);
+        let mut pa_off = 0;
+        for _t in 0..seq_len {
+            let mut token_pre = Vec::with_capacity(n - 1);
+            for l in 0..(n - 1) {
+                let dim = layout.layers[l].w_rows; // pre-act dim = output dim of layer l
+                token_pre.push(pre_acts_flat[pa_off..pa_off + dim].to_vec());
+                pa_off += dim;
+            }
+            pre_acts.push(token_pre);
+        }
+
+        // Unflatten activations: [seq_len][n_layers+1][layer_dim]
+        // activations[0] = input (dim d), activations[l+1] = output of layer l
+        let mut activations = Vec::with_capacity(seq_len);
+        let mut ac_off = 0;
+        for _t in 0..seq_len {
+            let mut token_acts = Vec::with_capacity(n + 1);
+            // activations[0] = input (d-dimensional)
+            token_acts.push(acts_flat[ac_off..ac_off + d].to_vec());
+            ac_off += d;
+            for l in 0..n {
+                let dim = layout.layers[l].w_rows; // output dim of layer l
+                token_acts.push(acts_flat[ac_off..ac_off + dim].to_vec());
+                ac_off += dim;
+            }
+            activations.push(token_acts);
+        }
+
+        (Some(layout), pre_acts, activations)
+    } else {
+        (None, Vec::new(), Vec::new())
+    };
 
     let cache = TitansLMMCache {
         seq_len, d,
@@ -496,8 +543,8 @@ pub fn titans_lmm_opaque_backward(
         error: saved[15].to_vec(),
         grad_outer: saved[16].to_vec(),
         y: saved[17].to_vec(),
-        k_mem_norms: if has_norms { saved[18].to_vec() } else { vec![] },
-        q_mem_norms: if has_norms { saved[19].to_vec() } else { vec![] },
+        k_mem_norms: saved[18].to_vec(),
+        q_mem_norms: saved[19].to_vec(),
         momentum_kind,
         decay: if momentum_kind == crate::model::MomentumKind::DeltaMomentum {
             assert!(saved.len() > decay_idx,
@@ -512,16 +559,16 @@ pub fn titans_lmm_opaque_backward(
         q_conv_cache: q_conv_cache_restored,
         fm_z_k_mem,
         fm_z_q_mem,
-        mlp_layout: None,
-        mlp_activation: crate::model::MemoryActivation::GELU,
-        mlp_k_pre_acts: Vec::new(),
-        mlp_k_activations: Vec::new(),
+        mlp_layout,
+        mlp_activation: memory_activation,
+        mlp_k_pre_acts,
+        mlp_k_activations,
     };
 
     let theta_floor = if saved[0].len() > 6 { saved[0][5] } else { 0.0 };
     let theta_ceil  = if saved[0].len() > 7 { saved[0][6] } else { f32::MAX };
-    let alpha_floor = if saved[0].len() > 8 { saved[0][7] } else { 0.0 };
-    let alpha_ceil  = if saved[0].len() > 9 { saved[0][8] } else { 1.0 };
+    let alpha_floor = if saved[0].len() > 11 { saved[0][10] } else { 0.0 };
+    let alpha_ceil  = if saved[0].len() > 12 { saved[0][11] } else { 1.0 };
     let rule = TitansLMM {
         bias, sign_sharpness,
         momentum_kind,
@@ -532,9 +579,9 @@ pub fn titans_lmm_opaque_backward(
         theta_ceil,
         m_norm_max: f32::MAX,
         feature_map: fm_kind,
-        memory_layers: 1,
-        memory_expansion_factor: 4,
-        memory_activation: crate::model::MemoryActivation::GELU,
+        memory_layers,
+        memory_expansion_factor: memory_expansion,
+        memory_activation,
     };
     let (param_grads, d_embedded) = rule.step_backward(&level_params, &cache, d_y, embedded);
 
@@ -1023,7 +1070,47 @@ fn frozen_read_backward(
 
 // All frozen variants share the same backward (M^T @ d_y).
 pub fn frozen_delta_rule_backward(d: &[&[f32]], s: &[&[f32]], di: &mut [Vec<f32>]) { frozen_read_backward(d, s, di) }
-pub fn frozen_titans_lmm_backward(d: &[&[f32]], s: &[&[f32]], di: &mut [Vec<f32>]) { frozen_read_backward(d, s, di) }
+pub fn frozen_titans_lmm_backward(d_outputs: &[&[f32]], saved: &[&[f32]], d_inputs: &mut [Vec<f32>]) {
+    // Detect MLP memory from extended meta: [s, d, fm_kind, fm_sigma, memory_layers, expansion, act]
+    if saved[0].len() >= 7 {
+        let seq_len = saved[0][0] as usize;
+        let d = saved[0][1] as usize;
+        let memory_layers = saved[0][4] as usize;
+        let expansion = saved[0][5] as usize;
+        let activation = match saved[0][6] as u8 {
+            0 => crate::model::MemoryActivation::GELU,
+            1 => crate::model::MemoryActivation::SiLU,
+            2 => crate::model::MemoryActivation::ReLU,
+            _ => crate::model::MemoryActivation::GELU,
+        };
+        let m_frozen = saved[1];
+        let q_mem = saved[2]; // saved by traced_forward for MLP frozen
+        let d_y = d_outputs[0];
+        let layout = crate::titans_lmm::MLPMemoryLayout::new(memory_layers, d, expansion);
+        debug_assert_eq!(m_frozen.len(), layout.total_params);
+        debug_assert_eq!(q_mem.len(), seq_len * d);
+
+        // MLP backward through each token: d_q_t = J_M(q_t)^T @ d_y_t
+        let mut d_q = vec![0.0f32; seq_len * d];
+        for t in 0..seq_len {
+            let q_t = &q_mem[t * d..(t + 1) * d];
+            let d_y_t = &d_y[t * d..(t + 1) * d];
+            // Recompute forward activations at q_t
+            let (_, pre_acts, activations) =
+                crate::titans_lmm::mlp_forward(m_frozen, 0, q_t, &layout, activation);
+            // MLP backward for d_input only (no weight grads for frozen M)
+            let mut dummy_dw = vec![0.0f32; layout.total_params];
+            let d_q_t = crate::titans_lmm::mlp_backward_full(
+                d_y_t, &pre_acts, &activations, m_frozen, 0, &layout, activation,
+                &mut dummy_dw, 0,
+            );
+            d_q[t * d..(t + 1) * d].copy_from_slice(&d_q_t);
+        }
+        d_inputs[0] = d_q;
+    } else {
+        frozen_read_backward(d_outputs, saved, d_inputs);
+    }
+}
 pub fn frozen_hebbian_backward(d: &[&[f32]], s: &[&[f32]], di: &mut [Vec<f32>]) { frozen_read_backward(d, s, di) }
 pub fn frozen_moneta_backward(d: &[&[f32]], s: &[&[f32]], di: &mut [Vec<f32>]) { frozen_read_backward(d, s, di) }
 pub fn frozen_yaad_backward(d: &[&[f32]], s: &[&[f32]], di: &mut [Vec<f32>]) { frozen_read_backward(d, s, di) }
@@ -1175,7 +1262,13 @@ impl OpaqueVjp for TitansLMM {
         };
         // extra_meta[7] = 1.0 signals L2 norms are present (backward compat flag).
         // [8] = alpha_floor, [9] = alpha_ceil (CS-39 alpha clamping).
-        let extra_meta = [crate::moneta::bias_to_f32(self.bias), self.sign_sharpness, mk_f32, self.theta_floor, self.theta_ceil, fm_kind_f32, fm_sigma, 1.0, self.alpha_floor, self.alpha_ceil];
+        // [10] = memory_layers, [11] = expansion, [12] = activation (MLP memory, spec 75).
+        let mem_act_f32 = match self.memory_activation {
+            crate::model::MemoryActivation::GELU => 0.0f32,
+            crate::model::MemoryActivation::SiLU => 1.0,
+            crate::model::MemoryActivation::ReLU => 2.0,
+        };
+        let extra_meta = [crate::moneta::bias_to_f32(self.bias), self.sign_sharpness, mk_f32, self.theta_floor, self.theta_ceil, fm_kind_f32, fm_sigma, 1.0, self.alpha_floor, self.alpha_ceil, self.memory_layers as f32, self.memory_expansion_factor as f32, mem_act_f32];
         let (emb_in, lp_in, meta_id, lp_saved, emb_saved) =
             record_common_inputs(tape, level_params, embedded, seq_len, d, &extra_meta);
 
@@ -1201,8 +1294,22 @@ impl OpaqueVjp for TitansLMM {
             tape.alloc(cache.q_mem_norms, vec![]),  // saved[19]: L2 norms for q
         ];
 
+        // Save MLP pre-activations/activations (saved[20..22] when memory_layers >= 2).
+        if self.memory_layers >= 2 {
+            let mut pre_acts_flat = Vec::new();
+            for token_pre in &cache.mlp_k_pre_acts {
+                for layer_pre in token_pre { pre_acts_flat.extend_from_slice(layer_pre); }
+            }
+            let mut acts_flat = Vec::new();
+            for token_acts in &cache.mlp_k_activations {
+                for layer_acts in token_acts { acts_flat.extend_from_slice(layer_acts); }
+            }
+            cache_ids.push(tape.alloc(pre_acts_flat, vec![]));
+            cache_ids.push(tape.alloc(acts_flat, vec![]));
+        }
+
         // Save DeltaMomentum decay buffer — keyed on momentum_kind, not emptiness,
-        // so backward can rely on saved[20] being present for DeltaMomentum.
+        // so backward can rely on the next saved entry being present for DeltaMomentum.
         if self.momentum_kind == crate::model::MomentumKind::DeltaMomentum {
             assert!(!cache.decay.is_empty(),
                 "DeltaMomentum forward produced empty decay buffer — step() bug");
@@ -2002,6 +2109,26 @@ mod tests {
             m_norm_max: f32::MAX,
             feature_map: FMKind::ELU,
             memory_layers: 1, memory_expansion_factor: 4, memory_activation: crate::model::MemoryActivation::GELU,
+        };
+        assert_opaque_roundtrip_with_params(&rule, &params, d, 3);
+    }
+
+    #[test]
+    fn test_opaque_vjp_titans_lmm_mlp() {
+        let d = 4;
+        let params = make_test_params(d);
+        let rule = TitansLMM {
+            bias: crate::model::AttentionalBias::L2,
+            sign_sharpness: 10.0,
+            momentum_kind: crate::model::MomentumKind::EMA,
+            momentum_d_hidden: 0,
+            alpha_floor: 0.0,
+            alpha_ceil: 1.0,
+            theta_floor: 0.0,
+            theta_ceil: f32::MAX,
+            m_norm_max: f32::MAX,
+            feature_map: crate::feature_map::FeatureMapKind::Identity,
+            memory_layers: 2, memory_expansion_factor: 4, memory_activation: crate::model::MemoryActivation::GELU,
         };
         assert_opaque_roundtrip_with_params(&rule, &params, d, 3);
     }

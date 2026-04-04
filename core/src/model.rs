@@ -2691,7 +2691,12 @@ impl MAGParams {
                 level_params.m_q_init = vec![0.0f32; d * d];
                 level_params.m_eta_init = vec![0.0f32; d * d];
                 level_params.m_alpha_init = vec![0.0f32; d * d];
-                level_params.m_mem_init = vec![0.0f32; d * d];
+                // MLP memory: state size = total_params from MLPMemoryLayout
+                let mem_size = if cfg.memory_layers >= 2 {
+                    crate::titans_lmm::MLPMemoryLayout::new(
+                        cfg.memory_layers, d, cfg.memory_expansion_factor).total_params
+                } else { d * d };
+                level_params.m_mem_init = vec![0.0f32; mem_size];
             }
             // Initialize SwiGluMlp projections with Xavier scaling
             if cfg.memory_rule == MemoryRuleKind::SwiGluMlp {
@@ -2961,7 +2966,11 @@ impl MAGParams {
                 z.m_q_init = vec![0.0f32; d * d];
                 z.m_eta_init = vec![0.0f32; d * d];
                 z.m_alpha_init = vec![0.0f32; d * d];
-                z.m_mem_init = vec![0.0f32; d * d];
+                let mem_size = if cfg.memory_layers >= 2 {
+                    crate::titans_lmm::MLPMemoryLayout::new(
+                        cfg.memory_layers, d, cfg.memory_expansion_factor).total_params
+                } else { d * d };
+                z.m_mem_init = vec![0.0f32; mem_size];
             }
             if cfg.memory_rule == MemoryRuleKind::SwiGluMlp {
                 let inter = cfg.intermediate_size;

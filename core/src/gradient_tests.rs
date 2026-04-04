@@ -1527,6 +1527,104 @@
         assert!(passed == checked, "titans l1_b_eta: {passed}/{checked} passed");
     }
 
+    // ── Titans MLP Memory (memory_layers=2) tape FD checks ────────────
+
+    fn titans_mlp_grad_check_config() -> MAGConfig {
+        let mut cfg = MAGConfig::titans_test_config_k2();
+        cfg.memory_layers = 2;
+        cfg.memory_expansion_factor = 4;
+        cfg.memory_activation = crate::model::MemoryActivation::GELU;
+        // EMA-only for MLP memory (DeltaMomentum not supported)
+        cfg.momentum_kind = crate::model::MomentumKind::EMA;
+        cfg
+    }
+
+    fn titans_mlp_params_for_grad_check(cfg: &MAGConfig, seed: u64) -> MAGParams {
+        let mut params = MAGParams::init(cfg, seed);
+        for level in &mut params.levels {
+            level.b_alpha = vec![0.0f32];
+            level.b_theta = vec![0.0f32];
+            level.b_eta = vec![0.0f32];
+        }
+        params
+    }
+
+    #[test]
+    fn test_titans_mlp_cms_gradient_l0_w_k_mem() {
+        let cfg = titans_mlp_grad_check_config();
+        let params = titans_mlp_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = titans_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = super::make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "titans_mlp_l0_w_k_mem", &pulse,
+            |p| p.levels[0].w_k_mem.master(), |p, i, v| p.levels[0].w_k_mem.set(i, v), |g| g.levels[0].w_k_mem.master(),
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("titans MLP l0_w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "titans MLP l0_w_k_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_titans_mlp_cms_gradient_l0_w_v_mem() {
+        let cfg = titans_mlp_grad_check_config();
+        let params = titans_mlp_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = titans_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = super::make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "titans_mlp_l0_w_v_mem", &pulse,
+            |p| p.levels[0].w_v_mem.master(), |p, i, v| p.levels[0].w_v_mem.set(i, v), |g| g.levels[0].w_v_mem.master(),
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("titans MLP l0_w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "titans MLP l0_w_v_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_titans_mlp_cms_gradient_l0_w_q_mem() {
+        let cfg = titans_mlp_grad_check_config();
+        let params = titans_mlp_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = titans_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = super::make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "titans_mlp_l0_w_q_mem", &pulse,
+            |p| p.levels[0].w_q_mem.master(), |p, i, v| p.levels[0].w_q_mem.set(i, v), |g| g.levels[0].w_q_mem.master(),
+            20, FD_EPS, FD_TOL,
+        );
+        eprintln!("titans MLP l0_w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "titans MLP l0_w_q_mem: {passed}/{checked} passed");
+    }
+
+    #[test]
+    fn test_titans_mlp_cms_gradient_l0_w_alpha() {
+        let cfg = titans_mlp_grad_check_config();
+        let params = titans_mlp_params_for_grad_check(&cfg, 42);
+        let (input_ids, target_ids) = titans_cms_make_test_data(&cfg);
+        let pulse = both_active_pulse(cfg.k);
+        let mut ctx = super::make_context_state(&cfg);
+        let mut ebufs: Vec<ErrorBuffer> = (0..cfg.k).map(|_| ErrorBuffer::new(cfg.swa.d_model)).collect();
+        let (_loss, grads) = cms_compute_gradients(&params, &cfg, &input_ids, &target_ids, &pulse, &mut ctx, &mut ebufs);
+
+        let (checked, passed, max_err) = cms_check_weight_gradient(
+            &params, &cfg, &input_ids, &target_ids, &grads, "titans_mlp_l0_w_alpha", &pulse,
+            |p| &p.levels[0].w_alpha, |p, i, v| p.levels[0].w_alpha[i] = v, |g| &g.levels[0].w_alpha,
+            16, FD_EPS, FD_TOL,
+        );
+        eprintln!("titans MLP l0_w_alpha: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
+        assert!(passed == checked, "titans MLP l0_w_alpha: {passed}/{checked} passed");
+    }
+
     // ── Hebbian Rule gradient checks (k=1) ────────────────────────────
 
     fn hebbian_grad_check_config() -> MAGConfig {

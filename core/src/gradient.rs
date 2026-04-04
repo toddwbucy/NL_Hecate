@@ -39,6 +39,24 @@ fn make_context_state(cfg: &MAGConfig) -> ContextState {
             let mem_size = 2 * cfg.d_compress * d;
             ContextState::new_with_memory_size(cfg.k, d, mem_size)
         }
+        MemoryRuleKind::TitansLMM | MemoryRuleKind::DeltaRule
+            if cfg.memory_layers >= 2 =>
+        {
+            let d = cfg.swa.d_model;
+            let layout = crate::titans_lmm::MLPMemoryLayout::new(
+                cfg.memory_layers, d, cfg.memory_expansion_factor);
+            let mem_size = layout.total_params;
+            let mut ctx = ContextState::new_with_memory_size(cfg.k, d, mem_size);
+            // Seed MLP memory with small Xavier-like values so dead-neuron gradients
+            // aren't all zero — every context starts from the same deterministic state.
+            let mut rng = crate::tensor::SimpleRng::new(12345);
+            for level_mem in &mut ctx.memory {
+                for v in level_mem.iter_mut() {
+                    *v = rng.uniform(0.5);
+                }
+            }
+            ctx
+        }
         _ => ContextState::new(cfg.k, cfg.swa.d_model),
     }
 }
