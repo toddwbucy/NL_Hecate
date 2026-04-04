@@ -400,6 +400,24 @@ pub fn feed(config_path: &str, resume: bool) {
         sf
     };
 
+    // ── Spec 04: Inline cursor — state file is authoritative cursor source ──
+    // Priority: state file cursor > safetensors BuildResumeState > legacy .cursor.json
+    if cfg.build.load.is_some() && !cfg.build.reset_step {
+        if !model_state.cursor.slots.is_empty() {
+            eprintln!("  [cursor: from state file ({} slots)]", model_state.cursor.slots.len());
+            resume_cursors = model_state.cursor.slots.clone();
+        } else if resume_cursors.is_empty() {
+            // Safetensors had no cursors either — try legacy sidecar
+            let load_path = cfg.build.load.as_deref().unwrap_or("");
+            let legacy = state_file::load_legacy_cursor(load_path);
+            if !legacy.is_empty() {
+                eprintln!("  [cursor: from legacy .cursor.json sidecar]");
+                resume_cursors = legacy;
+            }
+        }
+        // else: resume_cursors already populated from safetensors BuildResumeState
+    }
+
     // ── Reset intervals (spec 57) ────────────────────────────────────
     let reset_intervals: Vec<usize> = cfg.model.reset_intervals.clone()
         .unwrap_or_default();

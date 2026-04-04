@@ -208,6 +208,41 @@ pub fn state_file_path(run_dir: &str, name: &str) -> std::path::PathBuf {
     Path::new(run_dir).join(format!("{name}.state.json"))
 }
 
+/// Attempt to load a legacy `.cursor.json` sidecar from a checkpoint path.
+///
+/// Sidecar path: `<checkpoint_path>.cursor.json`
+/// Returns cursors mapped from the sidecar's position/chunk_id/content_hash fields.
+/// Returns empty vec if sidecar doesn't exist or can't be parsed.
+pub fn load_legacy_cursor(checkpoint_path: &str) -> Vec<StreamCursor> {
+    let sidecar = format!("{checkpoint_path}.cursor.json");
+    let path = Path::new(&sidecar);
+    if !path.exists() {
+        return Vec::new();
+    }
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    // Legacy sidecar schema: {"position": N, "total_tokens": N, "content_hash": N, ...}
+    let val: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let position = val.get("position").and_then(|v| v.as_u64()).unwrap_or(0);
+    let chunk_id = val.get("chunk_id").and_then(|v| v.as_u64()).unwrap_or(0);
+    let content_hash = val.get("content_hash").and_then(|v| v.as_u64()).unwrap_or(0);
+    if position == 0 {
+        return Vec::new();
+    }
+    vec![StreamCursor {
+        position,
+        chunk_id,
+        pulse_id: 0,
+        rng_state: None,
+        content_hash,
+    }]
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────
 
 fn uuid_v4() -> String {
@@ -589,6 +624,51 @@ mod tests {
         assert!(err.to_string().contains("unsupported schema_version"));
 
         std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn test_load_legacy_cursor_valid() {
+        let dir = std::env::temp_dir().join("nl_hecate_cursor_test");
+        std::fs::create_dir_all(&dir).ok();
+        let ckpt_path = dir.join("model.safetensors");
+        let sidecar_path = dir.join("model.safetensors.cursor.json");
+
+        let sidecar = r#"{"position": 512000, "total_tokens": 1000000, "content_hash": 12345, "chunk_id": 100}"#;
+        std::fs::write(&sidecar_path, sidecar).unwrap();
+
+        let cursors = load_legacy_cursor(ckpt_path.to_str().unwrap());
+        assert_eq!(cursors.len(), 1);
+        assert_eq!(cursors[0].position, 512000);
+        assert_eq!(cursors[0].chunk_id, 100);
+        assert_eq!(cursors[0].content_hash, 12345);
+        assert_eq!(cursors[0].pulse_id, 0);
+        assert!(cursors[0].rng_state.is_none());
+
+        std::fs::remove_file(&sidecar_path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn test_load_legacy_cursor_missing() {
+        let cursors = load_legacy_cursor("/nonexistent/model.safetensors");
+        assert!(cursors.is_empty());
+    }
+
+    #[test]
+    fn test_load_legacy_cursor_zero_position() {
+        let dir = std::env::temp_dir().join("nl_hecate_cursor_test_zero");
+        std::fs::create_dir_all(&dir).ok();
+        let ckpt_path = dir.join("model.safetensors");
+        let sidecar_path = dir.join("model.safetensors.cursor.json");
+
+        let sidecar = r#"{"position": 0, "total_tokens": 0}"#;
+        std::fs::write(&sidecar_path, sidecar).unwrap();
+
+        let cursors = load_legacy_cursor(ckpt_path.to_str().unwrap());
+        assert!(cursors.is_empty()); // position=0 means no meaningful cursor
+
+        std::fs::remove_file(&sidecar_path).ok();
         std::fs::remove_dir(&dir).ok();
     }
 }
