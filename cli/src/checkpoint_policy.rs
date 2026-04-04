@@ -96,26 +96,28 @@ impl TriggerState {
 }
 
 /// Generate checkpoint filename based on naming policy.
+///
+/// Uses `std::path::Path` to robustly handle base_path regardless of
+/// whether it ends in `.safetensors` or some other extension.
 pub fn checkpoint_filename(
     base_path: &str,
     naming: &CheckpointNaming,
     global_step: usize,
     total_tokens: usize,
 ) -> String {
-    match naming {
-        CheckpointNaming::Tokens => {
-            base_path.replace(
-                ".safetensors",
-                &format!("_{}tok.safetensors", total_tokens),
-            )
-        }
-        CheckpointNaming::Steps => {
-            base_path.replace(
-                ".safetensors",
-                &format!("_step{}.safetensors", global_step),
-            )
-        }
-    }
+    use std::path::Path;
+
+    let path = Path::new(base_path);
+    let stem = path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("model");
+    let suffix = match naming {
+        CheckpointNaming::Tokens => format!("{stem}_{total_tokens}tok"),
+        CheckpointNaming::Steps => format!("{stem}_step{global_step}"),
+    };
+    let mut new_path = path.with_file_name(suffix);
+    new_path.set_extension("safetensors");
+    new_path.to_string_lossy().into_owned()
 }
 
 #[cfg(test)]
@@ -245,6 +247,26 @@ mod tests {
             5_120_000,
         );
         assert_eq!(path, "checkpoints/model_step100.safetensors");
+    }
+
+    #[test]
+    fn test_checkpoint_filename_no_safetensors_extension() {
+        // Edge case: base_path with different or no extension
+        let path = checkpoint_filename(
+            "checkpoints/model.bin",
+            &CheckpointNaming::Tokens,
+            100,
+            5_120_000,
+        );
+        assert_eq!(path, "checkpoints/model_5120000tok.safetensors");
+
+        let path = checkpoint_filename(
+            "checkpoints/model",
+            &CheckpointNaming::Steps,
+            42,
+            1_000,
+        );
+        assert_eq!(path, "checkpoints/model_step42.safetensors");
     }
 
     #[test]

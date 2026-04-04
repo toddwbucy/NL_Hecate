@@ -212,7 +212,12 @@ pub struct BuildConfig {
     pub accum_steps: usize,
     #[serde(default = "default_log_every")]
     pub log_every: usize,
-    #[serde(default = "default_save_every")]
+    /// Raw save_every from JSON (None = not explicitly set by user).
+    /// Use `save_every()` method for the resolved value (defaults to 1000).
+    #[serde(default)]
+    save_every_raw: Option<usize>,
+    /// Resolved save_every (populated by apply_legacy_compat).
+    #[serde(skip)]
     pub save_every: usize,
     #[serde(default)]
     pub tape_device: Option<String>,
@@ -409,8 +414,8 @@ impl Config {
                 }
             }
         }
-        // Spec 78: warn if both triggers and save_every are present
-        if !cfg.build.checkpoint.triggers.is_empty() && cfg.build.save_every > 0 {
+        // Spec 78: warn only if the user explicitly wrote save_every AND also has triggers
+        if !cfg.build.checkpoint.triggers.is_empty() && cfg.build.save_every_raw.is_some() {
             eprintln!("WARNING: checkpoint.triggers present — save_every={} will be ignored",
                 cfg.build.save_every);
         }
@@ -419,7 +424,10 @@ impl Config {
 
     /// Apply backward-compat: promote flat build.lr/beta1/etc into the optimizer block,
     /// but only when the nested optimizer didn't explicitly set those fields.
+    /// Also resolves save_every from save_every_raw (Option → concrete default).
     fn apply_legacy_compat(cfg: &mut Config) {
+        // Resolve save_every: raw Option → concrete value (default 1000)
+        cfg.build.save_every = cfg.build.save_every_raw.unwrap_or(default_save_every());
         if let Some(lr) = cfg.build.lr {
             if cfg.build.optimizer.lr.is_none() {
                 cfg.build.optimizer.lr = Some(lr);
