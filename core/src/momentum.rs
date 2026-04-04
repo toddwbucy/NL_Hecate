@@ -59,6 +59,8 @@ pub fn ema_step_backward(
 ) -> (f32, f32, Vec<f32>) {
     // Use slice length for state size — works for both linear (d*d) and MLP memory (state_size).
     let ss = d_s.len();
+    debug_assert_eq!(s_t.len(), ss, "s_t length mismatch: expected {ss}, got {}", s_t.len());
+    debug_assert_eq!(grad_t.len(), ss, "grad_t length mismatch: expected {ss}, got {}", grad_t.len());
     let d_eta_scalar = frobenius_dot_f32(s_t, d_s);
     let d_theta_scalar = -frobenius_dot_f32(grad_t, d_s);
 
@@ -127,6 +129,8 @@ pub fn delta_momentum_step_backward(
 ) -> (f32, f32, Vec<f32>) {
     // Use slice length for state size — works for both linear (d*d) and MLP memory (state_size).
     let ss = d_s.len();
+    debug_assert_eq!(s_t.len(), ss, "s_t length mismatch: expected {ss}, got {}", s_t.len());
+    debug_assert_eq!(grad_t.len(), ss, "grad_t length mismatch: expected {ss}, got {}", grad_t.len());
 
     // d_loss/d_decay = frob(S_t, d_S)  (since S_{t+1} = decay * S_t - ...)
     let d_decay = frobenius_dot_f32(s_t, d_s);

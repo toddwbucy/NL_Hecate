@@ -432,13 +432,14 @@ pub fn titans_mlp_read_only_backward(
     let mut grads = MemoryLevelParams::zeros_like(d);
     let mut d_q_mem = vec![0.0f32; seq_len * d];
 
+    // Allocate once outside loop — accumulated values are discarded (frozen M has no weight grads)
+    let mut dummy_dw = vec![0.0f32; layout.total_params];
     for t in 0..seq_len {
         let q_t = &q_mem[t * d..(t + 1) * d];
         let d_y_t = &d_y[t * d..(t + 1) * d];
         // Recompute forward to get pre_acts/activations for backward
         let (_, pre_acts, activations) = mlp_forward(frozen_m, 0, q_t, &layout, activation);
         // MLP backward: d_input only (no weight gradients for frozen M)
-        let mut dummy_dw = vec![0.0f32; layout.total_params];
         let d_q_t = mlp_backward_full(
             d_y_t, &pre_acts, &activations, frozen_m, 0, &layout, activation,
             &mut dummy_dw, 0,
@@ -787,7 +788,6 @@ impl TitansLMM {
 
         // Reverse token loop
         for t in (0..s).rev() {
-            let k_t = &cache.k_mem[t * d..(t + 1) * d];
             let q_t = &cache.q_mem[t * d..(t + 1) * d];
             let m_t_base = t * state_size;
             let m_next_base = (t + 1) * state_size;
@@ -805,11 +805,6 @@ impl TitansLMM {
             // Feature maps
             let z_k_t = if has_fm { &cache.fm_z_k_mem[t * d..(t + 1) * d] } else { &[] as &[f32] };
             let z_q_t = if has_fm { &cache.fm_z_q_mem[t * d..(t + 1) * d] } else { &[] as &[f32] };
-            let _phi_k_t = if has_fm {
-                feature_map::apply(k_t, &self.feature_map, &level_params.w_rand, &level_params.b_rand, d).0
-            } else {
-                k_t.to_vec()
-            };
             let phi_q_t = if has_fm {
                 feature_map::apply(q_t, &self.feature_map, &level_params.w_rand, &level_params.b_rand, d).0
             } else {
@@ -2530,7 +2525,7 @@ mod tests {
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
         let layout = MLPMemoryLayout::new(2, d, 4);
-        let initial_m = Some(make_mlp_initial_m(d, &layout, 77));
+        let initial_m = Some(make_mlp_initial_m(&layout, 77));
 
         let rule = TitansLMM {
             memory_layers: 2,
@@ -2546,7 +2541,7 @@ mod tests {
             &rule, &params.levels[0], &embedded, s, d, &initial_m, "w_k_mem",
             |p| p.w_k_mem.master(), |p, i, v| p.w_k_mem.set(i, v),
             |g| g.w_k_mem.master(), &grads,
-            20, 1e-2, 0.15, 1e-6,
+            20, 1e-2, 0.10, 1e-6,
         );
         eprintln!("MLP FD w_k_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
         assert!(checked > 0, "w_k_mem: no gradients above threshold");
@@ -2561,7 +2556,7 @@ mod tests {
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
         let layout = MLPMemoryLayout::new(2, d, 4);
-        let initial_m = Some(make_mlp_initial_m(d, &layout, 77));
+        let initial_m = Some(make_mlp_initial_m(&layout, 77));
 
         let rule = TitansLMM {
             memory_layers: 2,
@@ -2577,7 +2572,7 @@ mod tests {
             &rule, &params.levels[0], &embedded, s, d, &initial_m, "w_v_mem",
             |p| p.w_v_mem.master(), |p, i, v| p.w_v_mem.set(i, v),
             |g| g.w_v_mem.master(), &grads,
-            20, 1e-2, 0.15, 1e-6,
+            20, 1e-2, 0.10, 1e-6,
         );
         eprintln!("MLP FD w_v_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
         assert!(checked > 0, "w_v_mem: no gradients above threshold");
@@ -2592,7 +2587,7 @@ mod tests {
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
         let layout = MLPMemoryLayout::new(2, d, 4);
-        let initial_m = Some(make_mlp_initial_m(d, &layout, 77));
+        let initial_m = Some(make_mlp_initial_m(&layout, 77));
 
         let rule = TitansLMM {
             memory_layers: 2,
@@ -2608,7 +2603,7 @@ mod tests {
             &rule, &params.levels[0], &embedded, s, d, &initial_m, "w_q_mem",
             |p| p.w_q_mem.master(), |p, i, v| p.w_q_mem.set(i, v),
             |g| g.w_q_mem.master(), &grads,
-            20, 1e-2, 0.15, 1e-6,
+            20, 1e-2, 0.10, 1e-6,
         );
         eprintln!("MLP FD w_q_mem: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
         assert!(checked > 0, "w_q_mem: no gradients above threshold");
@@ -2623,7 +2618,7 @@ mod tests {
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
         let layout = MLPMemoryLayout::new(2, d, 4);
-        let initial_m = Some(make_mlp_initial_m(d, &layout, 77));
+        let initial_m = Some(make_mlp_initial_m(&layout, 77));
 
         let rule = TitansLMM {
             memory_layers: 2,
@@ -2664,7 +2659,7 @@ mod tests {
             let (checked, passed, max_err) = mlp_fd_check_param(
                 &rule, &params.levels[0], &embedded, s, d, &initial_m, name,
                 get, set, get_grad, &grads,
-                20, 1e-2, 0.15, 1e-6,
+                20, 1e-2, 0.10, 1e-6,
             );
             eprintln!("MLP FD {name}: {passed}/{checked} pass, max_rel_err={max_err:.4e}");
             // Some gate grads may all be below threshold (e.g. b_eta with 1 element) — skip those
@@ -2683,7 +2678,7 @@ mod tests {
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
         let layout = MLPMemoryLayout::new(2, d, 4);
-        let initial_m = Some(make_mlp_initial_m(d, &layout, 77));
+        let initial_m = Some(make_mlp_initial_m(&layout, 77));
 
         let rule = TitansLMM {
             memory_layers: 2,
@@ -2696,7 +2691,7 @@ mod tests {
         let (_grads, d_emb) = rule.step_backward(&params.levels[0], &cache, &d_y, &embedded);
 
         let eps = 1e-2f32;
-        let tol = 0.15;
+        let tol = 0.10;
         let abs_thresh = 1e-6;
         let n_check = 20;
         let step_sz = if embedded.len() <= n_check { 1 } else { embedded.len() / n_check };
@@ -2736,7 +2731,7 @@ mod tests {
     /// Create a random initial MLP state with small non-zero weights.
     /// This breaks the dead-neuron cycle that occurs with zero-initialized MLP memory
     /// (W layers stay zero forever when M starts at zero because grad_W = outer(d_out, 0) = 0).
-    fn make_mlp_initial_m(d: usize, layout: &MLPMemoryLayout, seed: u64) -> Vec<f32> {
+    fn make_mlp_initial_m(layout: &MLPMemoryLayout, seed: u64) -> Vec<f32> {
         let mut rng = SimpleRng::new(seed);
         let mut m = vec![0.0f32; layout.total_params];
         rng.fill_uniform(&mut m, 0.3);
@@ -2760,7 +2755,7 @@ mod tests {
         let s = cfg.swa.seq_len;
         let d = cfg.swa.d_model;
         let layout = MLPMemoryLayout::new(2, d, 4);
-        let initial_m = Some(make_mlp_initial_m(d, &layout, 77));
+        let initial_m = Some(make_mlp_initial_m(&layout, 77));
 
         let rule = TitansLMM {
             memory_layers: 2,
