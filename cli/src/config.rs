@@ -213,10 +213,10 @@ pub struct BuildConfig {
     #[serde(default = "default_log_every")]
     pub log_every: usize,
     /// Raw save_every from JSON (None = not explicitly set by user).
-    /// Use `save_every()` method for the resolved value (defaults to 1000).
-    #[serde(default)]
+    /// Resolved to `save_every` in apply_legacy_compat (defaults to 1000).
+    #[serde(default, rename = "save_every")]
     save_every_raw: Option<usize>,
-    /// Resolved save_every (populated by apply_legacy_compat).
+    /// Resolved save_every (populated by apply_legacy_compat from save_every_raw).
     #[serde(skip)]
     pub save_every: usize,
     #[serde(default)]
@@ -624,6 +624,7 @@ mod tests {
         }}"#, minimal_model_json());
 
         let cfg = Config::from_str(&json).unwrap();
+        assert_eq!(cfg.build.save_every, 500); // regression: save_every must be read from JSON
         let phases = cfg.resolved_phases().unwrap();
         assert_eq!(phases.len(), 3);
 
