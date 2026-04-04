@@ -610,6 +610,7 @@ pub fn feed(config_path: &str, resume: bool) {
                         gpu_context.set_dormancy_config(floors.clone(), consecutive);
                     }
                 }
+                conductor.set_seq_len(phase_seq_len);
                 // AdamW state is param-sized (not batch/seq dependent), keep it
                 eprintln!("  [GPU context reallocated: batch_size={batch_size}, seq_len={phase_seq_len}]");
             }
@@ -912,6 +913,11 @@ pub fn feed(config_path: &str, resume: bool) {
 
             PhaseDuration::ThinkRounds(rounds) => {
                 // ── Think rounds: iterative self-refinement ────────
+                // Clear stale loaders from any prior Steps phase so the
+                // phase-boundary/on_unload checkpoint won't serialize
+                // stale stream cursor positions.
+                last_loaders.clear();
+
                 if batch_size != 1 {
                     eprintln!("ERROR: think_rounds requires batch_size=1 (got {batch_size}) — \
                         generation is singleton. Add \"batch_size\": 1 to the phase.");
@@ -1092,6 +1098,24 @@ pub fn feed(config_path: &str, resume: bool) {
             false
         };
 
+        // Run inline probes BEFORE restoring gpu_context/mag_cfg to build defaults,
+        // so probes see the phase-active seq_len and optimizer settings.
+        #[cfg(feature = "cuda")]
+        if phase_boundary_saved {
+            if let Some(ref tok_path) = cfg.build.tokenizer_path {
+                let snapshot = gpu_params.to_host(&mag_cfg);
+                let probe_results = run_inline_probes(
+                    &snapshot, &mag_cfg, tok_path, global_step,
+                    d, v, k, n_blocks, &chunk_sizes,
+                    cfg.build.probe_max_tokens,
+                    cfg.build.probe_temperature,
+                    opt.lr(), opt.beta1(), opt.beta2(),
+                    opt.weight_decay(), max_grad_norm,
+                );
+                logger.log_probe_results(global_step, probe_results);
+            }
+        }
+
         // Restore GPU context to build defaults if phase overrode them
         #[cfg(feature = "cuda")]
         {
@@ -1109,24 +1133,7 @@ pub fn feed(config_path: &str, resume: bool) {
                         gpu_context.set_dormancy_config(floors.clone(), consecutive);
                     }
                 }
-            }
-        }
-
-        // Run inline probes only when a new checkpoint was actually taken
-        #[cfg(feature = "cuda")]
-        if phase_boundary_saved {
-            if let Some(ref tok_path) = cfg.build.tokenizer_path {
-                let default_opt = &cfg.build.optimizer;
-                let snapshot = gpu_params.to_host(&mag_cfg);
-                let probe_results = run_inline_probes(
-                    &snapshot, &mag_cfg, tok_path, global_step,
-                    d, v, k, n_blocks, &chunk_sizes,
-                    cfg.build.probe_max_tokens,
-                    cfg.build.probe_temperature,
-                    default_opt.lr(), default_opt.beta1(), default_opt.beta2(),
-                    default_opt.weight_decay(), cfg.build.max_grad_norm,
-                );
-                logger.log_probe_results(global_step, probe_results);
+                conductor.set_seq_len(seq_len);
             }
         }
     }
@@ -1357,6 +1364,7 @@ fn save_checkpoint(
                 state_file::record_checkpoint(model_state, entry, &stream_cursors);
                 if let Err(e) = state_file::save_state_file(state_file_path, model_state) {
                     eprintln!("WARNING: state file update failed: {e}");
+                    return false;
                 }
                 return true;
             }
