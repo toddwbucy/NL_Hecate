@@ -867,7 +867,7 @@ pub fn feed(config_path: &str, resume: bool) {
                             #[cfg(feature = "cuda")]
                             &gpu_context,
                             &mag_cfg, &conductor, &chunk_sizes,
-                            &loaders, d, v, k,
+                            &loaders, &fire_counts, d, v, k,
                             &mut logger,
                         );
                         trigger_state.record_checkpoint(total_tokens_seen as u64, loss);
@@ -1063,7 +1063,7 @@ pub fn feed(config_path: &str, resume: bool) {
                 &gpu_params,
                 &gpu_context,
                 &mag_cfg, &conductor, &chunk_sizes,
-                &last_loaders, d, v, k,
+                &last_loaders, &fire_counts, d, v, k,
                 &mut logger,
             );
             trigger_state.record_checkpoint(total_tokens_seen as u64, loss_last);
@@ -1097,7 +1097,7 @@ pub fn feed(config_path: &str, resume: bool) {
             &gpu_params,
             &gpu_context,
             &mag_cfg, &conductor, &chunk_sizes,
-            &last_loaders, d, v, k,
+            &last_loaders, &fire_counts, d, v, k,
             &mut logger,
         );
     }
@@ -1199,6 +1199,7 @@ fn save_checkpoint(
     conductor: &Conductor,
     chunk_sizes: &[usize],
     loaders: &[BpeTokenStream],
+    fire_counts: &[usize],
     d: usize,
     v: usize,
     k: usize,
@@ -1249,7 +1250,41 @@ fn save_checkpoint(
                 eprintln!("  [checkpoint saved: {ckpt_path}]");
                 logger.log_checkpoint(global_step, &ckpt_path);
 
-                // Spec 02: update state file with checkpoint entry
+                // Spec 02 / SFL-4: health snapshot from live GPU state
+                let n_blocks = gpu_context.n_blocks.max(1) as f32;
+                let mut m_norm_per_level = vec![0.0f32; k];
+                for block_norms in &gpu_context.prev_m_norms {
+                    for (l, &n) in block_norms.iter().enumerate() {
+                        if l < k { m_norm_per_level[l] += n; }
+                    }
+                }
+                for n in &mut m_norm_per_level { *n /= n_blocks; }
+
+                // Gate biases → mean activation across blocks.
+                // sigmoid(b_alpha) = retention gate, softplus(b_theta) = learning rate gate.
+                let mut gate_alpha_mean = vec![0.0f32; k];
+                let mut gate_theta_mean = vec![0.0f32; k];
+                for block in &gpu_params.blocks {
+                    for (l, level) in block.levels.iter().enumerate() {
+                        if l < k {
+                            let mut ba = [0.0f32; 1];
+                            level.b_alpha.copy_to_host(&mut ba);
+                            gate_alpha_mean[l] += 1.0 / (1.0 + (-ba[0]).exp()); // sigmoid
+
+                            let mut bt = [0.0f32; 1];
+                            level.b_theta.copy_to_host(&mut bt);
+                            gate_theta_mean[l] += (1.0 + bt[0].exp()).ln(); // softplus
+                        }
+                    }
+                }
+                let n_blocks_params = gpu_params.blocks.len().max(1) as f32;
+                for v in &mut gate_alpha_mean { *v /= n_blocks_params; }
+                for v in &mut gate_theta_mean { *v /= n_blocks_params; }
+
+                let cms_activations: Vec<u64> = fire_counts.iter()
+                    .map(|&c| c as u64)
+                    .collect();
+
                 let entry = CheckpointEntry {
                     path: ckpt_path.clone(),
                     tokens: total_tokens_seen as u64,
@@ -1257,10 +1292,10 @@ fn save_checkpoint(
                     timestamp: state_file::iso8601_now(),
                     health: HealthSnapshot {
                         loss,
-                        m_norm_per_level: vec![],
-                        gate_alpha_mean_per_level: vec![],
-                        gate_theta_mean_per_level: vec![],
-                        cms_activations_since_restore: vec![],
+                        m_norm_per_level,
+                        gate_alpha_mean_per_level: gate_alpha_mean,
+                        gate_theta_mean_per_level: gate_theta_mean,
+                        cms_activations_since_restore: cms_activations,
                     },
                     session: SessionInfo::Build {
                         label: phase_label.into(),
