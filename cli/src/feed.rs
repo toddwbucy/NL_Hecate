@@ -23,6 +23,9 @@ use nl_hecate_core::gpu_profiler::GpuProfiler;
 
 use crate::checkpoint_policy::{TriggerState, checkpoint_filename};
 use crate::config::{Config, PhaseDuration, TriggerConfig, CheckpointNaming};
+use crate::state_file::{
+    self, StateFile, CheckpointEntry, HealthSnapshot, SessionInfo,
+};
 use crate::data::BpeTokenStream;
 #[cfg(feature = "cuda")]
 use crate::probe::run_inline_probes;
@@ -359,6 +362,44 @@ pub fn feed(config_path: &str, resume: bool) {
         resume_conductor_step = 0;
     }
 
+    // ── Spec 02: State file — lifecycle record ──────────────────────
+    // Placed after extend_k so that mag_cfg captures post-extension architecture.
+    let state_basename = std::path::Path::new(&save_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("model");
+    let state_file_path = state_file::state_file_path(run_dir, state_basename);
+    let mut model_state = if state_file_path.exists() {
+        match state_file::load_state_file(&state_file_path) {
+            Ok(sf) => {
+                eprintln!("  [state file loaded: {} ({} checkpoints, {} tokens)]",
+                    state_file_path.display(), sf.checkpoints.len(), sf.tokens_total);
+                sf
+            }
+            Err(e) => {
+                eprintln!("WARNING: failed to load state file {}: {e} — creating fresh",
+                    state_file_path.display());
+                state_file::init_state_file(state_basename, &mag_cfg)
+            }
+        }
+    } else {
+        let sf = if cfg.build.load.is_some() {
+            // Resuming from checkpoint without a state file — create one with parent ref
+            let mut sf = state_file::init_state_file(state_basename, &mag_cfg);
+            sf.tokens_total = resume_tokens as u64;
+            eprintln!("  [state file created from checkpoint resume: {}]", state_file_path.display());
+            sf
+        } else {
+            eprintln!("  [state file created: {}]", state_file_path.display());
+            state_file::init_state_file(state_basename, &mag_cfg)
+        };
+        // Persist immediately so the state file exists even if the run crashes before first checkpoint
+        if let Err(e) = state_file::save_state_file(&state_file_path, &sf) {
+            eprintln!("WARNING: failed to write state file: {e}");
+        }
+        sf
+    };
+
     // ── Reset intervals (spec 57) ────────────────────────────────────
     let reset_intervals: Vec<usize> = cfg.model.reset_intervals.clone()
         .unwrap_or_default();
@@ -488,6 +529,7 @@ pub fn feed(config_path: &str, resume: bool) {
     let mut total_tokens_seen: usize = resume_tokens; // CG-6: cumulative tokens for segment accounting
     let mut aborted = false;
     let mut trigger_state = TriggerState::new(resume_tokens as u64);
+    let mut last_loaders: Vec<BpeTokenStream> = Vec::new();
 
     for (phase_idx, phase) in phases.iter().enumerate() {
         // Resolve per-phase overrides (fall back to build defaults)
@@ -789,7 +831,8 @@ pub fn feed(config_path: &str, resume: bool) {
                     if do_checkpoint {
                         save_checkpoint(
                             &save_path, global_step, total_tokens_seen,
-                            checkpoint_naming,
+                            checkpoint_naming, loss,
+                            &mut model_state, &state_file_path, &phase.label,
                             #[cfg(feature = "cuda")]
                             &gpu_params,
                             #[cfg(feature = "cuda")]
@@ -816,6 +859,8 @@ pub fn feed(config_path: &str, resume: bool) {
                         }
                     }
                 }
+                // Preserve loaders for on_unload cursor state
+                last_loaders = loaders;
             }
 
             PhaseDuration::ThinkRounds(rounds) => {
@@ -982,15 +1027,14 @@ pub fn feed(config_path: &str, resume: bool) {
         eprintln!("  [phase {phase_idx} complete — checkpoint at step {global_step}]");
         #[cfg(feature = "cuda")]
         {
-            // Synthesize a minimal loader list for checkpoint metadata
-            let loaders_empty: Vec<BpeTokenStream> = Vec::new();
             save_checkpoint(
                 &save_path, global_step, total_tokens_seen,
-                checkpoint_naming,
+                checkpoint_naming, loss_last,
+                &mut model_state, &state_file_path, &phase.label,
                 &gpu_params,
                 &gpu_context,
                 &mag_cfg, &conductor, &chunk_sizes,
-                &loaders_empty, d, v, k,
+                &last_loaders, d, v, k,
                 &mut logger,
             );
             trigger_state.record_checkpoint(total_tokens_seen as u64, loss_last);
@@ -1017,14 +1061,14 @@ pub fn feed(config_path: &str, resume: bool) {
     if cfg.build.checkpoint.on_unload && trigger_state.is_stale(total_tokens_seen as u64) {
         eprintln!("  [on_unload: saving final checkpoint at step {global_step}]");
         let naming = &cfg.build.checkpoint.naming;
-        let loaders_empty: Vec<BpeTokenStream> = Vec::new();
         save_checkpoint(
             &save_path, global_step, total_tokens_seen,
-            naming,
+            naming, loss_last,
+            &mut model_state, &state_file_path, "on_unload",
             &gpu_params,
             &gpu_context,
             &mag_cfg, &conductor, &chunk_sizes,
-            &loaders_empty, d, v, k,
+            &last_loaders, d, v, k,
             &mut logger,
         );
     }
@@ -1110,12 +1154,16 @@ fn collect_cms_diagnostics(
     CmsDiagnostics { level_gnorms, level_m_norms, level_m_deltas, dormancy_status }
 }
 
-/// Save checkpoint with build state.
+/// Save checkpoint with build state, and update the state file.
 fn save_checkpoint(
     save_path: &str,
     global_step: usize,
     total_tokens_seen: usize,
     naming: &CheckpointNaming,
+    loss: f32,
+    model_state: &mut StateFile,
+    state_file_path: &Path,
+    phase_label: &str,
     #[cfg(feature = "cuda")] gpu_params: &GpuStackedParams,
     #[cfg(feature = "cuda")] gpu_context: &GpuStackedContext,
     mag_cfg: &MAGConfig,
@@ -1161,7 +1209,7 @@ fn save_checkpoint(
             },
             context: host_context,
             global_step,
-            stream_cursors,
+            stream_cursors: stream_cursors.clone(),
             total_tokens_seen,
         };
         match save_stacked_safetensors(
@@ -1171,6 +1219,31 @@ fn save_checkpoint(
             Ok(()) => {
                 eprintln!("  [checkpoint saved: {ckpt_path}]");
                 logger.log_checkpoint(global_step, &ckpt_path);
+
+                // Spec 02: update state file with checkpoint entry
+                let entry = CheckpointEntry {
+                    path: ckpt_path.clone(),
+                    tokens: total_tokens_seen as u64,
+                    content_hash: String::new(), // TODO: SHA-256 of weight bytes (future)
+                    timestamp: state_file::iso8601_now(),
+                    health: HealthSnapshot {
+                        loss,
+                        m_norm_per_level: vec![],
+                        gate_alpha_mean_per_level: vec![],
+                        gate_theta_mean_per_level: vec![],
+                        cms_activations_since_restore: vec![],
+                    },
+                    session: SessionInfo::Build {
+                        label: phase_label.into(),
+                        dataset: String::new(),
+                        dataset_hash: String::new(),
+                        config_snapshot: String::new(),
+                    },
+                };
+                state_file::record_checkpoint(model_state, entry, &stream_cursors);
+                if let Err(e) = state_file::save_state_file(state_file_path, model_state) {
+                    eprintln!("WARNING: state file update failed: {e}");
+                }
             }
             Err(e) => {
                 eprintln!("ERROR: checkpoint save failed: {e}");
