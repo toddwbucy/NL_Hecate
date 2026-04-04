@@ -407,6 +407,15 @@ impl Config {
     }
 
     fn validate(cfg: &Config) -> Result<(), String> {
+        if cfg.model.segments == 0 {
+            return Err("model.segments must be >= 1".into());
+        }
+        if cfg.model.window_size == 0 {
+            return Err("model.window_size must be >= 1".into());
+        }
+        if let Some(0) = cfg.build.segments_override {
+            return Err("build.segments_override must be >= 1 (use null to disable)".into());
+        }
         if cfg.build.accum_steps < 1 {
             return Err("accum_steps must be >= 1".into());
         }
@@ -415,6 +424,10 @@ impl Config {
                 if phase.accum_steps == Some(0) {
                     let label = phase.label.as_deref().unwrap_or(&phase.data);
                     return Err(format!("phase {i} ({label}): accum_steps must be >= 1"));
+                }
+                if phase.segments == Some(0) {
+                    let label = phase.label.as_deref().unwrap_or(&phase.data);
+                    return Err(format!("phase {i} ({label}): segments must be >= 1"));
                 }
             }
         }
@@ -895,5 +908,29 @@ mod tests {
 
         // Phase 1: no override, inherits top-level
         assert!(phases[1].checkpoint.is_none());
+    }
+
+    #[test]
+    fn zero_segments_rejected() {
+        let json = r#"{
+            "model": {"d_model": 64, "num_heads": 2, "segments": 0},
+            "build": {"optimizer": {"type": "adamw", "lr": 0.0003}},
+            "data": {"path": "data/test"}
+        }"#;
+        let err = Config::from_str(json).unwrap_err();
+        assert!(err.contains("segments must be >= 1"));
+    }
+
+    #[test]
+    fn zero_phase_segments_rejected() {
+        let json = format!(r#"{{
+            {},
+            "build": {{"optimizer": {{"type": "adamw", "lr": 0.0003}}}},
+            "phases": [
+                {{"data": "data/test", "steps": 100, "segments": 0}}
+            ]
+        }}"#, minimal_model_json());
+        let err = Config::from_str(&json).unwrap_err();
+        assert!(err.contains("segments must be >= 1"));
     }
 }

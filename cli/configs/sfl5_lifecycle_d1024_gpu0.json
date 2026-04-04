@@ -1,5 +1,5 @@
 {
-    "description": "SFL-5 lifecycle validation: pure Titans MAG with TNT, d768, k=1, 6 blocks. Fast iteration config for state file E2E test. GPU0.",
+    "description": "SFL-5 lifecycle validation: pure Titans MAG with TNT, d1024, k=1, 8 blocks. Fast iteration config for state file E2E test. GPU0.",
     "model": {
         "d_model": 1024,
         "num_heads": 16,
