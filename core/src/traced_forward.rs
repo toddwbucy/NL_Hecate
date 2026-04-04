@@ -525,6 +525,7 @@ pub fn traced_cms_forward(
                     crate::titans_lmm::titans_mlp_read_only(
                         &params.levels[level], &embedded, frozen_ref, s, d,
                         cfg.memory_layers, cfg.memory_expansion_factor, cfg.memory_activation,
+                        &cfg.feature_map,
                     ),
                 // Delta, Titans (linear) — support configured feature map.
                 _ => delta_rule_read_only(

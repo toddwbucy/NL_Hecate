@@ -85,17 +85,19 @@ pub fn validate_composition(
     composition: CompositionKind,
     parallel: Option<ParallelStrategy>,
 ) -> Result<(), Vec<CompositionError>> {
-    validate_composition_ex(rule, retention, composition, parallel, 1)
+    validate_composition_ex(rule, retention, composition, parallel, 1, None)
 }
 
-/// Extended validation with memory_layers parameter.
+/// Extended validation with memory_layers and momentum_kind parameters.
 /// `memory_layers`: 1 = linear M (matrix), >= 2 = MLP memory (spec 75).
+/// `momentum_kind`: if provided, validates momentum compatibility with MLP memory.
 pub fn validate_composition_ex(
     rule: MemoryRuleKind,
     retention: RetentionKind,
     composition: CompositionKind,
     parallel: Option<ParallelStrategy>,
     memory_layers: usize,
+    momentum_kind: Option<crate::model::MomentumKind>,
 ) -> Result<(), Vec<CompositionError>> {
     let mut errors = Vec::new();
 
@@ -168,6 +170,28 @@ pub fn validate_composition_ex(
                     reason: "MLP memory is nonlinear (activation function breaks the linear \
                              recurrence required by AssociativeScan). Use ChunkwiseGD or \
                              TNTHierarchical instead.".into(),
+                });
+            }
+        }
+    }
+
+    // ── MLP Memory × DeltaMomentum/DeepMomentum (spec 75) ───────────
+    // MLP memory backward only supports EMA (or None) momentum.
+    // DeltaMomentum and DeepMomentum require state-dependent decay that
+    // hasn't been validated for the MLP inner-loop gradient path yet.
+    if memory_layers >= 2 {
+        if let Some(ref mk) = momentum_kind {
+            if matches!(mk, crate::model::MomentumKind::DeltaMomentum | crate::model::MomentumKind::DeepMomentum) {
+                errors.push(CompositionError {
+                    axis_a: "MLP memory (memory_layers >= 2)",
+                    axis_b: match mk {
+                        crate::model::MomentumKind::DeltaMomentum => "DeltaMomentum",
+                        crate::model::MomentumKind::DeepMomentum => "DeepMomentum",
+                        _ => unreachable!(),
+                    },
+                    reason: "MLP memory backward only supports EMA or None momentum. \
+                             DeltaMomentum/DeepMomentum for MLP is deferred to Phase B."
+                        .into(),
                 });
             }
         }
@@ -817,14 +841,14 @@ mod tests {
         // memory_layers=1 (linear) + AssociativeScan: valid for Titans/Hebbian
         let result = validate_composition_ex(
             TitansLMM, RetentionKind::L2WeightDecay, CompositionKind::MAG,
-            Some(AssociativeScan), 1,
+            Some(AssociativeScan), 1, None,
         );
         assert!(result.is_ok(), "linear TitansLMM + AssociativeScan should be valid");
 
         // memory_layers=2 (MLP) + AssociativeScan: invalid (nonlinear activation)
         let result = validate_composition_ex(
             TitansLMM, RetentionKind::L2WeightDecay, CompositionKind::MAG,
-            Some(AssociativeScan), 2,
+            Some(AssociativeScan), 2, None,
         );
         assert!(result.is_err(), "MLP TitansLMM + AssociativeScan should be invalid");
         let errs = result.unwrap_err();
@@ -834,15 +858,59 @@ mod tests {
         // memory_layers=2 + ChunkwiseGD: valid
         let result = validate_composition_ex(
             TitansLMM, RetentionKind::L2WeightDecay, CompositionKind::MAG,
-            Some(ChunkwiseGD), 2,
+            Some(ChunkwiseGD), 2, None,
         );
         assert!(result.is_ok(), "MLP TitansLMM + ChunkwiseGD should be valid");
 
         // memory_layers=2 + TNTHierarchical: valid
         let result = validate_composition_ex(
             TitansLMM, RetentionKind::L2WeightDecay, CompositionKind::MAG,
-            Some(TNTHierarchical), 2,
+            Some(TNTHierarchical), 2, None,
         );
         assert!(result.is_ok(), "MLP TitansLMM + TNTHierarchical should be valid");
+    }
+
+    #[test]
+    fn test_mlp_memory_rejects_delta_deep_momentum() {
+        use crate::model::{MemoryRuleKind::*, MomentumKind};
+        use crate::retention::RetentionKind;
+
+        // MLP + EMA: valid
+        let result = validate_composition_ex(
+            TitansLMM, RetentionKind::L2WeightDecay, CompositionKind::MAG,
+            None, 2, Some(MomentumKind::EMA),
+        );
+        assert!(result.is_ok(), "MLP + EMA should be valid");
+
+        // MLP + None: valid
+        let result = validate_composition_ex(
+            TitansLMM, RetentionKind::L2WeightDecay, CompositionKind::MAG,
+            None, 2, Some(MomentumKind::None),
+        );
+        assert!(result.is_ok(), "MLP + None should be valid");
+
+        // MLP + DeltaMomentum: invalid
+        let result = validate_composition_ex(
+            TitansLMM, RetentionKind::L2WeightDecay, CompositionKind::MAG,
+            None, 2, Some(MomentumKind::DeltaMomentum),
+        );
+        assert!(result.is_err(), "MLP + DeltaMomentum should be invalid");
+        let errs = result.unwrap_err();
+        assert!(errs.iter().any(|e| e.reason.contains("EMA")),
+            "error should mention EMA: {:?}", errs);
+
+        // MLP + DeepMomentum: invalid
+        let result = validate_composition_ex(
+            TitansLMM, RetentionKind::L2WeightDecay, CompositionKind::MAG,
+            None, 2, Some(MomentumKind::DeepMomentum),
+        );
+        assert!(result.is_err(), "MLP + DeepMomentum should be invalid");
+
+        // Linear (memory_layers=1) + DeltaMomentum: valid (no MLP restriction)
+        let result = validate_composition_ex(
+            TitansLMM, RetentionKind::L2WeightDecay, CompositionKind::MAG,
+            None, 1, Some(MomentumKind::DeltaMomentum),
+        );
+        assert!(result.is_ok(), "linear + DeltaMomentum should be valid");
     }
 }

@@ -422,8 +422,10 @@ pub fn mlp_backward_input_only(
     d_out
 }
 
-/// Frozen MLP read-only forward: y_t = M_mlp(q_t) for each token.
+/// Frozen MLP read-only forward: y_t = M_mlp(φ(q_t)) for each token.
 /// Used for frozen CMS levels where M is not updated.
+/// Conv1d and L2 norm are intentionally skipped for frozen levels (same as
+/// delta_rule_read_only), but the feature map IS applied to match active-path semantics.
 /// Returns (y, q_mem) — same contract as delta_rule_read_only.
 pub fn titans_mlp_read_only(
     level_params: &MemoryLevelParams,
@@ -434,6 +436,7 @@ pub fn titans_mlp_read_only(
     memory_layers: usize,
     expansion_factor: usize,
     activation: MemoryActivation,
+    feature_map: &FeatureMapKind,
 ) -> (Vec<f32>, Vec<f32>) {
     debug_assert_eq!(embedded.len(), seq_len * d);
     let layout = MLPMemoryLayout::new(memory_layers, d, expansion_factor);
@@ -444,16 +447,20 @@ pub fn titans_mlp_read_only(
     crate::dispatch::matmul_transb_dispatch(embedded, &w_q_f32, &mut q_mem, seq_len, d, d);
 
     let mut y = vec![0.0f32; seq_len * d];
+    let mut phi_q_buf = vec![0.0f32; d];
+    let mut z_q_buf = vec![0.0f32; d];
     for t in 0..seq_len {
         let q_t = &q_mem[t * d..(t + 1) * d];
-        let (out, _, _) = mlp_forward(frozen_m, 0, q_t, &layout, activation);
+        feature_map::apply_into(q_t, feature_map, &level_params.w_rand, &level_params.b_rand, &mut phi_q_buf, &mut z_q_buf, d);
+        let (out, _, _) = mlp_forward(frozen_m, 0, &phi_q_buf, &layout, activation);
         y[t * d..(t + 1) * d].copy_from_slice(&out);
     }
 
     (y, q_mem)
 }
 
-/// Frozen MLP read-only backward: d_q via MLP Jacobian, then d_W_Q_mem and d_embedded.
+/// Frozen MLP read-only backward: d_q via MLP Jacobian + feature map VJP,
+/// then d_W_Q_mem and d_embedded.
 pub fn titans_mlp_read_only_backward(
     level_params: &MemoryLevelParams,
     frozen_m: &[f32],
@@ -465,20 +472,27 @@ pub fn titans_mlp_read_only_backward(
     memory_layers: usize,
     expansion_factor: usize,
     activation: MemoryActivation,
+    feature_map: &FeatureMapKind,
 ) -> (MemoryLevelParams, Vec<f32>) {
     let layout = MLPMemoryLayout::new(memory_layers, d, expansion_factor);
-    let mut grads = MemoryLevelParams::zeros_like(d);
+    let mut grads = MemoryLevelParams::zeros_like_from(level_params, d);
     let mut d_q_mem = vec![0.0f32; seq_len * d];
 
+    let mut z_q_buf = vec![0.0f32; d];
     for t in 0..seq_len {
         let q_t = &q_mem[t * d..(t + 1) * d];
         let d_y_t = &d_y[t * d..(t + 1) * d];
+        // Apply feature map (matching forward path)
+        let (phi_q_t, z_q_t) = feature_map::apply(q_t, feature_map, &level_params.w_rand, &level_params.b_rand, d);
+        z_q_buf.copy_from_slice(&z_q_t);
         // Recompute forward to get pre_acts for input-only VJP
-        let (_, pre_acts, _) = mlp_forward(frozen_m, 0, q_t, &layout, activation);
-        // Input-only VJP: frozen M has no weight gradients
-        let d_q_t = mlp_backward_input_only(
+        let (_, pre_acts, _) = mlp_forward(frozen_m, 0, &phi_q_t, &layout, activation);
+        // Input-only VJP through MLP: d_phi_q
+        let d_phi_q_t = mlp_backward_input_only(
             d_y_t, &pre_acts, frozen_m, 0, &layout, activation,
         );
+        // Feature map VJP: d_phi_q → d_q
+        let d_q_t = feature_map::vjp(&d_phi_q_t, &z_q_buf, feature_map, &level_params.w_rand, d);
         d_q_mem[t * d..(t + 1) * d].copy_from_slice(&d_q_t);
     }
 

@@ -1075,6 +1075,7 @@ pub fn frozen_titans_lmm_backward(d_outputs: &[&[f32]], saved: &[&[f32]], d_inpu
     if saved[0].len() >= 7 {
         let seq_len = saved[0][0] as usize;
         let d = saved[0][1] as usize;
+        let fm_kind = decode_feature_map_kind(saved[0][2], saved[0][3]);
         let memory_layers = saved[0][4] as usize;
         let expansion = saved[0][5] as usize;
         let activation = match saved[0][6] as u8 {
@@ -1090,20 +1091,27 @@ pub fn frozen_titans_lmm_backward(d_outputs: &[&[f32]], saved: &[&[f32]], d_inpu
         debug_assert_eq!(m_frozen.len(), layout.total_params);
         debug_assert_eq!(q_mem.len(), seq_len * d);
 
-        // MLP backward through each token: d_q_t = J_M(q_t)^T @ d_y_t
+        // MLP backward through each token with feature map VJP
         let mut d_q = vec![0.0f32; seq_len * d];
+        // We don't have w_rand/b_rand in saved — Identity FM uses no-op VJP,
+        // non-Identity FMs save z_q for VJP. For now, use empty w_rand/b_rand
+        // (Identity FM is the only variant currently used with MLP memory).
+        let w_rand_empty: Vec<f32> = vec![];
+        let b_rand_empty: Vec<f32> = vec![];
         for t in 0..seq_len {
             let q_t = &q_mem[t * d..(t + 1) * d];
             let d_y_t = &d_y[t * d..(t + 1) * d];
-            // Recompute forward activations at q_t
-            let (_, pre_acts, activations) =
-                crate::titans_lmm::mlp_forward(m_frozen, 0, q_t, &layout, activation);
-            // MLP backward for d_input only (no weight grads for frozen M)
-            let mut dummy_dw = vec![0.0f32; layout.total_params];
-            let d_q_t = crate::titans_lmm::mlp_backward_full(
-                d_y_t, &pre_acts, &activations, m_frozen, 0, &layout, activation,
-                &mut dummy_dw, 0,
+            // Apply feature map (matching forward path)
+            let (phi_q_t, z_q_t) = crate::feature_map::apply(q_t, &fm_kind, &w_rand_empty, &b_rand_empty, d);
+            // Recompute forward activations at phi(q_t)
+            let (_, pre_acts, _) =
+                crate::titans_lmm::mlp_forward(m_frozen, 0, &phi_q_t, &layout, activation);
+            // Input-only VJP through MLP
+            let d_phi_q_t = crate::titans_lmm::mlp_backward_input_only(
+                d_y_t, &pre_acts, m_frozen, 0, &layout, activation,
             );
+            // Feature map VJP: d_phi_q → d_q
+            let d_q_t = crate::feature_map::vjp(&d_phi_q_t, &z_q_t, &fm_kind, &w_rand_empty, d);
             d_q[t * d..(t + 1) * d].copy_from_slice(&d_q_t);
         }
         d_inputs[0] = d_q;
