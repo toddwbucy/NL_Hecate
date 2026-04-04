@@ -627,10 +627,20 @@ mod tests {
         std::fs::remove_dir(&dir).ok();
     }
 
+    /// Unique temp dir per test to avoid parallel test collisions.
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let pid = std::process::id();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}_{pid}_{ts}"))
+    }
+
     #[test]
     fn test_load_legacy_cursor_valid() {
-        let dir = std::env::temp_dir().join("nl_hecate_cursor_test");
-        std::fs::create_dir_all(&dir).ok();
+        let dir = unique_temp_dir("nl_hecate_cursor_valid");
+        std::fs::create_dir_all(&dir).unwrap();
         let ckpt_path = dir.join("model.safetensors");
         let sidecar_path = dir.join("model.safetensors.cursor.json");
 
@@ -657,8 +667,8 @@ mod tests {
 
     #[test]
     fn test_load_legacy_cursor_zero_position() {
-        let dir = std::env::temp_dir().join("nl_hecate_cursor_test_zero");
-        std::fs::create_dir_all(&dir).ok();
+        let dir = unique_temp_dir("nl_hecate_cursor_zero");
+        std::fs::create_dir_all(&dir).unwrap();
         let ckpt_path = dir.join("model.safetensors");
         let sidecar_path = dir.join("model.safetensors.cursor.json");
 

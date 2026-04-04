@@ -24,15 +24,43 @@ Cursors flow through three locations:
 
 When loading a checkpoint with `--resume` or `build.load`:
 
-```
-1. If state file exists AND cursor.slots is non-empty → use state file cursors
-2. Else if BuildResumeState.stream_cursors is non-empty → use safetensors cursors
-3. Else if BuildResumeState.stream_cursor.position > 0 → use single legacy cursor
-4. Else if <checkpoint>.cursor.json exists → read legacy sidecar
-5. Else → no cursor restoration (fresh start)
+```rust
+enum CursorSource {
+    StateFile,            // state file cursor matches loaded checkpoint
+    SafetensorsSlots,     // BuildResumeState.stream_cursors (batch>1)
+    SafetensorsLegacy,    // BuildResumeState.stream_cursor (batch=1 compat)
+    LegacySidecar,        // <checkpoint>.cursor.json migration
+    FreshStart,           // no cursor — start from position 0
+}
+
+fn select_resume_cursor_source(
+    state_slots: &[StreamCursor],
+    current_checkpoint: Option<&CurrentCheckpoint>,
+    checkpoint_path: &Path,
+    build_state: Option<&BuildResumeState>,
+) -> CursorSource {
+    // Guard: state file cursor only valid if it matches the loaded checkpoint
+    if !state_slots.is_empty()
+        && current_checkpoint.map(|cc| cc.path == checkpoint_path).unwrap_or(false)
+    {
+        return CursorSource::StateFile;
+    }
+    if let Some(bs) = build_state {
+        if !bs.stream_cursors.is_empty() {
+            return CursorSource::SafetensorsSlots;
+        }
+        if bs.stream_cursor.position > 0 {
+            return CursorSource::SafetensorsLegacy;
+        }
+    }
+    if checkpoint_path.with_extension("cursor.json").exists() {
+        return CursorSource::LegacySidecar;
+    }
+    CursorSource::FreshStart
+}
 ```
 
-Steps 2-3 are the existing behavior. Step 1 is new. Step 4 is migration support.
+Steps 2-3 (SafetensorsSlots/Legacy) are the existing behavior. Step 1 (StateFile) is new with checkpoint identity guard. Step 4 (LegacySidecar) is migration support.
 
 ## Legacy Sidecar Migration
 

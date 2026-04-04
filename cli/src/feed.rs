@@ -402,20 +402,31 @@ pub fn feed(config_path: &str, resume: bool) {
 
     // ── Spec 04: Inline cursor — state file is authoritative cursor source ──
     // Priority: state file cursor > safetensors BuildResumeState > legacy .cursor.json
+    // Guard: state file cursor only valid if it matches the loaded checkpoint.
     if cfg.build.load.is_some() && !cfg.build.reset_step {
-        if !model_state.cursor.slots.is_empty() {
+        let load_path = cfg.build.load.as_deref().unwrap_or("");
+        let state_cursor_matches = !model_state.cursor.slots.is_empty()
+            && model_state.current_checkpoint.as_ref()
+                .map(|cc| cc.path == load_path)
+                .unwrap_or(false);
+
+        if state_cursor_matches {
             eprintln!("  [cursor: from state file ({} slots)]", model_state.cursor.slots.len());
             resume_cursors = model_state.cursor.slots.clone();
-        } else if resume_cursors.is_empty() {
-            // Safetensors had no cursors either — try legacy sidecar
-            let load_path = cfg.build.load.as_deref().unwrap_or("");
-            let legacy = state_file::load_legacy_cursor(load_path);
-            if !legacy.is_empty() {
-                eprintln!("  [cursor: from legacy .cursor.json sidecar]");
-                resume_cursors = legacy;
+        } else {
+            if !model_state.cursor.slots.is_empty() {
+                eprintln!("  [cursor: state file cursor skipped — checkpoint mismatch]");
             }
+            if resume_cursors.is_empty() {
+                // Safetensors had no cursors either — try legacy sidecar
+                let legacy = state_file::load_legacy_cursor(load_path);
+                if !legacy.is_empty() {
+                    eprintln!("  [cursor: from legacy .cursor.json sidecar]");
+                    resume_cursors = legacy;
+                }
+            }
+            // else: resume_cursors already populated from safetensors BuildResumeState
         }
-        // else: resume_cursors already populated from safetensors BuildResumeState
     }
 
     // ── Reset intervals (spec 57) ────────────────────────────────────
