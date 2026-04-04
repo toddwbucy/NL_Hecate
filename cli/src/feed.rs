@@ -1269,11 +1269,11 @@ fn save_checkpoint(
                         if l < k {
                             let mut ba = [0.0f32; 1];
                             level.b_alpha.copy_to_host(&mut ba);
-                            gate_alpha_mean[l] += 1.0 / (1.0 + (-ba[0]).exp()); // sigmoid
+                            gate_alpha_mean[l] += nl_hecate_core::tensor::sigmoid_f32(ba[0]);
 
                             let mut bt = [0.0f32; 1];
                             level.b_theta.copy_to_host(&mut bt);
-                            gate_theta_mean[l] += (1.0 + bt[0].exp()).ln(); // softplus
+                            gate_theta_mean[l] += nl_hecate_core::tensor::softplus_f32(bt[0]);
                         }
                     }
                 }
