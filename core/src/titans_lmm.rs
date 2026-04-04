@@ -843,6 +843,8 @@ impl TitansLMM {
                 &cache.m_states, m_t_base, layout, activation, &mut grad_t, 0);
 
             // ── Phase 4: Momentum backward (EMA) ──
+            // Note: `d` is passed for API compat but unused — ema_step_backward
+            // derives state size from d_s.len(), which handles both d*d and MLP layouts.
             let (d_eta_scalar, d_theta_scalar, d_grad) =
                 crate::momentum::ema_step_backward(&mut d_s, s_t, &grad_t, eta_t, theta_t, d);
 
@@ -2734,15 +2736,18 @@ mod tests {
     fn make_mlp_initial_m(layout: &MLPMemoryLayout, seed: u64) -> Vec<f32> {
         let mut rng = SimpleRng::new(seed);
         let mut m = vec![0.0f32; layout.total_params];
+        // fill_uniform seeds all params (weights + biases) in [-0.3, 0.3].
+        // Below we rescale weight matrices to Xavier init, undoing the 0.3 range first.
         rng.fill_uniform(&mut m, 0.3);
-        // Scale weight matrices by Xavier factor
         for l in 0..layout.n_layers {
             let desc = &layout.layers[l];
             let fan_in = desc.w_cols;
             let fan_out = desc.w_rows;
-            let scale = (2.0 / (fan_in + fan_out) as f32).sqrt();
+            let xavier = (2.0 / (fan_in + fan_out) as f32).sqrt();
+            // Undo [-0.3,0.3] range then apply Xavier: net multiplier = xavier / 0.3
+            let rescale = xavier / 0.3;
             let w = layout.w_slice_mut(&mut m, 0, l);
-            for x in w.iter_mut() { *x *= scale / 0.3; }
+            for x in w.iter_mut() { *x *= rescale; }
         }
         m
     }
