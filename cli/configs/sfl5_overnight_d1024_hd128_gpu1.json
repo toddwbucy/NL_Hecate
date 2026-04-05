@@ -1,0 +1,53 @@
+{
+    "description": "SFL-5 overnight: full dolmino pass, d1024, hd=128 (8 heads), k=1, 8 blocks. Head-dim stability experiment. GPU1.",
+    "model": {
+        "d_model": 1024,
+        "num_heads": 8,
+        "segments": 20,
+        "window_size": 512,
+        "vocab_size": 49152,
+        "memory_rule": "titans",
+        "composition": "mag",
+        "k": 1,
+        "chunk_sizes": [64],
+        "m_norm_max": [50.0],
+        "error_clip": [0.0],
+        "residual": true,
+        "n_blocks": 8,
+        "parallel_strategy": "tnt_hierarchical",
+        "tnt_global_chunk_size": 64,
+        "tnt_local_chunk_size": 8,
+        "memory_reset": "none",
+        "tape_multiplier": 1,
+        "tape_strategies": ["exact"]
+    },
+    "build": {
+        "optimizer": "adamw_gpu_stacked",
+        "lr": 0.0003,
+        "steps": 15462,
+        "warmup_steps": 1500,
+        "weight_decay": 0.1,
+        "beta1": 0.9,
+        "beta2": 0.999,
+        "max_grad_norm": 1.0,
+        "alpha_floor": [0.0],
+        "theta_ceil": [1.0],
+        "batch_size": 3,
+        "log_every": 50,
+        "save_every": 1000,
+        "gpu": true,
+        "seed": 42,
+        "run_dir": "/home/todd/olympus/NL_Hecate/runs/sfl5_overnight_d1024_hd128",
+        "save_path": "/home/todd/olympus/NL_Hecate/runs/sfl5_overnight_d1024_hd128/checkpoints/model.safetensors",
+        "log_file": "/home/todd/olympus/NL_Hecate/runs/sfl5_overnight_d1024_hd128/metrics.jsonl",
+        "flashcard": false,
+        "profile_every": 0,
+        "tokenizer_path": "/home/todd/olympus/NL_Hecate/data/dolmino_100b_v3/tokenizer.json",
+        "probe_max_tokens": 0,
+        "probe_temperature": 0.8
+    },
+    "data": {
+        "path": "/home/todd/olympus/NL_Hecate/data/dolmino_100b_v3",
+        "format": "dolmino"
+    }
+}

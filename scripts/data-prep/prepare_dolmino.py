@@ -161,38 +161,96 @@ def stream_documents(
     return docs
 
 
-def tokenize_documents(
-    docs: list[str], tokenizer, target_tokens: int, eot_id: int = 0,
+def tokenize_documents_to_mmap(
+    docs: list[str], tokenizer, target_tokens: int, eot_id: int,
+    tokens_path: Path, targets_path: Path,
     batch_size: int = 10_000,
-) -> tuple[list[int], list[int]]:
-    """Tokenize docs into flat token/target arrays with EOT document separators.
+) -> int:
+    """Tokenize docs directly into memory-mapped numpy files.
 
-    Uses encode_batch for Rust-level parallelism across all available cores.
+    Writes tokens incrementally to avoid holding 10B+ ints in a Python list.
+    Returns the actual number of token pairs written (may be < target_tokens).
     """
-    all_tokens: list[int] = []
+    # Pre-allocate mmap files at target size
+    tokens_arr = np.lib.format.open_memmap(
+        str(tokens_path), mode='w+', dtype=np.uint32, shape=(target_tokens,))
+    targets_arr = np.lib.format.open_memmap(
+        str(targets_path), mode='w+', dtype=np.int32, shape=(target_tokens,))
+
+    # Small buffer to accumulate a batch before writing to mmap
+    buf = np.empty(batch_size * 3000, dtype=np.uint32)  # ~12MB, generous per-batch
+    buf_pos = 0
+    written = 0  # token pairs written to mmap (offset by 1 for next-token pred)
+    carry = -1   # last token from previous flush (needed for targets[0] of next chunk)
+
+    def flush_buf():
+        nonlocal buf_pos, written, carry
+        if buf_pos == 0:
+            return
+        chunk = buf[:buf_pos]
+        # Next-token prediction: tokens[i] predicts targets[i] = tokens[i+1]
+        if carry >= 0:
+            # Bridge: last token of previous flush -> first token of this chunk
+            n = min(len(chunk), target_tokens - written)
+            tokens_arr[written:written + n] = np.concatenate(
+                [np.array([carry], dtype=np.uint32), chunk[:n - 1]]) if n > 1 else np.array([carry], dtype=np.uint32)[:n]
+            targets_arr[written:written + n] = chunk[:n].astype(np.int32)
+            written += n
+        else:
+            # First flush: tokens = chunk[:-1], targets = chunk[1:]
+            n = min(len(chunk) - 1, target_tokens - written)
+            tokens_arr[written:written + n] = chunk[:n]
+            targets_arr[written:written + n] = chunk[1:n + 1].astype(np.int32)
+            written += n
+        carry = int(chunk[buf_pos - 1])
+        buf_pos = 0
 
     for start in range(0, len(docs), batch_size):
+        if written >= target_tokens:
+            break
         batch = docs[start:start + batch_size]
         encoded = tokenizer.encode_batch(batch)
         for enc in encoded:
-            all_tokens.extend(enc.ids)
-            all_tokens.append(eot_id)
+            ids = enc.ids
+            need = len(ids) + 1  # +1 for EOT
+            # Grow buffer if needed
+            if buf_pos + need > len(buf):
+                flush_buf()
+                if need > len(buf):
+                    buf = np.empty(need * 2, dtype=np.uint32)
+            buf[buf_pos:buf_pos + len(ids)] = ids
+            buf_pos += len(ids)
+            buf[buf_pos] = eot_id
+            buf_pos += 1
+
+        # Flush periodically to keep memory low
+        if buf_pos > 5_000_000:
+            flush_buf()
 
         print(
             f"    tokenized {min(start + batch_size, len(docs)):,}/{len(docs):,} docs, "
-            f"{len(all_tokens):,} tokens...",
+            f"{written:,} tokens written...",
             end="\r",
         )
-        if len(all_tokens) >= target_tokens:
-            break
 
-    all_tokens = all_tokens[:target_tokens]
-    print(f"\n  Total tokens: {len(all_tokens):,}")
+    flush_buf()  # final flush
 
-    # Standard next-token prediction: input[i] predicts target[i] = input[i+1]
-    input_tokens = all_tokens[:-1]
-    target_tokens_list = all_tokens[1:]
-    return input_tokens, target_tokens_list
+    # Truncate mmap files to actual size if we wrote less than target
+    actual = min(written, target_tokens)
+    if actual < target_tokens:
+        del tokens_arr, targets_arr
+        # Rewrite with correct size
+        tmp_tok = np.load(str(tokens_path), mmap_mode='r')[:actual].copy()
+        tmp_tgt = np.load(str(targets_path), mmap_mode='r')[:actual].copy()
+        np.save(str(tokens_path), tmp_tok)
+        np.save(str(targets_path), tmp_tgt)
+        del tmp_tok, tmp_tgt
+    else:
+        tokens_arr.flush()
+        targets_arr.flush()
+
+    print(f"\n  Total token pairs: {actual:,}")
+    return actual
 
 
 def main() -> None:
@@ -343,8 +401,8 @@ def main() -> None:
         sys.exit(1)
     print(f"  EOT token: <|endoftext|> = {eot_id}")
 
-    # ── Step 5: Tokenize ──────────────────────────────────────────────
-    print(f"\nStep 5: Tokenizing (target={args.target_tokens:,} total tokens)...")
+    # ── Step 5: Tokenize (streaming to mmap) ────────────────────────
+    print(f"\nStep 5: Tokenizing (target={args.target_tokens:,} total tokens, streaming to mmap)...")
     t0 = time.time()
 
     train_target = int(args.target_tokens * (1 - args.val_ratio))
@@ -354,26 +412,25 @@ def main() -> None:
     n_val_docs = len(val_docs)
 
     print("  Train split:")
-    train_input, train_targets = tokenize_documents(train_docs, tokenizer, train_target, eot_id)
+    n_train = tokenize_documents_to_mmap(
+        train_docs, tokenizer, train_target, eot_id,
+        out_dir / "train_tokens.npy", out_dir / "train_targets.npy",
+    )
     train_docs = []  # free memory
 
     print("  Val split:")
-    val_input, val_targets = tokenize_documents(val_docs, tokenizer, val_target, eot_id)
+    n_val = tokenize_documents_to_mmap(
+        val_docs, tokenizer, val_target, eot_id,
+        out_dir / "val_tokens.npy", out_dir / "val_targets.npy",
+    )
     val_docs = []
 
     print(f"  Tokenized in {time.time() - t0:.1f}s")
 
-    # ── Step 6: Save ──────────────────────────────────────────────────
-    print("\nStep 6: Saving output files...")
-
-    np.save(out_dir / "train_tokens.npy", np.array(train_input, dtype=np.uint32))
-    np.save(out_dir / "train_targets.npy", np.array(train_targets, dtype=np.int32))
-    np.save(out_dir / "val_tokens.npy", np.array(val_input, dtype=np.uint32))
-    np.save(out_dir / "val_targets.npy", np.array(val_targets, dtype=np.int32))
+    # ── Step 6: Save metadata ─────────────────────────────────────────
+    print("\nStep 6: Saving metadata...")
 
     # Tokenizer copy (not symlink — portable across mounts).
-    # If destination exists but differs from the requested tokenizer, overwrite it so
-    # the output directory is always consistent with the --tokenizer argument.
     dest_tok = out_dir / "tokenizer.json"
     if not dest_tok.exists() or not filecmp.cmp(tokenizer_path, dest_tok, shallow=False):
         shutil.copy2(tokenizer_path, dest_tok)
@@ -391,16 +448,16 @@ def main() -> None:
         "train": {
             "split": "train",
             "documents": n_train_docs,
-            "total_tokens": len(train_input),
-            "valid_targets": len(train_targets),
+            "total_tokens": n_train,
+            "valid_targets": n_train,
             "masked_targets": 0,
             "mask_ratio": 0.0,
         },
         "val": {
             "split": "val",
             "documents": n_val_docs,
-            "total_tokens": len(val_input),
-            "valid_targets": len(val_targets),
+            "total_tokens": n_val,
+            "valid_targets": n_val,
             "masked_targets": 0,
             "mask_ratio": 0.0,
         },
@@ -414,9 +471,9 @@ def main() -> None:
         json.dump(meta, f, indent=2)
 
     # ── Summary ───────────────────────────────────────────────────────
-    total = len(train_input) + len(val_input)
-    train_mb = (len(train_input) * 4) / 1e6  # uint32
-    val_mb = (len(val_input) * 4) / 1e6
+    total = n_train + n_val
+    train_mb = (n_train * 4) / 1e6  # uint32
+    val_mb = (n_val * 4) / 1e6
     print(f"\n{'=' * 60}")
     print("Dolmino-Mix data preparation complete")
     print(f"{'=' * 60}")
@@ -425,8 +482,8 @@ def main() -> None:
     print(f"  Ingredient:   {args.ingredient}")
     print(f"  Vocab:        {actual_vocab:,}")
     print(f"  Total tokens: {total:,}")
-    print(f"  Train tokens: {len(train_input):,}  ({train_mb:.1f} MB)")
-    print(f"  Val tokens:   {len(val_input):,}  ({val_mb:.1f} MB)")
+    print(f"  Train tokens: {n_train:,}  ({train_mb:.1f} MB)")
+    print(f"  Val tokens:   {n_val:,}  ({val_mb:.1f} MB)")
     print("  Mask ratio:   0.0% (all tokens are valid targets)")
     print(f"  Min doc len:  {args.min_text_len:,} chars (~{args.min_text_len//4} tokens)")
     print(f"{'=' * 60}")
