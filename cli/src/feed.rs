@@ -662,11 +662,7 @@ pub fn feed(config_path: &str, resume: bool) {
                     let pulse = conductor.pulse();
 
                     // SFL-4: count CMS activations per level for health snapshot
-                    for (level, &active) in pulse.active_levels.iter().enumerate() {
-                        if active && level < k {
-                            cms_activations[level] += 1;
-                        }
-                    }
+                    count_cms_activations(&pulse, k, &mut cms_activations);
 
                     // Spec 63: compute log_this early so backward can skip gnorm readback
                     let log_this = log_every > 0 && phase_step % log_every == 0;
@@ -954,11 +950,7 @@ pub fn feed(config_path: &str, resume: bool) {
                     let pulse = conductor.pulse(); // snapshot for logging
 
                     // SFL-4: count CMS activations per level for health snapshot
-                    for (level, &active) in pulse.active_levels.iter().enumerate() {
-                        if active && level < k {
-                            cms_activations[level] += 1;
-                        }
-                    }
+                    count_cms_activations(&pulse, k, &mut cms_activations);
 
                     // LEARN from current input (unified forward path)
                     #[cfg(feature = "cuda")]
@@ -1028,12 +1020,7 @@ pub fn feed(config_path: &str, resume: bool) {
                         let gen_top_k = phase.top_k.unwrap_or(0);
 
                         // SFL-4: count CMS activations for the generate optimizer step
-                        let gen_pulse = conductor.pulse();
-                        for (level, &active) in gen_pulse.active_levels.iter().enumerate() {
-                            if active && level < k {
-                                cms_activations[level] += 1;
-                            }
-                        }
+                        count_cms_activations(&conductor.pulse(), k, &mut cms_activations);
 
                         let gen_result = generate(
                             &mut gpu_params, &mag_cfg, &mut gpu_context,
@@ -1116,12 +1103,15 @@ pub fn feed(config_path: &str, resume: bool) {
             }
         }
 
-        // Restore GPU context to build defaults if phase overrode them
+        // Restore GPU context to build defaults if phase overrode them.
+        // Skip restore on the last phase if save failed — on_unload needs the
+        // phase-local context for a retry with correct health snapshot.
         #[cfg(feature = "cuda")]
         {
             let needs_restore = batch_size != cfg.build.batch_size
                 || phase_seq_len != seq_len;
-            if needs_restore {
+            let is_last_phase = phase_idx + 1 == phases.len();
+            if needs_restore && (phase_boundary_saved || !is_last_phase) {
                 mag_cfg.swa.seq_len = seq_len;
                 gpu_context = GpuStackedContext::new(
                     n_blocks, k, d, cfg.build.batch_size, Some(&mag_cfg),
@@ -1309,7 +1299,6 @@ fn save_checkpoint(
         ) {
             Ok(()) => {
                 eprintln!("  [checkpoint saved: {ckpt_path}]");
-                logger.log_checkpoint(global_step, &ckpt_path);
 
                 // Spec 02 / SFL-4: health snapshot from live GPU state
                 let n_blocks = gpu_context.n_blocks.max(1) as f32;
@@ -1366,6 +1355,7 @@ fn save_checkpoint(
                     eprintln!("WARNING: state file update failed: {e}");
                     return false;
                 }
+                logger.log_checkpoint(global_step, &ckpt_path);
                 return true;
             }
             Err(e) => {
@@ -1387,6 +1377,15 @@ fn fmt_num(n: usize) -> String {
         result.push(c);
     }
     result
+}
+
+/// Increment CMS activation counters for each active level in the pulse.
+fn count_cms_activations(pulse: &Pulse, k: usize, cms_activations: &mut [u64]) {
+    for (level, &active) in pulse.active_levels.iter().enumerate() {
+        if active && level < k {
+            cms_activations[level] += 1;
+        }
+    }
 }
 
 /// Default chunk sizes for k levels.
