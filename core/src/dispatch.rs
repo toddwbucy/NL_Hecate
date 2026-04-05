@@ -198,6 +198,17 @@ extern "C" {
         x: *const f32, incx: i32,
         y: *mut f32, incy: i32,
     ) -> i32;
+    fn cublasSgemmStridedBatched(
+        handle: *mut std::ffi::c_void,
+        transa: i32, transb: i32,
+        m: i32, n: i32, k: i32,
+        alpha: *const f32,
+        a: *const f32, lda: i32, stride_a: i64,
+        b: *const f32, ldb: i32, stride_b: i64,
+        beta: *const f32,
+        c: *mut f32, ldc: i32, stride_c: i64,
+        batch_count: i32,
+    ) -> i32;
 }
 
 /// Thread-safe wrapper for cuBLAS handle (raw pointer).
@@ -2543,27 +2554,24 @@ pub fn delta_chunkwise_forward_batched_dd(
         let t_end = std::cmp::min(t_start + chunk_size, seq_len);
         let c_len = t_end - t_start;
 
-        // Phase 1: cuBLAS GEMM per batch element
-        // predictions[b, c_len, d] = K_chunk[b, c_len, d] @ M₀ᵀ[b, d, d]
-        for b in 0..batch_size {
-            let k_offset = b * seq_len * d + t_start * d;
-            let m_offset = b * dd;
-            let pred_offset = b * chunk_size * d;
-
+        // Phase 1: batched cuBLAS GEMM — all batch elements in one call
+        {
             let alpha_val: f32 = 1.0;
             let beta_val: f32 = 0.0;
-            unsafe {
-                cublasSgemm_v2(
+            let rc = unsafe {
+                cublasSgemmStridedBatched(
                     cublas_handle(),
                     CUBLAS_OP_T, CUBLAS_OP_N,
                     d as i32, c_len as i32, d as i32,
                     &alpha_val,
-                    m_work.as_ptr().add(m_offset), d as i32,
-                    k_mem.as_ptr().add(k_offset), d as i32,
+                    m_work.as_ptr(), d as i32, dd as i64,
+                    k_mem.as_ptr().add(t_start * d), d as i32, (seq_len * d) as i64,
                     &beta_val,
-                    predictions.ptr().add(pred_offset), d as i32,
-                );
-            }
+                    predictions.ptr(), d as i32, (chunk_size * d) as i64,
+                    batch_size as i32,
+                )
+            };
+            assert_eq!(rc, 0, "cublasSgemmStridedBatched (delta fwd phase1) failed: {rc}");
         }
 
         // Error subtract + clip: predictions -= V_chunk, then L2 clip
@@ -2623,29 +2631,27 @@ pub fn titans_chunkwise_forward_batched_dd(
         let t_end = std::cmp::min(t_start + chunk_size, seq_len);
         let c_len = t_end - t_start;
 
-        // Phase 1: cuBLAS GEMM per batch element
-        for b in 0..batch_size {
-            let k_offset = b * seq_len * d + t_start * d;
-            let m_offset = b * dd;
-            let pred_offset = b * chunk_size * d;
-
+        // Phase 1: batched cuBLAS GEMM — all batch elements in one call
+        {
             let alpha_val: f32 = 1.0;
             let beta_val: f32 = 0.0;
-            unsafe {
-                cublasSgemm_v2(
+            let rc = unsafe {
+                cublasSgemmStridedBatched(
                     cublas_handle(),
                     CUBLAS_OP_T, CUBLAS_OP_N,
                     d as i32, c_len as i32, d as i32,
                     &alpha_val,
-                    m_work.as_ptr().add(m_offset), d as i32,
-                    k_mem.as_ptr().add(k_offset), d as i32,
+                    m_work.as_ptr(), d as i32, dd as i64,
+                    k_mem.as_ptr().add(t_start * d), d as i32, (seq_len * d) as i64,
                     &beta_val,
-                    predictions.ptr().add(pred_offset), d as i32,
-                );
-            }
+                    predictions.ptr(), d as i32, (chunk_size * d) as i64,
+                    batch_size as i32,
+                )
+            };
+            assert_eq!(rc, 0, "cublasSgemmStridedBatched (titans fwd phase1) failed: {rc}");
         }
 
-        // Error subtract + clip
+        // Error subtract + clip (per-batch: V stride differs from predictions stride)
         for b in 0..batch_size {
             let v_offset = b * seq_len * d + t_start * d;
             let pred_offset = b * chunk_size * d;
@@ -2700,29 +2706,27 @@ pub fn delta_chunkwise_backward_batched_dd(
         let t_end = std::cmp::min(t_start + chunk_size, seq_len);
         let c_len = t_end - t_start;
 
-        // Phase 1: recompute errors via cuBLAS GEMM
-        for b in 0..batch_size {
-            let k_offset = b * seq_len * d + t_start * d;
-            let m_cs_offset = b * (num_chunks + 1) * dd + c * dd;
-            let err_offset = b * chunk_size * d;
-
+        // Phase 1: batched cuBLAS GEMM — recompute errors for all batch elements
+        {
             let alpha_val: f32 = 1.0;
             let beta_val: f32 = 0.0;
-            unsafe {
-                cublasSgemm_v2(
+            let rc = unsafe {
+                cublasSgemmStridedBatched(
                     cublas_handle(),
                     CUBLAS_OP_T, CUBLAS_OP_N,
                     d as i32, c_len as i32, d as i32,
                     &alpha_val,
-                    m_chunk_states.as_ptr().add(m_cs_offset), d as i32,
-                    k_mem.as_ptr().add(k_offset), d as i32,
+                    m_chunk_states.as_ptr().add(c * dd), d as i32, ((num_chunks + 1) * dd) as i64,
+                    k_mem.as_ptr().add(t_start * d), d as i32, (seq_len * d) as i64,
                     &beta_val,
-                    errors.ptr().add(err_offset), d as i32,
-                );
-            }
+                    errors.ptr(), d as i32, (chunk_size * d) as i64,
+                    batch_size as i32,
+                )
+            };
+            assert_eq!(rc, 0, "cublasSgemmStridedBatched (delta bwd phase1) failed: {rc}");
         }
 
-        // Error subtract + clip
+        // Error subtract + clip (per-batch: V stride differs from errors stride)
         for b in 0..batch_size {
             let v_offset = b * seq_len * d + t_start * d;
             let err_offset = b * chunk_size * d;
@@ -2801,29 +2805,27 @@ pub fn titans_chunkwise_backward_batched_dd(
         let t_end = std::cmp::min(t_start + chunk_size, seq_len);
         let c_len = t_end - t_start;
 
-        // Phase 1: recompute errors via cuBLAS
-        for b in 0..batch_size {
-            let k_offset = b * seq_len * d + t_start * d;
-            let m_cs_offset = b * (num_chunks + 1) * dd + c * dd;
-            let err_offset = b * chunk_size * d;
-
+        // Phase 1: batched cuBLAS GEMM — recompute errors for all batch elements
+        {
             let alpha_val: f32 = 1.0;
             let beta_val: f32 = 0.0;
-            unsafe {
-                cublasSgemm_v2(
+            let rc = unsafe {
+                cublasSgemmStridedBatched(
                     cublas_handle(),
                     CUBLAS_OP_T, CUBLAS_OP_N,
                     d as i32, c_len as i32, d as i32,
                     &alpha_val,
-                    m_chunk_states.as_ptr().add(m_cs_offset), d as i32,
-                    k_mem.as_ptr().add(k_offset), d as i32,
+                    m_chunk_states.as_ptr().add(c * dd), d as i32, ((num_chunks + 1) * dd) as i64,
+                    k_mem.as_ptr().add(t_start * d), d as i32, (seq_len * d) as i64,
                     &beta_val,
-                    errors.ptr().add(err_offset), d as i32,
-                );
-            }
+                    errors.ptr(), d as i32, (chunk_size * d) as i64,
+                    batch_size as i32,
+                )
+            };
+            assert_eq!(rc, 0, "cublasSgemmStridedBatched (titans bwd phase1) failed: {rc}");
         }
 
-        // Error subtract + clip
+        // Error subtract + clip (per-batch: V stride differs from errors stride)
         for b in 0..batch_size {
             let v_offset = b * seq_len * d + t_start * d;
             let err_offset = b * chunk_size * d;

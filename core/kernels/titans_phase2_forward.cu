@@ -12,6 +12,10 @@
 //
 // Grid=(batch_size), Block=(min(d², 1024)).
 // All fp32.
+//
+// Optimization: When d² <= 8192 (head_dim ≤ 90), M and S are loaded into
+// shared memory for the inner loop, eliminating global memory round-trips.
+// At hd=64: M+S = 32KB, well within both Ampere (100KB) and Hopper (228KB) limits.
 
 #include <cuda_runtime.h>
 #include <stdint.h>
@@ -28,7 +32,13 @@ static inline void check_cuda_launch(const char* kernel_name, int d, int smem_by
     }
 }
 
-__global__ void titans_phase2_forward_kernel(
+// ══════════════════════════════════════════════════════════════════════
+// Shared-memory variant: M and S live in smem for the entire inner loop.
+// Used when d² ≤ SMEM_DD_LIMIT (fits in dynamic shared memory).
+// ══════════════════════════════════════════════════════════════════════
+#define SMEM_DD_LIMIT 8192  // 2 * 8192 * 4 = 64KB for M+S in smem
+
+__global__ void titans_phase2_forward_kernel_smem(
     const float* __restrict__ k_mem,          // [batch_size, seq_len, d]
     const float* __restrict__ q_mem,          // [batch_size, seq_len, d]
     const float* __restrict__ alpha,          // [batch_size, seq_len]
@@ -66,18 +76,28 @@ __global__ void titans_phase2_forward_kernel(
     float* scs_b         = s_chunk_states + b * (num_chunks + 1) * dd;
     float* y_b           = y + b * seq_len * d;
 
+    // Shared memory layout: M[dd] + S[dd] + error_buf[d]
     extern __shared__ float smem[];
-    float* error_buf = smem;  // [d]
+    float* m_smem    = smem;                // [dd]
+    float* s_smem    = smem + dd;           // [dd]
+    float* error_buf = smem + 2 * dd;       // [d]
 
-    // Store M₀ and S₀ for this chunk
-    int cs_off = chunk_idx * dd;
+    // Load M and S from global into shared memory
     for (int idx = tid; idx < dd; idx += blockDim.x) {
-        mcs_b[cs_off + idx] = m_b[idx];
-        scs_b[cs_off + idx] = s_b[idx];
+        m_smem[idx] = m_b[idx];
+        s_smem[idx] = s_b[idx];
     }
     __syncthreads();
 
-    // Sequential recurrence + readout
+    // Store M₀ and S₀ for this chunk (write to global chunk_states)
+    int cs_off = chunk_idx * dd;
+    for (int idx = tid; idx < dd; idx += blockDim.x) {
+        mcs_b[cs_off + idx] = m_smem[idx];
+        scs_b[cs_off + idx] = s_smem[idx];
+    }
+    __syncthreads();
+
+    // Sequential recurrence + readout (all M/S access through shared memory)
     for (int tl = 0; tl < C; tl++) {
         int t = t_start + tl;
         const float* k_t = k_b + t * d;
@@ -98,6 +118,111 @@ __global__ void titans_phase2_forward_kernel(
         for (int idx = tid; idx < dd; idx += blockDim.x) {
             int i = idx / d;
             int j = idx % d;
+            float s_new = eta_t * s_smem[idx]
+                          - theta_t * error_buf[i] * k_t[j];
+            s_smem[idx] = s_new;
+            m_smem[idx] = retention * m_smem[idx] + s_new;
+        }
+        __syncthreads();
+
+        // Per-token M-norm projection (spec 74)
+        m_norm_project_inplace(m_smem, error_buf, dd, tid, m_norm_max);
+
+        // y_t = M_{t+1} @ q_t (reads M from shared memory)
+        for (int row = tid; row < d; row += blockDim.x) {
+            float sum = 0.0f;
+            for (int j = 0; j < d; j++) {
+                sum += m_smem[row * d + j] * q_t[j];
+            }
+            y_b[t * d + row] = sum;
+        }
+        __syncthreads();
+    }
+
+    // Write M and S back to global m_work/s_work
+    for (int idx = tid; idx < dd; idx += blockDim.x) {
+        m_b[idx] = m_smem[idx];
+        s_b[idx] = s_smem[idx];
+    }
+
+    // If this is the last chunk, store M_final and S_final
+    if (chunk_idx == num_chunks - 1) {
+        for (int idx = tid; idx < dd; idx += blockDim.x) {
+            mcs_b[num_chunks * dd + idx] = m_smem[idx];
+            scs_b[num_chunks * dd + idx] = s_smem[idx];
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Fallback: global-memory variant for large d (d² > SMEM_DD_LIMIT).
+// Identical to the original kernel — M and S stay in global memory.
+// ══════════════════════════════════════════════════════════════════════
+
+__global__ void titans_phase2_forward_kernel(
+    const float* __restrict__ k_mem,
+    const float* __restrict__ q_mem,
+    const float* __restrict__ alpha,
+    const float* __restrict__ theta,
+    const float* __restrict__ eta,
+    const float* __restrict__ errors,
+    float* __restrict__ m_work,
+    float* __restrict__ s_work,
+    float* __restrict__ m_chunk_states,
+    float* __restrict__ s_chunk_states,
+    float* __restrict__ y,
+    int seq_len, int d, int chunk_size, int chunk_idx,
+    float m_norm_max)
+{
+    int b = blockIdx.x;
+    int tid = threadIdx.x;
+    int dd = d * d;
+    int num_chunks = (seq_len + chunk_size - 1) / chunk_size;
+
+    int t_start = chunk_idx * chunk_size;
+    int t_end   = t_start + chunk_size;
+    if (t_end > seq_len) t_end = seq_len;
+    int C = t_end - t_start;
+
+    const float* k_b     = k_mem + b * seq_len * d;
+    const float* q_b     = q_mem + b * seq_len * d;
+    const float* alpha_b = alpha + b * seq_len;
+    const float* theta_b = theta + b * seq_len;
+    const float* eta_b   = eta + b * seq_len;
+    const float* err_b   = errors + b * chunk_size * d;
+    float* m_b           = m_work + b * dd;
+    float* s_b           = s_work + b * dd;
+    float* mcs_b         = m_chunk_states + b * (num_chunks + 1) * dd;
+    float* scs_b         = s_chunk_states + b * (num_chunks + 1) * dd;
+    float* y_b           = y + b * seq_len * d;
+
+    extern __shared__ float smem[];
+    float* error_buf = smem;  // [d]
+
+    int cs_off = chunk_idx * dd;
+    for (int idx = tid; idx < dd; idx += blockDim.x) {
+        mcs_b[cs_off + idx] = m_b[idx];
+        scs_b[cs_off + idx] = s_b[idx];
+    }
+    __syncthreads();
+
+    for (int tl = 0; tl < C; tl++) {
+        int t = t_start + tl;
+        const float* k_t = k_b + t * d;
+        const float* q_t = q_b + t * d;
+        float alpha_t = alpha_b[t];
+        float theta_t = theta_b[t];
+        float eta_t   = eta_b[t];
+
+        for (int row = tid; row < d; row += blockDim.x) {
+            error_buf[row] = err_b[tl * d + row];
+        }
+        __syncthreads();
+
+        float retention = 1.0f - alpha_t;
+        for (int idx = tid; idx < dd; idx += blockDim.x) {
+            int i = idx / d;
+            int j = idx % d;
             float s_new = eta_t * s_b[idx]
                           - theta_t * error_buf[i] * k_t[j];
             s_b[idx] = s_new;
@@ -105,10 +230,8 @@ __global__ void titans_phase2_forward_kernel(
         }
         __syncthreads();
 
-        // Per-token M-norm projection (spec 74, matches CPU reference)
         m_norm_project_inplace(m_b, error_buf, dd, tid, m_norm_max);
 
-        // y_t = M_{t+1} @ q_t
         for (int row = tid; row < d; row += blockDim.x) {
             float sum = 0.0f;
             for (int j = 0; j < d; j++) {
@@ -119,7 +242,6 @@ __global__ void titans_phase2_forward_kernel(
         __syncthreads();
     }
 
-    // If this is the last chunk, store M_final and S_final
     if (chunk_idx == num_chunks - 1) {
         for (int idx = tid; idx < dd; idx += blockDim.x) {
             mcs_b[num_chunks * dd + idx] = m_b[idx];
@@ -142,11 +264,26 @@ extern "C" void titans_phase2_forward_f32_cuda(
     dim3 grid(batch_size);
     dim3 block(block_size);
 
-    int smem_bytes = d * sizeof(float);  // error_buf[d]
+    if (dd <= SMEM_DD_LIMIT) {
+        // Shared-memory path: M[dd] + S[dd] + error_buf[d]
+        int smem_bytes = (2 * dd + d) * (int)sizeof(float);
 
-    titans_phase2_forward_kernel<<<grid, block, smem_bytes>>>(
-        k_mem, q_mem, alpha, theta, eta, errors, m_work, s_work,
-        m_chunk_states, s_chunk_states, y,
-        seq_len, d, chunk_size, chunk_idx, m_norm_max);
-    check_cuda_launch("titans_phase2_forward_kernel", d, smem_bytes);
+        cudaFuncSetAttribute(titans_phase2_forward_kernel_smem,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+
+        titans_phase2_forward_kernel_smem<<<grid, block, smem_bytes>>>(
+            k_mem, q_mem, alpha, theta, eta, errors, m_work, s_work,
+            m_chunk_states, s_chunk_states, y,
+            seq_len, d, chunk_size, chunk_idx, m_norm_max);
+        check_cuda_launch("titans_phase2_forward_kernel_smem", d, smem_bytes);
+    } else {
+        // Fallback: global-memory path for large d
+        int smem_bytes = d * (int)sizeof(float);
+
+        titans_phase2_forward_kernel<<<grid, block, smem_bytes>>>(
+            k_mem, q_mem, alpha, theta, eta, errors, m_work, s_work,
+            m_chunk_states, s_chunk_states, y,
+            seq_len, d, chunk_size, chunk_idx, m_norm_max);
+        check_cuda_launch("titans_phase2_forward_kernel", d, smem_bytes);
+    }
 }
