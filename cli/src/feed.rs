@@ -570,7 +570,13 @@ pub fn feed(config_path: &str, resume: bool) {
         // Resolve per-phase overrides (fall back to build defaults)
         let opt = phase.optimizer.as_ref().unwrap_or(default_opt);
         let batch_size = phase.batch_size.unwrap_or(cfg.build.batch_size);
-        let phase_seq_len = phase.segments.map(|s| s * ws).unwrap_or(seq_len);
+        let phase_seq_len = match phase.segments {
+            Some(s) => s.checked_mul(ws).unwrap_or_else(|| {
+                eprintln!("ERROR: phase {phase_idx} segments={s} * window_size={ws} overflows");
+                std::process::exit(1);
+            }),
+            None => seq_len,
+        };
         let save_every = phase.save_every.unwrap_or(cfg.build.save_every);
         let log_every = phase.log_every.unwrap_or(cfg.build.log_every);
 
@@ -1133,7 +1139,7 @@ pub fn feed(config_path: &str, resume: bool) {
     if cfg.build.checkpoint.on_unload && trigger_state.is_stale(total_tokens_seen as u64) {
         eprintln!("  [on_unload: saving final checkpoint at step {global_step}]");
         let naming = &cfg.build.checkpoint.naming;
-        let _ = save_checkpoint(
+        let saved = save_checkpoint(
             &save_path, global_step, total_tokens_seen,
             naming, loss_last,
             &mut model_state, &state_file_path, "on_unload",
@@ -1143,6 +1149,10 @@ pub fn feed(config_path: &str, resume: bool) {
             &last_loaders, &cms_activations, d, v, k,
             &mut logger,
         );
+        if !saved {
+            eprintln!("ERROR: final durable save failed on_unload — state file may be stale");
+            std::process::exit(1);
+        }
     }
 
     // ── Summary ──────────────────────────────────────────────────────
