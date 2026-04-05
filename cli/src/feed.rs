@@ -227,7 +227,7 @@ pub fn feed(config_path: &str, resume: bool) {
             std::process::exit(1);
         }
 
-        if cfg.build.seq_len_override.is_some() {
+        if cfg.build.segments_override.is_some() {
             mag_cfg.swa.seq_len = seq_len;
         }
 
@@ -434,6 +434,12 @@ pub fn feed(config_path: &str, resume: bool) {
         .unwrap_or_default();
     let mut fire_counts = vec![0usize; k];
 
+    // ── CMS activation counter (SFL-4: health snapshot) ─────────────
+    // Counts how many optimizer steps each level was active since the
+    // last checkpoint. Separate from fire_counts (which tracks spec 57
+    // reset cycles). Reset on each checkpoint save.
+    let mut cms_activations = vec![0u64; k];
+
     // ── Conductor ────────────────────────────────────────────────────
     // Replay conductor to its persisted per-token step (not global_step which
     // counts optimizer steps). step()/generate() advance conductor per-token.
@@ -564,7 +570,13 @@ pub fn feed(config_path: &str, resume: bool) {
         // Resolve per-phase overrides (fall back to build defaults)
         let opt = phase.optimizer.as_ref().unwrap_or(default_opt);
         let batch_size = phase.batch_size.unwrap_or(cfg.build.batch_size);
-        let phase_seq_len = phase.seq_len.unwrap_or(seq_len);
+        let phase_seq_len = match phase.segments {
+            Some(s) => s.checked_mul(ws).unwrap_or_else(|| {
+                eprintln!("ERROR: phase {phase_idx} segments={s} * window_size={ws} overflows");
+                std::process::exit(1);
+            }),
+            None => seq_len,
+        };
         let save_every = phase.save_every.unwrap_or(cfg.build.save_every);
         let log_every = phase.log_every.unwrap_or(cfg.build.log_every);
 
@@ -604,6 +616,7 @@ pub fn feed(config_path: &str, resume: bool) {
                         gpu_context.set_dormancy_config(floors.clone(), consecutive);
                     }
                 }
+                conductor.set_seq_len(phase_seq_len);
                 // AdamW state is param-sized (not batch/seq dependent), keep it
                 eprintln!("  [GPU context reallocated: batch_size={batch_size}, seq_len={phase_seq_len}]");
             }
@@ -653,6 +666,9 @@ pub fn feed(config_path: &str, resume: bool) {
 
                     // Capture pulse snapshot for logging (conductor advances inside step_micro())
                     let pulse = conductor.pulse();
+
+                    // SFL-4: count CMS activations per level for health snapshot
+                    count_cms_activations(&pulse, k, &mut cms_activations);
 
                     // Spec 63: compute log_this early so backward can skip gnorm readback
                     let log_this = log_every > 0 && phase_step % log_every == 0;
@@ -858,7 +874,7 @@ pub fn feed(config_path: &str, resume: bool) {
                     };
 
                     if do_checkpoint {
-                        save_checkpoint(
+                        let saved = save_checkpoint(
                             &save_path, global_step, total_tokens_seen,
                             checkpoint_naming, loss,
                             &mut model_state, &state_file_path, &phase.label,
@@ -867,24 +883,29 @@ pub fn feed(config_path: &str, resume: bool) {
                             #[cfg(feature = "cuda")]
                             &gpu_context,
                             &mag_cfg, &conductor, &chunk_sizes,
-                            &loaders, &fire_counts, d, v, k,
+                            &loaders, &cms_activations, d, v, k,
                             &mut logger,
                         );
-                        trigger_state.record_checkpoint(total_tokens_seen as u64, loss);
+                        if saved {
+                            trigger_state.record_checkpoint(total_tokens_seen as u64, loss);
+                            cms_activations.fill(0); // Reset for next interval
+                        }
 
                         // Run inline probes if tokenizer is configured
                         #[cfg(feature = "cuda")]
-                        if let Some(ref tok_path) = cfg.build.tokenizer_path {
-                            let snapshot = gpu_params.to_host(&mag_cfg);
-                            let probe_results = run_inline_probes(
-                                &snapshot, &mag_cfg, tok_path, global_step,
-                                d, v, k, n_blocks, &chunk_sizes,
-                                cfg.build.probe_max_tokens,
-                                cfg.build.probe_temperature,
-                                opt.lr(), opt.beta1(), opt.beta2(),
-                                opt.weight_decay(), max_grad_norm,
-                            );
-                            logger.log_probe_results(global_step, probe_results);
+                        if saved {
+                            if let Some(ref tok_path) = cfg.build.tokenizer_path {
+                                let snapshot = gpu_params.to_host(&mag_cfg);
+                                let probe_results = run_inline_probes(
+                                    &snapshot, &mag_cfg, tok_path, global_step,
+                                    d, v, k, n_blocks, &chunk_sizes,
+                                    cfg.build.probe_max_tokens,
+                                    cfg.build.probe_temperature,
+                                    opt.lr(), opt.beta1(), opt.beta2(),
+                                    opt.weight_decay(), max_grad_norm,
+                                );
+                                logger.log_probe_results(global_step, probe_results);
+                            }
                         }
                     }
                 }
@@ -894,6 +915,11 @@ pub fn feed(config_path: &str, resume: bool) {
 
             PhaseDuration::ThinkRounds(rounds) => {
                 // ── Think rounds: iterative self-refinement ────────
+                // Clear stale loaders from any prior Steps phase so the
+                // phase-boundary/on_unload checkpoint won't serialize
+                // stale stream cursor positions.
+                last_loaders.clear();
+
                 if batch_size != 1 {
                     eprintln!("ERROR: think_rounds requires batch_size=1 (got {batch_size}) — \
                         generation is singleton. Add \"batch_size\": 1 to the phase.");
@@ -928,6 +954,9 @@ pub fn feed(config_path: &str, resume: bool) {
 
                     let lr = opt.lr(); // think_rounds uses constant lr (no schedule)
                     let pulse = conductor.pulse(); // snapshot for logging
+
+                    // SFL-4: count CMS activations per level for health snapshot
+                    count_cms_activations(&pulse, k, &mut cms_activations);
 
                     // LEARN from current input (unified forward path)
                     #[cfg(feature = "cuda")]
@@ -996,6 +1025,9 @@ pub fn feed(config_path: &str, resume: bool) {
                         let gen_temp = phase.temperature.unwrap_or(0.0);
                         let gen_top_k = phase.top_k.unwrap_or(0);
 
+                        // SFL-4: count CMS activations for the generate optimizer step
+                        count_cms_activations(&conductor.pulse(), k, &mut cms_activations);
+
                         let gen_result = generate(
                             &mut gpu_params, &mag_cfg, &mut gpu_context,
                             &mut adamw_state, &mut conductor,
@@ -1032,12 +1064,60 @@ pub fn feed(config_path: &str, resume: bool) {
 
         if aborted { break; }
 
-        // Restore GPU context to build defaults if phase overrode them
+        // ── Phase boundary checkpoint ─────────────────────────────
+        // Must happen BEFORE gpu_context restore so health snapshot reads
+        // the phase-active context (prev_m_norms, etc.), not a fresh default.
+        // Skip if the last step already saved (avoids duplicate entry).
+        #[cfg(feature = "cuda")]
+        let phase_boundary_saved = if trigger_state.is_stale(total_tokens_seen as u64) {
+            eprintln!("  [phase {phase_idx} complete — checkpoint at step {global_step}]");
+            let saved = save_checkpoint(
+                &save_path, global_step, total_tokens_seen,
+                checkpoint_naming, loss_last,
+                &mut model_state, &state_file_path, &phase.label,
+                &gpu_params,
+                &gpu_context,
+                &mag_cfg, &conductor, &chunk_sizes,
+                &last_loaders, &cms_activations, d, v, k,
+                &mut logger,
+            );
+            if saved {
+                trigger_state.record_checkpoint(total_tokens_seen as u64, loss_last);
+                cms_activations.fill(0);
+            }
+            saved
+        } else {
+            eprintln!("  [phase {phase_idx} complete — already checkpointed at step {global_step}]");
+            false
+        };
+
+        // Run inline probes BEFORE restoring gpu_context/mag_cfg to build defaults,
+        // so probes see the phase-active seq_len and optimizer settings.
+        #[cfg(feature = "cuda")]
+        if phase_boundary_saved {
+            if let Some(ref tok_path) = cfg.build.tokenizer_path {
+                let snapshot = gpu_params.to_host(&mag_cfg);
+                let probe_results = run_inline_probes(
+                    &snapshot, &mag_cfg, tok_path, global_step,
+                    d, v, k, n_blocks, &chunk_sizes,
+                    cfg.build.probe_max_tokens,
+                    cfg.build.probe_temperature,
+                    opt.lr(), opt.beta1(), opt.beta2(),
+                    opt.weight_decay(), max_grad_norm,
+                );
+                logger.log_probe_results(global_step, probe_results);
+            }
+        }
+
+        // Restore GPU context to build defaults if phase overrode them.
+        // Skip restore on the last phase if save failed — on_unload needs the
+        // phase-local context for a retry with correct health snapshot.
         #[cfg(feature = "cuda")]
         {
             let needs_restore = batch_size != cfg.build.batch_size
                 || phase_seq_len != seq_len;
-            if needs_restore {
+            let is_last_phase = phase_idx + 1 == phases.len();
+            if needs_restore && (phase_boundary_saved || !is_last_phase) {
                 mag_cfg.swa.seq_len = seq_len;
                 gpu_context = GpuStackedContext::new(
                     n_blocks, k, d, cfg.build.batch_size, Some(&mag_cfg),
@@ -1049,38 +1129,7 @@ pub fn feed(config_path: &str, resume: bool) {
                         gpu_context.set_dormancy_config(floors.clone(), consecutive);
                     }
                 }
-            }
-        }
-
-        // ── Phase boundary checkpoint ─────────────────────────────
-        eprintln!("  [phase {phase_idx} complete — checkpoint at step {global_step}]");
-        #[cfg(feature = "cuda")]
-        {
-            save_checkpoint(
-                &save_path, global_step, total_tokens_seen,
-                checkpoint_naming, loss_last,
-                &mut model_state, &state_file_path, &phase.label,
-                &gpu_params,
-                &gpu_context,
-                &mag_cfg, &conductor, &chunk_sizes,
-                &last_loaders, &fire_counts, d, v, k,
-                &mut logger,
-            );
-            trigger_state.record_checkpoint(total_tokens_seen as u64, loss_last);
-
-            // Run inline probes at phase boundary
-            if let Some(ref tok_path) = cfg.build.tokenizer_path {
-                let default_opt = &cfg.build.optimizer;
-                let snapshot = gpu_params.to_host(&mag_cfg);
-                let probe_results = run_inline_probes(
-                    &snapshot, &mag_cfg, tok_path, global_step,
-                    d, v, k, n_blocks, &chunk_sizes,
-                    cfg.build.probe_max_tokens,
-                    cfg.build.probe_temperature,
-                    default_opt.lr(), default_opt.beta1(), default_opt.beta2(),
-                    default_opt.weight_decay(), cfg.build.max_grad_norm,
-                );
-                logger.log_probe_results(global_step, probe_results);
+                conductor.set_seq_len(seq_len);
             }
         }
     }
@@ -1090,16 +1139,20 @@ pub fn feed(config_path: &str, resume: bool) {
     if cfg.build.checkpoint.on_unload && trigger_state.is_stale(total_tokens_seen as u64) {
         eprintln!("  [on_unload: saving final checkpoint at step {global_step}]");
         let naming = &cfg.build.checkpoint.naming;
-        save_checkpoint(
+        let saved = save_checkpoint(
             &save_path, global_step, total_tokens_seen,
             naming, loss_last,
             &mut model_state, &state_file_path, "on_unload",
             &gpu_params,
             &gpu_context,
             &mag_cfg, &conductor, &chunk_sizes,
-            &last_loaders, &fire_counts, d, v, k,
+            &last_loaders, &cms_activations, d, v, k,
             &mut logger,
         );
+        if !saved {
+            eprintln!("ERROR: final durable save failed on_unload — state file may be stale");
+            std::process::exit(1);
+        }
     }
 
     // ── Summary ──────────────────────────────────────────────────────
@@ -1184,6 +1237,7 @@ fn collect_cms_diagnostics(
 }
 
 /// Save checkpoint with build state, and update the state file.
+/// Returns true if the checkpoint was saved successfully, false on error.
 fn save_checkpoint(
     save_path: &str,
     global_step: usize,
@@ -1199,16 +1253,23 @@ fn save_checkpoint(
     conductor: &Conductor,
     chunk_sizes: &[usize],
     loaders: &[BpeTokenStream],
-    fire_counts: &[usize],
-    d: usize,
-    v: usize,
+    cms_activations: &[u64],
+    _d: usize,
+    _v: usize,
     k: usize,
     logger: &mut MetricsLogger,
-) {
-    let ckpt_path = checkpoint_filename(save_path, naming, global_step, total_tokens_seen);
+) -> bool {
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (save_path, global_step, total_tokens_seen, naming, loss, model_state,
+                 state_file_path, phase_label, mag_cfg, conductor, chunk_sizes, loaders,
+                 cms_activations, k, logger);
+        return false;
+    }
 
     #[cfg(feature = "cuda")]
     {
+        let ckpt_path = checkpoint_filename(save_path, naming, global_step, total_tokens_seen);
         let host_params = gpu_params.to_host(mag_cfg);
         let host_context = gpu_context.blocks[0].to_host(k);
         let stream_position = loaders.first().map(|l| l.position as u64).unwrap_or(0);
@@ -1248,7 +1309,6 @@ fn save_checkpoint(
         ) {
             Ok(()) => {
                 eprintln!("  [checkpoint saved: {ckpt_path}]");
-                logger.log_checkpoint(global_step, &ckpt_path);
 
                 // Spec 02 / SFL-4: health snapshot from live GPU state
                 let n_blocks = gpu_context.n_blocks.max(1) as f32;
@@ -1281,10 +1341,6 @@ fn save_checkpoint(
                 for v in &mut gate_alpha_mean { *v /= n_blocks_params; }
                 for v in &mut gate_theta_mean { *v /= n_blocks_params; }
 
-                let cms_activations: Vec<u64> = fire_counts.iter()
-                    .map(|&c| c as u64)
-                    .collect();
-
                 let entry = CheckpointEntry {
                     path: ckpt_path.clone(),
                     tokens: total_tokens_seen as u64,
@@ -1295,7 +1351,7 @@ fn save_checkpoint(
                         m_norm_per_level,
                         gate_alpha_mean_per_level: gate_alpha_mean,
                         gate_theta_mean_per_level: gate_theta_mean,
-                        cms_activations_since_restore: cms_activations,
+                        cms_activations_since_restore: cms_activations.to_vec(),
                     },
                     session: SessionInfo::Build {
                         label: phase_label.into(),
@@ -1304,13 +1360,19 @@ fn save_checkpoint(
                         config_snapshot: String::new(),
                     },
                 };
-                state_file::record_checkpoint(model_state, entry, &stream_cursors);
-                if let Err(e) = state_file::save_state_file(state_file_path, model_state) {
+                let mut staged = model_state.clone();
+                state_file::record_checkpoint(&mut staged, entry, &stream_cursors);
+                if let Err(e) = state_file::save_state_file(state_file_path, &staged) {
                     eprintln!("WARNING: state file update failed: {e}");
+                    return false;
                 }
+                *model_state = staged;
+                logger.log_checkpoint(global_step, &ckpt_path);
+                return true;
             }
             Err(e) => {
                 eprintln!("ERROR: checkpoint save failed: {e}");
+                return false;
             }
         }
     }
@@ -1327,6 +1389,15 @@ fn fmt_num(n: usize) -> String {
         result.push(c);
     }
     result
+}
+
+/// Increment CMS activation counters for each active level in the pulse.
+fn count_cms_activations(pulse: &Pulse, k: usize, cms_activations: &mut [u64]) {
+    for (level, &active) in pulse.active_levels.iter().enumerate() {
+        if active && level < k {
+            cms_activations[level] += 1;
+        }
+    }
 }
 
 /// Default chunk sizes for k levels.

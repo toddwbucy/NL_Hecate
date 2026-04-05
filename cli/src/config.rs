@@ -17,7 +17,9 @@ pub struct Config {
 pub struct ModelConfig {
     pub d_model: usize,
     pub num_heads: usize,
-    pub seq_len: usize,
+    /// Number of SWA windows per forward pass. seq_len = segments * window_size.
+    /// This guarantees seq_len is always a multiple of window_size — no split context.
+    pub segments: usize,
     #[serde(default = "default_window_size")]
     pub window_size: usize,
     #[serde(default = "default_vocab_size")]
@@ -229,7 +231,8 @@ pub struct BuildConfig {
     /// Reset step counter to 0 when loading a checkpoint (for gear shifts).
     #[serde(default)]
     pub reset_step: bool,
-    pub seq_len_override: Option<usize>,
+    /// Override segments count for this build (seq_len = segments_override * window_size).
+    pub segments_override: Option<usize>,
     pub run_dir: Option<String>,
     pub save_path: Option<String>,
     pub log_file: Option<String>,
@@ -299,7 +302,8 @@ pub struct PhaseConfig {
     pub optimizer: Option<OptimizerConfig>,
     pub batch_size: Option<usize>,
     pub accum_steps: Option<usize>,
-    pub seq_len: Option<usize>,
+    /// Per-phase segment override (seq_len = segments * window_size).
+    pub segments: Option<usize>,
     pub save_every: Option<usize>,
     pub log_every: Option<usize>,
     pub max_grad_norm: Option<f32>,
@@ -403,6 +407,15 @@ impl Config {
     }
 
     fn validate(cfg: &Config) -> Result<(), String> {
+        if cfg.model.segments == 0 {
+            return Err("model.segments must be >= 1".into());
+        }
+        if cfg.model.window_size == 0 {
+            return Err("model.window_size must be >= 1".into());
+        }
+        if let Some(0) = cfg.build.segments_override {
+            return Err("build.segments_override must be >= 1 (use null to disable)".into());
+        }
         if cfg.build.accum_steps < 1 {
             return Err("accum_steps must be >= 1".into());
         }
@@ -411,6 +424,10 @@ impl Config {
                 if phase.accum_steps == Some(0) {
                     let label = phase.label.as_deref().unwrap_or(&phase.data);
                     return Err(format!("phase {i} ({label}): accum_steps must be >= 1"));
+                }
+                if phase.segments == Some(0) {
+                    let label = phase.label.as_deref().unwrap_or(&phase.data);
+                    return Err(format!("phase {i} ({label}): segments must be >= 1"));
                 }
             }
         }
@@ -450,9 +467,12 @@ impl Config {
         }
     }
 
-    /// Effective seq_len (override takes precedence).
+    /// Effective seq_len = segments * window_size. Override takes precedence.
     pub fn seq_len(&self) -> usize {
-        self.build.seq_len_override.unwrap_or(self.model.seq_len)
+        let base = self.model.segments * self.model.window_size;
+        self.build.segments_override
+            .map(|s| s * self.model.window_size)
+            .unwrap_or(base)
     }
 
     /// Resolve phases: if `phases` is present, use it. Otherwise, synthesize
@@ -490,7 +510,7 @@ impl Config {
                     optimizer: merged_optimizer,
                     batch_size: phase.batch_size,
                     accum_steps: phase.accum_steps,
-                    seq_len: phase.seq_len,
+                    segments: phase.segments,
                     save_every: phase.save_every,
                     log_every: phase.log_every,
                     max_grad_norm: phase.max_grad_norm,
@@ -514,7 +534,7 @@ impl Config {
                 optimizer: None,
                 batch_size: None,
                 accum_steps: None,
-                seq_len: None,
+                segments: None,
                 save_every: None,
                 log_every: None,
                 max_grad_norm: None,
@@ -537,7 +557,8 @@ pub struct ResolvedPhase {
     pub optimizer: Option<OptimizerConfig>,
     pub batch_size: Option<usize>,
     pub accum_steps: Option<usize>,
-    pub seq_len: Option<usize>,
+    /// Per-phase segment override (seq_len = segments * window_size).
+    pub segments: Option<usize>,
     pub save_every: Option<usize>,
     pub log_every: Option<usize>,
     pub max_grad_norm: Option<f32>,
@@ -561,7 +582,7 @@ mod tests {
     use super::*;
 
     fn minimal_model_json() -> &'static str {
-        r#""model": {"d_model": 64, "num_heads": 2, "seq_len": 32}"#
+        r#""model": {"d_model": 64, "num_heads": 2, "segments": 1}"#
     }
 
     #[test]
@@ -887,5 +908,29 @@ mod tests {
 
         // Phase 1: no override, inherits top-level
         assert!(phases[1].checkpoint.is_none());
+    }
+
+    #[test]
+    fn zero_segments_rejected() {
+        let json = r#"{
+            "model": {"d_model": 64, "num_heads": 2, "segments": 0},
+            "build": {"optimizer": {"type": "adamw", "lr": 0.0003}},
+            "data": {"path": "data/test"}
+        }"#;
+        let err = Config::from_str(json).unwrap_err();
+        assert!(err.contains("segments must be >= 1"));
+    }
+
+    #[test]
+    fn zero_phase_segments_rejected() {
+        let json = format!(r#"{{
+            {},
+            "build": {{"optimizer": {{"type": "adamw", "lr": 0.0003}}}},
+            "phases": [
+                {{"data": "data/test", "steps": 100, "segments": 0}}
+            ]
+        }}"#, minimal_model_json());
+        let err = Config::from_str(&json).unwrap_err();
+        assert!(err.contains("segments must be >= 1"));
     }
 }

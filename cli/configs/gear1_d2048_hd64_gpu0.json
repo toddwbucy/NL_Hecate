@@ -1,9 +1,9 @@
 {
-    "description": "Gear 1: d2048 hd=64 (32 heads), 8 blocks, seq_len=512. Fresh init on foundations. GPU0. No probes.",
+    "description": "Gear 1: d2048 hd=64 (32 heads), 8 blocks, 1 segment (512 tok). Fresh init on foundations. GPU0. No probes.",
     "model": {
         "d_model": 2048,
         "num_heads": 32,
-        "seq_len": 512,
+        "segments": 1,
         "window_size": 512,
         "vocab_size": 49152,
         "memory_rule": "titans",
