@@ -1350,11 +1350,13 @@ fn save_checkpoint(
                         config_snapshot: String::new(),
                     },
                 };
-                state_file::record_checkpoint(model_state, entry, &stream_cursors);
-                if let Err(e) = state_file::save_state_file(state_file_path, model_state) {
+                let mut staged = model_state.clone();
+                state_file::record_checkpoint(&mut staged, entry, &stream_cursors);
+                if let Err(e) = state_file::save_state_file(state_file_path, &staged) {
                     eprintln!("WARNING: state file update failed: {e}");
                     return false;
                 }
+                *model_state = staged;
                 logger.log_checkpoint(global_step, &ckpt_path);
                 return true;
             }
