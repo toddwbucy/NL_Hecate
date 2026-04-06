@@ -497,6 +497,7 @@ impl MemoryLevelParams {
     /// Memory projections (w_k_mem, w_v_mem, w_q_mem) are scaled by 1/sqrt(2*n_blocks)
     /// to prevent gradient amplification through deep residual stacks (GPT-2 trick).
     pub fn init_with_depth(d: usize, rng: &mut SimpleRng, b_alpha_init: f32, b_theta_init: f32, b_eta_init: f32, n_blocks: usize) -> Self {
+        assert!(n_blocks > 0, "init_with_depth requires n_blocks > 0");
         let proj_scale = (2.0 / (d + d) as f32).sqrt();
         let depth_factor = 1.0 / (2.0 * n_blocks as f32).sqrt();
         let mem_proj_scale = proj_scale * depth_factor;
