@@ -66,11 +66,16 @@ impl BlockParams {
     /// not yet wired: AtlasOmega atlas_init, learned frequency gates (omega/freq
     /// params in MemoryLevelParams), Conv1D buffers, MAC persistent tokens.
     /// These will be added when their respective compositions are stacked.
-    pub fn init(cfg: &MAGConfig, seed: u64) -> Self {
+    pub fn init(cfg: &MAGConfig, seed: u64, n_blocks: usize) -> Self {
+        assert!(n_blocks > 0, "BlockParams::init requires n_blocks > 0");
         let d = cfg.swa.d_model;
         let mut rng = SimpleRng::new(seed);
 
         let proj_scale = (2.0 / (d + d) as f32).sqrt();
+        // GPT-2 depth scaling: output projections scaled by 1/sqrt(2*n_blocks)
+        // to prevent gradient amplification through deep residual stacks.
+        let depth_factor = 1.0 / (2.0 * n_blocks as f32).sqrt();
+        let w_o_scale = proj_scale * depth_factor;
         let mut w_q = vec![0.0f32; d * d];
         let mut w_k = vec![0.0f32; d * d];
         let mut w_v = vec![0.0f32; d * d];
@@ -78,7 +83,7 @@ impl BlockParams {
         rng.fill_uniform(&mut w_q, proj_scale);
         rng.fill_uniform(&mut w_k, proj_scale);
         rng.fill_uniform(&mut w_v, proj_scale);
-        rng.fill_uniform(&mut w_o, proj_scale);
+        rng.fill_uniform(&mut w_o, w_o_scale);
 
         let ln_attn_gamma = vec![1.0f32; d];
         let ln_attn_beta = vec![0.0f32; d];
@@ -92,11 +97,12 @@ impl BlockParams {
                 .unwrap_or_else(|| default_b_alpha(level));
             let b_theta = cfg.b_theta_init.get(level).copied()
                 .unwrap_or_else(|| default_b_theta(level));
-            let level_params = MemoryLevelParams::init(
+            let level_params = MemoryLevelParams::init_with_depth(
                 d, &mut level_rng,
                 b_alpha,
                 b_theta,
                 default_b_eta(level),
+                n_blocks,
             );
             levels.push(level_params);
         }
@@ -184,7 +190,7 @@ impl StackedMAGParams {
 
         // Per-block init with distinct seeds
         let blocks = (0..n_blocks)
-            .map(|b| BlockParams::init(cfg, seed.wrapping_add(10_000 + b as u64 * 10_000)))
+            .map(|b| BlockParams::init(cfg, seed.wrapping_add(10_000 + b as u64 * 10_000), n_blocks))
             .collect();
 
         // Persistent tokens: small random init (same scale as embeddings)
@@ -310,7 +316,7 @@ impl StackedMAGParams {
         // Per-block level shift with distinct seeds
         let new_blocks: Vec<BlockParams> = self.blocks.iter().enumerate().map(|(b, old_block)| {
             let block_seed = seed.wrapping_add(b as u64 * 10_000);
-            let mut new_block = BlockParams::init(new_cfg, block_seed);
+            let mut new_block = BlockParams::init(new_cfg, block_seed, self.blocks.len());
 
             // Preserve SWA projections and LayerNorms for this block
             new_block.w_q = old_block.w_q.clone();
@@ -404,7 +410,7 @@ impl StackedMAGParams {
 
         let new_blocks: Vec<BlockParams> = self.blocks.iter().enumerate().map(|(b, old_block)| {
             let block_seed = seed.wrapping_add(b as u64 * 10_000);
-            let mut new_block = BlockParams::init(new_cfg, block_seed);
+            let mut new_block = BlockParams::init(new_cfg, block_seed, self.blocks.len());
 
             // Preserve SWA projections and LayerNorms
             new_block.w_q = old_block.w_q.clone();
