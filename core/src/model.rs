@@ -453,19 +453,28 @@ impl MemoryLevelParams {
     ///   Level 1: b_alpha=4.0 (sigmoid≈0.98), b_theta=-5.6 (softplus≈0.004)
     /// `b_eta_init`: momentum gate bias (only used by TitansLMM; still allocated for uniform struct).
     pub fn init(d: usize, rng: &mut SimpleRng, b_alpha_init: f32, b_theta_init: f32, b_eta_init: f32) -> Self {
+        Self::init_with_depth(d, rng, b_alpha_init, b_theta_init, b_eta_init, 1)
+    }
+
+    /// Initialize with depth-dependent scaling for memory projections.
+    /// Memory output feeds into the residual stream, so w_k_mem/w_v_mem/w_q_mem
+    /// are scaled by 1/sqrt(2*n_blocks) to prevent gradient amplification.
+    pub fn init_with_depth(d: usize, rng: &mut SimpleRng, b_alpha_init: f32, b_theta_init: f32, b_eta_init: f32, n_blocks: usize) -> Self {
         let proj_scale = (2.0 / (d + d) as f32).sqrt();
+        let depth_factor = 1.0 / (2.0 * n_blocks as f32).sqrt();
+        let mem_proj_scale = proj_scale * depth_factor;
         let gate_scale = (1.0 / (2 * d) as f32).sqrt();
 
         let mut w_k_raw = vec![0.0f32; d * d];
-        rng.fill_uniform(&mut w_k_raw, proj_scale);
+        rng.fill_uniform(&mut w_k_raw, mem_proj_scale);
         let w_k_mem = Bf16Storage::from_f32_vec(w_k_raw);
 
         let mut w_v_raw = vec![0.0f32; d * d];
-        rng.fill_uniform(&mut w_v_raw, proj_scale);
+        rng.fill_uniform(&mut w_v_raw, mem_proj_scale);
         let w_v_mem = Bf16Storage::from_f32_vec(w_v_raw);
 
         let mut w_q_raw = vec![0.0f32; d * d];
-        rng.fill_uniform(&mut w_q_raw, proj_scale);
+        rng.fill_uniform(&mut w_q_raw, mem_proj_scale);
         let w_q_mem = Bf16Storage::from_f32_vec(w_q_raw);
 
         let mut w_alpha = vec![0.0f32; 2 * d];
