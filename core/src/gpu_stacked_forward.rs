@@ -1190,6 +1190,13 @@ pub fn gpu_stacked_forward_tokens(
     ws: &mut StackedDecodeWorkspace,
     activation_window: &mut ActivationWindow,
 ) -> Vec<f32> {
+    assert!(
+        !matches!(cfg.composition, CompositionKind::MAC),
+        "gpu_stacked_forward_tokens: MAC composition is not yet supported in the \
+         decode path (forward_single_token / ActivationWindow::assemble_cache). \
+         Use forward_sequence for MAC build experiments. See spec 79 TODO."
+    );
+
     let v = cfg.swa.vocab_size;
     let mut last_logits = vec![0.0f32; v];
 
@@ -2000,7 +2007,11 @@ fn forward_sequence(
         logits,
         pulse: pulse.clone(),
         s, d, v, nh, hd,
-        ws: window_size,
+        ws: if matches!(cfg.composition, CompositionKind::MAC) {
+            cfg.n_persistent + 2 * s  // MAC: full causal over assembled_len
+        } else {
+            window_size               // MAG: SWA sliding window
+        },
         batch_size: bs,
         s_aug: if matches!(cfg.composition, CompositionKind::MAC) {
             cfg.n_persistent + 2 * s  // assembled_len for MAC

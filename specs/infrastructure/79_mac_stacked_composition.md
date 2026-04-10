@@ -140,13 +140,15 @@ mac_window = assembled_len    -- full causal = window covers entire assembled se
 ```
 
 The config's `window_size` field retains its meaning for MAG (sliding window).
-For MAC, the code overrides the effective window to `assembled_len` regardless
-of the configured `window_size`. Config validation enforces:
+For MAC, `window_size` defines L_seg (the per-segment token count). The code
+overrides the effective attention window per call to `n_persistent + 2 * L_seg`
+regardless of the configured `window_size` value:
 
 ```text
 IF composition == "mac":
-  effective_window = n_persistent + 2 * seq_len
-  -- config.window_size is informational only (ignored)
+  L_seg = config.window_size           -- segment size (raw tokens per forward call)
+  effective_window = n_persistent + 2 * L_seg  -- full causal over assembled
+  -- config.window_size is NOT used as a sliding window; it only sets L_seg
 ```
 
 ## Memory Operations
@@ -264,7 +266,7 @@ The `window_size` config field serves different roles per composition:
 The assembled attention window **per call** is `n_p + 2 * L_seg`. For the initial experiment:
 - `window_size: 512` → L_seg = 512, assembled per call = 8 + 2*512 = 1032 tokens
 - `segments: 20` → 20 forward calls per step, 10240 total tokens
-- Attention cost per call: O(1032^2 * d) ≈ 4x vs MAG's SWA O(512 * 512 * d)
+- Attention cost per call: `O(1032^2 * d)` ≈ 4x vs MAG's SWA `O(512 * 512 * d)`
 
 ## Backward Pass
 
