@@ -69,6 +69,9 @@ pub struct GpuStackedBlockCache {
     pub mac_gated_out: Option<GpuBuf<f32>>,
     /// Per-level pre-WRITE M states [d*d each]. Backward needs for READ gradient.
     pub mac_pre_write_m: Option<Vec<GpuBuf<f32>>>,
+    /// READ aggregation weights [k] — softmax(alpha_mem). Separate from alpha_weights
+    /// (which stores reflective weights for MAC). Backward needs this for d_alpha_mem.
+    pub mac_read_weights: Option<Vec<f32>>,
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -569,6 +572,7 @@ impl ActivationWindow {
                 mac_h_t: None,
                 mac_gated_out: None,
                 mac_pre_write_m: None,
+                mac_read_weights: None,
             });
         }
 
@@ -1411,19 +1415,19 @@ fn forward_sequence(
         }
 
         // Aggregate h_t across levels (softmax-weighted sum)
-        let h_t = if cfg.k == 1 {
-            h_t_upsampled[0].clone_buf()
+        let (h_t, read_weights) = if cfg.k == 1 {
+            (h_t_upsampled[0].clone_buf(), vec![1.0])
         } else {
             let mut alpha_host = vec![0.0f32; cfg.k];
             block.alpha_mem.slice(0, cfg.k).copy_to_host(&mut alpha_host);
-            let read_weights = crate::stacked_model::host_softmax(&alpha_host);
+            let rw = crate::stacked_model::host_softmax(&alpha_host);
             let h = GpuBuf::zeros(sd);
             for (l, h_full) in h_t_upsampled.iter().enumerate() {
                 unsafe {
-                    crate::cuda_ffi::saxpy_cuda(read_weights[l], h_full.as_ptr(), h.ptr(), sd_i32);
+                    crate::cuda_ffi::saxpy_cuda(rw[l], h_full.as_ptr(), h.ptr(), sd_i32);
                 }
             }
-            h
+            (h, rw)
         };
 
         // ── Step 3: Assemble [persistent || h_t || normed] ───────────
@@ -1645,6 +1649,7 @@ fn forward_sequence(
             mac_h_t: Some(h_t),
             mac_gated_out: Some(mac_gated),
             mac_pre_write_m: Some(pre_write_m),
+            mac_read_weights: Some(read_weights),
         });
 
         } else {
@@ -1965,6 +1970,7 @@ fn forward_sequence(
             mac_h_t: None,
             mac_gated_out: None,
             mac_pre_write_m: None,
+            mac_read_weights: None,
         });
 
         } // end composition dispatch
