@@ -456,10 +456,11 @@ impl MemoryLevelParams {
         Self::init_with_depth(d, rng, b_alpha_init, b_theta_init, b_eta_init, 1)
     }
 
-    /// Initialize with depth-dependent scaling for memory projections.
-    /// Memory output feeds into the residual stream, so w_k_mem/w_v_mem/w_q_mem
-    /// are scaled by 1/sqrt(2*n_blocks) to prevent gradient amplification.
+    /// Initialize with depth-dependent scaling for stacked models.
+    /// Memory projections (w_k_mem, w_v_mem, w_q_mem) are scaled by 1/sqrt(2*n_blocks)
+    /// to prevent gradient amplification through deep residual stacks (GPT-2 trick).
     pub fn init_with_depth(d: usize, rng: &mut SimpleRng, b_alpha_init: f32, b_theta_init: f32, b_eta_init: f32, n_blocks: usize) -> Self {
+        assert!(n_blocks > 0, "init_with_depth requires n_blocks > 0");
         let proj_scale = (2.0 / (d + d) as f32).sqrt();
         let depth_factor = 1.0 / (2.0 * n_blocks as f32).sqrt();
         let mem_proj_scale = proj_scale * depth_factor;
@@ -490,12 +491,7 @@ impl MemoryLevelParams {
         let b_theta = vec![b_theta_init];
         let b_eta = vec![b_eta_init];
 
-        // Atlas Omega projection: empty by default (non-Atlas rules don't use it).
-        // atlas_init() below allocates and Xavier-initializes w_omega.
         let w_omega = vec![];
-
-        // Dynamic frequency gate: empty by default (Fixed schedule).
-        // Populated by MAGParams::init() when FrequencySchedule::Learned.
         let w_freq = vec![];
         let b_freq = vec![];
 

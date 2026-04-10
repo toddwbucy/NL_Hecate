@@ -67,6 +67,7 @@ impl BlockParams {
     /// params in MemoryLevelParams), Conv1D buffers, MAC persistent tokens.
     /// These will be added when their respective compositions are stacked.
     pub fn init(cfg: &MAGConfig, seed: u64, n_blocks: usize) -> Self {
+        assert!(n_blocks > 0, "BlockParams::init requires n_blocks > 0");
         let d = cfg.swa.d_model;
         let mut rng = SimpleRng::new(seed);
 
