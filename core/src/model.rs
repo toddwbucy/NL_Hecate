@@ -453,44 +453,7 @@ impl MemoryLevelParams {
     ///   Level 1: b_alpha=4.0 (sigmoid≈0.98), b_theta=-5.6 (softplus≈0.004)
     /// `b_eta_init`: momentum gate bias (only used by TitansLMM; still allocated for uniform struct).
     pub fn init(d: usize, rng: &mut SimpleRng, b_alpha_init: f32, b_theta_init: f32, b_eta_init: f32) -> Self {
-        let proj_scale = (2.0 / (d + d) as f32).sqrt();
-        let gate_scale = (1.0 / (2 * d) as f32).sqrt();
-
-        let mut w_k_raw = vec![0.0f32; d * d];
-        rng.fill_uniform(&mut w_k_raw, proj_scale);
-        let w_k_mem = Bf16Storage::from_f32_vec(w_k_raw);
-
-        let mut w_v_raw = vec![0.0f32; d * d];
-        rng.fill_uniform(&mut w_v_raw, proj_scale);
-        let w_v_mem = Bf16Storage::from_f32_vec(w_v_raw);
-
-        let mut w_q_raw = vec![0.0f32; d * d];
-        rng.fill_uniform(&mut w_q_raw, proj_scale);
-        let w_q_mem = Bf16Storage::from_f32_vec(w_q_raw);
-
-        let mut w_alpha = vec![0.0f32; 2 * d];
-        rng.fill_uniform(&mut w_alpha, gate_scale);
-
-        let mut w_theta = vec![0.0f32; 2 * d];
-        rng.fill_uniform(&mut w_theta, gate_scale);
-
-        let mut w_eta = vec![0.0f32; 2 * d];
-        rng.fill_uniform(&mut w_eta, gate_scale);
-
-        let b_alpha = vec![b_alpha_init];
-        let b_theta = vec![b_theta_init];
-        let b_eta = vec![b_eta_init];
-
-        // Atlas Omega projection: empty by default (non-Atlas rules don't use it).
-        // atlas_init() below allocates and Xavier-initializes w_omega.
-        let w_omega = vec![];
-
-        // Dynamic frequency gate: empty by default (Fixed schedule).
-        // Populated by MAGParams::init() when FrequencySchedule::Learned.
-        let w_freq = vec![];
-        let b_freq = vec![];
-
-        MemoryLevelParams { w_k_mem, w_v_mem, w_q_mem, w_alpha, b_alpha, w_theta, b_theta, w_eta, b_eta, w_omega, w_freq, b_freq, w_k_conv: vec![], b_k_conv: vec![], w_q_conv: vec![], b_q_conv: vec![], m_k_init: vec![], m_v_init: vec![], m_q_init: vec![], m_eta_init: vec![], m_alpha_init: vec![], m_mem_init: vec![], gate_proj: vec![], up_proj: vec![], down_proj: vec![], w_rand: vec![], b_rand: vec![] }
+        Self::init_with_depth(d, rng, b_alpha_init, b_theta_init, b_eta_init, 1)
     }
 
     /// Initialize with depth-dependent scaling for stacked models.

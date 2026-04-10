@@ -13,7 +13,7 @@ use crate::gpu_buf::GpuBuf;
 #[cfg(feature = "cuda")]
 use crate::gpu_params::{GpuStackedParams, GpuStackedContext};
 #[cfg(feature = "cuda")]
-use crate::model::{MAGConfig, MemoryRuleKind, HopeVariant};
+use crate::model::{MAGConfig, MemoryRuleKind, HopeVariant, CompositionKind};
 #[cfg(feature = "cuda")]
 use crate::conductor::Pulse;
 #[cfg(feature = "cuda")]
@@ -62,6 +62,16 @@ pub struct GpuStackedBlockCache {
     pub alpha_weights: Vec<f32>,      // [k] — softmax(alpha_mem), for backward
     // Residual connections
     pub residual_after_attn: GpuBuf<f32>, // [bs*s, d] = block_input + attn_proj
+    // MAC-specific (None for MAG)
+    /// Memory context tokens from READ step [s, d]. Backward splits assembled gradient.
+    pub mac_h_t: Option<GpuBuf<f32>>,
+    /// y_t * reflective_gate [s, d]. Backward needs this for W_O weight gradient.
+    pub mac_gated_out: Option<GpuBuf<f32>>,
+    /// Per-level pre-WRITE M states [d*d each]. Backward needs for READ gradient.
+    pub mac_pre_write_m: Option<Vec<GpuBuf<f32>>>,
+    /// READ aggregation weights [k] — softmax(alpha_mem). Separate from alpha_weights
+    /// (which stores reflective weights for MAC). Backward needs this for d_alpha_mem.
+    pub mac_read_weights: Option<Vec<f32>>,
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -559,6 +569,10 @@ impl ActivationWindow {
                 gate, attn_proj,
                 alpha_weights,
                 residual_after_attn,
+                mac_h_t: None,
+                mac_gated_out: None,
+                mac_pre_write_m: None,
+                mac_read_weights: None,
             });
         }
 
@@ -841,6 +855,12 @@ fn assemble_m_states(
 ///
 /// Spec 68: "The model is: process one token → update memory → produce output.
 /// That is the atomic unit of computation."
+///
+/// TODO(spec79): This function only implements the MAG path. When composition=MAC,
+/// the decode path needs a MAC branch (memory READ → assemble → full causal →
+/// extract → memory WRITE → reflective gate → W_O). Not needed for the initial
+/// MAC build experiment (which uses forward_sequence), but required before MAC
+/// can be used for inference/decode. Same applies to ActivationWindow::assemble_cache.
 #[cfg(feature = "cuda")]
 pub fn forward_single_token(
     params: &GpuStackedParams,
@@ -1174,6 +1194,13 @@ pub fn gpu_stacked_forward_tokens(
     ws: &mut StackedDecodeWorkspace,
     activation_window: &mut ActivationWindow,
 ) -> Vec<f32> {
+    assert!(
+        !matches!(cfg.composition, CompositionKind::MAC),
+        "gpu_stacked_forward_tokens: MAC composition is not yet supported in the \
+         decode path (forward_single_token / ActivationWindow::assemble_cache). \
+         Use forward_sequence for MAC build experiments. See spec 79 TODO."
+    );
+
     let v = cfg.swa.vocab_size;
     let mut last_logits = vec![0.0f32; v];
 
@@ -1307,6 +1334,328 @@ fn forward_sequence(
         let block_ctx = &mut context.blocks[b];
 
         let block_input = residual.clone_buf();
+
+        if matches!(cfg.composition, CompositionKind::MAC) {
+        // ══════════════════════════════════════════════════════════════
+        // MAC composition (Titans Eqs 21-25, spec 79)
+        // Memory READ → assemble → full causal attn → extract y_t →
+        // memory WRITE → reflective gate → W_O → residual
+        // ══════════════════════════════════════════════════════════════
+
+        // ── Step 1: Single LN (reuse ln_attn params) ─────────────────
+        let ln_attn_out = GpuBuf::zeros(sd);
+        let ln_attn_mean = GpuBuf::zeros(s);
+        let ln_attn_rstd = GpuBuf::zeros(s);
+        unsafe {
+            crate::cuda_ffi::layer_norm_forward_cuda(
+                residual.as_ptr(),
+                block.ln_attn_gamma.as_ptr(),
+                block.ln_attn_beta.as_ptr(),
+                ln_attn_out.ptr(), ln_attn_mean.ptr(), ln_attn_rstd.ptr(),
+                s_i32, d_i32, 1e-5,
+            );
+        }
+        let normed = &ln_attn_out; // alias for clarity
+
+        // ── Step 2: Memory READ (context tokens) ─────────────────────
+        // All levels read (frozen or active) — read-only, no M update.
+        // Save pre-write M states for backward.
+        let n_p = cfg.n_persistent;
+        let mut h_t_per_level: Vec<GpuBuf<f32>> = Vec::with_capacity(cfg.k);
+        let mut h_t_upsampled: Vec<GpuBuf<f32>> = Vec::with_capacity(cfg.k);
+        let mut pre_write_m: Vec<GpuBuf<f32>> = Vec::with_capacity(cfg.k);
+
+        for level in 0..cfg.k {
+            let c = cfg.chunk_sizes.get(level).copied().unwrap_or(1);
+            let s_f = s / c.max(1);
+            assert!(s_f > 0, "chunk_size {c} > seq_len {s} at level {level}");
+            assert!(c <= 1 || s % c == 0,
+                "seq_len {s} not divisible by chunk_size {c} at level {level}");
+
+            // Pool normed input for higher chunk levels
+            let level_input = if c > 1 {
+                let pooled = GpuBuf::zeros(bs * s_f * d);
+                unsafe {
+                    crate::cuda_ffi::mean_pool_1d_f32_cuda(
+                        normed.as_ptr(), pooled.ptr(),
+                        bs as i32, s as i32, d_i32, c as i32,
+                    );
+                }
+                pooled
+            } else {
+                normed.clone_buf()
+            };
+
+            // Save M before any writes (backward needs this for READ gradient)
+            pre_write_m.push(block_ctx.memory[level].clone_buf());
+
+            // Read-only: h_t_l = M_l @ (level_input @ W_Q_mem_l)
+            let h_t_l = gpu_memory_read_only(
+                &block.levels[level], &level_input,
+                &block_ctx.memory[level],
+                s_f, d, nh, hd,
+            );
+
+            // Upsample to full resolution for aggregation
+            let h_full = if c > 1 {
+                let upsampled = GpuBuf::zeros(sd);
+                unsafe {
+                    crate::cuda_ffi::repeat_upsample_1d_f32_cuda(
+                        h_t_l.as_ptr(), upsampled.ptr(),
+                        bs as i32, s_f as i32, d_i32, c as i32,
+                    );
+                }
+                upsampled
+            } else {
+                h_t_l.clone_buf()
+            };
+
+            h_t_per_level.push(h_t_l);
+            h_t_upsampled.push(h_full);
+        }
+
+        // Aggregate h_t across levels (softmax-weighted sum)
+        let (h_t, read_weights) = if cfg.k == 1 {
+            (h_t_upsampled[0].clone_buf(), vec![1.0])
+        } else {
+            let mut alpha_host = vec![0.0f32; cfg.k];
+            block.alpha_mem.slice(0, cfg.k).copy_to_host(&mut alpha_host);
+            let rw = crate::stacked_model::host_softmax(&alpha_host);
+            let h = GpuBuf::zeros(sd);
+            for (l, h_full) in h_t_upsampled.iter().enumerate() {
+                unsafe {
+                    crate::cuda_ffi::saxpy_cuda(rw[l], h_full.as_ptr(), h.ptr(), sd_i32);
+                }
+            }
+            (h, rw)
+        };
+
+        // ── Step 3: Assemble [persistent || h_t || normed] ───────────
+        let assembled_len = n_p + 2 * s;
+        let assembled_sd = assembled_len * d;
+        let assembled = GpuBuf::<f32>::zeros(assembled_sd);
+        unsafe {
+            let mut offset = 0usize;
+            // persistent tokens [n_p, d]
+            if n_p > 0 {
+                let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                    assembled.ptr() as *mut std::ffi::c_void,
+                    params.persistent_tokens.as_ptr() as *const std::ffi::c_void,
+                    n_p * d * 4,
+                );
+                assert_eq!(rc, 0);
+                offset = n_p * d * 4;
+            }
+            // h_t [s, d]
+            let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                (assembled.ptr() as *mut u8).add(offset) as *mut std::ffi::c_void,
+                h_t.as_ptr() as *const std::ffi::c_void,
+                s * d * 4,
+            );
+            assert_eq!(rc, 0);
+            offset += s * d * 4;
+            // normed [s, d]
+            let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                (assembled.ptr() as *mut u8).add(offset) as *mut std::ffi::c_void,
+                normed.as_ptr() as *const std::ffi::c_void,
+                s * d * 4,
+            );
+            assert_eq!(rc, 0);
+        }
+
+        // ── Step 4: QKV projections on assembled ─────────────────────
+        let mut q_f32 = GpuBuf::zeros(assembled_sd);
+        let mut k_f32 = GpuBuf::zeros(assembled_sd);
+        let mut v_f32 = GpuBuf::zeros(assembled_sd);
+        crate::dispatch::cublas_matmul_transb_dd(&assembled, &block.w_q, &mut q_f32, assembled_len, d, d, 0.0);
+        crate::dispatch::cublas_matmul_transb_dd(&assembled, &block.w_k, &mut k_f32, assembled_len, d, d, 0.0);
+        crate::dispatch::cublas_matmul_transb_dd(&assembled, &block.w_v, &mut v_f32, assembled_len, d, d, 0.0);
+
+        // ── Step 5: Full causal attention via SWA (window >= assembled_len)
+        let q_bf16 = GpuBuf::<u16>::zeros(assembled_sd);
+        let k_bf16 = GpuBuf::<u16>::zeros(assembled_sd);
+        let v_bf16 = GpuBuf::<u16>::zeros(assembled_sd);
+        unsafe {
+            crate::cuda_ffi::f32_to_bf16_cuda(q_f32.as_ptr(), q_bf16.ptr(), assembled_sd as i32);
+            crate::cuda_ffi::f32_to_bf16_cuda(k_f32.as_ptr(), k_bf16.ptr(), assembled_sd as i32);
+            crate::cuda_ffi::f32_to_bf16_cuda(v_f32.as_ptr(), v_bf16.ptr(), assembled_sd as i32);
+        }
+
+        // Full causal: window covers entire assembled sequence.
+        // n_persistent=0 because persistent tokens are already in assembled.
+        let mac_window = assembled_len;
+        let aw_stride = mac_window; // n_persistent(0) + window
+        let aw_total = bs * nh * assembled_len * aw_stride;
+        let mut attn_out_bf16 = GpuBuf::<u16>::zeros(assembled_sd);
+        let mut attn_weights_bf16 = GpuBuf::<u16>::zeros(aw_total);
+        crate::dispatch::swa_forward_dd(
+            &q_bf16, &k_bf16, &v_bf16,
+            &mut attn_out_bf16, &mut attn_weights_bf16,
+            assembled_len, nh, hd, mac_window, bs, 0, // n_persistent=0
+        );
+
+        // ── Step 6: Extract y_t from segment portion [n_p+s..] ───────
+        // Convert full assembled output bf16→f32, then extract segment portion.
+        let attn_out_full_f32 = GpuBuf::<f32>::zeros(assembled_sd);
+        unsafe {
+            crate::cuda_ffi::bf16_to_f32_cuda(
+                attn_out_bf16.as_ptr(), attn_out_full_f32.ptr(), assembled_sd as i32,
+            );
+        }
+        let y_t = GpuBuf::<f32>::zeros(sd);
+        unsafe {
+            let src_offset = (n_p + s) * d * 4; // skip persistent + h_t portions
+            let rc = crate::gpu_forward::gpu_buf_memcpy_d2d(
+                y_t.ptr() as *mut std::ffi::c_void,
+                (attn_out_full_f32.as_ptr() as *const u8).add(src_offset) as *const std::ffi::c_void,
+                sd * 4,
+            );
+            assert_eq!(rc, 0);
+        }
+
+        // ── Step 7-8: Memory WRITE(y_t) → reflective_y ──────────────
+        // Active levels: gpu_memory_forward (updates M, returns M @ q(y_t))
+        // Frozen levels: gpu_memory_read_only (read from frozen M with y_t query)
+        let mut refl_per_level: Vec<GpuBuf<f32>> = Vec::with_capacity(cfg.k);
+        let mut refl_upsampled: Vec<GpuBuf<f32>> = Vec::with_capacity(cfg.k);
+        let mut memory_caches: Vec<Option<GpuMemoryCache>> = Vec::with_capacity(cfg.k);
+        let mut level_seq_lens: Vec<usize> = Vec::with_capacity(cfg.k);
+
+        for level in 0..cfg.k {
+            let c = cfg.chunk_sizes.get(level).copied().unwrap_or(1);
+            let s_f = s / c.max(1);
+            let effective_active = pulse.active_levels[level]
+                || matches!(cfg.memory_rule, MemoryRuleKind::SwiGluMlp);
+
+            // Pool y_t for higher chunk levels
+            let write_input = if c > 1 {
+                let pooled = GpuBuf::zeros(bs * s_f * d);
+                unsafe {
+                    crate::cuda_ffi::mean_pool_1d_f32_cuda(
+                        y_t.as_ptr(), pooled.ptr(),
+                        bs as i32, s as i32, d_i32, c as i32,
+                    );
+                }
+                pooled
+            } else {
+                y_t.clone_buf()
+            };
+
+            let refl_level = if effective_active {
+                // WRITE: updates M_l, returns reflective read from UPDATED M
+                let (refl, mem_cache) = gpu_memory_forward(
+                    &block.levels[level], cfg, &write_input,
+                    &mut block_ctx.memory[level],
+                    s_f, d, level, bs,
+                );
+                memory_caches.push(Some(mem_cache));
+                refl
+            } else {
+                // Frozen: read-only from frozen M with y_t as query
+                let refl = gpu_memory_read_only(
+                    &block.levels[level], &write_input,
+                    &block_ctx.memory[level],
+                    s_f, d, nh, hd,
+                );
+                memory_caches.push(None);
+                refl
+            };
+
+            // Upsample to full resolution
+            let refl_full = if c > 1 {
+                let upsampled = GpuBuf::zeros(sd);
+                unsafe {
+                    crate::cuda_ffi::repeat_upsample_1d_f32_cuda(
+                        refl_level.as_ptr(), upsampled.ptr(),
+                        bs as i32, s_f as i32, d_i32, c as i32,
+                    );
+                }
+                upsampled
+            } else {
+                refl_level.clone_buf()
+            };
+
+            refl_per_level.push(refl_level);
+            refl_upsampled.push(refl_full);
+            level_seq_lens.push(s_f);
+        }
+
+        // Aggregate reflective_y across levels using alpha_refl (NOT alpha_mem).
+        // mac.rs:694: w_refl = masked_softmax(&params.alpha_refl, &active_mask)
+        // alpha_mem is for READ aggregation; alpha_refl is for WRITE/reflective.
+        let (reflective_y, alpha_weights) = if cfg.k == 1 {
+            (refl_upsampled[0].clone_buf(), vec![1.0])
+        } else {
+            let mut alpha_host = vec![0.0f32; cfg.k];
+            block.alpha_refl.slice(0, cfg.k).copy_to_host(&mut alpha_host);
+            let weights = crate::stacked_model::host_softmax(&alpha_host);
+            let combined = GpuBuf::zeros(sd);
+            for (l, r_full) in refl_upsampled.iter().enumerate() {
+                unsafe {
+                    crate::cuda_ffi::saxpy_cuda(weights[l], r_full.as_ptr(), combined.ptr(), sd_i32);
+                }
+            }
+            (combined, weights)
+        };
+
+        // ── Step 9: Reflective gate ──────────────────────────────────
+        // gate = sigmoid(reflective_y), gated_out = y_t * gate
+        let gate = GpuBuf::zeros(sd);
+        let mac_gated = GpuBuf::zeros(sd);
+        unsafe {
+            crate::cuda_ffi::sigmoid_cuda(reflective_y.as_ptr(), gate.ptr(), sd_i32);
+            crate::cuda_ffi::elemwise_mul_cuda(y_t.as_ptr(), gate.as_ptr(), mac_gated.ptr(), sd_i32);
+        }
+
+        // ── Step 10: Output projection ───────────────────────────────
+        let mut projected = GpuBuf::zeros(sd);
+        crate::dispatch::cublas_matmul_transb_dd(&mac_gated, &block.w_o, &mut projected, s, d, d, 0.0);
+
+        // ── Step 11: Residual skip ───────────────────────────────────
+        residual = GpuBuf::zeros(sd);
+        unsafe {
+            crate::cuda_ffi::saxpy_cuda(1.0, block_input.as_ptr(), residual.ptr(), sd_i32);
+            crate::cuda_ffi::saxpy_cuda(1.0, projected.as_ptr(), residual.ptr(), sd_i32);
+        }
+
+        // Cache — reuse existing fields with MAC semantics:
+        //   qkv_source  → assembled [assembled_len, d]
+        //   attn_out     → y_t [s, d] (extracted segment portion)
+        //   y_combined   → reflective_y [s, d]
+        //   gate         → reflective_gate [s, d]
+        //   attn_proj    → projected (gated_out @ W_O) [s, d]
+        //   y_per_level  → reflective_y per level [s_f, d]
+        //   ln_mem_*     → unused (dummy zero bufs)
+        //   residual_after_attn → unused (dummy zero buf)
+        block_caches.push(GpuStackedBlockCache {
+            block_input,
+            q_f32, k_f32, v_f32,
+            q_bf16, k_bf16, v_bf16,
+            attn_out_bf16, attn_weights_bf16,
+            attn_out: y_t,
+            qkv_source: assembled,
+            ln_attn_out, ln_attn_mean, ln_attn_rstd,
+            ln_mem_out: GpuBuf::zeros(1), // unused for MAC
+            ln_mem_mean: GpuBuf::zeros(1),
+            ln_mem_rstd: GpuBuf::zeros(1),
+            memory_caches,
+            y_per_level: refl_per_level,
+            level_seq_lens,
+            y_combined: reflective_y,
+            gate,
+            attn_proj: projected,
+            alpha_weights,
+            residual_after_attn: GpuBuf::zeros(1), // unused for MAC
+            mac_h_t: Some(h_t),
+            mac_gated_out: Some(mac_gated),
+            mac_pre_write_m: Some(pre_write_m),
+            mac_read_weights: Some(read_weights),
+        });
+
+        } else {
+        // ══════════════════════════════════════════════════════════════
+        // MAG composition (existing path, unchanged)
+        // ══════════════════════════════════════════════════════════════
 
         // ── LN_attn [s, d] ───────────────────────────────────────────
         let ln_attn_out = GpuBuf::zeros(sd);
@@ -1618,7 +1967,13 @@ fn forward_sequence(
             gate, attn_proj,
             alpha_weights,
             residual_after_attn,
+            mac_h_t: None,
+            mac_gated_out: None,
+            mac_pre_write_m: None,
+            mac_read_weights: None,
         });
+
+        } // end composition dispatch
     }
 
     // ── Final LN ──────────────────────────────────────────────────────
@@ -1658,9 +2013,17 @@ fn forward_sequence(
         logits,
         pulse: pulse.clone(),
         s, d, v, nh, hd,
-        ws: window_size,
+        ws: if matches!(cfg.composition, CompositionKind::MAC) {
+            cfg.n_persistent + 2 * s  // MAC: full causal over assembled_len
+        } else {
+            window_size               // MAG: SWA sliding window
+        },
         batch_size: bs,
-        s_aug: cfg.n_persistent + s,
+        s_aug: if matches!(cfg.composition, CompositionKind::MAC) {
+            cfg.n_persistent + 2 * s  // assembled_len for MAC
+        } else {
+            cfg.n_persistent + s      // augmented_len for MAG
+        },
     };
 
     (last_logits, cache)
