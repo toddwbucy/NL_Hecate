@@ -37,6 +37,7 @@ struct MomentBlock {
     m_ln_mem_beta: GpuBuf<f32>, v_ln_mem_beta: GpuBuf<f32>,
     // Learnable level aggregation (host-side scalars)
     m_alpha_mem: Vec<f32>, v_alpha_mem: Vec<f32>,
+    m_alpha_refl: Vec<f32>, v_alpha_refl: Vec<f32>,
     levels: Vec<MomentLevelStacked>,
 }
 
@@ -121,6 +122,8 @@ impl GpuStackedAdamWState {
                 v_ln_mem_beta: GpuBuf::zeros(bp.ln_mem_beta.len()),
                 m_alpha_mem: vec![0.0f32; bp.alpha_mem.len()],
                 v_alpha_mem: vec![0.0f32; bp.alpha_mem.len()],
+                m_alpha_refl: vec![0.0f32; bp.alpha_refl.len()],
+                v_alpha_refl: vec![0.0f32; bp.alpha_refl.len()],
                 levels,
             }
         }).collect();
@@ -331,6 +334,9 @@ fn gpu_stacked_grad_norm_clip_fused(
             for g in &mut bg.d_alpha_mem {
                 *g *= scale_host[0];
             }
+            for g in &mut bg.d_alpha_refl {
+                *g *= scale_host[0];
+            }
         }
     }
 }
@@ -440,8 +446,11 @@ pub fn gpu_stacked_per_block_grad_norms(
             }
         }
 
-        // alpha_mem gradients (host-side scalars)
+        // alpha_mem + alpha_refl gradients (host-side scalars)
         for &g in &bg.d_alpha_mem {
+            block_sq[bi] += (g as f64) * (g as f64);
+        }
+        for &g in &bg.d_alpha_refl {
             block_sq[bi] += (g as f64) * (g as f64);
         }
     }
@@ -495,8 +504,11 @@ pub fn gpu_stacked_scale_grads_ex(grads: &mut GpuStackedGrads, scale: f32, skip_
             scale_buf(&mut lg.d_w_eta);
             scale_buf(&mut lg.d_b_eta);
         }
-        // alpha_mem gradients (host-side)
+        // alpha_mem + alpha_refl gradients (host-side)
         for g in &mut bg.d_alpha_mem {
+            *g *= scale;
+        }
+        for g in &mut bg.d_alpha_refl {
             *g *= scale;
         }
     }
@@ -608,6 +620,23 @@ pub fn gpu_stacked_adamw_update(
             bp.alpha_mem.copy_from_host(&alpha_host);
         }
 
+        // alpha_refl: learnable reflective aggregation weights (host-side AdamW)
+        // Used by MAC composition; zero gradient for MAG.
+        {
+            let k = bg.d_alpha_refl.len();
+            let mut alpha_host = vec![0.0f32; k];
+            bp.alpha_refl.slice(0, k).copy_to_host(&mut alpha_host);
+            for i in 0..k {
+                let g = bg.d_alpha_refl[i];
+                mb.m_alpha_refl[i] = beta1 * mb.m_alpha_refl[i] + (1.0 - beta1) * g;
+                mb.v_alpha_refl[i] = beta2 * mb.v_alpha_refl[i] + (1.0 - beta2) * g * g;
+                let m_hat = mb.m_alpha_refl[i] * bc1_inv;
+                let v_hat = mb.v_alpha_refl[i] * bc2_inv;
+                alpha_host[i] -= lr * (m_hat / (v_hat.sqrt() + eps) + weight_decay * alpha_host[i]);
+            }
+            bp.alpha_refl.copy_from_host(&alpha_host);
+        }
+
         // Per-level CMS weights (pulse-gated)
         for (i, (lp, lg)) in bp.levels.iter_mut().zip(bg.levels.iter()).enumerate() {
             if i >= pulse.active_levels.len() || !pulse.active_levels[i] {
@@ -689,8 +718,9 @@ struct M3MomentBlockStacked {
     m1_ln_attn_beta: GpuBuf<f32>,  m2_ln_attn_beta: GpuBuf<f32>,  v_ln_attn_beta: GpuBuf<f32>,
     m1_ln_mem_gamma: GpuBuf<f32>,  m2_ln_mem_gamma: GpuBuf<f32>,  v_ln_mem_gamma: GpuBuf<f32>,
     m1_ln_mem_beta: GpuBuf<f32>,   m2_ln_mem_beta: GpuBuf<f32>,   v_ln_mem_beta: GpuBuf<f32>,
-    // alpha_mem: host-side (1D, small — k scalars)
+    // alpha_mem + alpha_refl: host-side (1D, small — k scalars)
     m1_alpha_mem: Vec<f32>, m2_alpha_mem: Vec<f32>, v_alpha_mem: Vec<f32>,
+    m1_alpha_refl: Vec<f32>, m2_alpha_refl: Vec<f32>, v_alpha_refl: Vec<f32>,
     // Per-level CMS
     levels: Vec<M3MomentLevelStacked>,
 }
@@ -808,6 +838,9 @@ impl GpuStackedM3State {
                 m1_alpha_mem: vec![0.0f32; k],
                 m2_alpha_mem: vec![0.0f32; k],
                 v_alpha_mem: vec![0.0f32; k],
+                m1_alpha_refl: vec![0.0f32; k],
+                m2_alpha_refl: vec![0.0f32; k],
+                v_alpha_refl: vec![0.0f32; k],
                 levels,
             }
         }).collect();
@@ -878,9 +911,13 @@ fn gpu_stacked_m3_grad_norm(
         }
     }
     drop(add);
-    // alpha_mem gradients (host-side scalars, accumulated after closure dropped)
+    // alpha_mem + alpha_refl gradients (host-side scalars, accumulated after closure dropped)
     for bg in &grads.blocks {
         for &g in &bg.d_alpha_mem {
+            let g64 = g as f64;
+            total += g64 * g64;
+        }
+        for &g in &bg.d_alpha_refl {
             let g64 = g as f64;
             total += g64 * g64;
         }
@@ -927,8 +964,11 @@ fn gpu_stacked_m3_scale_grads(grads: &mut GpuStackedGrads, scale: f32, skip_embe
             scale_buf(&mut lg.d_w_eta);
             scale_buf(&mut lg.d_b_eta);
         }
-        // alpha_mem (host-side scalars)
+        // alpha_mem + alpha_refl (host-side scalars)
         for g in &mut bg.d_alpha_mem {
+            *g *= scale;
+        }
+        for g in &mut bg.d_alpha_refl {
             *g *= scale;
         }
     }
@@ -1077,6 +1117,26 @@ pub fn gpu_stacked_m3_update(
                 alpha_host[i] -= lr * update / denom;
             }
             bp.alpha_mem.copy_from_host(&alpha_host);
+        }
+
+        // alpha_refl: host-side 1D M3 (mirror of alpha_mem)
+        {
+            let k = bg.d_alpha_refl.len();
+            let mut alpha_host = vec![0.0f32; k];
+            bp.alpha_refl.slice(0, k).copy_to_host(&mut alpha_host);
+            for i in 0..k {
+                let g = bg.d_alpha_refl[i];
+                mb.m1_alpha_refl[i] = cfg.beta1 * mb.m1_alpha_refl[i] + (1.0 - cfg.beta1) * g;
+                if update_m2 {
+                    mb.m2_alpha_refl[i] = cfg.beta3 * mb.m2_alpha_refl[i] + (1.0 - cfg.beta3) * g;
+                }
+                mb.v_alpha_refl[i] = cfg.beta2 * mb.v_alpha_refl[i] + (1.0 - cfg.beta2) * g * g;
+                let v_hat = mb.v_alpha_refl[i] / bc2;
+                let denom = v_hat.sqrt() + cfg.eps;
+                let update = mb.m1_alpha_refl[i] + cfg.alpha * mb.m2_alpha_refl[i];
+                alpha_host[i] -= lr * update / denom;
+            }
+            bp.alpha_refl.copy_from_host(&alpha_host);
         }
 
         // Per-level CMS weights (pulse-gated)

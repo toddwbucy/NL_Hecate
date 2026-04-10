@@ -17,7 +17,7 @@ use crate::gpu_stacked_forward::{GpuStackedCache, GpuBufClone};
 #[cfg(feature = "cuda")]
 use crate::gpu_backward::{GpuLevelGrads, gpu_memory_backward, gpu_memory_read_only_backward, gpu_matmul_transa_dd};
 #[cfg(feature = "cuda")]
-use crate::model::{MAGConfig, MemoryRuleKind, HopeVariant};
+use crate::model::{MAGConfig, MemoryRuleKind, HopeVariant, CompositionKind};
 #[cfg(feature = "cuda")]
 use crate::gpu_profiler::GpuProfiler;
 #[cfg(feature = "cuda")]
@@ -39,8 +39,11 @@ pub struct GpuStackedBlockGrads {
     pub d_ln_mem_gamma: GpuBuf<f32>,
     pub d_ln_mem_beta: GpuBuf<f32>,
     pub levels: Vec<GpuLevelGrads>,
-    /// Gradient for learnable level aggregation weights. Length k.
+    /// Gradient for learnable READ aggregation weights. Length k.
     pub d_alpha_mem: Vec<f32>,
+    /// Gradient for learnable reflective (WRITE) aggregation weights. Length k.
+    /// Only non-zero for MAC composition; MAG uses d_alpha_mem only.
+    pub d_alpha_refl: Vec<f32>,
     /// Per-level L2 norm of d_y_combined (output gradient entering each level's
     /// backward). Length k. 0.0 for inactive levels. Used by tape diagnostics.
     pub level_output_gnorms: Vec<f32>,
@@ -99,6 +102,7 @@ pub fn gpu_zero_grads(grads: &mut GpuStackedGrads) {
             lg.d_down_proj.zero();
         }
         for g in &mut block.d_alpha_mem { *g = 0.0; }
+        for g in &mut block.d_alpha_refl { *g = 0.0; }
         block.level_output_gnorms.iter_mut().for_each(|g| *g = 0.0);
     }
 }
@@ -141,8 +145,11 @@ pub fn gpu_accumulate_grads(accum: &mut GpuStackedGrads, micro: &GpuStackedGrads
             saxpy(&mut acc_lv.d_up_proj, &mic_lv.d_up_proj);
             saxpy(&mut acc_lv.d_down_proj, &mic_lv.d_down_proj);
         }
-        // Host-side alpha_mem grads
+        // Host-side alpha grads
         for (a, m) in acc_block.d_alpha_mem.iter_mut().zip(mic_block.d_alpha_mem.iter()) {
+            *a += m;
+        }
+        for (a, m) in acc_block.d_alpha_refl.iter_mut().zip(mic_block.d_alpha_refl.iter()) {
             *a += m;
         }
         // Accumulate gnorm diagnostics
@@ -235,19 +242,30 @@ pub fn gpu_stacked_backward(
 
     // ── Final LN backward ──────────────────────────────────────────────
     // The last block's output (residual_stream) went through ln_final.
-    // Reconstruct: residual_out = block_input + gated_out
-    //   where gated_out = attn_proj * gate (MAG sigmoid gating)
+    // Reconstruct residual_out for LN backward input:
+    //   MAC: residual_out = block_input + projected  (attn_proj already includes gating)
+    //   MAG: residual_out = block_input + attn_proj * gate
     prof_start!(profiler, "ln_final_bwd", LayerNorm, None, None);
     let last_block_cache = &cache.block_caches[n_blocks - 1];
     let residual_stream_final = GpuBuf::zeros(bsd);
-    let gated_out_last = GpuBuf::zeros(bsd);
-    unsafe {
-        crate::cuda_ffi::elemwise_mul_cuda(
-            last_block_cache.attn_proj.as_ptr(), last_block_cache.gate.as_ptr(),
-            gated_out_last.ptr(), bsd_i32,
-        );
-        crate::cuda_ffi::saxpy_cuda(1.0, last_block_cache.block_input.as_ptr(), residual_stream_final.ptr(), bsd_i32);
-        crate::cuda_ffi::saxpy_cuda(1.0, gated_out_last.as_ptr(), residual_stream_final.ptr(), bsd_i32);
+    let is_mac = matches!(cfg.composition, CompositionKind::MAC);
+    if is_mac {
+        // MAC: residual = block_input + projected (attn_proj = gated_out @ W_O)
+        unsafe {
+            crate::cuda_ffi::saxpy_cuda(1.0, last_block_cache.block_input.as_ptr(), residual_stream_final.ptr(), bsd_i32);
+            crate::cuda_ffi::saxpy_cuda(1.0, last_block_cache.attn_proj.as_ptr(), residual_stream_final.ptr(), bsd_i32);
+        }
+    } else {
+        // MAG: residual = block_input + attn_proj * gate
+        let gated_out_last = GpuBuf::zeros(bsd);
+        unsafe {
+            crate::cuda_ffi::elemwise_mul_cuda(
+                last_block_cache.attn_proj.as_ptr(), last_block_cache.gate.as_ptr(),
+                gated_out_last.ptr(), bsd_i32,
+            );
+            crate::cuda_ffi::saxpy_cuda(1.0, last_block_cache.block_input.as_ptr(), residual_stream_final.ptr(), bsd_i32);
+            crate::cuda_ffi::saxpy_cuda(1.0, gated_out_last.as_ptr(), residual_stream_final.ptr(), bsd_i32);
+        }
     }
 
     let mut d_residual_stream = GpuBuf::zeros(bsd);
@@ -318,6 +336,351 @@ pub fn gpu_stacked_backward(
             .map(|_| GpuLevelGrads::zeros_mlp(d, inter))
             .collect();
 
+        let d_alpha_mem: Vec<f32>;
+        let d_alpha_refl: Vec<f32>;
+        let block_level_gnorms: Vec<f32>;
+
+        if is_mac {
+        // ══════════════════════════════════════════════════════════════
+        // MAC composition backward (spec 79)
+        // Reverse: residual → W_O → reflective gate → memory WRITE →
+        //          extract y_t → SWA → QKV → split assembled →
+        //          memory READ → LN → residual
+        // ══════════════════════════════════════════════════════════════
+
+        block_level_gnorms = vec![0.0f32; cfg.k];
+
+        // ── Step 11→10: Residual skip + W_O backward ─────────────────
+        // Forward: residual = block_input + projected
+        //          projected = mac_gated_out @ W_O^T
+        // d_projected = d_residual_stream (single skip)
+        prof_start!(profiler, "mac_w_o_bwd", Projection, Some(b), None);
+        let mac_gated_ref = bc.mac_gated_out.as_ref().unwrap();
+        let mut d_mac_gated_out = GpuBuf::zeros(bsd);
+        crate::dispatch::cublas_matmul_dd(
+            &d_residual_stream, &block.w_o, &mut d_mac_gated_out,
+            n_tokens, d, d, 0.0,
+        );
+        gpu_matmul_transa_dd(
+            &d_residual_stream, mac_gated_ref, &mut d_w_o,
+            d, n_tokens, d,
+        );
+        prof_stop!(profiler);
+
+        // ── Step 9: Reflective gate backward ─────────────────────────
+        // Forward: mac_gated_out = y_t * gate, gate = sigmoid(reflective_y)
+        // y_t = bc.attn_out, gate = bc.gate, reflective_y = bc.y_combined
+        prof_start!(profiler, "mac_gate_bwd", Composition, Some(b), None);
+        let d_y_t_gate = GpuBuf::zeros(bsd);
+        let d_gate = GpuBuf::zeros(bsd);
+        unsafe {
+            // gating_backward: out=a*b → d_a=d_out*b, d_b=d_out*a
+            // here a=y_t(attn_out), b=gate → d_y_t_gate, d_gate
+            crate::cuda_ffi::gating_backward_cuda(
+                d_mac_gated_out.as_ptr(), bc.attn_out.as_ptr(), bc.gate.as_ptr(),
+                d_y_t_gate.ptr(), d_gate.ptr(), bsd_i32,
+            );
+        }
+        // sigmoid backward: gate = sigmoid(reflective_y) → d_reflective_y
+        let d_reflective_y = GpuBuf::zeros(bsd);
+        unsafe {
+            crate::cuda_ffi::sigmoid_backward_cuda(
+                d_gate.as_ptr(), bc.gate.as_ptr(), d_reflective_y.ptr(), bsd_i32,
+            );
+        }
+        prof_stop!(profiler);
+
+        // ── Step 8: Memory WRITE backward (per-level) ────────────────
+        // Forward: reflective_y = Σ_l alpha_refl_w[l] * refl_upsampled[l]
+        //          refl[l] = gpu_memory_forward(level_params, y_t, ...)
+        // Each level: d_refl_level = w_refl[l] * d_reflective_y
+        //             gpu_memory_backward → d_y_t_level
+        prof_start!(profiler, "mac_write_bwd", MemoryBackward, Some(b), None);
+        let w_refl = &bc.alpha_weights; // softmax(alpha_refl) from forward
+        let mut d_y_t_mem_total = GpuBuf::zeros(bsd);
+
+        for level in 0..cfg.k {
+            let c = cfg.chunk_sizes.get(level).copied().unwrap_or(1);
+            let s_f = bc.level_seq_lens[level];
+
+            // Scale upstream gradient by reflective aggregation weight
+            let d_refl_level_full = GpuBuf::zeros(bsd);
+            unsafe {
+                crate::cuda_ffi::saxpy_cuda(w_refl[level], d_reflective_y.as_ptr(), d_refl_level_full.ptr(), bsd_i32);
+            }
+
+            // Backward through upsample (sum groups of C)
+            let d_refl_level = if c > 1 {
+                let d_reduced = GpuBuf::zeros(bs * s_f * d);
+                unsafe {
+                    crate::cuda_ffi::repeat_upsample_1d_backward_f32_cuda(
+                        d_refl_level_full.as_ptr(), d_reduced.ptr(),
+                        bs as i32, s as i32, d as i32, c as i32,
+                    );
+                }
+                d_reduced
+            } else {
+                d_refl_level_full
+            };
+
+            // Reconstruct the WRITE input (pooled y_t)
+            let write_input = if c > 1 {
+                let pooled = GpuBuf::zeros(bs * s_f * d);
+                unsafe {
+                    crate::cuda_ffi::mean_pool_1d_f32_cuda(
+                        bc.attn_out.as_ptr(), pooled.ptr(),
+                        bs as i32, s as i32, d as i32, c as i32,
+                    );
+                }
+                pooled
+            } else {
+                bc.attn_out.clone_buf()
+            };
+
+            if let Some(ref mem_cache) = bc.memory_caches[level] {
+                let d_y_t_level = gpu_memory_backward(
+                    &block.levels[level], cfg, mem_cache,
+                    &d_refl_level, &write_input,
+                    &mut level_grads[level],
+                    s_f, d, level, bs,
+                );
+                if c > 1 {
+                    unsafe {
+                        crate::cuda_ffi::mean_pool_1d_backward_f32_cuda(
+                            d_y_t_level.as_ptr(), d_y_t_mem_total.ptr(),
+                            bs as i32, s as i32, d as i32, c as i32,
+                        );
+                    }
+                } else {
+                    unsafe {
+                        crate::cuda_ffi::saxpy_cuda(1.0, d_y_t_level.as_ptr(), d_y_t_mem_total.ptr(), bsd_i32);
+                    }
+                }
+            } else {
+                let d_y_t_level = gpu_memory_read_only_backward(
+                    &block.levels[level], &bc.y_per_level[level],
+                    &d_refl_level, &write_input,
+                    &mut level_grads[level],
+                    s_f, d, bs,
+                );
+                if c > 1 {
+                    unsafe {
+                        crate::cuda_ffi::mean_pool_1d_backward_f32_cuda(
+                            d_y_t_level.as_ptr(), d_y_t_mem_total.ptr(),
+                            bs as i32, s as i32, d as i32, c as i32,
+                        );
+                    }
+                } else {
+                    unsafe {
+                        crate::cuda_ffi::saxpy_cuda(1.0, d_y_t_level.as_ptr(), d_y_t_mem_total.ptr(), bsd_i32);
+                    }
+                }
+            }
+        }
+        prof_stop!(profiler);
+
+        // ── Step 7: Combine d_y_t from gate + memory write ───────────
+        let d_y_t = GpuBuf::zeros(bsd);
+        unsafe {
+            crate::cuda_ffi::saxpy_cuda(1.0, d_y_t_gate.as_ptr(), d_y_t.ptr(), bsd_i32);
+            crate::cuda_ffi::saxpy_cuda(1.0, d_y_t_mem_total.as_ptr(), d_y_t.ptr(), bsd_i32);
+        }
+
+        // ── Step 6: Scatter d_y_t → d_attn_out at assembled positions ─
+        // Forward extracted y_t from attn_out[n_p+s .. n_p+2s]
+        let assembled_len = n_p + 2 * s;
+        let assembled_sd = bs * assembled_len * d;
+        let d_attn_out_assembled = GpuBuf::zeros(assembled_sd);
+        unsafe {
+            crate::gpu_forward::gpu_buf_memcpy_d2d(
+                (d_attn_out_assembled.ptr() as *mut u8).add((n_p + s) * d * 4) as *mut std::ffi::c_void,
+                d_y_t.as_ptr() as *const std::ffi::c_void,
+                bsd * 4,
+            );
+        }
+
+        // ── Step 5: SWA backward on assembled ────────────────────────
+        prof_start!(profiler, "mac_swa_bwd", Attention, Some(b), None);
+        let n_aug = bs * assembled_len;
+        let mac_window = assembled_len; // full causal on assembled sequence
+        let mut d_q = GpuBuf::zeros(assembled_sd);
+        let mut d_k = GpuBuf::zeros(assembled_sd);
+        let mut d_v = GpuBuf::zeros(assembled_sd);
+
+        crate::dispatch::swa_backward_dd(
+            &bc.q_bf16, &bc.k_bf16, &bc.v_bf16,
+            &bc.attn_weights_bf16, &d_attn_out_assembled,
+            &mut d_q, &mut d_k, &mut d_v,
+            assembled_len, nh, hd, mac_window, bs, 0, // n_persistent=0 for MAC SWA
+        );
+        prof_stop!(profiler);
+
+        // ── Step 4: QKV projection backward (assembled dims) ─────────
+        prof_start!(profiler, "mac_qkv_bwd", Projection, Some(b), None);
+        let mut d_assembled = GpuBuf::zeros(assembled_sd);
+        crate::dispatch::cublas_matmul_acc_dd(&d_q, &block.w_q, &mut d_assembled, n_aug, d, d);
+        crate::dispatch::cublas_matmul_acc_dd(&d_k, &block.w_k, &mut d_assembled, n_aug, d, d);
+        crate::dispatch::cublas_matmul_acc_dd(&d_v, &block.w_v, &mut d_assembled, n_aug, d, d);
+
+        gpu_matmul_transa_dd(&d_q, &bc.qkv_source, &mut d_w_q, d, n_aug, d);
+        gpu_matmul_transa_dd(&d_k, &bc.qkv_source, &mut d_w_k, d, n_aug, d);
+        gpu_matmul_transa_dd(&d_v, &bc.qkv_source, &mut d_w_v, d, n_aug, d);
+        prof_stop!(profiler);
+
+        // ── Step 3: Split d_assembled → d_persistent, d_h_t, d_normed ─
+        // assembled = [persistent(n_p) || h_t(s) || normed(s)]
+        if n_p > 0 {
+            unsafe {
+                crate::cuda_ffi::saxpy_cuda(
+                    1.0, d_assembled.as_ptr(), d_persistent_tokens.ptr(),
+                    (n_p * d) as i32,
+                );
+            }
+        }
+        let d_h_t = GpuBuf::zeros(bsd);
+        unsafe {
+            crate::gpu_forward::gpu_buf_memcpy_d2d(
+                d_h_t.ptr() as *mut std::ffi::c_void,
+                (d_assembled.as_ptr() as *const u8).add(n_p * d * 4) as *const std::ffi::c_void,
+                bsd * 4,
+            );
+        }
+        let d_normed = GpuBuf::zeros(bsd);
+        unsafe {
+            crate::gpu_forward::gpu_buf_memcpy_d2d(
+                d_normed.ptr() as *mut std::ffi::c_void,
+                (d_assembled.as_ptr() as *const u8).add((n_p + s) * d * 4) as *const std::ffi::c_void,
+                bsd * 4,
+            );
+        }
+
+        // ── Step 2: Memory READ backward (per-level) ─────────────────
+        // Forward: h_t = Σ_l read_weights[l] * h_t_upsampled[l]
+        //          h_t[l] = gpu_memory_read_only(level_params, normed, M, ...)
+        prof_start!(profiler, "mac_read_bwd", MemoryBackward, Some(b), None);
+        let read_weights = bc.mac_read_weights.as_ref().unwrap();
+        let mut d_normed_read = GpuBuf::zeros(bsd);
+
+        for level in 0..cfg.k {
+            let c = cfg.chunk_sizes.get(level).copied().unwrap_or(1);
+            let s_f = bc.level_seq_lens[level];
+
+            let d_h_t_level_full = GpuBuf::zeros(bsd);
+            unsafe {
+                crate::cuda_ffi::saxpy_cuda(read_weights[level], d_h_t.as_ptr(), d_h_t_level_full.ptr(), bsd_i32);
+            }
+
+            // Backward through upsample
+            let d_h_t_level = if c > 1 {
+                let d_reduced = GpuBuf::zeros(bs * s_f * d);
+                unsafe {
+                    crate::cuda_ffi::repeat_upsample_1d_backward_f32_cuda(
+                        d_h_t_level_full.as_ptr(), d_reduced.ptr(),
+                        bs as i32, s as i32, d as i32, c as i32,
+                    );
+                }
+                d_reduced
+            } else {
+                d_h_t_level_full
+            };
+
+            // Reconstruct pooled normed input for READ
+            let read_input = if c > 1 {
+                let pooled = GpuBuf::zeros(bs * s_f * d);
+                unsafe {
+                    crate::cuda_ffi::mean_pool_1d_f32_cuda(
+                        bc.ln_attn_out.as_ptr(), pooled.ptr(),
+                        bs as i32, s as i32, d as i32, c as i32,
+                    );
+                }
+                pooled
+            } else {
+                bc.ln_attn_out.clone_buf()
+            };
+
+            // READ-only backward (gradient through memory projection)
+            // y_per_level stores reflective outputs for MAC, but read_only_backward
+            // uses it only for shape — the actual h_t values came from the read path.
+            // For MAC, we pass mac_h_t (the combined read output) as the y_level ref.
+            let h_t_ref = bc.mac_h_t.as_ref().unwrap();
+            let d_normed_level = gpu_memory_read_only_backward(
+                &block.levels[level], h_t_ref,
+                &d_h_t_level, &read_input,
+                &mut level_grads[level],
+                s_f, d, bs,
+            );
+            if c > 1 {
+                unsafe {
+                    crate::cuda_ffi::mean_pool_1d_backward_f32_cuda(
+                        d_normed_level.as_ptr(), d_normed_read.ptr(),
+                        bs as i32, s as i32, d as i32, c as i32,
+                    );
+                }
+            } else {
+                unsafe {
+                    crate::cuda_ffi::saxpy_cuda(1.0, d_normed_level.as_ptr(), d_normed_read.ptr(), bsd_i32);
+                }
+            }
+        }
+        prof_stop!(profiler);
+
+        // ── Step 1: LN backward ──────────────────────────────────────
+        // Forward: normed = LN(block_input) — MAC uses ln_attn only
+        // d_ln_attn_out = d_normed (from assembled split) + d_normed_read (from READ backward)
+        let d_ln_attn_out = GpuBuf::zeros(bsd);
+        unsafe {
+            crate::cuda_ffi::saxpy_cuda(1.0, d_normed.as_ptr(), d_ln_attn_out.ptr(), bsd_i32);
+            crate::cuda_ffi::saxpy_cuda(1.0, d_normed_read.as_ptr(), d_ln_attn_out.ptr(), bsd_i32);
+        }
+
+        prof_start!(profiler, "mac_ln_bwd", LayerNorm, Some(b), None);
+        let d_block_input = GpuBuf::zeros(bsd);
+        unsafe {
+            crate::cuda_ffi::layer_norm_backward_cuda(
+                d_ln_attn_out.as_ptr(),
+                bc.block_input.as_ptr(),
+                block.ln_attn_gamma.as_ptr(),
+                bc.ln_attn_mean.as_ptr(),
+                bc.ln_attn_rstd.as_ptr(),
+                d_block_input.ptr(),
+                d_ln_attn_gamma.ptr(),
+                d_ln_attn_beta.ptr(),
+                n_tokens as i32, d as i32,
+            );
+        }
+        prof_stop!(profiler);
+
+        // MAC has ONE residual skip: residual = block_input + projected
+        // d_block_input += d_residual_stream
+        unsafe {
+            crate::cuda_ffi::saxpy_cuda(1.0, d_residual_stream.as_ptr(), d_block_input.ptr(), bsd_i32);
+        }
+        d_residual_stream = d_block_input;
+
+        // Alpha aggregation gradients — for k=1, both are trivially zero.
+        // For k>1, deferred dot product pattern (like MAG).
+        d_alpha_mem = vec![0.0f32; cfg.k];
+        d_alpha_refl = vec![0.0f32; cfg.k];
+
+        // For k>1: TODO deferred dot product + softmax Jacobian for both
+        // alpha_mem (READ) and alpha_refl (WRITE). Currently zero-initialized
+        // which is correct for k=1 experiment config.
+
+        block_grads[b] = Some(GpuStackedBlockGrads {
+            d_w_q, d_w_k, d_w_v, d_w_o,
+            d_ln_attn_gamma, d_ln_attn_beta,
+            d_ln_mem_gamma, d_ln_mem_beta,
+            levels: level_grads,
+            d_alpha_mem,
+            d_alpha_refl,
+            level_output_gnorms: block_level_gnorms,
+        });
+
+        } else {
+        // ══════════════════════════════════════════════════════════════
+        // MAG composition backward (existing path, unchanged)
+        // ══════════════════════════════════════════════════════════════
+
         // ── MAG gating backward ──────────────────────────────────────
         // Forward: residual_out = block_input + gated_out
         //          gated_out = attn_proj * gate
@@ -348,9 +711,8 @@ pub fn gpu_stacked_backward(
         let is_chained = matches!(cfg.hope_variant, HopeVariant::Chained | HopeVariant::Sequential);
 
         // ── Per-level output gradient norms (tape diagnostics) ─────
-        let mut block_level_gnorms = vec![0.0f32; cfg.k];
+        block_level_gnorms = vec![0.0f32; cfg.k];
 
-        let d_alpha_mem: Vec<f32>;
         let d_mem_input;
 
         if is_chained {
@@ -799,14 +1161,19 @@ pub fn gpu_stacked_backward(
         // d_block_input becomes d_residual_stream for the previous block
         d_residual_stream = d_block_input;
 
+        d_alpha_refl = vec![0.0f32; cfg.k]; // MAG: no reflective aggregation
+
         block_grads[b] = Some(GpuStackedBlockGrads {
             d_w_q, d_w_k, d_w_v, d_w_o,
             d_ln_attn_gamma, d_ln_attn_beta,
             d_ln_mem_gamma, d_ln_mem_beta,
             levels: level_grads,
             d_alpha_mem,
+            d_alpha_refl,
             level_output_gnorms: block_level_gnorms,
         });
+
+        } // end composition dispatch
     }
 
     // ── Spec 63: deferred readback — ONE sync for all blocks ───────────
