@@ -851,6 +851,12 @@ fn assemble_m_states(
 ///
 /// Spec 68: "The model is: process one token → update memory → produce output.
 /// That is the atomic unit of computation."
+///
+/// TODO(spec79): This function only implements the MAG path. When composition=MAC,
+/// the decode path needs a MAC branch (memory READ → assemble → full causal →
+/// extract → memory WRITE → reflective gate → W_O). Not needed for the initial
+/// MAC build experiment (which uses forward_sequence), but required before MAC
+/// can be used for inference/decode. Same applies to ActivationWindow::assemble_cache.
 #[cfg(feature = "cuda")]
 pub fn forward_single_token(
     params: &GpuStackedParams,
@@ -1563,12 +1569,14 @@ fn forward_sequence(
             level_seq_lens.push(s_f);
         }
 
-        // Aggregate reflective_y across levels
+        // Aggregate reflective_y across levels using alpha_refl (NOT alpha_mem).
+        // mac.rs:694: w_refl = masked_softmax(&params.alpha_refl, &active_mask)
+        // alpha_mem is for READ aggregation; alpha_refl is for WRITE/reflective.
         let (reflective_y, alpha_weights) = if cfg.k == 1 {
             (refl_upsampled[0].clone_buf(), vec![1.0])
         } else {
             let mut alpha_host = vec![0.0f32; cfg.k];
-            block.alpha_mem.slice(0, cfg.k).copy_to_host(&mut alpha_host);
+            block.alpha_refl.slice(0, cfg.k).copy_to_host(&mut alpha_host);
             let weights = crate::stacked_model::host_softmax(&alpha_host);
             let combined = GpuBuf::zeros(sd);
             for (l, r_full) in refl_upsampled.iter().enumerate() {

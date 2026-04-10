@@ -252,14 +252,19 @@ IF composition == "mac":
 
 ### Segment length for MAC
 
-MAC processes the full `seq_len = segments * window_size` as one sequence per block.
-The `window_size` in config now serves double duty:
-- For MAG: the SWA sliding window size
-- For MAC: the segment size L_seg (how many raw tokens per segment)
+Each call to `forward_sequence` receives one segment of `L_seg` tokens (where
+`L_seg = window_size` from config). The outer loop in Python calls forward_sequence
+once per segment, advancing the data cursor by L_seg tokens each time. Over `segments`
+calls, the model processes `segments * L_seg` total tokens per training step.
 
-The assembled attention window is `n_p + 2 * seq_len`. For the initial experiment:
-- `window_size: 512` → L_seg = 512, assembled = ~1032, ~4x attention cost
-- `segments: 20` → 20 segments of 512 tokens, 10240 total
+The `window_size` config field serves different roles per composition:
+- For MAG: the SWA sliding window size (local attention within L_seg tokens)
+- For MAC: the segment size L_seg (how many raw tokens per forward call)
+
+The assembled attention window **per call** is `n_p + 2 * L_seg`. For the initial experiment:
+- `window_size: 512` → L_seg = 512, assembled per call = 8 + 2*512 = 1032 tokens
+- `segments: 20` → 20 forward calls per step, 10240 total tokens
+- Attention cost per call: O(1032^2 * d) ≈ 4x vs MAG's SWA O(512 * 512 * d)
 
 ## Backward Pass
 
