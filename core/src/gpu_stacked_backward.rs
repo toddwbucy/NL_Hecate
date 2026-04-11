@@ -241,32 +241,12 @@ pub fn gpu_stacked_backward(
     prof_stop!(profiler);
 
     // ── Final LN backward ──────────────────────────────────────────────
-    // The last block's output (residual_stream) went through ln_final.
-    // Reconstruct residual_out for LN backward input:
-    //   MAC: residual_out = block_input + projected  (attn_proj already includes gating)
-    //   MAG: residual_out = block_input + attn_proj * gate
+    // Use the exact residual_out stored during forward rather than reconstructing
+    // it — reconstruction introduces numerical discrepancy that corrupts the
+    // LN backward Jacobian and poisons all upstream block gradients.
     prof_start!(profiler, "ln_final_bwd", LayerNorm, None, None);
     let last_block_cache = &cache.block_caches[n_blocks - 1];
-    let residual_stream_final = GpuBuf::zeros(bsd);
-    let is_mac = matches!(cfg.composition, CompositionKind::MAC);
-    if is_mac {
-        // MAC: residual = block_input + projected (attn_proj = gated_out @ W_O)
-        unsafe {
-            crate::cuda_ffi::saxpy_cuda(1.0, last_block_cache.block_input.as_ptr(), residual_stream_final.ptr(), bsd_i32);
-            crate::cuda_ffi::saxpy_cuda(1.0, last_block_cache.attn_proj.as_ptr(), residual_stream_final.ptr(), bsd_i32);
-        }
-    } else {
-        // MAG: residual = block_input + attn_proj * gate
-        let gated_out_last = GpuBuf::zeros(bsd);
-        unsafe {
-            crate::cuda_ffi::elemwise_mul_cuda(
-                last_block_cache.attn_proj.as_ptr(), last_block_cache.gate.as_ptr(),
-                gated_out_last.ptr(), bsd_i32,
-            );
-            crate::cuda_ffi::saxpy_cuda(1.0, last_block_cache.block_input.as_ptr(), residual_stream_final.ptr(), bsd_i32);
-            crate::cuda_ffi::saxpy_cuda(1.0, gated_out_last.as_ptr(), residual_stream_final.ptr(), bsd_i32);
-        }
-    }
+    let residual_stream_final = last_block_cache.residual_out.clone_buf();
 
     let mut d_residual_stream = GpuBuf::zeros(bsd);
     unsafe {
@@ -319,6 +299,7 @@ pub fn gpu_stacked_backward(
     // all pending GPU work), so dropping per-block was causing pipeline stalls.
     let mut all_keep_alive: Vec<GpuBuf<f32>> = Vec::new();
 
+    let is_mac = matches!(cfg.composition, CompositionKind::MAC);
     for b in (0..n_blocks).rev() {
         let block = &params.blocks[b];
         let bc = &cache.block_caches[b];
@@ -457,11 +438,13 @@ pub fn gpu_stacked_backward(
                     }
                 }
             } else {
+                let pre_m = bc.mac_pre_write_m.as_ref().unwrap();
                 let d_y_t_level = gpu_memory_read_only_backward(
                     &block.levels[level], &bc.y_per_level[level],
                     &d_refl_level, &write_input,
                     &mut level_grads[level],
                     s_f, d, bs,
+                    Some(&pre_m[level]), nh, hd,
                 );
                 if c > 1 {
                     unsafe {
@@ -603,11 +586,13 @@ pub fn gpu_stacked_backward(
             // uses it only for shape — the actual h_t values came from the read path.
             // For MAC, we pass mac_h_t (the combined read output) as the y_level ref.
             let h_t_ref = bc.mac_h_t.as_ref().unwrap();
+            let pre_m = bc.mac_pre_write_m.as_ref().unwrap();
             let d_normed_level = gpu_memory_read_only_backward(
                 &block.levels[level], h_t_ref,
                 &d_h_t_level, &read_input,
                 &mut level_grads[level],
                 s_f, d, bs,
+                Some(&pre_m[level]), nh, hd,
             );
             if c > 1 {
                 unsafe {
@@ -821,6 +806,7 @@ pub fn gpu_stacked_backward(
                         &d_upstream, level_input,
                         &mut level_grads[level],
                         s_f, d, bs,
+                        None, nh, hd, // TODO: pass context_m for MAG frozen levels when available
                     );
                     let old = std::mem::replace(&mut d_upstream, d_emb_level);
                     all_keep_alive.push(old);
@@ -998,6 +984,7 @@ pub fn gpu_stacked_backward(
                         &d_y_level, &level_input,
                         &mut level_grads[level],
                         s_f, d, bs,
+                        None, nh, hd, // TODO: pass context_m for MAG frozen levels when available
                     );
                     if c > 1 {
                         unsafe {
