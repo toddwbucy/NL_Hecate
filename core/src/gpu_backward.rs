@@ -335,6 +335,7 @@ pub fn gpu_cms_backward(
                 &d_y_combined, mem_input_ref,
                 &mut grads.levels[level],
                 s, d, bs,
+                None, nh, hd, // no M available in non-stacked cache
             );
             unsafe {
                 crate::cuda_ffi::saxpy_cuda(1.0, d_emb_level.as_ptr(), d_mem_input.ptr(), bsd as i32);
@@ -2118,23 +2119,69 @@ fn accumulate_projection_grads(
 pub(crate) fn gpu_memory_read_only_backward(
     level_params: &GpuMemoryLevelParams,
     _y_level: &GpuBuf<f32>,
-    _d_y: &GpuBuf<f32>,
-    _embedded: &GpuBuf<f32>,
-    _level_grads: &mut GpuLevelGrads,
+    d_y: &GpuBuf<f32>,
+    embedded: &GpuBuf<f32>,
+    level_grads: &mut GpuLevelGrads,
     s: usize,
     d: usize,
     batch_size: usize,
+    context_m: Option<&GpuBuf<f32>>,
+    num_heads: usize,
+    head_dim: usize,
 ) -> GpuBuf<f32> {
-    // Frozen level: y = q_mem @ M^T where M is frozen context.
-    // d_q_mem = d_y @ M → needs M, which we don't store in cache.
-    // d_embedded = d_q_mem @ W_q_mem
-    //
-    // For the first iteration of GPU-resident model, return zeros.
-    // Frozen level gradients go to error buffers (not direct weight updates),
-    // so this only affects d_embedded propagation from frozen levels.
-    // The dominant gradient signal comes from active levels.
-    let _ = level_params;
-    GpuBuf::zeros(batch_size * s * d)
+    // Forward: q_mem = embedded @ W_q_mem^T, y = q_mem @ M^T
+    // Backward: d_q = d_y @ M, d_embedded = d_q @ W_q_mem, d_W_q_mem += d_q^T @ embedded
+    let n_tokens = batch_size * s;
+    let nsd = n_tokens * d;
+
+    let m = match context_m {
+        Some(m) => m,
+        None => {
+            // No M available — return zeros (legacy frozen-level path).
+            return GpuBuf::zeros(nsd);
+        }
+    };
+
+    // Step 1: Reconstruct q_mem = embedded @ W_q_mem^T
+    let mut q_mem = GpuBuf::zeros(nsd);
+    crate::dispatch::cublas_matmul_transb_dd(embedded, &level_params.w_q_mem, &mut q_mem, n_tokens, d, d, 0.0);
+
+    // Step 2: d_q = d_y @ M (nh=1: monolithic, nh>1: per-head)
+    let d_q = if num_heads == 1 {
+        let mut dq = GpuBuf::zeros(nsd);
+        crate::dispatch::cublas_matmul_dd(d_y, m, &mut dq, n_tokens, d, d, 0.0);
+        dq
+    } else {
+        // Per-head: reshape d_y → [nh, n_tokens, hd], matmul per head with M_h, reshape back
+        let d_y_ph = crate::gpu_forward::reshape_to_per_head(d_y, batch_size, s, num_heads, head_dim);
+        let dq_ph = GpuBuf::<f32>::zeros(num_heads * n_tokens * head_dim);
+        let dd_mem = head_dim * head_dim;
+        for h in 0..num_heads {
+            let off_dy = h * n_tokens * head_dim;
+            let off_m = h * dd_mem;
+            let off_dq = h * n_tokens * head_dim;
+            unsafe {
+                let dy_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(
+                    d_y_ph.as_ptr().add(off_dy) as *mut f32, n_tokens * head_dim);
+                let m_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(
+                    m.as_ptr().add(off_m) as *mut f32, dd_mem);
+                let mut dq_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(
+                    dq_ph.ptr().add(off_dq) as *mut f32, n_tokens * head_dim);
+                // d_Q_h[n_tokens, hd] = d_Y_h[n_tokens, hd] @ M_h[hd, hd]
+                crate::dispatch::cublas_matmul_dd(&dy_h, &m_h, &mut dq_h, n_tokens, head_dim, head_dim, 0.0);
+            }
+        }
+        crate::gpu_forward::reshape_from_per_head(&dq_ph, batch_size, s, num_heads, head_dim)
+    };
+
+    // Step 3: d_embedded = d_q @ W_q_mem
+    let mut d_embedded = GpuBuf::zeros(nsd);
+    crate::dispatch::cublas_matmul_dd(&d_q, &level_params.w_q_mem, &mut d_embedded, n_tokens, d, d, 0.0);
+
+    // Step 4: d_W_q_mem += d_q^T @ embedded (accumulate into level_grads)
+    gpu_matmul_transa_dd(&d_q, embedded, &mut level_grads.d_w_q_mem, d, n_tokens, d);
+
+    d_embedded
 }
 
 // ══════════════════════════════════════════════════════════════════════

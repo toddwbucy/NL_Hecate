@@ -72,6 +72,9 @@ pub struct GpuStackedBlockCache {
     /// READ aggregation weights [k] — softmax(alpha_mem). Separate from alpha_weights
     /// (which stores reflective weights for MAC). Backward needs this for d_alpha_mem.
     pub mac_read_weights: Option<Vec<f32>>,
+    /// Block output residual [bs*s, d]. Stored directly rather than reconstructed
+    /// in backward to avoid any numerical discrepancy with the LN backward.
+    pub residual_out: GpuBuf<f32>,
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -573,6 +576,7 @@ impl ActivationWindow {
                 mac_gated_out: None,
                 mac_pre_write_m: None,
                 mac_read_weights: None,
+                residual_out: GpuBuf::zeros(1), // placeholder — assemble path not used for FD/backward
             });
         }
 
@@ -1650,6 +1654,7 @@ fn forward_sequence(
             mac_gated_out: Some(mac_gated),
             mac_pre_write_m: Some(pre_write_m),
             mac_read_weights: Some(read_weights),
+            residual_out: residual.clone_buf(),
         });
 
         } else {
@@ -1971,6 +1976,7 @@ fn forward_sequence(
             mac_gated_out: None,
             mac_pre_write_m: None,
             mac_read_weights: None,
+            residual_out: residual.clone_buf(),
         });
 
         } // end composition dispatch
