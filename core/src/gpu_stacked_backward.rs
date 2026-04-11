@@ -806,7 +806,7 @@ pub fn gpu_stacked_backward(
                         &d_upstream, level_input,
                         &mut level_grads[level],
                         s_f, d, bs,
-                        None, nh, hd, // MAG frozen: no M in cache yet
+                        None, nh, hd, // TODO: pass context_m for MAG frozen levels when available
                     );
                     let old = std::mem::replace(&mut d_upstream, d_emb_level);
                     all_keep_alive.push(old);
@@ -984,7 +984,7 @@ pub fn gpu_stacked_backward(
                         &d_y_level, &level_input,
                         &mut level_grads[level],
                         s_f, d, bs,
-                        None, nh, hd, // MAG frozen: no M in cache yet
+                        None, nh, hd, // TODO: pass context_m for MAG frozen levels when available
                     );
                     if c > 1 {
                         unsafe {

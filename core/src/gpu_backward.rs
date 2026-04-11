@@ -2152,23 +2152,25 @@ pub(crate) fn gpu_memory_read_only_backward(
         crate::dispatch::cublas_matmul_dd(d_y, m, &mut dq, n_tokens, d, d, 0.0);
         dq
     } else {
-        // Per-head: reshape d_y → [nh, n_tokens, hd], matmul per head with M_h, reshape back
+        // Per-head: reshape d_y → [bs*nh, s, hd], matmul per head-batch with M_h
         let d_y_ph = crate::gpu_forward::reshape_to_per_head(d_y, batch_size, s, num_heads, head_dim);
-        let dq_ph = GpuBuf::<f32>::zeros(num_heads * n_tokens * head_dim);
+        let per_head_count = batch_size * num_heads;
+        let dq_ph = GpuBuf::<f32>::zeros(per_head_count * s * head_dim);
         let dd_mem = head_dim * head_dim;
-        for h in 0..num_heads {
-            let off_dy = h * n_tokens * head_dim;
-            let off_m = h * dd_mem;
-            let off_dq = h * n_tokens * head_dim;
+        for h in 0..per_head_count {
+            let head_idx = h % num_heads;
+            let off_dy = h * s * head_dim;
+            let off_m = head_idx * dd_mem;
+            let off_dq = h * s * head_dim;
             unsafe {
                 let dy_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(
-                    d_y_ph.as_ptr().add(off_dy) as *mut f32, n_tokens * head_dim);
+                    d_y_ph.as_ptr().add(off_dy) as *mut f32, s * head_dim);
                 let m_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(
                     m.as_ptr().add(off_m) as *mut f32, dd_mem);
                 let mut dq_h: GpuBuf<f32> = GpuBuf::from_raw_non_owning(
-                    dq_ph.ptr().add(off_dq) as *mut f32, n_tokens * head_dim);
-                // d_Q_h[n_tokens, hd] = d_Y_h[n_tokens, hd] @ M_h[hd, hd]
-                crate::dispatch::cublas_matmul_dd(&dy_h, &m_h, &mut dq_h, n_tokens, head_dim, head_dim, 0.0);
+                    dq_ph.ptr().add(off_dq) as *mut f32, s * head_dim);
+                // d_Q_h[s, hd] = d_Y_h[s, hd] @ M_h[hd, hd]
+                crate::dispatch::cublas_matmul_dd(&dy_h, &m_h, &mut dq_h, s, head_dim, head_dim, 0.0);
             }
         }
         crate::gpu_forward::reshape_from_per_head(&dq_ph, batch_size, s, num_heads, head_dim)
@@ -2178,8 +2180,15 @@ pub(crate) fn gpu_memory_read_only_backward(
     let mut d_embedded = GpuBuf::zeros(nsd);
     crate::dispatch::cublas_matmul_dd(&d_q, &level_params.w_q_mem, &mut d_embedded, n_tokens, d, d, 0.0);
 
-    // Step 4: d_W_q_mem += d_q^T @ embedded (accumulate into level_grads)
-    gpu_matmul_transa_dd(&d_q, embedded, &mut level_grads.d_w_q_mem, d, n_tokens, d);
+    // Step 4: d_W_q_mem += d_q^T @ embedded (accumulate — use temp + saxpy
+    // because gpu_matmul_transa_dd uses beta=0 and would overwrite prior
+    // contributions from the WRITE backward pass)
+    let dd = d * d;
+    let mut d_w_q_mem_tmp = GpuBuf::zeros(dd);
+    gpu_matmul_transa_dd(&d_q, embedded, &mut d_w_q_mem_tmp, d, n_tokens, d);
+    unsafe {
+        crate::cuda_ffi::saxpy_cuda(1.0, d_w_q_mem_tmp.as_ptr(), level_grads.d_w_q_mem.ptr(), dd as i32);
+    }
 
     d_embedded
 }

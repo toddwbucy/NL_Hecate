@@ -179,24 +179,28 @@ fn apply_sgd_stacked(
     // Shared params
     let mut d_w_embed = vec![0.0f32; v * d];
     grads.d_w_embed.copy_to_host(&mut d_w_embed);
+    assert_eq!(host.w_embed.len(), d_w_embed.len(), "w_embed grad size mismatch");
     for (p, &g) in host.w_embed.iter_mut().zip(d_w_embed.iter()) {
         *p -= lr * g;
     }
 
     let mut d_w_unembed = vec![0.0f32; d * v];
     grads.d_w_unembed.copy_to_host(&mut d_w_unembed);
+    assert_eq!(host.w_unembed.len(), d_w_unembed.len(), "w_unembed grad size mismatch");
     for (p, &g) in host.w_unembed.iter_mut().zip(d_w_unembed.iter()) {
         *p -= lr * g;
     }
 
     let mut d_ln_gamma = vec![0.0f32; d];
     grads.d_ln_final_gamma.copy_to_host(&mut d_ln_gamma);
+    assert_eq!(host.ln_final_gamma.len(), d_ln_gamma.len(), "ln_gamma grad size mismatch");
     for (p, &g) in host.ln_final_gamma.iter_mut().zip(d_ln_gamma.iter()) {
         *p -= lr * g;
     }
 
     let mut d_ln_beta = vec![0.0f32; d];
     grads.d_ln_final_beta.copy_to_host(&mut d_ln_beta);
+    assert_eq!(host.ln_final_beta.len(), d_ln_beta.len(), "ln_beta grad size mismatch");
     for (p, &g) in host.ln_final_beta.iter_mut().zip(d_ln_beta.iter()) {
         *p -= lr * g;
     }
@@ -210,6 +214,7 @@ fn apply_sgd_stacked(
             ($host_field:expr, $grad_field:expr, $len:expr) => {
                 let mut g = vec![0.0f32; $len];
                 $grad_field.copy_to_host(&mut g);
+                assert_eq!($host_field.len(), g.len(), "param/grad size mismatch");
                 for (p, &gv) in $host_field.iter_mut().zip(g.iter()) {
                     *p -= lr * gv;
                 }
@@ -277,8 +282,9 @@ fn apply_sgd_stacked(
 /// Finite-difference gradient check for W_O in block 0 (2-block model).
 /// IGNORED: pre-existing inter-block gradient flow bug (MAG/MAC block 0 in
 /// multi-block models). Will be addressed in a separate task.
+/// TODO: unignore when inter-block gradient flow is fixed
 #[test]
-#[ignore]
+#[ignore = "pre-existing inter-block gradient bug — block 0 in multi-block models"]
 fn test_mac_stacked_fd_w_o() {
     let cfg = mac_test_cfg();
     let n_blocks = 2;
@@ -570,8 +576,9 @@ fn test_mac_stacked_fd_w_q() {
 /// Sanity check: MAG 2-block FD gradient (block 0).
 /// IGNORED: pre-existing inter-block gradient flow bug (block 0 in multi-block
 /// models). Both MAG and MAC exhibit this. Separate task.
+/// TODO: unignore when inter-block gradient flow is fixed
 #[test]
-#[ignore]
+#[ignore = "pre-existing inter-block gradient bug — block 0 in multi-block models"]
 fn test_mag_stacked_fd_w_o_2block() {
     use nl_hecate_core::model::CompositionKind;
 
