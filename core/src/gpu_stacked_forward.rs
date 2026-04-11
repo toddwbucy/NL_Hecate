@@ -576,7 +576,9 @@ impl ActivationWindow {
                 mac_gated_out: None,
                 mac_pre_write_m: None,
                 mac_read_weights: None,
-                residual_out: GpuBuf::zeros(1), // placeholder — assemble path not used for FD/backward
+                // TODO: TokenBlockCache lacks residual_out; add it + capture in forward_single_token.
+                // Without this, LN backward via assemble_cache uses stale data. Pre-existing limitation.
+                residual_out: GpuBuf::zeros(1),
             });
         }
 
